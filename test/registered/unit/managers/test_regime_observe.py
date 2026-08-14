@@ -1024,7 +1024,26 @@ class TestSchedulerHookContract(CustomTestCase):
         intra-phase controller moves (#297 KV vector, #330 budget) change how
         work is DIVIDED, not how fast a GEMM runs, so the wait term is the
         only part of the round they can be credited against. A total would
-        hide it."""
+        hide it.
+
+        UPDATED DELIBERATELY AGAIN (#363 defect 8b): ``rank_split_seq``. The
+        tier decision is TIER-L, and it is not a third measurement -- it is
+        the IDENTITY of the sample the two ms terms describe. The accessor
+        carries its last measurable reading forward across boundaries that
+        saw no new forward, so without the identity the observer accumulated
+        one retired forward once per boundary; measured on the R14 window's
+        B3 trace, 82 341 of 82 549 boundaries carried a number against 2 574
+        forwards actually measured, a mean over roughly thirty copies of each
+        sample.
+
+        It gates ACCUMULATION, never a verdict: the only thing a rank decides
+        from it is whether a reading it already counted gets counted twice.
+        The group statistic is still the MIN reduction over the rank means.
+        Ranks run replicated batches, so the sequence advances on the same
+        rounds on every rank in the ordinary case; when event completion makes
+        them disagree, the disagreeing rank contributes no sample and the
+        packed sentinel makes the GROUP abstain -- the same safe direction the
+        absence of a split already takes."""
         import ast
         import pathlib
 
@@ -1056,6 +1075,7 @@ class TestSchedulerHookContract(CustomTestCase):
                 # Tier-L, #363 intra-phase. See the docstring above.
                 "rank_compute_ms",
                 "rank_wait_ms",
+                "rank_split_seq",
             },
         )
         self.assertEqual(calls[0].args, [], "the hook must be keyword-only")

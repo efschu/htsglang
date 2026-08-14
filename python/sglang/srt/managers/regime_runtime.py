@@ -49,9 +49,10 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import signal
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.regime_classifier import (
     DEFAULT_WINDOW_ROUNDS,
@@ -263,6 +264,11 @@ class RegimeObserver:
         self._ms_compute_sum = 0.0
         self._ms_wait_sum = 0.0
         self._ms_split_n = 0
+        # The identity of the last split this observer counted (#363 defect
+        # 8b). Never reset at a boundary: the accumulators are, but the
+        # sample identity has to survive them, or the first boundary after a
+        # reset would re-count the sample the previous one already used.
+        self._last_split_seq: Optional[int] = None
         # Carried forward from the previous boundary's reduction (see the
         # one-boundary lag in the module docstring).
         self._last_spread_pct: Optional[float] = None
@@ -326,6 +332,7 @@ class RegimeObserver:
         rank_forward_ms: Optional[float] = None,
         rank_compute_ms: Optional[float] = None,
         rank_wait_ms: Optional[float] = None,
+        rank_split_seq: Optional[int] = None,
     ) -> Optional[Dict]:
         """One between-tick boundary.
 
@@ -360,10 +367,22 @@ class RegimeObserver:
         if rank_forward_ms is not None:
             self._rank_ms_sum += float(rank_forward_ms)
             self._rank_ms_n += 1
+        # #363 defect 8b. ONE RETIRED FORWARD IS ONE SAMPLE. The accessor
+        # carries its last measurable reading forward across boundaries that
+        # saw no new one, so accumulating on VALUE would average a forward
+        # with copies of itself and divide by the number of copies. The
+        # sequence identifies the sample, so a boundary contributes only a
+        # reading it has not already counted. A caller that passes no
+        # sequence (an older wiring, or a test) keeps the previous behaviour
+        # rather than silently dropping every sample.
         if rank_compute_ms is not None and rank_wait_ms is not None:
-            self._ms_compute_sum += float(rank_compute_ms)
-            self._ms_wait_sum += float(rank_wait_ms)
-            self._ms_split_n += 1
+            fresh = rank_split_seq is None or rank_split_seq != self._last_split_seq
+            if fresh:
+                if rank_split_seq is not None:
+                    self._last_split_seq = int(rank_split_seq)
+                self._ms_compute_sum += float(rank_compute_ms)
+                self._ms_wait_sum += float(rank_wait_ms)
+                self._ms_split_n += 1
 
         # Rule 2: the cadence gate is the REPLICATED round counter. Every rank
         # passes or skips this line in the same round, so the collective below
@@ -547,9 +566,7 @@ class RegimeObserver:
         mean_compute = (
             (self._ms_compute_sum / self._ms_split_n) if self._ms_split_n else None
         )
-        mean_wait = (
-            (self._ms_wait_sum / self._ms_split_n) if self._ms_split_n else None
-        )
+        mean_wait = (self._ms_wait_sum / self._ms_split_n) if self._ms_split_n else None
         payload = pack_ms_sample(mean_compute, mean_wait)
         if self._tp_size > 1:
             if self._collective_min is None:
@@ -901,27 +918,61 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         commit_fn = build_regime_actuator(scheduler, table_plan).apply
         dwell = _dwell_for(table_plan)
 
-    # #363 INTRA-PHASE AXIS, off unless --regime-stage-clock. Built only in
-    # act mode: in observe there is nothing for an admission gate to admit,
-    # and a clock whose verdict cannot move anything would be an expensive
-    # observe under a misleading name.
+    # #363 INTRA-PHASE AXIS, off unless --regime-stage-clock.
+    #
+    # THE CLOCK IS A MEASUREMENT INSTRUMENT; THE ADMISSION GATE IS AN
+    # ACTUATOR. They used to be built together, act-only, on the reasoning
+    # that "a clock whose verdict cannot move anything would be an expensive
+    # observe under a misleading name". That is correct about the GATE and
+    # wrong about the CLOCK, and the difference was a bootstrap deadlock:
+    #
+    #   stage_measure_pass reads OBSERVE traces to build the measurement
+    #   canon -> the canon is what makes a stage a flip target -> a flip
+    #   target is what act mode needs -> but the ms_decision rows the pass
+    #   reads are written only when the clock is wired -> and the clock was
+    #   wired only in act mode.
+    #
+    # So the canon could not be bootstrapped on ANY rig, and #363's defect 7
+    # fix -- `_intra_phase_decide`'s "measurement only, no stage table"
+    # branch, written for exactly this case -- hung off a clock that observe
+    # never constructed and could not execute. MEASURED on the R14 window's
+    # own B3 trace: 82 549 verdict rows, `ms_decision` null on every one,
+    # `"stage_clock": null` in all three ranks' summary lines, on a boot that
+    # passed --regime-stage-clock.
+    #
+    # The clock now follows the FLAG in every mode. The admission gate stays
+    # act-only: it prices a flip against the corridor, observe has no flip to
+    # price, and it is a step toward acting rather than a way of seeing. So
+    # observe gains an instrument and still holds no actuator path -- the
+    # property the no-actuator test pins is untouched.
     stage_clock = None
     admission = None
-    if mode == MODE_ACT and bool(getattr(server_args, "regime_stage_clock", False)):
-        from sglang.srt.managers.regime_admission import build_corridor_admission
+    if bool(getattr(server_args, "regime_stage_clock", False)):
         from sglang.srt.managers.regime_ms_clock import MsStageDecider
 
         stage_clock = MsStageDecider()
-        admission = build_corridor_admission(
-            scheduler,
-            stage_transients=getattr(scheduler, "regime_stage_transients", None),
-        )
-        logger.warning(
-            "%s INTRA-PHASE AXIS ARMED (#363): ms/round selects the stage and "
-            "every flip is priced against the corridor. A stage with no "
-            "transient census is REFUSED, not priced at zero.",
-            LOG_PREFIX,
-        )
+        if mode == MODE_ACT:
+            from sglang.srt.managers.regime_admission import build_corridor_admission
+
+            admission = build_corridor_admission(
+                scheduler,
+                stage_transients=getattr(scheduler, "regime_stage_transients", None),
+            )
+            logger.warning(
+                "%s INTRA-PHASE AXIS ARMED (#363): ms/round selects the stage "
+                "and every flip is priced against the corridor. A stage with "
+                "no transient census is REFUSED, not priced at zero.",
+                LOG_PREFIX,
+            )
+        else:
+            logger.info(
+                "%s intra-phase axis MEASURING (#363): the ms/round clock is "
+                "wired in %s mode and writes ms_decision rows, but holds no "
+                "admission gate and no actuator. These rows are what "
+                "stage_measure_pass turns into the canon.",
+                LOG_PREFIX,
+                mode,
+            )
 
     observer = RegimeObserver(
         consensus_interval=interval,
@@ -1215,9 +1266,7 @@ def _shares(tokens):
 
 def _shares_str(tokens) -> str:
     sh = _shares(tokens)
-    body = (
-        ", ".join(f"{s * 100:.1f}%" for s in sh) if sh else "(no positive total)"
-    )
+    body = ", ".join(f"{s * 100:.1f}%" for s in sh) if sh else "(no positive total)"
     return f"{[int(t) for t in tokens]} tokens = {body}"
 
 
@@ -1369,11 +1418,16 @@ def _planner_solve_fn(scheduler):
                 list(kv_vector),
                 dev * 100.0,
             )
-        weights = ((best.get("key") or {}).get("rank_mlp_ratio")) or None
+        # Canonicalised into the SAME space as the booted stage's vector
+        # (#363 defect 5). The solver already reduces this one -- it is
+        # `key_solver._ratio_of(units)` -- so this is a no-op today and is
+        # here so that both sides of the comparison are reduced at the point
+        # of construction rather than by a coincidence upstream.
+        weights = _canonical_ratio(((best.get("key") or {}).get("rank_mlp_ratio")))
         return Stage(
             name=f"planner:{goal}",
             regime=_regime_for_goal(goal),
-            weight_vector=tuple(int(x) for x in weights) if weights else None,
+            weight_vector=weights,
             kv_token_vector=tuple(int(x) for x in kv_vector),
             vram_budget_mib=tuple(budgets),
             max_total_num_tokens=int(pool),
@@ -1400,6 +1454,78 @@ def _regime_for_goal(goal: str) -> str:
     raise PlannerFeedUnavailable(f"no regime maps to planner goal {goal!r}")
 
 
+def _canonical_ratio(vector) -> Optional[Tuple[int, ...]]:
+    """A weight vector reduced to the smallest integers describing it.
+
+    Two vectors that differ by a common factor describe ONE partition:
+    ``[60, 34, 42]`` and ``[30, 17, 21]`` split the same weights the same
+    way. The planner already reports its candidates reduced -- a candidate's
+    vector is ``key_solver._ratio_of(units)``, a gcd-reduced ratio of MLP
+    units -- while the INSTALLED plan is a raw ratio, in this fork's case
+    often the per-rank VRAM budgets themselves. Comparing the two spaces
+    directly is a false mismatch, which is what defect 5 was made of.
+
+    THE SPACE THIS DOES NOT REACH, stated because the difference decides a
+    flip. The exact comparison is in UNITS: the runtime derives per-rank MLP
+    unit counts from a ratio through ``partition_units``, a largest-remainder
+    quantisation, and that map is many-to-one -- two ratios that reduce
+    differently can still land on the same units. Reducing is therefore
+    STRICTER than the true test: it can refuse a stage that is in fact
+    reachable, and it can never admit one that is not. That is the safe
+    direction, and it is deliberate. The exact test needs the model's unit
+    count, which needs the checkpoint config that a built cost model owns and
+    this function does not have; making the stage table depend on one to
+    answer a reachability question would be a much larger coupling than the
+    residual it removes.
+    """
+    if not vector:
+        return None
+    vals = [int(x) for x in vector]
+    if any(v < 0 for v in vals):
+        return None
+    g = 0
+    for v in vals:
+        g = math.gcd(g, v)
+    if g > 1:
+        vals = [v // g for v in vals]
+    return tuple(vals)
+
+
+def _resolved_weight_vector(server_args) -> Optional[Tuple[int, ...]]:
+    """The weight partition this server is RUNNING, canonicalised.
+
+    #363 defect 5. This used to read ``server_args.rank_mlp_ratio`` -- the
+    FLAG. Under ``--rank-tp-ratio auto-performance`` that flag is None while
+    the server runs a concrete resolved partition, so the booted stage
+    reported ``weights=None``; every planner candidate carries a concrete
+    vector; and ``reachability`` checks weights FIRST -- so on any auto-ratio
+    boot every candidate came back REACH_NO_WEIGHT_MOVER whatever its KV
+    vector, and the stage table could never offer a flip target.
+
+    It is the same class as defects 3 and 6 in this ticket: a declared INPUT
+    read where the resolved runtime STATE is what matters. The resolved value
+    is the one the model layers actually partition on --
+    ``get_tp_partition_ratios("mlp")``, which answers with the ``mlp`` family
+    vector when one was installed and falls back to the base plan otherwise,
+    exactly as the layers themselves resolve it. The flag is kept only as the
+    last fallback, for a caller holding server_args before the plan is
+    installed.
+    """
+    resolved = None
+    try:
+        from sglang.srt.distributed.utils import get_tp_partition_ratios
+
+        resolved = get_tp_partition_ratios("mlp")
+    except Exception:
+        # No installed plan (a desk caller, or a process that never built the
+        # distributed state). Fall through to the flag rather than refuse: a
+        # declared vector is still better than no vector.
+        resolved = None
+    if not resolved:
+        resolved = getattr(server_args, "rank_mlp_ratio", None)
+    return _canonical_ratio(resolved)
+
+
 def _booted_stage(scheduler):
     """The configuration this server is actually running, as a Stage."""
     from sglang.srt.managers.regime_classifier import REGIME_MIXED, Stage
@@ -1418,13 +1544,13 @@ def _booted_stage(scheduler):
     capacity = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
     if capacity <= 0:
         return None
-    weights = getattr(server_args, "rank_mlp_ratio", None)
+    weights = _resolved_weight_vector(server_args)
     return Stage(
         name="booted",
         # The booted stage serves whatever regime the server is in; it is the
         # reference, not a regime's optimum, so it claims the resting one.
         regime=REGIME_MIXED,
-        weight_vector=tuple(int(x) for x in weights) if weights else None,
+        weight_vector=weights,
         kv_token_vector=kv_vector,
         vram_budget_mib=budgets,
         max_total_num_tokens=capacity,
@@ -1537,7 +1663,7 @@ def rank_forward_ms_from(scheduler) -> Optional[float]:
 
 
 def rank_split_ms_from(scheduler):
-    """This rank's last (compute_ms, wait_ms), or ``(None, None)``.
+    """This rank's last (compute_ms, wait_ms, sample_seq).
 
     The #363 intra-phase axis needs the two terms separately -- the stage
     axes move the WAIT term and not the compute term, so a total would hide
@@ -1545,16 +1671,28 @@ def rank_split_ms_from(scheduler):
     rule as ``rank_forward_ms_from``: a graph-covered forward reports NOTHING
     rather than a fast zero, and the absence travels into the packed payload
     as a sentinel.
+
+    THE THIRD TERM IS THE SAMPLE'S IDENTITY, and it is what makes the mean a
+    measurement (#363 defect 8b). ``RankPrefillLog`` carries its last
+    measurable reading forward until another one flushes, so this accessor
+    answers many consecutive boundaries with ONE retired forward. The
+    sequence advances only when a new reading lands, so a consumer can
+    accumulate a sample once instead of once per boundary. ``(None, None,
+    seq)`` still reports the sequence: a reader that sees no split and an
+    unchanged sequence knows nothing was missed.
     """
     reporter = getattr(scheduler, "metrics_reporter", None)
     log = getattr(reporter, "rank_prefill_log", None) if reporter else None
-    if log is None or not getattr(log, "last_split_known", False):
-        return (None, None)
+    if log is None:
+        return (None, None, 0)
+    seq = int(getattr(log, "last_split_seq", 0) or 0)
+    if not getattr(log, "last_split_known", False):
+        return (None, None, seq)
     gpu_ms = getattr(log, "last_gpu_ms", None)
     wait_ms = getattr(log, "last_wait_ms", None)
     if gpu_ms is None or wait_ms is None:
-        return (None, None)
-    return (max(0.0, float(gpu_ms) - float(wait_ms)), float(wait_ms))
+        return (None, None, seq)
+    return (max(0.0, float(gpu_ms) - float(wait_ms)), float(wait_ms), seq)
 
 
 __all__ = [

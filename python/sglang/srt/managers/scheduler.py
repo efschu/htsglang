@@ -4960,14 +4960,32 @@ class Scheduler(
                     # #363 intra-phase axis. The SAME retired forward, split
                     # into its two terms: the stage axes move the wait term
                     # and not the compute term, so a total would hide the only
-                    # part of the round they can be credited against. Both are
-                    # None on a graph-covered forward, and the observer's
-                    # packed sentinel carries that absence through the group
-                    # reduction rather than letting a blind rank read as fast.
+                    # part of the round they can be credited against.
+                    #
+                    # Both are None for a forward whose collectives ran inside
+                    # a captured graph, and the observer's packed sentinel
+                    # carries that absence through the group reduction rather
+                    # than letting a blind rank read as fast. Read that
+                    # narrowly: it is a statement about the COLLECTIVES, not
+                    # about every forward on a rig that captures graphs. This
+                    # comment previously said "None on a graph-covered
+                    # forward", and the R14 window read it as "every forward
+                    # on this rig", which sent a whole window looking for a
+                    # device-timing fix. The rig it was written on captures
+                    # DECODE graphs and runs prefill eager, so the split was
+                    # being measured on ~2 574 forwards in the very boot the
+                    # window concluded had none. What was actually missing
+                    # was the CLOCK (build_regime_observer, defect 8a).
                     # Accumulated unconditionally and read only by the
                     # flag-gated clock, so an off boot pays two float adds.
                     rank_compute_ms=rank_split[0],
                     rank_wait_ms=rank_split[1],
+                    # The sample's identity, not a second measurement (#363
+                    # defect 8b). The accessor carries its last reading
+                    # forward, so without this the observer counts one
+                    # retired forward once per boundary and calls the result
+                    # a mean.
+                    rank_split_seq=rank_split[2],
                 )
 
         # #631 PARKING: an ARMED flip withholds all new work -- no prefill

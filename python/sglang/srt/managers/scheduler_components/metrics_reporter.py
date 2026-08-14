@@ -152,6 +152,17 @@ class RankPrefillLog:
         self.last_gpu_ms: Optional[float] = None
         self.last_wait_ms: Optional[float] = None
         self.last_split_known: bool = False
+        # #363 defect 8b. The fields above CARRY FORWARD: they keep the last
+        # measurable forward's numbers until another one flushes, which is
+        # right for a log line ("what was last seen") and wrong for a mean.
+        # A consumer averaging them per boundary counts one retired forward
+        # once per boundary -- measured on the R14 window: 82 341 of 82 549
+        # boundaries carried a number, against 2 574 prefill forwards
+        # actually measured in that boot, i.e. a mean over ~30 copies of each
+        # sample. The sequence lets a consumer tell a NEW sample from the
+        # same one seen again; it is monotone and never reset, so a wrap or a
+        # missed read shows up as a gap rather than as a repeat.
+        self.last_split_seq: int = 0
 
     @property
     def has_pending(self) -> bool:
@@ -258,6 +269,12 @@ class RankPrefillLog:
         self.last_gpu_ms = gpu_s * 1000.0
         self.last_wait_ms = (wait_s * 1000.0) if split_known else None
         self.last_split_known = split_known
+        if split_known:
+            # Advanced only for a reading a consumer may legitimately count.
+            # A graph-covered flush leaves the sequence where it was, so the
+            # absence reads as "no new sample" rather than as a new one whose
+            # value happens to repeat.
+            self.last_split_seq += 1
 
 
 @dataclass(kw_only=True)
