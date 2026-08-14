@@ -49,17 +49,33 @@ that fills it from the controller's own traces
 those measurements on metal.** Until they exist the act leg has nowhere to go
 and must not be run — that is §5's STOP.
 
-**Blocker two is NOT closed and this window may not close it.** Gate 3 blocks
-on `spread_veto_pct = 25.0`, which peaked at 0.407 % on a balanced rig and
-**does not exist in the runtime at all** (`grep -rn 'spread_veto_pct' python/`
-returns nothing; the only act-mode interlock on that signal vetoes on
-`rank_ms_spread_pct is None`, never on a magnitude). So gate 3 cannot pass and
-`--regime-controller act` is refused at parse time. The verdict's item 2 —
-*decide what that constant is for: wire it, or take it out of gate 3's blocking
-set* — is a decision about the GATE and is owed by a shift with that mandate.
-**This runsheet does not re-tune it.** §5 uses the bootstrap the previous
-runsheet already sanctions, under the same four rules, and the window log
-records that the act leg ran under one.
+**Blocker two is NARROWER than this section used to say (R13 + ACT window).**
+It used to read: gate 3 blocks on `spread_veto_pct = 25.0`, a constant no
+runtime code reads. R13 acted on that — a `Constant` in
+`scripts/regime_gates/bands.py` now carries `runtime_site`, and a bad verdict
+blocks only if that symbol resolves, so `spread_veto_pct` and a second orphan
+(`PRESTAGE_SINGLE_PROMPT_TOKENS`) are **retired structurally**, still judged
+and still reported but no longer blocking.
+
+Run live on the ACT window's own arms, gate 3's blocking list is now **exactly
+one entry**:
+
+| constant | verdict | detail |
+|---|---|---|
+| `enter_prefill` 0.35 | **CLEARS** | rate 0.405 vs 2x0.0134 — 15x |
+| `enter_decode` 0.90 | **CLEARS** | rate 0.504 vs 2x0.035 — 7x |
+| `kv_ascend_mark` 0.85 | **UNREACHED** | occupancy peaked at **0.841765** |
+
+`kv_ascend_mark` is wired, is real, and is **1.0 % from reachable** —
+reproduced to four decimals on both arms (B1 0.841765, B2 0.841765). For the
+first time gate 3 is within reach of a WORKLOAD rather than structurally
+unreachable, so **record `kv_ascend_mark`'s peak every window**: the cheapest
+move on this ticket is a marginally heavier burst, not a re-tuned constant
+(§12 forbids it and `bands.py` assigns the constant to #287).
+
+Gate 3 therefore still does not pass, so `--regime-controller act` still runs
+under the bootstrap §5 rule 2 sanctions, under the same four rules, and the
+window log records that the act leg ran under one.
 
 ---
 
@@ -167,7 +183,7 @@ export SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 export SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
 export SGLANG_TRANSIENT_CENSUS=1 SGLANG_RESIDENCY_CENSUS_DIR=$OUT/census
-export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act/stage_measurements.json
+export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act-r2/stage_measurements.json
 
 MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
 COMMON="--model-path $MODEL --tp-size 3 --rank-gpu-id 0,1,2
@@ -399,7 +415,7 @@ mean under-charges exactly the expensive one.
 
 ```bash
 cd /spinning/wt-merge-r14 && export PYTHONPATH=/spinning/wt-merge-r14/python
-export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act/stage_measurements.json
+export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act-r2/stage_measurements.json
 
 $PY -m sglang.srt.planner.stage_measure_pass \
   --stage solved-enc --regime prefill_heavy --reference booted \
