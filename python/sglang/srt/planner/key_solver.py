@@ -1651,6 +1651,15 @@ def _predict_all(
         ),
         unit="tokens",
     )
+    # #363: the PER-RANK split, not just its total. `capacity()` computes it
+    # (cap["p"]) and every caller until now read only cells["maxkv"]["value"],
+    # the sum. The regime feed needs the split itself -- it is the #297
+    # reshard target -- and refused rather than derive one from the total,
+    # because a split invented from a sum looks exactly as authoritative as a
+    # solved one. This surfaces the solver's OWN numbers, unmodified.
+    cells["maxkv"]["per_rank_tokens"] = (
+        [int(round(x)) for x in cap["p"]] if cap["feasible"] else None
+    )
 
     sessions_val: Optional[float] = None
     if cap["feasible"] and target_context > 0:
@@ -1827,6 +1836,17 @@ class Candidate:
             "predictions": self.predictions,
             "tradeoff": self.tradeoff,
             "remeasure": self.remeasure,
+            # #363: the per-rank KV split this key funds, in ABSOLUTE tokens.
+            # Lifted to the top level because it is a property of the
+            # candidate, not of one goal's prediction cell, and because the
+            # regime feed reads candidates rather than cells. Absolute on
+            # purpose: converting it to a reshard RATIO is a decision about
+            # which declared vector the operator backed with pool rows, and
+            # that decision belongs to the consumer that knows the declared
+            # set -- not to the solver.
+            "per_rank_kv_tokens": (self.predictions.get("maxkv") or {}).get(
+                "per_rank_tokens"
+            ),
         }
 
 

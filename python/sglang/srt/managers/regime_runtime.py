@@ -1163,6 +1163,59 @@ class PlannerFeedUnavailable(Exception):
     """
 
 
+#: How far a declared reshard vector's proportions may sit from the solver's
+#: own split and still be called the same layout, as a share of the pool. Two
+#: percentage points: below the granularity a small integer vector can even
+#: express on three ranks (1/23 is 4.3 %), so a tighter value would refuse
+#: every vector an operator could reasonably declare, and a looser one would
+#: start calling a visibly different split "the solver's answer".
+_VECTOR_MATCH_TOLERANCE = 0.02
+
+
+def _shares(tokens):
+    total = float(sum(float(t) for t in tokens))
+    if total <= 0:
+        return None
+    return [float(t) / total for t in tokens]
+
+
+def _shares_str(tokens) -> str:
+    sh = _shares(tokens)
+    body = (
+        ", ".join(f"{s * 100:.1f}%" for s in sh) if sh else "(no positive total)"
+    )
+    return f"{[int(t) for t in tokens]} tokens = {body}"
+
+
+def _match_declared_vector(tokens, declared):
+    """The DECLARED vector whose proportions match the solver's split.
+
+    Returns ``(vector|None, deviation, ranked_descriptions)``. Nothing is
+    derived: the answer is always one of ``declared`` or ``None``. Deviation
+    is the largest per-rank difference in pool SHARE, which is the quantity
+    that matters -- two vectors that differ only by a common factor describe
+    the same layout and must compare equal.
+    """
+    want = _shares(tokens)
+    if want is None:
+        return None, 1.0, []
+    scored = []
+    for vec in declared:
+        got = _shares(vec)
+        if got is None or len(got) != len(want):
+            continue
+        dev = max(abs(a - b) for a, b in zip(want, got))
+        scored.append((dev, tuple(int(x) for x in vec)))
+    if not scored:
+        return None, 1.0, []
+    scored.sort()
+    ranked = [f"{list(v)} off by {d * 100:.1f}%" for d, v in scored]
+    best_dev, best_vec = scored[0]
+    if best_dev > _VECTOR_MATCH_TOLERANCE:
+        return None, best_dev, ranked
+    return best_vec, best_dev, ranked
+
+
 def _planner_solve_fn(scheduler):
     """Bind the planner feed (#578). Returns ``goal -> Optional[Stage]``.
 
@@ -1231,20 +1284,56 @@ def _planner_solve_fn(scheduler):
             )
         kv_vector = best.get("kv_token_vector") or best.get("per_rank_tokens")
         if not kv_vector:
-            # NOT invented. Stage.kv_token_vector is the #297 reshard target
-            # and must be the solver's own per-rank split; the solver computes
-            # it (key_solver.capacity() -> cap["p"]) but does not return it
-            # through this API. Splitting the total here -- evenly, or by
-            # budget share -- would be a fabricated reshard target that looks
-            # authoritative. Surfacing cap["p"] through key_solver_payload is
-            # the next concrete step and belongs to #584's slice with the
-            # measurement pass.
-            raise PlannerFeedUnavailable(
-                "the solver API returns no per-rank KV vector "
-                "(Stage.kv_token_vector). key_solver.capacity() computes it "
-                "as cap['p'] but key_solver_payload does not surface it; "
-                "exposing it is the remaining wiring step. A split derived "
-                "here would be a fabricated reshard target"
+            # #363: the solver's own per-rank split, in ABSOLUTE tokens.
+            # key_solver.capacity() computes it as cap["p"]; it is surfaced
+            # through key_solver_payload as `per_rank_kv_tokens`.
+            #
+            # Stage.kv_token_vector lives in the #297 reshard RATIO space --
+            # the same space as --kv-reshard-vectors and set_cp_token_ratios
+            # -- so the absolute split has to be resolved into it. Deriving a
+            # small ratio here by rounding would be the fabricated target the
+            # old refusal warned about: a vector nothing has backed with pool
+            # rows, that nonetheless reads as the solver's answer.
+            #
+            # So it is RESOLVED, never derived: the solver's proportions are
+            # matched against the vectors the OPERATOR declared, and only a
+            # declared vector can be the answer. When none is close enough the
+            # feed refuses and NAMES the proportions it wanted alongside every
+            # declared vector's deviation, which tells the operator exactly
+            # what to put in --kv-reshard-vectors.
+            tokens = best.get("per_rank_kv_tokens")
+            if not tokens:
+                raise PlannerFeedUnavailable(
+                    "the solver API returns no per-rank KV split "
+                    "(per_rank_kv_tokens); key_solver.capacity() computes it "
+                    "as cap['p'] and this candidate did not carry it -- most "
+                    "likely the key is infeasible, so no rank has a pool"
+                )
+            declared = _declared_vectors(scheduler)
+            if not declared:
+                raise PlannerFeedUnavailable(
+                    f"the solver wants the per-rank KV split "
+                    f"{_shares_str(tokens)}, but no reshard vectors are "
+                    f"declared: pass --kv-reshard-vectors so a target exists "
+                    f"that the pool actually backs"
+                )
+            kv_vector, dev, ranked = _match_declared_vector(tokens, declared)
+            if kv_vector is None:
+                raise PlannerFeedUnavailable(
+                    f"the solver wants the per-rank KV split "
+                    f"{_shares_str(tokens)}, and no declared vector is within "
+                    f"{_VECTOR_MATCH_TOLERANCE:.0%} of it "
+                    f"({'; '.join(ranked)}). Declaring the vector this names "
+                    f"in --kv-reshard-vectors makes it reachable; deriving "
+                    f"one here would be a reshard target nothing has backed"
+                )
+            logger.info(
+                "%s planner feed: solver split %s resolved to declared "
+                "vector %s (max share deviation %.2f%%)",
+                LOG_PREFIX,
+                _shares_str(tokens),
+                list(kv_vector),
+                dev * 100.0,
             )
         weights = ((best.get("key") or {}).get("rank_mlp_ratio")) or None
         return Stage(
