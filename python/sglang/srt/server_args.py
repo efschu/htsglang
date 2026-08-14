@@ -15345,9 +15345,32 @@ class ServerArgs:
         documented torch-vs-NVML device-order trap. Caught here by executing
         this path against a real census rather than by reading it.
         """
-        from sglang.srt.planner.card_library import CardLibrary
+        # #584: the library must come from the MEASUREMENT PASS, not from a
+        # fresh seed-only CardLibrary(). This line used to read
+        # ``library = CardLibrary()``, and every one of the 16 SEED_CARDS
+        # carries gemm_tflops=None / membw_gbs=None by design -- they are
+        # curated nameplate entries. So the refusal below fired for every card
+        # on every rig on every boot, and had no reachable remedy, because
+        # CardLibrary.save/load require an explicit path and nothing in the
+        # tree ever computed one. See planner/card_rate_pass.py.
+        from sglang.srt.planner.card_rate_pass import (
+            card_library_path,
+            load_measured_library,
+        )
 
-        library = CardLibrary()
+        library = load_measured_library()
+        if library is None:
+            raise ValueError(
+                f"--pp-solve-cut: no measured card-rate library at "
+                f"{card_library_path()!r}, so no stage can be priced. The "
+                f"seed catalog carries CAPACITY only -- not one of its "
+                f"entries has a measured gemm/bandwidth rate -- so falling "
+                f"back to it would price every stage from an absent number. "
+                f"Run the measurement pass on this rig: "
+                f"`python -m sglang.srt.planner.card_rate_pass --run`, or set "
+                f"SGLANG_CARD_LIBRARY to an artifact measured on cards with "
+                f"these UUIDs."
+            )
         out = []
         for stage in range(self.pp_size):
             name = gpu_names[stage] if stage < len(gpu_names) else None
@@ -15363,14 +15386,19 @@ class ServerArgs:
                 raise ValueError(
                     f"--pp-solve-cut: no measured profile for {name!r} "
                     f"(stage {stage}). A missing rate must be refused, never "
-                    f"defaulted -- see planner/cost_model.AbsentRate."
+                    f"defaulted -- see planner/cost_model.AbsentRate. Run "
+                    f"`python -m sglang.srt.planner.card_rate_pass --run` on "
+                    f"the rig that carries this card."
                 )
             spec = library.get(name)
             if not spec.gemm_tflops or not spec.membw_gbs:
                 raise ValueError(
                     f"--pp-solve-cut: the profile for {name!r} carries no "
                     f"measured gemm/bandwidth rate, so stage {stage} cannot "
-                    f"be priced."
+                    f"be priced. The measurement pass wrote a library that "
+                    f"does not cover this card -- it prices only cards the "
+                    f"#213 probe actually measured, and never fills a rate "
+                    f"from a nameplate peak."
                 )
             out.append((name, float(spec.gemm_tflops), float(spec.membw_gbs)))
         return out

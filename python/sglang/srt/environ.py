@@ -657,6 +657,13 @@ class Envs:
     # A later boot points --pp-solve-cut at it to solve the layer cut against
     # these measured bytes. Requires SGLANG_RESIDENCY_CENSUS.
     SGLANG_RESIDENCY_CENSUS_DIR = EnvStr(None)
+    # Override the location of the MEASURED card-rate library (#584) that
+    # --pp-solve-cut prices its stages from. Unset, the pass and the solver
+    # agree on ~/.cache/sglang/card_library.json, beside the #213 card probe
+    # the rates are projected from. Set it to point a boot at an artifact
+    # measured elsewhere -- the rates are keyed by card UUID, so an artifact
+    # from another rig is visibly not this rig's.
+    SGLANG_CARD_LIBRARY = EnvStr(None)
     # Record, per rank, the driver-visible free-memory MINIMUM reached in each
     # load state the rank actually serves (planner/transient_census.py), and
     # write it beside the residency census. The #485 cut gate funds the WORST

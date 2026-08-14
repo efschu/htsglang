@@ -223,10 +223,33 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
                 gpu_name = props.name
             except Exception:
                 gpu_name = None
+            # #584: the NAME is not an identity. This rig carries two RTX
+            # 3080s that props.name cannot tell apart, so a census keyed only
+            # by name cannot say which physical card a stage ran on -- and the
+            # measured rates the cut gate prices from are per CARD, not per
+            # model. The UUID is recorded alongside; readers that only know
+            # gpu_name keep working unchanged.
+            gpu_uuid = None
+            try:
+                gpu_uuid = str(getattr(props, "uuid", "")) or None
+            except Exception:
+                gpu_uuid = None
+            if not gpu_uuid:
+                try:
+                    from sglang.srt.registry.nvml import identity_map
+
+                    cards = identity_map().cards
+                    if len(cards) == 1:
+                        # CUDA_VISIBLE_DEVICES is pinned to one card per rank
+                        # on this rig, so a single visible card IS this rank's.
+                        gpu_uuid = cards[0].uuid
+                except Exception:
+                    gpu_uuid = None
             payload = {
                 "pp_rank": pp_rank,
                 "tag": tag,
                 "gpu_name": gpu_name,
+                "gpu_uuid": gpu_uuid,
                 "n_attn_layers": groups.get("n_layers_attention", 0),
                 "n_linear_layers": groups.get("n_layers_linear", 0),
                 "params_mib": {
