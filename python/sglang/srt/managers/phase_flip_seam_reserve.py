@@ -50,10 +50,10 @@ That argument holds for the DRAFTER and fails for the ARENA TAIL:
 ``stacks.refill`` is a PRE-cutover function, so its commit lands while the
 wave state is still outstanding, while rung 2's restore runs inside
 ``_cutover`` after the waves' buffers are dead. The stage walk of one
-``tp_to_pp`` cutover settles it -- entry 2464 MiB free, the refill reached at
-1250 with 1214 MiB still outstanding, and the refill's own 238 MiB taking the
-card to 1012, twelve MiB under the corridor law that ``max(1214, 238)``
-called 226 MiB clear.
+``tp_to_pp`` cutover settles it -- entry 2464 MiB free, a 1386 MiB wave peak,
+the refill reached at 1250 with 1214 MiB still outstanding, and the refill's
+own 238 MiB taking the card to 1012: twelve MiB under a corridor law that
+``max(1386, 238)`` called 54 MiB clear.
 
 Setting ``A = 0`` reproduces the previous arithmetic byte for byte, which is
 exactly what a record written before the split reads back as.
