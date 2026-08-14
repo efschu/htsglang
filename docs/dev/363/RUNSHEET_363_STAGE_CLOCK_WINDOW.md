@@ -79,6 +79,23 @@ This window is **not** first in the queue. In order:
 | P4 | **Stage table with ≥1 MEASURED non-reference stage** (ticket P1). A planner-only table runs clean and proves nothing. If every non-reference stage is unmeasured, **STOP** — that is #584's measurement pass, not this ticket. | The axis never proposes an UNMEASURED stage | GPU shift |
 | P5 | **Transient census** per stage, under **both** load states the window visits (deep-prefill and decode-heavy): `SGLANG_TRANSIENT_CENSUS=1` (`environ.py:667`), `SGLANG_RESIDENCY_CENSUS_DIR=<dir>` (`:659`). A partial set is refused loudly by `pp_cut_calibration` and that refusal is correct. | Without it every flip is REFUSED, not priced at zero | GPU shift |
 
+### The gate state, MEASURED on this box (2026-08-14, CPU, read-only)
+
+Not inferred from the runsheets — the preflight was pointed at the real
+evidence files on disk:
+
+| Evidence file | Verdict |
+|---|---|
+| `/spinning/gpu-battery-results/2026-08-01_363_gates_388/regime-gate-evidence.json` | **CLOSED** — missing `f3_bands_measured`, `f4_card_comparison` |
+| `/spinning/gpu-battery-results/2026-08-01_363_gates_rerun/regime-gate-evidence.json` | **CLOSED** — missing `f3_bands_measured`, `f4_card_comparison` |
+
+Both carry gates 1+2 (`desyncs_zero`, `f2_live_replay`) with sources. **No
+evidence file on this box opens the gate today**, and `/spinning/evidence-363/`
+does not exist — the path used in §2's example is a placeholder the shift must
+point at the real file. So `--regime-controller act` would be refused right
+now, on either file, exactly as F1 predicts. **Two items outstanding, and they
+are P1 and P3 below.**
+
 **Only when P1–P5 are done does this window have anything to measure.**
 
 ---
