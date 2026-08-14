@@ -226,6 +226,15 @@ def read_arm(
                 # (#363 window F4). Such an arm cannot be measured here, and
                 # the refusal below says so by name rather than by an empty
                 # series.
+                #
+                # #363, R14: this used to be the ONLY way to reach an empty
+                # split, and it was not the way that happened. A boot WITH the
+                # clock also wrote `ms_decision=None` on every row whenever the
+                # stage table was absent -- which is every rig before its first
+                # measurement, so the first measurement could never be taken.
+                # Fixed at the source (regime_runtime._intra_phase_decide now
+                # records the split with `target=None` when there is no table).
+                # A row reaching here therefore really does mean "no clock".
                 continue
             if regime is not None and row.get("regime") != regime:
                 continue

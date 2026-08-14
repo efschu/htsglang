@@ -512,15 +512,35 @@ class RegimeObserver:
         the rig measured.
         """
         from sglang.srt.managers.regime_ms_clock import (
+            MsDecision,
             pack_ms_sample,
             unpack_ms_sample,
         )
 
-        if self._table is None or self._current_stage is None:
-            return None
-        current = self._table[self._current_stage]
+        # #363 THE BOOTSTRAP DEADLOCK. This used to `return None` whenever the
+        # boot stage table was absent, which also suppressed the ms/round
+        # SPLIT -- and the split is a property of the BOUNDARY, not of a
+        # decision. The consequence was circular and cost three windows:
+        #
+        #   no stage table -> no ms_decision -> stage_measure_pass refuses
+        #   ("no boundary carries an ms/round split") -> no measurement ->
+        #   StageTable refuses the stage for carrying no measurement (#578)
+        #   -> no stage table.
+        #
+        # The pass's own comment reads the empty split as "a boot without
+        # --regime-stage-clock", which is one way to get there and not the one
+        # that actually happens on this rig. So the FIRST measurement could
+        # never be taken on a rig whose table starts empty -- i.e. every rig.
+        #
+        # The split is therefore measured and recorded whenever the clock is
+        # wired. Only the DECISION needs a table: with none, the record
+        # carries `target=None` and the measurement fields, `wants_flip` is
+        # False, and act mode is unaffected (`_act_interlocks` refuses on the
+        # missing table independently, as it should).
+        have_table = self._table is not None and self._current_stage is not None
+        current = self._table[self._current_stage] if have_table else None
         if current is None:
-            return None
+            have_table = False
 
         # The one collective this axis adds. A blind rank packs the sentinel,
         # so the group answers "no split" rather than a partial mean.
@@ -543,6 +563,20 @@ class RegimeObserver:
             return None
 
         self._stage_clock.observe_round(self._round, group_split[0], group_split[1])
+        if not have_table:
+            # Measurement only. Everything the measurement pass needs is here;
+            # nothing that implies a choice is.
+            return MsDecision(
+                target=None,
+                reason=(
+                    "measurement only: no boot stage table, so there is "
+                    "nothing to decide between -- the ms/round split is "
+                    "recorded anyway so the first stage measurement can be "
+                    "taken (#363 bootstrap)"
+                ),
+                mean_total_ms=self._stage_clock.window.mean_total_ms,
+                mean_wait_share=self._stage_clock.window.mean_wait_share,
+            )
         # `.stages`, not iteration: StageTable is keyed BY NAME, so iterating
         # it falls back to the sequence protocol and asks for index 0.
         candidates = [s for s in self._table.stages if s.name != current.name]
