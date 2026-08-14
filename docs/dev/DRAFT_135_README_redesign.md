@@ -108,27 +108,90 @@ impressiveness order:
 | Uneven KV ownership | Let the KV split differ from the weight split, so the cache is not pinned to the smallest rank | `--rank-kv-ratio` |
 | Per-family ratios | Rebalance dense-MLP and MoE weight families separately, freeing bytes for KV | `--rank-mlp-ratio`, `--rank-moe-ratio` |
 
-> **To be completed from `FEATURES_VS_UPSTREAM.md`** — the measured numbers for
-> each row, quoted verbatim with units, and any row this table is missing. A
-> feature inventory pass over that file is the input; rows without a measured
-> number must say so rather than carry an adjective.
+**The five rows above are a README-sized selection, not the inventory.**
+`FEATURES_VS_UPSTREAM.md` documents **seventeen** Block 1 features. The full
+list, in the source document's own order, is §3.1 below.
+
+### 3.1 The ordering is inherited, not invented
+
+The single most useful thing found while drafting this: **`FEATURES_VS_UPSTREAM.md`
+already encodes the required order**, so the redesign must adopt it rather than
+compose a new one.
+
+* Its **Block 1 — heterogeneous-GPU enablers** is exactly the hetero-first
+  group, defined as *"without these, three genuinely different GPUs cannot be
+  combined into one usable TP group at all, or cannot be combined correctly."*
+* Its **Block 2 — general fork deltas** is stated as *"ordered by how much a rig
+  of identical GPUs (1/2/4/8 cards) gains from it"* — which **is** descending
+  normal-rig usefulness, already applied.
+
+So the standing documentation order is satisfied by following the source
+document's sequence. Any README ordering that departs from it is a claim that
+the source doc is wrong and needs to be argued, not assumed.
+
+**Block 1, in source order** (§ numbers are the doc's feature ids):
+
+3 rank-to-GPU mapping and co-location · 1 asymmetric tensor parallelism ·
+2 asymmetric decode context parallelism · 10 measured VRAM budget ·
+21 barlink cross-vendor collectives · 23 Turing/gfx900 without sgl-kernel ·
+22 fp8 dequant fallback (W8A16) · 11 cross-architecture speculative determinism ·
+8e asymmetric-TP × GGUF correctness · 15 asymmetric-TP quantization correctness ·
+17 HiCache under asymmetric-TP/DCP · 24 SWA-DCP · 18 TP greater than
+num_kv_heads · 19 broad model bring-up under asymmetric-TP · 14 single-node PD
+disaggregation · 12 weightless-KV lane · 27 cross-rig uneven pipeline
+parallelism.
+
+Seventeen is too many for a README section. The proposal is to keep the first
+four as the named core (they are the ones a user chooses with flags), and
+present the rest as a "correctness under asymmetry" group with a link — because
+features 8e, 15, 17, 18, 19 and 24 are not things a user turns on, they are
+guarantees that other things keep working once the split is uneven. That
+distinction is invisible in the current flat list and is most of what
+distinguishes this fork from a patch.
 
 ---
 
 ## 4. Section 5 — useful on any rig (drafted, ordering pending)
 
-Ordered descending by what an ordinary two-identical-card owner gets, with
-measured evidence ranking ties. Candidate order, to be confirmed against the
-inventory:
+**Correction to an earlier version of this draft.** This section previously
+guessed an order — speculation, then scheduling, then KV offload — and that
+guess was **wrong**. The source document's Block 2 is already sorted by gain on
+an identical-GPU rig, and it puts the **GGUF family first**, not speculation.
+Recording the error because it is the exact failure the ordering rule exists to
+prevent: ranking by what sounds impressive rather than by what an ordinary rig
+gains. The authoritative order is:
 
-1. **Speculative decoding family** — MTP/NEXTN, DFLASH, cross-algorithm
-   co-residency and the acceptance-driven selector.
-2. **Fast lane scheduling** — a latency class that outranks batched heavy work,
-   with aging so heavy requests cannot starve.
-3. **KV session offload** — spill a running session's KV to host RAM and keep
-   decoding from host, rather than evicting it.
-4. **Cache and checkpoint behaviour** — mamba/GDN checkpoint pinning, HiCache
-   file backend.
+| Rank | Feature | Doc id | Status |
+|---|---|---|---|
+| 1 | Bespoke GGUF adapter framework | 8a | Boot-checked |
+| 2 | Qwen3.5/3.6 GGUF | 8b | Boot-checked |
+| 3 | Gemma-4 GGUF | 8c | Boot-checked |
+| 4 | GGUF K-quant compute kernels | 8d | Boot-checked |
+| 5 | Multimodal and dynamic-quant GGUF | 8f | Boot-checked |
+| 6 | Solo drafter placement | 4 | Built |
+| 7 | Cross-algorithm drafter routing | 5 | **WIP** |
+| 8 | CUDA graph memory aliasing for spec branches | 6 | Boot-checked |
+| 9 | MoE expert offload + asymmetric TP/DCP | 7 | Boot-checked |
+| 10 | GPU-to-GPU collectives over small PCIe BARs | 28 | **Exp**, unmerged branch |
+| 11 | Hibernate checkpoint/restore | 9 | Boot-checked |
+| 12 | Session KV spill | 20 | **Exp** |
+| 13 | Rig dashboard / planner UI | 13 | **Exp** |
+| 14 | Fast-lane priority scheduling | 16 | Built |
+| 15 | Dynamic concurrent-session limit | 29 | Built |
+| 16 | Per-message-class link selection | 25 | Cross-checked |
+| 17 | Prefill satellite (cross-host PD for hybrid GDN) | 26 | Boot-checked |
+
+That GGUF leads is sensible on reflection: it is what lets an ordinary owner
+*run a model at all* on a card that could not otherwise hold it. Speculation
+makes an already-working setup faster, which is a smaller gift.
+
+**Use the document's own status tiers, do not invent labels.** `Built` = merged,
+fork tests only. `Boot-checked` = executed on hardware with a real model.
+`Cross-checked` = validated against a named independent reference. Modifiers:
+`WIP` incomplete, `Exp` experimental, trailing `*` lives only on an unmerged
+branch. A README that flattens these into "supported" would be overclaiming
+four different things at once — three of the entries above are `Exp` and one is
+on an unmerged branch.
 
 Each entry gets the same three lines: what it buys, the flag, and either a
 measured number or an explicit "not measured on a symmetric rig".
@@ -188,13 +251,57 @@ names what it cannot test reads as a request for help, which is what it is.
 
 | # | Item | Blocking? |
 |---|---|---|
-| 1 | Feature inventory pass over `FEATURES_VS_UPSTREAM.md` — measured numbers per row, verbatim with units, and any feature this draft omits | yes, for §§3-4 |
-| 2 | Confirm the descending order in §4 against that inventory rather than against intuition | yes |
+| 1 | ~~Feature inventory pass~~ — **DONE.** All 34 features enumerated in source order (17 Block 1, 17 Block 2), with the document's own status tier per row | no |
+| 2 | ~~Confirm the descending order against the inventory~~ — **DONE, and the draft's guess was wrong.** The source document already sorts Block 2 by gain on an identical-GPU rig; the redesign inherits that order rather than composing one | no |
+| 2b | Per-row measured numbers, quoted verbatim with units, from the detail sections (`FEATURES_VS_UPSTREAM.md` lines 342-1390) | yes, for the evidence lines |
 | 3 | Rewrite `README.md` itself in this shape | yes |
 | 4 | Delete the stale `${VAR:=default}` caveat (§1.3) and the workaround with it | yes — it misinforms today |
 | 5 | Move the "not in the published image" list into per-tag release notes | no |
 | 6 | Decide whether §2's "you probably do not need it" survives review | no — a judgement call, flagged not settled |
 | 7 | **USER go to publish anything at all** | **yes — the gate** |
+
+---
+
+## 7. How numbers must be presented (inherited from the source document)
+
+`FEATURES_VS_UPSTREAM.md` is disciplined about evidence in a way a README
+usually is not, and the redesign must not launder that discipline away while
+"making it approachable".
+
+**Every figure is a lower bound, and the document says so once rather than per
+row.** The reference rig has no NVLink and no CUDA P2P, all cross-GPU traffic
+is host-staged, one 3080 sits on PCIe Gen4 x4 (~6.5 GB/s against ~13-14 GB/s
+for the other two), clock pinning is refused by the driver, and one card spent
+part of the measurements in thermal slowdown at 85-87 C. The document's own
+words: *"an unfavourable configuration on every interconnect axis; the figures
+throughout are a lower bound for the features, not a projection of them."*
+**The README must repeat that sentence, not drop it.** Dropping it converts a
+conservative measurement into an advertised benchmark.
+
+**Three identities do not count as validation**, and the README must not use
+them as if they did:
+
+1. **Byte-identity above ~109 prompt tokens on an RTX 3080 under fp8** —
+   `gptq_marlin_gemm` is measured run-to-run nondeterministic there (0 of 1200
+   mismatches through M=109, first at M=128). The 5090 is unaffected.
+2. **Token identity between speculative and non-speculative decoding** — the
+   verify round computes k+1 tokens in one forward, so the reduction order
+   differs by construction. A valid reference carries the same speculative
+   configuration.
+3. **Text identity between two boots of the same checkpoint at temperature 0** —
+   #360: two identical boots diverge on 12 of 42 graded answers. Text identity
+   is not even self-consistent within one checkpoint and one config.
+
+**The consequence for any claim the README makes:** a quality comparison needs a
+graded rubric plus a same-arm A-vs-A pair to fix the noise band, and only a
+delta clearing that band is evidence. #360 is the worked example — 12/42 texts
+differ while the grades are 42/42 and 41/42, inside the band.
+
+**Practical rule for the rewrite:** every number carries its unit, its hardware,
+and its status tier. A feature with no measurement says "not measured" in the
+same place a number would go. No adjective substitutes for either.
+
+---
 
 **Not done, deliberately:** no README was modified, no repository visibility
 changed, nothing posted, no announcement drafted for any forum. This file is
