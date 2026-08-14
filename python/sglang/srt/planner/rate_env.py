@@ -271,4 +271,45 @@ def check_card_rate_freshness(
     from sglang.srt.planner.card_library import _canonical
 
     table = current_envs_by_name() if by_name is None else by_name
-    return check_rate_freshness(stored_token, table.get(_canonical(name), []))
+    return check_rate_freshness(stored_token, _live_for(name, table))
+
+
+def _live_for(name: str, table: Dict[str, List[RateEnv]]) -> List[RateEnv]:
+    """Live environments for ``name``, matching VARIANTS as well as the name.
+
+    An exact-key lookup cannot date a capacity-disambiguated profile, and this
+    was found on metal (R13 act window): `card_rate_pass --run` measured all
+    three cards, and `--show` then reported the 5090 FRESH and the 3080
+    permanently UNKNOWN -- "NVML reports no current environment for this card"
+    -- for cards NVML could see, seconds apart, in one pass.
+
+    The two names are for one card. `#584`'s capacity resolution names this
+    rig's profile ``RTX 3080 20GB``, because the driver calls both the 10 GB
+    and the 20 GB card ``NVIDIA GeForce RTX 3080`` and the 20 GB cards were
+    otherwise resolving onto the 10240 MiB seed entry. The live table here is
+    keyed by the raw NVML name, ``RTX 3080``. Equality never holds, and no
+    number of re-runs could have fixed it. The 5090 escaped only because
+    nothing collides with it.
+
+    The relation is NOT invented here: it is the one
+    :meth:`CardLibrary.variants` already states -- a key matches when it
+    equals the request, EXTENDS it, or is extended BY it. Held in one place, at
+    a TOKEN boundary, so ``RTX 3080`` does not match ``RTX 3090`` and
+    ``RTX 308`` does not match ``RTX 3080``.
+
+    Loosening the LOOKUP does not loosen the VERDICT: what is found is still
+    compared term by term, so a rate taken at a power limit the rig no longer
+    runs comes back STALE through this path rather than FRESH.
+    """
+    from sglang.srt.planner.card_library import _canonical
+
+    key = _canonical(name)
+    out: List[RateEnv] = []
+    for entry_key, envs in table.items():
+        if (
+            entry_key == key
+            or entry_key.startswith(key + " ")
+            or key.startswith(entry_key + " ")
+        ):
+            out.extend(envs)
+    return out
