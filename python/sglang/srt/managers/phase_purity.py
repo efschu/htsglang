@@ -151,6 +151,21 @@ class PhasePurity:
     def enforced(self) -> bool:
         return self.mode != MODE_OFF
 
+    @property
+    def decode_forbidden_in_pp(self) -> bool:
+        """Is decode in the PP layout impossible at EVERY batch size?
+
+        The semantic property, as distinct from ``strict`` which is a mode
+        NAME. Consumers that need "no decode ever runs in PP" -- the spill
+        machinery releases the draft weights for the whole PP phase on
+        exactly this guarantee -- must test this, not the name, or a mode
+        that provides the guarantee by a different route is refused for no
+        reason. (That is precisely what happened when `prefill_in_tp` was
+        added: the spill guard compared the string and rejected a mode whose
+        decode prohibition is identical to strict's.)
+        """
+        return self.mode in (MODE_STRICT, MODE_PREFILL_IN_TP)
+
     def decode_allowed_in_pp(self, running_bs: int) -> bool:
         """May a decode batch execute in the PP layout right now?
 

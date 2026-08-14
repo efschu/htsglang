@@ -820,8 +820,16 @@ def install_draft_weight_carrier(
             DEPTH_DRAFT_WEIGHTS,
         )
         return None
-    purity = getattr(server_args, "phase_flip_purity", "strict")
-    if purity is not None and str(purity).strip().lower() != "strict":
+    # SEMANTIC check, not a name check. The precondition this guard exists
+    # to enforce is "no decode ever runs in PP" -- that is what makes it
+    # sound to release the draft weights for the whole PP phase. Comparing
+    # the mode STRING refuses any future mode that provides the same
+    # guarantee by another route; `prefill_in_tp` forbids PP decode exactly
+    # as strict does and was rejected purely for being spelled differently.
+    from sglang.srt.managers.phase_purity import parse_purity
+
+    purity = getattr(server_args, "phase_flip_purity", None)
+    if not parse_purity(purity).decode_forbidden_in_pp:
         raise PhaseFlipSpillError(
             f"{LOG_PREFIX} spill depth >= {DEPTH_DRAFT_WEIGHTS} requires "
             f"--phase-flip-purity strict, got {purity!r}. The draft weights "

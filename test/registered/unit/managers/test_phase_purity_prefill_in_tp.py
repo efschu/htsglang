@@ -114,3 +114,32 @@ class TestPrefillInTpMode(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheSemanticGuardProperty(CustomTestCase):
+    """Consumers must test the PROPERTY, not the mode name.
+
+    The spill machinery releases the draft weights for the whole PP phase on
+    the guarantee "no decode ever runs in PP". It used to assert that by
+    comparing the purity STRING to "strict", so adding `prefill_in_tp` --
+    whose decode prohibition is identical -- crashed the boot with
+    "spill depth >= 2 requires --phase-flip-purity strict, got
+    'prefill_in_tp'". The guarantee was met; only the spelling differed.
+    """
+
+    def test_modes_that_forbid_pp_decode(self):
+        for mode in ("strict", "prefill_in_tp"):
+            with self.subTest(mode=mode):
+                p = parse_purity(mode)
+                self.assertTrue(p.decode_forbidden_in_pp)
+                self.assertFalse(p.decode_allowed_in_pp(0))
+                self.assertFalse(p.decode_allowed_in_pp(16))
+
+    def test_modes_that_permit_pp_decode(self):
+        for mode in ("off", "threshold:2"):
+            with self.subTest(mode=mode):
+                self.assertFalse(parse_purity(mode).decode_forbidden_in_pp)
+
+    def test_threshold_zero_forbids_it_like_strict(self):
+        p = parse_purity("threshold:0")
+        self.assertTrue(p.decode_forbidden_in_pp)
