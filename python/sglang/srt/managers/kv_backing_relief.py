@@ -386,12 +386,28 @@ class KvRowCap:
             for name in ("free_pages", "release_pages"):
                 pages = getattr(self._alloc, name, None)
                 if pages is not None:
-                    back = self._withheld.to(pages.device, pages.dtype)
-                    merged = torch.cat((pages, back))
                     # Sorted, because the allocator takes from the FRONT and
                     # the high-water mark this rung prices itself against only
                     # tracks occupancy while low ids are reused first.
-                    setattr(self._alloc, name, torch.sort(merged).values)
+                    #
+                    # THROUGH THE HOST, for the corridor reason spelled out in
+                    # ``sort_free_lists``: the merge genuinely changes the
+                    # tensor's SIZE, so one device allocation is unavoidable --
+                    # but doing the cat and the sort on the device would take
+                    # three more, and this path now runs on every recovery
+                    # levelling rather than only on the rare cap agreement.
+                    host = torch.cat(
+                        (
+                            pages.detach().to("cpu", torch.int64),
+                            self._withheld.to("cpu", torch.int64),
+                        )
+                    )
+                    ordered = torch.sort(host).values
+                    setattr(
+                        self._alloc,
+                        name,
+                        ordered.to(device=pages.device, dtype=pages.dtype),
+                    )
                     break
         self._withheld = None
         self._publish()
@@ -404,6 +420,29 @@ class KvRowCap:
         MEMBERSHIP and nothing else. Two ranks with the same free ids must
         hand the next request the same row id, or their live slot sets -- and
         therefore the lengths of the payloads they frame -- part company.
+
+        IT SORTS THROUGH THE HOST, AND THAT IS A CORRIDOR DECISION (#656
+        C22-e). The free list is a device tensor of one int64 per row --
+        4.7 MiB at this rig's 586642 rows -- and ``torch.sort`` on it
+        allocates BOTH a values and an indices tensor, so the obvious
+        in-place-looking ``setattr(..., torch.sort(pages).values)`` costs
+        ~14 MiB of transient DEVICE memory. That was invisible while this ran
+        only on the rare rounds the cap agreement moved a rank. C22-d made it
+        run every seam round on every rank, and the seam is exactly where this
+        rig's corridor is tightest: measured 2026-08-14, gpu0's continuous
+        minimum fell from 1028/1084 MiB (0 samples below the 1024 law across
+        159212) to 978/990 MiB with 2 and 4 samples BELOW it. The law is a
+        hard user limit, so the sort may not be paid for in device memory.
+
+        Sorting on the host and writing back with ``copy_`` allocates NOTHING
+        on the device: the storage is reused. The host pays ~10 MiB and one
+        round trip of a few milliseconds, once per seam, against a flip
+        cadence measured in tens of seconds.
+
+        The equality guard is not an optimisation for its own sake -- it skips
+        the write-back entirely on the common round where the list is already
+        ascending, which is every round after the first one that had nothing
+        to reorder.
         """
         import torch
 
@@ -411,7 +450,11 @@ class KvRowCap:
             pages = getattr(self._alloc, name, None)
             if pages is None or pages.numel() < 2:
                 continue
-            setattr(self._alloc, name, torch.sort(pages).values)
+            host = pages.detach().to("cpu", torch.int64, copy=True)
+            ordered = torch.sort(host).values
+            if torch.equal(host, ordered):
+                continue
+            pages.copy_(ordered.to(pages.dtype))
 
     def _on_clear(self) -> None:
         """Re-apply the cap after the allocator rebuilt its free list.
