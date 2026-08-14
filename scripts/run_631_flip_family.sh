@@ -167,6 +167,17 @@ FAMILY=(
     # ratchet that guards the phase-flip surface's formatting is worth
     # exactly as much as the sweep that runs it.
     test/registered/unit/test_black_ratchet_656.py
+
+    # MERGE-R12: the two regression tests feat/desk-485-excursion lands on the
+    # flip surface. The managers one is already inside an arm; the planner one
+    # is the R11 shape again, one directory over: test/registered/unit/planner/
+    # is named by no arm in the canonical set, so test_seam_staging_producer_485
+    # -- the ONLY thing that pins the fed gate's admit-at-0 / refuse-at-5800
+    # behaviour -- would have run nowhere. It is the test that would go red if
+    # the gate silently stopped reading the census, which is precisely the
+    # failure this branch exists to make impossible.
+    test/registered/unit/managers/test_seam_cap_retire_485.py
+    test/registered/unit/planner/test_seam_staging_producer_485.py
 )
 
 cd "$WT/test/registered/scheduler"
