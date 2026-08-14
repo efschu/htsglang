@@ -51,6 +51,7 @@ metadata is rebuilt host-side per replay from the refreshed backend bounds).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -66,13 +67,26 @@ logger = logging.getLogger(__name__)
 LOG_PREFIX = "KV-RESHARD"
 
 #: Consensus payload fields, packed as (value, -value) pairs so ONE
-#: MIN-reduction yields (min, -max) per field. ``armed`` and ``ready`` are
-#: MIN-checked (divergence legal -> wait); ``epoch`` is equality-checked
-#: always; the vector elements are equality-checked once min(armed) == 1.
-_MIN_FIELDS = ("armed", "ready")
+#: MIN-reduction yields (min, -max) per field. ``armed``, ``ready`` and
+#: ``headroom`` are MIN-checked (divergence legal -> wait or refuse);
+#: ``epoch`` is equality-checked always; the vector elements are
+#: equality-checked once min(armed) == 1.
+#:
+#: ``headroom`` is #363's addition and it is in the MIN family for one
+#: reason: a rank that discovers it cannot afford the move must not act on
+#: that alone. See :meth:`KvReshardRuntime._headroom_check`.
+_MIN_FIELDS = ("armed", "ready", "headroom")
 _EQ_FIELDS = ("epoch",)
 
 _CHECKSUM_BYTES = 8
+
+#: The corridor law's floor, in MiB: no card on this rig may be shown with
+#: less than this much FREE memory, sampled continuously (100 ms) against the
+#: NVML FREE column -- never against total-minus-used, which hides the
+#: ~424/518 MiB carve-out. The reshard's transient buffers are charged
+#: against free memory ABOVE this floor, so a move that would eat into the
+#: user's reserve is refused rather than performed.
+CORRIDOR_FLOOR_MIB = 1024
 
 #: Rows gathered/scattered per step inside :class:`KvPoolView` (#631). The
 #: indexed read ``k[rows]`` and the strided ``.contiguous()`` on the write
@@ -91,6 +105,30 @@ def _gather_block_rows() -> int:
         return max(1, int(raw))
     except ValueError:
         return DEFAULT_GATHER_BLOCK_ROWS
+
+
+def _fmt_bytes(n: int) -> str:
+    """MiB where MiB is the honest unit, bytes where it is not.
+
+    A refusal that reports "0 MiB needed, margin -0 MiB" is arithmetically
+    true and useless to read; the guard's own tests run at kilobyte scale."""
+    n = int(n)
+    if abs(n) >= 1024 * 1024:
+        return f"{n / (1024.0 * 1024.0):.1f} MiB"
+    return f"{n:,d} B"
+
+
+@dataclasses.dataclass
+class _MovePlan:
+    """A priced move: what ``_execute`` will do, and what it will cost.
+
+    Built at the consensus boundary so the headroom guard and the allocation
+    it guards are talking about the same move (#363)."""
+
+    t0: float
+    slots: "torch.Tensor"
+    tr: object
+    terms: dict
 
 
 def _encode(values: Sequence[int]) -> List[int]:
@@ -345,6 +383,8 @@ class KvReshardRuntime:
         fit_check: Optional[
             Callable[[Tuple[int, ...]], Tuple[bool, str]]
         ] = None,
+        free_bytes_fn: Optional[Callable[[], int]] = None,
+        corridor_floor_bytes: int = CORRIDOR_FLOOR_MIB * 1024 * 1024,
     ):
         if dcp_size < 2:
             raise KvReshardError(
@@ -409,6 +449,18 @@ class KvReshardRuntime:
         # callback is a pure function of replicated capacity state, so every
         # rank computes the same verdict. None = stock behavior.
         self._fit_check = fit_check
+        # #363: `fit_check` answers "does the TARGET VECTOR fit the backed
+        # pool" and it passed on both runs that then died. What nothing
+        # checked was the TRANSIENT the move allocates on top of the resident
+        # pool -- the staged reads, the packed payloads and the receive
+        # buffers. On metal that was a 616 MiB allocation against 550 MiB free
+        # (under load) and 758 against 256 (drained), and it broke the
+        # corridor SEVEN SECONDS BEFORE the OOM in both runs: the allocation
+        # drove free memory under the floor, the floor did not drift into the
+        # allocation. `free_bytes_fn` reports this rank's NVML FREE bytes;
+        # None leaves the guard inert, which only a test fleet should do.
+        self._free_bytes_fn = free_bytes_fn
+        self._corridor_floor_bytes = int(corridor_floor_bytes)
         #: names of features that block Stage-A resharding for this process
         #: (evaluated once at construction; arming refuses while non-empty).
         self.blocking_guards = tuple(guards)
@@ -421,6 +473,11 @@ class KvReshardRuntime:
         self.desync_checks = 0
         self.completed = 0
         self.last_stats: Optional[dict] = None
+        #: #363 observability: how many armed moves the group refused for
+        #: headroom, and the arithmetic behind the last local verdict. The
+        #: window records both; a refusal with no numbers is not a finding.
+        self.refused_headroom = 0
+        self.last_headroom: Optional[dict] = None
 
         logger.info(
             "%s armed at boot: rank %d/%d, vector %s, ceiling set %s, "
@@ -510,9 +567,23 @@ class KvReshardRuntime:
         fit_ok, fit_msg = True, ""
         if armed and self._fit_check is not None:
             fit_ok, fit_msg = self._fit_check(self._pending)
-        ready = 1 if (armed and fit_ok and self._ready_fn()) else 0
+        local_ready = bool(armed and fit_ok and self._ready_fn())
+        ready = 1 if local_ready else 0
+        # #363 headroom. Evaluated ONLY by a rank that would otherwise move,
+        # because it costs a live-slot read and a transition build, and
+        # because a rank that is not ready has nothing to price yet. A rank
+        # that did not evaluate reports the NEUTRAL 1: it cannot veto on a
+        # number it never computed. That is safe because the refusal below is
+        # only ever consulted once min(ready) == 1 -- i.e. once EVERY rank was
+        # ready, and therefore every rank did evaluate.
+        headroom = 1
+        plan: Optional["_MovePlan"] = None
+        hr_local: Optional[dict] = None
+        if local_ready:
+            plan = self._plan_move()
+            headroom, hr_local = self._headroom_check(plan)
         vec = self._pending if self._pending is not None else (0,) * self._size
-        payload = _encode([armed, ready, self._epoch, *vec])
+        payload = _encode([armed, ready, headroom, self._epoch, *vec])
         self.desync_checks += 1
         reduced = self._collective_min(payload)
         if len(reduced) != len(payload):
@@ -563,25 +634,171 @@ class KvReshardRuntime:
                     f"(this rank ready={ready})"
                 )
             return None
+        # Every rank was ready, so every rank priced the move. If ANY of them
+        # cannot afford it, ALL of them refuse -- here, before a single rank
+        # has allocated a byte. A guard at the allocation site instead would
+        # let the affording ranks proceed into the exchange while the short
+        # one aborted, which is the #94/#194/#259 hang the desync check above
+        # exists to prevent: the same reduction has to carry it.
+        if lo["headroom"] == 0:
+            self._refuse_for_headroom(hr_local)
+            return None
         self._last_hold_reason = None
-        return self._execute()
+        return self._execute(plan)
 
     def _hold(self, reason: str) -> None:
         if reason != self._last_hold_reason:
             logger.info("%s hold: %s", LOG_PREFIX, reason)
             self._last_hold_reason = reason
 
-    # -- the move -------------------------------------------------------------
-    def _execute(self) -> dict:
-        """Copy -> exchange -> scatter -> cutover, synchronously, on every
-        rank of the group in the same round. See module docstring for the
-        aliasing and atomicity arguments."""
+    # -- #363 headroom -------------------------------------------------------
+    def _plan_move(self) -> "_MovePlan":
+        """The move's transition and its transient byte terms. READS ONLY.
+
+        Built once per boundary and handed to :meth:`_execute`, so the bytes
+        the guard prices are the bytes the move then allocates. Recomputing
+        them in ``_execute`` would reopen a window in which the live set moved
+        between the verdict and the allocation -- a guard that prices a
+        different move than the one it admits is not a guard.
+        """
         target = self._pending
         assert target is not None
         t0 = self._clock()
         slots = self._live_slots_fn()
         slots = torch.unique(slots.detach().to("cpu", torch.int64))
         tr = build_transition(slots, self._current, target, self._rank)
+        return _MovePlan(t0=t0, slots=slots, tr=tr, terms=self._transient_terms(tr))
+
+    def _transient_terms(self, tr) -> dict:
+        """Every device allocation ``_execute`` makes ON TOP of the pool.
+
+        Read straight off the PACK and EXCHANGE phases below, in their order,
+        and named individually so a refusal can show its work:
+
+        ``staged``  ``out_parts`` -- one ``read_rows`` result per (layer,
+                    peer). Held for the whole pack loop, never released early.
+        ``packed``  ``outgoing_payloads`` -- the ``torch.cat`` copy of the
+                    above plus one checksum per peer. Alive at the same time
+                    as ``staged``, which is why both terms count.
+        ``largest`` ``flat``, the biggest single per-peer ``cat`` transient
+                    inside the loop.
+        ``recv``    the ``torch.empty`` receive buffers -- the allocation that
+                    actually raised on metal.
+
+        The pool itself is NOT counted: it is already resident.
+        """
+        row_bytes = self._pool.total_row_nbytes
+        out_per_peer = {
+            p: int(rows.numel()) * row_bytes for p, rows in tr.outgoing_rows.items()
+        }
+        in_per_peer = {
+            p: int(rows.numel()) * row_bytes for p, rows in tr.incoming_rows.items()
+        }
+        staged = sum(out_per_peer.values())
+        packed = staged + _CHECKSUM_BYTES * len(out_per_peer)
+        largest = max(out_per_peer.values(), default=0)
+        recv = sum(in_per_peer.values()) + _CHECKSUM_BYTES * len(in_per_peer)
+        return {
+            "staged": staged,
+            "packed": packed,
+            "largest_peer_pack": largest,
+            "recv": recv,
+            "peak": staged + packed + largest + recv,
+        }
+
+    def _headroom_check(self, plan: "_MovePlan") -> Tuple[int, Optional[dict]]:
+        """Can THIS rank afford the move without breaking the corridor?
+
+        ``free - corridor_floor - peak >= 0``. The floor is subtracted before
+        the move is priced, not after: the corridor is the user's reserve, so
+        it was never memory the reshard could spend. Returns ``(0|1, detail)``
+        and NEVER acts -- the caller folds the verdict into the group-wide MIN
+        and only the group refuses.
+        """
+        if self._free_bytes_fn is None:
+            return 1, None
+        try:
+            free = int(self._free_bytes_fn())
+        except Exception as e:  # noqa: BLE001
+            # A guard that cannot read free memory must not pretend the move
+            # is affordable. Refusing costs a flip; guessing cost the server.
+            detail = {
+                "rank": self._rank,
+                "error": f"{type(e).__name__}: {e}",
+                "peak_bytes": plan.terms["peak"],
+                "corridor_floor_bytes": self._corridor_floor_bytes,
+            }
+            self.last_headroom = detail
+            return 0, detail
+        peak = int(plan.terms["peak"])
+        margin = free - self._corridor_floor_bytes - peak
+        detail = {
+            "rank": self._rank,
+            "free_bytes": free,
+            "corridor_floor_bytes": self._corridor_floor_bytes,
+            "peak_bytes": peak,
+            "margin_bytes": margin,
+            "terms": dict(plan.terms),
+            "ok": margin >= 0,
+        }
+        self.last_headroom = detail
+        return (1 if margin >= 0 else 0), detail
+
+    def _refuse_for_headroom(self, hr_local: Optional[dict]) -> None:
+        """The group refused. Disarm, name it, stay on the incumbent layout.
+
+        Disarm rather than hold: the metal reproduction was WORSE on a drained
+        pool (758 MiB needed against 256 free) than under load (616 against
+        550), so this is not a transient a silent retry loop grows out of. The
+        controller may arm again when something has actually changed; an
+        unbounded hold would just be the same refusal with no record.
+        """
+        self._pending = None
+        self.refused_headroom += 1
+        self._last_hold_reason = None
+        d = hr_local or {}
+        if "error" in d:
+            detail = f"this rank could not read free memory ({d['error']})"
+        elif d:
+            t = d.get("terms") or {}
+            detail = (
+                f"this rank: {_fmt_bytes(d['free_bytes'])} free, "
+                f"{_fmt_bytes(d['corridor_floor_bytes'])} corridor floor, "
+                f"{_fmt_bytes(d['peak_bytes'])} transient needed "
+                f"(staged {_fmt_bytes(t.get('staged', 0))} + packed "
+                f"{_fmt_bytes(t.get('packed', 0))} + pack-peak "
+                f"{_fmt_bytes(t.get('largest_peer_pack', 0))} + recv "
+                f"{_fmt_bytes(t.get('recv', 0))}) -> margin "
+                f"{_fmt_bytes(d['margin_bytes'])}"
+            )
+        else:
+            detail = "this rank had headroom; another rank in the group did not"
+        logger.warning(
+            "%s REFUSED for headroom at round %d: the move stays on the "
+            "incumbent vector %s. At least one rank cannot allocate the "
+            "move's transient buffers without taking free memory below the "
+            "%d MiB corridor floor, so NO rank allocates. %s",
+            LOG_PREFIX,
+            self._round,
+            self._current,
+            self._corridor_floor_bytes // (1024 * 1024),
+            detail,
+        )
+
+    # -- the move -------------------------------------------------------------
+    def _execute(self, plan: Optional["_MovePlan"] = None) -> dict:
+        """Copy -> exchange -> scatter -> cutover, synchronously, on every
+        rank of the group in the same round. See module docstring for the
+        aliasing and atomicity arguments.
+
+        ``plan`` is the transition the headroom guard priced this round
+        (#363). It is reused rather than rebuilt so the admitted move is the
+        priced move; ``None`` rebuilds it, which is the unguarded path."""
+        target = self._pending
+        assert target is not None
+        if plan is None:
+            plan = self._plan_move()
+        t0, tr = plan.t0, plan.tr
 
         # Bounds check BEFORE any write: the fitted ceiling must hold.
         max_row = tr.max_new_row()
@@ -778,6 +995,56 @@ def _dist_exchange(device_group, device):
     return _exchange
 
 
+def _free_bytes_fn_for(device) -> Callable[[], int]:
+    """Free bytes on THIS rank's card, read the way the corridor is judged.
+
+    NVML FREE, not total-minus-used: the ~424/518 MiB carve-out is invisible
+    to the subtraction and the corridor law is written against the FREE
+    column, so pricing a move against the wrong quantity would let the guard
+    pass a move the corridor sampler then fails.
+
+    The card is resolved by UUID, never by index. A scheduler rank runs under
+    a narrowed ``CUDA_VISIBLE_DEVICES``, so its torch device 0 is some other
+    NVML index entirely -- the same divergence that made the card probe
+    unreachable (#363 defect 3). A UUID survives the narrowing unchanged.
+
+    Falls back to ``torch.cuda.mem_get_info`` when NVML is unavailable, and
+    raises otherwise: :meth:`KvReshardRuntime._headroom_check` treats a raise
+    as a refusal, which is the safe direction.
+    """
+
+    def _free_bytes() -> int:
+        import pynvml  # noqa: PLC0415  (optional dependency)
+
+        want = str(torch.cuda.get_device_properties(device).uuid)
+        pynvml.nvmlInit()
+        try:
+            for i in range(pynvml.nvmlDeviceGetCount()):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                uuid = pynvml.nvmlDeviceGetUUID(h)
+                if isinstance(uuid, bytes):
+                    uuid = uuid.decode()
+                if str(uuid).replace("GPU-", "") == want.replace("GPU-", ""):
+                    return int(pynvml.nvmlDeviceGetMemoryInfo(h).free)
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        raise RuntimeError(
+            f"no NVML device carries this rank's card UUID {want}; free "
+            f"memory cannot be attributed to the card the move allocates on"
+        )
+
+    def _free_bytes_with_fallback() -> int:
+        try:
+            return _free_bytes()
+        except ImportError:
+            return int(torch.cuda.mem_get_info(device)[0])
+
+    return _free_bytes_with_fallback
+
+
 def _stage_a_guards(scheduler) -> List[str]:
     """Features whose owner-state encodings the Stage-A move does not
     migrate (DESIGN_297 section 2). Arming refuses while any is active."""
@@ -907,4 +1174,9 @@ def build_kv_reshard_runtime(scheduler) -> KvReshardRuntime:
         cutover_fn=_cutover_fn_for(scheduler),
         guards=_stage_a_guards(scheduler),
         fit_check=_fit_check,
+        # #363: without this the cutover allocates its transient buffers
+        # blind, which is how it OOM'd twice on metal and took the TP group
+        # down with it. Wired here, unconditionally, so the guard is a
+        # property of the production path rather than of a launch flag.
+        free_bytes_fn=_free_bytes_fn_for(view.device),
     )
