@@ -664,6 +664,16 @@ class Envs:
     # measured elsewhere -- the rates are keyed by card UUID, so an artifact
     # from another rig is visibly not this rig's.
     SGLANG_CARD_LIBRARY = EnvStr(None)
+    # Override the location of the PER-STAGE measurement canon (#584 second
+    # half) that the #363 stage table promotes solved candidates from: the
+    # measured gain over the reference stage, the band that gain was taken
+    # against, and the instrumented flip cost. Unset, the store sits beside
+    # the card library above, and its EXISTENCE is the gate -- no file means
+    # the pre-#584 path, where an unmeasured candidate refuses the table by
+    # name. Records are keyed by the sorted card-UUID set plus the checkpoint,
+    # so a record from another rig or another model is refused rather than
+    # borrowed. Written by planner/stage_measure_pass.py.
+    SGLANG_STAGE_MEASUREMENTS = EnvStr(None)
     # Record, per rank, the driver-visible free-memory MINIMUM reached in each
     # load state the rank actually serves (planner/transient_census.py), and
     # write it beside the residency census. The #485 cut gate funds the WORST
