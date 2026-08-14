@@ -17,6 +17,32 @@ row is a gate: the chain stops there until it is answered.
 
 ---
 
+## 0.0 Readiness at a glance — updated 2026-08-14 (`chore/release-chain-prep-r3`)
+
+Ordered as the release actually runs, from the user's go to a shipped image.
+**Nothing below has been published. No image was pushed, no post was made.**
+
+| # | Step | Owner gate | Readiness |
+|---|---|---|---|
+| 1 | Pre-build wheel provenance probe (host venv, read-only) | desk | **READY** — command in §1, last run green 2026-08-12 |
+| 2 | Decide the kernel arm | **USER** | **BLOCKED ON USER** — and the question changed: see the correction box in §1.5, which the first real build falsified |
+| 3 | Apply the NCCL package (#599) | desk | **READY, and self-verifying** — `deploy/release/apply-nccl-tuning.sh`. Emits no env vars by design; the requirement is `--ipc=host --shm-size=4g` plus the 2.30 floor. 11 tests, selftest 7/7 red-on-demand |
+| 4 | Final test suite | shift | **PARTIAL** — release-scoped suites green (see §3.1). A full-suite run needs a window |
+| 5 | Build the release image | **USER** | **PROVEN, with a defect found and fixed** — see §4.0. The recipe as it stood could not build; it now can |
+| 6 | Transfer to the Proxmox host and run | **USER** | **READY** — recipe in §5; the apparmor trap is confirmed live, see §4.0 |
+| 7 | Acceptance smoke (#416 shape) | **USER** | **READY** — §6 |
+| 8 | Push to ghcr with PAT2 | **USER** | **BLOCKED ON USER** — credential is read from file, never printed; §7 |
+| 9 | Public-image verify (#416 style) | **USER** | **READY** — §7 |
+| 10 | Publish docs / README redesign (#135) | **USER** | **DRAFT ONLY** — `docs/dev/DRAFT_135_README_redesign.md`, marked not-published |
+
+**The one item that changed the release's shape.** Step 5 was expected to be a
+formality. It was not: the first real `docker build` refused itself at the #384
+gate, and probing the *already-published* image showed the same defect had
+already shipped. §1.5 and §4.0 carry the evidence. The gate did its job on its
+first live run, which is the strongest thing that can be said for it.
+
+---
+
 ## 0. What this release ships, in one paragraph
 
 An `htsglang:cu130-nccl2307` image: the uneven-TP sglang fork on CUDA 13.0.1
@@ -62,6 +88,53 @@ provider (`sglang-kernel 0.4.4`, 74 files), `direct_url` sha256
 
 ### 1.5 Choosing the image's kernel arm — USER GATE
 
+> **CORRECTED 2026-08-14 by the first real `docker build`.** The description
+> below this box was written at the desk and is **factually wrong about what
+> the recipe builds**. Both of its premises failed against evidence. Read the
+> correction first; the original is kept underneath because the *decision* it
+> frames is still the user's to make, only on different facts.
+>
+> **What the build showed.** With the old defaults this Dockerfile **could not
+> build at all**. Step 3a refused it with `verdict=SHADOWED`, and the
+> already-published `htsglang:cu130-nccl2307` was then probed and found to
+> carry **the same shadow** — so this defect shipped, silently, in an image
+> that is already out. It was invisible until the guard existed.
+>
+> **Why, and why it is structural.** `python/pyproject.toml:68` hard-pins
+> `sglang-kernel==0.4.4` as a dependency of the fork's own package. Step 3's
+> `pip install -e .` therefore ALWAYS installs a distribution providing
+> `sgl_kernel` (a 615 MB prebuilt wheel — no toolchain, no 45-minute compile).
+> The Dockerfile then installed the pypi `sgl-kernel` on top, so two
+> distributions provided the same import package under different names: the
+> #384 defect exactly, with pip reporting no conflict.
+>
+> **Both premises of the original text are therefore false:**
+>
+> * *"The stock image installs the armless pypi wheel"* — it installs **both**,
+>   and the fork's wheel is installed **second**, so its files already win.
+> * *"That image cannot serve INT8-W8A8"* — the arm **is present**, measured in
+>   the built image: `int8_scaled_mm` in `sm90/common_ops.abi3.so` and
+>   `sm100/common_ops.abi3.so` (49 occurrences each). CUDA majors are uniformly
+>   13, so there is no #436 split.
+>
+> **The fix, and why it changes no runtime behaviour.** `INSTALL_SGL_KERNEL`
+> now defaults to `0`. Since the fork wheel's files already won, removing the
+> losing duplicate changes *which kernel runs* not at all — it only removes the
+> copy that a later `pip install` could silently promote. Option (a) below is
+> **not reachable** by flag: an armless image would require removing the
+> pyproject pin, which is a different change from this flag.
+>
+> **What remains a USER decision:** whether to ship the fork kernel that the
+> dependency graph already selects (default now, armed, builds green), or to
+> pursue a genuinely armless image by changing the pin. Also still true: "does
+> this image serve INT8" is not discoverable from the tag, so the answer
+> belongs in the release notes either way.
+>
+> Evidence: `/spinning/release3_build1.log` (the refusal, step `#17`), and the
+> probe of the shipped image in section 4.0.
+
+<details><summary>Original text, superseded — kept for the decision it frames</summary>
+
 The stock image installs the **armless** pypi wheel, deliberately (#353): the
 fork's kernel tree would add a full CUDA toolchain and roughly 45 minutes per
 image for one branch. Consequence: **that image cannot serve INT8-W8A8 on a
@@ -76,6 +149,8 @@ consumer Blackwell rank.** Two options, and the release must pick one:
 
 Whichever is chosen must be stated in the release notes, because "does this
 image serve INT8" is not discoverable from the tag.
+
+</details>
 
 ---
 
@@ -243,6 +318,96 @@ changes that #599 prep explicitly does not make:
 | 3.1 | Package assembled with evidence | desk | DONE — `deploy/release/nccl-tuning.env`, every line cited and labelled AUTO / UNIVERSAL / RIG / UNMEASURED. |
 | 3.2 | Run line carries `--ipc=host --shm-size=4g` | shift | Container boots a TP>1 collective without "unhandled system error". |
 | 3.3 | `NCCL_MAX_CTAS` measured, or recorded as unmeasured | shift | A/B recipe is in the env file, section 5. If it is not run, the release notes must say the cap is heuristic. Not a blocker. |
+| 3.4 | Application is executable and self-verifying | desk | DONE 2026-08-14 — `deploy/release/apply-nccl-tuning.sh`. 11 tests in `test/registered/unit/release/test_nccl_tuning_apply_599.py`; `selftest` drives all 7 checks red on demand. |
+
+### 3.5 Applying the package — `deploy/release/apply-nccl-tuning.sh`
+
+The env file is evidence; this is the part that runs. Applying #599 is mostly
+a **refusal** exercise, and the honest count of environment variables the
+package will hand a stranger is **zero** — every candidate was [AUTO], [RIG],
+or unmeasured. `env` therefore emits nothing, and a test pins that so a later
+plausible-looking default has to arrive with a number behind it.
+
+```bash
+deploy/release/apply-nccl-tuning.sh run-flags   # --ipc=host --shm-size=4g
+deploy/release/apply-nccl-tuning.sh check --strict
+deploy/release/apply-nccl-tuning.sh verify-log <boot.log>   # after a real boot
+deploy/release/apply-nccl-tuning.sh selftest    # proves the checks can fail
+```
+
+**The read-back rule, which is the whole point.** Exporting a variable proves
+the shell exported it and nothing more: NCCL ignores unknown names silently,
+and a value set after `ncclCommInitRank` never takes effect at all. So
+`verify-log` parses the lines NCCL prints about what it *actually consumed*
+under `NCCL_DEBUG=INFO` (`... NCCL INFO NCCL_MAX_CTAS set by environment to 4`),
+and reads the version floor from NCCL's own banner rather than from a filename
+or a `strings(1)` match over the binary.
+
+`check` refuses three classes: an [AUTO] variable set by hand (it loses to or
+fights the fork's computed value), a [RIG] variable without
+`--allow-rig-conditioned` (measured on a rig with no P2P and no NVLink —
+exporting it for a user who has NVLink is a regression), and an
+upstream-inherited variable with no fork measurement behind it (the #251
+defect by definition).
+
+**SKIP is not PASS.** `--strict` escalates it, so a check that could not run in
+the release gate cannot read as a green one. Known SKIP: the bundled
+`libnccl.so.2` carries no versioned soname, so the floor is only fully
+verifiable from a real boot log via `verify-log`.
+
+---
+
+## 4.0 What the first real build actually did — 2026-08-14
+
+The previous handoff said plainly: *"The build gate has never run inside a real
+`docker build`. First real build is the test."* It has now run. Recording the
+outcome here because two of its three named risks are retired and the third
+turned into a shipped defect.
+
+**Retired.** The layer expanded to `if [ "1" != "1" ]`, so `INSTALL_SGL_KERNEL`
+**was** in ARG scope at step 3a — the suspected scope break does not exist. And
+`sysconfig`'s purelib resolved to `/usr/local/lib/python3.12/dist-packages`,
+the path the guard then inspected successfully. `COPY docker/kernel-wheel`
+behaved normally alongside the cache mounts.
+
+**Found instead.** The build refused itself:
+
+```
+sgl_kernel dist guard (#384): verdict=SHADOWED
+  provider: sgl-kernel     0.3.21 (69 recorded sgl_kernel/ files)  <-- armless pypi dist
+  provider: sglang-kernel  0.4.4  (67 recorded sgl_kernel/ files)
+  INT8 arm (int8_scaled_mm): present in {'sm100/...': 49, 'sm90/...': 49}
+  CUDA majors: sgl_kernel={libnvrtc:13, libcudart:13, ...} torch=libcudart.so.13
+```
+
+This is a **true positive on a real defect**, not a gate bug. Root cause in
+§1.5. The fix is a one-line default flip, `INSTALL_SGL_KERNEL=0`, argued in the
+Dockerfile at the ARG itself.
+
+**And it had already shipped.** The published `htsglang:cu130-nccl2307` was
+probed with the same guard and returns the same `verdict=SHADOWED`:
+
+```bash
+docker run --rm --security-opt apparmor=unconfined \
+  -v "$PWD/python/sglang/srt/utils/kernel_dist_guard.py:/g.py:ro" \
+  htsglang:cu130-nccl2307 python3 -I /g.py     # exit 1, verdict=SHADOWED
+```
+
+**Two traps confirmed live while doing this**, both already named in this
+document, now with reproductions:
+
+1. **apparmor.** The probe above first died with
+   `Could not check if docker-default AppArmor profile was loaded:
+   open /sys/kernel/security/apparmor/profiles: permission denied`.
+   `--security-opt apparmor=unconfined` is required for *any* `docker run` in
+   this LXC, including a trivial one. §5 assumed this only bit the serving run.
+2. **Cache invalidation (trap 3).** Editing the `ARG INSTALL_SGL_KERNEL`
+   default — declared early — invalidated every layer after it and forced a
+   full re-download of torch, cuDNN and the 615 MB kernel wheel. The trap is
+   real and it is cheap to trip: the edit was one character of intent.
+
+**Not done here:** the image was not run as a server, not smoke-tested against
+a model, and not pushed anywhere. Those remain §§5-7, USER-gated.
 
 ---
 

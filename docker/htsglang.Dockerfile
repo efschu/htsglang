@@ -98,7 +98,32 @@ ARG SGLANG_SCM_VERSION=0.0.0.dev15138
 #   INSTALL_UCX=0        -> drop barlink/UCX; single-node images do not need it.
 #   INSTALL_PLANNER=0    -> no planner extra; MODE=planner still serves the UI,
 #                           only the quality-benchmark tab breaks.
-ARG INSTALL_SGL_KERNEL=1
+# INSTALL_SGL_KERNEL: install the PYPI `sgl-kernel` distribution as well?
+#
+# DEFAULT FLIPPED TO 0 ON EVIDENCE FROM THE FIRST REAL BUILD (2026-08-14).
+# With the old default of 1 this Dockerfile could not build at all: step 3a
+# refused every image with verdict=SHADOWED, and the already-published
+# htsglang:cu130-nccl2307 was confirmed to carry the same shadow.
+#
+# The cause is structural, not incidental. python/pyproject.toml:68 hard-pins
+#   "sglang-kernel==0.4.4"
+# as a dependency of the fork's own package, so step 3's `pip install -e .`
+# ALWAYS installs a distribution providing `sgl_kernel`. Adding the pypi
+# `sgl-kernel` on top makes two distributions provide the same import package
+# under different names -- the exact #384 defect -- and pip reports no
+# conflict, so the next install of either silently decides which files win.
+#
+# Flipping this default does NOT change which kernel the image runs. The fork
+# wheel is installed after the pypi one, so its files already won; all that
+# changes is that the losing duplicate is no longer present to flip later.
+# The arm therefore stays as measured: int8_scaled_mm present in sm90 and
+# sm100. Note this CORRECTS release-checklist 1.5, which describes the stock
+# image as armless -- see that section for the corrected gate.
+#
+# Setting this back to 1 is honoured, and step 3a will then refuse the build
+# by design. It is only meaningful for someone who has also removed the
+# pyproject pin, which is a different change than this flag.
+ARG INSTALL_SGL_KERNEL=0
 ARG INSTALL_UCX=1
 ARG INSTALL_PLANNER=1
 
@@ -189,10 +214,13 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     python3 -m pip install -c /sgl-workspace/constraints.txt \
        "flashinfer-python==${FLASHINFER_VERSION}" "triton==${TRITON_VERSION}" \
     && if [ "${INSTALL_SGL_KERNEL}" = "1" ]; then \
+         echo "INSTALL_SGL_KERNEL=1 -> installing the pypi sgl-kernel dist ALONGSIDE the fork's"; \
+         echo "  pinned sglang-kernel. These two provide the SAME sgl_kernel import package."; \
+         echo "  Step 3a will refuse this image (#384 WHEEL SHADOW). See the note above."; \
          python3 -m pip install -c /sgl-workspace/constraints.txt \
            "sgl-kernel==${SGL_KERNEL_VERSION}"; \
        else \
-         echo "INSTALL_SGL_KERNEL=0 -> sm75/Turing slim image, native+Triton paths"; \
+         echo "INSTALL_SGL_KERNEL=0 -> sgl_kernel comes from the fork's pinned sglang-kernel only"; \
        fi
 
 # 3) The htsglang fork source. Editable so the package resolves to
