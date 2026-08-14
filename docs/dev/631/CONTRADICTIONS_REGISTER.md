@@ -2783,3 +2783,74 @@ dirt on its first live encounter — the C22-e follow-on re-dirtied
 `test_kv_backing_cap_agreement_656.py`, one of the fourteen, within hours of them
 being cleaned, which is the failure mode R9 described ("R8 arrived with the hook
 run and R9 arrived without it") happening again in the same shift.
+
+## 90. The four reds the collection fix exposed: a stub bound a hand-picked
+subset of the call graph, and the guard was already down when they landed.
+
+Register 87 removed the NIXL collection block and reported four genuine
+CPU-visible failures in `test_mamba_checkpoint_interval.py`, all of them
+`AttributeError: 'types.SimpleNamespace' object has no attribute
+'_auto_mamba_demand_active'` out of
+`model_runner_kv_cache_mixin.py:1913`. Root-caused and closed.
+
+**MECHANISM.** `handle_max_mamba_cache` is a mixin method that several unit
+suites drive directly against a `SimpleNamespace` stub — a usage the
+production code acknowledges in its own comment at
+`getattr(self, "pp_size", 1)` ("the non-PP arm must stay reachable from
+minimal runner stubs ... several unit suites drive this function directly").
+The stub bound a HAND-PICKED subset of the mixin methods that function calls:
+two of the nine in its transitive closure. Any new `self._helper()` on a
+reachable branch therefore breaks it, and the breakage surfaces as an
+AttributeError on whichever unbound name the control flow reaches first.
+
+**ORIGIN, three landings inside one blind window.**
+
+| when | commit | what it did |
+|---|---|---|
+| 2026-06-01 | `d8a5a25c36` (upstream #25173, NIXL refactor) | made the whole directory uncollectable — **the guard goes down** |
+| 2026-07-15 | `a0ed7dc810` "[DCP] Auto-size the mamba state pool by demand under uneven DCP" | +132 lines to the mixin, **no test file touched**; added `elif self._auto_mamba_demand_active():` — break #1 |
+| 2026-07-22 | `8b48e32968` "T156 stage 3" | added `server_args.max_speculative_num_draft_tokens` at lines 1910/1922 — break #2, **masked behind #1** |
+
+The ordering is the finding: the collection block landed **six weeks before**
+the first defect, so the guard that would have caught either one was already
+down when both arrived. Neither commit was careless about testing in a way a
+reviewer could see — the suite that covered them had been silently dead since
+June. Attributing this to the authors rather than to the dead guard would be
+the wrong lesson.
+
+A third instance appeared only once #1 was removed: the demand path dies on
+`_mamba_pool_budget_cost_gb`, which `handle_max_mamba_cache` never names —
+`_fit_mamba_pool_to_budget` calls it. Binding one level deep re-arms the same
+trap one frame lower, which is why the fix takes the TRANSITIVE closure.
+
+**NOT A LIVE SERVING DEFECT.** Reachability, checked rather than assumed:
+`ModelRunner` INHERITS `ModelRunnerKVCacheMixin` (`model_runner.py:426`), so
+every real `self` carries every one of these methods; the sole production
+caller is `self.handle_max_mamba_cache(rest_memory)` inside that same mixin
+(`model_runner_kv_cache_mixin.py:725`); and `grep MethodType` over
+`python/sglang/srt/model_executor/` returns nothing, so no production code
+binds these onto a foreign object. The defect cannot be reached from a boot.
+**Zero production lines were changed to fix it** — which is also why the
+behaviour on the path where the methods ARE present is unchanged by
+construction, not merely by test.
+
+**FIXED FOR THE RIGHT REASON, not by relaxing anything.** The tempting repair
+— `getattr(self, "_auto_mamba_demand_active", lambda: False)()` in production
+— would silently select the fixed-fraction branch on a real runner whose
+method had genuinely gone missing, converting a loud AttributeError into a
+wrong pool size. The gate is instead BOUND FROM THE REAL CLASS so the stub
+takes production branches, the declared method list is checked against the
+AST of the real call graph (#504-a), and both directions of the gate are
+pinned: `False` for the stock stub (which is what the four original tests
+always assumed, now asserted instead of implied), `True` under an uneven
+token vector with radix on, plus a uniform-vector case (all-equal vectors are
+not uneven) and an explicit-`max_mamba_cache_size` case that must never reach
+the gate at all.
+
+Directory after: **940 failed, 748 passed, 707 skipped** — four fewer
+failures, ten more passes, and **zero remaining CPU-visible reds**; every one
+of the 940 is `No accelerator ... is available` and needs metal.
+
+Carried: the file is `register_cuda_ci(stage="base-b")`, so on a CPU-only CI
+arm these CPU-safe tests still would not run. Splitting the file by stage is
+not done here and is named rather than left implicit.

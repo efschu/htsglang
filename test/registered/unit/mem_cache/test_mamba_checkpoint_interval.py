@@ -13,6 +13,9 @@ Covers:
 * the budget-fitted mamba pool size when the radix cache is disabled.
 """
 
+import ast
+import inspect
+import textwrap
 import unittest
 from array import array
 from types import MethodType, SimpleNamespace
@@ -20,6 +23,7 @@ from types import MethodType, SimpleNamespace
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.distributed.utils import set_cp_token_ratios
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
@@ -421,9 +425,7 @@ class TestFlushResetsMambaPool(unittest.TestCase):
         self.assertTrue(torch.all(mamba_pool.replayssm_write_pos == 0))
         self.assertTrue(torch.all(pool.req_index_to_mamba_index_mapping == 0))
         # Allocator back to full capacity.
-        self.assertEqual(
-            pool.mamba_allocator.available_size(), mamba_pool.size
-        )
+        self.assertEqual(pool.mamba_allocator.available_size(), mamba_pool.size)
 
     def test_flush_equals_fresh_boot_bitwise(self):
         """Full flush invariance: after the scheduler-side flush sequence
@@ -471,7 +473,10 @@ class TestFlushResetsMambaPool(unittest.TestCase):
                 d_pool.mamba_pool.replayssm_write_pos,
                 f_pool.mamba_pool.replayssm_write_pos,
             ),
-            (d_pool.mamba_pool.mamba_cache.temporal, f_pool.mamba_pool.mamba_cache.temporal),
+            (
+                d_pool.mamba_pool.mamba_cache.temporal,
+                f_pool.mamba_pool.mamba_cache.temporal,
+            ),
         ]
         pairs += list(
             zip(d_pool.mamba_pool.mamba_cache.conv, f_pool.mamba_pool.mamba_cache.conv)
@@ -483,8 +488,12 @@ class TestFlushResetsMambaPool(unittest.TestCase):
                     getattr(f_pool.mamba_pool.mamba_cache, name),
                 )
             )
-        pairs += list(zip(d_kvcache.full_kv_pool.k_buffer, f_kvcache.full_kv_pool.k_buffer))
-        pairs += list(zip(d_kvcache.full_kv_pool.v_buffer, f_kvcache.full_kv_pool.v_buffer))
+        pairs += list(
+            zip(d_kvcache.full_kv_pool.k_buffer, f_kvcache.full_kv_pool.k_buffer)
+        )
+        pairs += list(
+            zip(d_kvcache.full_kv_pool.v_buffer, f_kvcache.full_kv_pool.v_buffer)
+        )
         for i, (a, b) in enumerate(pairs):
             self.assertTrue(torch.equal(a, b), f"tensor pair {i} differs after flush")
 
@@ -561,9 +570,7 @@ class TestPoolClaimPoison(unittest.TestCase):
         new_slot = pool.mamba_allocator.alloc(1)
         pool.donate_mamba_ping_pong_slot(req, new_slot)
         self.assertIsNotNone(req.mamba_pingpong_clear_indices)
-        self.assertEqual(
-            req.mamba_pingpong_clear_indices.tolist(), new_slot.tolist()
-        )
+        self.assertEqual(req.mamba_pingpong_clear_indices.tolist(), new_slot.tolist())
 
     def test_poison_helper_touches_only_float_buffers(self):
         from sglang.srt.mem_cache.memory_pool import maybe_poison_pool_data
@@ -609,13 +616,32 @@ class _FakeSpecAlgo:
 class _FakeServerArgs:
     """Just enough surface for handle_max_mamba_cache's disable-radix branch."""
 
-    def __init__(self, *, max_running_requests, speculative_num_draft_tokens):
+    def __init__(
+        self,
+        *,
+        max_running_requests,
+        speculative_num_draft_tokens,
+        disable_radix_cache=True,
+        dcp_size=1,
+    ):
         self.max_mamba_cache_size = None
-        self.disable_radix_cache = True
+        self.disable_radix_cache = disable_radix_cache
         self.max_running_requests = max_running_requests
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        # #656: 8b48e32968 (2026-07-22) switched the intermediate-state
+        # reservation to the MAX draft width -- the adaptive k-ladder and the
+        # cross-algorithm secondary rung can exceed the boot shape's. Equal to
+        # the boot width here, which is what the expectations below assume and
+        # what a non-adaptive launch has.
+        self.max_speculative_num_draft_tokens = speculative_num_draft_tokens
         self.enable_dp_attention = False
         self.dp_size = 1
+        # #656: read by _auto_mamba_demand_active, which handle_max_mamba_cache
+        # consults BEFORE it can reach the disable-radix branch. Absent, the
+        # gate raised on its own first argument.
+        self.dcp_size = dcp_size
+        self.max_running_requests_user_set = False
+        self.max_running_requests_ceiling = None
         self.mamba_full_memory_ratio = 0.9
         self.overrides = []
 
@@ -631,6 +657,69 @@ class _FakeServerArgs:
             setattr(self, k, v)
 
 
+#: Every mixin method ``handle_max_mamba_cache`` invokes on ``self``.
+#:
+#: DECLARED HERE AND CHECKED AGAINST THE CODE (#504-a one-source-of-truth,
+#: #656). This stub used to bind a hand-picked two of them, and when
+#: a0ed7dc810 added ``elif self._auto_mamba_demand_active():`` the list was not
+#: extended -- so the stub raised AttributeError on the new call before it
+#: could reach the branch these tests are about. Binding a name at a time as
+#: each one blows up just re-arms the same trap for the next branch, so the
+#: list is declared and
+#: ``TestTheStubTracksTheFunctionItDrives`` fails when it drifts.
+_HANDLE_MAX_MAMBA_CACHE_SELF_CALLS = (
+    "_auto_mamba_demand_active",
+    "_auto_mamba_demand_size",
+    "_auto_mamba_target_concurrency",
+    "_calculate_mamba_ratio",
+    "_fit_mamba_pool_to_budget",
+    "_mamba_pool_budget_cost_gb",
+    "_stage_local_mamba_cache_per_req",
+    "_stage_mamba_layer_counts",
+    "_sync_uneven_mamba_cache_size",
+)
+
+
+def _direct_mixin_self_calls(func_name):
+    """Mixin methods called as ``self.X(...)`` directly inside ``func_name``.
+
+    A STATIC read of the real source, never a re-implementation of the call
+    graph: a test that restated which helpers the function uses would keep
+    passing after the function changed, which is the failure this exists to
+    catch.
+    """
+    src = textwrap.dedent(
+        inspect.getsource(getattr(ModelRunnerKVCacheMixin, func_name))
+    )
+    return {
+        node.func.attr
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and hasattr(ModelRunnerKVCacheMixin, node.func.attr)
+    }
+
+
+def _mixin_self_calls(func_name):
+    """TRANSITIVE closure of the above.
+
+    One level is not enough, and finding that out cost a second round: with
+    the direct callees bound, the demand path still died on
+    ``_mamba_pool_budget_cost_gb``, which ``handle_max_mamba_cache`` never
+    names -- ``_fit_mamba_pool_to_budget`` calls it. A stub that binds only
+    what the entry point mentions re-arms the same trap one frame deeper.
+    """
+    seen, stack = set(), [func_name]
+    while stack:
+        for callee in _direct_mixin_self_calls(stack.pop()):
+            if callee not in seen:
+                seen.add(callee)
+                stack.append(callee)
+    return seen
+
+
 def _make_mock_runner(per_req_bytes, server_args, has_spec):
     mock = SimpleNamespace(
         mambaish_config=SimpleNamespace(
@@ -638,13 +727,14 @@ def _make_mock_runner(per_req_bytes, server_args, has_spec):
         ),
         server_args=server_args,
         spec_algorithm=_FakeSpecAlgo(none=not has_spec),
+        dp_size=1,
     )
-    mock._calculate_mamba_ratio = MethodType(
-        ModelRunnerKVCacheMixin._calculate_mamba_ratio, mock
-    )
-    mock._sync_uneven_mamba_cache_size = MethodType(
-        ModelRunnerKVCacheMixin._sync_uneven_mamba_cache_size, mock
-    )
+    # BOUND FROM THE REAL CLASS, not stubbed out. The point of driving the
+    # production function is that the branches it takes are the production
+    # branches; replacing a gate with a lambda would make the disable-radix
+    # tests below pass without ever asking the gate anything.
+    for name in _HANDLE_MAX_MAMBA_CACHE_SELF_CALLS:
+        setattr(mock, name, MethodType(getattr(ModelRunnerKVCacheMixin, name), mock))
     mock.handle_max_mamba_cache = MethodType(
         ModelRunnerKVCacheMixin.handle_max_mamba_cache, mock
     )
@@ -680,9 +770,7 @@ class TestCheckpointIntervalValidation(unittest.TestCase):
     def test_conflicting_track_interval_rejected(self):
         args = self._args(2048)
         with self.assertRaises(ValueError):
-            args._handle_mamba_checkpoint_interval(
-                self._view(args, track_interval=512)
-            )
+            args._handle_mamba_checkpoint_interval(self._view(args, track_interval=512))
 
     def test_chunk_multiple_required(self):
         args = self._args(FLA_CHUNK_SIZE + 1)
@@ -741,9 +829,7 @@ class TestDisableRadixJointFit(unittest.TestCase):
         mock = _make_mock_runner(self.PER_REQ, args, has_spec=False)
         rest = mock.handle_max_mamba_cache(4.0)
         budget_bytes = 4.0 * 0.9 / 1.9 * GB
-        self.assertEqual(
-            args.max_mamba_cache_size, int(budget_bytes // self.PER_REQ)
-        )
+        self.assertEqual(args.max_mamba_cache_size, int(budget_bytes // self.PER_REQ))
         self.assertGreater(rest, 0)
 
     def test_zero_budget_raises_actionable_error(self):
@@ -752,6 +838,131 @@ class TestDisableRadixJointFit(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             mock.handle_max_mamba_cache(0.01)
         self.assertIn("max_mamba_cache_size", str(ctx.exception))
+
+
+class TestTheStubTracksTheFunctionItDrives(unittest.TestCase):
+    """#656: the stub's bound-method list against the real call graph.
+
+    ORIGIN. a0ed7dc810 ("[DCP] Auto-size the mamba state pool by demand under
+    uneven DCP", 2026-07-15) added 132 lines to model_runner_kv_cache_mixin.py
+    -- including `elif self._auto_mamba_demand_active():` in
+    handle_max_mamba_cache -- and touched no test file. This stub bound two of
+    the mixin methods that function calls, so from that commit on it raised
+
+        AttributeError: 'types.SimpleNamespace' object has no attribute
+        '_auto_mamba_demand_active'
+
+    before reaching the disable-radix branch TestDisableRadixJointFit is about.
+
+    IT WAS INVISIBLE FOR SIX WEEKS FOR A SEPARATE REASON. d8a5a25c36
+    (upstream #25173, 2026-06-01) had already made this whole directory
+    uncollectable with an unguarded NIXL import, six weeks BEFORE the defect
+    landed -- the guard was down when the break arrived. Both halves are
+    needed to explain it, and only the second was ever recorded.
+
+    NOT A LIVE SERVING DEFECT. ModelRunner inherits ModelRunnerKVCacheMixin
+    (model_runner.py:426), the sole production caller is
+    `self.handle_max_mamba_cache(rest_memory)` inside that same mixin
+    (model_runner_kv_cache_mixin.py:725), and no production code anywhere in
+    model_executor binds these methods with MethodType. Every real `self` has
+    every one of them. The defect is confined to this harness.
+    """
+
+    def test_the_declared_list_matches_the_functions_real_self_calls(self):
+        self.assertEqual(
+            set(_HANDLE_MAX_MAMBA_CACHE_SELF_CALLS),
+            _mixin_self_calls("handle_max_mamba_cache"),
+            "handle_max_mamba_cache calls a different set of mixin methods "
+            "than this stub binds. Add the new name to "
+            "_HANDLE_MAX_MAMBA_CACHE_SELF_CALLS -- an unbound one raises "
+            "AttributeError on whichever branch reaches it first, which is "
+            "how a0ed7dc810 broke four tests nobody could see",
+        )
+
+    def test_the_gate_is_bound_from_the_real_class(self):
+        """Not stubbed. A lambda here would let every test below pass while
+        the production gate went unasked."""
+        args = _FakeServerArgs(max_running_requests=48, speculative_num_draft_tokens=4)
+        mock = _make_mock_runner(1 << 20, args, has_spec=True)
+        self.assertIs(
+            mock._auto_mamba_demand_active.__func__,
+            ModelRunnerKVCacheMixin._auto_mamba_demand_active,
+        )
+
+
+class TestTheDemandGateIsConsultedBothWays(unittest.TestCase):
+    """Both directions of `_auto_mamba_demand_active`, through the real call.
+
+    The four TestDisableRadixJointFit cases pin the gate answering FALSE -- if
+    binding the method had flipped them to the demand branch, their expected
+    values would have moved and the "fix" would have been a behaviour change
+    wearing a harness commit. That direction is asserted here explicitly
+    rather than left implicit in four unchanged numbers.
+    """
+
+    PER_REQ = 64 << 20
+
+    def tearDown(self):
+        set_cp_token_ratios(None)
+
+    def test_the_stock_stub_takes_the_fixed_fraction_path(self):
+        set_cp_token_ratios(None)
+        args = _FakeServerArgs(max_running_requests=48, speculative_num_draft_tokens=4)
+        mock = _make_mock_runner(self.PER_REQ, args, has_spec=True)
+        self.assertFalse(mock._auto_mamba_demand_active())
+        mock.handle_max_mamba_cache(1000.0)
+        self.assertNotIn(
+            "mamba_pool.demand_driven", [src for src, _f in args.overrides]
+        )
+
+    def test_an_uneven_vector_with_radix_on_takes_the_demand_path(self):
+        """The TRUE direction. Without it, binding the method would be pinned
+        only where it answers False, i.e. the new branch would still be
+        untested by this file."""
+        set_cp_token_ratios([30, 17, 17])
+        args = _FakeServerArgs(
+            max_running_requests=48,
+            speculative_num_draft_tokens=None,
+            disable_radix_cache=False,
+            dcp_size=3,
+        )
+        mock = _make_mock_runner(self.PER_REQ, args, has_spec=False)
+        self.assertTrue(mock._auto_mamba_demand_active())
+        mock.handle_max_mamba_cache(1000.0)
+        self.assertIn("mamba_pool.demand_driven", [src for src, _f in args.overrides])
+        self.assertIsNotNone(args.max_mamba_cache_size)
+        self.assertGreater(args.max_mamba_cache_size, 0)
+
+    def test_a_uniform_vector_is_not_uneven_and_stays_on_the_fixed_path(self):
+        """All-equal vectors use the even modulo fast path, so the gate must
+        say False even with a vector installed and radix on."""
+        set_cp_token_ratios([1, 1, 1])
+        args = _FakeServerArgs(
+            max_running_requests=48,
+            speculative_num_draft_tokens=None,
+            disable_radix_cache=False,
+            dcp_size=3,
+        )
+        mock = _make_mock_runner(self.PER_REQ, args, has_spec=False)
+        self.assertFalse(mock._auto_mamba_demand_active())
+
+    def test_an_explicit_cache_size_never_reaches_the_gate(self):
+        """max_mamba_cache_size is the branch ABOVE the elif; an explicit pin
+        must win even under uneven DCP."""
+        set_cp_token_ratios([30, 17, 17])
+        args = _FakeServerArgs(
+            max_running_requests=48,
+            speculative_num_draft_tokens=None,
+            disable_radix_cache=False,
+            dcp_size=3,
+        )
+        args.max_mamba_cache_size = 1234
+        mock = _make_mock_runner(self.PER_REQ, args, has_spec=False)
+        mock.handle_max_mamba_cache(1000.0)
+        self.assertIn("mamba_pool.per_dp_shard", [src for src, _f in args.overrides])
+        self.assertNotIn(
+            "mamba_pool.demand_driven", [src for src, _f in args.overrides]
+        )
 
 
 if __name__ == "__main__":
