@@ -4,12 +4,20 @@
 boots, the measurement pass, the act leg with the decision rule live,
 extraction, teardown, sanctioned restore.
 
-**Derived from** the merged line `ac0d1f36f3` (`feat/route-a-631` ==
-`integration/r2` at the time of writing) plus branch `feat/desk-363-act`,
-worktree `/spinning/wt-desk-363-act`,
-`PYTHONPATH=/spinning/wt-desk-363-act/python`. Every flag, env var and script
-below was verified against the REAL parser and the REAL files on that branch
-(§11); nothing here was grepped.
+**Derived from** the merged line, `feat/route-a-631` == `integration/r2`,
+worktree `/spinning/wt-merge-r14`,
+`PYTHONPATH=/spinning/wt-merge-r14/python`. Every flag, env var and script
+below was verified against the REAL parser and the REAL files (§11a, re-run
+for R14); nothing here was grepped.
+
+> **R14 REPAIRS — four numbers in this runsheet were wrong, and each cost the
+> ACT window a boot or a measurement.** The reserve in §4.1 breached the
+> corridor law; the driver in §4.3 could not produce enough boundaries to feed
+> §9's own analysis command; `--tp` is not a declared flag; and port 30030
+> receives the router's traffic. All four are corrected below WITH the
+> measurement that condemned them, so the next shift can see why rather than
+> re-derive it. A runsheet whose profile refuses its own tool costs a window
+> every time it is executed faithfully.
 
 > Read `docs/rig-runbook.md` before the first boot — it is the source of truth
 > for launch mechanics and it outranks any command line copied from a runsheet,
@@ -110,8 +118,8 @@ agreeable.
 ## 3. PREFLIGHT — CPU only, before claiming any card
 
 ```bash
-cd /spinning/wt-desk-363-act
-export PYTHONPATH=/spinning/wt-desk-363-act/python
+cd /spinning/wt-merge-r14
+export PYTHONPATH=/spinning/wt-merge-r14/python
 PY=/spinning/htsglang-gpu/.venv/bin/python
 
 # 3a. the window preflight (flags, gate evidence, census, stage table).
@@ -154,7 +162,7 @@ Whoever stops serving owns bringing it back (§10).
 ```bash
 NVRTC=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
 export LD_LIBRARY_PATH="$NVRTC:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH=/spinning/wt-desk-363-act/python
+export PYTHONPATH=/spinning/wt-merge-r14/python
 export SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 export SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
@@ -162,17 +170,59 @@ export SGLANG_TRANSIENT_CENSUS=1 SGLANG_RESIDENCY_CENSUS_DIR=$OUT/census
 export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act/stage_measurements.json
 
 MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
-COMMON="--model-path $MODEL --tp 3 --rank-gpu-id 0,1,2
-  --rank-tp-ratio auto-performance --rank-auto-reserve-mib 3000,2700,2700
+COMMON="--model-path $MODEL --tp-size 3 --rank-gpu-id 0,1,2
+  --rank-tp-ratio auto-performance --rank-auto-reserve-mib 5500,3800,3800
   --kv-cache-dtype fp8_e4m3 --context-length 32768 --trust-remote-code
   --max-running-requests 16
   --speculative-algorithm NEXTN --speculative-num-steps 3
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-  --enable-metrics --host 127.0.0.1 --port 30030"
+  --enable-metrics --host 127.0.0.1 --port 30041"
 ```
 
+**The reserve is `5500,3800,3800`, and the previous value cost a boot (R13).**
+`3000,2700,2700` was measured on the first B1 attempt of the ACT window and
+BREACHES the corridor law on this rig — 5497 samples/card at 100 ms, NVML FREE:
+
+| card | min free | samples below 1024 |
+|---|---|---|
+| gpu0 | **443 MiB** | **4528 of 5497** |
+| gpu1 | 6116 MiB | 0 |
+| gpu2 | 2931 MiB | 0 |
+
+First breach ~97 s in and steady to the end, so it is not a load transient, and
+the squeeze is on ONE card while the other two sit loose. Recorded separately
+because it is the more interesting half: **the squeezed rank had asked for a
+2700 MiB reserve and was left 443 MiB, 2257 MiB below its own request** — not
+explained by the ~424/518 MiB carve-out, and owed an answer by whoever next
+touches the reserve arithmetic. `5500,3800,3800` is this rig's recorded stress
+reserve, is what the previous 363 window booted with, and passes with margin.
+Evidence: `/spinning/evidence-363-act/B1-r1/corridor.csv`.
+
 `--rank-auto-reserve-mib 2200` on the 3080s **tips** (OOM in the GDN prefill
-scratch; the 80-token warm-up survives and fakes success). 2700 carries.
+scratch; the 80-token warm-up survives and fakes success). 2700 carries the
+boot but not the corridor, per the table above.
+
+**`--tp-size`, not `--tp`.** `--tp 3` parses today only through argparse's
+unambiguous-prefix matching: `--tp-size` is the sole declared `--tp*` flag.
+The first time any other one lands the prefix becomes ambiguous and every boot
+in this runsheet dies at parse time. Verified by building the parser (§11).
+
+**Port 30041, not 30030.** The local router on 30099 forwards to 30030, so a
+measurement instance on 30030 receives the Qwen agent fleet's traffic and its
+ms/round is not its own. Both previous 363 windows moved to 30041 in the
+window and left the runsheet saying 30030.
+
+**Never paste the extra launch arguments into a `bash -c` STRING.** The `;`
+inside `--kv-reshard-vectors '2,11,10;3,10,10'` terminates the command: the
+server comes up carrying ONE vector — which cannot flip, so the act leg runs
+with nowhere to go and reports "no flip targets" as a finding about the
+controller — and `> boot.log 2>&1` becomes a separate shell command, so there
+is no boot log at all. Pass the arguments as an array, and confirm what the
+process actually got:
+
+```bash
+tr '\0' ' ' < /proc/<pid>/cmdline; echo      # not the launcher's own echo
+```
 
 ### 4.2 The four boots
 
@@ -214,10 +264,45 @@ band needs to be worth reading.
 | Return | 300 s | decode-heavy again, identical to settle |
 
 ```bash
-$PY scripts/regime_gates/workload.py --base http://127.0.0.1:30030 \
-  --repeats 2 --burst 16 --burst-tokens 6000 \
+$PY scripts/regime_gates/workload.py --base http://127.0.0.1:30041 \
+  --repeats 6 --burst 16 --burst-tokens 6000 \
   --drain 12 --drain-tokens 900 --mixed 8 --idle-s 25
 ```
+
+**`--repeats 6`, and the previous value could not feed §9's own tool.**
+`--repeats 2` was run to completion on both arms of the ACT window and
+`msround_split.py` then refused the floor outright:
+
+| | B1 | B2 |
+|---|---|---|
+| verdict boundaries | 22 646 | 11 872 |
+| **ACTIVE** boundaries | **48** | **43** |
+| `prefill_heavy` | **27** | **24** |
+
+```
+REFUSED: arm segment has 7 boundaries, below --min-samples 30. A band from a
+handful of samples is a number, not a measurement.
+```
+
+27 minus `--warmup 20` is 7. The rig is idle in essentially every window: 48
+active boundaries out of 22 646. **Do not lower `--min-samples` or `--warmup`
+to admit the segment** — that is solving against the instrument, and
+`--warmup 5` would still have left 22. Make the driver longer instead.
+
+The escalation was measured rather than guessed: `--repeats 4` was tried
+first, a mid-run count at 2.7 minutes showed 10 `prefill_heavy` boundaries
+(~3.7/min) extrapolating to ~41 for the full run and **21 after warmup** —
+still short — so that arm was stopped at 3 minutes rather than run to a
+foreseeable refusal. `--repeats 6` yields ~73 `prefill_heavy`, 53 after
+warmup, which clears `--min-samples 30` with margin. Measured: B1 at
+`--repeats 6` produced 73, 216 requests, 0 failed, in 16 minutes.
+
+`--burst` is NOT the lever: it raises the burst arm's DECODE work in the same
+proportion (48 concurrent x 6000 generated tokens), so it costs ~3x the wall
+clock for the same boundary count. `--repeats` buys boundaries linearly.
+
+**Budget the window accordingly:** each measurement arm is ~16 minutes of
+driver, so B1 + B2 + B3's four phases + B4 is the bulk of a 90-minute window.
 
 **Same driver flags on every boot.** The gate-3 pair proved what a workload
 change between arms costs; a floor measured under one load and a delta under
@@ -245,7 +330,7 @@ cost the controller will pay.
 grep -o '"round": [0-9]*' $OUT/trace.rank0.jsonl | tail -1     # -> $REF_TO
 
 # (2) THE MOVE -- arm the candidate vector; returns immediately
-curl -s -X POST http://127.0.0.1:30030/kv_reshard \
+curl -s -X POST http://127.0.0.1:30041/kv_reshard \
      -H 'content-type: application/json' -d '{"target_vector": [3,10,10]}'
 grep 'KV-RESHARD DONE' $OUT/boot.log | tail -1          # carries total_ms
 grep -o '"round": [0-9]*' $OUT/trace.rank0.jsonl | tail -1     # -> $STAGE_FROM (+2 boundaries)
@@ -254,9 +339,9 @@ grep -o '"round": [0-9]*' $OUT/trace.rank0.jsonl | tail -1     # -> $STAGE_FROM 
 
 # (4) FLIP SAMPLES -- three round trips, still under load
 for i in 1 2 3; do
-  curl -s -X POST http://127.0.0.1:30030/kv_reshard -H 'content-type: application/json' \
+  curl -s -X POST http://127.0.0.1:30041/kv_reshard -H 'content-type: application/json' \
        -d '{"target_vector": [2,11,10]}'; sleep 45
-  curl -s -X POST http://127.0.0.1:30030/kv_reshard -H 'content-type: application/json' \
+  curl -s -X POST http://127.0.0.1:30041/kv_reshard -H 'content-type: application/json' \
        -d '{"target_vector": [3,10,10]}'; sleep 45
 done
 grep -c 'KV-RESHARD DONE' $OUT/boot.log                  # expect >= 7
@@ -288,13 +373,32 @@ mean under-charges exactly the expensive one.
    window log records that the first act leg ran under one.
 3. **A corridor breach on any boot fails the window regardless of everything
    else**, and it is a code defect rather than a tight margin.
+4. **A headroom REFUSAL from `/kv_reshard` is a RESULT, not a failure.** R14
+   fixed the defect that made the ACT window's B3 and B3b crash the server:
+   the cutover now prices its own transient buffers and the group refuses,
+   collectively, when any rank cannot afford them above the 1024 MiB corridor
+   floor. When that fires, `boot.log` carries
+
+   ```
+   KV-RESHARD REFUSED for headroom at round <N>: the move stays on the
+   incumbent vector (...). ... this rank: <free> free, 1024.0 MiB corridor
+   floor, <peak> transient needed (staged .. + packed .. + pack-peak ..
+   + recv ..) -> margin <margin>
+   ```
+
+   **Record the refusal and its arithmetic verbatim** — every rank logs its
+   own line, so the group-MIN is readable from the set of them — and then try
+   a LIGHTER load point within the window if one is corridor-safe. Do not
+   raise the reserve to force the move through: that invalidates the B1/B2
+   floor the act leg is judged against. A named refusal with margins is a
+   valid window outcome; a flip that breaks the corridor is not.
 
 ---
 
 ## 6. THE MEASUREMENT PASS — turn the boots into the canon
 
 ```bash
-cd /spinning/wt-desk-363-act && export PYTHONPATH=/spinning/wt-desk-363-act/python
+cd /spinning/wt-merge-r14 && export PYTHONPATH=/spinning/wt-merge-r14/python
 export SGLANG_STAGE_MEASUREMENTS=/spinning/evidence-363-act/stage_measurements.json
 
 $PY -m sglang.srt.planner.stage_measure_pass \
@@ -462,7 +566,27 @@ Four of six is not a pass.
 
 ---
 
-## 11. DESK VALIDATION ALREADY DONE (CPU, branch `feat/desk-363-act`)
+## 11. DESK VALIDATION ALREADY DONE (CPU)
+
+### 11a. RE-VERIFIED FOR R14, against the BUILT parser
+
+Every flag this runsheet launches with, checked by constructing
+`ServerArgs.add_cli_args` and reading `_actions` — not by grep, which reports
+a false MISSING because the flags are derived from annotated dataclass field
+names (the AUDIT-251 trap).
+
+| flag | verdict |
+|---|---|
+| `--model-path` `--rank-gpu-id` `--rank-tp-ratio` `--rank-auto-reserve-mib` `--kv-cache-dtype` `--context-length` `--trust-remote-code` `--max-running-requests` `--speculative-algorithm` `--speculative-num-steps` `--speculative-eagle-topk` `--speculative-num-draft-tokens` `--enable-metrics` `--host` `--port` `--regime-controller` `--regime-stage-clock` `--regime-trace` `--regime-gate-evidence` `--kv-reshard-vectors` `--enable-vram-dial` | **21/21 PASS** |
+| `--tp` | **NOT A DECLARED FLAG.** Parses only by unambiguous-prefix match against `--tp-size`, the sole `--tp*` flag on this line. Runsheet corrected to `--tp-size`. |
+| `--regime-interval`, `--regime-log-every` | **CORRECTLY ABSENT** — any runsheet naming them is stale |
+
+Values the parser reports, so a boot does not have to discover them:
+`--regime-controller` choices `['off','observe','act']`, default `off`;
+`--rank-auto-reserve-mib` default `auto`; `--kv-reshard-vectors` default
+`None`; `--rank-tp-ratio` default `None`.
+
+### 11b. Inherited from the desk branch (now merged)
 
 | Item | Result |
 |---|---|
