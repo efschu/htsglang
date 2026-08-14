@@ -1813,6 +1813,76 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
     return None, "probe failed", gpus
 
 
+def _cached_profile_for_view(uuids: Sequence[str], driver: str) -> Optional[dict]:
+    """The cached profile that DESCRIBES the cards this process can see.
+
+    #363, and the same defect the card probe had. ``_load_profile`` compares
+    ``profile["uuids"]`` to the caller's for EQUALITY, which is right for the
+    process that WRITES a profile and wrong for every process that reads one:
+    a scheduler rank runs under a narrowed ``CUDA_VISIBLE_DEVICES`` and sees
+    one card where the writer saw three. Measured on metal:
+
+        CUDA_VISIBLE_DEVICES=0,1,2 -> hardware profile PRESENT
+        CUDA_VISIBLE_DEVICES=1     -> hardware profile ABSENT
+
+    The consequence is quieter than a crash and worse than one: with the
+    profile absent, ``rates_from_probe`` loses the v3 ``gemm_lanes`` map and
+    every rank prices an fp8 / int8 / W4A16 checkpoint on the dense bf16
+    probe (#324/#359) -- so the RANKS solve a different problem than the
+    dashboard does, from the same disk, and neither says so.
+
+    Containment, exactly as in ``rigmon.card_probe.matching_cached_probe_json``:
+    a profile matches when it describes every card this process can see, same
+    driver. Directional, so a profile of FEWER cards still cannot serve a
+    wider view. Exact match first, then the tightest superset, then newest.
+    Read path only -- the write and probe paths keep exact rig identity.
+    """
+    want = {str(u) for u in uuids}
+    if not want:
+        return None
+    best = None  # (-extra, mtime, profile)
+    try:
+        names = os.listdir(PROFILE_CACHE_DIR)
+    except OSError:
+        return None
+    for name in names:
+        if not (name.startswith("hw_profile-") and name.endswith(".json")):
+            continue
+        path = os.path.join(PROFILE_CACHE_DIR, name)
+        try:
+            with open(path) as f:
+                profile = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(profile, dict):
+            continue
+        if profile.get("driver") != driver:
+            continue
+        got = {str(u) for u in (profile.get("uuids") or [])}
+        if not got or not want <= got:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        key = (-(len(got) - len(want)), mtime)
+        if best is None or key > best[0]:
+            best = (key, profile)
+    if best is None:
+        return None
+    if best[0][0] != 0:
+        logger.info(
+            "auto-performance: this process sees %d card(s); the matching "
+            "hardware profile describes more, including all of them. Using "
+            "it -- a narrowed CUDA_VISIBLE_DEVICES is a smaller VIEW of this "
+            "rig, not another rig, and without it this rank would price "
+            "quantized weights on the dense bf16 lane while a full-view "
+            "process uses the measured ones.",
+            len(want),
+        )
+    return best[1]
+
+
 def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
     """Cache-only variant of ``get_hardware_profile``: returns the cached
     profile when its (sorted GPU UUIDs, driver, version) key matches, else
@@ -1835,6 +1905,19 @@ def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
         if old is not None and int(old.get("version") or 0) == old_version:
             migrated, _ = migrate_profile(old)
             return migrated, gpus
+    # #363: nothing is keyed to THIS view. A scheduler rank's view is narrowed,
+    # so the exact-key lookups above can only ever miss on it. Fall back to a
+    # profile that DESCRIBES this view rather than reporting "no profile" and
+    # silently pricing quantized weights on the dense lane.
+    wider = _cached_profile_for_view(uuids, driver)
+    if wider is not None:
+        if wider.get("version") == PROFILE_VERSION:
+            return wider, gpus
+        try:
+            migrated, _ = migrate_profile(wider)
+            return migrated, gpus
+        except Exception:  # noqa: BLE001 -- a migration failure is a miss
+            return None, gpus
     return None, gpus
 
 
