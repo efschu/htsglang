@@ -418,7 +418,20 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
                 return _cleared()
 
         def relief(
-            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+            _scheduler,
+            _reduce,
+            *,
+            want_bytes,
+            guard,
+            direction="",
+            discretionary_bytes=0,
+            # #656 C22-d: the live-slot ballot rides this same call. Named
+            # explicitly rather than swallowed by **kwargs, so a rename on the
+            # production side breaks this double loudly instead of letting it
+            # keep accepting a call it no longer models.
+            slots_digest=0,
+            max_live_row=-1,
+            slot_ballot_out=None,
         ):
             order.append("kv-relief")
             return 300 * MIB
@@ -442,7 +455,20 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
 
     def test_a_relief_that_freed_nothing_is_not_counted(self):
         def relief(
-            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+            _scheduler,
+            _reduce,
+            *,
+            want_bytes,
+            guard,
+            direction="",
+            discretionary_bytes=0,
+            # #656 C22-d: the live-slot ballot rides this same call. Named
+            # explicitly rather than swallowed by **kwargs, so a rename on the
+            # production side breaks this double loudly instead of letting it
+            # keep accepting a call it no longer models.
+            slots_digest=0,
+            max_live_row=-1,
+            slot_ballot_out=None,
         ):
             return 0
 
@@ -458,7 +484,20 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
 
     def test_a_relief_that_raises_does_not_take_the_flip_down(self):
         def relief(
-            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+            _scheduler,
+            _reduce,
+            *,
+            want_bytes,
+            guard,
+            direction="",
+            discretionary_bytes=0,
+            # #656 C22-d: the live-slot ballot rides this same call. Named
+            # explicitly rather than swallowed by **kwargs, so a rename on the
+            # production side breaks this double loudly instead of letting it
+            # keep accepting a call it no longer models.
+            slots_digest=0,
+            max_live_row=-1,
+            slot_ballot_out=None,
         ):
             raise RuntimeError("arena is gone")
 

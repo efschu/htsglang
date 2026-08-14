@@ -75,6 +75,11 @@ FAMILY=(
     # gate's arming floor as ONE declared pair, and stops a private 1024
     # literal creeping back into an instrument that audits the gate.
     test/registered/scheduler/test_flip_frame_agreement_656.py
+    # #656 C22-d, the SET half of the frame agreement. Arrived with the soak
+    # shift's red test and was NOT added to this list in that commit -- the
+    # SIXTH consecutive round in which the canonical family list was short
+    # (MERGE-R9 section 2 wrote the fifth). Added here with the fix it pins.
+    test/registered/scheduler/test_flip_live_slot_agreement_656.py
     test/registered/unit/managers/test_corridor_threshold_pair_656.py
     test/registered/unit/managers/test_seam_margin_selfcal_656.py
     # SIXTH: the R2 shift, added with the list extended in the same commit.

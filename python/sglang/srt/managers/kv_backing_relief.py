@@ -235,6 +235,63 @@ def collective_cap_target(reduced):
     return int(capable)
 
 
+#: The live-slot half of the widened rung payload, for a rank that has no
+#: relief object to read (no pool, a stub runtime, a hermetic test). The
+#: digest pair is ``(0, 0)`` so it cannot make the group's digests disagree by
+#: itself, the row extent is ``-1`` (contributes nothing to the MAX), and the
+#: backing is :data:`_UNBOUNDED_ROWS` so the MIN is decided by whichever rank
+#: actually knows its backing.
+SLOT_ABSTAIN = (0, 0, -1, _UNBOUNDED_ROWS)
+
+
+def slot_proposal(digest: int, max_live_row: int, backed_rows: int):
+    """This rank's four-field proposal for the group's LIVE SLOT agreement.
+
+    #656 C22-d. The pairing is the same one the fit verdict and the frame
+    ballot already use, so it costs four integers on a reduction the rung
+    runs anyway and no second collective::
+
+        [ digest, -digest, -max_live_row, backed_rows ]
+            |        |          |             `-- MIN backed rows: the highest
+            |        |          |                 row id EVERY rank has mapped
+            |        |          `-- negated, so MIN yields the group's MAX
+            |        |              live row id
+            |        `-- negated, so MIN yields the MAX digest
+            `-- MIN digest: with the pair above, ``min == -max`` answers
+                "do the ranks enumerate the SAME live slot set"
+
+    ``digest`` must be a function of the SET and nothing else -- the caller
+    feeds it a sorted, deduplicated enumeration -- or this ballot would
+    disagree on a reordering that is not a divergence at all.
+    """
+    return (int(digest), -int(digest), -int(max_live_row), int(backed_rows))
+
+
+def collective_slot_ballot(reduced):
+    """Decode the live-slot half of the reduced rung payload.
+
+    Returns ``None`` when the payload is too short (a peer on an older tree,
+    or a channel that truncated), which the caller must treat as "no verdict"
+    and not as agreement -- an absent ballot leaves today's behaviour, which
+    is the frame ballot refusing the flip.
+    """
+    if reduced is None or len(reduced) < 4:
+        return None
+    lo = int(reduced[0])
+    hi = -int(reduced[1])
+    return {
+        "agree": lo == hi,
+        "digest_lo": lo,
+        "digest_hi": hi,
+        # The group's highest live row id: the id space a union has to span.
+        "max_live_row": -int(reduced[2]),
+        # The highest row id EVERY rank has physically backed. A union may not
+        # contain a row at or above it: on the rank whose backing ends there,
+        # the mover would read unmapped memory.
+        "min_backed_rows": int(reduced[3]),
+    }
+
+
 class KvRowCap:
     """Withhold slot ids above ``cap`` from the allocator's free list.
 
@@ -1113,6 +1170,45 @@ class KvBackingRelief:
         if self._cap.engaged and self._cap.cap is not None:
             return int(self._cap.cap)
         return self._reservation_rows()
+
+    def backed_rows(self) -> int:
+        """Rows this rank has PHYSICALLY BACKED, as a public reading.
+
+        #656 C22-d: the seam's live-slot agreement needs it. A row id above
+        this number is not mapped on this rank, so a framed set containing one
+        would have the mover read unmapped memory -- a
+        ``cudaErrorIllegalAddress`` that kills every rank rather than raising.
+        The agreement therefore bounds the group's union by the MIN of this
+        value across ranks, and that minimum has to come from a public reading
+        rather than from a private one the caller reaches around for.
+        """
+        return int(self._current_rows())
+
+    def normalize_free_lists(self) -> None:
+        """Put this rank's free lists in ascending id order, unconditionally.
+
+        #656 C22-d, and it is the SOURCE half of the live-slot divergence the
+        agreement below repairs after the fact.
+
+        ``reconcile_to`` already ends with this sort, but it only ever runs
+        when :func:`collective_cap_target` returns a level -- and that function
+        returns ``None`` precisely when the group's exposed counts already
+        AGREE. So the one state in which nothing normalises the order is the
+        state in which the counts are equal, which is exactly the state the
+        metal wedged in: rank PP1 had taken a corridor-bounded ``recover()``
+        (``KvRowCap.release`` SORTS, ``engage`` preserves eviction order) while
+        its peers, which never shrank, had never sorted at all. Identical
+        membership, identical counts, different ORDER -- and the allocator
+        takes from the FRONT, so the next request got a different physical row
+        id on PP1 than on PP0/PP2. From there the live slot sets part company
+        with nothing in the pool census to show for it.
+
+        Called on every rank on every seam round, from the one point every
+        rank reaches unconditionally. It is a pure ordering of ids: no bytes
+        move, no capacity changes, and doing it when it was already sorted is
+        free.
+        """
+        self._cap.sort_free_lists()
 
     def cap_proposal(self):
         """This rank's four-field proposal for the group's exposed row level.
