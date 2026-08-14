@@ -5,8 +5,28 @@ unit tests only. No line of the intra-phase axis has executed on a GPU. This
 ticket is the window that would change that; it is written so the next GPU
 window can execute it without re-deriving anything.
 
-Branch: `feat/regime-stage-actuator-363`. Worktree `/spinning/wt-363-stages`,
-`PYTHONPATH=/spinning/wt-363-stages/python`.
+> **SUPERSEDED FOR EXECUTION (2026-08-14) by
+> `docs/dev/363/RUNSHEET_363_STAGE_CLOCK_WINDOW.md`.** This ticket remains the
+> statement of what is measured and why; the runsheet is what the GPU shift
+> executes. Four desk findings against the merged line change how this ticket
+> is run, and two of them are blocking:
+>
+> * **The branch pointer below is stale.** The actuator merged as `b2f0a749ac`
+>   and rides `integration/r2` flag-gated OFF (`c3919fe1cb`).
+> * **BLOCKING — `act` is refused at parse time** unless all FOUR entry-gate
+>   items pass with sources, and `f4_card_comparison` is produced by an `act`
+>   arm. That circularity is real; the runsheet §3 has the honest bootstrap.
+> * **BLOCKING — §4's boot line lacks a required actuator flag.** `act` also
+>   refuses without `--kv-reshard-vectors` or `--enable-vram-dial`
+>   (`server_args.py:7784-7793`).
+> * **A3 is not evaluable as written**: the trace carries no wall clock, so
+>   "the last 120 s of the SHIFT phase" must be segmented by regime label or
+>   round range; and the control arm carries no `ms_decision` at all, so the
+>   compute/wait SPLIT cannot come from the arm-vs-control pair.
+
+Branch: `chore/ticket-363-window` (was `feat/regime-stage-actuator-363`, now
+merged). Worktree `/spinning/wt-363-window`,
+`PYTHONPATH=/spinning/wt-363-window/python`.
 
 ---
 
