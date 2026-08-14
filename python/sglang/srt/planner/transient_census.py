@@ -197,7 +197,7 @@ class TransientCensus:
         STAGING exclusive, and a shared staging name defeats the whole idiom:
         measured hermetically, 23 of 600 concurrent flushes were LOST because
         a peer's ``os.replace`` renamed the file away mid-write, and on metal
-        the published file was left unparseable (#363 window 2026-08-14).
+        the published file was left unparsable (#363 window 2026-08-14).
         """
         return f"{path}.{os.getpid()}.tmp"
 
