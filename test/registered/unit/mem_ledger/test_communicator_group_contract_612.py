@@ -268,6 +268,93 @@ class TestTheUnderDeclaredGroupsAppear(unittest.TestCase):
         self.assertEqual(groups["attention_tp"].world_size, 1)
 
 
+class TestThePhaseFlipSecondaryGroupsAreDeclared(unittest.TestCase):
+    """#656: the flip-target set was the remaining under-declaration.
+
+    ``initialize_phase_flip_secondary_groups`` builds ``flip_tp``,
+    ``flip_dcp`` and ``flip_pp`` over the same world, and #605 placed
+    ``nccl_init_end`` AFTER that call on purpose -- so those communicators are
+    inside the window the NCCL term is measured over. Undeclared, their
+    buffers were charged to nobody AND left ``nccl_signature`` unmoved, which
+    means a figure measured on a non-flip launch was reusable on a flip one.
+    That is why fixing the declaration is a prerequisite for trusting the
+    term, not a tidying pass (MERGE-R9 12.6).
+    """
+
+    BASE = dict(tp_size=1, pp_size=3, dcp_size=1)
+
+    def _groups(self, **over):
+        sa = types.SimpleNamespace(**{**self.BASE, **over})
+        return {
+            g.name: g for g in communicator_groups_from_server_args(sa, list(range(3)))
+        }
+
+    def test_a_non_flip_launch_declares_none_of_them(self):
+        names = set(self._groups())
+        self.assertEqual(names & {"flip_tp", "flip_dcp", "flip_pp"}, set())
+
+    def test_a_flip_launch_declares_all_three(self):
+        groups = self._groups(enable_phase_flip=True, phase_flip_tp_vector="1,1,1")
+        self.assertIn("flip_tp", groups)
+        self.assertIn("flip_dcp", groups)
+        self.assertIn("flip_pp", groups)
+
+    def test_the_widths_come_from_the_vector_the_call_site_reads(self):
+        groups = self._groups(enable_phase_flip=True, phase_flip_tp_vector="2,1,1")
+        # model_runner passes tp_size = dcp_size = len(vector), pp_size = 1.
+        self.assertEqual(groups["flip_tp"].world_size, 3)
+        self.assertEqual(groups["flip_dcp"].world_size, 3)
+        self.assertEqual(groups["flip_pp"].world_size, 1)
+
+    def test_a_single_entry_vector_builds_no_flip_dcp(self):
+        """The construction site's condition is ``dcp_size > 1``, quoted.
+
+        Declaring it unconditionally would be the phantom-member direction on
+        a one-rank secondary set.
+        """
+        sa = types.SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            dcp_size=1,
+            enable_phase_flip=True,
+            phase_flip_tp_vector="4",
+        )
+        names = [g.name for g in communicator_groups_from_server_args(sa, [0])]
+        self.assertIn("flip_tp", names)
+        self.assertNotIn("flip_dcp", names)
+
+    def test_the_flip_set_changes_what_a_measurement_is_valid_for(self):
+        """The load-bearing falsifier for the NCCL term.
+
+        Without this, a TERM_NCCL_BUFFERS figure measured on a boot that built
+        no secondary set digests identically to one that built three more
+        communicators, and the ledger reuses it.
+        """
+        without = communicator_groups_from_server_args(
+            types.SimpleNamespace(**self.BASE), list(range(3))
+        )
+        with_flip = communicator_groups_from_server_args(
+            types.SimpleNamespace(
+                **{
+                    **self.BASE,
+                    "enable_phase_flip": True,
+                    "phase_flip_tp_vector": "1,1,1",
+                }
+            ),
+            list(range(3)),
+        )
+        self.assertNotEqual(nccl_signature(without), nccl_signature(with_flip))
+
+    def test_a_malformed_vector_does_not_raise_here(self):
+        """server_args is the judge of argv; the ledger runs before it.
+
+        A ValueError out of the inventory would turn a bad flag into a stack
+        trace from the memory ledger, which is the wrong place to learn it.
+        """
+        groups = self._groups(enable_phase_flip=True, phase_flip_tp_vector="1,x,1")
+        self.assertIn("flip_tp", groups)
+
+
 class TestTheDeclarationCitesItsSites(unittest.TestCase):
     def test_every_inventory_entry_names_a_construction_site(self):
         for name, rule in RUNTIME_COMMUNICATOR_GROUPS.items():
