@@ -527,7 +527,15 @@ class ItRidesTheExistingReductionAndAddsNoneTest(unittest.TestCase):
             proposals.append(sent[-1])
         del payloads
         for p in proposals:
-            self.assertEqual(len(p), 8, "4 shrink fields + 4 cap fields")
+            # 4 shrink + 4 cap + 4 live-slot (#656 C22-d). The width is the
+            # load-bearing claim, not the number: every decision this rung
+            # makes rides ONE reduction, and each round that widens it is a
+            # decision that did NOT get a collective of its own. R2 moved it
+            # 4 -> 8 for the cap agreement; C22-d moves it 8 -> 12 for the
+            # live slot set.
+            self.assertEqual(
+                len(p), 12, "4 shrink fields + 4 cap fields + 4 live-slot fields"
+            )
         self.assertEqual(len(sent), 3, "exactly one reduction per rank")
 
         # Now the real MIN across the group, applied on every rank.

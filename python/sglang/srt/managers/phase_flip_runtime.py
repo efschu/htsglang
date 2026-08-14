@@ -2164,6 +2164,23 @@ class PhaseFlipRuntime:
         #: apart from the aborts: a levelling is the fix working, an abort is
         #: the ballot catching what the levelling could not reach.
         self.corridor_cap_levelled = 0
+        #: #656 C22-d. Rounds the rung's ballot found the ranks enumerating
+        #: DIFFERENT live slot sets -- the failure that wedged boot_m3 after
+        #: 194 cutovers. Split three ways on purpose, because "the mechanism
+        #: fired" and "the mechanism worked" are different measurements and
+        #: the corpus has shipped that confusion before: ``divergences`` is
+        #: how often it was needed, ``agreements`` how often the union
+        #: repaired it, ``refusals`` how often the union reached past the
+        #: group's backing and the round had to abandon instead.
+        self.slot_set_divergences = 0
+        self.slot_set_agreements = 0
+        self.slot_set_refusals = 0
+        #: The set this rank last put on the ballot, and its digest. Since the
+        #: agreement above, that is not necessarily what ``_live_slots_fn``
+        #: returned, and the difference is the whole point.
+        self.last_framed_slots = None
+        self.last_framed_slots_digest = None
+        self.last_framed_digest = None
         #: Flips abandoned by the corridor gate (#656 item 15a) because no
         #: provider could fund the staging without breaking the floor.
         #: Distinct from staging_aborts: that one says "there is not enough
@@ -3396,6 +3413,46 @@ class PhaseFlipRuntime:
     #: be ATTRIBUTED. See _frame_digest_parts.
     FRAME_PARTS = ("slots", "waves", "geometry")
 
+    @staticmethod
+    def _slots_acc(slots: torch.Tensor):
+        """The live set's position-weighted accumulator, and its length.
+
+        Factored out of :meth:`_frame_digest_parts` WITHOUT changing a single
+        arithmetic step, because the same value has to be available one rung
+        earlier: the live-slot agreement (#656 C22-d) votes on it at the KV
+        rung, before the frame is computed, and a second implementation of the
+        same fold would be a divergence source of its own.
+
+        A pure function of the SET, given the sorted, deduplicated input every
+        caller feeds it -- which is what makes it usable as a membership
+        ballot. Fed raw it is order-sensitive by design; see
+        :meth:`_frame_digest` and the test that pins the distinction.
+        """
+        mod = _FRAME_DIGEST_MOD
+        s = slots.detach().to("cpu", torch.int64)
+        n = int(s.numel())
+        if not n:
+            return 0, 0
+        # Position-weighted so a permutation is not a collision; both
+        # ends sort, so any difference here is a real set difference.
+        acc = int(
+            (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod)
+            .sum()
+            .item()
+            % mod
+        )
+        return acc, n
+
+    def _slots_membership_digest(self, slots: torch.Tensor) -> int:
+        """The ``slots`` frame part, computed one rung early.
+
+        Bit-for-bit the value ``_frame_digest_parts(...)["slots"]`` produces,
+        so the rung's ballot and the frame's attribution can never disagree
+        about what "the live slot set" means.
+        """
+        acc, n = self._slots_acc(slots)
+        return (acc * 1000003 + n) % _FRAME_DIGEST_MOD
+
     def _frame_digest_parts(
         self,
         slots: torch.Tensor,
@@ -3427,19 +3484,7 @@ class PhaseFlipRuntime:
         safe to negate for the max half of each pair.
         """
         mod = _FRAME_DIGEST_MOD
-        s = slots.detach().to("cpu", torch.int64)
-        n = int(s.numel())
-        if n:
-            # Position-weighted so a permutation is not a collision; both
-            # ends sort, so any difference here is a real set difference.
-            acc = int(
-                (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod)
-                .sum()
-                .item()
-                % mod
-            )
-        else:
-            acc = 0
+        acc, n = self._slots_acc(slots)
         slots_part = (acc * 1000003 + n) % mod
 
         wave_terms: List[int] = [len(waves)]
@@ -4255,7 +4300,14 @@ class PhaseFlipRuntime:
             f"retried when occupancy drops"
         )
 
-    def _corridor_gate(self, staging_bytes: int, direction: str) -> str:
+    def _corridor_gate(
+        self,
+        staging_bytes: int,
+        direction: str,
+        slots_digest: int = 0,
+        max_live_row: int = -1,
+        slot_ballot_out: Optional[dict] = None,
+    ) -> str:
         """#656 item 15a: spill BEFORE the seam allocates. Returns "" if clear.
 
         WHY HERE AND NOT AT ``commit_range``. The seam's commits happen
@@ -4396,6 +4448,10 @@ class PhaseFlipRuntime:
                 guard=guard,
                 direction=direction,
                 discretionary_bytes=int(margin_bytes),
+                # #656 C22-d rides here too. See _agree_live_slots.
+                slots_digest=int(slots_digest),
+                max_live_row=int(max_live_row),
+                slot_ballot_out=slot_ballot_out,
             )
         except Exception as e:
             logger.error(
@@ -4820,6 +4876,146 @@ class PhaseFlipRuntime:
             offset += n * width
         return out
 
+    def _row_bounds_detail(self, tr: "PhaseFlipTransition") -> List[str]:
+        """Do BOTH pools cover the rows this plan touches? One list, no side
+        effects, so it can be recomputed after the live-slot agreement has
+        changed which rows the plan touches (#656 C22-d)."""
+        detail: List[str] = []
+        if tr.max_pp_row() >= self._pp.num_rows:
+            detail.append(
+                f"PP row {tr.max_pp_row()} vs pool {self._pp.num_rows} rows "
+                f"(the PP pool must cover every live global slot id)"
+            )
+        if tr.max_tp_row() >= self._tp.num_rows:
+            detail.append(
+                f"TP row {tr.max_tp_row()} vs pool {self._tp.num_rows} rows "
+                f"(the TP pool must cover the compact rows of vector "
+                f"{self._vec})"
+            )
+        return detail
+
+    def _agree_live_slots(self, slots: torch.Tensor, ballot: dict):
+        """#656 C22-d: make the ranks frame the SAME live slot SET.
+
+        WHAT #656 C22 CLOSED AND WHAT IT LEFT OPEN. The cap agreement
+        (``phase_flip_spill.apply_cap_agreement``) levels how MANY rows every
+        rank exposes, in the rung reduction that runs before ``_frame_digest``
+        in the same round. Boot ``boot_m3``, 2026-08-13, showed that is not
+        enough: the cap agreement fired (-15455 rows, then -77), the three
+        POOL CENSUS lines matched, and PP1 still framed a different digest in
+        four consecutive ``pp_to_tp`` episodes -- ``THE DIVERGING TERM IS: the
+        live slot set``. After 194 clean cutovers the instance never flipped
+        again. Levelling how many rows a rank exposes does not make the ranks
+        hold the SAME rows.
+
+        THE TRIGGER, NAMED. ``KvRowCap.release`` SORTS the free list;
+        ``engage`` preserves whatever order it found. A corridor-bounded
+        ``recover()`` therefore reorders the recovering rank's free list while
+        its peers, which never shrank, keep theirs in eviction order. The only
+        thing that re-normalises the group is ``reconcile_to``'s final sort --
+        and ``collective_cap_target`` returns ``None``, skipping it, exactly
+        when the exposed counts already AGREE. So a recovery whose row
+        shortfall is levelled (leg C's single 23199-row episode: the next
+        shrink caps every rank to one absolute target, by construction) opens
+        no divergence, while a recovery that leaves the counts EQUAL and the
+        ORDER different opens one that nothing closes. That asymmetry is why
+        the trigger is narrower than "a rank came back short", and it is why
+        the source-side repair (``normalize_free_lists``, run unconditionally
+        at the rung) is only half the answer: it stops NEW divergences and
+        cannot undo rows already handed out to live requests and cached in the
+        radix tree, which is why draining the instance and ``/flush_cache``
+        both failed to clear boot 1's wedge.
+
+        SO THIS IS THE RECOVERY HALF. When the rung's ballot says the ranks
+        enumerate different sets, every rank -- unanimously, because the
+        verdict is read off a value the reduction produced identically
+        everywhere -- adopts the group's UNION. The union is the only
+        reconciliation that is safe in both directions: a rank-0-authoritative
+        broadcast would drop a peer's live rows from the plan and lose that
+        request's KV at the seam, and an intersection would do the same to
+        everyone. A union never removes a row from the rank that holds it, so
+        no request loses context, and it never asks a rank to give up backing,
+        so it cannot breach the corridor law the recovery was bounded by.
+
+        IT COSTS NOTHING WHEN THE RANKS AGREE, which is the shipped case: 1134
+        consecutive cutovers on boot 2 with zero divergences would enter this
+        function and return at the first branch. The detection is four extra
+        integers on the rung's existing reduction (8 fields -> 12, the same
+        move R2 made from 4 -> 8). Only the repair itself adds a reduction,
+        and only on the round that needs one.
+
+        WHY THE UNION DOES NOT DISTURB THE ROWS EVERY RANK ALREADY AGREED ON.
+        ``reshard_plan.rows_of`` maps a slot to its compact TP row as
+        ``(slot // s) * ratio + (slot % s - lo)`` -- a pure function of the
+        SLOT ID and the vector, not of the slot's position in the enumeration.
+        Adding rows to the framed set therefore moves no other row's
+        destination; it only adds copies. The extra rows carry whatever the
+        holder's pool holds and nothing reads them on a rank that has no
+        request behind them.
+
+        THE ONE BOUND THAT IS NOT NEGOTIABLE. A row id at or above a rank's
+        BACKED row count is not mapped on that rank, and the mover reading it
+        is ``cudaErrorIllegalAddress``, which kills every rank rather than
+        raising. The union is therefore refused when it reaches the group's
+        MINIMUM backing (carried in the same four fields), and the refusal
+        joins ``too_small`` -- a free, unanimous, announced abandon, with the
+        rung's levelling and the free-list normalisation still running every
+        round underneath it, so the offending rows drain as their requests
+        finish and the next round can agree.
+
+        Returns ``(slots, detail)``: the set to frame, and "" or one
+        ``too_small`` entry.
+        """
+        if not ballot or ballot.get("agree") is not False:
+            return slots, ""
+        self.slot_set_divergences = getattr(self, "slot_set_divergences", 0) + 1
+        span = int(ballot.get("max_live_row", -1)) + 1
+        if span <= 0:
+            return slots, ""
+        # THE UNION, ON THE MIN CHANNEL THE GROUP ALREADY HAS. A membership
+        # vector of -1/0 reduced with MIN yields -1 wherever ANY rank holds
+        # the row, which is the OR this channel cannot express directly. The
+        # same [x, -x] inversion the fit verdict uses, one field per row id.
+        presence = torch.zeros(span, dtype=torch.int64)
+        local = slots[slots < span]
+        if local.numel():
+            presence[local] = -1
+        reduced = self._collective_min(presence.tolist())
+        union = (
+            (torch.tensor(reduced, dtype=torch.int64) < 0).nonzero().flatten().to(torch.int64)
+        )
+        min_backed = int(ballot.get("min_backed_rows", 0))
+        highest = int(union[-1].item()) if union.numel() else -1
+        if highest >= min_backed:
+            self.slot_set_refusals = getattr(self, "slot_set_refusals", 0) + 1
+            return slots, (
+                f"live slot set divergence cannot be repaired this round: the "
+                f"group's union reaches row {highest} and the poorest rank has "
+                f"only {min_backed} rows BACKED, so framing the union would "
+                f"have that rank read unmapped memory. This rank enumerates "
+                f"{int(slots.numel())} rows, the union has {int(union.numel())}. "
+                f"The rung's cap agreement and free-list normalisation run "
+                f"every round underneath this, so the rows above the group's "
+                f"backing drain as their requests finish"
+            )
+        self.slot_set_agreements = getattr(self, "slot_set_agreements", 0) + 1
+        added = int(union.numel()) - int(slots.numel())
+        logger.warning(
+            "%s live slot SET agreed by union: this rank enumerated %d rows, "
+            "the group holds %d (%+d), digests spanned [%s, %s]. The count "
+            "agreement (#656 C22) had already levelled the group; agreeing "
+            "WHICH rows is what stops the frame ballot refusing every "
+            "subsequent flip. No rank gives up a row it holds, so no request "
+            "loses context and no backing is released",
+            LOG_PREFIX,
+            int(slots.numel()),
+            int(union.numel()),
+            added,
+            ballot.get("digest_lo"),
+            ballot.get("digest_hi"),
+        )
+        return union, ""
+
     def _execute(self) -> Optional[dict]:
         direction = self._pending
         assert direction is not None
@@ -4854,18 +5050,6 @@ class PhaseFlipRuntime:
         # plan, not a move -- so the safe answer is unanimous: reduce the
         # local verdict, and if ANY rank does not fit, every rank abandons
         # the flip and keeps serving. The flip is the optional thing here.
-        too_small = []
-        if tr.max_pp_row() >= self._pp.num_rows:
-            too_small.append(
-                f"PP row {tr.max_pp_row()} vs pool {self._pp.num_rows} rows "
-                f"(the PP pool must cover every live global slot id)"
-            )
-        if tr.max_tp_row() >= self._tp.num_rows:
-            too_small.append(
-                f"TP row {tr.max_tp_row()} vs pool {self._tp.num_rows} rows "
-                f"(the TP pool must cover the compact rows of vector "
-                f"{self._vec})"
-            )
         # SECOND TERM OF THE SAME VERDICT: can the bytes be STAGED at all?
         # The rows fitting in the target pool says nothing about the memory
         # needed to carry them there. The exchange packs this rank's
@@ -4891,7 +5075,49 @@ class PhaseFlipRuntime:
         # #656 item 15a/16: spill before the allocation, and level the cards
         # before touching host RAM. Runs first so its reclaim is money the
         # affordability check below can see.
-        corridor_detail = self._corridor_gate(staging_bytes, direction)
+        #
+        # #656 C22-d RIDES THIS SAME RUNG. Four more integers on the reduction
+        # the gate already runs (12 fields, not 8) carry the live slot SET
+        # ballot -- the membership digest, the group's row extent, and the
+        # group's minimum BACKED rows -- so a set divergence is known here,
+        # before ``_frame_digest`` is computed in this same round. See
+        # _agree_live_slots for the trigger this closes and why the count
+        # agreement above it was not enough.
+        slot_ballot: dict = {}
+        corridor_detail = self._corridor_gate(
+            staging_bytes,
+            direction,
+            slots_digest=self._slots_membership_digest(slots),
+            max_live_row=int(slots[-1].item()) if slots.numel() else -1,
+            slot_ballot_out=slot_ballot,
+        )
+        # A ``slot_detail`` is a divergence the union cannot safely repair; it
+        # joins the unanimous abandon like every other objection, and the plan
+        # is left exactly as it was because nothing may move on that round.
+        slots, slot_detail = self._agree_live_slots(slots, slot_ballot)
+        if not slot_detail and int(slots.numel()) != int(tr.total_slots):
+            # The union is a SUPERSET, so an unchanged cardinality is an
+            # unchanged set -- this comparison is exact, not a heuristic.
+            # THE PLAN IS REBUILT ON THE AGREED SET, and everything priced from
+            # it with it. ``rows_of`` is a pure function of the slot id, so no
+            # row that both sets already contained changes destination -- but
+            # the bounds and the staging price DO change with the extra rows,
+            # and they are re-derived here rather than carried over from the
+            # provisional plan. The rung's relief was asked for the provisional
+            # price, which is the smaller one; a shortfall that leaves is
+            # caught by ``_staging_affordable`` below and votes into the same
+            # unanimous abandon, so the conservatism costs a flip and never a
+            # rank.
+            tr = build_phase_flip_transition(
+                slots, self._map, self._n_layers, self._vec, self._rank, direction
+            )
+            staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
+        # BOUNDS ON THE FINAL PLAN. Computed after the agreement, so the rows
+        # the group actually intends to move are the rows the pools are
+        # checked against.
+        too_small = self._row_bounds_detail(tr)
+        if slot_detail:
+            too_small.append(slot_detail)
         if corridor_detail:
             too_small.append(corridor_detail)
         affordable, staging_detail = self._staging_affordable(staging_bytes)
@@ -4923,6 +5149,14 @@ class PhaseFlipRuntime:
         # one test that proves this ballot can fail.
         parts = self._frame_digest_parts(slots, direction, waves)
         frame = self._frame_digest(slots, direction, waves)
+        # WHAT THIS RANK ACTUALLY FRAMED, recorded before the vote. #656 C22-d
+        # made the framed set differ from the enumerated one -- the union is
+        # what goes on the wire -- so a test (or an operator) that re-derives
+        # a digest from ``_live_slots_fn`` is no longer asking the same
+        # question the ballot asked. This is the question the ballot asked.
+        self.last_framed_slots = slots
+        self.last_framed_slots_digest = parts["slots"]
+        self.last_framed_digest = frame
         payload = [fits, -fits, margin_only, frame, -frame]
         for name in self.FRAME_PARTS:
             payload.extend((parts[name], -parts[name]))

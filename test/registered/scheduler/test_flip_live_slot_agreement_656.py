@@ -63,7 +63,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,17 +136,28 @@ class TheCountCanAgreeWhileTheSetStillDivergesTest(CustomTestCase):
         return live, rank1_live, pp_views, tp_pools, tp_views
 
     def test_equal_cardinality_membership_shift_still_abandons_the_flip(self):
-        """RED: this is the deliverable.
+        """THE DELIVERABLE, now green.
 
         Same row COUNT on every rank (the thing #656 C22's cap-agreement
         note already guarantees), a corridor-shaped membership shift on
         rank 1 only. What SHOULD happen, once a flip is allowed to keep
         making progress after a corridor-bounded recovery, is that the
-        group still frames one digest and cuts over. It does not: this
-        tree has no step that agrees the live slot SET (only #656 already
-        agreed the count), so the ballot abandons -- and would abandon
-        again on the very next round, and the one after that, exactly as
-        the metal did for four consecutive episodes.
+        group still frames one digest and cuts over.
+
+        WHAT THE ASSERTION ASKS, AND WHY IT MOVED. It used to re-derive a
+        digest from the three RAW per-rank views and require those to
+        collide. No agreement step can satisfy that -- the fixture builds
+        three genuinely different sets and no fix mutates
+        ``live_slots_fn`` retroactively -- so as a statement of the goal
+        it was unreachable, and as a statement of the defect it measured
+        the fixture rather than the runtime. What the ballot actually
+        votes on is the set each rank FRAMES, which the runtime now
+        records (``last_framed_slots_digest``). Asking THAT is the same
+        sentence the old docstring wrote ("every rank must frame the SAME
+        digest -- i.e. the flip completes") against the value that
+        sentence was about, and it is strictly harder to satisfy than the
+        cutover assertions below, not easier: a fix that cut over while
+        framing different sets would pass those and fail this.
         """
         live, rank1_live, pp_views, tp_pools, tp_views = self._corridor_live(41)
         exchange = _NcclLikeExchange(3)
@@ -165,21 +176,60 @@ class TheCountCanAgreeWhileTheSetStillDivergesTest(CustomTestCase):
             "than the one this file is pinning",
         )
 
-        # THE ASSERTION THAT SHOULD HOLD AND DOES NOT. Every rank must
-        # frame the SAME digest -- i.e. the flip completes -- once the
-        # group's row count already agrees. It does not: nothing between
-        # the count agreement and ``_frame_digest`` reconciles WHICH rows
-        # each rank enumerates, so the digests differ and every rank
-        # abandons. This is the failure to fix, not a fixture bug.
-        digests = {rt._frame_digest(v, PP_TO_TP, rt._flip_waves(PP_TO_TP)) for rt, v in zip(runtimes, [live, rank1_live, live])}
+        # THE ASSERTION. Every rank must frame the SAME digest -- i.e. the
+        # flip completes -- once the group's row count already agrees.
+        # Read off what each runtime PUT ON THE BALLOT, because that is
+        # what a divergence is a divergence of.
+        digests = {rt.last_framed_slots_digest for rt in runtimes}
         self.assertEqual(
             len(digests),
             1,
-            "the three ranks framed different digests despite an equal "
-            "live-row COUNT on every rank -- this is the 194-cutover "
-            "wedge: count agreement (#656 C22) is not set agreement, and "
-            "nothing today reconciles the SET before _frame_digest runs",
+            f"the three ranks framed different live-slot digests "
+            f"({sorted(digests)}) despite an equal live-row COUNT on every "
+            f"rank -- this is the 194-cutover wedge: count agreement "
+            f"(#656 C22) is not set agreement, and the SET has to be "
+            f"reconciled before _frame_digest runs",
         )
+        self.assertNotIn(
+            None,
+            digests,
+            "a rank never reached the ballot at all, so the digests agree "
+            "vacuously -- that is not the property under test",
+        )
+        # AND THE AGREEMENT IS WHAT DID IT. Without this the test would
+        # also pass on a tree that made the fixture's divergence
+        # disappear (a stray torch.unique, a fixture that stopped
+        # diverging), which is the failure mode this file's neighbours
+        # were bitten by.
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(
+                rt.slot_set_divergences,
+                1,
+                f"rank {r}: the rung's ballot did not even SEE the planted "
+                f"divergence, so whatever made this test pass was not the "
+                f"live-slot agreement",
+            )
+            self.assertEqual(
+                rt.slot_set_agreements,
+                1,
+                f"rank {r}: the divergence was seen and not repaired by "
+                f"the union",
+            )
+        # The union is a SUPERSET of every rank's own live rows: no
+        # request loses its context at the seam. Pinned per rank against
+        # that rank's OWN input, which is the property the alternative
+        # repairs (rank-0-authoritative broadcast, intersection) violate.
+        for r, (rt, own) in enumerate(zip(runtimes, [live, rank1_live, live])):
+            framed = set(int(x) for x in rt.last_framed_slots.tolist())
+            missing = sorted(set(int(x) for x in torch.unique(own).tolist()) - framed)
+            self.assertEqual(
+                missing,
+                [],
+                f"rank {r} framed a set missing {len(missing)} of its own "
+                f"live rows (first: {missing[:8]}) -- a repair that drops a "
+                f"rank's rows loses that request's KV at the seam, which is "
+                f"worse than the wedge it replaces",
+            )
         self.assertEqual(
             [cutovers[r] for r in range(3)],
             [[PP_TO_TP]] * 3,
@@ -212,28 +262,278 @@ class TheCountCanAgreeWhileTheSetStillDivergesTest(CustomTestCase):
             [live, rank1_live, live],
             exchange_factory=exchange.exchange_for,
         )
-        # Two independent arm/abandon cycles: re-arm after the first
-        # abandon returns the runtime to PHASE_PP with nothing pending,
-        # exactly as production re-arms the next auto-flip attempt.
-        for _episode in range(2):
-            exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        # THREE episodes, ALTERNATING, which is what "consecutive" has to
+        # mean once the flip succeeds: the same direction twice in a row
+        # is a no-op on the second attempt, because the instance is
+        # already in that layout. The metal's four abandons were four
+        # attempts at the leg it never got through, so the property to
+        # pin is that the pp_to_tp leg still works AFTER a full round
+        # trip -- the divergence is re-enumerated every round (the
+        # fixture's ``live_slots_fn`` never stops diverging) and has to
+        # be re-agreed every round.
+        legs = [PP_TO_TP, TP_TO_PP, PP_TO_TP]
+        for leg in legs:
+            exceptions = _run_ranks(3, runtimes=runtimes, directions=[leg] * 3)
             self.assertEqual([e for e in exceptions if e is not None], [])
         self.assertEqual(
             [cutovers[r] for r in range(3)],
-            [[]] * 3,
-            "SHOULD be non-empty once set-agreement lands; today every "
-            "episode abandons, which is the perpetual-wedge shape measured "
-            "on metal (four consecutive abandons, not a single blip)",
+            [legs] * 3,
+            "the group must cut over on EVERY episode: a fix that smooths "
+            "over round 1 and wedges on round 2 has not closed the "
+            "perpetual-wedge shape measured on metal (four consecutive "
+            "abandons of the same leg, not a single blip)",
         )
         for r, rt in enumerate(runtimes):
             self.assertEqual(
                 rt.frame_aborts,
-                2,
-                f"rank {r}: expected both episodes to abandon on the frame "
-                f"ballot under the current tree (documents today's "
-                f"behaviour; this count should drop once set-agreement "
-                f"lands)",
+                0,
+                f"rank {r} abandoned on the frame ballot in one of the "
+                f"episodes -- the wedge is exactly a divergence that SURVIVES "
+                f"the round it was first seen in",
             )
+            self.assertEqual(
+                (rt.slot_set_divergences, rt.slot_set_agreements),
+                (len(legs), len(legs)),
+                f"rank {r}: the agreement must fire on EVERY episode and on "
+                f"BOTH legs. A run that saw the divergence fewer times than "
+                f"there were rounds means a later cutover went through on a "
+                f"stale agreement rather than a fresh one -- and the tp->pp "
+                f"leg is the one the cap agreement itself is NOT allowed to "
+                f"shrink on, so it is the leg most likely to be missed",
+            )
+
+
+class TheAgreementCanFailTest(CustomTestCase):
+    """CAN-FAIL PROOFS. An instrument that cannot fail has certified nothing.
+
+    The corpus has shipped that mistake seven times (see the removed
+    ``torch.unique`` belt in ``KvRowCap._apply``, which made the symptom
+    disappear and the regression test pass either way). So each arm here
+    disables exactly one half of the fix and shows the measurement goes
+    red again -- and one arm shows the fix REFUSING rather than
+    repairing, which is the outcome that must never quietly become a
+    read of unmapped memory.
+    """
+
+    def _pools(self, seed):
+        return _make_layout_pools(MAP_625, VEC, 400, seed=seed)
+
+    def test_with_the_agreement_disarmed_the_same_fixture_abandons(self):
+        """Arm 1: the green above comes from the agreement, not the fixture.
+
+        ``_agree_live_slots`` is replaced by a pass-through -- the tree as
+        it was before this change -- and the identical fixture is run. It
+        must reproduce the metal signature: no cutover, one frame abort
+        per rank, and the abandon naming the live slot set.
+        """
+        _ref, live, _ppp, pp_views, _tpp, tp_views = self._pools(41)
+        rank1_live = _corridor_shifted_view(live, k=12)
+        exchange = _NcclLikeExchange(3)
+        runtimes, cutovers = _runtimes_with_per_rank_live(
+            pp_views,
+            tp_views,
+            [live, rank1_live, live],
+            exchange_factory=exchange.exchange_for,
+        )
+        for rt in runtimes:
+            rt._agree_live_slots = lambda slots, ballot: (slots, "")
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e is not None], [])
+        self.assertEqual(
+            [cutovers[r] for r in range(3)],
+            [[]] * 3,
+            "with the agreement disarmed the flip STILL went through -- so "
+            "the fixture is no longer planting a divergence and the green "
+            "test above proves nothing",
+        )
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 1, f"rank {r}")
+            self.assertIsNotNone(rt.last_seam_abandon, f"rank {r}")
+            self.assertIn(
+                "the live slot set",
+                rt.last_seam_abandon[1],
+                f"rank {r}: the disarmed run must abandon on the LIVE SLOT "
+                f"SET specifically -- an abandon for any other reason means "
+                f"this arm is measuring something else",
+            )
+
+    def test_a_union_reaching_past_the_group_backing_refuses_and_says_so(self):
+        """Arm 2: the bound that may never be crossed.
+
+        A row id at or above a rank's BACKED row count is unmapped on that
+        rank. The union must refuse rather than frame it -- the mover
+        reading it is ``cudaErrorIllegalAddress``, which kills every rank
+        rather than raising, so "abandon" is the only correct answer and
+        it has to be a NAMED one.
+        """
+        _ref, live, _ppp, pp_views, _tpp, tp_views = self._pools(41)
+        rank1_live = _corridor_shifted_view(live, k=12)
+        exchange = _NcclLikeExchange(3)
+        runtimes, _cutovers = _runtimes_with_per_rank_live(
+            pp_views,
+            tp_views,
+            [live, rank1_live, live],
+            exchange_factory=exchange.exchange_for,
+        )
+        rt = runtimes[0]
+        # One rank, exercised alone: MIN over a single proposal is the
+        # identity, so the union is this rank's own set and the bound is
+        # the only thing under test.
+        rt._collective_min = lambda payload, **kw: list(payload)
+        top = int(torch.unique(live)[-1].item())
+        agreed, detail = rt._agree_live_slots(
+            torch.unique(live),
+            {
+                "agree": False,
+                "digest_lo": 1,
+                "digest_hi": 2,
+                "max_live_row": top,
+                # The poorest rank's backing ends BELOW the group's highest
+                # live row: the corridor-bounded shape, exactly.
+                "min_backed_rows": top,
+            },
+        )
+        self.assertTrue(
+            detail,
+            "the union reached row >= the group's backing and was framed "
+            "anyway -- that is a read of unmapped memory on the poorest rank",
+        )
+        self.assertIn("BACKED", detail)
+        self.assertIn(str(top), detail)
+        self.assertEqual(rt.slot_set_refusals, 1)
+        self.assertEqual(rt.slot_set_agreements, 0)
+        self.assertTrue(
+            torch.equal(agreed, torch.unique(live)),
+            "a refused round must leave the plan exactly as it was",
+        )
+
+    def test_an_agreeing_ballot_costs_nothing_and_touches_no_collective(self):
+        """Arm 3: the shipped case. 1134 consecutive cutovers on boot 2 had
+        zero divergences, so the common path must return before any
+        reduction -- a repair that ran every round would put a
+        full-width allreduce on every seam."""
+        _ref, live, _ppp, pp_views, _tpp, tp_views = self._pools(41)
+        exchange = _NcclLikeExchange(3)
+        runtimes, _ = _runtimes_with_per_rank_live(
+            pp_views, tp_views, [live] * 3, exchange_factory=exchange.exchange_for
+        )
+        rt = runtimes[0]
+        calls = []
+        rt._collective_min = lambda payload, **kw: calls.append(payload) or payload
+        canonical = torch.unique(live)
+        for ballot in (
+            {},
+            {"agree": True, "max_live_row": int(canonical[-1].item())},
+        ):
+            agreed, detail = rt._agree_live_slots(canonical, ballot)
+            self.assertEqual(detail, "")
+            self.assertIs(agreed, canonical)
+        self.assertEqual(
+            calls,
+            [],
+            "the agreeing path entered a collective; on the shipped case "
+            "that is one full-width allreduce per seam for nothing",
+        )
+        self.assertEqual(rt.slot_set_divergences, 0)
+
+
+class TheFreeListOrderIsNormalisedEvenWhenTheCountsAgreeTest(CustomTestCase):
+    """THE SOURCE HALF (#656 C22-d), and the exact gap it closes.
+
+    ``collective_cap_target`` returns ``None`` when the group's exposed
+    counts already agree -- and that ``None`` skips ``reconcile_to``,
+    whose final ``sort_free_lists`` is the only thing making free-list
+    ORDER a function of membership alone. So the one state nothing
+    normalised was the state the counts were equal in, which is where a
+    rank that took a corridor-bounded ``recover()`` (``KvRowCap.release``
+    SORTS) sits next to peers that never shrank (and never sorted).
+    """
+
+    def test_collective_cap_target_returns_none_exactly_when_level(self):
+        """The gap, stated as the arithmetic that produces it."""
+        from sglang.srt.managers.kv_backing_relief import collective_cap_target
+
+        # capable=1000, floor=10, every rank exposed at 1000: LEVEL.
+        self.assertIsNone(collective_cap_target([1000, -10, 1000, -1000]))
+        # One rank short: a level is returned and reconcile_to (and its
+        # sort) runs on every rank.
+        self.assertEqual(collective_cap_target([1000, -10, 900, -1000]), 1000)
+
+    def test_the_rung_normalises_the_order_on_a_level_group(self):
+        """So the rung must sort ANYWAY, and this is the proof it does."""
+        from sglang.srt.managers import phase_flip_spill as pfs
+        from sglang.srt.managers.kv_backing_relief import CAP_ABSTAIN
+
+        sorted_calls = []
+
+        class _Relief:
+            def backed_rows(self):
+                return 10_000
+
+            def cap_proposal(self):
+                # A LEVEL group: collective_cap_target returns None for
+                # this, so the pre-fix tree did nothing at all here.
+                return (1000, -10, 1000, -1000)
+
+            def normalize_free_lists(self):
+                sorted_calls.append(True)
+
+        class _Sched:
+            pass
+
+        sched = _Sched()
+        setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, _Relief())
+        freed = pfs.collective_kv_backing_relief(
+            sched,
+            lambda vals: list(vals),  # single rank: MIN of one proposal
+            want_bytes=0,
+            guard=None,
+            direction="tp_to_pp",  # the leg the shrink may NOT run on
+        )
+        self.assertEqual(freed, 0)
+        self.assertEqual(
+            sorted_calls,
+            [True],
+            "the rung did not normalise the free-list order on a group "
+            "whose counts already agree -- that is the exact state the "
+            "194-cutover wedge opened in",
+        )
+        self.assertEqual(len(CAP_ABSTAIN), 4, "payload shape guard")
+
+    def test_the_rung_payload_carries_the_slot_ballot(self):
+        """12 fields, not 8, and the last four decode to the verdict."""
+        from sglang.srt.managers import phase_flip_spill as pfs
+        from sglang.srt.managers.kv_backing_relief import collective_slot_ballot
+
+        seen = []
+
+        def _reduce(vals):
+            seen.append(list(vals))
+            return list(vals)
+
+        out = {}
+        pfs.collective_kv_backing_relief(
+            None,
+            _reduce,
+            want_bytes=0,
+            guard=None,
+            direction="pp_to_tp",
+            slots_digest=4242,
+            max_live_row=777,
+            slot_ballot_out=out,
+        )
+        self.assertEqual(len(seen), 1, "the rung must run ONE reduction")
+        self.assertEqual(
+            len(seen[0]),
+            12,
+            "the live-slot ballot must ride the rung's existing reduction "
+            "(8 -> 12 fields), never a second collective",
+        )
+        self.assertEqual(seen[0][8:10], [4242, -4242])
+        self.assertEqual(out["agree"], True)
+        self.assertEqual(out["max_live_row"], 777)
+        self.assertIsNone(collective_slot_ballot([1, -1]), "short payload")
+        self.assertFalse(collective_slot_ballot([1, -2, -5, 9])["agree"])
 
 
 class TheDigestStaysOrderInsensitiveTest(CustomTestCase):

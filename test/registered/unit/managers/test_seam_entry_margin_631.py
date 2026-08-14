@@ -236,19 +236,51 @@ class TestTheGateAsksForTheMargin(unittest.TestCase):
         """
         seen = {}
 
-        def spy(_sched, _reduce, *, want_bytes, guard, direction, discretionary_bytes=0):
+        def spy(
+            _sched,
+            _reduce,
+            *,
+            want_bytes,
+            guard,
+            direction,
+            discretionary_bytes=0,
+            # #656 C22-d: the live-slot ballot rides this same call.
+            slots_digest=0,
+            max_live_row=-1,
+            slot_ballot_out=None,
+        ):
             seen["want"] = int(want_bytes)
             seen["discretionary"] = int(discretionary_bytes)
+            seen["ballot_out"] = slot_ballot_out
+            seen["slots_digest"] = int(slots_digest)
             return 0
 
+        ballot: dict = {}
         with _Margin(margin_mib=512):
             with _Patched(_Guard(4096 * MIB), kv_spy=spy):
-                _runtime()._corridor_gate(STAGING, "pp_to_tp")
+                _runtime()._corridor_gate(
+                    STAGING, "pp_to_tp", slots_digest=99, slot_ballot_out=ballot
+                )
         self.assertEqual(seen["want"], STAGING + 512 * MIB)
         self.assertEqual(
             seen["discretionary"],
             512 * MIB,
             "the rung must be told the margin's size or it cannot bound it",
+        )
+        self.assertIs(
+            seen["ballot_out"],
+            ballot,
+            "the gate must FORWARD the caller's live-slot ballot object to "
+            "the rung (#656 C22-d). A gate that dropped it would leave the "
+            "seam framing before the set is agreed, which is the "
+            "194-cutover wedge -- and it would do so silently, because the "
+            "rung's own reduction still succeeds",
+        )
+        self.assertEqual(
+            seen["slots_digest"],
+            99,
+            "the membership digest must reach the rung unaltered, or the "
+            "ballot votes on something other than this rank's live set",
         )
 
 

@@ -791,11 +791,21 @@ class TestAbortDeferral(CustomTestCase):
         self.assertGreater(int(rank1_slots.numel()), 0)
         dropped = int(rank1_slots[0].item())
         live_rank0 = live[live != dropped]
+        #
+        # #656 C22-d: the live-slot AGREEMENT now repairs this class before
+        # the ballot votes, so the shipped behaviour is no longer an abandon.
+        # This arm keeps measuring the hazard by DISARMING the agreement --
+        # which is what makes it a can-fail arm at all: it has to reproduce
+        # the state the protection is absent in. The repaired behaviour is
+        # pinned by its own test below, so both halves are measured and
+        # neither is assumed.
         live_per_rank = [live_rank0, live, live]
         tp_before = _clone_pools(tp_pools)
         runtimes = self._runtimes_with_per_rank_live(
             live_per_rank, pp_views, tp_views
         )
+        for rt in runtimes:
+            rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e is not None], [])
         for r, rt in enumerate(runtimes):
@@ -805,6 +815,47 @@ class TestAbortDeferral(CustomTestCase):
             _pools_equal(tp_pools, tp_before),
             "a divergent live set scattered bytes into the TP layout",
         )
+
+    def test_the_agreement_repairs_the_dropped_slot_instead_of_wedging(self):
+        """#656 C22-d, the shipped half of the arm above.
+
+        The same divergence, the agreement ARMED. The group must agree on
+        the union and cut over -- because the alternative, measured on
+        boot ``boot_m3``, is that the ranks re-frame the same disagreement
+        every round and the pp_to_tp leg (the one decode needs) is never
+        taken again. The disagreement about WHOSE request that row belongs
+        to is a real and separate defect; it is counted and logged here,
+        not silently absorbed, and the flip no longer wedges on it.
+        """
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 140, seed=31
+        )
+        owner = owner_of(live, VEC)
+        rank1_slots = live[owner == 1]
+        dropped = int(rank1_slots[0].item())
+        live_rank0 = live[live != dropped]
+        runtimes = self._runtimes_with_per_rank_live(
+            [live_rank0, live, live], pp_views, tp_views
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e is not None], [])
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 0, f"rank {r}")
+            self.assertEqual(rt.completed, 1, f"rank {r}")
+            self.assertEqual(
+                (rt.slot_set_divergences, rt.slot_set_agreements),
+                (1, 1),
+                f"rank {r}: the flip went through WITHOUT the agreement "
+                f"firing, which would mean a divergence was never seen -- "
+                f"silence, not repair",
+            )
+            framed = set(int(x) for x in rt.last_framed_slots.tolist())
+            self.assertIn(
+                dropped,
+                framed,
+                f"rank {r} framed a set missing the row two of its peers "
+                f"still hold -- that row's KV would be lost at the seam",
+            )
 
     def test_can_fail_batch_membership_disagreement_is_refused(self):
         # Cross-strand hazard (#622 root cause, first-token no-sync): on a
@@ -830,11 +881,20 @@ class TestAbortDeferral(CustomTestCase):
                 mask[i] = False
         live_rank2 = live[mask]
         self.assertLess(int(live_rank2.numel()), int(live.numel()))
+        #
+        # #656 C22-d: the agreement is DISARMED here for the same reason as
+        # the arm above -- this test measures what happens when nothing
+        # reconciles the set, and it has to keep being able to go red. With
+        # the agreement armed the group frames the union and cuts over; the
+        # EOS disagreement itself is untouched by either behaviour, since it
+        # exists before the flip and survives it.
         live_per_rank = [live, live, live_rank2]
         tp_before = _clone_pools(tp_pools)
         runtimes = self._runtimes_with_per_rank_live(
             live_per_rank, pp_views, tp_views
         )
+        for rt in runtimes:
+            rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual(
             [e for e in exceptions if e is not None],

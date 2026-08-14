@@ -223,6 +223,12 @@ class TestFrameDivergence(CustomTestCase):
         )
         for rt in runtimes:
             rt._frame_digest = lambda *a, **k: 0
+            # #656 C22-d: the live-slot AGREEMENT is part of the protection
+            # chain now, and it runs one rung EARLIER than the ballot. A red
+            # arm that neutralised only the vote would find nothing left to
+            # diverge, and would go green for a reason that has nothing to do
+            # with the defect it exists to reproduce. Neutralise the chain.
+            rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         raised = [e for e in exceptions if e is not None]
         self.assertTrue(
@@ -248,7 +254,15 @@ class TestFrameDivergence(CustomTestCase):
         self.assertEqual(sum(rt.frame_aborts for rt in runtimes), 0)
 
     def test_the_ballot_abandons_the_flip_instead_of_killing_the_instance(self):
-        """GREEN: the same divergence, the ballot on. Nobody raises."""
+        """GREEN: the same divergence, the ballot on. Nobody raises.
+
+        #656 C22-d: with the live-slot agreement armed this divergence is
+        REPAIRED before the ballot sees it (see the two tests below), so
+        the agreement is disarmed here to keep this arm measuring the
+        ballot. The ballot's own reach in the shipped configuration is
+        pinned by ``test_the_ballot_still_abandons_what_the_union_cannot
+        _repair``, which diverges a term the union does not touch.
+        """
         _ref, live, _ppp, pp_views, tp_pools, tp_views = self._pools(29)
         tp_before = _clone_pools(tp_pools)
         exchange = _NcclLikeExchange(3)
@@ -258,6 +272,8 @@ class TestFrameDivergence(CustomTestCase):
             self._diverged(live),
             exchange_factory=exchange.exchange_for,
         )
+        for rt in runtimes:
+            rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual(
             [e for e in exceptions if e is not None],
@@ -275,6 +291,80 @@ class TestFrameDivergence(CustomTestCase):
             _pools_equal(tp_pools, tp_before),
             "bytes were scattered despite the frame ballot refusing",
         )
+
+    def test_the_ballot_still_abandons_what_the_union_cannot_repair(self):
+        """#656 C22-d: the ballot stays armed in the SHIPPED configuration.
+
+        The live-slot agreement reconciles ONE of the three framing terms.
+        Diverge another -- the wave partition, which ``_flip_waves`` derives
+        rank-locally from ``SGLANG_FLIP_SEAM_WAVES`` and ``_pools_alias``,
+        both of its own documented gaps -- and the ballot must still refuse
+        before a byte moves, with nothing stubbed out.
+        """
+        _ref, live, _ppp, pp_views, tp_pools, tp_views = self._pools(29)
+        tp_before = _clone_pools(tp_pools)
+        exchange = _NcclLikeExchange(3)
+        runtimes, cutovers = _runtimes_with_per_rank_live(
+            pp_views,
+            tp_views,
+            [live, live, live],
+            exchange_factory=exchange.exchange_for,
+        )
+        base = runtimes[1]._flip_waves(PP_TO_TP)
+        flat = [o for wave in base for o in wave]
+        self.assertGreater(len(flat), 1, "fixture needs >1 layer ordinal")
+        split = (tuple(flat[:1]), tuple(flat[1:]))
+        runtimes[1]._flip_waves = lambda direction, _s=split: _s
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e is not None], [])
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 1, f"rank {r}")
+            self.assertEqual(cutovers[r], [], f"rank {r} cut over anyway")
+            self.assertEqual(
+                rt.slot_set_agreements,
+                0,
+                f"rank {r}: the live sets were identical, so the agreement "
+                f"must not have fired -- if it did, it is repairing noise",
+            )
+        self.assertTrue(
+            _pools_equal(tp_pools, tp_before),
+            "bytes moved on a wave-partition divergence the ballot refused",
+        )
+        self.assertIn(
+            "the wave partition",
+            runtimes[0].last_seam_abandon[1],
+            "the ballot refused but attributed the divergence to the wrong "
+            "term, which is what sent an hour into the wrong module before",
+        )
+
+    def test_the_agreement_repairs_the_length_divergence_this_file_planted(self):
+        """#656 C22-d: and the shipped answer to ``_diverged``.
+
+        The one-slot-short divergence above is exactly the shape the cap
+        agreement's own note describes (a rank whose enumeration "differs
+        by exactly that many"). Armed, the group agrees the union and cuts
+        over instead of refusing every round for the rest of the boot.
+        """
+        _ref, live, _ppp, pp_views, _tpp, tp_views = self._pools(29)
+        exchange = _NcclLikeExchange(3)
+        runtimes, cutovers = _runtimes_with_per_rank_live(
+            pp_views,
+            tp_views,
+            self._diverged(live),
+            exchange_factory=exchange.exchange_for,
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e is not None], [])
+        canonical = torch.unique(live)
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 0, f"rank {r}")
+            self.assertEqual(cutovers[r], [PP_TO_TP], f"rank {r}")
+            self.assertEqual((rt.slot_set_divergences, rt.slot_set_agreements), (1, 1))
+            self.assertTrue(
+                torch.equal(rt.last_framed_slots, canonical),
+                f"rank {r} framed something other than the union of the "
+                f"group's live rows",
+            )
 
     def test_agreeing_ranks_are_unaffected_by_the_ballot(self):
         """The ballot must be inert on every healthy flip."""

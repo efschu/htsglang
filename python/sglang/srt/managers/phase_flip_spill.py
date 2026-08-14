@@ -1208,6 +1208,9 @@ def collective_kv_backing_relief(
     guard,
     direction: str = KV_RELIEF_DIRECTION,
     discretionary_bytes: int = 0,
+    slots_digest: int = 0,
+    max_live_row: int = -1,
+    slot_ballot_out: Optional[dict] = None,
 ) -> int:
     """#656 item 12, the device half: ONE shrink target for the whole group.
 
@@ -1253,6 +1256,14 @@ def collective_kv_backing_relief(
     staging, the guard must see the full ask and refuse the seam -- a free,
     unanimous abandon with every request intact. Laundering that into a smaller
     ask would produce a seam that "fits" and an allocator that disagrees.
+
+    ``slots_digest`` / ``max_live_row`` / ``slot_ballot_out`` carry #656 C22-d:
+    the seam's LIVE SLOT SET agreement rides this same reduction, four fields
+    wider again (12, not 8), for the reason the cap agreement rides it at all
+    -- this is the one point every rank reaches unconditionally BEFORE
+    ``_frame_digest`` runs in the same round. ``slot_ballot_out``, when given,
+    is filled in place with :func:`kv_backing_relief.collective_slot_ballot`'s
+    verdict so the caller can act on it without a second collective.
 
     Returns the bytes THIS rank gave back to the driver.
     """
@@ -1363,7 +1374,56 @@ def collective_kv_backing_relief(
                 e,
             )
             cap_proposal = kbr.CAP_ABSTAIN
-    reduced = list(reduce_fn(list(proposal) + list(cap_proposal)))
+    # THE THIRD QUARTER OF THE SAME PAYLOAD (#656 C22-d). Built
+    # unconditionally, like the cap proposal above and for the same reason:
+    # the payload LENGTH must be identical on every rank or the reduction is
+    # malformed. A rank with no relief object contributes SLOT_ABSTAIN, whose
+    # backing field is unbounded so the group's minimum is decided by whoever
+    # can actually read theirs.
+    if cap_relief is not None:
+        try:
+            slot_fields = kbr.slot_proposal(
+                slots_digest, max_live_row, cap_relief.backed_rows()
+            )
+        except Exception as e:
+            logger.warning(
+                "%s live-slot proposal failed (%s); abstaining, which leaves "
+                "the frame ballot to refuse a divergence instead of the "
+                "agreement repairing it",
+                LOG_PREFIX,
+                e,
+            )
+            slot_fields = kbr.SLOT_ABSTAIN
+    else:
+        slot_fields = kbr.slot_proposal(
+            slots_digest, max_live_row, kbr.SLOT_ABSTAIN[3]
+        )
+    reduced = list(
+        reduce_fn(list(proposal) + list(cap_proposal) + list(slot_fields))
+    )
+    if slot_ballot_out is not None:
+        verdict = kbr.collective_slot_ballot(reduced[8:12])
+        if verdict is not None:
+            slot_ballot_out.update(verdict)
+    # #656 C22-d, THE SOURCE HALF: make the free-list ORDER a function of
+    # MEMBERSHIP alone on EVERY rank, EVERY seam round, whatever the cap
+    # agreement below decides to do. ``reconcile_to`` ends with this sort, but
+    # it only runs when the group's exposed counts DISAGREE -- so the one
+    # state nothing normalises is the state the counts are equal in, which is
+    # exactly the state a rank that took a corridor-bounded ``recover()`` (and
+    # therefore sorted) sits in next to peers that never shrank (and therefore
+    # never did). See ``KvBackingRelief.normalize_free_lists``.
+    if cap_relief is not None:
+        try:
+            cap_relief.normalize_free_lists()
+        except Exception as e:
+            logger.warning(
+                "%s could not normalise this rank's free-list order (%s); the "
+                "next allocation may hand out a different row id than a peer "
+                "does, which the seam's live-slot agreement then has to repair",
+                LOG_PREFIX,
+                e,
+            )
     target = kbr.collective_kv_target(reduced[:4])
     if target is not None and relief is not None:
         # A SHRINK MAKES THE GROUP LEVEL BY CONSTRUCTION -- every rank caps to
