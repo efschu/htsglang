@@ -7403,9 +7403,41 @@ class ServerArgs:
                 "--enable-hisparse (S1)."
             )
         if self.pp_size > 1 or self.dp_size > 1:
+            # THE REFUSAL STANDS, AND IT COSTS A NAMED SPEC AXIS (#656,
+            # MERGE-R9 12.5). Under pp_size>1 no argv produces a vacate line,
+            # so the flip-setup capacity spec's "bs2-4 reserves, INCLUDING
+            # unused mamba states, are spilled during bs1 time" is
+            # structurally unreachable on a flip boot. The message says so
+            # rather than leaving the next reader to rediscover it, and it
+            # names what is and is NOT the substitute: --phase-flip-spill-depth
+            # is real spilling, but it is FLIP-SEAM spilling on the inactive
+            # layout's cold memory, not the idle-session mamba vacate that
+            # axis asks for. Reporting its rung count as satisfying that axis
+            # would be exactly the substitution the contradictions register
+            # exists to prevent.
+            #
+            # The route out is a PP-safe idle-session SOURCE, not lifting this
+            # refusal: the dependency is a sourcing one (GdnStateStore is an
+            # interface), and the stated reason for the refusal -- host pool
+            # rows sized from the boot vector -- is real.
             raise ValueError(
                 "--enable-kv-session-offload (S1) supports single-node pure "
-                f"TP/DCP only (pp_size={self.pp_size}, dp_size={self.dp_size})."
+                f"TP/DCP only (pp_size={self.pp_size}, dp_size={self.dp_size}). "
+                "The host pool's rows are sized from the boot vector, which a "
+                "PP or DP launch does not fix.\n"
+                "SPEC NOTE (#656 flip-setup capacity spec, MERGE-R9 12.5): "
+                "under pp_size>1 this refusal makes the spec axis 'bs2-4 "
+                "reserves, including unused mamba states, are spilled during "
+                "bs1 time' STRUCTURALLY UNREACHABLE -- no argv produces a "
+                "vacate line on a flip boot.\n"
+                "ALTERNATIVE, and what it is not: --phase-flip-spill-depth "
+                "(the pressure ladder: 'cache' -> 'draft' -> 'arena', i.e. the "
+                "outgoing phase's cached allocator segments, the draft "
+                "model's weights, then the weights arena's idle tail) does "
+                "reclaim VRAM under PP. It is FLIP-SEAM spilling of the "
+                "INACTIVE layout's cold memory, NOT the idle-session mamba "
+                "vacate above, and its rung count must not be reported as "
+                "satisfying that axis."
             )
         if self.enable_mixed_chunk:
             raise ValueError(

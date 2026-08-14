@@ -4357,9 +4357,7 @@ class Scheduler(
             rank = getattr(runtime, "_rank", None)
             if rank is not None:
                 depth_mib = int(summary.get("corridor_mib", 0)) - floor
-                record_corridor_shortfall(
-                    self.server_args, int(rank), depth_mib << 20
-                )
+                record_corridor_shortfall(self.server_args, int(rank), depth_mib << 20)
         except Exception:  # noqa: BLE001 - instrument must not raise
             pass
 

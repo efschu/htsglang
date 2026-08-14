@@ -104,7 +104,9 @@ class _Patched:
         self.old = phase_flip_spill.get_corridor_guard
         self.old_kv = phase_flip_spill.collective_kv_backing_relief
         phase_flip_spill.get_corridor_guard = lambda _s: self.g
-        phase_flip_spill.collective_kv_backing_relief = lambda *a, **k: 0  # noqa: ARG005
+        phase_flip_spill.collective_kv_backing_relief = (
+            lambda *a, **k: 0
+        )  # noqa: ARG005
         return self.g
 
     def __exit__(self, *exc):

@@ -56,7 +56,7 @@ def _corridor_law_floor_bytes() -> int:
     floor here would spend the allocator cache on a walk that was never going
     to break the law.
     """
-    #656: read through the ONE declaration rather than re-implementing the
+    # 656: read through the ONE declaration rather than re-implementing the
     # env read with a private "1024" fallback here. Three modules had their
     # own copy, so the law could be moved for one and not the others -- a
     # divergence with no symptom until a breach is judged twice and answered

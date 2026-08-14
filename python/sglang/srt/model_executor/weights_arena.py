@@ -254,9 +254,7 @@ def plan_arena_layout(
             )
         )
         offset += _align(nbytes)
-    return ArenaLayout(
-        slots=tuple(slots), aliases=tuple(aliases), total_bytes=offset
-    )
+    return ArenaLayout(slots=tuple(slots), aliases=tuple(aliases), total_bytes=offset)
 
 
 def allocate_arena(total_bytes: int, device) -> torch.Tensor:
@@ -488,8 +486,8 @@ def image_from_tensors(
         view.copy_(t)
     payload = host[: layout.total_bytes]
     csum = uint8_checksum(payload)
-    host[layout.total_bytes :] = (
-        torch.tensor([csum], dtype=torch.int64).view(torch.uint8)
+    host[layout.total_bytes :] = torch.tensor([csum], dtype=torch.int64).view(
+        torch.uint8
     )
     return host
 
@@ -532,8 +530,8 @@ def arena_image(
     host = _alloc_host_image(layout.total_bytes + _CHECKSUM_BYTES, pin, zero=False)
     host[: layout.total_bytes].copy_(used)
     total = uint8_checksum(used)
-    host[layout.total_bytes :] = (
-        torch.tensor([total], dtype=torch.int64).view(torch.uint8)
+    host[layout.total_bytes :] = torch.tensor([total], dtype=torch.int64).view(
+        torch.uint8
     )
     return host
 
@@ -573,9 +571,7 @@ def arena_refill(
             f"{int(arena.numel())}"
         )
     payload = image[: layout.total_bytes]
-    want = int(
-        image[layout.total_bytes :].clone().view(torch.int64).item()
-    )
+    want = int(image[layout.total_bytes :].clone().view(torch.int64).item())
     dst = arena[: layout.total_bytes]
     dst.copy_(payload)
     have = uint8_checksum(dst)
@@ -583,9 +579,7 @@ def arena_refill(
         restored = ""
         if restore is not None:
             r_layout, r_image = restore
-            arena[: r_layout.total_bytes].copy_(
-                r_image[: r_layout.total_bytes]
-            )
+            arena[: r_layout.total_bytes].copy_(r_image[: r_layout.total_bytes])
             restored = (
                 "; the current phase's layout was restored into the arena "
                 "(its views are byte-identical again)"

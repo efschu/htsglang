@@ -719,13 +719,13 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             tree_parts = parts[:n_tree]
             req_parts = parts[n_tree:]
             split = {
-                "tree_max": int(max(int(p.max()) for p in tree_parts))
-                if tree_parts
-                else -1,
+                "tree_max": (
+                    int(max(int(p.max()) for p in tree_parts)) if tree_parts else -1
+                ),
                 "tree_rows": int(sum(int(p.numel()) for p in tree_parts)),
-                "req_max": int(max(int(p.max()) for p in req_parts))
-                if req_parts
-                else -1,
+                "req_max": (
+                    int(max(int(p.max()) for p in req_parts)) if req_parts else -1
+                ),
                 "req_rows": int(sum(int(p.numel()) for p in req_parts)),
             }
             # On the FUNCTION, so the rung that calls it can read the split
@@ -3446,9 +3446,7 @@ class PhaseFlipRuntime:
         # Position-weighted so a permutation is not a collision; both
         # ends sort, so any difference here is a real set difference.
         acc = int(
-            (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod)
-            .sum()
-            .item()
+            (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod).sum().item()
             % mod
         )
         return acc, n
@@ -3871,12 +3869,55 @@ class PhaseFlipRuntime:
         wave_peak = incoming + max(outgoing, local) + one_layer_window + backing_slack
         # THE SPILLED DRAFTER'S RESTORE (#656 rung 2), priced HERE and not at
         # the site that performs it. See _draft_restore_bytes.
+        #
+        # THE ARENA TAIL IS ADDED; THE DRAFT RESTORE IS NOT. #656, MERGE-R9
+        # 12.4. This was one flat max() over all three on the reasoning that
+        # the peaks belong to different instants of the seam. That reasoning
+        # holds for the drafter -- rung 2's restore runs inside ``_cutover``,
+        # after the waves' buffers are dead and after the source pool's pages
+        # have gone back -- and it is FALSE for the arena tail, because
+        # ``stacks.refill`` is a PRE-cutover function (see the pre_cutover_fns
+        # list above, census label ``weights_refill``) and therefore commits
+        # while the wave state is still outstanding.
+        #
+        # THE STAGE WALK, one cutover, tp_to_pp rank 1
+        # (/spinning/evidence-631/remediation-656/boot_m1.log):
+        #
+        #   transient 1452 MiB (baseline free 2464 MiB, trough 1012 MiB at
+        #   'weights_refill') *** CORRIDOR LAW BROKEN: deepest 1012 MiB ***
+        #   ... backing_restore free=1250 | gdn_state free=1250
+        #   weights_refill free=1012 step-238 | cutover free=1290 step+278
+        #
+        # The card entered at 2464, the wave walk left 1214 MiB outstanding at
+        # 1250, and the refill's 238 MiB commit landed on top of THAT, twelve
+        # MiB under the law. ``max(1214, 238)`` predicts a 1250 MiB trough --
+        # 226 MiB clear -- so the seam entered on a verdict that could not see
+        # the breach it was about to make. The additive form predicts it.
+        #
+        # AND IT IS A COMMIT, NOT A TRANSIENT: the tail stays backed into the
+        # destination phase, so at the cutover it is still held while the
+        # drafter is restored. Hence tail + max(waves, restore) rather than
+        # max(tail + waves, restore).
+        #
+        # WHY THIS DOES NOT REINTRODUCE THE LIVELOCK the docstring above
+        # refuses a larger reservation for. That objection is about terms
+        # scaling with the RESIDENT SET: reserving more of those reaches the
+        # wedge at a smaller request, because a refusal does not drain what it
+        # refused on. The arena tail is a static LAYOUT quantity -- the span
+        # one phase's weights image holds above the other's -- so it shifts
+        # the affordable pool by a constant the prompt cannot move.
+        #
+        # IT OVER-RESERVES, and the direction is deliberate. Bounding the
+        # outstanding wave state by the wave PEAK charges the full walk even
+        # where the walk has partly drained by refill time. Across the ten
+        # most-repeated tp_to_pp cutovers of that boot the max() form came out
+        # at measured/predicted 1.11x (UNDER, worst single event +246 MiB) and
+        # this form at 0.80x (OVER). For a gate whose only action is to
+        # refuse, over-reserving costs a delayed flip and under-reserving cost
+        # the corridor breach above.
         return int(
-            max(
-                wave_peak,
-                self._draft_restore_bytes(direction),
-                self._arena_tail_bytes(direction),
-            )
+            self._arena_tail_bytes(direction)
+            + max(wave_peak, self._draft_restore_bytes(direction))
         )
 
     def _arena_tail_bytes(self, direction: str) -> int:
@@ -4713,9 +4754,7 @@ class PhaseFlipRuntime:
             # once decode drains in the degraded layout the memory comes back
             # and the very next round enters with room.
             if draw_short:
-                self.seam_yields_withheld = (
-                    getattr(self, "seam_yields_withheld", 0) + 1
-                )
+                self.seam_yields_withheld = getattr(self, "seam_yields_withheld", 0) + 1
                 logger.warning(
                     "%s seam entry margin YIELD WITHHELD (%s): the budget of "
                     "%d attempts is spent, but this rank's own worst MEASURED "
@@ -4992,7 +5031,10 @@ class PhaseFlipRuntime:
             presence[local] = -1
         reduced = self._collective_min(presence.tolist())
         union = (
-            (torch.tensor(reduced, dtype=torch.int64) < 0).nonzero().flatten().to(torch.int64)
+            (torch.tensor(reduced, dtype=torch.int64) < 0)
+            .nonzero()
+            .flatten()
+            .to(torch.int64)
         )
         min_backed = int(ballot.get("min_backed_rows", 0))
         highest = int(union[-1].item()) if union.numel() else -1

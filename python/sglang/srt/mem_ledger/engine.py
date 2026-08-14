@@ -686,6 +686,34 @@ RUNTIME_COMMUNICATOR_GROUPS: Mapping[str, str] = {
         "always built (parallel_state.py:3267) with the default transport; "
         "spans pp_size ranks"
     ),
+    # THE #631 SECONDARY (FLIP-TARGET) SET. Three more GroupCoordinators over
+    # the SAME world, built by initialize_phase_flip_secondary_groups
+    # (parallel_state.py:3421-3515) from model_runner.py:1972-1984 whenever
+    # --enable-phase-flip is set. They are communicators like any other and
+    # they are constructed INSIDE the nccl_init_begin/nccl_init_end window
+    # (#605 placed the end mark after them deliberately, model_runner.py:1985),
+    # so the first boot to measure TERM_NCCL_BUFFERS measures them. Leaving
+    # them undeclared was the OOM direction twice over: their buffers were
+    # charged to nobody, and they did not move nccl_signature, so a
+    # measurement taken on a non-flip launch was reusable on a flip one.
+    "flip_tp": (
+        "built whenever --enable-phase-flip is set (parallel_state.py:3502, "
+        "via model_runner.py:1980) with the default transport; spans "
+        "len(--phase-flip-tp-vector) ranks, which server_args pins equal to "
+        "pp_size (server_args.py:7708)"
+    ),
+    "flip_dcp": (
+        "built with the secondary set when its dcp_size > 1 "
+        "(parallel_state.py:3505-3507); model_runner passes "
+        "dcp_size=len(--phase-flip-tp-vector), so it exists on every "
+        "multi-rank flip launch -- a SECOND communicator over the same ranks "
+        "flip_tp already covers"
+    ),
+    "flip_pp": (
+        "built with the secondary set (parallel_state.py:3509-3512) and then "
+        "with use_custom_allreduce=False but the DEFAULT use_pynccl; "
+        "model_runner passes pp_size=1, so on Route A it spans a single rank"
+    ),
 }
 
 
@@ -781,7 +809,49 @@ def communicator_groups_from_server_args(
         groups.append(
             CommunicatorGroup(name="moe_tp", world_size=moe_tp, use_pynccl=False)
         )
+    groups.extend(_phase_flip_secondary_groups(server_args, pp))
     return tuple(groups)
+
+
+def _phase_flip_secondary_groups(server_args, pp: int):
+    """The #631 flip-target set, as CommunicatorGroups. Empty without the flag.
+
+    THE GEOMETRY IS QUOTED, NOT RESTATED. model_runner.py:1976-1984 calls
+    ``initialize_phase_flip_secondary_groups`` with
+    ``tp_size = dcp_size = len(--phase-flip-tp-vector)`` and ``pp_size=1``, and
+    server_args refuses a vector whose length differs from ``pp_size``
+    (server_args.py:7708) -- so the vector length IS the primary pp_size and
+    this needs no second parse to agree with the launch that will happen. The
+    vector is still read when present, because reading the value the call site
+    reads is what keeps the two from drifting; ``pp`` is only the fallback.
+
+    ``flip_dcp`` appears exactly on the construction site's condition
+    (``dcp_size > 1``), not on "dcp is enabled": the secondary set's DCP width
+    is its own, and the primary ``--dcp-size`` has nothing to do with it.
+    """
+    if not getattr(server_args, "enable_phase_flip", False):
+        return ()
+    from sglang.srt.mem_ledger.nccl_transport import CommunicatorGroup
+
+    vec = getattr(server_args, "phase_flip_tp_vector", None)
+    width = pp
+    if vec:
+        try:
+            width = len([int(x) for x in str(vec).split(",")])
+        except ValueError:
+            # server_args refuses this launch outright; the ledger runs first
+            # and must not raise on argv it is not the judge of.
+            width = pp
+    width = max(1, int(width))
+    out = [CommunicatorGroup(name="flip_tp", world_size=width)]
+    if width > 1:
+        out.append(CommunicatorGroup(name="flip_dcp", world_size=width))
+    # pp_size=1 at the call site. Declared anyway: the group is CONSTRUCTED,
+    # and classify_communicator_groups is the thing that decides a single-rank
+    # group allocates nothing. Deciding it here would hide the group from the
+    # inventory the moment the call site passes a different pp_size.
+    out.append(CommunicatorGroup(name="flip_pp", world_size=1))
+    return tuple(out)
 
 
 def _attention_tp_uses_pynccl(server_args) -> bool:

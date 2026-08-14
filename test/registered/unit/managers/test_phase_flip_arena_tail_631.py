@@ -207,11 +207,24 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
         r._census_scheduler = None
         self.assertEqual(r._arena_tail_bytes(TP_TO_PP), 0)
 
-    def test_staging_bytes_folds_the_tail_in_with_max_not_sum(self):
+    def test_staging_bytes_folds_the_tail_in_ADDITIVELY(self):
+        """WAS test_staging_bytes_folds_the_tail_in_with_max_not_sum.
+
+        The rename is the correction. The old pin asserted that the tail was
+        an ALTERNATIVE to the wave peak, on the argument that the two belong
+        to different instants of the seam. The stage walk falsifies it: the
+        refill is a PRE-cutover function, so it commits with the wave state
+        still outstanding, and the one measured corridor breach in the corpus
+        is exactly the gap between the two forms (MERGE-R9 12.4, and
+        test_seam_arena_tail_additive_656.py for the numbers).
+
+        The drafter's restore keeps its max() -- it runs inside the cutover,
+        after the waves are dead -- so ``max(`` must still appear.
+        """
         src = inspect.getsource(PhaseFlipRuntime._staging_bytes)
         self.assertIn("_arena_tail_bytes", src)
         self.assertIn("max(", src)
-        self.assertNotIn("+ self._arena_tail_bytes", src)
+        self.assertIn("self._arena_tail_bytes(direction)\n            + max(", src)
 
 
 class OrderingAroundTheRefillTest(unittest.TestCase):
