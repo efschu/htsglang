@@ -31,8 +31,8 @@ Ordered as the release actually runs, from the user's go to a shipped image.
 | 5 | Build the release image | **USER** | **PROVEN END-TO-END** — three builds, §4.0.2. The recipe as inherited could not build; it now builds with the gate running in-build and the image verifying ARMED. One command, no build args |
 | 6 | Transfer to the Proxmox host and run | **USER** | **READY** — recipe in §5; the apparmor trap is confirmed live, see §4.0 |
 | 7 | Acceptance smoke (#416 shape) | **USER** | **READY** — §6 |
-| 8 | Push to ghcr with PAT2 | **USER** | **BLOCKED ON USER** — credential is read from file, never printed; §7 |
-| 9 | Public-image verify (#416 style) | **USER** | **READY** — §7 |
+| 8 | Push to ghcr with PAT2 | **USER** | **BLOCKED ON USER** — credential read from file, never printed; §7. **Now carries a mandatory pre-push step (§7.0): the release build must SUPERSEDE the published `cu130-nccl2307`, which is confirmed SHADOWED** |
+| 9 | Public-image verify (#416 style) | **USER** | **READY, and must re-run against the NEW digest** — §7.1, by `@sha256:` not by tag (§7.0.c-d) |
 | 10 | Publish docs / README redesign (#135) | **USER** | **DRAFT ONLY** — `docs/dev/DRAFT_135_README_redesign.md`, marked not-published |
 
 **The one item that changed the release's shape.** Step 5 was expected to be a
@@ -617,6 +617,42 @@ docker push ghcr.io/efschu/htsglang:cu130-nccl2307
   here.
 * Nothing about this release is posted publicly before the operator's go.
 
+### 7.0 PRE-PUSH, MANDATORY: the release build must SUPERSEDE the published tag
+
+**The currently published `ghcr.io/efschu/htsglang:cu130-nccl2307` is defective
+and must not remain the tag a stranger pulls.** Probed 2026-08-14 with the #384
+guard: `verdict=SHADOWED`, exit 1.
+
+**State the defect precisely, because the imprecise version is already in
+circulation.** The published image is **not armless**. The probe reports:
+
+```
+provider: sgl-kernel     0.3.21 (69 recorded sgl_kernel/ files)  <-- armless pypi dist
+provider: sglang-kernel  0.4.4  (67 recorded sgl_kernel/ files)
+INT8 arm (int8_scaled_mm): present in {'sm100/...': 49, 'sm90/...': 49}
+```
+
+Two distributions provide the same `sgl_kernel` import package, and the fork's
+**armed** files currently win because they were installed second. So the arm is
+**present today**. The defect is *instability, not absence*: pip reports no
+conflict between the two, so the next `pip install` of either one silently
+decides which files win — and one of the two candidates is armless. An image
+that is correct today and one `pip install` from being wrong is not a shippable
+artifact, which is exactly why the guard treats a shadow as an error even when
+the arm is present.
+
+| Step | Requirement |
+|---|---|
+| 7.0.a | Build the release image from the current merged line with the gate running in-build (§4.0.2). Pass criterion: `verdict=ARMED`, exit 0. |
+| 7.0.b | **Supersede the existing tag.** Push the new build to `cu130-nccl2307` (same tag, new digest) so no one keeps pulling the shadowed image, or retire that tag and publish the replacement under the tag the release notes name. Leaving the old digest reachable as the default pull is not acceptable. |
+| 7.0.c | **Record the NEW digest.** `docker buildx imagetools inspect ghcr.io/efschu/htsglang:<tag>` — the digest, not the tag, is what §7.1 must verify against; a tag can move under you. |
+| 7.0.d | **Re-run §7.1 against that new digest**, by digest (`...@sha256:...`), not by tag. A verify that ran against the old digest proves nothing about what was just published. |
+| 7.0.e | Release notes state whether the image serves INT8, since that is not discoverable from the tag (§1.5). |
+
+> **Do not announce anything until 7.0.d passes on the new digest.** The
+> published image predates the guard; the guard is now the thing that decides
+> whether an image is publishable at all.
+
 ### 7.1 Public-image verify (the #416 shape) — do this BEFORE announcing
 
 #416 is the precedent: an image that built fine, pushed fine, and was wrong for
@@ -624,9 +660,13 @@ the person who pulled it. The only check that would have caught it is pulling
 the published artifact **as a stranger does** — fresh, by tag, with no local
 layers and no build context — and inspecting what it actually contains.
 
+**Verify by DIGEST, not by tag** (§7.0.c-d) — a tag can move between the push
+and the check, and then the verify describes an artifact nobody pulled.
+
 ```bash
+DIG=ghcr.io/efschu/htsglang@sha256:<new-digest-from-7.0.c>
 docker rmi ghcr.io/efschu/htsglang:<tag> 2>/dev/null || true   # no local cache
-docker pull ghcr.io/efschu/htsglang:<tag>
+docker pull "$DIG"
 
 # (a) provenance: exactly one distribution provides sgl_kernel, arm as intended
 docker run --rm --security-opt apparmor=unconfined \
