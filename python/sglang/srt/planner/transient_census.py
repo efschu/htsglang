@@ -183,19 +183,45 @@ class TransientCensus:
             "worst_transient_mib": draws.get(worst) if worst else None,
         }
 
+    @staticmethod
+    def _staging_path(path: str) -> str:
+        """Where this PROCESS stages its census before publishing it.
+
+        MUST be unique per process. ``pp_rank`` is not enough to make it so:
+        under pure tensor parallelism every rank carries ``pp_rank=0``, so all
+        of them derive the same output path -- and, before this, the same
+        staging path. Three schedulers then opened one
+        ``transient_pp0.json.tmp`` with mode ``"w"`` at overlapping times.
+
+        Write-tmp-then-rename makes the PUBLISH atomic. It does not make the
+        STAGING exclusive, and a shared staging name defeats the whole idiom:
+        measured hermetically, 23 of 600 concurrent flushes were LOST because
+        a peer's ``os.replace`` renamed the file away mid-write, and on metal
+        the published file was left unparseable (#363 window 2026-08-14).
+        """
+        return f"{path}.{os.getpid()}.tmp"
+
     def write(self, out_dir: str) -> Optional[str]:
         if not self.min_free_bytes:
             return None
+        tmp = None
         try:
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"transient_pp{self.pp_rank}.json")
-            tmp = f"{path}.tmp"
+            tmp = self._staging_path(path)
             with open(tmp, "w") as fh:
                 json.dump(self.payload(), fh, indent=2, sort_keys=True)
             os.replace(tmp, path)
             return path
         except OSError as exc:
             logger.warning("transient census could not be written: %s", exc)
+            # A staging file that never got published would otherwise sit in
+            # the census directory looking like data to anyone globbing it.
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             return None
 
 
