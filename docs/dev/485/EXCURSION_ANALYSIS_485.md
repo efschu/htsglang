@@ -182,12 +182,20 @@ free 668 MiB is below the 1024 MiB floor. torch is holding 652 MiB of slack
 (reserved 32342 MiB, allocated 31689 MiB)
 ```
 
-> Note the arithmetic: `reserved 32342 + free 668 = 33010 MiB` against a card
-> whose NVML total is ~32.6 GiB. `memory_reserved()` therefore cannot be
-> counting physical segments alone here — either expandable-segments virtual
-> reservation is in play, or the two probes were not simultaneous. **Resolving
-> this is a precondition for reading the reserved column at all**, and it is
-> question 1 of the metal ticket.
+> **`reserved` is not a physical quantity on this rank, and that is settled
+> from the artifacts, not inferred.** The card's NVML total is **32088.5 MiB**
+> (`s51/boot_arm_280000.log`: `nvml_used=30050.1 nvml_free=2038.4
+> nvml_total=32088.5`; the two 3080s read `nvml_total=20054.9`). So at the
+> breach `reserved 32342 + free 668 = 33010` overshoots the card by **921
+> MiB** — and the same line shows the overshoot is not a crash artifact: **at
+> rest**, `reserved=32040.0` against `nvml_used=30050.1` is already **1990 MiB
+> of reserve that no physical page backs**. Expandable-segments virtual
+> reservation is the ordinary explanation.
+>
+> **Consequence, and it corrects the obvious instrument fix.** Printing
+> `reserved` per stage would *not* decide anything: a virtual reserve can grow
+> without costing a byte of NVML free. **`allocated` is the decisive column** —
+> live torch bytes, physically backed by definition. See §7.
 
 ### S1 — caching-allocator segment growth during the checksum leg (LEADING)
 
@@ -205,11 +213,14 @@ The corridor guard reclaimed 310 MiB "from [allocator-cache]" 0.5 s after the
 breach, i.e. there *was* fresh reclaimable cache that a modal flip does not
 leave behind.
 
-**Discriminator:** `reserved` before and after `weights_refill`. If S1 holds,
-`reserved` rises by ~1258 MiB across the stage. The census **already samples
-`reserved` and `allocated` at every mark and prints only their difference**
-(`phase_flip_seam_census.py:277-280`). Printing all three is a one-line change
-and makes this decidable from the next boot's log with no extra instrument.
+**Discriminator:** **`allocated`** across `weights_refill`. Under S1 the
+8x-chunk buffers are live tensors while they sum, so `allocated` rises with
+`free` falling. The census **already samples `allocated` at every mark and
+prints only `reserved - allocated`** (`phase_flip_seam_census.py:277-280`);
+printing `allocated` as its own field is a one-line change and needs no new
+probe. Note S1 predicts a rise far larger than the 128 MiB the checksum is
+capped at, so a ~1258 MiB rise in `allocated` indicts the *allocator's
+behaviour around* the checksum rather than the checksum's own bound.
 
 ### S2 — a concurrent allocation by another actor on device 0
 
@@ -218,10 +229,12 @@ else allocating on device 0 during the ~1 s stage is attributed to
 `weights_refill`. Rank 0 was quiescent at the cutover, which makes this
 unlikely but not excluded.
 
-**Discriminator:** the same three-column census line. Under S2, `reserved` is
-flat across the stage while `free` drops — the signature is the *opposite* of
-S1's and the two cannot be confused. (Under S2 with a torch-side actor, cross
-against `allocated`.)
+**Discriminator:** the same `allocated` column, read together with *who* was
+running. S2 also raises `allocated` (any torch actor does), so it is not
+separated from S1 by the number alone — it is separated by the concurrent log
+context on device 0 in that second, which for this flip shows the rank
+quiescent at the cutover. Ranking S1 above S2 rests on that, and on S1's
+independent fit to the three-minute post-event baseline shift.
 
 ### S3 — VMM commit fragmentation in `arena_carrier.set_active_prefix`
 
@@ -230,10 +243,11 @@ stable VA. If the driver could not satisfy the commit from the handles released
 on the previous `pp_to_tp` leg and had to back it with fresh pages while the old
 ones were still held, free drops by more than the tail.
 
-**Discriminator:** `reserved` flat AND `allocated` flat across the stage (the
-commit is outside torch entirely). Distinguishes cleanly from both S1 and S2.
-Secondary: instrument `set_active_prefix` to log the pages it actually created
-versus reused.
+**Discriminator:** **`allocated` flat while `free` drops ~1258 MiB** — the
+commit is outside torch entirely, so no torch counter moves. This is the one
+clean, unambiguous split in the set: it separates S3 from {S1, S2} on a single
+column. Secondary: instrument `set_active_prefix` to log the pages it actually
+created versus reused.
 
 ### S4 — the `restore=` arm of `arena_refill` firing
 
@@ -433,9 +447,13 @@ Not "no breach". A boot that does not breach has only shown it did not draw the
 outlier — s51 is the worked example, and it had the *thinner* margin. One boot
 must produce **three specific readings**:
 
-1. **`reserved` and `allocated` per stage mark**, not just `slack`. This
-   discriminates S1 / S2 / S3 in §4 in a single window, and it is a one-line
-   change to a log format on a path that already samples all three.
+1. **`allocated` per stage mark**, not just `slack`. `allocated` flat across
+   `weights_refill` while `free` drops says S3 (a VMM commit outside torch);
+   `allocated` rising with `free` says S1 or S2. That is the one clean split,
+   and it is a one-line change to a log format on a path that already samples
+   the value. Print `reserved` too, but read it knowing it is virtually
+   inflated by ~1990 MiB at rest on this rank (§4) — it cannot carry this
+   decision on its own.
 2. **The at-rest TP free on rank 0 on current HEAD** — the left term of the §0
    identity, and the only term `cb8da83774` could have moved. Needed: ≥ 8079 MiB
    to clear C2′ against the worst already observed. s50 had 7725, s51 had 7314.
@@ -477,15 +495,15 @@ seam census left on (it is on by default).
 
 **Answer these four questions, in writing, from M1's log:**
 
-1. **The reserved arithmetic.** At any breach or deep trough, does
-   `reserved + free` exceed the card's NVML total? If yes, is
-   `expandable_segments` set (check `PYTORCH_CUDA_ALLOC_CONF` in the boot env
-   and the launch script)? Until this is answered the reserved column cannot be
-   read, and it is the column everything else in §4 turns on.
-2. **S1 vs S2 vs S3.** Across `weights_refill`, does `reserved` rise
-   (S1: allocator growth), stay flat while `free` drops (S2/S3: an actor outside
-   torch, or a VMM commit), or rise with `allocated` flat (neither)? One window
-   decides it.
+1. **Confirm the virtual reserve.** `reserved` overshoots this card's
+   32088.5 MiB total by 921 MiB at the breach and by 1990 MiB *at rest*. Check
+   `PYTORCH_CUDA_ALLOC_CONF` / `expandable_segments` in the boot env and record
+   it, so the next reader does not repeat the desk's first mistake of treating
+   `reserved` as physical. This is bookkeeping, not a blocker.
+2. **S3 vs {S1, S2} — the decision this boot exists for.** Across
+   `weights_refill`, does `allocated` stay flat while `free` drops (S3: a VMM
+   commit outside torch), or does it rise with `free` (S1/S2: a torch
+   allocation)? One window decides it, on one column.
 3. **The left term.** What is the at-rest TP-phase free on rank 0 on HEAD, for
    both M0 and M1? Is it ≥ 8079 MiB? State the number even if the answer is
    obviously no — it is the input to option (c).
