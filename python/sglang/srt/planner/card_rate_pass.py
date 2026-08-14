@@ -156,6 +156,12 @@ class MeasuredCardRate:
     pci_bus_id: Optional[str] = None
     nvml_index: Optional[int] = None
     throttled: bool = False
+    #: The environment the rates above were measured in
+    #: (``planner.rate_env.RateEnv.token``): this card's enforced NVML power
+    #: limit plus the driver version. Without it a rate cannot be dated, which
+    #: is how the borrowed s50 rates were consumed for a whole shift after the
+    #: 2026-08-05 power-target cut had already invalidated their GEMM half.
+    rate_env: Optional[str] = None
 
     @property
     def complete(self) -> bool:
@@ -242,6 +248,13 @@ def rates_by_uuid(profile=None) -> Dict[str, MeasuredCardRate]:
         return {}
 
     ident = _identity_by_uuid()
+    # The environment each card is running under RIGHT NOW, which is the
+    # environment the probe measured in (the probe is either running in this
+    # pass or was cached from this same rig). Stamped per card because the
+    # power limit is per card -- this rig runs its 3080s and its 5090 at
+    # different reduced targets. Best-effort: no NVML, no fingerprint, and the
+    # rate then reads as stale-unknown rather than as fresh.
+    envs = _rate_envs_by_uuid()
     # The probe records each card's own VRAM total. Preferred over NVML here
     # because it travels WITH the measurement: an artifact carried to another
     # host still says how big the card it was measured on actually was.
@@ -265,8 +278,19 @@ def rates_by_uuid(profile=None) -> Dict[str, MeasuredCardRate]:
             pci_bus_id=getattr(card, "pci_bus_id", None),
             nvml_index=getattr(card, "nvml_index", None),
             throttled=bool(entry.get("throttled")),
+            rate_env=(envs[uuid].token if uuid in envs else None),
         )
     return out
+
+
+def _rate_envs_by_uuid() -> Dict[str, Any]:
+    """``{uuid: RateEnv}`` for the cards present now, or ``{}``."""
+    try:
+        from sglang.srt.planner.rate_env import capture_rate_envs
+
+        return capture_rate_envs()
+    except Exception:
+        return {}
 
 
 def rates_by_name(
@@ -295,10 +319,18 @@ def rates_by_name(
             out[rate.name] = rate
             continue
         totals = [t for t in (cur.total_mib, rate.total_mib) if t]
+        # The fingerprint follows the GEMM minimum. GEMM is the power-bound
+        # term -- the one the power-target cut moved by 12-22 % while
+        # bandwidth reproduced to the decimal -- so the environment worth
+        # carrying is the one the surviving GEMM number was taken in. Two
+        # same-named cards at different power limits therefore keep the
+        # binding card's environment rather than an averaged fiction.
+        gemm_winner = cur if cur.gemm_tflops <= rate.gemm_tflops else rate
         out[rate.name] = dataclasses.replace(
             cur,
             gemm_tflops=min(cur.gemm_tflops, rate.gemm_tflops),
             membw_gbs=min(cur.membw_gbs, rate.membw_gbs),
+            rate_env=gemm_winner.rate_env,
             # A capacity is a budget: crediting a name with the larger of two
             # same-named cards would over-fund whichever rank lands on the
             # smaller one.
@@ -322,52 +354,98 @@ def project_onto_library(
 ):
     """Write measured rates into a :class:`CardLibrary`, returning (library, names).
 
-    A name already in the library keeps its curated capacity and nameplate
-    fields; only the measured rates are set, and they OVERWRITE -- a fresh
-    measurement supersedes a stale one, which ``add(overwrite=False)`` would
-    not do (it fills only absent fields).
+    The entry a measurement lands on is chosen by NAME **and CAPACITY**, via
+    ``CardLibrary.resolve``. The name alone does not identify a card: the RTX
+    3080 shipped in a 10 GB and a 20 GB variant, the seed catalogue holds both,
+    and the driver calls both ``NVIDIA GeForce RTX 3080``.
 
-    A name NOT in the library is added, which needs a VRAM total. It comes from
-    NVML via the caller (``total_mib_by_name``); a card whose total is unknown
-    is skipped rather than added with a fabricated capacity.
+    Three cases, and the middle one is the correction:
+
+    * the catalogue has an entry of that name AND that capacity -> it takes the
+      rates, keeping its curated nameplate fields;
+    * the catalogue has entries of that name but NONE of that capacity -> a new
+      variant entry is filed under a capacity-suffixed name. #584 instead
+      OVERWROTE the colliding entry's capacity, which fixed this rig's reading
+      by breaking the catalogue's: after that pass, "RTX 3080" in the library
+      claimed 20480 MiB, so anyone composing a hypothetical rig from the 10 GB
+      card got a 20 GB one. A measurement is the authority on the card it
+      measured -- not on a card it never saw;
+    * the name is not in the catalogue at all -> added, provided a VRAM total
+      is known. A card whose total is unknown is skipped rather than added with
+      a fabricated capacity.
+
+    Rates OVERWRITE (a fresh measurement supersedes a stale one, which
+    ``add(overwrite=False)`` would not do), and carry their provenance:
+    ``source="measured"`` plus the environment fingerprint they were taken
+    under.
     """
-    from sglang.srt.planner.card_library import CardLibrary, CardSpec
+    from sglang.srt.planner.card_library import (
+        CardCapacityMismatch,
+        CardLibrary,
+        CardSpec,
+    )
 
     lib = library if library is not None else CardLibrary()
     written: List[str] = []
     caveats: List[str] = []
     for name, rate in sorted(rates_by_name(rates).items()):
         measured_total = rate.total_mib or (total_mib_by_name or {}).get(name)
-        if lib.has(name):
-            cur = lib.get(name)
-            # CAPACITY COLLISION, and it is not hypothetical. The driver
-            # reports this rig's 20 GB cards as "NVIDIA GeForce RTX 3080",
-            # which canonicalises to the same key as the seed entry for the
-            # 10 GB RTX 3080 -- the seed set holds "RTX 3080" and
-            # "RTX 3080 20GB" as deliberately distinct entries, but no name
-            # the driver emits can select between them. Left alone, this rig's
-            # measured rates would be written onto a profile claiming 10240
-            # MiB. The measurement is the authority on the card it measured,
-            # so the capacity is corrected to what was actually seen.
-            total = int(measured_total) if measured_total else cur.total_mib
-            if measured_total and cur.total_mib and int(measured_total) != cur.total_mib:
-                caveats.append(
-                    f"{name}: catalog capacity {cur.total_mib} MiB does not "
-                    f"match the {int(measured_total)} MiB actually measured. "
-                    f"The card name cannot distinguish these variants, so the "
-                    f"MEASURED capacity wins and the profile now describes the "
-                    f"card in this rig."
-                )
+        if rate.rate_env is None:
+            caveats.append(
+                f"{name}: measured with no environment fingerprint (NVML could "
+                f"not be read for the power limit / driver version), so the "
+                f"rate is written STALE-UNKNOWN and every consumer will say so. "
+                f"A rate that cannot name the power limit it was taken under "
+                f"cannot be shown to still describe this rig."
+            )
+        cur = None
+        if lib.variants(name):
+            try:
+                cur = lib.resolve(name, total_mib=measured_total)
+            except CardCapacityMismatch:
+                cur = None
+        if cur is not None:
             lib.add(
                 dataclasses.replace(
                     cur,
-                    total_mib=total,
+                    total_mib=int(measured_total) if measured_total else cur.total_mib,
                     gemm_tflops=float(rate.gemm_tflops),
                     membw_gbs=float(rate.membw_gbs),
+                    source="measured",
+                    rate_env=rate.rate_env,
                 ),
                 overwrite=True,
             )
-            written.append(name)
+            written.append(cur.name)
+            continue
+        if measured_total and lib.variants(name):
+            # A capacity variant the catalogue does not carry. Filed under its
+            # own name so ``resolve`` can find it next time, and so the
+            # same-named entries it is NOT are left exactly as they were.
+            variant = f"{name} {round(int(measured_total) / 1024)}GB"
+            caveats.append(
+                f"{name}: the catalogue carries "
+                f"{', '.join(f'{v.name} = {v.total_mib} MiB' for v in lib.variants(name))}"
+                f", none of them the {int(measured_total)} MiB card actually "
+                f"measured. The name cannot distinguish these variants, so the "
+                f"measurement is filed as a NEW entry {variant!r} rather than "
+                f"overwriting another variant's capacity. It carries no "
+                f"nameplate peaks -- the catalogue has none for this variant, "
+                f"and a peak copied from a different-capacity sibling would be "
+                f"a guess wearing a datasheet's clothes."
+            )
+            lib.add(
+                CardSpec(
+                    name=variant,
+                    total_mib=int(measured_total),
+                    gemm_tflops=float(rate.gemm_tflops),
+                    membw_gbs=float(rate.membw_gbs),
+                    source="measured",
+                    rate_env=rate.rate_env,
+                ),
+                overwrite=True,
+            )
+            written.append(variant)
             continue
         if not measured_total:
             caveats.append(
@@ -381,6 +459,8 @@ def project_onto_library(
                 total_mib=int(measured_total),
                 gemm_tflops=float(rate.gemm_tflops),
                 membw_gbs=float(rate.membw_gbs),
+                source="measured",
+                rate_env=rate.rate_env,
             ),
             overwrite=True,
         )
@@ -542,10 +622,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  if lib.get(n).gemm_tflops and lib.get(n).membw_gbs]
         print(f"{target}: {len(rated)} of {len(lib.names())} profiles carry "
               f"measured rates")
+        # Dated against the environment running NOW, because a rate that was
+        # correct when taken is not therefore correct today: this rig's
+        # 2026-08-05 power-target cut moved measured GEMM by 12-22 % while
+        # bandwidth reproduced to the decimal, and the artifact that predates
+        # fingerprinting cannot say which side of that it was written on.
+        from sglang.srt.planner.rate_env import check_card_rate_freshness
+
+        try:
+            from sglang.srt.planner.rate_env import current_envs_by_name
+
+            envs = current_envs_by_name()
+        except Exception:
+            envs = {}
         for n in rated:
             s = lib.get(n)
+            verdict = check_card_rate_freshness(
+                n, getattr(s, "rate_env", None), by_name=envs
+            )
             print(f"  {n}: gemm {s.gemm_tflops:.2f} TFLOPS  "
-                  f"membw {s.membw_gbs:.1f} GB/s")
+                  f"membw {s.membw_gbs:.1f} GB/s  [{verdict.state.upper()}] "
+                  f"{verdict.reason}")
         return 0 if rated else 1
 
     report = run_card_rate_pass(path=args.path, run_probe=args.run)

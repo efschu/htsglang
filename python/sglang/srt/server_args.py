@@ -15371,6 +15371,19 @@ class ServerArgs:
                 f"SGLANG_CARD_LIBRARY to an artifact measured on cards with "
                 f"these UUIDs."
             )
+        # #584 by-catch: a rate is a number PLUS the environment it holds in.
+        # The borrowed s50 rates reproduced BANDWIDTH to the decimal and ran
+        # GEMM 12-22 % high, in the direction the 2026-08-05 power-target cut
+        # (3080s 320 -> 200 W, 5090 525 -> 400 W) predicts -- and nothing in
+        # the artifact recorded the power limit, so nothing could notice. Read
+        # NVML once here and date every stage's rate against it.
+        from sglang.srt.planner import rate_env as _rate_env
+
+        try:
+            current_envs = _rate_env.current_envs_by_name()
+        except Exception:
+            current_envs = {}
+
         out = []
         for stage in range(self.pp_size):
             name = gpu_names[stage] if stage < len(gpu_names) else None
@@ -15382,7 +15395,7 @@ class ServerArgs:
                     f"do NOT fall back to the --rank-gpu-id index, which is "
                     f"not the NVML order on every rig."
                 )
-            if not library.has(name):
+            if not library.variants(name):
                 raise ValueError(
                     f"--pp-solve-cut: no measured profile for {name!r} "
                     f"(stage {stage}). A missing rate must be refused, never "
@@ -15390,7 +15403,23 @@ class ServerArgs:
                     f"`python -m sglang.srt.planner.card_rate_pass --run` on "
                     f"the rig that carries this card."
                 )
-            spec = library.get(name)
+            # ``resolve``, not ``get``: the catalogue keys by NAME, and the RTX
+            # 3080 shipped in a 10 GB and a 20 GB variant that the driver calls
+            # by the same string. ``get`` returns whichever one owns the plain
+            # key -- the 10 GB seed -- and would shadow the MEASURED 20 GB
+            # entry the pass just wrote for the card actually in this rig, so
+            # the gate would refuse a card it has a rate for. ``resolve`` lets
+            # a measured entry outrank a same-named seed.
+            try:
+                spec = library.resolve(name)
+            except LookupError as exc:
+                raise ValueError(
+                    f"--pp-solve-cut: {name!r} (stage {stage}) cannot be "
+                    f"resolved to one card in the measured library -- {exc} "
+                    f"Run `python -m sglang.srt.planner.card_rate_pass --run` "
+                    f"on the rig that carries this card so the measured "
+                    f"variant is written."
+                ) from exc
             if not spec.gemm_tflops or not spec.membw_gbs:
                 raise ValueError(
                     f"--pp-solve-cut: the profile for {name!r} carries no "
@@ -15399,6 +15428,36 @@ class ServerArgs:
                     f"does not cover this card -- it prices only cards the "
                     f"#213 probe actually measured, and never fills a rate "
                     f"from a nameplate peak."
+                )
+            verdict = _rate_env.check_card_rate_freshness(
+                name, getattr(spec, "rate_env", None), by_name=current_envs
+            )
+            if verdict.stale:
+                raise ValueError(
+                    f"--pp-solve-cut: the measured rate for {name!r} (stage "
+                    f"{stage}) was taken in a DIFFERENT environment than the "
+                    f"one running now -- {verdict.reason}. A sustained GEMM "
+                    f"rate is a power-bound quantity: when this rig's power "
+                    f"targets were cut on 2026-08-05, measured GEMM moved "
+                    f"-12.2 % on the 5090 and -22.5 % on the 3080 while "
+                    f"memory bandwidth reproduced to the decimal. A rate "
+                    f"carried across such a change prices a stage from a card "
+                    f"that no longer exists, so it is refused rather than "
+                    f"consumed. Re-measure on this rig: `python -m "
+                    f"sglang.srt.planner.card_rate_pass --run`."
+                )
+            if verdict.unknown:
+                logger.warning(
+                    "--pp-solve-cut: the measured rate for %r (stage %d) is "
+                    "STALE-UNKNOWN -- %s. It is priced as-is because refusing "
+                    "would reject every artifact written before rate "
+                    "fingerprinting, but it carries no evidence that it "
+                    "describes this rig's current power limit and driver. Run "
+                    "`python -m sglang.srt.planner.card_rate_pass --run` to "
+                    "stamp one.",
+                    name,
+                    stage,
+                    verdict.reason,
                 )
             out.append((name, float(spec.gemm_tflops), float(spec.membw_gbs)))
         return out

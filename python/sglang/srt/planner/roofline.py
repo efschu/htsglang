@@ -90,8 +90,11 @@ precise; the surfacing says so loudly.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "RankRoofline",
@@ -466,7 +469,7 @@ def _measured_power_by_card(hardware, per_rank, library, power_profile, phase):
         if uu:
             m = by_uuid.get(_norm_uuid(uu))
         if m is None and by_arch:
-            prof = _profile_for(library, card.name)
+            prof = _profile_for(library, card.name, total_mib=getattr(card, "total_mib", None))
             arch = getattr(prof, "sm_arch", None) if prof else None
             if arch:
                 m = by_arch.get(arch)
@@ -524,7 +527,14 @@ def roofline_energy(
     for pr in per_rank:
         if pr.gpu_index in tdp_by_card:
             continue
-        prof = _profile_for(library, pr.gpu_name)
+        # The card's own measured total, not the name alone: a TDP read off the
+        # wrong capacity variant is the wrong TDP class. Absent hardware for a
+        # rank leaves it None, which resolves exactly as before.
+        try:
+            rank_total_mib = getattr(hardware.gpu(pr.gpu_index), "total_mib", None)
+        except Exception:
+            rank_total_mib = None
+        prof = _profile_for(library, pr.gpu_name, total_mib=rank_total_mib)
         if prof is None or not getattr(prof, "tdp_w", None):
             return None
         tdp_by_card[pr.gpu_index] = float(prof.tdp_w)
@@ -638,19 +648,43 @@ def _infer_compute(model_path: str, cfg: dict):
     return "fp16", marlinish
 
 
-def _profile_for(library, name):
+def _profile_for(library, name, total_mib=None):
     """Look up a CardSpec by card name, tolerating the vendor/marketing prefix
     that live NVML reports ("NVIDIA GeForce RTX 5090") but the catalog omits
     ("RTX 5090"). Returns None when the card is not in the library (then the
-    roofline has no nameplate fallback for it — measured probe or nothing)."""
-    if library.has(name):
-        return library.get(name)
-    alt = (
+    roofline has no nameplate fallback for it — measured probe or nothing).
+
+    ``total_mib`` is the card's measured VRAM total and every caller passes it,
+    because the name ALONE is not an identity. The RTX 3080 shipped in a 10 GB
+    and a 20 GB variant and the driver calls both "NVIDIA GeForce RTX 3080", so
+    a name-only lookup priced this rig's 20 GB cards from the 10 GB entry — a
+    different TDP class, a different nameplate, silently. With the total, the
+    catalogue selects the variant; when NO variant matches it REFUSES, and the
+    refusal arrives here as None.
+
+    None rather than the exception, deliberately: this module never raises into
+    the plan flow (see ``roofline_energy``), and "unknown card" is already its
+    documented answer — it then reports what it cannot price instead of pricing
+    it from the wrong card's numbers.
+    """
+    from sglang.srt.planner.card_library import CardCapacityMismatch
+
+    for candidate in (
+        name,
         str(name).replace("NVIDIA", "").replace("GeForce", "")
-        .replace("geforce", "").strip()
-    )
-    if alt and library.has(alt):
-        return library.get(alt)
+        .replace("geforce", "").strip(),
+    ):
+        if not candidate:
+            continue
+        try:
+            return library.resolve(candidate, total_mib=total_mib)
+        except CardCapacityMismatch as exc:
+            logger.warning(
+                "roofline: not pricing %r from the card library — %s", name, exc
+            )
+            return None
+        except KeyError:
+            continue
     return None
 
 
@@ -785,7 +819,7 @@ def _rank_peaks(model, hardware, library, measured_scores, dtype):
     for r in range(model.tp_size):
         gid = model.plan_inputs.rank_gpu_id[r] if model.plan_inputs.rank_gpu_id else r
         card = hardware.gpu(gid)
-        prof = _profile_for(library, card.name)
+        prof = _profile_for(library, card.name, total_mib=getattr(card, "total_mib", None))
         ms = measured_by_idx.get(gid)
 
         membw = membw_src = None
@@ -921,7 +955,7 @@ def _interconnect(hardware, library, used_gids, n_cross, weight_share_by_card,
         except ValueError:
             all_nvlink = False
             break
-        prof = _profile_for(library, card.name)
+        prof = _profile_for(library, card.name, total_mib=getattr(card, "total_mib", None))
         if prof is None or not prof.nvlink:
             all_nvlink = False
             break
