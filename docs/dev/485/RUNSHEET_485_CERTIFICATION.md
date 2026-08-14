@@ -368,6 +368,14 @@ it.
 is even about. Running P3 first is how this ticket spent two windows measuring
 a cut that its own gate would not admit.
 
+> **WHICH CENSUS FEEDS P2 IS NOT THE SHIFT'S CHOICE — see §6b.** Two honest
+> censuses gave opposite answers in the R12 window (M1 admits `37,14,13`, M0
+> admits nothing). §6b pins the governing rule: **the worst value over the
+> pooled population, per quantity**. A shift that solves against whichever
+> census admits a cut is choosing its own result. And if the pooled-worst
+> calibration admits nothing, **that is the answer**, reported with the lever
+> arithmetic — not a window to be re-run against a friendlier input.
+
 Each window: soak traffic for the duration, plus the A/B depth probe at 179200
 with `n_scored >= 5` (window 1 scored 5; fewer is not a measurement).
 
@@ -443,7 +451,9 @@ minima.
 ```
 
 taken over **every flip in the reference class**, not over window minima.
-Verbatim from `excursion_485.py judge` on the real data:
+**§6b defines what the reference class IS** — the pooled population, not the
+cut's own flips — because that question was left open here and it decides the
+verdict. Verbatim from `excursion_485.py judge` on the real data:
 
 ```
    reference class: 196 flips over 2 window(s)
@@ -534,6 +544,128 @@ the older +50.9 % is not.
 Also note the ordering consequence: **the A/B probe belongs in P3, not P1.**
 Running it during M1 measures the throughput of a cut that P2 may be about to
 reject. §7a forbids it in the metal ticket for exactly this reason.
+
+---
+
+## 6b. WHICH CENSUS CALIBRATES THE GATE — the governing rule
+
+**Added 2026-08-14, shift `m584`. This section exists because P2's answer
+changed depending on an input nobody was reporting, and a gate with an
+unreported free parameter is not a gate.**
+
+`WINDOW_VERDICT_485_R12.md` §2 recorded the problem exactly and declined to
+settle it: fed M1's census the gate **admits `37,14,13`**; fed the M0 ship-cut
+census, at the same pool with the same budgets, the same code **admits
+nothing**. "Two honest censuses give opposite answers. Nothing here says which
+extrapolation is right." This section says which.
+
+### THE RULE
+
+> **A quantity that calibrates the gate is taken as the WORST value observed
+> over the POOLED population of every census on the line — never the value from
+> the census most convenient to the cut under test, and never the value from
+> the cut's own class alone.**
+
+Applied to the two places it bites:
+
+| quantity | governing value | source |
+|---|---|---|
+| worst transient (C2′) | **7055 MiB** | pooled census, 221 flips (196 from s50+s51, 25 from M1); unchanged when W1's 99 are added — 320 observed |
+| required at-rest free, binding rank | **7055 + 1024 = 8079 MiB** | the C2′ identity |
+| seam staging, fixed overheads | the **most demanding** census on the line, per term | M0 vs M1, whichever refuses |
+
+### WHY POOLED, when §6a argues the opposite
+
+This is a real disagreement with a real argument on the other side, and it is
+recorded rather than smoothed over. §6a and `WINDOW_VERDICT_485_R12.md` §3 hold
+that a transient is **a property of the cut**: s50/s51/M1 measured `40,12,12`,
+W1 measured `37,14,13`, and charging W1 with s50's 7055 pools across
+configurations — the very error §6a exists to prevent, and the reason the
++25.5 % had to be retired. On W1's own class of 99 flips C2′ **passes by
++2589 MiB**.
+
+That argument is correct about the **body** of the transient and wrong about
+the **tail**, and the distinction is what decides it:
+
+1. **The body is cut-specific and nobody disputes it.** W1's worst is 3186,
+   M1's 4378, s50's modal 5800. These track the weights each stage refills, so
+   they move with the cut, exactly as §6a says.
+2. **The tail is not explained at all.** The 7055 is the invariant `−4278`
+   step plus an excess of **1258 MiB** that `EXCURSION_ANALYSIS_485.md` states
+   is **NOT resolved** — one flip in 320, every other stage byte-identical,
+   identical entry state, no branch difference.
+3. **The mechanism the tail rides on is cut-INDEPENDENT.** Q2 decided S3 over
+   594 flips: the draw is the VMM commit in `arena_carrier.set_active_prefix`,
+   with `max |Δallocated| = 0`. That is a property of the **flip machinery**,
+   not of the layer cut. Q1 independently shows the arena is such a
+   `cuMemAddressReserve`/`cuMemMap` reservation.
+
+**An unexplained excess, riding on a mechanism shown to be cut-independent,
+must be charged to every cut until it is explained.** Charging it only to the
+cut that happened to draw it assumes precisely what is in question — that the
+cut is why it was drawn. W1 did not draw a 7055; it also only ran once, and
+s51 did not draw one either, then §1 showed s51 was not the lucky boot but the
+one running the *thinner* margin, which would have troughed at 259 MiB had the
+same seam arrived.
+
+**So `37,14,13` is not certified by W1's own class.** Under the governing rule:
+
+| window | at-rest free, binding | vs 8079 required | verdict |
+|---|---:|---:|---|
+| M0 ship `14,10,8` | 3953.7 | **−4125.3 MiB** | FAILS |
+| M1 `40,12,12` | 2691.7 | **−5387.3 MiB** | FAILS |
+| W1 `37,14,13` | 4435.7 | **−3643.3 MiB** | FAILS |
+
+W1 passes C2′ on its own 99 flips by +2589 and fails the governing rule by
+−3643. Both numbers are true; the second is the one that governs, and the
+reason is stated above rather than asserted.
+
+**This rule is falsifiable, and here is what falsifies it.** Explain the
+1258 MiB excess. If its mechanism turns out to depend on the cut, the reference
+class narrows to the cut's own class that same day and W1's +2589 becomes the
+governing number. Until then the excess is unpriced, and an unpriced term
+reading as free memory is the failure this whole ticket is about.
+
+### THE CONSEQUENCE, STATED BEFORE THE WINDOW SO IT CANNOT BE RE-READ AFTER
+
+**If the pooled-worst census admits nothing, that IS the certified answer.**
+Not a failed window, not a measurement to be retried with a friendlier census
+— the result. §5.1b outcome (3) already says a refusal "is a stronger outcome
+than a clean window, because it is not a sample", and that applies here with
+full force: a refusal derived from the worst observed population is a statement
+about the configuration, while a clean window is one draw from a distribution
+whose tail is known to contain a 7055.
+
+**The named levers, and the one that is not a lever.** From §5.1a's sweep,
+which is fixture-derived but structural:
+
+* **`--rank-gpu-memory-mib`** — raise the binding rank's budget. This moves
+  at-rest free, the left term of the C2′ identity, and is the lever that
+  recovered feasibility in the sweep (+6000 MiB per rank there).
+* **Seam reduction** — reduce the draw itself. The sweep recovered feasibility
+  at a seam of ~500 MiB, and it then picks a *different* cut (`39,12,13`),
+  so a seam reduction is not a free win on the same cut.
+* **`--max-total-tokens` / KV-pool shrinking is NOT a lever.** Proven, not
+  assumed: 280000 down to 40000, every one refused, because the shortfall sits
+  in the FIXED terms — overhead, weights, corridor, seam — and the pool is not
+  one of them. The seam-cap guard's own operator advice lists it first; on this
+  shape it is the one knob that cannot help. **Do not reach for it.**
+
+When the re-solve returns nothing, report the shortfall in the solver's own
+numbers and convert it into both lever quantities — how many MiB per rank, and
+how much seam reduction — so the refusal arrives with its remedy attached
+rather than as a bare no.
+
+### Housekeeping this rule implies
+
+* The corridor sampler's long-form output is now read natively by
+  `certify_485.py` (shift `m584`), so the ad-hoc `corridor_to_wide.py` in
+  `evidence-631/m485/` is **superseded** and must not be reintroduced: it
+  synthesised `ts_ms` from a file mtime, and `ordering` — which reasons about
+  wall-clock instants — now refuses a series carrying no real timestamps.
+* `certify_485.py judge` no longer prints `CERTIFIED` for C1+C2+C3 alone. C2′,
+  C4 and C5 are attested with `--c2prime-margin`, `--cut` /
+  `--c4-admitted-cut` and `--c5-seam-samples`; unattested is refused.
 
 ---
 
