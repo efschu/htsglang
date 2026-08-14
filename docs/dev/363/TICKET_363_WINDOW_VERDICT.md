@@ -201,3 +201,39 @@ shared staging path is the mechanism.
    different cards publishes a single document describing whichever rank raced
    last. The corruption is fixed; **this** is not, and it is a design question
    for the census's owner rather than a bug to patch in a measurement window.
+
+---
+
+## 7. ADDENDUM — the staging pattern has a family, and two members already do it right
+
+Recorded after the merge suite, docs-only (the convention R7–R11 use for a
+handoff commit sitting on measured code).
+
+`grep -rn '\.tmp"' python/sglang/srt/` finds **~19 sites** staging through
+`path + ".tmp"`. Two of them already carry the fix this window had to make:
+
+* `distributed/device_communicators/barlink_matrix.py:1745` —
+  `p.with_suffix(p.suffix + f".{os.getpid()}.tmp")`, the exact per-process
+  staging path;
+* `registry/ledger.py:443` — `tempfile` with `dir=`, which is the same idea.
+
+So the correct pattern was already present in this tree, twice, and the census
+did not use it. The remaining ~16 sites are **unaudited**: the pattern is only
+dangerous where two or more PROCESSES derive the same output path, which for
+most planner artefacts is probably a single writer — but "probably" is what
+this window just spent a corrupt file learning about. The discriminating
+question per site is not "does it stage through a tmp" but **"can two
+processes reach it with the same path"**, and under pure TP the degenerate
+`pp_rank` is exactly what makes that happen without anyone intending it.
+
+Two further notes on coverage, both instances of this shift's own MERGE-R11 §2:
+
+* `test/registered/unit/planner/` is **not** a canonical arm, so the new
+  regression test does not run in the nine-arm sweep. It was run explicitly:
+  the planner arm is **2366P 123S** with 2 failures
+  (`test_rejected_evidence_pins.py`), and those two are present on the
+  untouched R11 tree as well.
+* The transient census writes **one file per `pp_rank`**. Under TP=3 that is
+  one document describing whichever of three DIFFERENT cards raced last. The
+  corruption is fixed; this is not, and it is a design question for the
+  census's owner.
