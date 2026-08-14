@@ -488,7 +488,9 @@ class TestNoPathProceedsIntoABreach(unittest.TestCase):
         old = phase_flip_spill.get_corridor_guard
         old_kv = phase_flip_spill.collective_kv_backing_relief
         phase_flip_spill.get_corridor_guard = lambda _s: None
-        phase_flip_spill.collective_kv_backing_relief = lambda *a, **k: 0  # noqa: ARG005
+        phase_flip_spill.collective_kv_backing_relief = (
+            lambda *a, **k: 0
+        )  # noqa: ARG005
         try:
             with _Margin(margin_mib=512, budget=2):
                 r = _runtime()

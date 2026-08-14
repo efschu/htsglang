@@ -244,9 +244,7 @@ def _build_runtimes(
                 pp_pool_view=pp_views[r],
                 tp_pool_view=tp_views[r],
                 live_slots_fn=lambda: live,
-                ready_fn=(
-                    ready_fns[r] if ready_fns else (lambda: True)
-                ),
+                ready_fn=(ready_fns[r] if ready_fns else (lambda: True)),
                 cutover_fn=lambda d, r=r: cutover_log[r].append(d),
                 pre_write_fns=(
                     pre_write_fns_for(r) if pre_write_fns_for else pre_write_fns
@@ -257,9 +255,7 @@ def _build_runtimes(
 
 
 def _clone_pools(pools):
-    return [
-        ([k.clone() for k in ks], [v.clone() for v in vs]) for ks, vs in pools
-    ]
+    return [([k.clone() for k in ks], [v.clone() for v in vs]) for ks, vs in pools]
 
 
 def _pools_equal(a, b):
@@ -327,9 +323,7 @@ class TestConsensusDiscipline(CustomTestCase):
         pp_before = _clone_pools(pp_pools)
         tp_before = _clone_pools(tp_pools)
         maps = [MAP_625, shifted, MAP_625]
-        runtimes, _ = _build_runtimes(
-            pp_views, tp_views, live, layer_maps=maps
-        )
+        runtimes, _ = _build_runtimes(pp_views, tp_views, live, layer_maps=maps)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[None] * 3)
         for r, e in enumerate(exceptions):
             self.assertIsInstance(e, KvReshardError, f"rank {r}: {e}")
@@ -350,9 +344,7 @@ class TestConsensusDiscipline(CustomTestCase):
                 return gate["count"] > 2  # not ready the first two probes
 
         ready_fns = [lambda: True, _rank1_ready, lambda: True]
-        runtimes, _ = _build_runtimes(
-            pp_views, tp_views, live, ready_fns=ready_fns
-        )
+        runtimes, _ = _build_runtimes(pp_views, tp_views, live, ready_fns=ready_fns)
         exceptions = _run_ranks(
             3, runtimes=runtimes, directions=[PP_TO_TP] * 3, rounds=10
         )
@@ -514,9 +506,7 @@ class TestValidationAndBounds(CustomTestCase):
         # is executed, so this is a no-op, not a partial move.
         for r in range(3):
             for buf in small_tp_views[r]._k:
-                self.assertEqual(
-                    float(buf.abs().sum()), 0.0, f"rank {r} wrote bytes"
-                )
+                self.assertEqual(float(buf.abs().sum()), 0.0, f"rank {r} wrote bytes")
 
 
 class TestSchedulerSideHelpers(CustomTestCase):
@@ -716,9 +706,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
         guards = flip_blocking_guards(sched)
         self.assertTrue(any("#630" in g for g in guards), guards)
         sched = self._fake_scheduler(is_dual_group_lane=True)
-        self.assertTrue(
-            any("dual-group" in g for g in flip_blocking_guards(sched))
-        )
+        self.assertTrue(any("dual-group" in g for g in flip_blocking_guards(sched)))
 
 
 class TestAbortDeferral(CustomTestCase):
@@ -801,9 +789,7 @@ class TestAbortDeferral(CustomTestCase):
         # neither is assumed.
         live_per_rank = [live_rank0, live, live]
         tp_before = _clone_pools(tp_pools)
-        runtimes = self._runtimes_with_per_rank_live(
-            live_per_rank, pp_views, tp_views
-        )
+        runtimes = self._runtimes_with_per_rank_live(live_per_rank, pp_views, tp_views)
         for rt in runtimes:
             rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
@@ -890,9 +876,7 @@ class TestAbortDeferral(CustomTestCase):
         # exists before the flip and survives it.
         live_per_rank = [live, live, live_rank2]
         tp_before = _clone_pools(tp_pools)
-        runtimes = self._runtimes_with_per_rank_live(
-            live_per_rank, pp_views, tp_views
-        )
+        runtimes = self._runtimes_with_per_rank_live(live_per_rank, pp_views, tp_views)
         for rt in runtimes:
             rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
@@ -929,9 +913,7 @@ class TestAbortDeferral(CustomTestCase):
         # The disconnect lands while the window is active (armed flip).
         self.assertTrue(window.submit(lambda: applied.append("abort req X")))
         live_per_rank = [live, live, live]  # deferral kept the set uniform
-        runtimes = self._runtimes_with_per_rank_live(
-            live_per_rank, pp_views, tp_views
-        )
+        runtimes = self._runtimes_with_per_rank_live(live_per_rank, pp_views, tp_views)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
         ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
@@ -1033,8 +1015,7 @@ class TestPpLoopConsensusOrdering(CustomTestCase):
                 outcomes[r] = e
 
         threads = [
-            threading.Thread(target=_worker, args=(r,), daemon=True)
-            for r in range(n)
+            threading.Thread(target=_worker, args=(r,), daemon=True) for r in range(n)
         ]
         for t in threads:
             t.start()
@@ -1197,9 +1178,7 @@ class TestParkDeadline(CustomTestCase):
         it had parked never resumed."""
         clock = _FakeClock()
         calls = []
-        rt = self._runtime(
-            ready_seq=[], clock=clock, deadline=5.0, channel_calls=calls
-        )
+        rt = self._runtime(ready_seq=[], clock=clock, deadline=5.0, channel_calls=calls)
         ok, _ = rt.arm(PP_TO_TP, source="test")
         self.assertTrue(ok)
 
@@ -1228,9 +1207,7 @@ class TestParkDeadline(CustomTestCase):
         down -- killing exactly the requests the deadline protects."""
         clock = _FakeClock()
         calls = []
-        rt = self._runtime(
-            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
-        )
+        rt = self._runtime(ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls)
         rt.arm(PP_TO_TP, source="test")
         clock.advance(2.0)
         # No exception, and serving continues in the SAME phase.
@@ -1242,9 +1219,7 @@ class TestParkDeadline(CustomTestCase):
     def test_re_arming_after_abandon_restarts_the_clock(self):
         clock = _FakeClock()
         calls = []
-        rt = self._runtime(
-            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
-        )
+        rt = self._runtime(ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls)
         rt.arm(PP_TO_TP, source="test")
         clock.advance(2.0)
         rt.on_round(require_armed_and_parked=True)
@@ -1255,9 +1230,7 @@ class TestParkDeadline(CustomTestCase):
         before = len(calls)
         for _ in range(5):
             rt.on_round(require_armed_and_parked=True)
-        self.assertEqual(
-            len(calls), before, "the re-armed clock must start from zero"
-        )
+        self.assertEqual(len(calls), before, "the re-armed clock must start from zero")
 
     def test_parked_rank_is_unaffected_by_the_deadline(self):
         """The healthy path must not change: parked ranks enter as before."""
@@ -1273,16 +1246,12 @@ class TestParkDeadline(CustomTestCase):
         except Exception:
             pass  # the commit path runs further than this stub supports
         self.assertTrue(calls, "a parked rank must still enter the consensus")
-        self.assertEqual(
-            rt.park_deadline_aborts, 0, "a parked rank must never abandon"
-        )
+        self.assertEqual(rt.park_deadline_aborts, 0, "a parked rank must never abandon")
 
     def test_zero_deadline_restores_the_unbounded_wait(self):
         clock = _FakeClock()
         calls = []
-        rt = self._runtime(
-            ready_seq=[], clock=clock, deadline=0.0, channel_calls=calls
-        )
+        rt = self._runtime(ready_seq=[], clock=clock, deadline=0.0, channel_calls=calls)
         rt.arm(PP_TO_TP, source="test")
         clock.advance(10_000.0)
         for _ in range(10):
@@ -1298,9 +1267,7 @@ class TestParkDeadline(CustomTestCase):
         family keeps producing."""
         clock = _FakeClock()
         calls = []
-        rt = self._runtime(
-            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
-        )
+        rt = self._runtime(ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls)
         rt.arm(PP_TO_TP, source="test")
         clock.advance(2.0)
         rt.on_round(require_armed_and_parked=True)
@@ -1311,7 +1278,6 @@ class TestParkDeadline(CustomTestCase):
         self.assertEqual(payload[5], -1)
         self.assertEqual(payload[0], 1, "armed")
         self.assertEqual(payload[2], 0, "ready")
-
 
 
 class TestEmptyLiveSetFlip(CustomTestCase):
@@ -1351,9 +1317,7 @@ class TestEmptyLiveSetFlip(CustomTestCase):
 
     def test_full_flip_with_an_empty_live_set(self):
         """End to end on the real runtime: an empty flip COMMITS."""
-        _, _, _, pp_views, _, tp_views = _make_layout_pools(
-            MAP_625, VEC, 64, seed=77
-        )
+        _, _, _, pp_views, _, tp_views = _make_layout_pools(MAP_625, VEC, 64, seed=77)
         live = torch.empty(0, dtype=torch.int64)
         runtimes, _ = _build_runtimes(pp_views, tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
@@ -1453,8 +1417,8 @@ class TestSharedArenaReadsPrecedeWrites(CustomTestCase):
     """
 
     def test_pp_to_tp_is_byte_exact_with_aliased_pools(self):
-        ref, live, _pp_pools, pp_views, tp_pools, tp_views = (
-            _make_aliased_layout_pools(MAP_625, VEC, 300)
+        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_aliased_layout_pools(
+            MAP_625, VEC, 300
         )
         runtimes, _cutovers = _build_runtimes(pp_views, tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
@@ -1523,9 +1487,7 @@ class TestSeamWavesAreByteIdentical(CustomTestCase):
             rt._n_waves = waves
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        self.assertEqual(
-            [rt.last_stats["seam_waves"] for rt in runtimes], [waves] * 3
-        )
+        self.assertEqual([rt.last_stats["seam_waves"] for rt in runtimes], [waves] * 3)
         return ref, live, tp_pools
 
     def test_one_wave_and_the_default_split_agree_byte_for_byte(self):
@@ -1567,9 +1529,7 @@ class TestSeamWavesAreByteIdentical(CustomTestCase):
         runtimes, _ = _build_runtimes(pp_views, tp_views, live)
         waves = runtimes[0]._flip_waves(PP_TO_TP)
         self.assertEqual(len(waves), N_LAYERS)
-        self.assertEqual(
-            sorted(f for w in waves for f in w), list(range(N_LAYERS))
-        )
+        self.assertEqual(sorted(f for w in waves for f in w), list(range(N_LAYERS)))
         self.assertEqual(default_wave_count(MAP_625), 4)
 
 
@@ -1617,9 +1577,7 @@ class TestPreWriteSeamOrdering(CustomTestCase):
         def _fns_for(rank):
             return (lambda direction, rank=rank: events[rank].append("SWAP"),)
 
-        runtimes, _ = _build_runtimes(
-            rec_pp, rec_tp, live, pre_write_fns_for=_fns_for
-        )
+        runtimes, _ = _build_runtimes(rec_pp, rec_tp, live, pre_write_fns_for=_fns_for)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
 
@@ -1900,9 +1858,7 @@ class TestWavedSeamOrdering(CustomTestCase):
                     segments.append(cur)
                     cur = []
             self.assertTrue(segments, f"rank {r}: streamed path never engaged")
-            self.assertEqual(
-                cur, [], f"rank {r}: a wave never reached finalize: {cur}"
-            )
+            self.assertEqual(cur, [], f"rank {r}: a wave never reached finalize: {cur}")
             for w, seg in enumerate(segments):
                 self.assertEqual(
                     seg,
@@ -2081,7 +2037,9 @@ class TestStreamedReleaseCoversBoundaryChunks(CustomTestCase):
             num_rows=16,
             write_rows=lambda li, r, d: written.append((li, r.clone())),
         )
-        rt._stream_wave(swap, PP_TO_TP, (0,), NS(num_rows=16), dst, [(0, rows, data)], 4)
+        rt._stream_wave(
+            swap, PP_TO_TP, (0,), NS(num_rows=16), dst, [(0, rows, data)], 4
+        )
         rel = [span for kind, span in log if kind == "release_span"]
         self.assertEqual(
             rel,
@@ -2107,8 +2065,13 @@ class TestStreamedReleaseCoversBoundaryChunks(CustomTestCase):
         data = torch.zeros(8, 4, dtype=torch.uint8)
         dst = NS(num_rows=16, write_rows=lambda li, r, d: None)
         rt._stream_wave(
-            _RecordingSeamSwap(log), PP_TO_TP, (0,), NS(num_rows=16), dst,
-            [(0, rows, data)], 4,
+            _RecordingSeamSwap(log),
+            PP_TO_TP,
+            (0,),
+            NS(num_rows=16),
+            dst,
+            [(0, rows, data)],
+            4,
         )
         res = [span for kind, span in log if kind == "restore_span"]
         self.assertEqual(res, [(0, 4), (4, 8), (8, 12), (12, 16)])

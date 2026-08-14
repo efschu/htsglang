@@ -719,13 +719,13 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             tree_parts = parts[:n_tree]
             req_parts = parts[n_tree:]
             split = {
-                "tree_max": int(max(int(p.max()) for p in tree_parts))
-                if tree_parts
-                else -1,
+                "tree_max": (
+                    int(max(int(p.max()) for p in tree_parts)) if tree_parts else -1
+                ),
                 "tree_rows": int(sum(int(p.numel()) for p in tree_parts)),
-                "req_max": int(max(int(p.max()) for p in req_parts))
-                if req_parts
-                else -1,
+                "req_max": (
+                    int(max(int(p.max()) for p in req_parts)) if req_parts else -1
+                ),
                 "req_rows": int(sum(int(p.numel()) for p in req_parts)),
             }
             # On the FUNCTION, so the rung that calls it can read the split
@@ -3446,9 +3446,7 @@ class PhaseFlipRuntime:
         # Position-weighted so a permutation is not a collision; both
         # ends sort, so any difference here is a real set difference.
         acc = int(
-            (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod)
-            .sum()
-            .item()
+            (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod).sum().item()
             % mod
         )
         return acc, n
@@ -4756,9 +4754,7 @@ class PhaseFlipRuntime:
             # once decode drains in the degraded layout the memory comes back
             # and the very next round enters with room.
             if draw_short:
-                self.seam_yields_withheld = (
-                    getattr(self, "seam_yields_withheld", 0) + 1
-                )
+                self.seam_yields_withheld = getattr(self, "seam_yields_withheld", 0) + 1
                 logger.warning(
                     "%s seam entry margin YIELD WITHHELD (%s): the budget of "
                     "%d attempts is spent, but this rank's own worst MEASURED "
@@ -5035,7 +5031,10 @@ class PhaseFlipRuntime:
             presence[local] = -1
         reduced = self._collective_min(presence.tolist())
         union = (
-            (torch.tensor(reduced, dtype=torch.int64) < 0).nonzero().flatten().to(torch.int64)
+            (torch.tensor(reduced, dtype=torch.int64) < 0)
+            .nonzero()
+            .flatten()
+            .to(torch.int64)
         )
         min_backed = int(ballot.get("min_backed_rows", 0))
         highest = int(union[-1].item()) if union.numel() else -1

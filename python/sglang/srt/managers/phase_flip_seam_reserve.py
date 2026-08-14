@@ -424,7 +424,9 @@ def record_corridor_shortfall(
             json.dump(rec, fh, indent=1)
         os.replace(tmp, path)
     except Exception as e:
-        logger.warning("%s could not record the shortfall in %s: %s", LOG_PREFIX, path, e)
+        logger.warning(
+            "%s could not record the shortfall in %s: %s", LOG_PREFIX, path, e
+        )
         return None
     logger.warning(
         "%s recorded a MEASURED corridor shortfall of %d MiB for rank %d "

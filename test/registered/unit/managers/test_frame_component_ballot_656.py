@@ -121,7 +121,8 @@ class TheReportNamesTheDivergingTermTest(unittest.TestCase):
     def test_it_names_the_live_slot_set_when_only_slots_differ(self):
         mine = {"slots": 11, "waves": 22, "geometry": 33}
         said = self._named(
-            mine, {"slots": 10, "waves": 22, "geometry": 33},
+            mine,
+            {"slots": 10, "waves": 22, "geometry": 33},
             {"slots": 11, "waves": 22, "geometry": 33},
         )
         self.assertIn("live slot set", said)
@@ -130,7 +131,8 @@ class TheReportNamesTheDivergingTermTest(unittest.TestCase):
     def test_it_names_the_wave_partition_when_only_waves_differ(self):
         mine = {"slots": 11, "waves": 22, "geometry": 33}
         said = self._named(
-            mine, {"slots": 11, "waves": 21, "geometry": 33},
+            mine,
+            {"slots": 11, "waves": 21, "geometry": 33},
             {"slots": 11, "waves": 22, "geometry": 33},
         )
         self.assertIn("wave partition", said)
@@ -139,7 +141,8 @@ class TheReportNamesTheDivergingTermTest(unittest.TestCase):
     def test_it_names_more_than_one_when_more_than_one_differs(self):
         mine = {"slots": 11, "waves": 22, "geometry": 33}
         said = self._named(
-            mine, {"slots": 10, "waves": 21, "geometry": 33},
+            mine,
+            {"slots": 10, "waves": 21, "geometry": 33},
             {"slots": 11, "waves": 22, "geometry": 33},
         )
         self.assertIn("live slot set", said)

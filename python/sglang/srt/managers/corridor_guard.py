@@ -227,6 +227,7 @@ def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> No
             f"the law PLUS the seam's expected draw, never less than it."
         )
 
+
 #: How far ABOVE the floor a reclaim frees, so the next few allocations do not
 #: each pay a spill. 256 MiB is one seam's worth of slack on this rig's
 #: measured seam trough (1196 MiB free at the tightest instant, floor 1024).
@@ -617,8 +618,7 @@ class CorridorGuard:
             f"{free_now/_MIB:.0f} MiB, reclaimed {reclaimed/_MIB:.0f} MiB "
             f"from [{', '.join(used) or 'nothing'}], arming floor "
             f"{self.floor_bytes/_MIB:.0f} MiB, corridor law "
-            f"{self.law_floor_mib} MiB"
-            + (f" ({reason})" if reason else "")
+            f"{self.law_floor_mib} MiB" + (f" ({reason})" if reason else "")
         )
         if host_forced and used_host:
             detail += (
@@ -644,7 +644,9 @@ class CorridorGuard:
             if clause:
                 detail += f". {clause}"
         if ok:
-            logger.info("%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail)
+            logger.info(
+                "%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail
+            )
         else:
             logger.error(
                 "%s REFUSED on device %d: %s. Every provider is exhausted, so "
@@ -837,7 +839,9 @@ class CorridorGuard:
             )
             + (f" ({reason})" if reason else "")
         )
-        return GuardResult(True, free_before, free_now, 0, measured, tuple(used), detail)
+        return GuardResult(
+            True, free_before, free_now, 0, measured, tuple(used), detail
+        )
 
 
 def nvml_fleet_probe() -> Callable[[], List[int]]:

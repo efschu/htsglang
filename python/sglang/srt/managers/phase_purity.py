@@ -189,16 +189,17 @@ def purity_from_server_args(server_args) -> PhasePurity:
         raw = os.environ.get(ENV_PURITY)
     purity = parse_purity(raw)
     logger.warning(
-        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP "
-        "layout: %s",
+        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP " "layout: %s",
         LOG_PREFIX,
         purity.describe(),
-        "forbidden"
-        if purity.strict
-        else (
-            "allowed"
-            if purity.mode == MODE_OFF
-            else f"allowed up to bs {purity.decode_in_pp_threshold}"
+        (
+            "forbidden"
+            if purity.strict
+            else (
+                "allowed"
+                if purity.mode == MODE_OFF
+                else f"allowed up to bs {purity.decode_in_pp_threshold}"
+            )
         ),
         "allowed" if purity.prefill_allowed_in_tp() else "forbidden",
     )

@@ -112,7 +112,7 @@ def law_floor_bytes() -> int:
     law. Reporting a "breach" on the arming floor would cry wolf on every
     cutover that legally spends its margin.
     """
-    #656: through the ONE declaration, not a private env read with its own
+    # 656: through the ONE declaration, not a private env read with its own
     # "1024" fallback. See corridor_guard.LAW_ENV.
     from sglang.srt.managers.corridor_guard import corridor_law_bytes
 

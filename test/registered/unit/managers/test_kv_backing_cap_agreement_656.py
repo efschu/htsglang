@@ -446,9 +446,7 @@ class ARankThatCannotJoinVetoesTest(unittest.TestCase):
     def test_an_abstaining_rank_makes_the_group_decline(self):
         good, _p, _c = _rank(free_mib=8000, backed=BOOT_ROWS)
         self.assertIsNone(
-            kbr.collective_cap_target(
-                _reduce([good.cap_proposal(), kbr.CAP_ABSTAIN])
-            )
+            kbr.collective_cap_target(_reduce([good.cap_proposal(), kbr.CAP_ABSTAIN]))
         )
 
     def test_an_unreadable_live_set_abstains_rather_than_guessing(self):

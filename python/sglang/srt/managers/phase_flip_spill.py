@@ -635,9 +635,7 @@ class VmmDraftWeightCarrier:
         # test of this class fail for a reason unrelated to what it tests.
         pin = bool(param_devices)
         self._image = snapshot_and_free(self._named, self._layout, pin=pin)
-        bind_arena_views(
-            self._layout, self._carrier, rebind=list(self._named.items())
-        )
+        bind_arena_views(self._layout, self._carrier, rebind=list(self._named.items()))
         arena_refill(self._carrier, self._layout, self._image)
         logger.info(
             "%s carrier installed on device %d: %d params, %.1f MiB on a "
@@ -981,9 +979,7 @@ class VmmWeightsArenaCarrier:
             return 0.0
         if want < self._committed:
             released = int(self._arena.decommit_range(self._offset, want))
-            self._committed = int(
-                self._arena.committed_bytes(self._offset)
-            )
+            self._committed = int(self._arena.committed_bytes(self._offset))
             self._released_mib = released / _MIB
             return released / _MIB
         return 0.0
@@ -1182,6 +1178,7 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
             e,
         )
     return grown
+
 
 def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
     """#656 C22: ONE exposed row level for the whole group, every seam round.
@@ -1462,12 +1459,8 @@ def collective_kv_backing_relief(
             )
             slot_fields = kbr.SLOT_ABSTAIN
     else:
-        slot_fields = kbr.slot_proposal(
-            slots_digest, max_live_row, kbr.SLOT_ABSTAIN[3]
-        )
-    reduced = list(
-        reduce_fn(list(proposal) + list(cap_proposal) + list(slot_fields))
-    )
+        slot_fields = kbr.slot_proposal(slots_digest, max_live_row, kbr.SLOT_ABSTAIN[3])
+    reduced = list(reduce_fn(list(proposal) + list(cap_proposal) + list(slot_fields)))
     if slot_ballot_out is not None:
         verdict = kbr.collective_slot_ballot(reduced[8:12])
         if verdict is not None:
@@ -1605,9 +1598,7 @@ def get_corridor_guard(scheduler: Any):
 
     from sglang.srt.managers import corridor_guard as cg
 
-    model_runner = getattr(
-        getattr(scheduler, "tp_worker", None), "model_runner", None
-    )
+    model_runner = getattr(getattr(scheduler, "tp_worker", None), "model_runner", None)
     device_index = getattr(model_runner, "gpu_id", None)
     if device_index is None:
         return None
