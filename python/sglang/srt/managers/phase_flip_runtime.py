@@ -313,9 +313,7 @@ def seam_cap_retire_limit() -> int:
         return max(
             0,
             int(
-                os.environ.get(
-                    ENV_SEAM_CAP_RETIRE_LIMIT, DEFAULT_SEAM_CAP_RETIRE_LIMIT
-                )
+                os.environ.get(ENV_SEAM_CAP_RETIRE_LIMIT, DEFAULT_SEAM_CAP_RETIRE_LIMIT)
             ),
         )
     except ValueError:
@@ -3882,8 +3880,10 @@ class PhaseFlipRuntime:
         spent = getattr(self, "seam_cap_retirements", 0)
         if limit <= 0 or spent >= limit:
             return False
-        bar = int(ask_bytes) + seam_entry_margin_bytes() + (
-            seam_cap_retire_hysteresis_bytes()
+        bar = (
+            int(ask_bytes)
+            + seam_entry_margin_bytes()
+            + (seam_cap_retire_hysteresis_bytes())
         )
         vote = 1 if int(affordable_bytes) >= bar else 0
         try:
