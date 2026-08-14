@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -38,6 +39,43 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
+
+#: The name the fusion projection is resolved under. It is the CHECKPOINT's
+#: name, not the attribute path (`fc`), because every exclusion list that
+#: mentions this layer was written against the checkpoint: NVFP4 names
+#: `mtp.fc` outright, Qwen3.6-INT8-W8A8 carries `re:.*mtp.*`, the AWQ sibling
+#: carries a bare `mtp`. Resolving it as `fc` would miss all three and build a
+#: quantised skeleton against dense bf16 tensors.
+MTP_FC_LAYER_NAME = "mtp.fc"
+
+
+def build_mtp_fc(hidden_size: int, quant_config, prefix: str):
+    """Build the MTP head's `2*hidden -> hidden` fusion projection.
+
+    Every Qwen3.5/3.6-era checkpoint left this projection dense, so a plain
+    `nn.Linear` was indistinguishable from a correct one. Qwen3.8-27B-INT8 is
+    the first that quantises it: its `ignore` list matches neither `mtp.fc`
+    nor anything above it, and the index carries `mtp.fc.weight_scale`.
+
+    Against a plain `nn.Linear` that is silent rather than fatal --
+    `mtp.fc.weight` keeps its `[out, in]` shape under int-quantisation, so the
+    default loader's size assert passes and copies int8 payload into a bf16
+    parameter undequantised, while `mtp.fc.weight_scale` finds no parameter to
+    land on and is dropped by the loader's scale-suffix skip. The drafter then
+    runs on garbage with a successful-looking load.
+
+    Routing the layer through `quant_config` fixes both directions at once: a
+    checkpoint that excludes the layer resolves to `UnquantizedLinearMethod`
+    and keeps loading exactly as before, and one that quantises it gets the
+    scale parameter it ships.
+    """
+    return ReplicatedLinear(
+        2 * hidden_size,
+        hidden_size,
+        bias=False,
+        quant_config=quant_config,
+        prefix=add_prefix(MTP_FC_LAYER_NAME, prefix),
+    )
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -94,7 +132,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.fc = build_mtp_fc(config.hidden_size, quant_config, prefix)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -219,7 +257,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            hidden_states = self.fc(hidden_states)
+            hidden_states, _ = self.fc(hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(
