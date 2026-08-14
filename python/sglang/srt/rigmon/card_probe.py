@@ -407,6 +407,41 @@ def matching_cached_probe_json(
     a driver that has since been rolled back, then became the rig's profile
     for every later solver call. This resolves by key instead.
 
+    #363: the key is right, the COMPARISON was not. #513 matched the probe's
+    card set against the caller's for EQUALITY, which is the correct test for
+    the process that WRITES a probe and the wrong one for every process that
+    reads one, because a scheduler rank runs under a narrowed
+    ``CUDA_VISIBLE_DEVICES`` and sees one card where the writer saw three:
+
+        CUDA_VISIBLE_DEVICES=0,1,2 -> FOUND
+        CUDA_VISIBLE_DEVICES=1     -> NONE
+        CUDA_VISIBLE_DEVICES=0     -> NONE
+
+    measured on metal in the ACT window. No rank could ever match, so the
+    planner feed was permanently ``PlannerFeedUnavailable`` and every stage
+    table on a real multi-rank boot read "0 flip target(s)".
+
+    The comparison is CONTAINMENT now: a probe matches when it DESCRIBES every
+    card the caller can see (``visible <= probe``), same driver. Containment is
+    directional, so #513's protection still points the way #513 aimed it -- a
+    two-card probe cannot serve a three-card view, because two cards do not
+    describe three. What it stops refusing is the narrowed view, which is the
+    only view a rank ever has.
+
+    Matching is on UUID at every step and never on a device index: a UUID is
+    the one name for a card that survives ``CUDA_VISIBLE_DEVICES`` narrowing
+    unchanged, and an index is precisely what narrowing renumbers.
+
+    The WHOLE probe is returned, not the caller's slice of it. Load-bearing:
+    ``key_solver.rates_from_probe`` indexes cards by ``cuda_index`` in the
+    ``--rank-gpu-id`` space (the full-inventory space), so a rank solving a
+    three-rank layout needs all three cards' rates while seeing only its own.
+
+    Preference, when several probes describe the view: an exact card-set match
+    first (those cards were measured under this view's own contention), then
+    the TIGHTEST superset, then newest by mtime as the tie-break. Newest is
+    only ever a tie-break among probes already proven to describe the same rig.
+
     A miss is the correct answer when nothing matches: every consumer already
     has a "no probe" remedy path, and that includes the case where the
     inventory itself cannot be read -- a probe we cannot attribute to this rig
@@ -454,8 +489,11 @@ def matching_cached_probe_json(
         if data is not None:
             return dict(data)
 
-    # Second chance by CONTENT, for a file whose name was written by a
-    # different path convention. Still a match on the rig, never on the mtime.
+    # Second chance by CONTENT: a file whose name was written by a different
+    # path convention, and -- #363 -- any probe that DESCRIBES this view even
+    # though it was written by a process that could see more cards. Still a
+    # match on the rig by UUID, never on the mtime alone.
+    want_set = set(want_uuids)
     candidates = []
     try:
         names = os.listdir(directory)
@@ -468,16 +506,33 @@ def matching_cached_probe_json(
         data = _read(path)
         if data is None:
             continue
-        got = sorted(str(c.get("uuid")) for c in data.get("cards") or [])
-        if got != want_uuids:
+        got = {str(c.get("uuid")) for c in data.get("cards") or []}
+        # CONTAINMENT, not equality: every card this caller can see must be
+        # described. Directional on purpose -- a probe that knows fewer cards
+        # than the caller sees is still the #513 refusal.
+        if not want_set <= got:
             continue
         if str(data.get("driver") or "") != str(driver or ""):
             continue
-        candidates.append((os.path.getmtime(path), data))
+        # Rank the match: exact card set first, then the tightest superset,
+        # then newest. `extra` is 0 for an exact match, so one sort key covers
+        # both steps.
+        extra = len(got) - len(want_set)
+        candidates.append((-extra, os.path.getmtime(path), data))
     if not candidates:
         return None
-    # Among probes of the SAME rig and driver, newest is the right tie-break.
-    return dict(max(candidates, key=lambda pair: pair[0])[1])
+    best = max(candidates, key=lambda c: (c[0], c[1]))
+    if best[0] != 0:
+        logger.info(
+            "card probe: this process sees %d card(s); the matching probe "
+            "describes %d, including all of them. Using it -- a narrowed "
+            "CUDA_VISIBLE_DEVICES is a smaller VIEW of this rig, not another "
+            "rig, and the solver indexes cards in the full --rank-gpu-id "
+            "space regardless of what this process can see.",
+            len(want_set),
+            len(want_set) - best[0],
+        )
+    return dict(best[2])
 
 
 def save_card_probe(profile: CardProbeProfile, path: Optional[str] = None) -> str:
