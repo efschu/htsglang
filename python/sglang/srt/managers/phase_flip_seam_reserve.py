@@ -34,21 +34,34 @@ THE FIXED POINT, AND WHY IT IS SOLVED RATHER THAN ITERATED
 ----------------------------------------------------------
 ``staging`` is not a constant: the wave-boundary slack is
 ``drift_layers x row_nbytes x pool_rows``, so it GROWS with the pool it is
-being subtracted from. Writing it with the pool-independent floor ``F``
-(arena tail, draft restore) and the per-row coefficient ``a``::
+being subtracted from. Writing it with the ADDITIVE pool-independent floor
+``A`` (the weights-arena tail), the ALTERNATIVE pool-independent floor ``F``
+(the drafter's restore) and the per-row coefficient ``a``::
 
-    staging(T) = max(F, a*T)          T*cell + staging(T) <= R'
+    staging(T) = A + max(F, a*T)      T*cell + staging(T) <= R'
 
-MAX, NOT SUM. That is what ``_staging_bytes`` computes, and it says why: the
-wave staging and the arena/draft re-commits belong to different instants of
-the seam and never coexist, so summing them "would model a peak that does not
-occur and would abandon flips that fit". Reserving the sum here would give
-away roughly 24k tokens of permanent pool for a peak the hardware never sees.
+TWO FLOORS, BECAUSE THEY COMBINE DIFFERENTLY, and the split is a measurement
+rather than a refinement (#656, MERGE-R9 12.4). This was one flat
+``max(F, a*T)`` with ``F = max(arena tail, draft restore)``, mirroring the
+runtime's own ``_staging_bytes``, on the argument that the wave staging and
+the re-commits belong to different instants of the seam and never coexist.
+
+That argument holds for the DRAFTER and fails for the ARENA TAIL:
+``stacks.refill`` is a PRE-cutover function, so its commit lands while the
+wave state is still outstanding, while rung 2's restore runs inside
+``_cutover`` after the waves' buffers are dead. The stage walk of one
+``tp_to_pp`` cutover settles it -- entry 2464 MiB free, the refill reached at
+1250 with 1214 MiB still outstanding, and the refill's own 238 MiB taking the
+card to 1012, twelve MiB under the corridor law that ``max(1214, 238)``
+called 226 MiB clear.
+
+Setting ``A = 0`` reproduces the previous arithmetic byte for byte, which is
+exactly what a record written before the split reads back as.
 
 Two regimes, and exactly one of them holds for any given ``R'``::
 
-    A. the floor binds  ->  T = (R' - F) / cell,   while a*T <= F
-    B. the slack binds  ->  T = R' / (cell + a),   while a*T >  F
+    A. the floor binds  ->  T = (R' - A - F) / cell,   while a*T <= F
+    B. the slack binds  ->  T = (R' - A) / (cell + a), while a*T >  F
 
 Both are closed forms; the branch is chosen by testing a candidate against
 its own condition. Iterating instead lands on the wrong side -- it charges
@@ -137,9 +150,32 @@ PROVENANCE_MALFORMED = "malformed"
 class SeamReserve:
     """What the seam costs this rank at rest, and where the number came from."""
 
-    #: Pool-INDEPENDENT floor: the arena tail re-commit and the drafter's
-    #: restore. Present with an empty live set and unaffected by draining.
+    #: Pool-INDEPENDENT floor that is an ALTERNATIVE to the wave slack: the
+    #: drafter's restore. Present with an empty live set and unaffected by
+    #: draining. Rung 2's restore runs inside ``_cutover``, after the waves'
+    #: buffers are dead, so it and the slack cannot both be resident -- which
+    #: is why this one stays inside a ``max``.
     fixed_bytes: int = 0
+    #: Pool-INDEPENDENT floor that is ADDED to whatever else the seam holds:
+    #: the weights-arena tail (#656, MERGE-R9 12.4).
+    #:
+    #: SEPARATED FROM ``fixed_bytes`` BECAUSE THE TWO COMBINE DIFFERENTLY,
+    #: and the measurement says so. ``stacks.refill`` is a PRE-cutover
+    #: function, so its commit lands while the wave state is still
+    #: outstanding; the stage walk of one tp_to_pp cutover
+    #: (evidence-631/remediation-656/boot_m1.log, rank 1) entered at 2464 MiB
+    #: free, reached the refill at 1250 with 1214 MiB outstanding, and the
+    #: refill's own 238 MiB took the card to 1012 -- twelve MiB under the
+    #: corridor law. Folded into one ``max`` the model predicted a 1250 MiB
+    #: trough and could not see the breach.
+    #:
+    #: DEFAULT ZERO IS THE BACK-COMPAT PATH, exactly. A record written before
+    #: this field existed carries ``fixed_bytes = max(arena, draft)`` and no
+    #: arena entry, so it reads back as A=0 and the arithmetic below is
+    #: byte-identical to what that record was written for. The next boot of
+    #: that configuration re-measures and fills the field in -- the two-boot
+    #: protocol this module already documents, carrying one more quantity.
+    arena_fixed_bytes: int = 0
     #: Device bytes per KV POOL ROW: the wave-boundary backing slack, which
     #: scales with the pool and is therefore the term that makes this a fixed
     #: point rather than a subtraction.
@@ -163,8 +199,17 @@ class SeamReserve:
     detail: str = ""
 
     @property
+    def total_fixed_bytes(self) -> int:
+        """The seam's whole at-rest floor: the additive term plus the
+        alternative one. What a caller wants when it needs ONE number for
+        "the seam costs at least this much with an empty live set"."""
+        return max(0, int(self.arena_fixed_bytes)) + max(0, int(self.fixed_bytes))
+
+    @property
     def active(self) -> bool:
-        return self.id_space > 0 and (self.fixed_bytes > 0 or self.per_row_bytes > 0)
+        return self.id_space > 0 and (
+            self.fixed_bytes > 0 or self.arena_fixed_bytes > 0 or self.per_row_bytes > 0
+        )
 
 
 def seam_reserve_enabled() -> bool:
@@ -269,6 +314,11 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             rec = json.load(fh)
         return SeamReserve(
             fixed_bytes=int(rec["fixed_bytes"]),
+            # Absent in records written before #656 MERGE-R9 12.4. Absent
+            # means "this boot did not separate the two floors", and the
+            # zero it defaults to reproduces that record's own arithmetic
+            # exactly rather than guessing a split for it.
+            arena_fixed_bytes=int(rec.get("arena_fixed_bytes", 0)),
             per_row_bytes=float(rec["per_row_bytes"]),
             have_bytes=int(rec.get("have_bytes", 0)),
             id_space=int(rec.get("id_space", 0)),
@@ -292,6 +342,7 @@ def write_seam_reserve(
     detail: str,
     have_bytes: int = 0,
     id_space: int = 0,
+    arena_fixed_bytes: int = 0,
 ) -> Optional[str]:
     """Persist this boot's measurement for the next one. Never raises.
 
@@ -312,6 +363,7 @@ def write_seam_reserve(
         prior_shortfall = 0
     payload = {
         "fixed_bytes": int(fixed_bytes),
+        "arena_fixed_bytes": int(arena_fixed_bytes),
         "per_row_bytes": float(per_row_bytes),
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),
@@ -417,6 +469,7 @@ def solve_pool_tokens(
     cell_bytes: int,
     fixed_bytes: int,
     per_row_bytes: float,
+    arena_fixed_bytes: int = 0,
 ) -> int:
     """The largest T with ``T*cell + staging(T) <= R'``.
 
@@ -424,18 +477,31 @@ def solve_pool_tokens(
     headroom the sizer already leaves, minus the corridor law -- i.e. every
     byte that could become KV if the corridor were the only thing to respect.
 
-    ``staging(T) = max(F, a*T)``, a MAX and not a sum, because that is what
-    ``_staging_bytes`` computes: the wave staging and the arena/draft
-    re-commits belong to different instants of the seam and never coexist
-    (the runtime says so at its ``max()`` and explains why summing them
-    "would model a peak that does not occur and would abandon flips that
-    fit"). Reserving their sum here would give away pool for a peak the
-    hardware never sees -- roughly 24k tokens on this rig's numbers.
+    ``staging(T) = A + max(F, a*T)``, and the SHAPE is the #656 MERGE-R9 12.4
+    correction rather than an elaboration:
+
+    * ``A`` (``arena_fixed_bytes``) is the weights-arena tail, committed by
+      ``stacks.refill`` at the PRE-cutover seam and therefore held WHILE the
+      wave state is still outstanding. It ADDS.
+    * ``F`` (``fixed_bytes``) is the drafter's restore, which runs inside
+      ``_cutover`` after the waves' buffers are dead. It and the slack cannot
+      coexist, so it stays an ALTERNATIVE.
+
+    The whole floor used to be one ``max`` against the slack, on the argument
+    that the peaks belong to different instants and summing them "would model
+    a peak that does not occur". The stage walk falsified that for the arena
+    tail and only for the arena tail: one tp_to_pp cutover entered at 2464 MiB
+    free, reached the refill at 1250 with 1214 MiB outstanding, and the
+    refill's 238 MiB took it to 1012 -- under the 1024 MiB law that
+    ``max(1214, 238)`` said was 226 MiB clear.
+
+    ``A = 0`` restores the previous arithmetic exactly, which is what a
+    pre-#656 record reads back as.
 
     Two regimes, one of which always holds:
 
-      A. the floor binds  ->  T = (R' - F) / cell,   valid while a*T <= F
-      B. the slack binds  ->  T = R' / (cell + a),   valid while a*T >  F
+      A. the floor binds  ->  T = (R' - A - F) / cell,   valid while a*T <= F
+      B. the slack binds  ->  T = (R' - A) / (cell + a), valid while a*T >  F
 
     Both are exact; the branch is chosen by checking the candidate against
     its own condition, so there is no iteration and no tolerance.
@@ -445,12 +511,13 @@ def solve_pool_tokens(
         return 0
     R = max(0, int(corridor_relaxed_bytes))
     F = max(0, int(fixed_bytes))
+    A = max(0, int(arena_fixed_bytes))
     a = max(0.0, float(per_row_bytes))
 
-    t_floor = max(0, (R - F) // cell)
+    t_floor = max(0, (R - A - F) // cell)
     if a * t_floor <= F:
         return int(t_floor)
-    return int(max(0, R // (cell + a)))
+    return int(max(0, (R - A) // (cell + a)))
 
 
 def corridor_relaxed_bytes(
@@ -478,12 +545,19 @@ def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
     returns ``cell`` bytes to that pool, so along the pool axis::
 
         have(T) = have_m + (T_m - T) * cell
-        need(T) = max(F, a*T)
+        need(T) = A + max(F, a*T)
 
     and the answer is the largest T with ``have(T) >= need(T)``:
 
-        A. the floor binds  ->  T <= T_m + (have_m - F) / cell
-        B. the slack binds  ->  T <= (have_m + T_m*cell) / (cell + a)
+        A. the floor binds  ->  T <= T_m + (have_m - A - F) / cell
+        B. the slack binds  ->  T <= (have_m + T_m*cell - A) / (cell + a)
+
+    ``A`` is the ADDITIVE floor -- the weights-arena tail, committed at the
+    pre-cutover seam while the wave state is still outstanding (#656,
+    MERGE-R9 12.4, and ``solve_pool_tokens`` for the walk that shows it).
+    ``F`` is the drafter's restore and stays an alternative to the slack.
+    ``A = 0`` is exactly the pre-#656 arithmetic, which is what a record
+    written before the split reads back as.
 
     This needs no term for the activation reserve, the capture peak, the
     arena, the TP stack or the invisible carve-out -- all of them are already
@@ -504,12 +578,13 @@ def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
     have_m = max(0, int(reserve.have_bytes) - seam_margin_bytes(reserve))
     t_m = int(reserve.id_space)
     F = max(0, int(reserve.fixed_bytes))
+    A = max(0, int(reserve.arena_fixed_bytes))
     a = max(0.0, float(reserve.per_row_bytes))
 
-    t_floor = t_m + (have_m - F) // cell
+    t_floor = t_m + (have_m - A - F) // cell
     if a * max(0, t_floor) <= F:
         return int(max(0, t_floor))
-    return int(max(0, (have_m + t_m * cell) // (cell + a)))
+    return int(max(0, (have_m + t_m * cell - A) // (cell + a)))
 
 
 def seam_adjusted_budget_bytes(
@@ -579,8 +654,13 @@ def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:
     return arena_tail, draft_restore
 
 
-def measure_at_rest(runtime) -> Tuple[int, float, str]:
-    """(fixed_bytes, per_row_bytes, detail) for THIS boot's two layouts.
+def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
+    """(arena_fixed_bytes, fixed_bytes, per_row_bytes, detail) for this boot.
+
+    FOUR VALUES SINCE #656 MERGE-R9 12.4, not three. The arena tail and the
+    drafter's restore used to be folded into one ``max`` here, matching the
+    runtime's own; they are returned separately now because they combine
+    differently -- see :class:`SeamReserve` for which is which and why.
 
     Computed from the runtime's OWN methods against an EMPTY live set, so the
     number recorded here is the number the gate will check -- not a parallel
@@ -604,6 +684,7 @@ def measure_at_rest(runtime) -> Tuple[int, float, str]:
     scheduler = getattr(runtime, "_census_scheduler", None)
     id_space = max(1, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
     fixed = 0
+    arena_fixed = 0
     per_row = 0.0
     parts = []
     for direction in ("pp_to_tp", "tp_to_pp"):
@@ -620,7 +701,14 @@ def measure_at_rest(runtime) -> Tuple[int, float, str]:
         total = int(runtime._staging_bytes(tr, direction, src, dst, waves))
         slack = int(runtime._backing_slack_bytes(direction, src, dst, waves))
         arena, draft = _worst_case_fixed_bytes(runtime, direction)
-        d_fixed = max(arena, draft)
+        # SPLIT, NOT MAXED (#656, MERGE-R9 12.4). ``d_fixed = max(arena,
+        # draft)`` was the sizer's mirror of the runtime's flat max(), and it
+        # inherited the same defect: whichever of the two was smaller vanished
+        # from the floor entirely. The arena tail is committed at the
+        # PRE-cutover seam and is therefore additive against everything else
+        # the seam holds; the drafter's restore is not. Kept as two numbers so
+        # the solver can combine them the way the walk says.
+        d_fixed = draft
         # NORMALISED BY THE ID SPACE, NOT BY src.num_rows (boot F).
         #
         # The sizer's T is the GLOBAL pool -- the id space every rank shares.
@@ -633,16 +721,17 @@ def measure_at_rest(runtime) -> Tuple[int, float, str]:
         # multiplies it by.
         d_per_row = float(slack) / float(id_space)
         fixed = max(fixed, d_fixed)
+        arena_fixed = max(arena_fixed, arena)
         per_row = max(per_row, d_per_row)
         mib = 1 << 20
         parts.append(
             f"{direction}: staging {total / mib:.0f} MiB now, seam commit "
-            f"{d_fixed / mib:.0f} MiB (arena tail {arena / mib:.0f}, draft "
-            f"restore {draft / mib:.0f}), wave slack {slack / mib:.0f} MiB "
-            f"over an id space of {id_space} = {d_per_row:.1f} B/token "
-            f"[this rank holds {int(src.num_rows)} rows]"
+            f"{(arena + d_fixed) / mib:.0f} MiB (arena tail {arena / mib:.0f} "
+            f"ADDITIVE + draft restore {draft / mib:.0f} vs slack), wave "
+            f"slack {slack / mib:.0f} MiB over an id space of {id_space} = "
+            f"{d_per_row:.1f} B/token [this rank holds {int(src.num_rows)} rows]"
         )
-    return fixed, per_row, "; ".join(parts)
+    return arena_fixed, fixed, per_row, "; ".join(parts)
 
 
 def measure_and_record(scheduler, runtime) -> None:
@@ -654,7 +743,7 @@ def measure_and_record(scheduler, runtime) -> None:
     if not seam_reserve_enabled():
         return
     try:
-        fixed, per_row, detail = measure_at_rest(runtime)
+        arena_fixed, fixed, per_row, detail = measure_at_rest(runtime)
     except Exception as e:
         logger.warning("%s could not measure the seam at rest: %s", LOG_PREFIX, e)
         return
@@ -680,12 +769,16 @@ def measure_and_record(scheduler, runtime) -> None:
         detail,
         have_bytes=have,
         id_space=id_space,
+        arena_fixed_bytes=arena_fixed,
     )
     logger.info(
-        "%s MEASURED (rank %d): floor %.0f MiB, %.1f B/row. %s. Recorded in "
-        "%s for the next boot with this configuration.",
+        "%s MEASURED (rank %d): floor %.0f MiB (%.0f arena tail ADDITIVE "
+        "+ %.0f draft restore vs the wave slack), %.1f B/row. %s. Recorded "
+        "in %s for the next boot with this configuration.",
         LOG_PREFIX,
         int(runtime._rank),
+        (arena_fixed + fixed) / mib,
+        arena_fixed / mib,
         fixed / mib,
         per_row,
         detail,
@@ -698,7 +791,10 @@ def measure_and_record(scheduler, runtime) -> None:
     # instance that answers /health and serves nothing (#656 boot E).
     try:
         spendable = have
-        if spendable < fixed:
+        # THE WHOLE at-rest floor, both terms. Checking the alternative
+        # term alone would let a boot whose arena tail is the binding
+        # cost report that it can fund a flip it cannot.
+        if spendable < arena_fixed + fixed:
             logger.error(
                 "%s (rank %d): THIS BOOT CANNOT FUND ITS OWN FLIP. The seam "
                 "needs %.0f MiB at rest and only %.0f MiB is spendable above "
