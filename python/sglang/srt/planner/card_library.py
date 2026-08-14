@@ -61,8 +61,27 @@ __all__ = [
     "CardSpec",
     "SEED_CARDS",
     "CardLibrary",
+    "CardCapacityMismatch",
+    "CAPACITY_TOLERANCE_FRAC",
     "compose_rig",
 ]
+
+
+#: How far a live NVML total may sit from a catalogue capacity and still be the
+#: same card. NVML does not report the nominal number -- the seed 5090 is 32607
+#: MiB, not 32768 -- and the driver carve-out moves it further, by card and by
+#: driver. 5 % absorbs that (1630 MiB on a 32 GB card) and is nowhere near the
+#: 100 % gap between the two RTX 3080 variants this tolerance exists to catch.
+CAPACITY_TOLERANCE_FRAC = 0.05
+
+
+class CardCapacityMismatch(LookupError):
+    """A card name resolved to a catalogue entry of a different capacity.
+
+    Raised instead of returning the entry, because the substitution is silent
+    otherwise: a wrong VRAM total does not announce itself, it flows into
+    feasibility and packing and returns as a plan that does not fit.
+    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,6 +119,22 @@ class CardSpec:
     peak_membw_gbs: Optional[float] = None
     peak_gemm_tflops_fp16: Optional[float] = None
     peak_gemm_tflops_fp8: Optional[float] = None
+    #: PROVENANCE. ``"seed"`` is a curated nameplate entry (capacity from a
+    #: datasheet); ``"measured"`` means the entry describes a card the #213
+    #: probe actually ran on, so its capacity is an NVML reading rather than a
+    #: catalogue claim; ``"submitted"`` came from a RESULTS fingerprint.
+    #: :meth:`CardLibrary.resolve` lets a measured entry outrank a seed of the
+    #: same name -- the measurement is the authority on the card it measured.
+    #: Absent in files written before this field existed, which read as
+    #: ``"seed"``: an entry that cannot prove it was measured is not measured.
+    source: str = "seed"
+    #: The environment fingerprint (``planner.rate_env.RateEnv.token``) the
+    #: measured ``gemm_tflops`` / ``membw_gbs`` above were taken under. None on
+    #: a nameplate entry (nothing was measured) and on any artifact written
+    #: before fingerprinting, where it reads as stale-unknown rather than
+    #: fresh. See ``planner/rate_env.py`` for why a rate without its power
+    #: limit is undatable.
+    rate_env: Optional[str] = None
 
     def to_descriptor(self, index: int) -> GpuDescriptor:
         """Map to the S1 planner card. ``free_mib`` stays None — a composed /
@@ -206,6 +241,15 @@ class CardLibrary:
         return sorted(p.name for p in self._by_key.values())
 
     def get(self, name: str) -> CardSpec:
+        """Look up by NAME ALONE.
+
+        Correct only where no capacity is at stake -- composing a hypothetical
+        rig from a catalogue name the caller typed, listing the library. A
+        caller holding a REAL card must use :meth:`resolve` and hand it the
+        measured total: a card model that ships in several capacities has
+        several entries here, and no name the driver emits selects between
+        them. See :meth:`resolve`.
+        """
         key = _canonical(name)
         if key not in self._by_key:
             raise KeyError(
@@ -216,6 +260,117 @@ class CardLibrary:
     def has(self, name: str) -> bool:
         return _canonical(name) in self._by_key
 
+    def variants(self, name: str) -> List[CardSpec]:
+        """Every catalogue entry that ``name`` could denote.
+
+        A variant carries the model plus a capacity suffix -- ``RTX 3080`` and
+        ``RTX 3080 20GB`` -- so an entry is a candidate when its key equals the
+        request, extends it, or is extended BY it (a config file may name the
+        variant the driver never does). Sorted longest-key-last so the plain
+        model reads first.
+        """
+        key = _canonical(name)
+        out = []
+        for entry_key, spec in self._by_key.items():
+            if (
+                entry_key == key
+                or entry_key.startswith(key + " ")
+                or key.startswith(entry_key + " ")
+            ):
+                out.append(spec)
+        return sorted(out, key=lambda s: (len(_canonical(s.name)), s.name))
+
+    def resolve(
+        self,
+        name: str,
+        total_mib: Optional[int] = None,
+        tolerance_frac: float = CAPACITY_TOLERANCE_FRAC,
+    ) -> CardSpec:
+        """Resolve a card name to the catalogue entry that describes THIS card.
+
+        THE DEFECT THIS FIXES. The catalogue keys by name; the RTX 3080 shipped
+        in a 10 GB and a 20 GB variant; the driver calls both ``NVIDIA GeForce
+        RTX 3080``. ``_canonical`` strips only the vendor words, so this rig's
+        20 GB cards resolved onto the 10240 MiB seed entry, silently. #584
+        corrected that on the WRITE path and named the READ path as unfixed
+        by-catch. A wrong capacity is not a cosmetic error: it is the input to
+        feasibility and packing.
+
+        Resolution, in order:
+
+        1. **Measured outranks seed.** An entry whose ``source`` is
+           ``"measured"`` describes a card the probe ran on, so its capacity is
+           an NVML reading. When any candidate is measured, only measured
+           candidates are considered.
+        2. **The measured total selects the variant.** With ``total_mib`` given,
+           candidates whose capacity disagrees beyond ``tolerance_frac`` are
+           dropped. An exact name match that survives wins (``RTX 3090`` and
+           ``RTX 3090 Ti`` are 12 MiB apart -- capacity alone cannot separate
+           siblings); otherwise the single survivor wins, which is the variant
+           selection this rig needs.
+        3. **No survivor is a REFUSAL**, naming both numbers. Never the nearest
+           entry: pricing a 20480 MiB card as a 10240 MiB one is the failure.
+
+        Without ``total_mib`` this degrades to :meth:`get` -- there is nothing
+        to check against, and a caller composing a hypothetical rig from a
+        catalogue name means exactly the entry it named.
+        """
+        candidates = self.variants(name)
+        if not candidates:
+            raise KeyError(
+                f"unknown GPU profile {name!r}. Known: {', '.join(self.names())}"
+            )
+        measured = [c for c in candidates if c.source == "measured"]
+        if measured:
+            candidates = measured
+
+        key = _canonical(name)
+        exact = [c for c in candidates if _canonical(c.name) == key]
+
+        if total_mib is None:
+            if exact:
+                return exact[0]
+            if len(candidates) == 1:
+                return candidates[0]
+            raise CardCapacityMismatch(
+                f"card name {name!r} names {len(candidates)} catalogue entries "
+                f"of different capacity ("
+                f"{', '.join(f'{c.name} = {c.total_mib} MiB' for c in candidates)}"
+                f") and no measured VRAM total was supplied to select between "
+                f"them. Pass the card's NVML total to resolve(), or name the "
+                f"variant exactly -- picking one by name alone is how a "
+                f"{candidates[0].total_mib} MiB profile ends up describing a "
+                f"different card."
+            )
+
+        want = int(total_mib)
+        agreeing = [
+            c
+            for c in candidates
+            if c.total_mib
+            and abs(c.total_mib - want) <= max(1.0, tolerance_frac * max(c.total_mib, want))
+        ]
+        for c in agreeing:
+            if _canonical(c.name) == key:
+                return c
+        if len(agreeing) == 1:
+            return agreeing[0]
+        if agreeing:
+            return min(agreeing, key=lambda c: abs(c.total_mib - want))
+
+        listing = ", ".join(f"{c.name} = {c.total_mib} MiB" for c in candidates)
+        raise CardCapacityMismatch(
+            f"card {name!r} measures {want} MiB (NVML), and no catalogue entry "
+            f"of that name has that capacity: {listing}. The catalogue keys by "
+            f"NAME and this model ships in several capacities, so the name "
+            f"cannot select between them -- and a capacity is not cosmetic, it "
+            f"is what feasibility and packing are computed from. Refusing "
+            f"rather than pricing a {want} MiB card as a "
+            f"{candidates[0].total_mib} MiB one. Run "
+            f"`python -m sglang.srt.planner.card_rate_pass --run` on this rig "
+            f"to add the measured variant, or name the variant explicitly."
+        )
+
     def add(self, profile: CardSpec, overwrite: bool = False) -> bool:
         """Add/refresh a profile. Returns True when the library changed. An
         existing entry is kept unless ``overwrite`` (a submission never
@@ -225,10 +380,20 @@ class CardLibrary:
             # Fill only missing perf fields from the newcomer (measured wins
             # over absent, never the reverse).
             cur = self._by_key[key]
+            # The fingerprint belongs to whoever supplied the RATES. Filling a
+            # missing rate from the newcomer while keeping the incumbent's
+            # (absent) rate_env would produce a rate that reads as
+            # stale-unknown forever, and filling it the other way would stamp
+            # the incumbent's rates with the newcomer's environment -- which is
+            # a rate claiming to have been measured under conditions it was
+            # not. So provenance travels with the number.
+            takes_rates = not cur.gemm_tflops and bool(profile.gemm_tflops)
             merged = dataclasses.replace(
                 cur,
                 gemm_tflops=cur.gemm_tflops or profile.gemm_tflops,
                 membw_gbs=cur.membw_gbs or profile.membw_gbs,
+                rate_env=profile.rate_env if takes_rates else cur.rate_env,
+                source=profile.source if takes_rates else cur.source,
             )
             if merged != cur:
                 self._by_key[key] = merged
@@ -286,8 +451,18 @@ class CardLibrary:
         lib = cls() if seed else cls(profiles={})
         with open(path) as f:
             data = json.load(f)
+        # Readable in BOTH directions: a file written before ``source`` /
+        # ``rate_env`` existed loads and takes their defaults (seed, no
+        # fingerprint -> stale-unknown, which is the honest reading of an
+        # artifact that cannot say when it was measured); a file written by a
+        # later version with fields this build does not know drops them rather
+        # than failing to load a whole library over one unknown key.
+        known = {f.name for f in dataclasses.fields(CardSpec)}
         for pd in data.get("profiles", []):
-            lib.add(CardSpec(**pd), overwrite=True)
+            lib.add(
+                CardSpec(**{k: v for k, v in pd.items() if k in known}),
+                overwrite=True,
+            )
         return lib
 
 

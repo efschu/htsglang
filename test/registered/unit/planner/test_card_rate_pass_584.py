@@ -275,12 +275,16 @@ def test_t11_round_trips_through_the_real_library_format(rig_profile, lib_path):
 
     crp.run_card_rate_pass(path=str(lib_path), profile=rig_profile)
     lib = CardLibrary.load(str(lib_path))
-    assert lib.get(R3080).gemm_tflops == pytest.approx(61.20)
+    # Looked up by name AND capacity: the driver's "NVIDIA GeForce RTX 3080"
+    # names two catalogue entries and only the 20 GB one is this rig's card.
+    # (See test_card_library_guards.py -- a name-only `get` here reads the
+    # 10 GB seed, which is the collision this rig actually has.)
+    assert lib.resolve(R3080, total_mib=20480).gemm_tflops == pytest.approx(61.20)
     # Cards the pass never measured keep their seeded, unrated form rather
     # than acquiring a number from anywhere. Compared canonically: the pass
     # writes under the DRIVER's name, and the catalog keys on the stripped
     # form, so a literal name comparison would miss the entry it just wrote.
-    measured_keys = {_canonical(R5090), _canonical(R3080)}
+    measured_keys = {_canonical(R5090), _canonical("RTX 3080 20GB")}
     for name in lib.names():
         spec = lib.get(name)
         if _canonical(name) not in measured_keys:
@@ -299,6 +303,16 @@ def test_t11b_measured_capacity_corrects_a_colliding_catalog_entry(
     correction the library would describe a 20480 MiB card as 10240 MiB while
     carrying that card's measured rates -- a profile internally inconsistent
     with the machine it was measured on.
+
+    SUPERSEDED IN PART. #584 corrected this by OVERWRITING the colliding
+    entry's capacity, which fixed the reading of this rig by breaking the
+    reading of the catalog: "RTX 3080" then claimed 20480 MiB, so a composed
+    rig built from the 10 GB card silently got a 20 GB one -- the same
+    substitution, one level up. The measurement now lands on the entry that
+    matches BOTH name and capacity (the 20 GB variant the catalog already
+    carried), and the 10 GB entry is left exactly as it was. The assertion
+    below is therefore about which ENTRY took the rates, not about one entry
+    changing size.
     """
     seeded = CardLibrary()
     assert seeded.get(R3080).total_mib == 10240, (
@@ -308,8 +322,15 @@ def test_t11b_measured_capacity_corrects_a_colliding_catalog_entry(
 
     report = crp.run_card_rate_pass(path=str(lib_path), profile=rig_profile)
     lib = crp.load_measured_library(str(lib_path))
-    assert lib.get(R3080).total_mib == 20480
-    assert any("does not match" in c for c in report.caveats), report.caveats
+    resolved = lib.resolve(R3080, total_mib=20480)
+    assert resolved.name == "RTX 3080 20GB"
+    assert resolved.total_mib == 20480
+    assert resolved.gemm_tflops == pytest.approx(61.20)
+    # The variant the measurement is NOT about keeps its curated capacity and
+    # acquires no rate.
+    assert lib.get("RTX 3080").total_mib == 10240
+    assert lib.get("RTX 3080").gemm_tflops is None
+    assert "RTX 3080 20GB" in report.names_written, report.names_written
 
 
 def test_t12_projection_will_not_invent_a_capacity(lib_path):
