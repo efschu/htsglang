@@ -275,6 +275,77 @@ def note(load_state: str) -> None:
             census.write(out_dir)
 
 
+#: #485: the load states the phase-flip SEAM contributes, one per direction.
+#:
+#: WHY THE SEAM NEEDED ITS OWN STATE AT ALL. ``note`` above is called from
+#: exactly one site -- ``Scheduler.process_batch_result`` -- and labels the
+#: sample with ``batch.forward_mode.name``. A cutover is not a batch, so
+#: before this the census could not take a single sample inside the one event
+#: that draws the most memory on the binding rank. Measured over 196 flips of
+#: the two #485 certification windows, the tp->pp seam drew 5800 MiB modally
+#: and 7055 MiB at its worst on rank 0, against a census whose reported worst
+#: load state was 1989 MiB. The gate "funds the WORST state each rank
+#: actually served" and the worst state was invisible to it.
+SEAM_LOAD_STATE_PREFIX = "SEAM_"
+
+
+def seam_load_state(direction: str) -> str:
+    """The load-state label for a flip in ``direction``.
+
+    Per DIRECTION rather than one shared ``SEAM`` bucket: on this rig the two
+    legs are not the same event. The tp->pp leg commits the weights-arena
+    tail and draws thousands of MiB; the pp->tp leg releases it and measured
+    a transient of 0 on rank 0 in all 86 flips of s50. Folding them into one
+    minimum would hide which leg the demand belongs to, and the leg is what a
+    reader needs in order to act on it.
+    """
+    return f"{SEAM_LOAD_STATE_PREFIX}{str(direction).upper()}"
+
+
+def note_free(load_state: str, free_bytes: int) -> None:
+    """Record an ALREADY-MEASURED free level. Never probes, never strides.
+
+    ``note`` above is right for a stream: it is called on every batch result,
+    so it samples one in ``_stride()`` of them and asks the driver itself.
+    Both of those are wrong for a seam.
+
+    NOT STRIDED, because a flip's trough is ONE event, not a stream. A stride
+    of N drops N-1 of every N flips, and the flip that matters is by
+    definition the rare one -- s50's breach was 1 flip in 86. An instrument
+    that samples the common case is measuring the thing that was never in
+    question.
+
+    NOT RE-PROBED, because the caller already has the reading and it is the
+    RIGHT reading. The seam census marks free at every stage of the cutover
+    and knows the trough; querying the driver again here would return a level
+    from after the seam released, which is a different instant from the one
+    the corridor law is denominated at. Passing the measured value through is
+    what keeps the two instruments talking about the same event -- on window
+    1 they agreed to 1 MiB, and a disagreement is itself a finding.
+
+    Best-effort like everything else in this module: an unarmed census is a
+    no-op, never an error, because this is called from the cutover path.
+    """
+    census = _CENSUS
+    if census is None:
+        return
+    try:
+        census.note(str(load_state), int(free_bytes))
+    except Exception:  # pragma: no cover -- an instrument never kills a flip
+        return
+    out_dir = _census_dir()
+    if out_dir:
+        # Written EAGERLY, unlike the strided path's interval write. A seam
+        # sample is rare and expensive to reproduce; losing it to a crash
+        # that happens before the next interval tick would lose the whole
+        # reason this feed exists.
+        census._last_write = time.monotonic()
+        try:
+            census.write(out_dir)
+        except Exception:  # pragma: no cover
+            return
+
+
 def snapshot() -> Optional[dict]:
     return _CENSUS.payload() if _CENSUS is not None else None
 

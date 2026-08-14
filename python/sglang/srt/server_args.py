@@ -15135,6 +15135,7 @@ class ServerArgs:
         rates = self._pp_cut_card_rates(calibration.gpu_names)
         budgets = self._pp_cut_budgets(calibration.total_visible_mib)
         transients = self._pp_cut_transients(calibration, census_dir)
+        seam_staging = self._pp_cut_seam_staging(transients, census_dir)
         ranks = tuple(
             pp_cut.RankResources(
                 label=f"stage{i}-{rates[i][0]}",
@@ -15143,6 +15144,7 @@ class ServerArgs:
                 budget_mib=budgets[i],
                 fixed_overhead_mib=calibration.residual_mib[i],
                 transient_by_load_state=transients[i],
+                seam_staging_mib=seam_staging[i],
             )
             for i in range(self.pp_size)
         )
@@ -15238,6 +15240,72 @@ class ServerArgs:
                 f"transient."
             )
         return tables
+
+    def _pp_cut_seam_staging(self, transients, census_dir: str):
+        """Per-rank measured SEAM staging in MiB, or a refusal naming the fix.
+
+        #485 T1. ``RankResources.seam_staging_mib`` has carried a 0.0 default
+        since it was added, and until this shift NOTHING IN THE TREE SUPPLIED
+        IT -- a grep for the field outside ``pp_cut.py`` returned nothing. So
+        ``runnable_headroom_mib == headroom_mib`` on every wired boot, and the
+        field's own docstring says what that makes the answer: "left at zero
+        the verdict is a residency verdict again and says nothing about
+        runnability".
+
+        THE COST OF THAT DEFAULT, MEASURED. The gate admitted the #485
+        planner cut ``40,12,12`` reporting 374.9 MiB of headroom. Pooled over
+        the 196 tp->pp flips of the two certification windows, the seam it
+        funded at zero drew 5800 MiB modally and 7055 MiB at its worst on
+        rank 0, and one of those flips took the corridor to 668 MiB against a
+        1024 MiB law. The admit was arithmetically unreachable, not unlucky.
+
+        WHERE THE NUMBER COMES FROM, AND WHY IT IS NOT A FORMULA. The same
+        census the transient table comes from, under the seam load states
+        ``transient_census.seam_load_state(...)``, which the cutover now
+        writes (#485 T3). The field's docstring refuses a derived term on
+        purpose -- two measured demands, 4881 and 4343 MiB, do not separate
+        "scales with the attention count" from "scales with the arena's row
+        count", and the last mechanism guessed for it was wrong. So this
+        reads a MEASUREMENT and never computes one.
+
+        THE WORST SEAM STATE, not the mean and not the last: this funds a
+        safety predicate, and the flip that breaks the corridor is by
+        definition the rare one. s50 breached on 1 flip in 86.
+
+        REFUSES rather than defaulting to zero, matching
+        ``_pp_cut_transients`` exactly. A census taken before the seam feed
+        existed has no seam state, and silently pricing that at zero would
+        reproduce the admit this method exists to prevent -- the failure mode
+        would be identical and the code would look calibrated.
+        """
+        from sglang.srt.planner import transient_census
+
+        out = []
+        for stage in range(self.pp_size):
+            table = transients[stage] if stage < len(transients) else None
+            seam = {
+                k: v
+                for k, v in (table or {}).items()
+                if str(k).startswith(transient_census.SEAM_LOAD_STATE_PREFIX)
+            }
+            if not seam:
+                raise ValueError(
+                    f"--pp-solve-cut {census_dir!r} carries no measured SEAM "
+                    f"staging for stage {stage}, and the cut gate will not "
+                    f"price the seam at zero. A cut that fits AT REST can "
+                    f"still be unable to reach its cutover: on the reference "
+                    f"rig the tp_to_pp seam drew 5800 MiB modally and 7055 "
+                    f"MiB at worst on the binding rank, while the gate that "
+                    f"admitted that cut funded 0 MiB of it and reported "
+                    f"374.9 MiB of headroom. Re-take the census on a boot "
+                    f"with --enable-phase-flip that actually FLIPS -- the "
+                    f"seam states are written by the cutover, so a boot that "
+                    f"never flipped measures no seam -- with "
+                    f"SGLANG_RESIDENCY_CENSUS=1, SGLANG_TRANSIENT_CENSUS=1 "
+                    f"and SGLANG_RESIDENCY_CENSUS_DIR={census_dir}."
+                )
+            out.append(float(max(seam.values())))
+        return tuple(out)
 
     def _pp_cut_card_rates(self, gpu_names):
         """(name, gemm_tflops, attn_bw_gbs) per stage, or refuse.

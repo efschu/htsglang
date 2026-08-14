@@ -48,6 +48,39 @@ What remains is the CROSS-PHASE BACKING SWAP (``release_backing`` /
 ``cuMemCreate``) and the GDN state mover. This census settles it by
 measurement instead of a fourth round of deduction.
 
+**IT DID SETTLE IT, AND THE ANSWER WAS THE EXCLUDED CANDIDATE (#485,
+2026-08-14).** The two paragraphs above are kept verbatim because the
+deduction they record is exactly what this instrument was built to
+overrule, and deleting a falsified prediction hides how the mistake was
+made. The measurement, pooled over the 196 ``tp_to_pp`` flips of the two
+#485 certification windows (s50 + s51):
+
+    stage at the trough        weights_refill, 86 of 86 flips on rank 0
+    gdn_state                  step +0 MiB in every flip
+    backing_restore_span       -5280 MiB, netted by backing_release_span
+                               +3584 -- identical to the MiB in the modal
+                               flip AND in the one that broke the law
+    weights_refill             -4278 MiB modal, -5536 once
+
+So the backing swap and the GDN mover -- "what remains" -- are not what
+spends it; the refill is, by a factor of three.
+
+WHERE THE DEDUCTION WENT WRONG, because the error is instructive and
+survives in other reasoning about this path: "an arena that ALREADY
+EXISTS" is false on the ``tp_to_pp`` leg. ``PhaseFlipStacks.refill``
+calls ``_commit_refill_high_water()`` BEFORE the copy, and on a rank
+whose PP layout is the larger one that grows the arena from the TP
+layout back to the high-water through ``arena_carrier.set_active_prefix``
+-- a real ``cuMemCreate`` of ~4150 MiB, which is the term the exclusion
+never considered. The copy and the checksum were priced correctly; the
+commit that precedes them was not priced at all. The 128 MiB checksum
+bound is also confirmed by this data rather than contradicted: the step
+takes exactly two modal values, -4150 and -4278, and the 128 MiB
+difference between them IS the checksum.
+
+Full derivation and the amended certification criterion:
+``docs/dev/485/EXCURSION_ANALYSIS_485.md``.
+
 WHAT IT MEASURES, AND WHY EACH COLUMN IS THERE
 ----------------------------------------------
 At every stage boundary it records three numbers that disagree with each
@@ -275,9 +308,34 @@ class SeamCensus:
                 parts.append(f"{label}=probe-failed")
                 continue
             step = "" if prev_free is None else f" step{(free - prev_free) // _MIB:+d}"
+            # #485: ``allocated`` IS PRINTED, and it is not decoration.
+            #
+            # The three suspects for the one seam that broke the corridor law
+            # (docs/dev/485/EXCURSION_ANALYSIS_485.md) are separated by
+            # exactly one column, and it is this one. ``allocated`` is live
+            # torch bytes, physically backed by definition, so:
+            #
+            #   allocated FLAT while free drops  -> the bytes went somewhere
+            #                                       outside torch (a VMM
+            #                                       commit, the arena carrier)
+            #   allocated RISES with free falling -> a torch allocation
+            #
+            # ``slack`` alone cannot carry that: it is a DIFFERENCE, so an
+            # allocation that raises reserved and allocated together leaves it
+            # unchanged -- which is precisely what the 11:44:06 breach did
+            # (slack 652 both before and after the anomalous refill).
+            #
+            # And ``reserved`` cannot carry it either, on this rig: measured
+            # at rest on the 5090, reserved=32040.0 against nvml_used=30050.1
+            # is 1990 MiB of reserve that no physical page backs, so a
+            # virtual reserve can grow without costing a byte of NVML free.
+            # Both are printed anyway -- the point of a census is that the
+            # reader does not have to have guessed the right column in
+            # advance -- but ``allocated`` is the one that decides.
             parts.append(
                 f"{label} free={free // _MIB}{step} "
-                f"slack={(reserved - allocated) // _MIB}"
+                f"slack={(reserved - allocated) // _MIB} "
+                f"alloc={allocated // _MIB} res={reserved // _MIB}"
             )
             prev_free = free
         low = self.trough()

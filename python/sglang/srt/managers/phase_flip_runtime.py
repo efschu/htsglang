@@ -262,6 +262,80 @@ ENV_SEAM_ABANDON_BACKOFF_MAX = "SGLANG_SEAM_ABANDON_BACKOFF_MAX"
 #: phase" a STATE rather than a hope -- and it surfaces in the status string.
 SEAM_ABANDON_CAP_GUARD = "seam unfundable"
 
+# #485: THE VERDICT IS TERMINAL FOR A REASON, NOT FOREVER.
+#
+# ``_install_seam_cap_guard`` argues the cap is safe because "the staging ask
+# is set by the layer map and the live set; an abandon moves neither". The
+# layer map is static. THE LIVE SET IS NOT -- it is the resident request set,
+# and it drains. The seam-entry gate one level down already treats the same
+# shortage as transient: it DELAYS rather than refuses, "because the
+# paired-trough measurement says the memory comes back". Denying that one
+# level up costs a long-lived instance its other phase for the rest of the
+# process because of one crowded minute.
+#
+# Retirement is therefore allowed, and it is fenced three ways:
+#
+#   EARNED     the ask must have reversed against affordable WITH margin, at
+#              the current live set. Retiring at exactly the entry bar
+#              re-abandons on the next arm, and that pair is the livelock
+#              with extra steps -- hence a hysteresis strictly above the C20
+#              entry margin rather than equal to it.
+#   UNANIMOUS  booked through ``_collective_min`` like ``reduced_fit``. A rank
+#              that cleared while a peer did not has learnt nothing about the
+#              group, which is the runtime's own reason for resetting the
+#              streak collectively rather than in the rank-local gate.
+#   BOUNDED    a retire path with no limit re-opens the livelock through the
+#              back door: install, retire, re-abandon, forever. After this
+#              many retirements the guard is installed for good and names the
+#              limit it hit.
+#
+# NOT KEYED TO THE CUTOVER EPOCH, deliberately. The epoch advances on
+# cutovers, and no cutover happens while the guard is installed, so an
+# epoch-keyed retire clock would be frozen by the very state it exists to
+# leave. The retire round carries its own count over the same transport.
+#
+# Zero disables retirement and restores the shipped behaviour exactly -- a
+# VALUE of the same term, not a second code path.
+DEFAULT_SEAM_CAP_RETIRE_LIMIT = 2
+ENV_SEAM_CAP_RETIRE_LIMIT = "SGLANG_SEAM_CAP_RETIRE_LIMIT"
+
+#: How far ABOVE the entry requirement the ask must have reversed before the
+#: verdict may be retired. Independent of ``seam_entry_margin_bytes`` on
+#: purpose: disabling the C20 margin must not collapse the retire bar onto
+#: the entry bar, which is precisely the flapping pair this fences off.
+DEFAULT_SEAM_CAP_RETIRE_HYSTERESIS_MIB = 512
+ENV_SEAM_CAP_RETIRE_HYSTERESIS = "SGLANG_SEAM_CAP_RETIRE_HYSTERESIS_MIB"
+
+
+def seam_cap_retire_limit() -> int:
+    """How many times a capped seam may be given back. 0 disables retirement."""
+    try:
+        return max(
+            0,
+            int(
+                os.environ.get(
+                    ENV_SEAM_CAP_RETIRE_LIMIT, DEFAULT_SEAM_CAP_RETIRE_LIMIT
+                )
+            ),
+        )
+    except ValueError:
+        # An unreadable knob must not decide a safety bound by accident.
+        return DEFAULT_SEAM_CAP_RETIRE_LIMIT
+
+
+def seam_cap_retire_hysteresis_bytes() -> int:
+    """Margin, on top of the entry requirement, that retirement must clear."""
+    try:
+        mib = int(
+            os.environ.get(
+                ENV_SEAM_CAP_RETIRE_HYSTERESIS,
+                DEFAULT_SEAM_CAP_RETIRE_HYSTERESIS_MIB,
+            )
+        )
+    except ValueError:
+        mib = DEFAULT_SEAM_CAP_RETIRE_HYSTERESIS_MIB
+    return max(0, mib) * 1024 * 1024
+
 
 def seam_entry_margin_bytes() -> int:
     """The designed headroom a seam must have ON TOP OF its staging ask.
@@ -3675,7 +3749,12 @@ class PhaseFlipRuntime:
 
     # -- the seam's terminal verdict ------------------------------------------
     def _install_seam_cap_guard(
-        self, direction: str, spent: int, too_small: Sequence[str]
+        self,
+        direction: str,
+        spent: int,
+        too_small: Sequence[str],
+        ask_bytes: Optional[int] = None,
+        live_slots: Optional[int] = None,
     ) -> None:
         """Stand the flip down for good and say why, once.
 
@@ -3711,6 +3790,19 @@ class PhaseFlipRuntime:
             return
         self.blocking_guards = tuple(self.blocking_guards) + (guard,)
         self.seam_cap_verdicts = getattr(self, "seam_cap_verdicts", 0) + 1
+        # #485 THE WITNESS. Retirement has to be able to say what changed, and
+        # a verdict a reader cannot audit is a verdict a reader will disable.
+        # ``ask_bytes`` may be None on a caller that does not have it: an
+        # unknown ask can never be shown to have reversed, so such a guard is
+        # simply not retirable, which is the shipped behaviour.
+        if not hasattr(self, "_seam_cap_witness"):
+            self._seam_cap_witness = {}
+        self._seam_cap_witness[direction] = {
+            "spent": int(spent),
+            "ask_bytes": None if ask_bytes is None else int(ask_bytes),
+            "live_slots": None if live_slots is None else int(live_slots),
+            "detail": detail,
+        }
         logger.error(
             "%s SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (%s). %d consecutive "
             "group abandons reached the cap; this rank: %s. The staging ask is "
@@ -3731,6 +3823,118 @@ class PhaseFlipRuntime:
             detail,
             self._phase,
         )
+
+    def retire_seam_cap_guard(
+        self,
+        direction: str,
+        ask_bytes: int,
+        affordable_bytes: int,
+    ) -> bool:
+        """Give the flip back once the shortage that stood it down is gone.
+
+        Returns True only when the guard was actually removed. Every refusal
+        path is silent-but-countable rather than raising: this is called from
+        a service turn, and an instrument that can kill the loop it runs in is
+        worse than no instrument.
+
+        ``ask_bytes`` / ``affordable_bytes`` are THIS RANK's reading at the
+        CURRENT live set -- not the ones the verdict was installed with. The
+        whole point is that the live set moved.
+
+        THE THREE FENCES, and each one is a test in
+        ``test_seam_cap_retire_485.py``:
+
+        EARNED. ``affordable >= ask + entry_margin + hysteresis``. The entry
+        margin is the C20 term the seam would face on its next attempt, so
+        clearing only that is clearing to the bar it is about to be measured
+        against -- which flaps. The hysteresis is a separate constant so that
+        disabling C20 cannot collapse the retire bar onto the entry bar.
+
+        UNANIMOUS. The local verdict is reduced through ``_collective_min``,
+        the same channel ``reduced_fit`` uses, so one rank that has drained
+        cannot hand the group a seam a peer still cannot fund. Note the
+        reduction runs on EVERY rank that reaches here, which is what makes
+        the answer group-uniform rather than a rank-local opinion.
+
+        BOUNDED. ``seam_cap_retire_limit()`` retirements, then the next
+        verdict is permanent. Without this the pair (install, retire) is the
+        unbounded retry the cap was built to end, one level up.
+
+        WHAT THIS DELIBERATELY DOES NOT DO. It does not arm, does not run the
+        spill ladder, and does not withhold admissions -- those three are what
+        turned the original retry loop into a dead instance, and a retire
+        probe that did any of them would rebuild it.
+        """
+        witness = getattr(self, "_seam_cap_witness", {}).get(direction)
+        installed = [
+            g for g in self.blocking_guards if g.startswith(SEAM_ABANDON_CAP_GUARD)
+        ]
+        if witness is None or not installed:
+            # Never capped in this direction, or already retired. Not an error:
+            # the caller is a periodic probe and asking is how it finds out.
+            return False
+        if witness.get("ask_bytes") is None:
+            # An unknown ask cannot be shown to have reversed. Refusing here
+            # keeps a caller that omits the witness on the shipped behaviour
+            # rather than retiring on an assumption.
+            return False
+        limit = seam_cap_retire_limit()
+        spent = getattr(self, "seam_cap_retirements", 0)
+        if limit <= 0 or spent >= limit:
+            return False
+        bar = int(ask_bytes) + seam_entry_margin_bytes() + (
+            seam_cap_retire_hysteresis_bytes()
+        )
+        vote = 1 if int(affordable_bytes) >= bar else 0
+        try:
+            reduced = self._collective_min([vote])
+        except Exception as exc:  # noqa: BLE001 -- a probe never kills the loop
+            logger.debug(
+                "%s seam cap retire vote could not be reduced (%s); the "
+                "verdict stands",
+                LOG_PREFIX,
+                exc,
+            )
+            return False
+        if not reduced or int(reduced[0]) == 0:
+            return False
+
+        self.blocking_guards = tuple(
+            g for g in self.blocking_guards if not g.startswith(SEAM_ABANDON_CAP_GUARD)
+        )
+        self._seam_cap_witness.pop(direction, None)
+        self.seam_cap_retirements = spent + 1
+        # The streak and the damping go with it. Leaving the counter at the
+        # cap would re-install the verdict on the very next abandon, which
+        # would make the retirement a log line rather than a state change.
+        if not hasattr(self, "_seam_abandons_in_a_row"):
+            self._seam_abandons_in_a_row = {}
+        self._seam_abandons_in_a_row[direction] = 0
+        if not hasattr(self, "_seam_retry_at_arm"):
+            self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
+            self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
+        self._seam_retry_at_arm[direction] = 0
+        logger.warning(
+            "%s SEAM CAP RETIRED (%s): the verdict was installed at an ask of "
+            "%.1f MiB with %s live slot(s) after %d consecutive abandons (%s); "
+            "the group now unanimously reads an ask of %.1f MiB against %.1f "
+            "MiB affordable, clearing the %.1f MiB retire bar. The flip may "
+            "arm again. Retirement %d of %d -- after the last one the verdict "
+            "is permanent, because an unbounded install/retire pair is the "
+            "livelock this cap exists to end (SGLANG_SEAM_CAP_RETIRE_LIMIT).",
+            LOG_PREFIX,
+            direction,
+            witness["ask_bytes"] / 1048576.0,
+            witness.get("live_slots"),
+            witness.get("spent", 0),
+            witness.get("detail", ""),
+            int(ask_bytes) / 1048576.0,
+            int(affordable_bytes) / 1048576.0,
+            bar / 1048576.0,
+            self.seam_cap_retirements,
+            limit,
+        )
+        return True
 
     # -- staging affordability ------------------------------------------------
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
@@ -5712,6 +5916,33 @@ class PhaseFlipRuntime:
                 stats["seam_transient_bytes"] = int(peak)
                 low = census.trough()
                 stats["seam_trough_stage"] = low[0] if low else ""
+                # #485 T3: AND FEED THE #485 TRANSIENT CENSUS, which is a
+                # DIFFERENT consumer from the gate below and had a hole the
+                # gate did not.
+                #
+                # transient_census.note() is called from exactly one site --
+                # Scheduler.process_batch_result -- and labels its sample
+                # with batch.forward_mode.name. A cutover is not a batch, so
+                # the census that the planner cut gate funds "the WORST load
+                # state" from could not take a single sample inside the
+                # largest transient in the system. Measured over 196 flips of
+                # the two certification windows: 5800 MiB modal, 7055 MiB
+                # worst on rank 0, against a census reporting 1989 MiB.
+                #
+                # The TROUGH's free level, not the peak DRAW: the census
+                # stores per-state minima of the free column and computes the
+                # draw itself against its own at-rest baseline. Handing it a
+                # draw here would be measuring against a different reference
+                # than every other state in the same table.
+                if low is not None:
+                    try:
+                        from sglang.srt.planner import transient_census
+
+                        transient_census.note_free(
+                            transient_census.seam_load_state(direction), low[1]
+                        )
+                    except Exception:  # noqa: BLE001 -- never kill a cutover
+                        pass
                 # FEED THE MEASUREMENT BACK TO THE GATE THAT GUESSED IT.
                 # This is the only place the driver-visible in-cutover draw is
                 # ever known, and until now it was written to a stats dict and
