@@ -145,6 +145,28 @@ FAMILY=(
     test/srt/test_phase_flip_serving_proof_gate.py
     test/srt/test_rope_lazy_cache.py
     test/srt/test_yarn_rope_cache_growth.py
+    # SEVENTH CONSECUTIVE round with a short family list (MERGE-R10 section 2
+    # wrote the sixth, R9 the fifth). feat/desk-hardening-656 added three
+    # phase-flip-surface files and extended this list by none.
+    #
+    # The first two are the familiar shape -- their directory arm collects
+    # them, so nothing was red, but the CANONICAL sweep did not run them.
+    # The arena-tail file pins the fix that the seam's tail is ADDITIVE
+    # against the wave peak rather than an alternative to it, which is a
+    # sizing claim about the flip itself; the 612 contract file pins that
+    # the ledger DECLARES every phase-flip secondary communicator the
+    # runtime actually builds.
+    test/registered/unit/managers/test_seam_arena_tail_additive_656.py
+    test/registered/unit/mem_ledger/test_communicator_group_contract_612.py
+    # The third is worse than the usual shape and is the reason this entry
+    # exists at all: test/registered/unit/ ROOT is collected by NO arm in
+    # the canonical set -- every arm names a subdirectory. So this file ran
+    # nowhere, in any sweep, from the moment it landed. Measured green
+    # (3 passed) when run by hand here for the first time; it could equally
+    # have been red for a whole round and no arm would have said so. A
+    # ratchet that guards the phase-flip surface's formatting is worth
+    # exactly as much as the sweep that runs it.
+    test/registered/unit/test_black_ratchet_656.py
 )
 
 cd "$WT/test/registered/scheduler"
