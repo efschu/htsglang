@@ -612,9 +612,7 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         self.assertGreater(max(r.exposed_rows() for r in fleet), backed[1])
         # And once a peer's live set reaches up there, the cap agreement has
         # no honest level left: its floor is above the poorest rank's ceiling.
-        fleet[0]._live_slots_fn = lambda: torch.tensor(
-            [backed[0]], dtype=torch.int64
-        )
+        fleet[0]._live_slots_fn = lambda: torch.tensor([backed[0]], dtype=torch.int64)
         self.assertIsNone(
             _agree(fleet),
             "collective_cap_target must DECLINE here -- if it returned a "
@@ -667,8 +665,9 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         poorest rank can fund it."""
         from sglang.srt.managers import phase_flip_spill as pfs
 
-        rich, pool, card = _rank(free_mib=1024 + 200_000, backed=500_000,
-                                 rows=BOOT_ROWS_E)
+        rich, pool, card = _rank(
+            free_mib=1024 + 200_000, backed=500_000, rows=BOOT_ROWS_E
+        )
         rich._rows_at_boot = BOOT_ROWS_E
         sched = type("S", (), {})()
         setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, rich)

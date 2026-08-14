@@ -2631,3 +2631,155 @@ was judged on what it DECIDED and not on what it ALLOCATED, and it was moved
 from a rare path to a hot one in the same change. Whenever a mechanism's
 frequency changes, its cost has to be re-measured at the new frequency -- the
 old measurement was taken under the old one.
+
+## 85. The arena tail is ADDITIVE against the wave state, and the max() that said
+otherwise is why the one measured corridor breach was not foreseen.
+
+R9 §12.4 recorded the suspicion and did not act on it: `_staging_bytes` returned
+`max(wave_peak, draft_restore, arena_tail)`, the sizer's `measure_at_rest`
+mirrored it with `d_fixed = max(arena, draft)`, and both rested on "the peaks
+belong to different instants of the seam and never coexist".
+
+**The argument is true for the drafter and false for the arena tail, and the
+difference is where each commit runs.** Rung 2's restore is inside `_cutover`,
+after the waves' buffers are dead. `stacks.refill` is a PRE-cutover function
+(`phase_flip_runtime.py:1655`, census label `weights_refill`), so its commit
+lands while the wave state is still outstanding.
+
+The stage walk settles it. One cutover,
+`/spinning/evidence-631/remediation-656/boot_m1.log`, `tp_to_pp` rank 1:
+
+    transient 1452 MiB (baseline free 2464 MiB, trough 1012 MiB at
+    'weights_refill') *** CORRIDOR LAW BROKEN: 1 stage(s) below 1024 MiB ***
+    ... backing_restore free=1250 | gdn_state free=1250
+    weights_refill free=1012 step-238 | cutover free=1290 step+278
+
+Entry 2464, deepest pre-refill reading 1078 (a 1386 MiB wave peak), still 1214
+MiB down when the refill began at 1250, and the refill's own 238 MiB took the
+card to 1012. `max(1386, 238)` predicts a 1078 MiB trough — 54 MiB CLEAR of the
+law. **The gate entered on a verdict that could not see the breach it was about
+to make.**
+
+Before/after over that boot's distinct `tp_to_pp` census lines, MiB:
+
+| rk | entry | wave_peak | arena | max() | additive | measured | max err | add err |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 2464 | 1386 | 238 | 1386 | 1624 | 1452 | +66 | -172 |
+| 2 | 2952 | 492 | 1052 | 1052 | 1544 | 1276 | +224 | -268 |
+| 0 | 4585 | 1256 | 428 | 1256 | 1684 | 1256 | +0 | -428 |
+| 1 | 2128 | 158 | 594 | 594 | 752 | 580 | -14 | -172 |
+| 2 | 2952 | 448 | 1052 | 1052 | 1500 | 1232 | +180 | -268 |
+| 1 | 2038 | 418 | 466 | 466 | 884 | 712 | +246 | -172 |
+| 2 | 2854 | 592 | 924 | 924 | 1516 | 1248 | +324 | -268 |
+| 1 | 2102 | 370 | 466 | 466 | 836 | 664 | +198 | -172 |
+
+`max err` positive means the model reserved LESS than the cutover drew: six of
+eight rows, up to 324 MiB. The additive form does it on none. On the breach row
+its residual is 172 MiB, inside the sizer's own 192 MiB error bar
+(`DEFAULT_MARGIN_MIB`). On the `kv_pack`-trough rows, where the wave has drained
+before the refill, it is loose by up to 428 MiB — **not claimed as agreement**,
+named as the safe direction.
+
+Shape, both files: `arena_tail + max(wave_peak, draft_restore)` in the runtime
+(the tail is a COMMIT that persists into the destination phase, so it is still
+held when the cutover restores the drafter), and `staging(T) = A + max(F, a*T)`
+in the sizer, closed form in both regimes. `A = 0` reproduces the previous
+arithmetic byte for byte, which is what a record written before the split reads
+back as — no stored record is invalidated.
+
+R9 §12.4's stated reason for not acting ("it widens the entry requirement on
+every seam") is answered rather than ignored: the livelock objection applies to
+terms that scale with the RESIDENT SET, because a refusal does not drain what it
+refused on. The arena tail is a static LAYOUT quantity, so it shifts the
+affordable pool by a constant the prompt cannot move.
+
+**Still open, and NOT closed by this.** R9 §12.3's "seam cost model is ~3.8x
+low — 484 MiB modelled against ~1830 MiB drawn" is not reproduced here, and the
+correction above does not account for a factor of that size. The two numbers are
+different quantities: an AT-REST floor against a LIVE-SET draw. Separating them
+needs the seam-SCOPED price — `scripts/s38_seam_price_vs_draw.py` against a boot
+of this configuration — which is metal. Recorded as a ticket rather than
+asserted; a desk shift claiming a 3.8x closure from a 1.11x term would be the
+substitution this register exists to prevent.
+
+## 86. The ledger declared no phase-flip communicator, and #605 had already put
+the measurement boundary on the far side of them.
+
+`test_communicator_group_contract_612` was the one inherited `mem_ledger` red and
+R9 §12.6 called it load-bearing. Confirmed and closed: `parallel_state` builds
+`flip_tp`, `flip_dcp` and `flip_pp` over the same world
+(`parallel_state.py:3502-3512`), `model_runner.py:1985` places `nccl_init_end`
+AFTER that call deliberately, so the first boot to measure `TERM_NCCL_BUFFERS`
+measures three communicators whose existence the term's signature does not know
+about. Undeclared, they failed in the OOM direction twice over — their buffers
+charged to no row, and `nccl_signature` unmoved, so a figure measured on a
+non-flip launch was reusable on a flip one.
+
+`flip_dcp` is emitted on the CONSTRUCTION SITE's condition (`dcp_size > 1` of the
+SECONDARY set, whose width is `len(--phase-flip-tp-vector)`), not on "dcp is
+enabled" — the primary `--dcp-size` has nothing to do with it. `flip_pp` is
+emitted with `world_size=1` because the call site passes `pp_size=1`;
+`classify_communicator_groups`, not the inventory, is what decides a single-rank
+group allocates nothing. Deciding it at the inventory would hide the group the
+moment the call site passed a different `pp_size`.
+
+## 87. The kvso-under-PP refusal was accurate and useless.
+
+R9 §12.5's note now lives where the operator meets it. Under `pp_size>1` no argv
+produces a vacate line, so the flip-setup capacity spec's "bs2-4 reserves,
+including unused mamba states, are spilled during bs1 time" is STRUCTURALLY
+UNREACHABLE on a flip boot — not "unsupported", which reads as "not wired yet".
+The message says so, offers `--phase-flip-spill-depth` (rungs `'cache'` →
+`'draft'` → `'arena'`, checked against `DEPTH_NAMES`/`IMPLEMENTED_DEPTH` rather
+than restated, so it cannot come to offer the defined-but-unwired
+`'draft+graphs'`), and in the same breath says what that alternative is NOT:
+flip-seam spilling of the inactive layout's cold memory, whose rung count must
+not be reported as satisfying that axis. The refusal is not lifted and its real
+reason — host pool rows sized from the boot vector — is now stated in it.
+
+## 88. A missing optional backend hid 2331 tests, and the count nobody looked at
+was the fix's only gate.
+
+R9 §12.7, closed. One unguarded module-scope `HiCacheNixl` import in
+`test_hicache_nixl_storage.py` raised at COLLECTION time on any host without
+NIXL, and pytest treats a collection error as an interrupt for the whole run:
+`2331 tests collected, 1 error -> Interrupted`, i.e. **zero of the 2331 ran**.
+That is why no canonical arm covers `test/registered/unit/mem_cache/` and why
+`test_gdn_resident_cap_floor_656.py` was red in a place nothing looks.
+
+Guarded, the directory collects 2351 with 0 errors. The honest verdict on what
+was hidden: **944 failed, 738 passed, 707 skipped**. Of the 906 distinct FAILED
+entries, 902 are `RuntimeError: No accelerator ... is available` and need metal
+to say anything at all. The remaining **4 are a genuine CPU-visible defect the
+block was hiding**: `test_mamba_checkpoint_interval.py` drives
+`model_runner_kv_cache_mixin.py:1913` into `AttributeError: 'types.SimpleNamespace'
+object has no attribute '_auto_mamba_demand_active'`. Left red and named rather
+than repaired inside a hermeticity fix.
+
+`TestNixlFileLayout` — 5 tests exercising `nixl_routing` key arithmetic, with no
+dependency on the missing backend at all — was hidden by the import too. That is
+the clearest statement of why the guard belongs at the import and not at the
+class.
+
+## 89. The pinned `black` was never installed, and the honest gate is a scoped
+ratchet rather than a tree claim.
+
+R9 §1 asked for the third time why the formatter had stopped running. Mechanical
+answer: the repo's hook directory holds only `reference-transaction` —
+`pre-commit install` was never run. Actions are disabled on this fork, so neither
+half of the usual enforcement exists. The gate therefore lives in the registered
+suite, which is what actually runs.
+
+R9's recorded fourteen (11 pre-existing + 3 new of the twenty `.py` its merge
+touched) reproduce exactly at this tip under the pinned black 26.1.0 and are
+formatted, AST-verified identical before and after, with all five affected arms
+matching on counts AND on sorted FAILED/ERROR name sets.
+
+The ratchet covers the phase-flip surface (75 files), tolerates 32 already-dirty
+files by name, and is shrink-only in both directions. **It does not claim the
+tree**: 762 of 6211 tracked `.py` are dirty under the same black, nearly all
+upstream, and a 762-entry allowlist is a list nobody maintains. It caught real
+dirt on its first live encounter — the C22-e follow-on re-dirtied
+`test_kv_backing_cap_agreement_656.py`, one of the fourteen, within hours of them
+being cleaned, which is the failure mode R9 described ("R8 arrived with the hook
+run and R9 arrived without it") happening again in the same shift.
