@@ -2501,3 +2501,45 @@ off on this boot (`393600x64 ... written EAGER ... (0 lazy)` on every rank).
 **Still open and never examined by any shift:** the GDN/mamba chunked-scan
 boundary, and attention-backend / CUDA-graph / page-table bucket sizing at these
 depths.
+
+## 82. C22-d closed: the row COUNT agreement was never a SET agreement, and the
+gap opens exactly when the counts happen to AGREE.
+
+Register row 78 recorded the ballot catching a live-slot divergence and the
+serving-preserving livelock that cost. The trigger is now named, from the code
+rather than from the log: `KvRowCap.release` SORTS the free list and `engage`
+preserves eviction order, so a corridor-bounded `recover()` reorders the
+recovering rank's free list while peers that never shrank keep theirs in
+eviction order. The only re-normalisation is `reconcile_to`'s final sort — and
+`collective_cap_target` returns `None`, skipping it, **precisely when the
+group's exposed counts already agree**. The allocator takes from the FRONT, so
+from that moment the ranks hand different physical rows to the same logical
+token: identical cardinality, different set, identical POOL CENSUS.
+
+That is why the trigger is narrower than "a rank came back short". Soak leg C's
+single 23199-row recovery left the counts UNEQUAL, so the next shrink levelled
+the group by construction and opened no divergence; boot 1 took seven
+recoveries, and it is the ones that left the counts EQUAL that opened the wedge.
+
+Closed in two halves, because prevention cannot undo rows already handed to
+live requests and cached in the radix tree (which is why draining to zero
+requests and `/flush_cache` both failed to clear boot 1). SOURCE:
+`normalize_free_lists` runs unconditionally at the KV rung, every rank, every
+seam round. RECOVERY: the rung's reduction widens 8 → 12 fields (the move R2
+made 4 → 8) to carry a membership digest, the group's row extent and the
+group's MINIMUM BACKED rows; on disagreement every rank adopts the group UNION,
+computed on the same MIN channel because `MIN(-p)` is `-OR(p)`. A union never
+removes a row from the rank holding it, so no request loses context and no
+backing is released — a rank-0 broadcast or an intersection would drop a peer's
+live rows at the seam. `reshard_plan.rows_of` is a pure function of the slot id,
+so no already-agreed row changes destination.
+
+**The bound that is not negotiable:** a row at or above a rank's backed count is
+unmapped there, and the mover reading it is `cudaErrorIllegalAddress`, which
+kills every rank rather than raising. A union reaching the group's minimum
+backing is REFUSED into the existing unanimous abandon, named, with the
+levelling and normalisation still running underneath so those rows drain.
+
+Costs nothing when the ranks agree — soak boot 2's 1134 consecutive cutovers
+return at the first branch, and the agreeing path is pinned to enter no
+collective at all.
