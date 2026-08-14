@@ -2595,3 +2595,39 @@ Metal, same rig, same argv, code as the only difference:
 Four such levellings against four corridor-bounded recoveries, and **0 wire
 frame divergences, 0 abandons, 0 union refusals** where the previous boot
 wedged permanently on the same shape.
+
+## 84. The C22-d normalisation broke the corridor law, and the cost was in the
+SORT'S TEMPORARIES rather than in anything it decided.
+
+`sort_free_lists` did `setattr(alloc, name, torch.sort(pages).values)`. On a
+DEVICE tensor that allocates a values tensor AND an indices tensor -- the free
+list is one int64 per row, 4.7 MiB at this rig's 586642 rows, so ~14 MiB
+transient per call and up to ~34 MiB across the normalise and release paths.
+
+Invisible while it ran only on the rounds the cap agreement moved a rank.
+C22-d made it run **every seam round on every rank**, and the seam is exactly
+where this rig's corridor is tightest:
+
+| boot | code | gpu0 continuous min | samples < 1024 |
+|---|---|---|---|
+| soak boot 1 | before | 1028 MiB | **0** of 33459 |
+| soak boot 2 | before | 1084 MiB | **0** of 125753 |
+| leg 2 | C22-d | 978 MiB | **2** |
+| leg 3 | C22-d + C22-e | 990 MiB | **4** |
+
+`1024 - 990 = 34`, which is the transient to the MiB. The law is a hard user
+limit and a mechanism that is correct about ids may not pay for itself in
+device memory.
+
+Sorting through the HOST and writing back with `copy_` allocates nothing on the
+device -- the storage is reused -- and an equality guard skips the write-back
+entirely on the common round where the list is already ascending. The host pays
+~10 MiB and a few milliseconds once per seam, against a flip cadence in tens of
+seconds. `release`, where the merge genuinely changes the tensor SIZE, still
+takes one device allocation and no longer takes four.
+
+**The general shape, because this corpus keeps meeting it:** a correctness fix
+was judged on what it DECIDED and not on what it ALLOCATED, and it was moved
+from a rare path to a hot one in the same change. Whenever a mechanism's
+frequency changes, its cost has to be re-measured at the new frequency -- the
+old measurement was taken under the old one.

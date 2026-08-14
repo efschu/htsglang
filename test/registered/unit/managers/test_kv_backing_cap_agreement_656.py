@@ -704,5 +704,81 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         )
 
 
+class TheNormalisationMayNotCostDeviceMemoryTest(unittest.TestCase):
+    """#656 C22-e: the sort runs every seam now, and the seam is where the
+    corridor is tightest.
+
+    ``torch.sort`` on a device tensor allocates a values AND an indices
+    tensor, so replacing the free list with ``torch.sort(pages).values`` costs
+    ~3x the list in transient DEVICE memory -- 14 MiB at this rig's 586642
+    rows. That was invisible while the sort ran only on the rare rounds the
+    cap agreement moved a rank. C22-d made it run every round on every rank,
+    and gpu0's continuous minimum went from 1028/1084 MiB with 0 samples below
+    the 1024 law (159212 samples, two soak boots) to 978/990 MiB with 2 and 4
+    samples BELOW it. The law is a hard user limit.
+
+    The invariant that keeps it free: the sort writes back through ``copy_``
+    into the SAME storage, so the device allocates nothing. Pinned by tensor
+    IDENTITY, which is the observable proxy for "no new allocation" on a CPU
+    desk.
+    """
+
+    def test_sorting_reuses_the_same_storage(self):
+        relief, _pool, _card = _rank(free_mib=1024 + 10, rows=64)
+        alloc = relief._cap._alloc
+        alloc.free_pages = torch.tensor([9, 3, 7, 1], dtype=torch.int64)
+        before = alloc.free_pages
+        ptr = before.data_ptr()
+        relief.normalize_free_lists()
+        self.assertIs(
+            alloc.free_pages,
+            before,
+            "the free list object was REPLACED -- on a device tensor that is "
+            "a fresh allocation at the seam, which is where the corridor law "
+            "has the least room",
+        )
+        self.assertEqual(alloc.free_pages.data_ptr(), ptr, "storage moved")
+        self.assertEqual(alloc.free_pages.tolist(), [1, 3, 7, 9])
+
+    def test_an_already_sorted_list_is_not_written_at_all(self):
+        relief, _pool, _card = _rank(free_mib=1024 + 10, rows=64)
+        alloc = relief._cap._alloc
+        alloc.free_pages = torch.tensor([1, 3, 7, 9], dtype=torch.int64)
+        before = alloc.free_pages.clone()
+        relief.normalize_free_lists()
+        self.assertTrue(torch.equal(alloc.free_pages, before))
+
+    def test_it_is_idempotent_which_is_what_makes_it_safe_every_round(self):
+        relief, _pool, _card = _rank(free_mib=1024 + 10, rows=64)
+        alloc = relief._cap._alloc
+        alloc.free_pages = torch.tensor([5, 2, 8], dtype=torch.int64)
+        relief.normalize_free_lists()
+        first = alloc.free_pages.clone()
+        for _ in range(3):
+            relief.normalize_free_lists()
+        self.assertTrue(
+            torch.equal(alloc.free_pages, first),
+            "running the normalisation on every seam round must converge, or "
+            "the ranks chase each other's order forever",
+        )
+
+    def test_release_still_restores_every_withheld_id_in_order(self):
+        """The merge changes the tensor SIZE, so one device allocation is
+        unavoidable there -- but the ids and their order must be exactly what
+        the device path produced, or the group's handout order changes with
+        the plumbing."""
+        relief, _pool, _card = _rank(free_mib=1024 + 10, rows=64)
+        alloc = relief._cap._alloc
+        alloc.free_pages = torch.arange(1, 65, dtype=torch.int64)
+        relief._cap.engage(40)
+        self.assertEqual(relief._cap.withheld, 24)
+        relief._cap.release()
+        self.assertEqual(
+            alloc.free_pages.tolist(),
+            list(range(1, 65)),
+            "release must hand back every withheld id, ascending",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
