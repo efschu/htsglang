@@ -15211,6 +15211,33 @@ class ServerArgs:
             calibration.describe(),
         )
 
+    def _pp_cut_token_shares(self):
+        """Per-rank KV token shares for the gate's arena split.
+
+        #485. ``_handle_pp_solve_cut`` has called this since the solver was
+        wired and NOTHING DEFINED IT, so every ``--pp-solve-cut`` boot raised
+        ``AttributeError`` before the cut gate ran. The flag was verified to
+        parse -- RUNSHEET 485 section 4 builds the real parser -- and never
+        verified to run, and the one harness that exercised the gate rebuilds
+        ``RankResources`` by hand rather than dispatching through here, so a
+        mirror of the path could not discover that the path was dead.
+
+        THE VECTOR IS THE TOKEN VECTOR, NOT THE FLIP WEIGHT VECTOR.
+        ``token_shares_from_vector`` says so in its own docstring: pass what
+        ``parse_flip_token_vector`` returns -- the resolved
+        ``SGLANG_UNEVEN_TOKEN_VECTOR``, or the flip vector when that env is
+        unset and the two genuinely coincide -- and never
+        ``--phase-flip-tp-vector`` read straight off the flag. The weight
+        shard follows COMPUTE and the token split follows each rank's
+        REMAINING memory once its weights are placed; sizing the arena with
+        the compute vector makes the most compute-loaded rank binding and the
+        min-reduce drags the group down to its unit.
+        """
+        from sglang.srt.managers.phase_flip_boot import parse_flip_token_vector
+        from sglang.srt.planner import pp_cut
+
+        return pp_cut.token_shares_from_vector(parse_flip_token_vector(self))
+
     def _pp_cut_transients(self, calibration, census_dir: str):
         """Per-rank measured transient tables, or a refusal naming the fix.
 

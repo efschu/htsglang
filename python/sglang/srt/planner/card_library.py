@@ -173,9 +173,21 @@ SEED_CARDS: Dict[str, CardSpec] = {
 }
 
 
+#: Vendor/brand words that a driver-reported name carries and a catalogue key
+#: does not. NVML reports consumer NVIDIA cards as "NVIDIA GeForce RTX 5090"
+#: while the seed key is "RTX 5090", so stripping only "nvidia" left every
+#: GeForce card unmatchable -- and `--pp-solve-cut` looks the card up by the
+#: name the CENSUS recorded, which is the driver's. Model tokens are never
+#: listed here: "RTX 3080" and "RTX 3080 20GB" must stay distinct.
+_VENDOR_WORDS = ("nvidia", "geforce")
+
+
 def _canonical(name: str) -> str:
     """Loose key for name lookup (case/space-insensitive)."""
-    return " ".join(str(name).lower().replace("nvidia", "").split())
+    text = str(name).lower()
+    for word in _VENDOR_WORDS:
+        text = text.replace(word, "")
+    return " ".join(text.split())
 
 
 class CardLibrary:
