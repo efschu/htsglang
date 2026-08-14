@@ -1093,19 +1093,52 @@ CORRIDOR_GUARD_ATTR = "phase_flip_corridor_guard"
 KV_BACKING_RELIEF_ATTR = "phase_flip_kv_backing_relief"
 
 
-def recover_kv_backing(scheduler: Any) -> int:
+def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
     """Re-back the scheduler's KV pool and lift the allocator cap.
 
     Called on the tp->pp leg, where the scheduler's pool becomes the ACTIVE
     layout again. Recovery is not optional bookkeeping: a cap that is never
     lifted turns dynamic residency into a permanently smaller pool, which is
     the one fix the standing rule forbids.
+
+    #656 C22-e: AND THE RECOVERY LEVELS TO THE GROUP. ``recover`` grows as far
+    as THIS rank's distance from the corridor law allows -- correctly, since
+    the grow is an allocation on the card that needed relieving -- so the
+    corridor-bounded rank comes back lower than its peers and, from that
+    instant, the group has TWO DIFFERENT ID SPACES. The peers hand out row ids
+    the poorest rank cannot map, and nothing downstream can repair it:
+
+        05:40 PP2  proposal: current=585390 floor=585903 (max_live=585390)
+        05:40 PP1  proposal: current=546236 floor=546749 (max_live=546236)
+
+    measured on this rig, 2026-08-14. ``collective_cap_target`` then DECLINES
+    by its own rule -- ``max_floor > capable``, the poorest rank cannot expose
+    the rows a peer's live set requires -- and the seam's live-slot agreement
+    cannot take the union either, because a union reaching row 585390 would
+    have the rank whose backing ends at 546236 read unmapped memory. Both
+    refusals are correct; both leave the flip refused for the rest of the
+    boot. The only place the divergence can be prevented is the instant it is
+    created, which is here.
+
+    So after the grow, the group's MINIMUM backing is reduced and every rank
+    caps its allocator to it. That is an ID decision and nothing else: no
+    pages are released, no memory is committed, and a rank whose backing is
+    already higher simply stops handing out ids above the level its poorest
+    peer can map. It costs no real capacity for the reason the cap agreement
+    already states -- under pure PP every rank holds the SAME token rows, so
+    rows above the group minimum could never have been admitted against.
+
+    ``reduce_fn`` is the seam's element-wise MIN channel. Entered on the
+    tp->pp post-cutover hook, which every rank reaches exactly once per
+    tp->pp cutover -- the cutover itself is unanimous, so this is not a
+    conditional path. Without a channel (single-rank shapes) the levelling is
+    skipped, which is correct: one rank is level with itself.
     """
     relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
     if relief is None:
         return 0
     try:
-        return int(relief.recover())
+        grown = int(relief.recover())
     except Exception as e:
         logger.error(
             "%s KV backing recovery failed: %s. The pool is still capped, so "
@@ -1114,7 +1147,41 @@ def recover_kv_backing(scheduler: Any) -> int:
             LOG_PREFIX,
             e,
         )
-        return 0
+        grown = 0
+    if reduce_fn is None:
+        return grown
+    try:
+        backed = int(relief.backed_rows())
+        reduced = list(reduce_fn([backed, -backed]))
+        group_min = int(reduced[0])
+        group_max = -int(reduced[1])
+        if group_min > 0 and group_min < group_max:
+            moved = int(relief.level_recovery_to(group_min))
+            logger.warning(
+                "%s KV recovery levelled to the group: this rank backs %d "
+                "rows, the group's poorest backs %d, so the allocator is "
+                "capped at %d (%+d exposed rows). A rank that came back from "
+                "a phase with more backed rows than its peers would hand out "
+                "ids they cannot map, and neither the cap agreement nor the "
+                "seam's live-slot union can repair that afterwards -- the "
+                "peers' own live rows put the agreement's floor above the "
+                "poorest rank's ceiling. No pages are released here; this is "
+                "an id decision",
+                LOG_PREFIX,
+                backed,
+                group_min,
+                group_min,
+                moved,
+            )
+    except Exception as e:
+        logger.error(
+            "%s could not level the recovery to the group (%s). The ranks may "
+            "now expose different id spaces, which the seam's frame ballot "
+            "refuses -- a lost flip, never a half-flipped group",
+            LOG_PREFIX,
+            e,
+        )
+    return grown
 
 def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
     """#656 C22: ONE exposed row level for the whole group, every seam round.

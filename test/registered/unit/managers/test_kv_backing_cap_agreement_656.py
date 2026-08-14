@@ -551,5 +551,158 @@ class ItRidesTheExistingReductionAndAddsNoneTest(unittest.TestCase):
         )
 
 
+#: The 2026-08-14 boot, verbatim, so this file joins to its own log lines.
+BOOT_ROWS_E = 585390
+PP1_RECOVERED_E = 546236
+
+
+class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
+    """#656 C22-e: the grow is rank-local, the ID SPACE it produces may not be.
+
+    The measurement, 2026-08-14 on the rig, with the C22-d live-slot
+    agreement already in the tree::
+
+        05:40 PP2  proposal: current=585390 floor=585903 (max_live=585390)
+        05:40 PP1  proposal: current=546236 floor=546749 (max_live=546236)
+        05:44 all  FLIP ABANDONED ... the group's union reaches row 585390 and
+                   the poorest rank has only 546236 rows BACKED
+
+    ``recover`` is bounded by each rank's own distance from the corridor law,
+    so the corridor-bounded rank came back at 546236 while its peers went to
+    585390. From that instant the peers could hand out ids the poorest rank
+    cannot map -- and BOTH downstream repairs then correctly refuse: the cap
+    agreement because ``max_floor > capable``, the live-slot union because
+    framing a row above a rank's backing is a read of unmapped memory. Two
+    correct refusals and a flip that never happens again. The divergence has
+    to be prevented where it is created.
+    """
+
+    def _fleet(self):
+        """PP1 corridor-bound, peers rich -- the metal's shape."""
+        poor, _p, _c = _rank(
+            free_mib=1024 + (PP1_RECOVERED_E - 500_000),
+            backed=500_000,
+            rows=BOOT_ROWS_E,
+        )
+        rich = [
+            _rank(free_mib=1024 + 200_000, backed=500_000, rows=BOOT_ROWS_E)[0]
+            for _ in range(2)
+        ]
+        for r in [poor] + rich:
+            r._rows_at_boot = BOOT_ROWS_E
+        return [rich[0], poor, rich[1]]
+
+    def _recover_all(self, fleet):
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        for relief in fleet:
+            sched = type("S", (), {})()
+            setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, relief)
+            pfs.recover_kv_backing(sched)
+        return [r.backed_rows() for r in fleet]
+
+    def test_without_levelling_the_id_spaces_diverge_and_nothing_can_repair(self):
+        """The dead end, reproduced: both downstream repairs decline."""
+        fleet = self._fleet()
+        backed = self._recover_all(fleet)
+        self.assertLess(
+            backed[1],
+            backed[0],
+            "fixture: the corridor-bounded rank must come back lower",
+        )
+        # The peers' allocators now span ids the poorest rank cannot map.
+        self.assertGreater(max(r.exposed_rows() for r in fleet), backed[1])
+        # And once a peer's live set reaches up there, the cap agreement has
+        # no honest level left: its floor is above the poorest rank's ceiling.
+        fleet[0]._live_slots_fn = lambda: torch.tensor(
+            [backed[0]], dtype=torch.int64
+        )
+        self.assertIsNone(
+            _agree(fleet),
+            "collective_cap_target must DECLINE here -- if it returned a "
+            "level it would be withholding ids a peer's request is using, "
+            "which is the one thing it may never do",
+        )
+
+    def test_recover_kv_backing_reduces_the_backing_and_levels(self):
+        """The payload is [backed, -backed] and the group MIN decides."""
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        fleet = self._fleet()
+        backed = self._recover_all(fleet)
+        group_min = min(backed)
+        seen = []
+
+        levelled = []
+        for relief, own in zip(fleet, backed):
+            sched = type("S", (), {})()
+            setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, relief)
+
+            def reduce_fn(vals, _own=own):
+                seen.append(list(vals))
+                return [group_min, -max(backed)]
+
+            levelled.append(pfs.recover_kv_backing(sched, reduce_fn=reduce_fn))
+
+        self.assertEqual(
+            [v[0] for v in seen],
+            list(backed),
+            "each rank must propose the rows it has BACKED, not its cap and "
+            "not its reservation -- the ceiling that matters is what is "
+            "physically mapped",
+        )
+        self.assertEqual([v[1] for v in seen], [-b for b in backed])
+        self.assertEqual(
+            {r.exposed_rows() for r in fleet},
+            {group_min},
+            "every rank must expose the SAME id space after the levelling; "
+            "one rank above the group is the whole defect",
+        )
+
+    def test_a_levelled_peer_still_remembers_it_owes_itself_a_recovery(self):
+        """NOT a ratchet. ``reconcile_to`` clears ``_rows_at_boot`` when the
+        level reaches the ceiling it knows about, and a rank that recovered
+        fully has already cleared it -- so levelling such a rank down with
+        ``reconcile_to`` alone would cap it AND destroy the record that it is
+        owed a recovery, which ``recover`` needs (it returns 0 immediately on
+        a None). The level has to be able to rise again as soon as the
+        poorest rank can fund it."""
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        rich, pool, card = _rank(free_mib=1024 + 200_000, backed=500_000,
+                                 rows=BOOT_ROWS_E)
+        rich._rows_at_boot = BOOT_ROWS_E
+        sched = type("S", (), {})()
+        setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, rich)
+        pfs.recover_kv_backing(sched)
+        self.assertEqual(rich.backed_rows(), BOOT_ROWS_E, "fixture: full recovery")
+        self.assertIsNone(rich._rows_at_boot, "fixture: and the memory cleared")
+
+        rich.level_recovery_to(PP1_RECOVERED_E)
+        self.assertEqual(rich.exposed_rows(), PP1_RECOVERED_E)
+        self.assertIsNotNone(
+            rich._rows_at_boot,
+            "the levelled rank forgot its reservation, so recover() will "
+            "return 0 for the rest of the boot and the group level becomes a "
+            "ratchet -- the one outcome the standing rule forbids",
+        )
+        # And it climbs back when asked.
+        pfs.recover_kv_backing(sched)
+        self.assertEqual(rich.exposed_rows(), BOOT_ROWS_E)
+
+    def test_levelling_releases_no_pages_it_is_an_id_decision(self):
+        fleet = self._fleet()
+        backed = self._recover_all(fleet)
+        before = [r.backed_rows() for r in fleet]
+        for r in fleet:
+            r.level_recovery_to(min(backed))
+        self.assertEqual(
+            [r.backed_rows() for r in fleet],
+            before,
+            "levelling committed or released BACKING; it may only move ids, "
+            "or a seam that was affordable a moment ago is not any more",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
