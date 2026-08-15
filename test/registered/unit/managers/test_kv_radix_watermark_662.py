@@ -19,7 +19,6 @@ CPU-only; no pool, no CUDA, no allocator. The tree is a stub whose shape
 is the only thing under test.
 """
 
-import pytest
 
 from sglang.srt.managers.kv_radix_watermark import (
     evict_rows_above,
