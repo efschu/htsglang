@@ -7335,6 +7335,17 @@ class Scheduler(
                 # on the lane-local limiter, not a server arg -- the ceiling
                 # the pools were built for stays where it is.
                 "effective_max_running_requests",
+                # #665-F1: the measured decode-contention fraction the flip
+                # threshold is solved against. Runtime-settable for the same
+                # reason as dual_group_lane_pairing above -- it lets the
+                # one-sided and the measured threshold be compared from ONE
+                # boot, on the same memory vector, the same KV token vector
+                # and the same corridor, instead of carrying boot-to-boot
+                # variance into the comparison. It changes only how a
+                # threshold is COMPUTED; it moves no memory and reshapes no
+                # pool, which is why it is safe to move at runtime while the
+                # budgets around it are not.
+                "phase_policy_decode_contention",
             ]
         )
 
@@ -7383,6 +7394,31 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "phase_policy_decode_contention":
+                if self.phase_policy_state is None:
+                    logging.warning(
+                        "phase_policy_decode_contention requires the phase "
+                        "policy to be enabled (--phase-flip-policy auto)."
+                    )
+                    if_success = False
+                    break
+                try:
+                    frac = float(v)
+                except (TypeError, ValueError):
+                    logging.warning(
+                        f"phase_policy_decode_contention must be a number in "
+                        f"[0, 1], got {v!r}."
+                    )
+                    if_success = False
+                    break
+                if not 0.0 <= frac <= 1.0:
+                    logging.warning(
+                        f"phase_policy_decode_contention must be in [0, 1] -- "
+                        f"it is a FRACTION of decode throughput lost to a "
+                        f"co-resident TP prefill -- got {frac}."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -7415,6 +7451,28 @@ class Scheduler(
                     "Admission limit set to %d (ceiling %d).",
                     self.admission_limiter.current,
                     self.admission_limiter.ceiling,
+                )
+            # #665-F1: recompute the threshold, not a pool. Logged with the
+            # whole ladder because the failure this guards against is a TOP
+            # rung no prompt can reach, which is invisible if only one rung
+            # is printed.
+            if "phase_policy_decode_contention" in server_args_dict:
+                frac = float(remaining.pop("phase_policy_decode_contention"))
+                self.phase_policy_cfg = dataclasses.replace(
+                    self.phase_policy_cfg, decode_contention=frac
+                )
+                from sglang.srt.managers.phase_policy import (
+                    effective_flip_threshold,
+                )
+
+                logger.warning(
+                    "PHASE-POLICY decode contention set to %g; N ladder by "
+                    "decoding reqs now %s",
+                    frac,
+                    [
+                        effective_flip_threshold(self.phase_policy_cfg, b)
+                        for b in range(5)
+                    ],
                 )
             # Multi-group runtime (#274): lane job -- a command, not a server
             # arg. Only the rank carrying the addressed lane enqueues; every

@@ -235,6 +235,14 @@ ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
 # this -- and not a third mechanism bolted on here.
 DEFAULT_DECODE_CONTENTION = 0.0
 
+# Returned when the differential model proves no backlog can repay a flip --
+# reachable only with the fairness window disabled (pp_window_s <= 0), where
+# nothing bounds how long a carried decode waits. Deliberately a finite,
+# recognisable number rather than sys.maxsize: it is compared against pending
+# token counts, and a value that shows up in a log should read as "the policy
+# says never", not as arithmetic that overflowed.
+UNREACHABLE_FLIP_THRESHOLD = 1 << 40
+
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
 # Both thresholds above are LOAD-TRIGGERED, and that is not enough. Under
 # CONTINUOUS mixed arrivals -- which is exactly what a real agent backend
@@ -436,8 +444,10 @@ def _differential_flip_threshold(
     Both reduce to ``N0`` at ``B = 0``, as they must.
 
     THE BOUND IS DERIVED, NOT DECREED. At the measured ``sigma = 1`` the first
-    regime collapses to ``N0 x (1 + 2B) / (1 + B)``, whose supremum is exactly
-    ``2 x N0``: with decode stalled either way, even an infinitely busy server
+    regime collapses to ``N0 x (1 + 2B) / (1 + B)`` -- with ``N0`` the
+    UNROUNDED break-even ``C / (1/X - 1/P)``, since the solve uses the
+    measurements rather than the rounded integer ``flip_tokens`` -- whose
+    supremum is exactly ``2 x N0``: with decode stalled either way, even an infinitely busy server
     needs at most twice the break-even backlog, and the factor two is the
     round trip the decodes additionally pay. The threshold still RISES with
     the number of decodes stranded -- the surcharge keeps doing its job of
@@ -463,24 +473,49 @@ def _differential_flip_threshold(
         # No speedup to solve against; fall back to the seam break-even
         # rather than invent a threshold from an unusable ratio.
         return base
-    ratio = tp_tok_s / pp_tok_s
     b = float(running_bs)
     sigma = float(cfg.decode_contention)
-    gain = float(base) * (1.0 - ratio)
+    cost = cfg.flip_cost_s * (1.0 + 2.0 * b)
 
-    den_a = (1.0 + b * sigma) - (1.0 + b) * ratio
+    # Solved from C, X and P DIRECTLY rather than by substituting
+    # N0 = C / (1/X - 1/P) and cancelling. The substitution is only valid
+    # while `flip_tokens` is exactly the break-even of THESE three numbers,
+    # and it need not be: `config_from_env` derives the default N from the
+    # module constant DEFAULT_FLIP_COST_S while `flip_cost_s` itself is
+    # overridable, and an operator may pin `flip_tokens` outright. Deriving
+    # from the measurements makes the surcharge independent of that, and
+    # `base` survives only as the floor it should always have been.
+    den_a = (1.0 + b * sigma) / tp_tok_s - (1.0 + b) / pp_tok_s
+
+    if cfg.pp_window_s <= 0.0:
+        # NO WINDOW BOUND. The PP phase is not time-limited, so a carried
+        # decode waits out the whole prefill: the stall is 2C + N/P and
+        # regime A is the ONLY regime. Regime B must not be reached here --
+        # it models the decode charge SATURATING at W, and with W = 0 that
+        # reads as "stranding is free", the opposite of what an absent
+        # window means. Falling through to it produced a threshold that
+        # spiked toward the singularity at den_a -> 0+ and then dropped by
+        # half a million tokens once den_a went negative.
+        if den_a <= 0.0:
+            # No positive N satisfies the inequality: with this little
+            # contention and this many decodes, flipping does not repay at
+            # ANY backlog. That is a real answer, not a failure, and it is
+            # reached only when the operator has disabled the fairness
+            # window that would otherwise bound the stranding.
+            return UNREACHABLE_FLIP_THRESHOLD
+        return max(base, int(round(cost / den_a)))
+
     if den_a > 0.0:
-        n_a = gain * (1.0 + 2.0 * b) / den_a
-        # Only valid where the prefill actually fits inside one PP window.
-        if cfg.pp_window_s <= 0.0 or n_a <= cfg.pp_window_s * pp_tok_s:
+        n_a = cost / den_a
+        # Regime A holds only where the prefill fits inside one PP window.
+        if n_a <= cfg.pp_window_s * pp_tok_s:
             return max(base, int(round(n_a)))
 
     # Beyond the window the decode charge saturates at W, which makes this
     # denominator strictly positive (sigma >= 0 and ratio < 1), so the
     # threshold is always solvable and always finite.
-    den_b = (1.0 + b * sigma) - ratio
-    n_b = gain * ((1.0 + 2.0 * b) + b * cfg.pp_window_s / cfg.flip_cost_s) / den_b
-    return max(base, int(round(n_b)))
+    den_b = (1.0 + b * sigma) / tp_tok_s - 1.0 / pp_tok_s
+    return max(base, int(round((cost + b * cfg.pp_window_s) / den_b)))
 
 
 @dataclass(frozen=True)
@@ -571,6 +606,14 @@ class PhasePolicyConfig:
                 "the phase policy needs a positive flip threshold; set "
                 f"{ENV_FLIP_TOKENS} or supply a measured TP prefill "
                 f"throughput via {ENV_TP_TOK_S}"
+            )
+        if self.pp_window_s < 0.0:
+            # 0 means "no fairness window" and is a supported configuration;
+            # a NEGATIVE window is not a weaker version of that, it is a typo
+            # that would flow into the stranding charge as negative seconds.
+            raise PhasePolicyError(
+                f"{ENV_PP_WINDOW}={self.pp_window_s!r} is negative; use 0 to "
+                f"disable the fairness window, or a positive number of seconds"
             )
         if not 0.0 <= self.decode_contention <= 1.0:
             raise PhasePolicyError(
