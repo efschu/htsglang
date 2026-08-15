@@ -302,14 +302,34 @@ def test_a_funded_rank_is_still_never_cut_in_either_mode():
         assert allowed > BOOT_G_T, survivable
 
 
-def test_the_budget_helper_carries_the_survivability_through():
-    # Large enough that the SEAM is the binding term in both modes; with a
-    # smaller budget both answers clamp to the budget and the test would pass
-    # without exercising anything.
+def test_a_survivable_refusal_charges_the_pool_nothing():
+    """The headline of the second half: advisory, not a deduction.
+
+    A seam costs bytes for the length of a cutover. The pool it is subtracted
+    from lasts for the boot. On this rig the ADDITIVE arena tail alone is
+    854 MiB (rank1) and 1527 MiB (rank2), held free for the whole instance so
+    a ~2 s cutover can re-commit it. Where the refusal is survivable that is
+    the wrong trade, and the seam is funded at flip time from unoccupied KV
+    backing instead (#662-F4 is what made that funder able to pay).
+    """
+    # Large enough that the SEAM would be the binding term if it were charged.
     budget = 23 * (1 << 30)
-    fatal, _ = sr.seam_adjusted_budget_bytes(budget, CELL, _reserve(484 * MIB))
-    survivable, _ = sr.seam_adjusted_budget_bytes(
+    fatal, fatal_allowed = sr.seam_adjusted_budget_bytes(
+        budget, CELL, _reserve(484 * MIB)
+    )
+    survivable, advised = sr.seam_adjusted_budget_bytes(
         budget, CELL, _reserve(484 * MIB), abandon_is_survivable=True
     )
-    assert survivable > fatal, "the law-bounded cut must leave a larger budget"
-    assert survivable <= budget, "and must still never GROW the budget"
+    assert fatal < budget, "the fatal case must still pay with pool"
+    assert survivable == budget, "the survivable case must not be charged"
+    assert advised > 0, "and must still report what a flip would need"
+
+
+def test_the_advisory_still_reports_a_number_the_operator_can_act_on():
+    """Advisory is not silent: the solve is still run and still returned."""
+    _bytes, advised = sr.seam_adjusted_budget_bytes(
+        23 * (1 << 30), CELL, _reserve(484 * MIB), abandon_is_survivable=True
+    )
+    assert advised == sr.seam_allowed_tokens(
+        CELL, _reserve(484 * MIB), abandon_is_survivable=True
+    )

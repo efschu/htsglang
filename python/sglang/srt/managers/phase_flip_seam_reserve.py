@@ -692,12 +692,50 @@ def seam_adjusted_budget_bytes(
     Unchanged when there is nothing to charge -- a cold record, a disabled
     term, or a configurator with no single per-token cell -- so every
     non-flip boot and every first boot is byte-identical.
+
+    A PERMANENT CHARGE FOR A TRANSIENT NEED, when the refusal is survivable.
+    The seam's cost is real but it lasts for the duration of a cutover; the
+    pool this subtracts it from lasts for the boot. The measured record on
+    this rig makes the shape plain -- ``arena_fixed_bytes`` alone is 854 MiB
+    on rank1 and 1527 MiB on rank2, held free for the whole instance so that
+    a flip lasting ~2 s can re-commit the weights-arena tail.
+
+    Where a refused seam is FATAL that trade is still the right one and it is
+    made exactly as before. Where the other layout can do the work, it is not:
+    the correct place to find those bytes is AT THE SEAM, from the KV relief
+    rung, which returns unoccupied backing and takes it straight back after
+    the cutover. That funder is only now able to pay -- before #662-F4 it read
+    a configured row count as physical backing, proposed shrinks against pool
+    it did not have, and disqualified itself for the life of the process on
+    the first zero it produced.
+
+    So under a survivable refusal the reserve becomes ADVISORY: it reports
+    what a flip will need and charges the pool nothing. A flip that cannot be
+    funded at runtime abandons, which is free and unanimous; a pool shrunk at
+    boot is gone for the whole boot whether a flip is ever attempted or not.
     """
     if not reserve.active or int(cell_bytes) <= 0:
         return int(budget_bytes), 0
     allowed = seam_allowed_tokens(
         cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
     )
+    if abandon_is_survivable:
+        logger.warning(
+            "%s ADVISORY (a refused seam is survivable here): a flip needs "
+            "%.0f MiB fixed (%.0f arena tail + %.0f draft restore) plus "
+            "%.1f B/token at this rank. The KV pool is NOT charged for it -- "
+            "that is a boot-long cost for a cutover-long need, and the seam "
+            "is funded at flip time from unoccupied KV backing instead. The "
+            "solve says this rank could hold an id space of %d if the pool "
+            "did pay; it does not.",
+            LOG_PREFIX,
+            reserve.total_fixed_bytes / (1 << 20),
+            max(0, int(reserve.arena_fixed_bytes)) / (1 << 20),
+            max(0, int(reserve.fixed_bytes)) / (1 << 20),
+            reserve.per_row_bytes,
+            allowed,
+        )
+        return int(budget_bytes), allowed
     return min(int(budget_bytes), allowed * int(cell_bytes)), allowed
 
 
