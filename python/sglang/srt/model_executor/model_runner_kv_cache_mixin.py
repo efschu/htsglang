@@ -5644,9 +5644,40 @@ class ModelRunnerKVCacheMixin:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
         reserve = self._seam_reserve()
-        if not reserve.active:
-            return int(budget_bytes)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        # #662-F4 / A0: THE ARMING FLOOR IS CHARGED EVEN ON A COLD RECORD.
+        #
+        # ``reserve.active`` is False when every MEASURED field is zero, which
+        # is exactly a first boot -- and returning here is what sized
+        # boot_maxfill.log's rank 1 to ~875 MiB free against a 1536 MiB arming
+        # floor. Every prefill then stayed in the TP layout, in both
+        # directions, with no runtime recovery possible because the pool is
+        # fixed at boot; the operator had to hand-pin --max-total-tokens.
+        #
+        # A cold record means THE STAGING COST IS UNKNOWN. It does not mean the
+        # arming LEVEL is unknown: that one is derived from the corridor law
+        # the operator already stated, and is knowable on every rig at boot.
+        # So the two are charged separately from here on.
+        flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
+        arming_floor = seam.arming_floor_target_bytes() if flips_on else 0
+        floor_charge = seam.arming_floor_subtrahend_bytes(arming_floor)
+        if floor_charge:
+            logger.info(
+                "%s (rank %d): ARMING FLOOR %d MiB (corridor law + the flip's "
+                "entry reserve + load margin) must stay free for a flip to arm "
+                "at all, and the sizer already holds the %d MiB law free, so "
+                "the pool gives up the %d MiB difference. Charged on a COLD "
+                "record too: a first boot not knowing what a flip COSTS is not "
+                "the same as it not knowing what level the gate WANTS.",
+                seam.LOG_PREFIX,
+                self._seam_world_rank(),
+                arming_floor >> 20,
+                seam._corridor_law_bytes() >> 20,
+                floor_charge >> 20,
+            )
+        if not reserve.active:
+            return max(0, int(budget_bytes) - floor_charge)
 
         # Per-RANK per-token bytes, which is what the record's slope means.
         # A configurator with no single cell (hybrid SWA, MiniMax sparse)
@@ -5670,7 +5701,11 @@ class ModelRunnerKVCacheMixin:
         except Exception:
             survivable = False
         new_bytes, allowed = seam.seam_adjusted_budget_bytes(
-            budget_bytes, cell, reserve, abandon_is_survivable=survivable
+            budget_bytes,
+            cell,
+            reserve,
+            abandon_is_survivable=survivable,
+            arming_floor_bytes=arming_floor,
         )
         logger.info(
             "%s (rank %d): seam floor %d MiB + %.1f B/token, measured with "

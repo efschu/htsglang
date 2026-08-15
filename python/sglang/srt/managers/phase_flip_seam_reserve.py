@@ -249,7 +249,7 @@ def seam_margin_bytes(reserve: Optional["SeamReserve"] = None) -> int:
     different margin without a code change, and a test can set it per case.
     A malformed or negative value falls back to the default rather than
     disabling the margin -- the failure mode this exists to prevent is a
-    zero-margin pool, so an unparseable override must not produce one.
+    zero-margin pool, so an unparsable override must not produce one.
     """
     raw = os.environ.get(ENV_MARGIN_MIB)
     if raw is not None:
@@ -261,9 +261,84 @@ def seam_margin_bytes(reserve: Optional["SeamReserve"] = None) -> int:
             return mib << 20
         # Malformed or negative: fall through to the derived margin rather
         # than to zero. The failure mode this exists to prevent is a
-        # zero-margin pool, so an unparseable override must not produce one.
+        # zero-margin pool, so an unparsable override must not produce one.
     measured = 0 if reserve is None else max(0, int(reserve.corridor_shortfall_bytes))
     return (DEFAULT_MARGIN_MIB << 20) + measured
+
+
+#: #662-F4 / A0: how much free VRAM the ARMING FLOOR needs on top of the
+#: corridor law, as a load margin. The floor is a level the card must hold at
+#: the INSTANT an arm is considered, and a card that sits exactly on it arms
+#: only while nothing else moves. Same shape and same default as the seam
+#: measurement's error bar, for the same reason.
+ENV_ARMING_MARGIN_MIB = "SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB"
+DEFAULT_ARMING_MARGIN_MIB = 192
+
+
+def arming_floor_target_bytes() -> int:
+    """The free VRAM a rank must keep so a flip can ARM at all.
+
+    THIS IS THE TERM THE POOL SOLVE WAS MISSING, and its absence is a boot
+    that cannot flip in either direction no matter what happens at runtime.
+
+    Measured 2026-08-15 (boot_maxfill.log): with a COLD seam record the sizer
+    charged NO flip term at all -- ``SeamReserve.active`` is False when every
+    measured field is zero, so ``seam_adjusted_budget_bytes`` returned the
+    budget unchanged -- and filled the pool to the corridor law. Rank 1 came
+    up with ~875 MiB free against an arming floor of 1536 MiB, so ``tp_to_pp``
+    was refused on every arm, every prefill stayed in the TP layout, and
+    NOTHING AT RUNTIME COULD RECOVER IT: the pool is fixed at boot. The
+    operator had to hand-pin ``--max-total-tokens`` to work around it. That is
+    the planner failing to solve something it has every input for.
+
+    WHY IT IS SEPARATE FROM THE SEAM RESERVE, rather than a cold default for
+    it. They are different quantities measured at different instants. The seam
+    reserve is what a flip COSTS WHILE IT RUNS, is genuinely knowable only by
+    measurement, and legitimately reads zero on a first boot. The arming floor
+    is a LEVEL THE GATE COMPARES AGAINST, is derived from the corridor law the
+    operator already stated, and is knowable at boot on every rig. Folding the
+    second into the first would make a derived constant look like a
+    measurement -- the #584 ``derived_provenance`` defect, which this chain
+    has already paid for once.
+
+    So this term is charged on EVERY flip boot, cold or stored: a cold record
+    means the staging cost is unknown, never that the arming level is.
+    """
+    from sglang.srt.managers import corridor_guard as cg
+
+    floor = max(0, int(cg.arming_floor_mib())) << 20
+    return floor + _arming_margin_bytes()
+
+
+def _arming_margin_bytes() -> int:
+    """The load margin above the floor. Malformed overrides fall back to the
+    default rather than to zero, for the reason ``seam_margin_bytes`` gives:
+    the failure this exists to prevent is a pool with no margin at all."""
+    raw = os.environ.get(ENV_ARMING_MARGIN_MIB)
+    if raw is not None:
+        try:
+            mib = int(raw)
+        except (TypeError, ValueError):
+            mib = -1
+        if mib >= 0:
+            return mib << 20
+    return DEFAULT_ARMING_MARGIN_MIB << 20
+
+
+def arming_floor_subtrahend_bytes(arming_floor_bytes: int) -> int:
+    """KV bytes the pool must give up so the floor is actually free.
+
+    THE SIZER ALREADY HOLDS THE CORRIDOR LAW FREE, so charging the whole floor
+    would reserve the law twice and cost the pool a gigabyte it did not owe --
+    the same double-count ``required_free_bytes`` refuses with its ``max``.
+    What the pool owes is the DIFFERENCE: the per-rank free target becomes
+    ``max(law, arming floor + load margin)``, which is the user's stated rule.
+
+    Zero when the floor is already covered by the law, so a rig whose arming
+    floor sits below its corridor is sized exactly as before.
+    """
+    law = _corridor_law_bytes()
+    return max(0, int(arming_floor_bytes) - int(law))
 
 
 def record_path(server_args, world_rank: int) -> str:
@@ -686,19 +761,38 @@ def seam_adjusted_budget_bytes(
     reserve: "SeamReserve",
     *,
     abandon_is_survivable: bool = False,
+    arming_floor_bytes: int = 0,
 ) -> Tuple[int, int]:
     """(new_budget_bytes, allowed_tokens). Never GROWS the budget.
 
-    Unchanged when there is nothing to charge -- a cold record, a disabled
-    term, or a configurator with no single per-token cell -- so every
-    non-flip boot and every first boot is byte-identical.
+    TWO CHARGES, AND THEY ARE NOT THE SAME KIND OF THING.
+
+    * ``arming_floor_bytes`` is the LEVEL the gate compares against. It is
+      charged whenever it is given, INCLUDING on a cold record, because a
+      first boot not knowing what a flip costs is not the same as it not
+      knowing what level the gate wants. Passing 0 -- the default -- is
+      byte-identical to the previous behaviour, which is what every non-flip
+      boot gets.
+    * the seam RESERVE is what the flip costs while it runs, is knowable only
+      by measurement, and is legitimately absent on a first boot. Unchanged:
+      a cold record, a disabled term or a configurator with no single
+      per-token cell still charges nothing for it.
+
+    Charging the floor first is what makes the fix work at all. Before this,
+    a cold record returned the budget unchanged and the pool filled to the
+    corridor, leaving rank 1 at ~875 MiB against a 1536 MiB floor -- a boot
+    that could not arm a flip in either direction, unrecoverable at runtime
+    because the pool is fixed at boot.
     """
+    budget = max(
+        0, int(budget_bytes) - arming_floor_subtrahend_bytes(arming_floor_bytes)
+    )
     if not reserve.active or int(cell_bytes) <= 0:
-        return int(budget_bytes), 0
+        return budget, 0
     allowed = seam_allowed_tokens(
         cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
     )
-    return min(int(budget_bytes), allowed * int(cell_bytes)), allowed
+    return min(budget, allowed * int(cell_bytes)), allowed
 
 
 def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:

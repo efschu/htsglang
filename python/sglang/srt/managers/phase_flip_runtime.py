@@ -257,6 +257,39 @@ ENV_SEAM_ABANDON_CAP = "SGLANG_SEAM_ABANDON_CAP"
 DEFAULT_SEAM_ABANDON_BACKOFF_MAX = 16
 ENV_SEAM_ABANDON_BACKOFF_MAX = "SGLANG_SEAM_ABANDON_BACKOFF_MAX"
 
+#: #662-F4 / A0: may an arm SPILL for the arming floor before refusing for it?
+#:
+#: On by default, and a no-op whenever the card already holds the floor, which
+#: is every arm on a correctly sized instance -- the sizer charges the floor at
+#: boot. What this catches is the transient the sizer cannot: a co-tenant, a
+#: capture peak, a rank that drifted. Set to 0 to restore the plain refusal.
+ENV_PREARM_RELIEF = "SGLANG_PHASE_FLIP_PREARM_RELIEF"
+#: How many consecutive relief attempts one direction may spend before the
+#: shortfall is called persistent. BOUNDED BY A COUNT, not a clock: the ladder
+#: is synchronous, so a deadline would be measured across a call that cannot be
+#: interrupted anyway, and an unbounded loop spills the instance flat.
+DEFAULT_PREARM_RELIEF_ATTEMPTS = 3
+ENV_PREARM_RELIEF_ATTEMPTS = "SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS"
+
+
+def _prearm_relief_enabled() -> bool:
+    return os.environ.get(ENV_PREARM_RELIEF, "1") not in ("0", "false", "False")
+
+
+def _prearm_relief_attempts() -> int:
+    """A malformed or non-positive bound falls back to the default rather than
+    to zero: a zero bound would refuse every dip without ever asking the
+    ladder, which is the behaviour this term exists to replace."""
+    raw = os.environ.get(ENV_PREARM_RELIEF_ATTEMPTS)
+    if raw is None:
+        return DEFAULT_PREARM_RELIEF_ATTEMPTS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREARM_RELIEF_ATTEMPTS
+    return n if n > 0 else DEFAULT_PREARM_RELIEF_ATTEMPTS
+
+
 #: The guard a capped seam installs. ``arm`` already refuses on
 #: ``blocking_guards``, so appending here is what makes "stay in the current
 #: phase" a STATE rather than a hope -- and it surfaces in the status string.
@@ -2572,6 +2605,128 @@ class PhaseFlipRuntime:
         return self._pending
 
     # -- arming (replicated callers) -----------------------------------------
+    def _prearm_floor_relief(self, direction: str) -> Tuple[bool, str]:
+        """Free the ARMING FLOOR before arming, or refuse with the numbers.
+
+        "IT CAN ALWAYS BE SPILLED" IS TRUE BEFORE ARMING, AND ONLY BEFORE.
+        The sizer now charges the floor at boot, so a correctly planned
+        instance never reaches this. What reaches it is the transient: a
+        co-tenant, a capture peak, a rank that drifted. Refusing an arm for a
+        condition the host tier could fix in one call is the same mistake as
+        sizing without the floor -- it turns a recoverable dip into a phase
+        the instance cannot enter.
+
+        WHY HERE AND NOT AT THE SEAM GATE. The gate already spills, but it
+        runs after the arm is committed, at the last point before the
+        no-return region -- by then the group has agreed to a flip and the
+        staged fund must stay hard-resident, so anything freed underneath it
+        is the evictable-seam-fund mistake that produced the served-nothing
+        class in #656 boots E/G. This rung is strictly earlier: nothing is
+        armed, no rank has entered the seam, no collective has been reached,
+        and a refusal here is free. It is the same argument #485 makes for
+        declining at arm rather than inside ``_execute``.
+
+        RANK-LOCAL BY CONSTRUCTION, AND THAT IS SAFE. A rank that refuses
+        here simply does not arm, which the consensus round already handles:
+        arming is reduced across the group and a rank that did not arm holds
+        the flip back without anyone entering the seam. This adds no
+        collective and cannot desync one.
+
+        BOUNDED, because an unbounded relief loop is a hot loop that spills
+        the instance flat. Attempts are counted per direction and reset the
+        moment the floor is clear, so a rig that dips once pays one ladder.
+        """
+        if not _prearm_relief_enabled():
+            return True, ""
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:
+            return True, ""
+        try:
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                arming_floor_target_bytes,
+            )
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            guard = get_corridor_guard(scheduler)
+            if guard is None:
+                return True, ""
+            floor = int(arming_floor_target_bytes())
+            free = int(guard.free_bytes())
+        except Exception as e:  # pragma: no cover - defensive
+            # AN UNREADABLE INSTRUMENT MAY NOT BLOCK A FLIP. The floor is a
+            # precaution; failing to measure it is not evidence that it is
+            # short, and refusing here would turn a probe failure into a
+            # permanently stuck phase.
+            logger.warning(
+                "%s pre-arm floor could not be read (%s); arming proceeds",
+                LOG_PREFIX,
+                e,
+            )
+            return True, ""
+        if not hasattr(self, "_prearm_relief_attempts"):
+            self._prearm_relief_attempts = {PP_TO_TP: 0, TP_TO_PP: 0}
+        if free >= floor:
+            self._prearm_relief_attempts[direction] = 0
+            return True, ""
+        spent = int(self._prearm_relief_attempts.get(direction, 0))
+        bound = _prearm_relief_attempts()
+        if spent >= bound:
+            msg = (
+                f"phase flip {direction} refused: free {free >> 20} MiB is "
+                f"below the {floor >> 20} MiB arming floor, short by "
+                f"{(floor - free) >> 20} MiB, and {spent} bounded relief "
+                f"attempts did not recover it. The pool is sized with the "
+                f"floor charged, so a persistent shortfall here is a "
+                f"co-tenant or a leak, not a sizing error."
+            )
+            logger.warning("%s %s", LOG_PREFIX, msg)
+            return False, msg
+        self._prearm_relief_attempts[direction] = spent + 1
+        # ``ensure_headroom`` guarantees ``free_after - want >= law``, so the
+        # ask that lands the card ON the arming floor is the floor MINUS the
+        # law the guard already defends. Asking for the whole floor would
+        # spill a second corridor's worth for nothing.
+        want = max(0, floor - int(guard.law_floor_bytes))
+        try:
+            res = guard.ensure_headroom(
+                want, reason=f"pre-arm arming floor for {direction}"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "%s pre-arm relief raised (%s); arming proceeds on the "
+                "seam gate's own ladder",
+                LOG_PREFIX,
+                e,
+            )
+            return True, ""
+        reclaimed = int(getattr(res, "reclaimed", 0) or 0)
+        providers = tuple(getattr(res, "used_providers", ()) or ())
+        if getattr(res, "ok", False):
+            logger.info(
+                "%s pre-arm relief funded the %s arming floor: free %d -> "
+                "%d MiB against a %d MiB floor, %d MiB reclaimed from %s. "
+                "Spilled BEFORE the arm, so the staged fund stays resident "
+                "once the flip begins.",
+                LOG_PREFIX,
+                direction,
+                free >> 20,
+                int(getattr(res, "free_after", free)) >> 20,
+                floor >> 20,
+                reclaimed >> 20,
+                list(providers) or ["nothing"],
+            )
+            self._prearm_relief_attempts[direction] = 0
+            return True, ""
+        msg = (
+            f"phase flip {direction} refused: free {free >> 20} MiB is below "
+            f"the {floor >> 20} MiB arming floor, short by "
+            f"{(floor - free) >> 20} MiB. The relief ladder freed "
+            f"{reclaimed >> 20} MiB from {list(providers) or ['nothing']} and "
+            f"the floor is still not covered (attempt {spent + 1} of {bound})"
+        )
+        logger.warning("%s %s", LOG_PREFIX, msg)
+        return False, msg
+
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
         """Arm a flip. Replicated call; the consensus round commits it once
         every rank is armed AND ready. Returns (ok, msg)."""
@@ -2695,6 +2850,13 @@ class PhaseFlipRuntime:
                 direction,
                 source,
             )
+        # #662-F4 / A0: the floor is SPILLED FOR before it is refused for, and
+        # this is the last point at which relief is still free -- nothing is
+        # armed, no rank has entered the seam, and the staged fund does not
+        # exist yet to be pulled out from under.
+        floor_ok, floor_msg = self._prearm_floor_relief(direction)
+        if not floor_ok:
+            return False, floor_msg
         self._pending = direction
         # A fresh arm starts a fresh round sequence. The epoch already
         # distinguishes this arm from any earlier one, so the round
