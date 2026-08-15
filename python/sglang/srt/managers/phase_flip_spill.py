@@ -826,13 +826,23 @@ def install_draft_weight_carrier(
     # the mode STRING refuses any future mode that provides the same
     # guarantee by another route; `prefill_in_tp` forbids PP decode exactly
     # as strict does and was rejected purely for being spelled differently.
-    from sglang.srt.managers.phase_purity import parse_purity
+    from sglang.srt.managers.phase_purity import PhasePurityError, parse_purity
 
     purity = getattr(server_args, "phase_flip_purity", None)
-    if not parse_purity(purity).decode_forbidden_in_pp:
+    try:
+        guaranteed = parse_purity(purity).decode_forbidden_in_pp
+    except PhasePurityError:
+        # An unparseable mode is not a guarantee. Server-args validation is the
+        # place that reports WHY it is malformed; this guard must still fail in
+        # its OWN currency, because callers catch PhaseFlipSpillError -- letting
+        # a PhasePurityError through here changes the exception type a caller
+        # sees for the same refusal.
+        guaranteed = False
+    if not guaranteed:
         raise PhaseFlipSpillError(
             f"{LOG_PREFIX} spill depth >= {DEPTH_DRAFT_WEIGHTS} requires "
-            f"--phase-flip-purity strict, got {purity!r}. The draft weights "
+            f"a purity mode that forbids decode in PP (strict, "
+            f"prefill_in_tp, or threshold:0), got {purity!r}. The draft weights "
             f"are released for the whole PP phase, which is only sound "
             f"because strict purity forbids decode there. Under threshold "
             f"purity a PP-phase decode would touch unbacked virtual memory "
