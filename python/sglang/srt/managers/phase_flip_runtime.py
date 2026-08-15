@@ -1835,8 +1835,17 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             or 1
         )
         if design_tokens > 0:
+            base = max(1, -(-design_tokens // page))
+            # Named assumptions, not one oracle. "threshold" is the smallest
+            # backlog that will ask for a flip; the multiples bracket what the
+            # seam actually meets once the arm has travelled and the resident
+            # set is carried across with it.
             runtime.log_staging_projection(
-                n_slots=max(1, -(-design_tokens // page))
+                points=(
+                    ("threshold", base),
+                    ("threshold+resident x2", base * 2),
+                    ("threshold+resident x4", base * 4),
+                )
             )
     except Exception as exc:
         logger.warning("%s staging projection skipped: %r", LOG_PREFIX, exc)
@@ -4131,28 +4140,47 @@ class PhaseFlipRuntime:
         )
         return self._staging_bytes(tr, direction, src, dst, waves)
 
-    def log_staging_projection(self, n_slots: int, floor_mib: float = 819.0) -> None:
-        """Print the projected want per direction at a design-point live set.
+    def log_staging_projection(
+        self, points: Sequence[Tuple[str, int]], floor_mib: float = 819.0
+    ) -> None:
+        """Print the projected want per direction at NAMED live-set points.
 
-        Emitted at boot so a configuration change surfaces as a solved number
-        BEFORE anyone runs load against it.
+        A boot-time projection can only ever be a stated-assumption number,
+        never an oracle: the seam is priced against the live set it actually
+        meets, and at boot nobody knows what that will be. So every line names
+        the assumption it was evaluated under, and several are printed, because
+        the first version of this projected only at the ladder's arming
+        threshold and under-read the real want by a constant ~511 MiB -- the
+        flip ARMS at the threshold but EXECUTES against whatever has
+        accumulated plus the resident set. The number was right; the sentence
+        it silently implied was wrong.
+
+        Reading these: find the line whose assumption is closest to the load
+        you intend to run, and compare its "needs N MiB free" against the
+        corridor. A configuration whose seam cannot be paid for at the live set
+        you expect is visible here, at boot, instead of as a run of abandons on
+        a live instance.
         """
-        for direction in (TP_TO_PP, PP_TO_TP):
-            try:
-                want = self.project_staging_bytes(direction, n_slots) / (1 << 20)
-            except Exception as exc:  # a projection must never fail a boot
+        for label, n_slots in points:
+            for direction in (TP_TO_PP, PP_TO_TP):
+                try:
+                    want = self.project_staging_bytes(
+                        direction, n_slots
+                    ) / (1 << 20)
+                except Exception as exc:  # must never fail a boot
+                    logger.warning(
+                        "%s staging projection unavailable for %s @ %s: %r",
+                        LOG_PREFIX, direction, label, exc,
+                    )
+                    continue
                 logger.warning(
-                    "%s staging projection unavailable for %s: %r",
-                    LOG_PREFIX, direction, exc,
+                    "%s STAGING PROJECTION rank %s %s: want %.0f MiB "
+                    "projected @ %s = %d slots, + floor %.0f = needs %.0f MiB "
+                    "free. Evaluated from _staging_bytes against the plan, not "
+                    "fitted; valid for THIS stated live set only.",
+                    LOG_PREFIX, self._rank, direction, want, label, n_slots,
+                    floor_mib, want + floor_mib,
                 )
-                continue
-            logger.warning(
-                "%s STAGING PROJECTION rank %s %s: want %.0f MiB at a live set "
-                "of %d slots, + floor %.0f = needs %.0f MiB free. Evaluated "
-                "from _staging_bytes against the plan, not fitted.",
-                LOG_PREFIX, self._rank, direction, want, n_slots,
-                floor_mib, want + floor_mib,
-            )
 
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
         """Device bytes the move will hold at once, from the PLAN.
