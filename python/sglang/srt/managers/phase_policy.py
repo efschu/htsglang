@@ -219,6 +219,20 @@ ENV_PP_EXIT_TOKENS = "SGLANG_PHASE_POLICY_PP_EXIT_TOKENS"
 # self-attention scratch grows with the square of its width while the
 # per-token weights and KV terms are linear and land in `base`.
 #
+# PROVISIONAL, AND FALSIFIED AS A PREDICTOR (validation 2026-08-15, chunk 1024).
+# The held-out point predicted 1240 MiB; the runtime demanded 1690, 1995 and
+# 2398 MiB -- THREE different wants at ONE chunk width on ONE boot, which no
+# function of chunk width alone can produce. The three anchors came from three
+# boots at three different pool states, so this fit reads chunk width as the
+# cause of a variation that occupancy was driving too.
+#
+# It stays because the REPORTING is the durable half: a chunk-size change now
+# surfaces a number at boot instead of a run of abandons on a live instance.
+# It is a lower bound, under-predicting by 36-93 % at 1024, and it MUST NOT be
+# used as a funding decision until it carries a live-set term. Re-fit wants
+# occupancy as a second variable, from anchors taken on ONE boot at several
+# pool states.
+#
 # THE POINT IS THAT IT IS PRINTED AT BOOT. A chunk-size change is now a solved
 # number visible in the armed line before anyone runs load against it, instead
 # of a run of abandons discovered at 15:14 on a live instance.
