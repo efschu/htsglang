@@ -404,6 +404,19 @@ def _differential_flip_threshold(
     the number of decodes stranded -- the surcharge keeps doing its job of
     delaying a marginal flip -- it just can no longer diverge to a number no
     prompt can reach.
+
+    AND AT sigma = 1 THE RATIO CANCELS. ``(1-r)`` divides out of numerator and
+    denominator, so the whole threshold depends only on ``N0`` and ``B`` -- not
+    on the prefill ladder. That matters operationally: this rig re-ships
+    production on re-solved memory and KV vectors, and a calibration that
+    needed ``r`` re-measured after every such change would be stale the moment
+    it landed. sigma = 1 is not a fitted constant either; it is what
+    ``--disable-overlap-schedule`` structurally does -- a prefill batch and a
+    decode batch cannot occupy the same step, so decode STOPS. Measured 1.000
+    at running_bs 2 and 3, on both the loose and the law-fitted vector, with
+    A-vs-A noise floors of 0.4 % and 0.0 %. ``r`` is consulted only for a
+    partial sigma, where a deployment that really does interleave would need
+    its own ladder anyway.
     """
     tp_tok_s = float(cfg.tp_prefill_tok_s)
     pp_tok_s = float(cfg.pp_prefill_tok_s)
