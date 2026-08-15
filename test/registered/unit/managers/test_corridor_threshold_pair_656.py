@@ -71,8 +71,8 @@ class TestTheDeclaredPair(CustomTestCase):
     def test_the_band_is_the_law_plus_or_minus_a_fifth(self):
         floor, centre, ceiling = cg.corridor_band_mib()
         self.assertEqual(centre, cg.corridor_law_mib())
-        self.assertEqual(floor, int(centre - centre * cg.CORRIDOR_BAND_FRACTION))
-        self.assertEqual(ceiling, int(centre + centre * cg.CORRIDOR_BAND_FRACTION))
+        self.assertEqual(floor, round(centre - centre * cg.CORRIDOR_BAND_FRACTION))
+        self.assertEqual(ceiling, round(centre + centre * cg.CORRIDOR_BAND_FRACTION))
         self.assertLess(floor, centre)
         self.assertGreater(ceiling, centre)
         # The measured cutover transient on this rig sits inside it.

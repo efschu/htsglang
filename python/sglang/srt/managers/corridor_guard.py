@@ -218,7 +218,12 @@ CORRIDOR_BAND_FRACTION = 0.20
 def corridor_band_floor_mib() -> int:
     """Below this is a breach. The law minus its tolerance."""
     law = corridor_law_mib()
-    return int(law - law * CORRIDOR_BAND_FRACTION)
+    # ROUNDED, not truncated, so the two edges are symmetric about the centre
+    # and match the band as it was declared (819-1229 at the shipped law).
+    # Truncating both would put the ceiling at 1228 and quietly make the band
+    # asymmetric -- a MiB nobody chose, in the direction of refusing configs
+    # the operator allowed.
+    return int(round(law - law * CORRIDOR_BAND_FRACTION))
 
 
 def corridor_band_ceiling_mib() -> int:
@@ -228,7 +233,7 @@ def corridor_band_ceiling_mib() -> int:
     order to refuse a configuration that leaves gibibytes idle.
     """
     law = corridor_law_mib()
-    return int(law + law * CORRIDOR_BAND_FRACTION)
+    return int(round(law + law * CORRIDOR_BAND_FRACTION))
 
 
 def corridor_band_mib():
