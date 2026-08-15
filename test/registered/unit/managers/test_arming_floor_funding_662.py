@@ -158,6 +158,42 @@ class TheColdRecordIsTheBootThatNeedsTheFloorMostTest(unittest.TestCase):
                 (int(cg.arming_floor_mib()) << 20) + (192 << 20),
             )
 
+    def test_the_operators_override_RAISES_the_floor_the_pool_reserves_for(self):
+        """CAUGHT ON THIS RIG BEFORE THE PROOF BOOT, and it would have been
+        silent. The live instance sets SGLANG_CORRIDOR_FLOOR_MIB=1536 while the
+        derived floor is 1331. A sizer that reserved for the derived number
+        would leave every rank 205 MiB short of the floor its own gate arms at
+        -- a healthy-looking boot that simply never flips, which is the exact
+        defect this whole change exists for, reintroduced one level down.
+        """
+        with _Env(SGLANG_CORRIDOR_FLOOR_MIB="4096"):
+            self.assertEqual(sr.configured_arming_floor_mib(), 4096)
+            self.assertEqual(
+                sr.arming_floor_target_bytes(configured_mib=4096),
+                (4096 << 20) + sr._arming_margin_bytes(),
+            )
+
+    def test_the_floor_is_resolved_HIGHEST_WINS_like_the_guard(self):
+        """A floor below the real draw launders breaches as passed checks, so
+        a configured value may raise the derived one and may never lower it --
+        the guard's own rule, applied to the number the pool reserves."""
+        from sglang.srt.managers import corridor_guard as cg
+
+        derived = cg.arming_floor_mib()
+        low = sr.arming_floor_target_bytes(configured_mib=1)
+        self.assertEqual(low, (derived << 20) + sr._arming_margin_bytes())
+
+    def test_a_measured_seam_draw_raises_it_too(self):
+        """The gate arms at law + the MEASURED draw where one exists; the pool
+        must reserve for the same, or the two disagree by the draw."""
+        big = sr.arming_floor_target_bytes(measured_draw_mib=4096)
+        small = sr.arming_floor_target_bytes(measured_draw_mib=0)
+        self.assertGreater(big, small)
+
+    def test_a_malformed_override_is_not_a_floor_of_zero(self):
+        with _Env(SGLANG_CORRIDOR_FLOOR_MIB="wide open"):
+            self.assertEqual(sr.configured_arming_floor_mib(), 0)
+
     def test_a_malformed_margin_falls_back_to_the_default_not_to_zero(self):
         """The failure this exists to prevent is a pool with no margin, so an
         unparsable override must not produce one."""
@@ -205,6 +241,11 @@ class TheDefaultIsByteIdenticalTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+#: The floor the stub guard arms at, so the tests do not move when the rig's
+#: corridor law is retimed.
+FLOOR = 1523 * MIB
+
+
 class _Result:
     def __init__(self, ok, free_after, reclaimed, providers):
         self.ok = ok
@@ -220,6 +261,11 @@ class _Guard:
         self.free = free
         self.deliverable = deliverable
         self.law_floor_bytes = law
+        #: THE GATE'S OWN ARMING FLOOR. The relief reads this rather than
+        #: re-deriving it, so the stub carries it too -- a test that patched a
+        #: derivation instead would pass while the runtime spilled for a level
+        #: nothing enforces.
+        self.floor_bytes = FLOOR
         self.providers = providers
         self.asks = []
 
@@ -260,31 +306,12 @@ def _runtime():
     return r
 
 
-#: The floor the stub guard is judged against, so the tests do not move when
-#: the rig's corridor law is retimed.
-FLOOR = 1523 * MIB
-
-
-class _PatchedFloor:
-    def __init__(self, floor=FLOOR):
-        self.floor = floor
-
-    def __enter__(self):
-        self.old = sr.arming_floor_target_bytes
-        sr.arming_floor_target_bytes = lambda: self.floor
-        return self
-
-    def __exit__(self, *exc):
-        sr.arming_floor_target_bytes = self.old
-        return False
-
-
 class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
     def test_a_card_already_holding_the_floor_asks_the_ladder_for_nothing(self):
         """The common case on a correctly sized instance: a no-op."""
         r = _runtime()
         g = _Guard(free=FLOOR + 100 * MIB)
-        with _PatchedFloor(), _PatchedGuard(g):
+        with _PatchedGuard(g):
             ok, msg = r._prearm_floor_relief(TP_TO_PP)
         self.assertTrue(ok)
         self.assertEqual(msg, "")
@@ -294,7 +321,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         """The operator's first required shape: relief available -> flip goes."""
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=2 * GIB)
-        with _PatchedFloor(), _PatchedGuard(g):
+        with _PatchedGuard(g):
             ok, msg = r._prearm_floor_relief(TP_TO_PP)
         self.assertTrue(ok, msg)
         self.assertEqual(len(g.asks), 1, "the ladder was asked exactly once")
@@ -304,7 +331,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         nothing: ensure_headroom already guarantees free_after - want >= law."""
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=2 * GIB)
-        with _PatchedFloor(), _PatchedGuard(g):
+        with _PatchedGuard(g):
             r._prearm_floor_relief(TP_TO_PP)
         self.assertEqual(g.asks[0][0], FLOOR - g.law_floor_bytes)
 
@@ -313,7 +340,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         deliverable: how much was short, and what the ladder actually freed."""
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
-        with _PatchedFloor(), _PatchedGuard(g):
+        with _PatchedGuard(g):
             ok, msg = r._prearm_floor_relief(TP_TO_PP)
         self.assertFalse(ok)
         self.assertIn("900", msg)
@@ -326,7 +353,6 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
-            _PatchedFloor(),
             _PatchedGuard(g),
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="2"),
         ):
@@ -340,7 +366,6 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
-            _PatchedFloor(),
             _PatchedGuard(g),
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
         ):
@@ -354,7 +379,6 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
-            _PatchedFloor(),
             _PatchedGuard(g),
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
         ):
@@ -370,7 +394,6 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=2 * GIB)
         with (
-            _PatchedFloor(),
             _PatchedGuard(g),
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="0"),
         ):
@@ -392,11 +415,12 @@ class AnUnreadableInstrumentMayNotBlockAFlipTest(unittest.TestCase):
 
         class _Boom:
             law_floor_bytes = 1024 * MIB
+            floor_bytes = FLOOR
 
             def free_bytes(self):
                 raise RuntimeError("nvml is having a day")
 
-        with _PatchedFloor(), _PatchedGuard(_Boom()):
+        with _PatchedGuard(_Boom()):
             ok, _ = r._prearm_floor_relief(TP_TO_PP)
         self.assertTrue(ok)
 
@@ -407,7 +431,7 @@ class AnUnreadableInstrumentMayNotBlockAFlipTest(unittest.TestCase):
             def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
                 raise RuntimeError("the ladder fell over")
 
-        with _PatchedFloor(), _PatchedGuard(_BoomLadder(free=900 * MIB)):
+        with _PatchedGuard(_BoomLadder(free=900 * MIB)):
             ok, _ = r._prearm_floor_relief(TP_TO_PP)
         self.assertTrue(ok)
 
@@ -415,7 +439,6 @@ class AnUnreadableInstrumentMayNotBlockAFlipTest(unittest.TestCase):
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
-            _PatchedFloor(),
             _PatchedGuard(g),
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF="0"),
         ):

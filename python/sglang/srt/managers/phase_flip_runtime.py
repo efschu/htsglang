@@ -2642,15 +2642,18 @@ class PhaseFlipRuntime:
         if scheduler is None:
             return True, ""
         try:
-            from sglang.srt.managers.phase_flip_seam_reserve import (
-                arming_floor_target_bytes,
-            )
             from sglang.srt.managers.phase_flip_spill import get_corridor_guard
 
             guard = get_corridor_guard(scheduler)
             if guard is None:
                 return True, ""
-            floor = int(arming_floor_target_bytes())
+            # THE GUARD'S OWN FLOOR, NOT A SECOND DERIVATION OF IT. The gate
+            # arms against ``floor_bytes``; re-deriving the same number here
+            # would be two computations that must agree, which is how a rank
+            # ends up spilling for a level nothing enforces. The sizer targets
+            # this floor PLUS a load margin so the card starts above it; at
+            # runtime the floor itself is the thing to reach.
+            floor = int(guard.floor_bytes)
             free = int(guard.free_bytes())
         except Exception as e:  # pragma: no cover - defensive
             # AN UNREADABLE INSTRUMENT MAY NOT BLOCK A FLIP. The floor is a
@@ -4334,13 +4337,14 @@ class PhaseFlipRuntime:
         for label, n_slots in points:
             for direction in (TP_TO_PP, PP_TO_TP):
                 try:
-                    want = self.project_staging_bytes(
-                        direction, n_slots
-                    ) / (1 << 20)
+                    want = self.project_staging_bytes(direction, n_slots) / (1 << 20)
                 except Exception as exc:  # must never fail a boot
                     logger.warning(
                         "%s staging projection unavailable for %s @ %s: %r",
-                        LOG_PREFIX, direction, label, exc,
+                        LOG_PREFIX,
+                        direction,
+                        label,
+                        exc,
                     )
                     continue
                 logger.warning(
@@ -4348,8 +4352,14 @@ class PhaseFlipRuntime:
                     "projected @ %s = %d slots, + floor %.0f = needs %.0f MiB "
                     "free. Evaluated from _staging_bytes against the plan, not "
                     "fitted; valid for THIS stated live set only.",
-                    LOG_PREFIX, self._rank, direction, want, label, n_slots,
-                    floor_mib, want + floor_mib,
+                    LOG_PREFIX,
+                    self._rank,
+                    direction,
+                    want,
+                    label,
+                    n_slots,
+                    floor_mib,
+                    want + floor_mib,
                 )
 
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:

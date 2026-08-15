@@ -275,8 +275,38 @@ ENV_ARMING_MARGIN_MIB = "SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB"
 DEFAULT_ARMING_MARGIN_MIB = 192
 
 
-def arming_floor_target_bytes() -> int:
+def configured_arming_floor_mib(server_args=None) -> int:
+    """The operator's arming-floor override, or 0.
+
+    READ FROM THE SAME TWO PLACES THE GUARD READS, in the same order, because
+    the whole point of this term is that the sizer reserves for the number the
+    gate will actually enforce. This rig sets ``SGLANG_CORRIDOR_FLOOR_MIB=1536``
+    while the derived value is 1331: a sizer that reserved for the derived one
+    would leave every rank 205 MiB short of the floor its own gate arms at, and
+    the resulting boot looks exactly like the defect this fix exists for.
+    """
+    from sglang.srt.managers.phase_flip_spill import CORRIDOR_FLOOR_ENV
+
+    raw = os.environ.get(CORRIDOR_FLOOR_ENV) or getattr(
+        server_args, "phase_flip_corridor_floor_mib", None
+    )
+    try:
+        return max(0, int(raw)) if raw else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def arming_floor_target_bytes(
+    configured_mib: int = 0, measured_draw_mib: int = 0
+) -> int:
     """The free VRAM a rank must keep so a flip can ARM at all.
+
+    RESOLVED EXACTLY AS ``get_corridor_guard`` RESOLVES IT -- ``max(configured,
+    derived-from-the-measured-draw)``, highest wins -- and not by a second
+    derivation that happens to agree today. Two numbers that must be equal and
+    are computed twice are the shape this corpus has already paid for more than
+    once; here the consequence would be silent, because a pool sized against a
+    lower floor produces a healthy-looking boot that simply never flips.
 
     THIS IS THE TERM THE POOL SOLVE WAS MISSING, and its absence is a boot
     that cannot flip in either direction no matter what happens at runtime.
@@ -306,8 +336,14 @@ def arming_floor_target_bytes() -> int:
     """
     from sglang.srt.managers import corridor_guard as cg
 
-    floor = max(0, int(cg.arming_floor_mib())) << 20
-    return floor + _arming_margin_bytes()
+    derived_mib = cg.arming_floor_mib(
+        seam_entry_reserve_mib=max(
+            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, max(0, int(measured_draw_mib or 0))
+        ),
+        law_mib=cg.corridor_law_mib(),
+    )
+    floor_mib = max(max(0, int(configured_mib or 0)), int(derived_mib))
+    return (floor_mib << 20) + _arming_margin_bytes()
 
 
 def _arming_margin_bytes() -> int:

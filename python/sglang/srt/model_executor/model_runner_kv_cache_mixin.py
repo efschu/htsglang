@@ -5660,7 +5660,22 @@ class ModelRunnerKVCacheMixin:
         # the operator already stated, and is knowable on every rig at boot.
         # So the two are charged separately from here on.
         flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
-        arming_floor = seam.arming_floor_target_bytes() if flips_on else 0
+        # The floor is resolved from the SAME two inputs the guard resolves it
+        # from -- the operator's override and this rank's measured seam draw --
+        # so the pool reserves for the number the gate will actually enforce.
+        # On this rig the override is 1536 MiB against a derived 1331: sizing
+        # for the derived one would leave every rank 205 MiB short of its own
+        # arming floor, which looks like a healthy boot that never flips.
+        arming_floor = (
+            seam.arming_floor_target_bytes(
+                configured_mib=seam.configured_arming_floor_mib(self.server_args),
+                measured_draw_mib=(
+                    int(reserve.total_fixed_bytes) >> 20 if reserve.active else 0
+                ),
+            )
+            if flips_on
+            else 0
+        )
         floor_charge = seam.arming_floor_subtrahend_bytes(arming_floor)
         if floor_charge:
             logger.info(
