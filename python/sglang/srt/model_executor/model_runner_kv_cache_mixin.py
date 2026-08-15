@@ -392,7 +392,9 @@ class ModelRunnerKVCacheMixin:
         total_gb = total_b / (1 << 30)
         return (total_gb, max(0.0, total_gb - device_free_gb - own_b / (1 << 30)))
 
-    def _nvml_process_reach_gb(self: ModelRunner) -> Optional[Tuple[float, float, float]]:
+    def _nvml_process_reach_gb(
+        self: ModelRunner,
+    ) -> Optional[Tuple[float, float, float]]:
         """``(held by THIS process, card free, card total)`` in GiB, or None.
 
         Read through the registry identity map, never by assuming the CUDA
@@ -1678,9 +1680,7 @@ class ModelRunnerKVCacheMixin:
         n_global = len(layers)
         if self.pp_size <= 1:
             return n_global, n_global
-        n_local = sum(
-            1 for lid in layers if self.start_layer <= lid < self.end_layer
-        )
+        n_local = sum(1 for lid in layers if self.start_layer <= lid < self.end_layer)
         return n_local, n_global
 
     def _stage_local_mamba_cache_per_req(self: ModelRunner, config) -> int:
@@ -5276,9 +5276,7 @@ class ModelRunnerKVCacheMixin:
                         solution.capacities,
                     )
                 return
-            capped = [
-                r for r in range(self.dcp_size) if q_by_rank[r] < p_by_rank[r]
-            ]
+            capped = [r for r in range(self.dcp_size) if q_by_rank[r] < p_by_rank[r]]
             c_active = _context_budget(active, solution.capacities)
             active_unit = min(
                 solution.capacities[r] // active[r] for r in range(self.dcp_size)
@@ -5655,8 +5653,24 @@ class ModelRunnerKVCacheMixin:
         # gets no invented one: abstaining is a smaller error than charging
         # a slope against a cell that does not exist.
         cell = int(getattr(configurator, "_cell_size", 0) or 0)
+        # WHAT A REFUSED SEAM COSTS decides whether the pool pays for the
+        # guarantee. Under strict purity a refused tp_to_pp means prefill
+        # never runs -- boot E held the corridor and served nothing -- so the
+        # pool must shrink until the seam is affordable. Where prefill may run
+        # in the TP layout the refusal costs one flip, and shrinking the pool
+        # below what the corridor law already pays for would hold VRAM free
+        # ABOVE the law for the life of the instance instead. Read from the
+        # purity mode, never configured on its own.
+        from sglang.srt.managers.phase_purity import purity_from_server_args
+
+        try:
+            survivable = bool(
+                purity_from_server_args(self.server_args).prefill_allowed_in_tp()
+            )
+        except Exception:
+            survivable = False
         new_bytes, allowed = seam.seam_adjusted_budget_bytes(
-            budget_bytes, cell, reserve
+            budget_bytes, cell, reserve, abandon_is_survivable=survivable
         )
         logger.info(
             "%s (rank %d): seam floor %d MiB + %.1f B/token, measured with "

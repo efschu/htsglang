@@ -230,3 +230,86 @@ def test_every_symbol_the_callers_import_exists():
     assert callable(m.measure_at_rest)
     assert callable(m.write_seam_reserve)
     assert callable(m.seam_allowed_tokens)
+
+
+# ---------------------------------------------------------------------------
+# #662: the reserve may SPEND slack above the corridor law, never MAKE it.
+#
+# The law has two halves -- "~1024 MiB free per card" AND "best-filled". A cut
+# taken below the measured position does not find memory; it converts KV pool
+# into free VRAM and holds it there for the life of the instance. Measured on
+# this rig 2026-08-15, one config, one boot pair:
+#
+#     t_m = 590000, have_m = 0 MiB spendable   ->  solved 486403
+#     at-rest free/card: 1139 / 1462 / 2279    ->  3153 / 4604 / 3977
+#
+# ~2 GiB per card, permanently, to guarantee a seam at an occupancy the
+# shrunken pool can no longer reach.
+#
+# Whether that trade is allowed is decided by WHAT A REFUSAL COSTS, which is a
+# consequence of the purity mode and not a knob of its own:
+#   * strict          -- a refused tp_to_pp means prefill never runs (boot E),
+#                        so the pool pays. Unchanged, and pinned above.
+#   * prefill_in_tp   -- the TP layout may do the prefill, so the refusal
+#                        costs one flip and the corridor law wins.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fatal_refusal_still_buys_the_guarantee_with_pool():
+    """The boot-E case, restated: when abandoning is fatal, the pool pays."""
+    need = 484 * MIB
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(need))
+    assert allowed == BOOT_G_T + (BOOT_G_HAVE - need) // CELL
+    assert allowed < BOOT_G_T
+
+
+def test_a_survivable_refusal_does_not_shrink_the_pool_below_the_law():
+    """The inversion. Same numbers, but the TP layout may do the prefill.
+
+    ``have_m`` is 8 MiB, i.e. 256 tokens' worth, so that much slack may be
+    spent and not one token more.
+    """
+    need = 484 * MIB
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(need), abandon_is_survivable=True)
+    spendable_tokens = BOOT_G_HAVE // CELL
+    assert allowed == BOOT_G_T - spendable_tokens
+    assert allowed > BOOT_G_T + (BOOT_G_HAVE - need) // CELL, (
+        "the survivable case must keep pool the fatal case gives away"
+    )
+
+
+def test_a_position_exactly_on_the_law_is_not_cut_at_all():
+    """The measured case from this rig: 0 MiB spendable above the law.
+
+    There is no slack to spend, so there is nothing to trade, and the id space
+    must not move. Before the fix this returned 486403 of 590000 and moved
+    every card ~2 GiB above the law.
+    """
+    allowed = sr.seam_allowed_tokens(
+        CELL, _reserve(484 * MIB, have=0), abandon_is_survivable=True
+    )
+    assert allowed == BOOT_G_T
+
+
+def test_a_funded_rank_is_still_never_cut_in_either_mode():
+    """A rank with room to spare keeps its pool whichever way refusal falls."""
+    for survivable in (False, True):
+        allowed = sr.seam_allowed_tokens(
+            CELL,
+            _reserve(455 * MIB, have=2000 * MIB),
+            abandon_is_survivable=survivable,
+        )
+        assert allowed > BOOT_G_T, survivable
+
+
+def test_the_budget_helper_carries_the_survivability_through():
+    # Large enough that the SEAM is the binding term in both modes; with a
+    # smaller budget both answers clamp to the budget and the test would pass
+    # without exercising anything.
+    budget = 23 * (1 << 30)
+    fatal, _ = sr.seam_adjusted_budget_bytes(budget, CELL, _reserve(484 * MIB))
+    survivable, _ = sr.seam_adjusted_budget_bytes(
+        budget, CELL, _reserve(484 * MIB), abandon_is_survivable=True
+    )
+    assert survivable > fatal, "the law-bounded cut must leave a larger budget"
+    assert survivable <= budget, "and must still never GROW the budget"

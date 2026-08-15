@@ -538,8 +538,22 @@ def corridor_relaxed_bytes(
     return int(budget_bytes) + int(headroom_bytes) - int(corridor_bytes)
 
 
-def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
+def seam_allowed_tokens(
+    cell_bytes: int,
+    reserve: "SeamReserve",
+    *,
+    abandon_is_survivable: bool = False,
+) -> int:
     """The largest id space whose seam this rank can still fund.
+
+    ``abandon_is_survivable`` says what a refused seam COSTS, and it is the
+    difference between paying for the guarantee with a smaller pool and
+    refusing to. Under strict purity a refused ``tp_to_pp`` means prefill
+    never runs (boot E held the corridor and served nothing), so the pool
+    pays. Where the other layout may do the work -- ``prefill_in_tp`` --
+    the refusal is a runtime abandon that costs one flip, and the corridor
+    law wins instead. Derived from the purity mode, never configured
+    separately: it is a consequence of the boot, not a preference.
 
     ANCHORED ON A MEASUREMENT, NOT ON A MODEL OF THE SIZER. The previous
     boot recorded, at a known id space ``T_m``, how many bytes were actually
@@ -585,14 +599,93 @@ def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
 
     t_floor = t_m + (have_m - A - F) // cell
     if a * max(0, t_floor) <= F:
-        return int(max(0, t_floor))
-    return int(max(0, (have_m + t_m * cell - A) // (cell + a)))
+        solved = int(max(0, t_floor))
+    else:
+        solved = int(max(0, (have_m + t_m * cell - A) // (cell + a)))
+    if not abandon_is_survivable:
+        # An abandoned seam is FATAL here, so the pool must pay for the
+        # guarantee. This is boot E's lesson and it is not being unlearned.
+        return solved
+    return _clamped_to_the_law(solved, t_m, have_m, cell)
+
+
+def _clamped_to_the_law(solved: int, t_m: int, have_m: int, cell: int) -> int:
+    """The reserve may SPEND slack above the corridor law. It may not MAKE it.
+
+    ``have(T) = have_m + (t_m - T) * cell`` is the whole reason this solver
+    can answer at all, and it says plainly where the bytes come from: every
+    token cut off the id space turns into free VRAM. So a solve that returns
+    ``T < t_m`` is not finding memory, it is MANUFACTURING free VRAM by
+    making the KV pool permanently smaller.
+
+    That is legitimate only while it is spending slack the instance already
+    had. Once ``have_m`` is exhausted -- i.e. once the measured position sits
+    ON the law -- any further cut pushes free VRAM ABOVE the law and holds it
+    there for the life of the instance.
+
+    THE CORRIDOR LAW HAS TWO HALVES AND THIS BROKE THE SECOND ONE. The law is
+    "~1024 MiB free per card, and best-filled": 2-3 GiB too much free is the
+    same defect as too little, because those bytes buy no tokens and serve no
+    request. Measured on this rig 2026-08-15, one boot, one config:
+
+        t_m = 590000, have_m = 0 MiB spendable  ->  solved 486403
+        at-rest free per card: 1139 / 1462 / 2279  ->  3153 / 4604 / 3977
+
+    The instance was ON the law and the reserve moved it ~2 GiB per card above
+    it, permanently, to guarantee a seam could be funded at an occupancy the
+    pool now could not even reach. The guarantee is not worth a pool: an
+    unfundable seam is a runtime ABANDON, which is free, unanimous and leaves
+    every request intact, while the bytes it was bought with are gone for the
+    whole boot.
+
+    So the cut stops at the measured position. When that is not enough to
+    fund the seam the caller is told, loudly, that flips may abandon at this
+    pool size -- which is a true statement about a serving instance, not a
+    reason to shrink one.
+    """
+    if solved >= t_m or t_m <= 0:
+        return solved
+    if have_m <= 0:
+        logger.warning(
+            "%s the seam wants a SMALLER POOL than the corridor law already "
+            "pays for: solved %d tokens against a measured position of %d, "
+            "with 0 MiB spendable above the law. Cutting there would hold "
+            "roughly %.0f MiB per card free ABOVE the law for the life of "
+            "the instance, and free VRAM above the law buys no tokens. The "
+            "id space STAYS at %d. A seam that cannot be funded at this size "
+            "abandons at runtime -- free, unanimous, every request intact.",
+            LOG_PREFIX,
+            solved,
+            t_m,
+            (t_m - solved) * cell / (1 << 20),
+            t_m,
+        )
+        return int(t_m)
+    # Slack above the law exists: spend it, and no more than it.
+    spendable_tokens = int(have_m // cell)
+    floor_at_law = max(0, t_m - spendable_tokens)
+    if solved >= floor_at_law:
+        return solved
+    logger.warning(
+        "%s the seam's cut is bounded by the corridor law: solved %d tokens, "
+        "but only %d MiB sits above the law, which is %d tokens' worth. The "
+        "id space stops at %d instead. Cutting further would manufacture free "
+        "VRAM above the law rather than spend slack the instance had.",
+        LOG_PREFIX,
+        solved,
+        have_m // (1 << 20),
+        spendable_tokens,
+        floor_at_law,
+    )
+    return int(floor_at_law)
 
 
 def seam_adjusted_budget_bytes(
     budget_bytes: int,
     cell_bytes: int,
     reserve: "SeamReserve",
+    *,
+    abandon_is_survivable: bool = False,
 ) -> Tuple[int, int]:
     """(new_budget_bytes, allowed_tokens). Never GROWS the budget.
 
@@ -602,7 +695,9 @@ def seam_adjusted_budget_bytes(
     """
     if not reserve.active or int(cell_bytes) <= 0:
         return int(budget_bytes), 0
-    allowed = seam_allowed_tokens(cell_bytes, reserve)
+    allowed = seam_allowed_tokens(
+        cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
+    )
     return min(int(budget_bytes), allowed * int(cell_bytes)), allowed
 
 
