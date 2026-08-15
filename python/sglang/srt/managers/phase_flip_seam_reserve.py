@@ -831,6 +831,27 @@ def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
     return arena_fixed, fixed, per_row, "; ".join(parts)
 
 
+def _band_floor_bytes(law_bytes: int) -> int:
+    """The band floor in bytes, from the one declaration of the tolerance.
+
+    Falls back to the law itself if the band cannot be read: reserving the
+    centre sizes a smaller pool, which costs tokens, while reserving less than
+    the floor would size a pool whose seam breaches. The fallback goes the
+    costly-but-lawful way.
+    """
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+        # ROUNDED IN MiB, then converted -- the runtime staging reserve does
+        # the same, and the two must be the SAME number rather than two
+        # roundings of one intention that differ by a fifth of a MiB.
+        mib = 1 << 20
+        floor_mib = int(round((int(law_bytes) / mib) * (1.0 - CORRIDOR_BAND_FRACTION)))
+        return max(0, floor_mib) * mib
+    except Exception:  # pragma: no cover - sizing must never fail on this
+        return int(law_bytes)
+
+
 def _rung_fundable_for_seam(scheduler, arena_fixed: int, fixed: int) -> int:
     """Bytes the KV rung can put toward the seam, bounded by the FIXED floor.
 
@@ -936,7 +957,27 @@ def measure_and_record(scheduler, runtime) -> None:
     # enough VRAM sat idle to cover the seam -- the ~12.7 GiB this ticket
     # exists to remove. See _rung_fundable_for_seam for what it may cover and
     # why that bound is the fixed floor and not a token more.
-    have = max(0, free_bytes - law) + rung_fund
+    # #662 JOINT CONSTRAINT: the seam's demand is a term in the POOL SOLVE,
+    # not something the flip discovers at runtime.
+    #
+    # Sizing reserved the law CENTRE here while the runtime seam reserves the
+    # band FLOOR, and the two disagreeing is what let a pool gain eat the
+    # seam. Causally, on this rig: deriving the arming floor from the band
+    # recovered ~205 MiB/rank, that went into pool, device 0's under-load free
+    # fell from ~2.5 GiB to ~1.9-2.0 GiB, and the seam's 1059 MiB staging then
+    # missed by 59 MiB and latched "unfundable". The earlier boot flipped
+    # BECAUSE its pool was smaller -- pool-fill and seam fundability were being
+    # maximised as separate criteria and collided.
+    #
+    # Subtracting the BAND FLOOR makes the solve reserve exactly
+    # ``band_floor + seam_draw``: at the solved id space the resting free
+    # column is the floor plus what a cutover draws, so the seam can always be
+    # staged and the dip bottoms out at the floor -- which is lawful, because
+    # the verdict is the continuous minimum against the floor. It is the same
+    # number the runtime staging reserve now uses, so sizing and the gate can
+    # no longer disagree, and every future pool gain is taken from what is
+    # left AFTER the seam's demand rather than out of it.
+    have = max(0, free_bytes - _band_floor_bytes(law)) + rung_fund
     id_space = max(0, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
     path = write_seam_reserve(
         scheduler.server_args,

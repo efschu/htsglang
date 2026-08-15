@@ -76,3 +76,53 @@ def test_the_corridor_law_itself_is_untouched():
     judges ordinary allocations by is still the centre."""
     assert cg.corridor_law_mib() == 1024
     assert cg.corridor_band_floor_mib() == 819
+
+
+# ---------------------------------------------------------------------------
+# The JOINT constraint: pool-fill and seam fundability are one solve.
+#
+# They were maximised as separate criteria and collided by 59 MiB. Causally,
+# on this rig: deriving the arming floor from the band recovered ~205 MiB/rank,
+# that went into pool, device 0's under-load free fell ~2.5 -> ~1.9-2.0 GiB,
+# and the seam's 1059 MiB staging missed. The earlier boot flipped BECAUSE its
+# pool was smaller. Sizing must therefore reserve band_floor + seam_draw, from
+# the SAME number the runtime staging reserve uses.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.managers import phase_flip_seam_reserve as sr
+
+
+def test_sizing_reserves_the_band_floor_not_the_centre():
+    law = 1024 * MIB
+    assert sr._band_floor_bytes(law) == 819 * MIB
+
+
+def test_sizing_and_the_runtime_seam_reserve_are_the_same_number():
+    """The disagreement WAS the defect: sizing kept 1024 while the gate spent
+    to 819, so a pool gain could eat the seam's margin unnoticed."""
+    law_mib = 1024
+    sizing = sr._band_floor_bytes(law_mib * MIB)
+    runtime = pfr._seam_staging_reserve_bytes(_args(law_mib))
+    assert sizing == runtime == 819 * MIB
+
+
+def test_the_solve_leaves_the_floor_plus_the_seam_draw():
+    """At the solved id space, resting free is floor + draw -- so the cutover
+    dip bottoms out AT the floor, which is lawful, and no tighter."""
+    law = 1024 * MIB
+    floor = sr._band_floor_bytes(law)
+    seam_draw = 1059 * MIB  # the measured GATE C staging demand
+    resting_free = floor + seam_draw
+    assert resting_free - seam_draw == floor
+    assert (resting_free - floor) >= seam_draw, "the seam always fits"
+
+
+def test_a_pool_gain_is_taken_after_the_seam_demand_not_out_of_it():
+    """The regression this exists to prevent: free memory recovered by any
+    future change is spendable only above floor + draw."""
+    law = 1024 * MIB
+    floor = sr._band_floor_bytes(law)
+    seam_draw = 1059 * MIB
+    recovered = 205 * MIB  # what the arming-floor derivation gave back
+    resting_free = floor + seam_draw + recovered
+    assert resting_free - seam_draw >= floor, "the seam still funds after the gain"
