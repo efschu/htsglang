@@ -298,3 +298,74 @@ def test_a_measured_reading_is_the_strongest_provenance_this_rig_can_make():
     preds = ce.predictions_from_measurement({"gpu0": 1100}, detail="100 ms NVML free")
     assert preds[0].provenance is ce.Provenance.MEASURED
     assert preds[0].predicted_free_mib == 1100
+
+
+# ---------------------------------------------------------------------------
+# MEMBER 6 -- a number that LOOKS solved and is not.
+#
+# The phase policy's break-even ladder is derived from three measured knobs.
+# An operator set them, the derivation read the module CONSTANTS instead, and
+# the boot logged a ladder that looked solved: the measured 5.918 s seam
+# produced [7004, 19430, 21589, 22669, 23316] where the solve gives
+# [7878, 11817, 13130, 13786, 14180]. Rung 0 had not moved at all, because it
+# was still the constant's number.
+#
+# Nothing was wrong with the solver or the inputs. The number had a provenance
+# nobody checked -- which is this corpus's whole subject.
+# ---------------------------------------------------------------------------
+
+LADDER_FROM_DEFAULTS = [7004, 10506, 11674, 12257, 12608]
+LADDER_FROM_INPUTS = [7878, 11817, 13130, 13786, 14180]
+
+
+def test_member6_a_knob_that_never_reached_the_number_is_not_SOLVED():
+    """The bug as it shipped: knobs set, ladder still the constants'."""
+    prov = ce.derived_provenance(
+        inputs_supplied=True,
+        value_from_inputs=LADDER_FROM_DEFAULTS,  # what the boot logged
+        value_from_defaults=LADDER_FROM_DEFAULTS,
+    )
+    assert prov is ce.Provenance.DEFAULTED
+
+
+def test_member6_the_fixed_derivation_is_SOLVED():
+    prov = ce.derived_provenance(
+        inputs_supplied=True,
+        value_from_inputs=LADDER_FROM_INPUTS,
+        value_from_defaults=LADDER_FROM_DEFAULTS,
+    )
+    assert prov is ce.Provenance.SOLVED
+
+
+def test_member6_no_inputs_is_honestly_defaulted():
+    assert (
+        ce.derived_provenance(
+            inputs_supplied=False,
+            value_from_inputs=LADDER_FROM_DEFAULTS,
+            value_from_defaults=LADDER_FROM_DEFAULTS,
+        )
+        is ce.Provenance.DEFAULTED
+    )
+
+
+def test_member6_a_defaulted_ladder_cannot_certify_a_boot():
+    """Wired to the gate: a DEFAULTED input drags the verdict down, so a boot
+    cannot be certified on a number whose knobs never reached it."""
+    prov = ce.derived_provenance(
+        inputs_supplied=True,
+        value_from_inputs=LADDER_FROM_DEFAULTS,
+        value_from_defaults=LADDER_FROM_DEFAULTS,
+    )
+    assert ce.weakest([ce.Provenance.MEASURED, prov]) is ce.Provenance.DEFAULTED
+
+
+def test_member6_under_claiming_is_the_safe_direction():
+    """Inputs that happen to reproduce the default exactly report DEFAULTED.
+    A gate that refuses a correctly-configured boot is cheaper than one that
+    certifies a silently-unwired knob."""
+    assert (
+        ce.derived_provenance(
+            inputs_supplied=True, value_from_inputs=42, value_from_defaults=42
+        )
+        is ce.Provenance.DEFAULTED
+    )

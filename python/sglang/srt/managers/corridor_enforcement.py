@@ -289,6 +289,45 @@ def enforce(
 # -- the planner side -------------------------------------------------------
 
 
+def derived_provenance(
+    *,
+    inputs_supplied: bool,
+    value_from_inputs,
+    value_from_defaults,
+) -> Provenance:
+    """SOLVED only if the operator's inputs actually reached the number.
+
+    THE DEFECT THIS NAMES, measured 2026-08-15. The phase policy's break-even
+    ladder is derived from three measured knobs (seam cost, PP prefill rate,
+    TP prefill rate). An operator set them; the derivation read the module
+    CONSTANTS instead; and the boot logged a ladder that looked solved and was
+    not -- the measured 5.918 s seam produced ``[7004, 19430, ...]`` where the
+    solve gives ``[7878, 11817, ...]``, and rung 0 had not moved at all
+    because it was still the constant's number.
+
+    Nothing was wrong with the solver and nothing was wrong with the inputs.
+    The number simply had a provenance nobody checked, which is this corpus's
+    entire subject: a value that LOOKS derived is indistinguishable from one
+    that is, until someone compares it against what the defaults alone would
+    have produced.
+
+    So: inputs supplied and the value differs from the defaults-derived one ->
+    SOLVED. Inputs supplied and it does NOT differ -> DEFAULTED, because the
+    inputs demonstrably did not reach it. No inputs -> DEFAULTED, honestly.
+
+    The one false negative is deliberate: inputs that happen to reproduce the
+    default value exactly are reported DEFAULTED. That is the safe direction --
+    it under-claims provenance rather than over-claiming it, and a gate that
+    refuses a correctly-configured boot is cheaper than one that certifies a
+    silently-unwired knob.
+    """
+    if not inputs_supplied:
+        return Provenance.DEFAULTED
+    if value_from_inputs == value_from_defaults:
+        return Provenance.DEFAULTED
+    return Provenance.SOLVED
+
+
 def predict_from_planner(server_args, cards: Sequence[str]) -> List[CardPrediction]:
     """Ask the planner where each card will rest. Usually: it cannot say.
 
