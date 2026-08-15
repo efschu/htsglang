@@ -1828,6 +1828,42 @@ def _bytes_per_row(pool: Any) -> int:
     return int(total)
 
 
+def rung_can_pay(scheduler: Any) -> bool:
+    """Will this boot have a KV rung able to return bytes at the seam?
+
+    THE SAME DISQUALIFIERS :func:`kv_backing_provider` APPLIES, asked without
+    building anything. The seam reserve has to price the rung while sizing the
+    pool, and at that point the relief object does not exist yet -- it is
+    installed at the first corridor gate, which is later than both the pool
+    sizing and the seam measurement. Re-deriving the conditions there would be
+    a second source of truth for "can this rung pay", and the two would drift;
+    this is the one place they are written.
+
+    A predicate, never an amount. What the rung may cover is decided by the
+    caller and bounded there.
+    """
+    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "1") not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return False
+    get_kvcache = getattr(allocator, "get_kvcache", None)
+    pool = get_kvcache() if callable(get_kvcache) else None
+    if pool is None or not callable(getattr(pool, "runtime_set_backing_rows", None)):
+        return False
+    if not bool(getattr(pool, "supports_backing_spans", False)):
+        # A chunkless arena cannot return anything to the driver, so a pool
+        # sized as if it could would be sized on a promise nothing keeps.
+        return False
+    row_bytes, _buffers = row_geometry(pool)
+    return row_bytes > 0
+
+
 def kv_backing_provider(
     scheduler: Any,
     *,

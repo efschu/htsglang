@@ -842,45 +842,64 @@ def _rung_fundable_for_seam(scheduler, arena_fixed: int, fixed: int) -> int:
 
     Those two are one-shot commits at the cutover, which is exactly the moment
     the rung can release rows and exactly the moment it takes them back again;
-    on this rig they are also the dominant term (854 MiB and 1456 MiB of arena
+    on this rig they are also the dominant term (815 MiB and 1456 MiB of arena
     tail on the two 3080 ranks). The PER-ROW slack is deliberately NOT covered:
     it is held across the whole wave walk and it scales with the very pool this
     would be growing, which is the shape that runs away.
 
-    Returns 0 whenever the rung cannot answer -- no relief object, an
-    unreadable bound, a pool that cannot release. Zero reproduces the previous
-    sizing exactly, which is the direction a term that grows a pool must fail
-    in, and it is the can-fail arm: with the rung unable to pay, the reserve
-    must charge what it always charged.
-    """
-    from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+    ASKED AS A PREDICATE, NOT OF AN OBJECT, and that is an ordering fact rather
+    than a preference. The relief is installed at the first corridor gate,
+    which happens AFTER both the pool sizing and this measurement -- measured
+    on this rig, the MEASURED line is five lines above "KV backing relief is
+    available" in the same millisecond. Asking the scheduler for the object
+    here returns None every time, and a term that is silently zero is worse
+    than one that is absent. So the question asked is the one that can be
+    answered now: WILL there be a rung able to pay
+    (:func:`kv_backing_relief.rung_can_pay`, the same disqualifiers the
+    provider applies), and if so the fixed floor need not also be held in idle
+    VRAM.
 
-    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
-    if relief is None:
+    Returns 0 whenever no such rung will exist -- the env switch off, no
+    allocator, a chunkless arena, unreadable geometry. Zero reproduces the
+    previous sizing exactly, which is the direction a term that GROWS a pool
+    has to fail in, and it is the can-fail arm: with
+    ``SGLANG_KV_BACKING_RELIEF=0`` the reserve charges what it always charged.
+    """
+    from sglang.srt.managers.kv_backing_relief import rung_can_pay
+
+    ceiling = max(0, int(arena_fixed)) + max(0, int(fixed))
+    if ceiling <= 0:
         return 0
     try:
-        fundable = int(relief.fundable_bytes())
+        can_pay = bool(rung_can_pay(scheduler))
     except Exception as e:
         logger.warning(
-            "%s could not price what the KV rung can put toward the seam "
-            "(%s); sizing as if it can put nothing",
+            "%s could not decide whether a KV rung will be able to pay at the "
+            "seam (%s); sizing as if it cannot",
             LOG_PREFIX,
             e,
         )
         return 0
-    ceiling = max(0, int(arena_fixed)) + max(0, int(fixed))
-    granted = max(0, min(fundable, ceiling))
+    if not can_pay:
+        logger.info(
+            "%s no KV rung will be able to return bytes at the seam, so the "
+            "%.0f MiB fixed floor stays charged to the pool exactly as before",
+            LOG_PREFIX,
+            ceiling / (1 << 20),
+        )
+        return 0
     logger.info(
-        "%s the KV rung can return %.0f MiB at the seam and the seam's fixed "
-        "floor is %.0f MiB, so %.0f MiB of it is counted as spendable. The "
-        "per-row slack stays charged to the pool: it is held across the whole "
-        "wave walk and scales with the pool this term would grow.",
+        "%s a KV rung will be able to return backing at the seam, so the "
+        "%.0f MiB fixed floor (%.0f arena tail + %.0f draft restore) is "
+        "counted as spendable instead of held free. The per-row slack stays "
+        "charged: it is held across the whole wave walk and scales with the "
+        "pool this term would grow.",
         LOG_PREFIX,
-        fundable / (1 << 20),
         ceiling / (1 << 20),
-        granted / (1 << 20),
+        max(0, int(arena_fixed)) / (1 << 20),
+        max(0, int(fixed)) / (1 << 20),
     )
-    return granted
+    return ceiling
 
 
 def measure_and_record(scheduler, runtime) -> None:

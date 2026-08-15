@@ -330,6 +330,68 @@ def test_the_budget_helper_carries_the_survivability_through():
 # ---------------------------------------------------------------------------
 
 
+class _PayingSched:
+    """A scheduler whose allocator/pool satisfy the rung's preconditions."""
+
+    class _Pool:
+        supports_backing_spans = True
+
+        def runtime_set_backing_rows(self, rows):
+            return 0
+
+    class _Alloc:
+        def get_kvcache(self):
+            return _PayingSched._Pool()
+
+    def __init__(self):
+        self.token_to_kv_pool_allocator = _PayingSched._Alloc()
+
+
+def test_a_boot_that_will_have_a_paying_rung_need_not_hold_the_fixed_floor(
+    monkeypatch,
+):
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    arena, fixed = 1456 * MIB, 139 * MIB
+    granted = sr._rung_fundable_for_seam(_PayingSched(), arena, fixed)
+    assert granted == arena + fixed, "the whole fixed floor, and not a byte more"
+
+
+def test_the_env_switch_is_the_can_fail_arm(monkeypatch):
+    """With the rung off, the reserve must charge what it always charged."""
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    monkeypatch.setenv("SGLANG_KV_BACKING_RELIEF", "0")
+    assert sr._rung_fundable_for_seam(_PayingSched(), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_a_chunkless_arena_cannot_promise_anything(monkeypatch):
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    sched = _PayingSched()
+    sched.token_to_kv_pool_allocator.get_kvcache().__class__.supports_backing_spans = (
+        False
+    )
+    try:
+        assert sr._rung_fundable_for_seam(sched, 1456 * MIB, 139 * MIB) == 0
+    finally:
+        _PayingSched._Pool.supports_backing_spans = True
+
+
+def test_no_allocator_means_no_promise():
+    class _Bare:
+        pass
+
+    assert sr._rung_fundable_for_seam(_Bare(), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_a_zero_floor_grants_nothing():
+    assert sr._rung_fundable_for_seam(_PayingSched(), 0, 0) == 0
+
+
 class _Rung:
     def __init__(self, fundable):
         self._fundable = fundable
@@ -343,37 +405,6 @@ class _Rung:
 class _Sched:
     def __init__(self, rung):
         setattr(self, "phase_flip_kv_backing_relief", rung)
-
-
-def test_the_rung_may_cover_the_fixed_floor_and_not_a_byte_more():
-    arena, fixed = 1456 * MIB, 139 * MIB
-    sched = _Sched(_Rung(40 * (1 << 30)))  # rung offers 40 GiB at rest
-    granted = sr._rung_fundable_for_seam(sched, arena, fixed)
-    assert granted == arena + fixed, "bounded by the seam's own fixed floor"
-
-
-def test_a_rung_that_can_pay_little_grants_only_that():
-    arena, fixed = 1456 * MIB, 139 * MIB
-    granted = sr._rung_fundable_for_seam(_Sched(_Rung(200 * MIB)), arena, fixed)
-    assert granted == 200 * MIB
-
-
-def test_no_rung_means_the_previous_sizing_exactly():
-    """The can-fail arm. With nothing able to pay at the seam, the reserve
-    must charge what it always charged."""
-    assert sr._rung_fundable_for_seam(_Sched(None), 1456 * MIB, 139 * MIB) == 0
-
-
-def test_an_unreadable_rung_is_treated_as_unable_to_pay():
-    sched = _Sched(_Rung(RuntimeError("pool went away")))
-    assert sr._rung_fundable_for_seam(sched, 1456 * MIB, 139 * MIB) == 0
-
-
-def test_a_scheduler_without_the_attribute_is_not_an_error():
-    class _Bare:
-        pass
-
-    assert sr._rung_fundable_for_seam(_Bare(), 1456 * MIB, 139 * MIB) == 0
 
 
 def test_the_granted_fund_raises_the_allowed_id_space():
