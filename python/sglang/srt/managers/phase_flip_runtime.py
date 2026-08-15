@@ -1836,17 +1836,25 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         )
         if design_tokens > 0:
             base = max(1, -(-design_tokens // page))
-            # Named assumptions, not one oracle. "threshold" is the smallest
-            # backlog that will ask for a flip; the multiples bracket what the
-            # seam actually meets once the arm has travelled and the resident
-            # set is carried across with it.
-            runtime.log_staging_projection(
-                points=(
-                    ("threshold", base),
-                    ("threshold+resident x2", base * 2),
-                    ("threshold+resident x4", base * 4),
-                )
-            )
+            # THE LIVE SET IS THE RESIDENT POOL, NOT THE PENDING BACKLOG.
+            # Projecting at the arming threshold under-read a real flip by a
+            # constant ~511 MiB, and multiplying the threshold barely moved it
+            # (+93 MiB for 4x the slots). Solving the slope put the real live
+            # set near 200k slots -- i.e. the OCCUPIED POOL, which is what the
+            # seam carries across, not the backlog that triggered it.
+            #
+            # So the named points are pool occupancies, which is both the
+            # honest assumption and the one an operator can match to intended
+            # load. The threshold point is kept as the floor of the range.
+            pool = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+            pool_slots = max(0, -(-pool // page))
+            points = [("threshold", base)]
+            for frac in (0.50, 0.75, 0.90):
+                if pool_slots > 0:
+                    points.append(
+                        (f"pool @ {int(frac * 100)}%", int(pool_slots * frac))
+                    )
+            runtime.log_staging_projection(points=tuple(points))
     except Exception as exc:
         logger.warning("%s staging projection skipped: %r", LOG_PREFIX, exc)
     return runtime
