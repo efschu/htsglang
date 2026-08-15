@@ -797,3 +797,257 @@ class TheDrawIsOneLegTest(unittest.TestCase):
                 self.assertEqual(json.load(fh)["worst_leg_fixed_bytes"], 1456 * MIB)
             back = sr.read_seam_reserve(args, 2)
             self.assertEqual(back.arming_draw_bytes() >> 20, 1456)
+
+
+class TheFloorIsSOLVEDNotApproximatedTest(unittest.TestCase):
+    """#678 remainder: the constraint is an equality, so solve it.
+
+    THE SUBTRAHEND COULD NOT STATE THE CONSTRAINT. What the pool gives up and
+    what the card ends up holding free are related by the sizer's other posts,
+    and the gap between them is where both failures of this ticket lived:
+
+        284181 tokens  the subtrahend double-charged a floor the seam solve
+                       had already reserved
+        537076 tokens  the double charge removed, and two of three ranks came
+                       up BELOW their floor -- 987 MiB against 1536, the
+                       pre-arm ladder finding 46 MiB of a 650 MiB gap
+
+    Both are the same error in opposite directions: a quantity that must be
+    SOLVED FOR was being adjusted TOWARDS.
+
+    THE FIXTURES ARE THE TWO BRACKET BOOTS, and the rank-to-card pairing below
+    is evidenced rather than assumed. rank 0 carries the 31800 MiB budget, which
+    only the 5090 can hold. Of the two 3080s, only one pairing is consistent
+    with what was measured -- 482490 flipped both ways under load, so at that
+    pool every rank MUST have been at or above its floor, and the alternative
+    pairing puts a card 300 MiB under. The verdicts below are what that
+    consistency argument is built on.
+    """
+
+    #: The two bracket boots, in tokens.
+    T_LOW = 482490  # flipped both ways under load; every rank above its floor
+    T_HIGH = 537076  # cleared the >=495000 bar; two ranks BELOW their floor
+    D_T = T_HIGH - T_LOW
+
+    #: Resting free at each pool, MiB, per rank, and the arming-floor target
+    #: (gate floor + load margin) each rank was sized against on the second
+    #: boot. Taken from boot_678_validate.log / boot_678_final.log.
+    RANKS = {
+        0: {"free_low": 3056, "free_high": 2286, "target": 1728},
+        1: {"free_low": 2167, "free_high": 987, "target": 1825},
+        2: {"free_low": 3233, "free_high": 1475, "target": 2467},
+    }
+
+    def _reserve_for(self, rank):
+        """A record anchored at the LOW boot, with that rank's measured slope."""
+        r = self.RANKS[rank]
+        cell = ((r["free_low"] - r["free_high"]) * MIB) // self.D_T
+        return (
+            sr.SeamReserve(
+                fixed_bytes=139 * MIB,
+                arena_fixed_bytes=1456 * MIB,
+                worst_leg_fixed_bytes=1456 * MIB,
+                per_row_bytes=1.0,
+                have_bytes=8 * GIB,  # deliberately non-binding here
+                id_space=self.T_LOW,
+                free_at_measure_bytes=r["free_low"] * MIB,
+                provenance=sr.PROVENANCE_STORED,
+            ),
+            cell,
+            r["target"] * MIB,
+        )
+
+    def test_the_LOW_bracket_is_accepted_on_every_rank(self):
+        """482490 flipped both ways on metal, so the solve must permit it."""
+        for rank in self.RANKS:
+            with self.subTest(rank=rank):
+                reserve, cell, target = self._reserve_for(rank)
+                allowed = sr.floor_allowed_tokens(cell, reserve, target)
+                self.assertIsNotNone(allowed)
+                self.assertGreaterEqual(
+                    allowed,
+                    self.T_LOW,
+                    "the pool that demonstrably flips must not be refused",
+                )
+
+    def test_the_HIGH_bracket_is_REJECTED_by_the_floor_guarantee(self):
+        """537076 cleared the token bar and could not hold the floors. The
+        whole point of the guarantee is that it says so."""
+        offenders = []
+        for rank in self.RANKS:
+            reserve, cell, target = self._reserve_for(rank)
+            if sr.floor_allowed_tokens(cell, reserve, target) < self.T_HIGH:
+                offenders.append(rank)
+        self.assertEqual(
+            sorted(offenders),
+            [1, 2],
+            "exactly the two ranks measured below their floor must reject it",
+        )
+
+    def test_the_solved_pool_clears_the_operators_bar(self):
+        """THE NUMBER THIS CHANGE EXISTS TO PRODUCE.
+
+        The pool is the smallest id space any rank permits. The bar is 495000,
+        i.e. within 10% of the 550000 the hand-pin encodes.
+        """
+        per_rank = {}
+        for rank in self.RANKS:
+            reserve, cell, target = self._reserve_for(rank)
+            per_rank[rank] = sr.floor_allowed_tokens(cell, reserve, target)
+        pool = min(per_rank.values())
+        self.assertGreaterEqual(
+            pool,
+            495000,
+            f"solved per-rank ceilings {per_rank} -> pool {pool}, which must "
+            f"clear the 495000 bar the subtrahend could not reach",
+        )
+        self.assertLess(
+            pool,
+            self.T_HIGH,
+            "and it must stay under the bracket that could not hold the floor",
+        )
+
+    def test_the_binding_rank_is_the_one_with_the_least_headroom(self):
+        per_rank = {}
+        for rank in self.RANKS:
+            reserve, cell, target = self._reserve_for(rank)
+            per_rank[rank] = sr.floor_allowed_tokens(cell, reserve, target)
+        self.assertEqual(min(per_rank, key=per_rank.get), 1)
+
+    def test_the_solve_is_an_EQUALITY_within_one_token(self):
+        """At the solved id space the card rests ON the target, not above it.
+        That is the difference between solving and approximating."""
+        for rank in self.RANKS:
+            with self.subTest(rank=rank):
+                reserve, cell, target = self._reserve_for(rank)
+                allowed = sr.floor_allowed_tokens(cell, reserve, target)
+                free_at = (
+                    reserve.free_at_measure_bytes + (reserve.id_space - allowed) * cell
+                )
+                self.assertGreaterEqual(free_at, target)
+                self.assertLess(free_at - target, cell, "not the LARGEST such T")
+
+    def test_a_bigger_floor_target_permits_fewer_tokens(self):
+        reserve, cell, target = self._reserve_for(1)
+        self.assertLess(
+            sr.floor_allowed_tokens(cell, reserve, target + 512 * MIB),
+            sr.floor_allowed_tokens(cell, reserve, target),
+        )
+
+
+class TheSolveDegradesToTheOldPathTest(unittest.TestCase):
+    """A record written before the free column was persisted must be sized
+    exactly as before -- absent means unknown, and unknown may not be treated
+    as an opportunity."""
+
+    def test_no_free_column_means_no_direct_solve(self):
+        old = sr.SeamReserve(
+            fixed_bytes=455 * MIB,
+            have_bytes=2000 * MIB,
+            id_space=400000,
+            provenance=sr.PROVENANCE_STORED,
+        )
+        self.assertEqual(old.free_at_measure_bytes, 0)
+        self.assertIsNone(sr.floor_allowed_tokens(4096, old, 2 * GIB))
+
+    def test_a_cold_record_has_no_direct_solve_either(self):
+        cold = sr.SeamReserve(provenance=sr.PROVENANCE_COLD)
+        self.assertIsNone(sr.floor_allowed_tokens(4096, cold, 2 * GIB))
+
+    def test_no_cell_means_no_direct_solve(self):
+        r = sr.SeamReserve(
+            fixed_bytes=455 * MIB,
+            have_bytes=2000 * MIB,
+            id_space=400000,
+            free_at_measure_bytes=3 * GIB,
+            provenance=sr.PROVENANCE_STORED,
+        )
+        self.assertIsNone(sr.floor_allowed_tokens(0, r, 2 * GIB))
+
+    def test_the_old_path_still_charges_when_it_must(self):
+        """The fallback keeps the subtrahend, so a pre-#678 record is neither
+        double-charged nor left unprotected."""
+        old = sr.SeamReserve(
+            fixed_bytes=455 * MIB,
+            have_bytes=2000 * MIB,
+            id_space=400000,
+            provenance=sr.PROVENANCE_STORED,
+        )
+        floor = sr.arming_floor_target_bytes()
+        with_floor, _ = sr.seam_adjusted_budget_bytes(
+            20 * GIB, 4096, old, arming_floor_bytes=floor
+        )
+        without, _ = sr.seam_adjusted_budget_bytes(20 * GIB, 4096, old)
+        self.assertLess(with_floor, without)
+
+    def test_both_constraints_bind_and_the_min_wins(self):
+        """The seam must be fundable AND the card must rest above its floor.
+        They bind on different ranks at different vectors, so neither is
+        subtracted from the other."""
+        r = sr.SeamReserve(
+            fixed_bytes=139 * MIB,
+            arena_fixed_bytes=1456 * MIB,
+            worst_leg_fixed_bytes=1456 * MIB,
+            per_row_bytes=1.0,
+            have_bytes=200 * MIB,  # a TIGHT seam solve
+            id_space=482490,
+            free_at_measure_bytes=8 * GIB,  # a generous floor solve
+            provenance=sr.PROVENANCE_STORED,
+        )
+        cell = 20000
+        seam_only = sr.seam_allowed_tokens(cell, r)
+        floor_only = sr.floor_allowed_tokens(cell, r, 1825 * MIB)
+        _, allowed = sr.seam_adjusted_budget_bytes(
+            40 * GIB, cell, r, arming_floor_bytes=1825 * MIB
+        )
+        self.assertEqual(allowed, min(seam_only, floor_only))
+        self.assertEqual(allowed, seam_only, "the seam binds in this fixture")
+
+    def test_the_FLOOR_binding_is_what_reaches_the_budget(self):
+        """THE CASE THE CHANGE EXISTS FOR, and the one a mutation caught
+        missing: with the seam solve generous and the floor tight, the pool
+        must be the FLOOR's ceiling. A min that quietly drops the floor term
+        passes every other test in this class, because they all happen to have
+        the seam binding -- which is exactly how a guarantee ends up wired to
+        nothing.
+        """
+        r = sr.SeamReserve(
+            fixed_bytes=139 * MIB,
+            arena_fixed_bytes=0,
+            worst_leg_fixed_bytes=139 * MIB,
+            per_row_bytes=1.0,
+            have_bytes=40 * GIB,  # a very generous seam solve
+            id_space=482490,
+            free_at_measure_bytes=2167 * MIB,  # rank 1's measured column
+            provenance=sr.PROVENANCE_STORED,
+        )
+        cell = 22667  # rank 1's measured slope
+        seam_only = sr.seam_allowed_tokens(cell, r)
+        floor_only = sr.floor_allowed_tokens(cell, r, 1825 * MIB)
+        self.assertLess(floor_only, seam_only, "the FLOOR must bind here")
+        _, allowed = sr.seam_adjusted_budget_bytes(
+            400 * GIB, cell, r, arming_floor_bytes=1825 * MIB
+        )
+        self.assertEqual(
+            allowed,
+            floor_only,
+            "the floor's ceiling must reach the budget, or the guarantee is "
+            "computed and discarded",
+        )
+
+    def test_the_budget_reflects_the_floor_ceiling_in_BYTES(self):
+        """And it must come out of the returned budget, not just the count."""
+        r = sr.SeamReserve(
+            fixed_bytes=139 * MIB,
+            worst_leg_fixed_bytes=139 * MIB,
+            per_row_bytes=1.0,
+            have_bytes=40 * GIB,
+            id_space=482490,
+            free_at_measure_bytes=2167 * MIB,
+            provenance=sr.PROVENANCE_STORED,
+        )
+        cell = 22667
+        new_bytes, allowed = sr.seam_adjusted_budget_bytes(
+            400 * GIB, cell, r, arming_floor_bytes=1825 * MIB
+        )
+        self.assertEqual(new_bytes, allowed * cell)

@@ -215,6 +215,25 @@ class SeamReserve:
     #: back to ``total_fixed_bytes`` there -- the previous arithmetic exactly,
     #: which is what makes an old record readable.
     worst_leg_fixed_bytes: int = 0
+    #: #678: the RESTING FREE COLUMN at the measured id space, in bytes, and
+    #: the rung credit that was folded into ``have_bytes`` beside it.
+    #:
+    #: ``have_bytes`` is already net of the band floor AND of what the KV rung
+    #: was judged able to pay (``free - band_floor + rung_fund``), so the raw
+    #: free column cannot be recovered from it. Without the raw number the
+    #: sizer can only APPROXIMATE the arming-floor constraint by subtracting
+    #: from the budget -- which is what #678 measured going wrong in both
+    #: directions: 284181 tokens when the subtrahend double-charged, 537076
+    #: when it was removed and two of three ranks came up below their floor.
+    #:
+    #: With it, the constraint is solved instead of approximated:
+    #: ``free(T) = free_at_measure + (id_space - T) * cell``, and the largest
+    #: T with ``free(T) >= floor + margin`` is an equality, not an estimate.
+    #:
+    #: ZERO on a record written before this field existed, and the sizer falls
+    #: back to the subtrahend there -- the previous arithmetic exactly.
+    free_at_measure_bytes: int = 0
+    rung_fund_bytes: int = 0
     provenance: str = PROVENANCE_COLD
     written_at: Optional[str] = None
     detail: str = ""
@@ -535,6 +554,8 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             # back to total_fixed_bytes -- the previous pricing exactly, which
             # is what keeps an old record readable rather than optimistic.
             worst_leg_fixed_bytes=int(rec.get("worst_leg_fixed_bytes", 0)),
+            free_at_measure_bytes=int(rec.get("free_at_measure_bytes", 0)),
+            rung_fund_bytes=int(rec.get("rung_fund_bytes", 0)),
             per_row_bytes=float(rec["per_row_bytes"]),
             have_bytes=int(rec.get("have_bytes", 0)),
             id_space=int(rec.get("id_space", 0)),
@@ -560,6 +581,8 @@ def write_seam_reserve(
     id_space: int = 0,
     arena_fixed_bytes: int = 0,
     worst_leg_fixed_bytes: int = 0,
+    free_at_measure_bytes: int = 0,
+    rung_fund_bytes: int = 0,
 ) -> Optional[str]:
     """Persist this boot's measurement for the next one. Never raises.
 
@@ -582,6 +605,8 @@ def write_seam_reserve(
         "fixed_bytes": int(fixed_bytes),
         "arena_fixed_bytes": int(arena_fixed_bytes),
         "worst_leg_fixed_bytes": int(worst_leg_fixed_bytes),
+        "free_at_measure_bytes": int(free_at_measure_bytes),
+        "rung_fund_bytes": int(rung_fund_bytes),
         "per_row_bytes": float(per_row_bytes),
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),
@@ -898,6 +923,59 @@ def _clamped_to_the_law(solved: int, t_m: int, have_m: int, cell: int) -> int:
     return int(floor_at_law)
 
 
+def floor_allowed_tokens(
+    cell_bytes: int, reserve: "SeamReserve", floor_target_bytes: int
+) -> Optional[int]:
+    """Largest id space whose RESTING FREE COLUMN still holds the arming floor.
+
+    #678, and it replaces an approximation with an equality. The constraint has
+    always been "every rank must rest at or above ``floor + margin``, or it can
+    never arm a flip and the pool is fixed at boot". Expressing it as a
+    SUBTRAHEND on the KV budget could not state that, because the budget is not
+    the free column: what the pool gives up and what the card ends up holding
+    free are related by the sizer's other posts, and the gap between them is
+    exactly where both failures of this ticket lived.
+
+        284181 tokens  the subtrahend double-charged, reserving a floor the
+                       seam solve had already reserved
+        537076 tokens  the double charge removed, and two of three ranks came
+                       up BELOW their floor -- 987 MiB against 1536, with the
+                       pre-arm ladder finding 46 MiB of a 650 MiB gap
+
+    Both are the same error in opposite directions: a quantity that must be
+    solved for was being adjusted towards.
+
+    THE SOLVE. The record now carries the resting free column at the measured
+    id space, so free moves along the pool axis exactly as ``have`` does::
+
+        free(T) = free_at_measure + (id_space - T) * cell
+
+    and the answer is the largest T with ``free(T) >= floor + margin``::
+
+        T <= id_space + (free_at_measure - floor - margin) / cell
+
+    One line, exact, and it needs no model of the activation reserve, the
+    capture peak, the arena or the carve-out -- all of them were resident when
+    ``free_at_measure`` was taken, which is the same argument
+    ``seam_allowed_tokens`` makes for its own anchor.
+
+    RETURNS None WHEN IT CANNOT BE SOLVED -- a cold record, no cell, or a
+    record written before the free column was persisted. The caller falls back
+    to the subtrahend there, which is the previous behaviour exactly. None and
+    zero are deliberately different: zero would mean "no tokens are allowed",
+    which is a verdict, and this function must not invent one.
+    """
+    cell = int(cell_bytes)
+    if cell <= 0 or not reserve.active:
+        return None
+    free_m = int(reserve.free_at_measure_bytes)
+    t_m = int(reserve.id_space)
+    if free_m <= 0 or t_m <= 0:
+        return None
+    target = max(0, int(floor_target_bytes))
+    return max(0, t_m + (free_m - target) // cell)
+
+
 def seam_adjusted_budget_bytes(
     budget_bytes: int,
     cell_bytes: int,
@@ -940,20 +1018,34 @@ def seam_adjusted_budget_bytes(
     ever REDUCE the result, which is why it is safe to apply after a min that
     already never grows it.
     """
-    # #678: the charge is the shortfall against what is ALREADY held free --
-    # the law always, and the seam solve too when a measured record made it
-    # reserve. Charging the whole floor over the solve is what collapsed the
-    # unpinned pool to 284181 tokens where 550000 arms and flips.
-    charge = arming_floor_subtrahend_bytes(
-        arming_floor_bytes, seam_solve_reserved_free_bytes(reserve)
-    )
     budget = int(budget_bytes)
-    if not reserve.active or int(cell_bytes) <= 0:
-        return max(0, budget - charge), 0
-    allowed = seam_allowed_tokens(
+    # #678: SOLVE THE FLOOR WHERE THE RECORD ALLOWS IT, approximate only where
+    # it does not. floor_allowed_tokens returns the largest id space whose
+    # RESTING FREE COLUMN still holds the floor -- an equality -- and a
+    # constraint solved exactly needs no charge against the budget at all.
+    floor_allowed = floor_allowed_tokens(cell_bytes, reserve, arming_floor_bytes)
+    if floor_allowed is None:
+        # No free column on record (cold, no cell, or a pre-#678 record): fall
+        # back to the subtrahend, which is the previous arithmetic exactly.
+        charge = arming_floor_subtrahend_bytes(
+            arming_floor_bytes, seam_solve_reserved_free_bytes(reserve)
+        )
+        if not reserve.active or int(cell_bytes) <= 0:
+            return max(0, budget - charge), 0
+        allowed = seam_allowed_tokens(
+            cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
+        )
+        return max(0, min(budget, allowed * int(cell_bytes)) - charge), allowed
+
+    # TWO CONSTRAINTS, ONE MIN, AND NEITHER IS SUBTRACTED FROM THE OTHER. The
+    # seam must be fundable AND the card must rest above its arming floor;
+    # they bind on different ranks at different vectors, so the pool is the
+    # smaller of the two id spaces rather than one adjusted by the other.
+    seam_allowed = seam_allowed_tokens(
         cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
     )
-    return max(0, min(budget, allowed * int(cell_bytes)) - charge), allowed
+    allowed = min(int(seam_allowed), int(floor_allowed))
+    return min(budget, allowed * int(cell_bytes)), allowed
 
 
 def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:
@@ -1251,6 +1343,8 @@ def measure_and_record(scheduler, runtime) -> None:
         id_space=id_space,
         arena_fixed_bytes=arena_fixed,
         worst_leg_fixed_bytes=worst_leg,
+        free_at_measure_bytes=free_bytes,
+        rung_fund_bytes=rung_fund,
     )
     logger.info(
         "%s MEASURED (rank %d): floor %.0f MiB (%.0f arena tail ADDITIVE "
