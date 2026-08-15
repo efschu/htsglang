@@ -163,6 +163,38 @@ ENV_PP_WINDOW = "SGLANG_PHASE_POLICY_PP_WINDOW_S"
 ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
 ENV_REFUSAL_BACKOFF_CAP = "SGLANG_PHASE_POLICY_REFUSAL_BACKOFF_CAP_S"
 ENV_REFUSAL_DEGRADE_AFTER = "SGLANG_PHASE_POLICY_REFUSAL_DEGRADE_AFTER"
+ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
+
+# -- THE COUNTERFACTUAL, MEASURED (#665-F1, 2026-08-15) ----------------------
+# `effective_flip_threshold` charges every decoding request a full PP window
+# for the stranding a cutover causes, and charges the alternative -- leaving
+# the prefill in TP -- nothing at all. That one-sidedness made the gate
+# unreachable in production: the ladder ran 7004 / 39835 / 72666 / 105498 /
+# 138329 tokens for 0..4 decoding requests, so at --max-running-requests 4 no
+# prompt this model can hold could ever flip, and a live 72,257-token backlog
+# at running_bs 2 was refused by 409 tokens.
+#
+# The premise behind the zero was never measured. It is false here. Measured
+# against the live instance (2 decode streams + one 72k prompt, client-side
+# token timing, /spinning/evidence-665-f1/measure_decode_contention.py):
+#
+#   decode throughput, undisturbed            53.2 tok/s
+#   decode throughput, during a TP prefill      0.0 tok/s
+#   A-vs-A noise floor                          0.4 %
+#   TP prefill wall clock for 72k tokens       60.6 s
+#
+# Decode does not degrade beside a co-resident TP prefill -- it STOPS, for the
+# whole minute the prefill takes. So the decodes are stranded in BOTH branches
+# and the only question is for how long: ~60 s if we stay, ~16 s (two seams
+# plus a 9.9 s PP prefill) if we flip. The surcharge was protecting the
+# decodes by stalling them roughly four times longer.
+#
+# `decode_contention` is that measurement: the fraction of decode throughput
+# lost while a prefill is co-resident in TP. 1.0 = decode stops dead, which is
+# what this scheduler does with --disable-overlap-schedule. 0.0 means "not
+# measured here" and keeps the old surcharge byte-identically, the same
+# measurement gate `flip_cost_s` already uses.
+DEFAULT_DECODE_CONTENTION = 0.0
 
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
 # Both thresholds above are LOAD-TRIGGERED, and that is not enough. Under
@@ -322,10 +354,81 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     if not cfg.prefill_runs_in_tp:
         return 0
     base = int(cfg.flip_tokens)
-    if cfg.flip_cost_s <= 0 or running_bs <= 0 or cfg.decode_strand_weight <= 0:
+    if cfg.flip_cost_s <= 0 or running_bs <= 0:
+        return base
+    if cfg.decode_contention > 0.0:
+        return _differential_flip_threshold(cfg, running_bs, base)
+    if cfg.decode_strand_weight <= 0:
         return base
     stranded_s = cfg.decode_strand_weight * float(running_bs) * cfg.pp_window_s
     return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
+
+
+def _differential_flip_threshold(
+    cfg: "PhasePolicyConfig", running_bs: int, base: int
+) -> int:
+    """The threshold once the counterfactual is priced too (#665-F1).
+
+    The old surcharge compares the stranding a flip causes against a
+    stay-in-TP branch assumed to cost the decodes nothing. Measured, that
+    branch costs them everything (see DEFAULT_DECODE_CONTENTION). Both
+    branches are therefore priced as aggregate delay-seconds, with
+    ``sigma = cfg.decode_contention`` the measured fraction of decode
+    throughput lost while a prefill is co-resident in TP:
+
+        stay = N/X + B x sigma x N/X
+        flip = (C + N/P) + B x (2C + min(W, N/P))
+
+    ``2C`` and not ``C`` because a stranded decode waits out the cutover in
+    BOTH directions -- it resumes only once the instance is back in TP -- while
+    the prefill only pays the way in. ``min(W, N/P)`` because the PP window
+    bounds how long the instance may sit in PP: past ``W x P`` tokens the
+    prefill no longer fits one window, the decodes are released at ``W``, and
+    the remainder waits for the next window.
+
+    Flipping is justified when ``flip < stay``. Solving for N is linear in
+    each of the two regimes ``min()`` selects, so the result is still a single
+    scalar threshold that the caller compares against pending tokens:
+
+        N/P <= W :  N > N0 (1-r)(1+2B) / [ (1+B*sigma) - (1+B) r ]
+        N/P >  W :  N > N0 (1-r)[(1+2B) + B W / C] / [ (1+B*sigma) - r ]
+
+    with ``r = X/P`` the prefill speed ratio and ``N0`` the seam break-even.
+    Both reduce to ``N0`` at ``B = 0``, as they must.
+
+    THE BOUND IS DERIVED, NOT DECREED. At the measured ``sigma = 1`` the first
+    regime collapses to ``N0 x (1 + 2B) / (1 + B)``, whose supremum is exactly
+    ``2 x N0``: with decode stalled either way, even an infinitely busy server
+    needs at most twice the break-even backlog, and the factor two is the
+    round trip the decodes additionally pay. The threshold still RISES with
+    the number of decodes stranded -- the surcharge keeps doing its job of
+    delaying a marginal flip -- it just can no longer diverge to a number no
+    prompt can reach.
+    """
+    tp_tok_s = float(cfg.tp_prefill_tok_s)
+    pp_tok_s = float(cfg.pp_prefill_tok_s)
+    if tp_tok_s <= 0 or pp_tok_s <= 0 or tp_tok_s >= pp_tok_s:
+        # No speedup to solve against; fall back to the seam break-even
+        # rather than invent a threshold from an unusable ratio.
+        return base
+    ratio = tp_tok_s / pp_tok_s
+    b = float(running_bs)
+    sigma = float(cfg.decode_contention)
+    gain = float(base) * (1.0 - ratio)
+
+    den_a = (1.0 + b * sigma) - (1.0 + b) * ratio
+    if den_a > 0.0:
+        n_a = gain * (1.0 + 2.0 * b) / den_a
+        # Only valid where the prefill actually fits inside one PP window.
+        if cfg.pp_window_s <= 0.0 or n_a <= cfg.pp_window_s * pp_tok_s:
+            return max(base, int(round(n_a)))
+
+    # Beyond the window the decode charge saturates at W, which makes this
+    # denominator strictly positive (sigma >= 0 and ratio < 1), so the
+    # threshold is always solvable and always finite.
+    den_b = (1.0 + b * sigma) - ratio
+    n_b = gain * ((1.0 + 2.0 * b) + b * cfg.pp_window_s / cfg.flip_cost_s) / den_b
+    return max(base, int(round(n_b)))
 
 
 @dataclass(frozen=True)
@@ -351,7 +454,24 @@ class PhasePolicyConfig:
     #: How much of a PP window a stranded decode is charged. 1.0 = the full
     #: window (a paused generation really does wait it out); 0.0 disables the
     #: surcharge while keeping ``flip_cost_s`` available for reporting.
+    #:
+    #: Consulted only while ``decode_contention`` is 0. Once the
+    #: counterfactual is measured there is nothing left for a hand-set weight
+    #: to express -- the stranding is priced against what NOT flipping costs
+    #: the same decodes.
     decode_strand_weight: float = 1.0
+    #: MEASURED fraction of decode throughput lost while a prefill is
+    #: co-resident in the TP layout, in [0, 1]. 0.0 = "not measured here" and
+    #: the old one-sided surcharge is used unchanged. See the block comment at
+    #: DEFAULT_DECODE_CONTENTION for why the un-measured default of zero made
+    #: the gate unreachable, and _differential_flip_threshold for the model
+    #: this feeds.
+    decode_contention: float = DEFAULT_DECODE_CONTENTION
+    #: The prefill ladder the threshold is solved against. Only the RATIO
+    #: matters to the differential model; ``flip_tokens`` already carries the
+    #: absolute scale.
+    tp_prefill_tok_s: float = DEFAULT_TP_PREFILL_TOK_S
+    pp_prefill_tok_s: float = DEFAULT_PP_PREFILL_TOK_S
     #: How long a REFUSED arm holds the policy off that direction, doubling
     #: per consecutive refusal from ``min_dwell_s`` and clamped here.
     #:
@@ -399,6 +519,13 @@ class PhasePolicyConfig:
                 "the phase policy needs a positive flip threshold; set "
                 f"{ENV_FLIP_TOKENS} or supply a measured TP prefill "
                 f"throughput via {ENV_TP_TOK_S}"
+            )
+        if not 0.0 <= self.decode_contention <= 1.0:
+            raise PhasePolicyError(
+                f"{ENV_DECODE_CONTENTION}={self.decode_contention!r} is not a "
+                f"fraction of decode throughput; it must be in [0, 1], where "
+                f"1 means decode stops dead while a prefill shares the TP "
+                f"batch (measured on this rig) and 0 means it is unaffected"
             )
 
     @property
@@ -555,6 +682,17 @@ def _decide_from_load(
             # Repays the seam, but not the seam PLUS the generations this
             # cutover would pause for a whole PP window. Named explicitly so
             # the log says which term refused, not just "below threshold".
+            if cfg.decode_contention > 0.0:
+                # Under the differential model the refusal is NOT "a flip
+                # would strand them" -- they are stranded either way -- but
+                # "the backlog is not yet big enough that flipping shortens
+                # the stall". Say which, or the log invites the wrong fix.
+                return _no(
+                    f"pending prefill {inp.pending_prefill_tokens} tok > N="
+                    f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                    f"{inp.running_bs} req decoding: too short for the round "
+                    f"trip to beat prefilling it in tp"
+                )
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok > N="
                 f"{cfg.flip_tokens} but <= {tp_threshold} with "
@@ -911,6 +1049,14 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         # generations it would pause. Without this the surcharge is inert.
         flip_cost_s=_env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S),
         decode_strand_weight=_env_float(ENV_DECODE_STRAND_WEIGHT, 1.0),
+        # The measured counterfactual. With it the surcharge prices a flip
+        # against what NOT flipping costs the same decodes; without it the
+        # old one-sided form is kept, unchanged.
+        decode_contention=_env_float(
+            ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION
+        ),
+        tp_prefill_tok_s=DEFAULT_TP_PREFILL_TOK_S,
+        pp_prefill_tok_s=DEFAULT_PP_PREFILL_TOK_S,
         refusal_backoff_cap_s=_env_float(
             ENV_REFUSAL_BACKOFF_CAP, DEFAULT_REFUSAL_BACKOFF_CAP_S
         ),
@@ -921,8 +1067,9 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     if enabled:
         logger.warning(
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
-            "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g "
-            "(N with 1 req decoding: %d), resting layout %s (%s)",
+            "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g, "
+            "decode contention %g, N ladder by decoding reqs %s, "
+            "resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
@@ -932,7 +1079,11 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             cfg.tp_decode_floor_s,
             cfg.flip_cost_s,
             cfg.decode_strand_weight,
-            effective_flip_threshold(cfg, 1),
+            cfg.decode_contention,
+            # The whole ladder, not just the one-decode rung: an unreachable
+            # top rung is exactly the defect #665-F1 was, and it is invisible
+            # if only the first rung is logged.
+            [effective_flip_threshold(cfg, b) for b in range(5)],
             cfg.rest_phase,
             cfg.rest_state,
         )
