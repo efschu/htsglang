@@ -411,6 +411,32 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
 
 
+def with_decode_contention(
+    cfg: "PhasePolicyConfig", value: object
+) -> "PhasePolicyConfig":
+    """Return ``cfg`` with a new MEASURED decode-contention fraction.
+
+    Lives here rather than in the scheduler's ``set_internal_state`` chain so
+    the validation sits with the thing it validates and can be tested without
+    standing up a Scheduler. Range checking is not repeated: ``replace`` re-runs
+    ``__post_init__``, which already refuses anything outside [0, 1].
+
+    Raises ``PhasePolicyError`` for a value that is not a fraction, so the
+    caller can report it and refuse the update rather than half-applying one.
+    """
+    import dataclasses
+
+    try:
+        frac = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise PhasePolicyError(
+            f"{ENV_DECODE_CONTENTION} must be a number in [0, 1] -- it is the "
+            f"FRACTION of decode throughput lost to a co-resident TP prefill "
+            f"-- got {value!r}"
+        ) from None
+    return dataclasses.replace(cfg, decode_contention=frac)
+
+
 def _differential_flip_threshold(
     cfg: "PhasePolicyConfig", running_bs: int, base: int
 ) -> int:
