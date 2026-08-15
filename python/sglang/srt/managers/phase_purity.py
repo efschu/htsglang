@@ -356,21 +356,84 @@ def _decode_slo_s(scheduler) -> float:
         return 0.0
 
 
+def _group_starvation_signal(scheduler, work: str) -> bool:
+    """Has the GROUP failed to fund the flip this work class needs?
+
+    THE EVENT THE CLOCK IS STAMPED FROM, and the reason this function exists
+    at all. It replaces "this rank has a non-empty batch", which was measured
+    WRONG on metal 2026-08-15 in the only topology that matters here.
+
+    THE PREMISE THAT FAILED. The clock used to start when decode was blocked
+    in PP with ``running_bs > 0``, argued group-uniform because "phase, purity
+    and batch are identical on every rank at that point". That is true under
+    TP and FALSE UNDER PP. In a pipeline the HEAD holds the requests and the
+    downstream ranks do not see them until it forwards them -- and a head that
+    is holding decode never forwards. So PP1 and PP2 sat at ``running_bs = 0``,
+    ``_clear_decode_starving`` reset their clocks on every iteration, and only
+    rank 0 ever crossed the SLO.
+
+    WHAT THAT COST, exactly, on boot_slo_proof_r2.log: one
+    "RELAXING PURITY FOR DECODE" line, on PP0 alone, against two
+    "FLIP ABANDONED" lines on every rank. Rank 0 then admitted a decode batch
+    into the PP layout while its peers still refused decode, blocked in
+    ``_pp_commit_comm_work`` on a proxy-tensor send whose matching receives
+    nobody posted, while PP1 and PP2 blocked in ``recv_requests`` waiting for a
+    forward rank 0 could no longer make. All three ranks alive, all three cards
+    at 0% utilisation, and not one decode step ever ran. A safety valve that
+    deadlocks the instance it is meant to rescue is worse than the stall.
+
+    SO THE SIGNAL IS THE ONE THE GROUP ALREADY AGREES ON: the seam abandon
+    streak for the direction that starves this work class. It is incremented
+    from ``reduced_fit``, a collective MIN, so every rank advances it on the
+    same iteration -- which the same log confirms, two lines per rank, exactly.
+    No new collective is introduced; this reads a number the group already
+    reduced.
+
+    IT IS ALSO THE HONEST WORK SIGNAL. The streak only advances when the policy
+    ARMED the flip, and the policy arms the direction that serves decode
+    because decode is waiting. So "an empty batch is not starvation" still
+    holds, sourced from a quantity every rank can see rather than from one only
+    the head can.
+
+    BOTH GROUP-UNIFORM COUNTERS COUNT, for the reason
+    ``flip_unavailable_reason`` already reads both: the seam streak alone
+    CANNOT advance once the policy's backoff engages, because the policy then
+    declines the arm without entering the seam at all. Measured 2026-08-13
+    15:40-15:44Z: three group abandons armed the backoff, the abandon counter
+    froze at 3, and the policy went on logging "arm refused (7 in a row)" while
+    work sat unrunnable. A signal keyed only to the inner counter is a signal
+    the damping layer holds at zero.
+
+    A NON-ZERO COUNT IS NOT THE SAME AS A COUNT THAT REACHED ITS BOUND, and
+    that distinction is the whole point. The bounds (``stand_down_after``, the
+    abandon cap) are what the SLO exists to outlive; ONE refusal is merely
+    evidence that a funding failure is happening at all, which is exactly the
+    precondition the invariant is stated over. The clock still has to run out.
+    """
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    if rt is None:
+        return False
+    direction = _STARVED_BY.get(work)
+    if direction is None:
+        return False
+    try:
+        book = getattr(rt, "_seam_abandons_in_a_row", None) or {}
+        if int(book.get(direction, 0) or 0) > 0:
+            return True
+        state = getattr(scheduler, "phase_policy_state", None)
+        refusals = getattr(state, "arm_refusals", None) or {}
+        return int(refusals.get(direction, 0) or 0) > 0
+    except Exception:  # noqa: BLE001 - a safety valve must not raise
+        return False
+
+
 def _note_decode_starving(scheduler) -> None:
-    """Stamp the instant decode first became blocked with work to do.
+    """Stamp the instant the GROUP first failed to fund decode's layout.
 
-    GROUP UNIFORMITY, which is the property this file's other inputs are
-    chosen for. This is a wall clock, and the two existing causes are
-    group-REDUCED counters -- so it is the first non-uniform input here and
-    the choice is deliberate.
-
-    What makes it safe is the EVENT it is stamped from: the first iteration on
-    which decode is blocked in PP with a non-empty batch. Phase, purity and
-    batch are identical on every rank at that point, so every rank stamps on
-    the same iteration and crosses the SLO within ONE iteration of the others
-    -- the same bound the abandon streak already has, since that advances per
-    iteration too. A sub-iteration skew cannot split the group's decision for
-    longer than the iteration itself.
+    GROUP UNIFORMITY IS THE WHOLE PROPERTY HERE, and it is now sourced the way
+    this file's other two causes are: from a group-reduced counter. See
+    :func:`_group_starvation_signal` for the metal deadlock that proved a
+    per-rank batch reading cannot carry it.
     """
     if getattr(scheduler, "_decode_starved_since", None) is None:
         scheduler._decode_starved_since = time.monotonic()
@@ -555,11 +618,13 @@ def decode_blocked_here(scheduler, running_bs: int) -> bool:
     if purity_of(scheduler).decode_allowed_in_pp(running_bs):
         _clear_decode_starving(scheduler)
         return False
-    # THE CLOCK RUNS ONLY WHEN THERE IS DECODE TO HOLD. An empty batch is not
-    # starvation, and starting the clock on it would spend the SLO before a
-    # single request arrived -- which is exactly how today's window looked
-    # harmless: the mechanism was live, the batch was empty.
-    if int(running_bs) > 0:
+    # THE CLOCK RUNS ONLY WHEN THERE IS DECODE TO HOLD, AND "THERE IS DECODE TO
+    # HOLD" MUST BE A GROUP FACT. It was ``running_bs > 0`` -- this rank's own
+    # batch -- and under PP only the head has one, so only the head ever
+    # crossed the SLO and the group half-relaxed into a deadlock. See
+    # _group_starvation_signal for the measurement. The signal is now the seam
+    # abandon streak, which every rank advances off the same collective MIN.
+    if _group_starvation_signal(scheduler, "decode"):
         _note_decode_starving(scheduler)
     else:
         _clear_decode_starving(scheduler)
