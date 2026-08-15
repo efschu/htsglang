@@ -1818,6 +1818,28 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
     )
     # #631 J: read-only handle for the pool census straddling the cutover.
     runtime._census_scheduler = scheduler
+    # #665-F1 item 7: price the seam at boot instead of discovering it at arm
+    # time. The design point is the live set at the deployed ladder's arming
+    # threshold -- the smallest backlog that will actually ask for a flip, so
+    # the projection answers "can the seam this config will attempt be paid
+    # for?" A projection must never fail a boot, hence the broad guard inside.
+    try:
+        policy_cfg = getattr(scheduler, "phase_policy_cfg", None)
+        design_tokens = int(getattr(policy_cfg, "flip_tokens", 0) or 0)
+        page = int(
+            getattr(
+                getattr(scheduler, "token_to_kv_pool_allocator", None),
+                "page_size",
+                1,
+            )
+            or 1
+        )
+        if design_tokens > 0:
+            runtime.log_staging_projection(
+                n_slots=max(1, -(-design_tokens // page))
+            )
+    except Exception as exc:
+        logger.warning("%s staging projection skipped: %r", LOG_PREFIX, exc)
     return runtime
 
 
@@ -4080,6 +4102,58 @@ class PhaseFlipRuntime:
         return True
 
     # -- staging affordability ------------------------------------------------
+    def project_staging_bytes(self, direction: str, n_slots: int) -> int:
+        """What the seam WILL want, for a live set of ``n_slots`` rows.
+
+        #665-F1 item 7. The cost of a configuration change used to be
+        discovered at arm time, by staging, being refused and abandoning on a
+        live instance -- 512 -> 2048 took the pp_to_tp want from ~907 MiB to
+        2481 and wedged the return leg with nothing having predicted it.
+
+        This is the same `_staging_bytes` the gate itself calls, evaluated
+        ahead of time against a projected live set, so it is EXACT rather than
+        fitted and inherits every future change to the formula for free. An
+        earlier attempt fitted want = base + k*chunk^2 to three measured
+        anchors; it was falsified on a held-out point, and the anchors turned
+        out to be one per RANK, so the curve was tracking per-rank arena_tail
+        offsets rather than chunk width. There was never anything to fit: the
+        plan's only live-set input is the slot count, and everything else is
+        static layout.
+
+        Per rank by construction -- `arena_tail` and the layer map differ
+        across ranks, which is exactly what the fit mistook for a trend.
+        """
+        src, dst = self._src_dst(direction)
+        waves = self._flip_waves(direction)
+        slots = torch.arange(int(max(0, n_slots)), dtype=torch.int64)
+        tr = build_phase_flip_transition(
+            slots, self._map, self._n_layers, self._vec, self._rank, direction
+        )
+        return self._staging_bytes(tr, direction, src, dst, waves)
+
+    def log_staging_projection(self, n_slots: int, floor_mib: float = 819.0) -> None:
+        """Print the projected want per direction at a design-point live set.
+
+        Emitted at boot so a configuration change surfaces as a solved number
+        BEFORE anyone runs load against it.
+        """
+        for direction in (TP_TO_PP, PP_TO_TP):
+            try:
+                want = self.project_staging_bytes(direction, n_slots) / (1 << 20)
+            except Exception as exc:  # a projection must never fail a boot
+                logger.warning(
+                    "%s staging projection unavailable for %s: %r",
+                    LOG_PREFIX, direction, exc,
+                )
+                continue
+            logger.warning(
+                "%s STAGING PROJECTION rank %s %s: want %.0f MiB at a live set "
+                "of %d slots, + floor %.0f = needs %.0f MiB free. Evaluated "
+                "from _staging_bytes against the plan, not fitted.",
+                LOG_PREFIX, self._rank, direction, want, n_slots,
+                floor_mib, want + floor_mib,
+            )
+
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
         """Device bytes the move will hold at once, from the PLAN.
 
