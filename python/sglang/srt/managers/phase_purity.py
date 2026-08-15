@@ -1,11 +1,33 @@
-"""#631 STRICT PHASE PURITY -- each layout runs only the work it is for.
+"""#631 PHASE PURITY -- each layout runs the work it is for, when that pays.
 
-THE USER RULE THIS ENCODES (2026-08-09, hard, default on this rig)
+CORRECTION 2026-08-14 (user, explicit) -- READ BEFORE THE HISTORY BELOW
+----------------------------------------------------------------------
+The blanket rule "NOT A SINGLE TOKEN may be prefilled in the TP layout" is
+WITHDRAWN, and the record that the user ordered it as a hard rule is struck:
+that instruction rested on wrong input data. Small prefills do not always
+repay a seam round trip, so the default is now the SENSIBLE setup -- let the
+policy's measured break-even N decide whether flipping to PP is worth it.
+
+Measured on this rig 2026-08-14, which is what forced the correction: under a
+workload of many small requests the blanket rule produced 882 flips in one
+boot, arming `tp_to_pp` at 184 pending prefill tokens against a policy
+break-even of N=7004, ~4.8 s of seam per request (tp_to_pp ~2.7 s + pp_to_tp
+~2.1 s), and TTFT ~2.9 s on a 65-CHARACTER prompt. The flip cost dominated
+everything it was supposed to accelerate.
+
+WHAT STANDS, AND WHAT DOES NOT
+- STANDS: decode in the PP layout is forbidden. That half has its own metal
+  measurement (below) and is unchanged by this correction.
+- WITHDRAWN: the unconditional prefill-in-TP prohibition. Prefill in TP is
+  slower per token, so the policy still prefers PP -- but only once the
+  pending prefill is large enough to amortise the seam, which is exactly what
+  ``phase_policy.break_even_tokens`` already computes.
+
+HISTORICAL RATIONALE (2026-08-09) -- the decode half remains valid
 ------------------------------------------------------------------
 - Decode in the PP layout is COMPLETELY FORBIDDEN. Decode work is DEFERRED
   and executed BATCHED in the TP layout after the flip.
-- NOT A SINGLE TOKEN may be prefilled in the TP layout. Prefill is deferred
-  and executed ONLY in the PP layout.
+- (withdrawn) Prefill was likewise confined to the PP layout.
 
 The server therefore alternates:
 
@@ -43,14 +65,19 @@ MODES
 -----
 ``--phase-flip-purity``:
 
-    strict          (DEFAULT) no decode in PP, no prefill in TP.
+    prefill_in_tp   (DEFAULT since 2026-08-14) no decode in PP; prefill MAY
+                    run in TP, so the policy's break-even N decides when a
+                    flip to PP repays its seam. Small prefills stay in TP.
+    strict          no decode in PP, no prefill in TP. The pre-2026-08-14
+                    default; collapses the policy's break-even N to 0, so
+                    ANY pending prefill forces a cutover.
     threshold:<n>   ESCAPE HATCH: decode may still run in the PP layout
                     while at most <n> requests are decoding. Above <n> the
                     strict rule applies again. n=0 is exactly ``strict``.
                     The prefill-in-TP prohibition is NOT relaxed by this --
-                    prefill in TP is a 4.3x throughput loss with no
-                    latency argument on the other side, so it has no
-                    threshold form.
+                    prefill in TP is slower per token, which is why the
+                    amortisation lives in the policy's break-even N rather
+                    than in a second purity threshold.
     off             both prohibitions lifted: the pre-purity interleaving.
                     Kept reachable so the defect above can be reproduced
                     on demand for an A/B, not because it is a supported
@@ -90,9 +117,17 @@ LOG_PREFIX = "PHASE-PURITY"
 MODE_STRICT = "strict"
 MODE_THRESHOLD = "threshold"
 MODE_OFF = "off"
+#: THE DEFAULT since 2026-08-14. Lifts ONLY the prefill-in-TP prohibition, so
+#: the policy's break-even N governs the cutover; decode in PP stays forbidden.
+MODE_PREFILL_IN_TP = "prefill_in_tp"
 
 ENV_PURITY = "SGLANG_PHASE_FLIP_PURITY"
-DEFAULT_PURITY = MODE_STRICT
+#: DEFAULT CHANGED 2026-08-14 (user, explicit): `prefill_in_tp`, not `strict`.
+#: The blanket prefill-in-TP prohibition rested on wrong input data; with a
+#: SMALL pending prefill the seam round trip is not worth paying, so the
+#: sensible setup is to let the policy's break-even N decide. Decode in PP
+#: remains forbidden -- that half has its own measurement and is unchanged.
+DEFAULT_PURITY = MODE_PREFILL_IN_TP
 
 
 class PhasePurityError(ValueError):
@@ -116,6 +151,21 @@ class PhasePurity:
     def enforced(self) -> bool:
         return self.mode != MODE_OFF
 
+    @property
+    def decode_forbidden_in_pp(self) -> bool:
+        """Is decode in the PP layout impossible at EVERY batch size?
+
+        The semantic property, as distinct from ``strict`` which is a mode
+        NAME. Consumers that need "no decode ever runs in PP" -- the spill
+        machinery releases the draft weights for the whole PP phase on
+        exactly this guarantee -- must test this, not the name, or a mode
+        that provides the guarantee by a different route is refused for no
+        reason. (That is precisely what happened when `prefill_in_tp` was
+        added: the spill guard compared the string and rejected a mode whose
+        decode prohibition is identical to strict's.)
+        """
+        return self.mode in (MODE_STRICT, MODE_PREFILL_IN_TP)
+
     def decode_allowed_in_pp(self, running_bs: int) -> bool:
         """May a decode batch execute in the PP layout right now?
 
@@ -127,14 +177,26 @@ class PhasePurity:
             return True
         if self.mode == MODE_STRICT:
             return False
+        if self.mode == MODE_PREFILL_IN_TP:
+            # Explicit, not fall-through: this mode leaves
+            # decode_in_pp_threshold at its 0 default, and `running_bs <= 0`
+            # would then read as "a zero-sized decode batch is allowed" and
+            # quietly re-admit decode into PP. Decode in PP is the half of the
+            # 2026-08-09 rule the starvation measurement actually indicts, so
+            # it stays forbidden here regardless of batch size.
+            return False
         return int(running_bs) <= self.decode_in_pp_threshold
 
     def prefill_allowed_in_tp(self) -> bool:
         """May a prefill batch be BUILT in the TP layout right now?
 
-        No threshold form on purpose -- see the module docstring.
+        No threshold form HERE on purpose: the amortisation is not a second
+        purity knob, it is ``phase_policy.break_even_tokens`` -- the pending
+        prefill above which paying the seam beats prefilling in the slower
+        layout. This method only says whether that machinery is allowed to
+        run at all; ``strict`` forces it to 0 and every prefill flips.
         """
-        return self.mode == MODE_OFF
+        return self.mode in (MODE_OFF, MODE_PREFILL_IN_TP)
 
     def describe(self) -> str:
         if self.mode == MODE_THRESHOLD:
@@ -151,6 +213,8 @@ def parse_purity(raw: Optional[str]) -> PhasePurity:
         return PhasePurity(mode=MODE_STRICT)
     if value == MODE_OFF:
         return PhasePurity(mode=MODE_OFF)
+    if value == MODE_PREFILL_IN_TP:
+        return PhasePurity(mode=MODE_PREFILL_IN_TP)
     if value.startswith(MODE_THRESHOLD):
         rest = value[len(MODE_THRESHOLD) :]
         if not rest.startswith(":"):

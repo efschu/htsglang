@@ -3921,7 +3921,16 @@ _PACKED_WEIGHT_MARKERS = (
     "qweight",  # gptq / awq / gguf
     "qzeros",  # gptq / awq
     "g_idx",  # gptq with desc_act
-    "scales",  # gptq / awq / marlin (covers weight_scale* too)
+    "scales",  # gptq / awq / marlin, and any PLURAL weight_scales
+    # compressed-tensors writes the SINGULAR `weight_scale`, which "scales"
+    # does not cover -- the plural is not a substring of the singular. This
+    # entry used to be a claim in the comment above rather than a marker, and
+    # Qwen3.8-27B-INT8 is the checkpoint that collected the bill: its MTP head
+    # is int8 with a `weight_scale` per projection, no marker matched, the
+    # namespace read dense, the drafter was built bf16 around int8 payload,
+    # and speculation fell to 1 accepted draft in 354 with nothing logged as
+    # an error.
+    "weight_scale",  # compressed-tensors / fp8 per-channel and per-tensor
     "scale_inv",  # fp8 blockwise
     "weight_packed",  # compressed-tensors
     "weight_shape",  # compressed-tensors

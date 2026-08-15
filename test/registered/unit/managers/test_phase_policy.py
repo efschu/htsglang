@@ -342,7 +342,11 @@ def test_config_from_env_derives_n_from_a_measured_throughput(monkeypatch):
     c = pp.config_from_env(enabled=True)
     assert c.enabled
     assert c.flip_tokens == pytest.approx(51629, abs=2)
-    assert c.rest_state == REST_PREFILL  # the default is the prefill layout
+    # CHANGED 2026-08-14 (user): the resting layout is the DECODE layout.
+    # Every request decodes and decode in PP is forbidden, so resting in PP
+    # charged every request a pp_to_tp cutover and then idled back to PP to
+    # charge it again -- 882 flips in one boot on this rig.
+    assert c.rest_state == REST_DECODE
 
 
 def test_config_from_env_explicit_threshold_wins(monkeypatch):
