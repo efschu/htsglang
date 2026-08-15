@@ -7402,21 +7402,15 @@ class Scheduler(
                     )
                     if_success = False
                     break
+                from sglang.srt.managers.phase_policy import (
+                    PhasePolicyError,
+                    with_decode_contention,
+                )
+
                 try:
-                    frac = float(v)
-                except (TypeError, ValueError):
-                    logging.warning(
-                        f"phase_policy_decode_contention must be a number in "
-                        f"[0, 1], got {v!r}."
-                    )
-                    if_success = False
-                    break
-                if not 0.0 <= frac <= 1.0:
-                    logging.warning(
-                        f"phase_policy_decode_contention must be in [0, 1] -- "
-                        f"it is a FRACTION of decode throughput lost to a "
-                        f"co-resident TP prefill -- got {frac}."
-                    )
+                    with_decode_contention(self.phase_policy_cfg, v)
+                except PhasePolicyError as e:
+                    logging.warning(f"Updating {k} to {v!r} is rejected: {e}")
                     if_success = False
                     break
 
@@ -7457,18 +7451,19 @@ class Scheduler(
             # rung no prompt can reach, which is invisible if only one rung
             # is printed.
             if "phase_policy_decode_contention" in server_args_dict:
-                frac = float(remaining.pop("phase_policy_decode_contention"))
-                self.phase_policy_cfg = dataclasses.replace(
-                    self.phase_policy_cfg, decode_contention=frac
-                )
                 from sglang.srt.managers.phase_policy import (
                     effective_flip_threshold,
+                    with_decode_contention,
                 )
 
+                self.phase_policy_cfg = with_decode_contention(
+                    self.phase_policy_cfg,
+                    remaining.pop("phase_policy_decode_contention"),
+                )
                 logger.warning(
                     "PHASE-POLICY decode contention set to %g; N ladder by "
                     "decoding reqs now %s",
-                    frac,
+                    self.phase_policy_cfg.decode_contention,
                     [
                         effective_flip_threshold(self.phase_policy_cfg, b)
                         for b in range(5)

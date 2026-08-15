@@ -497,3 +497,59 @@ def _drive(cfg, pending, bs, phase=PHASE_TP):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheRuntimeToggle(CustomTestCase):
+    """`with_decode_contention` -- the within-boot A/B lever.
+
+    The measured and the one-sided threshold have to be comparable on the SAME
+    memory vector, KV token vector and corridor, or the comparison carries
+    boot-to-boot variance instead of the effect. So the fraction is settable at
+    runtime, and this is the hermetic cover for the validation the scheduler
+    delegates here.
+    """
+
+    def test_it_returns_a_new_config_and_leaves_the_original_alone(self):
+        from sglang.srt.managers.phase_policy import with_decode_contention
+
+        cfg = _cfg(decode_contention=0.0)
+        got = with_decode_contention(cfg, 1.0)
+        self.assertEqual(got.decode_contention, 1.0)
+        self.assertEqual(cfg.decode_contention, 0.0)
+
+    def test_it_actually_moves_the_ladder(self):
+        from sglang.srt.managers.phase_policy import with_decode_contention
+
+        one_sided = _cfg(decode_contention=0.0)
+        measured = with_decode_contention(one_sided, 1.0)
+        self.assertEqual(effective_flip_threshold(one_sided, 2), 72666)
+        self.assertEqual(effective_flip_threshold(measured, 2), 11674)
+
+    def test_a_string_fraction_is_accepted(self):
+        """It arrives over JSON, so "1.0" must work as well as 1.0."""
+        from sglang.srt.managers.phase_policy import with_decode_contention
+
+        self.assertEqual(
+            with_decode_contention(_cfg(), "0.5").decode_contention, 0.5
+        )
+
+    def test_nonsense_is_refused_rather_than_half_applied(self):
+        from sglang.srt.managers.phase_policy import with_decode_contention
+
+        for bad in ("banana", None, [1], 1.5, -0.1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PhasePolicyError):
+                    with_decode_contention(_cfg(), bad)
+
+    def test_the_round_trip_restores_the_old_behaviour_exactly(self):
+        """The A arm of the A/B must be the shipped behaviour, not an
+        approximation of it."""
+        from sglang.srt.managers.phase_policy import with_decode_contention
+
+        cfg = _cfg(decode_contention=0.0)
+        there = with_decode_contention(cfg, 1.0)
+        back = with_decode_contention(there, 0.0)
+        self.assertEqual(
+            [effective_flip_threshold(back, b) for b in range(5)],
+            [effective_flip_threshold(cfg, b) for b in range(5)],
+        )
