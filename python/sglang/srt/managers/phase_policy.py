@@ -499,6 +499,46 @@ def with_decode_contention(
     return dataclasses.replace(cfg, decode_contention=frac)
 
 
+def _demand_outweighs_a_retry(
+    cfg: "PhasePolicyConfig",
+    inp: "PhasePolicyInputs",
+    state: "PhasePolicyState",
+) -> bool:
+    """Should a pending backlog override the staging rate limit?
+
+    THE DAMPER THIS REMOVES. A rate limit that postpones a seam the load is
+    actively demanding is a damper, not a guard. Live at 12:49-12:51: 70-90k
+    tokens sat in TP behind "next staging in 12.4s ... capped at 60s" while
+    the prefill crawled at the TP rate. Whatever the odds that the retry
+    abandons again, waiting was strictly worse than trying.
+
+    So the limiter yields whenever the flip is worth more than the wait. Both
+    sides are seconds and both are measured:
+
+        saved   = N x (1/r_tp - 1/r_pp) - 2C     what landing it is worth now
+        waited  = the limiter's current interval
+
+    At 90k on this checkpoint that is ~47 s against ~12.8 s: attempt. At the
+    break-even rung it is ~0 s against 11.8 s: let the limiter hold. And under
+    strict purity with one token pending -- the #656 storm shape -- saved is
+    ~0, which is exactly the case the guard exists for.
+
+    The guard therefore still bounds storms, and can no longer bound progress.
+    """
+    if not cfg.prefill_runs_in_tp:
+        # Purity: a sub-N prompt cannot run in TP at all, so "demand" here
+        # carries no time saving to weigh -- this is the #656 shape.
+        return False
+    tp, pp = float(cfg.tp_prefill_tok_s), float(cfg.pp_prefill_tok_s)
+    if tp <= 0 or pp <= tp:
+        return False
+    saved_s = inp.pending_prefill_tokens * (1.0 / tp - 1.0 / pp) - 2.0 * cfg.flip_cost_s
+    k = max(1, state.arm_refusals.get(TP_TO_PP, 1))
+    base_s = solved_tp_decode_floor_s(cfg) if cfg.flip_cost_s > 0 else cfg.min_dwell_s
+    waited_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+    return saved_s > waited_s
+
+
 def _differential_flip_threshold(
     cfg: "PhasePolicyConfig", running_bs: int, base: int
 ) -> int:
@@ -846,7 +886,7 @@ def decide(
     # timestamp, never exceeds 2 x flip_cost_s, and a COMPLETION clears it
     # outright. The instant conditions allow funding, the next arm goes.
     last_abandon = state.last_abandon_at.get(d.direction)
-    if last_abandon is not None:
+    if last_abandon is not None and not _demand_outweighs_a_retry(cfg, inp, state):
         # Interval starts at one round trip and doubles per consecutive
         # abandon, capped. Doubling because a second failure against the same
         # conditions is evidence the conditions have not moved; capped because
