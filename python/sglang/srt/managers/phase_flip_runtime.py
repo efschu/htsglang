@@ -4602,8 +4602,37 @@ class PhaseFlipRuntime:
             f"{self._staging_reserve_bytes / mib:.0f} MiB kept free). The "
             f"KV pool is too full to carry its own contents across the "
             f"flip; serving continues in this layout and the flip is "
-            f"retried when occupancy drops"
+            f"retried when occupancy drops. " + self._kv_rung_verdict()
         )
+
+    def _kv_rung_verdict(self) -> str:
+        """What the KV rung decided this round, for a REFUSAL message.
+
+        A refusal is not an edge, so the rung's edge-triggered trace is
+        typically silent at exactly the moment a reader needs it -- and a
+        silent decline is indistinguishable from a rung that was never
+        reached. Those have completely different fixes, and on 2026-08-15 the
+        difference cost a wrong diagnosis: the seam was refused by 59 MiB, the
+        rung had logged nothing for five minutes, and that was read as a
+        missing call when the rung had in fact been consulted every gate and
+        declined quietly.
+
+        Never raises and never blocks the refusal it is decorating: an
+        instrument that can break the message it rides on is worse than no
+        instrument.
+        """
+        try:
+            from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+            scheduler = getattr(self, "_census_scheduler", None)
+            relief = (
+                getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+            )
+            if relief is None:
+                return "No KV rung is installed on this rank."
+            return relief.last_proposal_summary()
+        except Exception as e:  # noqa: BLE001 - decoration must not raise
+            return f"(the KV rung's verdict could not be read: {e})"
 
     def _corridor_gate(
         self,

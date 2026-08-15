@@ -1261,19 +1261,48 @@ def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
 def _cached_relief_estimate(device_index: int) -> int:
     """Bytes the tiers BELOW the KV rung could still return, on this rank.
 
-    On this rig that is torch's caching allocator, which holds 1028-1426 MiB
-    per card at idle. It is an UPPER bound on what ``empty_cache`` really
+    TAKEN, THEN MEASURED -- no longer estimated. This used to return
+    ``reserved - allocated``, an UPPER bound on what ``empty_cache`` really
     hands back (the allocator keeps whole segments it is still carving from),
-    and the overestimate is deliberate: it understates the KV ask, and
-    under-shrinking is retried while over-shrinking costs admission capacity
-    that bought nothing.
+    and the overestimate was deliberate on the argument that "under-shrinking
+    is retried while over-shrinking costs admission capacity that bought
+    nothing".
+
+    THAT ARGUMENT IS FALSIFIED. Under-shrinking is not retried: eight refusals
+    latch the direction "unfundable" and the instance holds in TP with tens of
+    thousands of tokens pending at 1000-1600 tok/s where the PP layout does
+    4000-7000. The rung's own trace had already recorded the mechanism -- the
+    deficit was NEGATIVE on 100 % of arms across two acceptance runs, and
+    dropping this term alone flipped every one of them positive by 260-832
+    MiB. An overstated subtraction is why the only rung that can pay real
+    bytes declined every single time it was asked.
+
+    So the cheap tier is RECLAIMED HERE, before the rung is asked, and the ask
+    is then sized against what the driver actually has. The reclaimed bytes
+    land in the driver's free column, which the rung probes directly, so this
+    function returns 0: subtracting them a second time is the double-count
+    that caused the defect. Reclaiming here rather than after the verdict is
+    the same reordering the guard already applies to this tier for the same
+    reason.
     """
     try:
         import torch
 
-        reserved = int(torch.cuda.memory_reserved(device_index))
-        allocated = int(torch.cuda.memory_allocated(device_index))
-        return max(0, reserved - allocated)
+        before = int(torch.cuda.mem_get_info(device_index)[0])
+        torch.cuda.empty_cache()
+        after = int(torch.cuda.mem_get_info(device_index)[0])
+        returned = max(0, after - before)
+        if returned:
+            logger.info(
+                "%s cheap tier taken before the KV ask: %.0f MiB returned to "
+                "the driver, so the rung sizes against real free memory "
+                "instead of an upper bound on this tier",
+                LOG_PREFIX,
+                returned / (1024 * 1024),
+            )
+        # Already in the free column the rung probes. Counting it again is the
+        # subtraction that made the rung decline on every arm.
+        return 0
     except Exception:
         return 0
 
