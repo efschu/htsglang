@@ -139,6 +139,12 @@ DEFAULT_PP_PREFILL_TOK_S = 7245.5
 # PROD_BRINGUP_BENCH. Overridable so a different rig can re-derive N from
 # its own ladder without editing code.
 ENV_TP_TOK_S = "SGLANG_PHASE_POLICY_TP_TOK_S"
+#: The PP-phase counterpart. It did not exist until 2026-08-15, which
+#: meant the PP rate was the ONLY input to the break-even that could not
+#: be re-measured per checkpoint -- so a rig whose PP prefill differed
+#: from this module's 7245.5 had no way to say so, and silently solved N
+#: against another rig's number.
+ENV_PP_TOK_S = "SGLANG_PHASE_POLICY_PP_TOK_S"
 # TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
 # (2026-08-08, commit 2bcc6b7d25, quiet-gated ladder with zero contended
 # draws): 2134.1 / 1681.0 / 1484.1 at 2048 / 8192 / 32768, spreads 0.25 /
@@ -1138,19 +1144,28 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     min_dwell = _env_float(ENV_MIN_DWELL, DEFAULT_MIN_DWELL_S)
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
 
+    # THE THREE MEASUREMENTS THE WHOLE LADDER RESTS ON, resolved from the
+    # environment ONCE and then used everywhere -- for the break-even N, for
+    # the stranded-decode surcharge, and for the boot log.
+    #
+    # This used to read the module CONSTANTS here while the surcharge read the
+    # env, so the two halves of one ladder were solved against different
+    # numbers. Booting with a measured 5.918 s seam produced
+    # [7004, 19430, 21589, 22669, 23316]: rung 0 did not move at all, because
+    # the seam knob never reached it. A solved number silently replaced by a
+    # constant is exactly the provenance defect this policy exists to avoid.
+    seam_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
+    tp_tok_s = _env_float(ENV_TP_TOK_S, DEFAULT_TP_PREFILL_TOK_S)
+    pp_tok_s = _env_float(ENV_PP_TOK_S, DEFAULT_PP_PREFILL_TOK_S)
+
     explicit = _env_int(ENV_FLIP_TOKENS, 0)
     if explicit > 0:
         flip_tokens = explicit
         source = f"{ENV_FLIP_TOKENS}={explicit}"
-    elif DEFAULT_TP_PREFILL_TOK_S > 0:
-        flip_tokens = break_even_tokens(
-            DEFAULT_FLIP_COST_S,
-            DEFAULT_TP_PREFILL_TOK_S,
-            DEFAULT_PP_PREFILL_TOK_S,
-        )
+    elif tp_tok_s > 0:
+        flip_tokens = break_even_tokens(seam_s, tp_tok_s, pp_tok_s)
         source = (
-            f"break-even {DEFAULT_FLIP_COST_S:g}s / (1/"
-            f"{DEFAULT_TP_PREFILL_TOK_S:g} - 1/{DEFAULT_PP_PREFILL_TOK_S:g})"
+            f"break-even {seam_s:g}s / (1/{tp_tok_s:g} - 1/{pp_tok_s:g})"
         )
     elif enabled:
         raise PhasePolicyError(
@@ -1175,7 +1190,7 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         # The seam cost the threshold was derived from, carried so the
         # stranded-decode surcharge can price a cutover against the
         # generations it would pause. Without this the surcharge is inert.
-        flip_cost_s=_env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S),
+        flip_cost_s=seam_s,
         decode_strand_weight=_env_float(ENV_DECODE_STRAND_WEIGHT, 1.0),
         # The measured counterfactual. With it the surcharge prices a flip
         # against what NOT flipping costs the same decodes; without it the
@@ -1183,8 +1198,8 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         decode_contention=_env_float(
             ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION
         ),
-        tp_prefill_tok_s=DEFAULT_TP_PREFILL_TOK_S,
-        pp_prefill_tok_s=DEFAULT_PP_PREFILL_TOK_S,
+        tp_prefill_tok_s=tp_tok_s,
+        pp_prefill_tok_s=pp_tok_s,
         refusal_backoff_cap_s=_env_float(
             ENV_REFUSAL_BACKOFF_CAP, DEFAULT_REFUSAL_BACKOFF_CAP_S
         ),

@@ -643,3 +643,74 @@ class TestTheLadderIsSolvedNotConfigured(CustomTestCase):
             self.assertLessEqual(rung / centre, 2.0)
         worst = max(solved) / self._p_star(1001.0)
         self.assertAlmostEqual(worst, 2.045, places=2)
+
+
+class TestTheBootedLadderEqualsTheSolvedLadder(CustomTestCase):
+    """A solved number the boot silently replaces is the #584 defect itself.
+
+    `config_from_env` derived the break-even from the module CONSTANTS while
+    the surcharge read the environment, so one ladder was solved against two
+    different sets of numbers. Booting the measured 5.918 s seam produced
+    [7004, 19430, 21589, 22669, 23316] -- rung 0 unmoved, because the seam
+    knob never reached it. There was also no PP-rate knob at all, so the PP
+    prefill rate was the one input that could not be re-measured per
+    checkpoint.
+    """
+
+    ENV = {
+        "SGLANG_PHASE_POLICY_FLIP_COST_S": "5.918",
+        "SGLANG_PHASE_POLICY_TP_TOK_S": "1100",
+        "SGLANG_PHASE_POLICY_PP_TOK_S": "4036",
+        "SGLANG_PHASE_POLICY_DECODE_CONTENTION": "1.0",
+        "SGLANG_PHASE_POLICY_PP_WINDOW_S": "15",
+    }
+
+    def _cfg_from_env(self):
+        import dataclasses
+        import os
+        from unittest import mock
+
+        from sglang.srt.managers.phase_policy import config_from_env
+
+        with mock.patch.dict(os.environ, self.ENV, clear=False):
+            cfg = config_from_env(True)
+        return dataclasses.replace(cfg, prefill_runs_in_tp=True)
+
+    def test_the_measured_seam_reaches_rung_zero(self):
+        cfg = self._cfg_from_env()
+        self.assertEqual(cfg.flip_tokens, 8949)
+        self.assertNotEqual(cfg.flip_tokens, 7004)
+
+    def test_all_three_measurements_reach_the_config(self):
+        cfg = self._cfg_from_env()
+        self.assertAlmostEqual(cfg.flip_cost_s, 5.918)
+        self.assertAlmostEqual(cfg.tp_prefill_tok_s, 1100.0)
+        self.assertAlmostEqual(cfg.pp_prefill_tok_s, 4036.0)
+
+    def test_the_booted_ladder_is_the_solved_ladder(self):
+        cfg = self._cfg_from_env()
+        booted = [effective_flip_threshold(cfg, b) for b in range(5)]
+        self.assertEqual(booted, [8949, 13423, 14915, 15660, 16108])
+        # And not the half-solved ladder the mismatch produced.
+        self.assertNotEqual(booted, [7004, 19430, 21589, 22669, 23316])
+
+    def test_anti_thrash_survives_the_higher_rungs(self):
+        """Re-verified, as required: rungs only rose, so 8 small requests
+        still arm nothing."""
+        cfg = self._cfg_from_env()
+        state = PhasePolicyState()
+        now, pending, flips = 1000.0, 0, 0
+        for i in range(8):
+            pending += 600
+            now += 0.4
+            inp = PhasePolicyInputs(
+                phase=PHASE_TP,
+                pending_prefill_tokens=pending,
+                running_bs=min(i + 1, 4),
+                now=now,
+            )
+            observe_idle(state, inp)
+            if decide(cfg, state, inp).direction is not None:
+                flips += 1
+            pending = max(0, pending - 600)
+        self.assertEqual(flips, 0)
