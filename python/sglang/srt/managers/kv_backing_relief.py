@@ -89,7 +89,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,17 @@ _UNBOUNDED_ROWS = 1 << 40
 #: Rows this rung refuses to give up ON TOP of the live high-water mark, so a
 #: shrink leaves a pool that can still ADMIT. See :meth:`KvBackingRelief._floor_rows`.
 KV_ADMISSION_RESERVE_ENV = "SGLANG_KV_ADMISSION_RESERVE_ROWS"
+
+#: #662: may this rung lower the high-water mark by EVICTING recomputable
+#: prefix cache, rather than only releasing the slack above it?
+#:
+#: Defaults ON, because with it OFF the seam can only be funded by VRAM held
+#: free at rest -- which is the corridor-law breach this flag exists to end.
+#: It is kept as a flag purely so the CAN-FAIL PROOF is runnable on metal: at
+#: 0 the guard must refuse a flip from a corridor-filled pool, and at 1 the
+#: same flip must clear. A relief mechanism that has never been observed to
+#: change an outcome is indistinguishable from one that is never reached.
+KV_RADIX_EVICT_ENV = "SGLANG_KV_RADIX_EVICT_RELIEF"
 
 #: One chunked prefill on the shipped configuration (``chunked_prefill_size``
 #: 512), which is the exact allocation that raised when the floor reserved
@@ -528,10 +539,21 @@ class KvBackingRelief:
         buffers: int = 0,
         law_floor_bytes: int = 1024 * 1024 * 1024,
         admission_reserve_rows: int = DEFAULT_ADMISSION_RESERVE_ROWS,
+        tree_cache_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._pool = pool
         self._alloc = allocator
         self._live_slots_fn = live_slots_fn
+        #: #662: the id-targeted evictor that lowers ``max_live`` itself.
+        #: Without it this rung can only release backing NO row occupies --
+        #: the slack above the high-water mark -- which is precisely why the
+        #: seam had to be funded from VRAM held free at rest. Resolved per
+        #: call rather than captured: the tree cache is rebuilt on a flush,
+        #: and a stale reference would evict into a tree nobody reads.
+        self._tree_cache_fn = tree_cache_fn
+        #: Rows given up to the watermark actuator, cumulative, for the log.
+        self.evicted_rows_total = 0
+        self.evict_count = 0
         self._bytes_per_row = int(bytes_per_row)
         #: Number of arena buffers (2 x layer_num). The release granularity is
         #: one commit chunk in EACH of them, not one chunk overall.
@@ -708,6 +730,125 @@ class KvBackingRelief:
         )
         return int(math.ceil(floor / page) * page)
 
+    # -- #662: the watermark actuator -------------------------------------
+
+    def _evict_enabled(self) -> bool:
+        return os.environ.get(KV_RADIX_EVICT_ENV, "1") not in ("0", "false", "False")
+
+    def _tree_cache(self):
+        if self._tree_cache_fn is None:
+            return None
+        try:
+            return self._tree_cache_fn()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s tree cache unavailable: %s", LOG_PREFIX, e)
+            return None
+
+    def _resident_ceiling(self) -> int:
+        """Highest row a RESIDENT REQUEST pins, or -1 when none/unknown.
+
+        This is the half of the live set eviction cannot touch, and it is
+        therefore the true floor of the watermark. Read from the live-set
+        function's side channel (``last_split``), which the flip's own
+        enumeration already populates -- see build_flip_live_slots_fn.
+
+        AN UNREADABLE SPLIT RETURNS -1 AND THE CALLER MUST TREAT THAT AS
+        "DO NOT EVICT". Defaulting an unknown resident ceiling to 0 would
+        say "every row is evictable", which is the one wrong answer that
+        unmaps memory a live request is reading.
+        """
+        split = getattr(self, "_last_live_split", None)
+        if not split:
+            return -1
+        try:
+            return int(split.get("req_max", -1))
+        except Exception:  # pragma: no cover - defensive
+            return -1
+
+    def _evict_floor_rows(self, max_live: int) -> Tuple[int, int]:
+        """``(floor_rows, evictable_rows)`` if the mark were lowered.
+
+        The pair the proposal needs: how low this rank could cap once the
+        recomputable half of the live set is given up, and what that would
+        cost in rows. When eviction is unavailable, or the ceiling is
+        already pinned by resident requests, this degrades EXACTLY to
+        ``_floor_rows(max_live)`` with zero cost -- so a rank that cannot
+        evict proposes precisely what it proposed before this existed.
+        """
+        plain = self._floor_rows(max_live)
+        if not self._evict_enabled():
+            return plain, 0
+        tree = self._tree_cache()
+        if tree is None:
+            return plain, 0
+        req_max = self._resident_ceiling()
+        if req_max < 0:
+            # Unknown resident half: refuse to price an eviction at all.
+            return plain, 0
+        if req_max >= int(max_live):
+            # The mark is pinned by work in flight; nothing to win here.
+            return plain, 0
+        floor = self._floor_rows(req_max)
+        if floor >= plain:
+            return plain, 0
+        try:
+            from sglang.srt.managers.kv_radix_watermark import evictable_rows_above
+
+            rows, _nodes = evictable_rows_above(tree, max(0, floor - 1))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s could not price the watermark rung: %s", LOG_PREFIX, e)
+            return plain, 0
+        if rows <= 0:
+            return plain, 0
+        return floor, int(rows)
+
+    def _lower_watermark_to(self, target: int) -> int:
+        """Evict every recomputable row at or above ``target``. Rows freed.
+
+        Called on the SHRINK path only, immediately before the cap, so the
+        rows the cap is about to withhold are genuinely unoccupied by the
+        time it withholds them.
+        """
+        if not self._evict_enabled():
+            return 0
+        tree = self._tree_cache()
+        if tree is None:
+            return 0
+        req_max = self._resident_ceiling()
+        if req_max < 0:
+            return 0
+        try:
+            from sglang.srt.managers.kv_radix_watermark import evict_rows_above
+
+            # A cap of ``target`` rows admits ids strictly below ``target``,
+            # so the last id that may survive is ``target - 1``.
+            freed = int(
+                evict_rows_above(
+                    tree, max(0, int(target) - 1), resident_ceiling=req_max
+                )
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s watermark eviction failed: %s", LOG_PREFIX, e)
+            return 0
+        if freed > 0:
+            self.evicted_rows_total += freed
+            self.evict_count += 1
+            logger.info(
+                "%s EVICTED %d recomputable row(s) to bring the high-water "
+                "mark below %d on device %d (resident ceiling %d, %.1f MiB of "
+                "prefix cache given up, %d row(s) over %d seam(s) so far). "
+                "This is the seam's fund: content, not empty VRAM.",
+                LOG_PREFIX,
+                freed,
+                int(target),
+                self._device_index,
+                req_max,
+                freed * self._bytes_per_row / _MIB,
+                self.evicted_rows_total,
+                self.evict_count,
+            )
+        return freed
+
     def fundable_bytes(self) -> int:
         """Bytes this rank could return WITHOUT crossing its admission floor.
 
@@ -727,7 +868,13 @@ class KvBackingRelief:
         current = self._current_rows()
         if current <= 0:
             return 0
-        return max(0, current - self._floor_rows(max_live)) * self._bytes_per_row
+        # #662: quote the floor this rank could actually REACH, which
+        # includes the recomputable half of the live set. Quoting the plain
+        # floor here while the shrink path can go lower would understate the
+        # rung to its only caller, and an honest bound is the whole purpose
+        # of this method.
+        floor, _evictable = self._evict_floor_rows(max_live)
+        return max(0, current - floor) * self._bytes_per_row
 
     # -- the collective decision -----------------------------------------
 
@@ -784,7 +931,16 @@ class KvBackingRelief:
                 "FAULT"
             )
         self._clear_abstain()
-        floor_rows = self._floor_rows(max_live)
+        # #662: THE FLOOR IS NOW A CHOICE, NOT A READING. Without the
+        # watermark actuator the floor is wherever the cache happens to
+        # have left its highest id, and on a corridor-filled pool that is
+        # at or above ``current`` -- the rung then reports "no slack above
+        # the live set" and funds nothing, which is exactly why the seam
+        # had to be paid for in VRAM held free at rest. With it, the floor
+        # is the RESIDENT half of the live set, and the difference is
+        # recomputable prefix cache this rung may spend.
+        floor_rows, evictable_rows = self._evict_floor_rows(max_live)
+        self._last_evictable_rows = int(evictable_rows)
         desire = current
         # Hoisted so the diagnostic below can report the terms on the path
         # where the rung declines, which is the ONLY path it has ever taken.
@@ -1001,7 +1157,7 @@ class KvBackingRelief:
             return 0
         current = self._current_rows()
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
-        floor = self._floor_rows(max_live)
+        floor, _evictable = self._evict_floor_rows(max_live)
         rows_wanted = int(math.ceil(max(0, int(nbytes)) / self._bytes_per_row))
         # RELEASE IS EXTENT-GRANULAR, PER BUFFER, AND THAT IS COARSE.
         #
@@ -1031,6 +1187,14 @@ class KvBackingRelief:
         before = self._free_bytes()
         if self._rows_at_boot is None:
             self._rows_at_boot = current
+        # #662: EVICT FIRST, AND ONLY THEN CAP. The rows this cap is about
+        # to withhold must be unoccupied by the time it withholds them, and
+        # on a corridor-filled pool they are occupied by recomputable prefix
+        # cache. Evicting here rather than in the caller keeps the whole
+        # order -- evict, cap, unmap -- in one place, because it is the
+        # ORDER that is the safety property and splitting it across two
+        # modules is how it would come apart.
+        self._lower_watermark_to(target)
         # ORDER IS THE SAFETY PROPERTY: cap FIRST, unmap SECOND. Reversed,
         # there is a window in which the allocator may hand out an id whose
         # pages have already gone back to the driver.
@@ -1531,6 +1695,13 @@ def kv_backing_provider(
         buffers=n_buffers,
         law_floor_bytes=law_floor_bytes,
         admission_reserve_rows=_admission_reserve_rows(scheduler),
+        # #662: RESOLVED PER CALL, NEVER CAPTURED. The tree cache object is
+        # replaced on a flush (flush_cache builds a new one), and a rung
+        # holding the old reference would evict into a tree the scheduler no
+        # longer reads -- freeing rows the allocator still believes are
+        # cached. Reading it through the scheduler each time is the only
+        # form that cannot go stale.
+        tree_cache_fn=lambda: getattr(scheduler, "tree_cache", None),
     )
 
 
