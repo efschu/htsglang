@@ -7,12 +7,15 @@ one got the request and what the body looked like when it arrived.
 """
 
 import json
+import os
+import tempfile
 import unittest
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestServer
 
 from sglang.srt.entrypoints.anthropic.router import (
+    NOTHINK_ALIAS_SUFFIX,
     STATS_PATH,
     THINKING_ALIAS_SUFFIX,
     create_app,
@@ -20,6 +23,7 @@ from sglang.srt.entrypoints.anthropic.router import (
 
 LOCAL_MODEL = "Qwen3.6-27B"
 THINKING_ALIAS = LOCAL_MODEL + THINKING_ALIAS_SUFFIX
+NOTHINK_ALIAS = LOCAL_MODEL + NOTHINK_ALIAS_SUFFIX
 REMOTE_MODEL = "claude-opus-4-6"
 
 
@@ -367,6 +371,176 @@ class RouterTestCase(AioHTTPTestCase):
         await self.client.get(STATS_PATH)
         self.assertEqual(self.upstream["requests"], [])
         self.assertEqual(self.local["requests"], [])
+
+
+class ThinkingOnDefaultTestCase(AioHTTPTestCase):
+    """The Qwen3.8 arm: the PLAIN id defaults to thinking on, with effort.
+
+    The 3.6 arm is covered by RouterTestCase, whose app takes the defaults.
+    Everything here is about the flipped default and the effort encoding.
+    """
+
+    EFFORT = "medium"
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        self.policy_path = os.path.join(
+            tempfile.mkdtemp(prefix="router-policy-"), "policy.json"
+        )
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            thinking_enabled=True,
+            effort=self.EFFORT,
+            policy_file=self.policy_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    def _sent(self):
+        return self.local["requests"][-1]["body"]
+
+    # ---------- the flipped default ----------
+
+    async def test_plain_id_gets_adaptive_thinking(self):
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["thinking"], {"type": "adaptive"})
+
+    async def test_plain_id_gets_the_configured_effort(self):
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["output_config"]["effort"], self.EFFORT)
+
+    async def test_client_thinking_off_does_not_win_the_arm(self):
+        # The arm is the deployment's decision; the client's lever is the id.
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(LOCAL_MODEL, thinking={"type": "disabled"}),
+        )
+        self.assertEqual(self._sent()["thinking"], {"type": "adaptive"})
+
+    async def test_nothink_alias_reaches_the_cheap_arm(self):
+        await self.client.post("/v1/messages", json=self._body(NOTHINK_ALIAS))
+        sent = self._sent()
+        self.assertEqual(sent["thinking"], {"type": "disabled"})
+        self.assertEqual(sent["model"], LOCAL_MODEL)
+
+    async def test_nothink_alias_carries_no_effort(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(NOTHINK_ALIAS, output_config={"effort": "low"}),
+        )
+        self.assertNotIn("output_config", self._sent())
+
+    # ---------- effort override and encoding ----------
+
+    async def test_per_request_effort_overrides_the_default(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(LOCAL_MODEL, output_config={"effort": "low"}),
+        )
+        self.assertEqual(self._sent()["output_config"]["effort"], "low")
+
+    async def test_client_high_effort_becomes_the_omitted_field(self):
+        # "high"/"xhigh"/"max" would all reach the template as a value it
+        # rejects. The strongest arm is the ABSENT field, so that is what a
+        # client asking for maximum reasoning must be turned into.
+        for asked in ("high", "xhigh", "max"):
+            with self.subTest(asked=asked):
+                await self.client.post(
+                    "/v1/messages",
+                    json=self._body(LOCAL_MODEL, output_config={"effort": asked}),
+                )
+                self.assertNotIn("output_config", self._sent())
+
+    async def test_normalization_preserves_other_output_config_fields(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(
+                LOCAL_MODEL,
+                output_config={
+                    "effort": "max",
+                    "task_budget": {"type": "tokens", "total": 100},
+                },
+            ),
+        )
+        sent = self._sent()
+        self.assertNotIn("effort", sent["output_config"])
+        self.assertEqual(sent["output_config"]["task_budget"]["total"], 100)
+
+    async def test_think_alias_forces_effort_over_a_client_value(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(THINKING_ALIAS, output_config={"effort": "low"}),
+        )
+        self.assertEqual(self._sent()["output_config"]["effort"], self.EFFORT)
+
+    async def test_count_tokens_is_not_given_an_effort(self):
+        await self.client.post(
+            "/v1/messages/count_tokens", json=self._body(LOCAL_MODEL)
+        )
+        self.assertNotIn("output_config", self._sent())
+
+    # ---------- live policy file ----------
+
+    async def test_policy_file_flips_the_arm_without_a_restart(self):
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["thinking"], {"type": "adaptive"})
+
+        with open(self.policy_path, "w") as fh:
+            json.dump({"thinking": "off"}, fh)
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["thinking"], {"type": "disabled"})
+
+    async def test_policy_file_changes_the_effort_without_a_restart(self):
+        with open(self.policy_path, "w") as fh:
+            json.dump({"effort": "xhigh"}, fh)
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        # xhigh is the omitted field, so the strongest arm carries no key.
+        self.assertNotIn("output_config", self._sent())
+
+        os.utime(self.policy_path, None)
+        with open(self.policy_path, "w") as fh:
+            json.dump({"effort": "low"}, fh)
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["output_config"]["effort"], "low")
+
+    async def test_a_broken_policy_file_leaves_the_flags_standing(self):
+        with open(self.policy_path, "w") as fh:
+            fh.write("{not json")
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        sent = self._sent()
+        self.assertEqual(sent["thinking"], {"type": "adaptive"})
+        self.assertEqual(sent["output_config"]["effort"], self.EFFORT)
+
+    async def test_a_bad_effort_value_in_the_policy_file_is_ignored(self):
+        with open(self.policy_path, "w") as fh:
+            json.dump({"effort": "turbo"}, fh)
+        await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(self._sent()["output_config"]["effort"], self.EFFORT)
+
+    async def test_stats_report_the_effective_policy(self):
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["policy"]["thinking_enabled"], True)
+        self.assertEqual(stats["policy"]["effort"], self.EFFORT)
+        self.assertEqual(stats["nothink_aliases"], [NOTHINK_ALIAS])
 
 
 if __name__ == "__main__":
