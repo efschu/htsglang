@@ -118,12 +118,19 @@ class TestTheOldModelIsUntouchedWithoutTheMeasurement(CustomTestCase):
 
 class TestTheMeasuredModelMakesTheGateReachable(CustomTestCase):
     def test_sigma_one_gives_the_closed_form_ladder(self):
-        """N_eff = N x (1 + 2B) / (1 + B)."""
+        """N_eff = N0 x (1 + 2B) / (1 + B), with N0 the UNROUNDED break-even.
+
+        The threshold is solved from C, X and P rather than from the rounded
+        integer `flip_tokens`, so it does not inherit that rounding: N0 here
+        is 7004.23, and scaling the rounded 7004 instead would drift a token
+        or two per rung.
+        """
         cfg = _cfg(decode_contention=1.0)
+        n0 = C / (1.0 / 1681.0 - 1.0 / 7245.5)
         got = [effective_flip_threshold(cfg, b) for b in range(5)]
-        want = [int(round(N * (1 + 2 * b) / (1 + b))) for b in range(5)]
+        want = [int(round(n0 * (1 + 2 * b) / (1 + b))) for b in range(5)]
         self.assertEqual(got, want)
-        self.assertEqual(got, [7004, 10506, 11673, 12257, 12607])
+        self.assertEqual(got, [7004, 10506, 11674, 12257, 12608])
 
     def test_the_live_refusal_becomes_a_flip(self):
         cfg = _cfg(decode_contention=1.0)
@@ -169,11 +176,22 @@ class TestTheBoundIsStructural(CustomTestCase):
         """Past W x r_pp the prefill no longer fits one window, so the decode
         charge saturates at the window; the threshold must remain solvable."""
         cfg = _cfg(decode_contention=0.05)
+        pp_ceiling = W * 7245.5  # past this the prefill exceeds one window
+        prev = 0
         for bs in range(5):
             with self.subTest(bs=bs):
                 t = effective_flip_threshold(cfg, bs)
-                self.assertGreater(t, 0)
-                self.assertLess(t, 10_000_000)
+                self.assertGreaterEqual(t, N)
+                self.assertGreaterEqual(t, prev)  # still monotonic out here
+                # A real bound, not just "not infinity": even at the weakest
+                # contention this model accepts, four stranded decodes stay
+                # inside a few window-fulls of prefill.
+                self.assertLess(t, 4 * pp_ceiling)
+                prev = t
+
+    def test_a_negative_window_is_refused_rather_than_read_as_disabled(self):
+        with self.assertRaises(PhasePolicyError):
+            _cfg(decode_contention=1.0, pp_window_s=-1.0)
 
     def test_purity_strict_still_collapses_to_zero(self):
         cfg = _cfg(decode_contention=1.0, prefill_runs_in_tp=False)
@@ -187,21 +205,31 @@ class TestTheBoundIsStructural(CustomTestCase):
         divides out, so the threshold depends only on the break-even and the
         number of decodes -- nothing here needs re-measuring after a re-ship.
         """
+        from sglang.srt.managers.phase_policy import break_even_tokens
+
         ladders = [(1681.0, 7245.5), (1194.0, 7245.5), (1322.0, 6842.6)]
         for bs in range(5):
-            got = {
-                effective_flip_threshold(
-                    _cfg(
-                        decode_contention=1.0,
-                        tp_prefill_tok_s=tp,
-                        pp_prefill_tok_s=pp,
-                    ),
-                    bs,
+            shape = set()
+            for tp, pp in ladders:
+                # A real re-ship re-derives N from the new ladder; holding
+                # flip_tokens fixed across ladders would test nothing but the
+                # algebra of a substitution.
+                n0 = break_even_tokens(C, tp, pp)
+                cfg = _cfg(
+                    decode_contention=1.0,
+                    flip_tokens=n0,
+                    tp_prefill_tok_s=tp,
+                    pp_prefill_tok_s=pp,
                 )
-                for tp, pp in ladders
-            }
+                got = effective_flip_threshold(cfg, bs)
+                shape.add(round(got / (C / (1.0 / tp - 1.0 / pp)), 3))
             with self.subTest(bs=bs):
-                self.assertEqual(len(got), 1, f"ladder-dependent at bs={bs}")
+                # The threshold is always the same MULTIPLE of that ladder's
+                # own break-even, so nothing but N needs re-deriving.
+                self.assertEqual(len(shape), 1, f"ladder-dependent at bs={bs}")
+                self.assertAlmostEqual(
+                    shape.pop(), (1 + 2 * bs) / (1 + bs), places=2
+                )
 
 
 class TestTheMeasurementIsValidated(CustomTestCase):
@@ -247,6 +275,96 @@ class TestAntiThrashStillHolds(CustomTestCase):
                 self.assertIsNone(_drive(cfg, N - 1, bs).direction)
 
 
+class TestTheShippedDefaultWindow(CustomTestCase):
+    """`pp_window_s` DEFAULTS TO 0, and every other test here overrides it.
+
+    Found in review, not by the suite. With the window disabled the old code
+    bypassed the regime-A validity check entirely, so as `den_a` approached
+    its singularity from above the threshold spiked, and the moment `den_a`
+    went negative it fell into regime B -- which reads `W = 0` as "stranding
+    is free", the exact opposite of what an absent window means. The result
+    was a spike to 548,049 tokens at running_bs 5 (worse than the 138,329 this
+    branch exists to remove) followed by a ~497,000-token CLIFF down to 51,117
+    at running_bs 6: a busier server becoming drastically more eager to flip.
+    """
+
+    LADDER_SIGMA_01 = [7004, 25373, 53365, 101225, 201739, 548049, 51117, 54963]
+
+    def _cfg0(self, sigma):
+        return PhasePolicyConfig(
+            enabled=True,
+            flip_tokens=N,
+            flip_cost_s=C,
+            pp_window_s=0.0,  # the SHIPPED default
+            decode_contention=sigma,
+            prefill_runs_in_tp=True,
+        )
+
+    def test_the_ladder_is_monotonic_with_the_window_disabled(self):
+        for sigma in (0.05, 0.1, 0.25, 0.5, 1.0):
+            cfg = self._cfg0(sigma)
+            rungs = [effective_flip_threshold(cfg, b) for b in range(12)]
+            with self.subTest(sigma=sigma):
+                self.assertEqual(rungs, sorted(rungs), f"non-monotonic: {rungs}")
+
+    def test_the_specific_cliff_is_gone(self):
+        cfg = self._cfg0(0.1)
+        rungs = [effective_flip_threshold(cfg, b) for b in range(8)]
+        self.assertNotEqual(rungs, self.LADDER_SIGMA_01)
+        # bs 5 -> 6 was the cliff: 548049 -> 51117.
+        self.assertGreaterEqual(rungs[6], rungs[5])
+
+    def test_never_repaying_is_said_plainly_rather_than_approximated(self):
+        """Below the contention where a flip can ever repay an unbounded PP
+        residency, the answer is 'never' -- not a large finite number that
+        happens to look like a threshold, and not a small one."""
+        from sglang.srt.managers.phase_policy import UNREACHABLE_FLIP_THRESHOLD
+
+        cfg = self._cfg0(0.1)
+        self.assertEqual(
+            effective_flip_threshold(cfg, 6), UNREACHABLE_FLIP_THRESHOLD
+        )
+
+    def test_a_measured_full_stall_still_flips_with_no_window(self):
+        """sigma = 1 is the measured case, and it must stay reachable even
+        with the fairness window off."""
+        cfg = self._cfg0(1.0)
+        for bs in range(6):
+            with self.subTest(bs=bs):
+                self.assertLessEqual(effective_flip_threshold(cfg, bs), 2 * N)
+
+
+class TestItDoesNotDependOnAStaleBreakEven(CustomTestCase):
+    """The surcharge is solved from C, X and P, not by cancelling N0.
+
+    `config_from_env` derives the default N from the module constant
+    DEFAULT_FLIP_COST_S while `flip_cost_s` is separately overridable, and an
+    operator may pin `flip_tokens` outright -- so `flip_tokens` need not be
+    the break-even of the seam cost actually configured. Substituting it into
+    the formula would then under-threshold silently, arming flips that do not
+    repay the real seam.
+    """
+
+    def test_a_re_measured_seam_moves_the_threshold(self):
+        cheap = _cfg(decode_contention=1.0, flip_cost_s=3.2)
+        dear = _cfg(decode_contention=1.0, flip_cost_s=5.0)
+        for bs in range(1, 5):
+            with self.subTest(bs=bs):
+                self.assertGreater(
+                    effective_flip_threshold(dear, bs),
+                    effective_flip_threshold(cheap, bs),
+                )
+
+    def test_a_stale_flip_tokens_cannot_lower_the_bar(self):
+        """flip_tokens left at the 3.2 s break-even while the seam is really
+        5.0 s must not produce the 3.2 s ladder."""
+        stale = _cfg(decode_contention=1.0, flip_cost_s=5.0, flip_tokens=7004)
+        got = [effective_flip_threshold(stale, b) for b in range(5)]
+        self.assertNotEqual(got, [7004, 10506, 11673, 12257, 12607])
+        # 5.0/3.2 = 1.5625x the seam, so every rung above B=0 scales with it.
+        self.assertAlmostEqual(got[2] / 11673.0, 5.0 / 3.2, places=2)
+
+
 class TestTheLiveCaptureReplay(CustomTestCase):
     """Replay of a capture taken from the running instance, 2026-08-15.
 
@@ -281,7 +399,7 @@ class TestTheLiveCaptureReplay(CustomTestCase):
             if _drive(cfg, n, self.RUNNING_BS).direction is not None
         ]
         self.assertEqual(armed, [19957, 31221, 42997, 55797, 69109])
-        self.assertEqual(effective_flip_threshold(cfg, self.RUNNING_BS), 11673)
+        self.assertEqual(effective_flip_threshold(cfg, self.RUNNING_BS), 11674)
 
 
 class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
