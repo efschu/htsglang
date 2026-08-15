@@ -501,7 +501,9 @@ class Scheduler(
             if self.phase_policy_cfg.pp_exit_tokens <= 0:
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg,
-                    pp_exit_tokens=int(self.server_args.chunked_prefill_size or 0),
+                    pp_exit_tokens=int(
+                        getattr(server_args, "chunked_prefill_size", 0) or 0
+                    ),
                 )
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
