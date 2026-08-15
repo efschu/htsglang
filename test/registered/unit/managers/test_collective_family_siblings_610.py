@@ -373,9 +373,7 @@ def make_hiradix(collective, controller, symmetric=True):
     cache._get_extra_pools = lambda: {}
     cache.evict_host = lambda n: None
     cache._hicache_prefetch_symmetric = lambda: symmetric
-    cache._all_reduce_attn_groups = lambda t, op, **kwargs: collective.all_reduce(
-        t, op
-    )
+    cache._all_reduce_attn_groups = lambda t, op, **kwargs: collective.all_reduce(t, op)
     return cache
 
 

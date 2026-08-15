@@ -465,9 +465,7 @@ def test_the_armed_intake_services_and_never_blocks_on_any_rank(pp_rank):
         "an armed rank admitted work or returned None; empty means 'no new "
         "work this pass', which every later step already handles"
     )
-    assert calls == [pp_rank], (
-        "the armed intake skipped its service turn on this rank"
-    )
+    assert calls == [pp_rank], "the armed intake skipped its service turn on this rank"
 
 
 def test_the_receiver_wiring_actually_publishes_the_consumed_count(tmp_path):
@@ -634,8 +632,8 @@ def test_the_falling_edge_reports_and_rearms(tmp_path):
     for i in range(5):
         tick(i % 3)
     s._armed = False
-    tick(1)          # the falling edge: reports the group
-    tick(1)          # and does not report again
+    tick(1)  # the falling edge: reports the group
+    tick(1)  # and does not report again
     s._armed = True
     tick(0)
 

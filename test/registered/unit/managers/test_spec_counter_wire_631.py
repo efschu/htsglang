@@ -120,9 +120,7 @@ class TestSpecCounterWireSurvivesThePpFinish(unittest.TestCase):
         never verified -- that zero is what the `> 0` check downstream
         keys on.
         """
-        acc = _acc(
-            spec_configured=True, spec_algorithm=SpeculativeAlgorithm.NONE
-        )
+        acc = _acc(spec_configured=True, spec_algorithm=SpeculativeAlgorithm.NONE)
         acc.accept(req=_FakeReq("r0", [1], verify_ct=0))
         acc.accept(req=_FakeReq("r1", [2, 3], verify_ct=5, correct_drafts=9))
         acc.accept(req=_FakeReq("r2", [4], verify_ct=0))
@@ -141,9 +139,7 @@ class TestSpecCounterWireSurvivesThePpFinish(unittest.TestCase):
         This is what the live-phase gate did on every PP-finishing
         request: silent, answer-preserving, evidence-destroying.
         """
-        acc = _acc(
-            spec_configured=False, spec_algorithm=SpeculativeAlgorithm.NONE
-        )
+        acc = _acc(spec_configured=False, spec_algorithm=SpeculativeAlgorithm.NONE)
         acc.accept(req=_FakeReq("r0", [1, 2, 3], verify_ct=4, correct_drafts=7))
         payload = acc.to_payload(dp_rank=0, is_idle_batch=False)
         self.assertEqual(
@@ -160,9 +156,7 @@ class TestSpecCounterWireSurvivesThePpFinish(unittest.TestCase):
         unchanged: no speculative_algorithm, no counters, exactly as
         before.
         """
-        acc = _acc(
-            spec_configured=False, spec_algorithm=SpeculativeAlgorithm.NONE
-        )
+        acc = _acc(spec_configured=False, spec_algorithm=SpeculativeAlgorithm.NONE)
         acc.accept(req=_FakeReq("r0", [1]))
         acc.accept(req=_FakeReq("r1", [2]))
         payload = acc.to_payload(dp_rank=0, is_idle_batch=False)

@@ -237,7 +237,9 @@ class TheProviderBindsLateTest(unittest.TestCase):
         s.phase_flip_spill_ladder._weights = _Carrier()
         self.assertEqual(provider(1 << 30), int(286.0 * MIB))
 
-    def test_an_already_spilled_carrier_yields_nothing_rather_than_double_counting(self):
+    def test_an_already_spilled_carrier_yields_nothing_rather_than_double_counting(
+        self,
+    ):
         class _Carrier:
             spilled = True
 
@@ -250,9 +252,7 @@ class TheProviderBindsLateTest(unittest.TestCase):
         class _S:
             phase_flip_spill_ladder = _Ladder()
 
-        self.assertEqual(
-            phase_flip_spill._late_bound_draft_provider(_S())(1 << 30), 0
-        )
+        self.assertEqual(phase_flip_spill._late_bound_draft_provider(_S())(1 << 30), 0)
 
 
 class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):

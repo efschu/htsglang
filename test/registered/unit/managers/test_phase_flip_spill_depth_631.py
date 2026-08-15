@@ -140,15 +140,11 @@ class ReleaseAllocatorCacheTest(unittest.TestCase):
     def test_depth_one_reclaims_and_reports_delta_for_the_named_device(self):
         calls = []
         with _patched_torch(calls, free_seq=[1000, 3500]):
-            got = spill.release_allocator_cache(
-                "pp_to_tp", depth=1, device_index=2
-            )
+            got = spill.release_allocator_cache("pp_to_tp", depth=1, device_index=2)
         # Both reads name device 2 EXPLICITLY. Every worker in this deployment
         # sees all three cards, so a current-device read can report a card the
         # rank does not own -- which is exactly the bug this pins.
-        self.assertEqual(
-            calls, ["mem_get_info:2", "empty_cache", "mem_get_info:2"]
-        )
+        self.assertEqual(calls, ["mem_get_info:2", "empty_cache", "mem_get_info:2"])
         self.assertEqual(got, 2500)
         self.assertNotIn("current_device", calls)
 
@@ -209,8 +205,12 @@ class SeamOrderingTest(unittest.TestCase):
         log = self._run("none", "pp_to_tp")
         self.assertEqual(
             log,
-            ["release:pp", "mark:backing_release", "restore:tp",
-             "mark:backing_restore"],
+            [
+                "release:pp",
+                "mark:backing_release",
+                "restore:tp",
+                "mark:backing_restore",
+            ],
         )
         self.assertNotIn("reclaim", log)
 
@@ -218,9 +218,14 @@ class SeamOrderingTest(unittest.TestCase):
         log = self._run("cache", "pp_to_tp")
         self.assertEqual(
             log,
-            ["release:pp", "mark:backing_release", "reclaim",
-             "mark:allocator_cache_release", "restore:tp",
-             "mark:backing_restore"],
+            [
+                "release:pp",
+                "mark:backing_release",
+                "reclaim",
+                "mark:allocator_cache_release",
+                "restore:tp",
+                "mark:backing_restore",
+            ],
         )
         # Stated as an ordering invariant too, so a future refactor that keeps
         # every element but permutes them fails here with a readable message.
@@ -231,9 +236,14 @@ class SeamOrderingTest(unittest.TestCase):
         log = self._run("cache", "tp_to_pp")
         self.assertEqual(
             log,
-            ["release:tp", "mark:backing_release", "reclaim",
-             "mark:allocator_cache_release", "restore:pp",
-             "mark:backing_restore"],
+            [
+                "release:tp",
+                "mark:backing_release",
+                "reclaim",
+                "mark:allocator_cache_release",
+                "restore:pp",
+                "mark:backing_restore",
+            ],
         )
 
     def test_a_bad_depth_is_refused_at_wiring_time_not_mid_cutover(self):
@@ -309,6 +319,7 @@ class _patched_torch:
 if __name__ == "__main__":
     unittest.main()
 
+
 class TheDocstringMatchesTheLadderTest(unittest.TestCase):
     """The ladder is described in three places -- the module docstring's flag
     list, its rung table, and the refusal message -- and all three drifted the
@@ -347,7 +358,6 @@ class TheDocstringMatchesTheLadderTest(unittest.TestCase):
         msg = str(cm.exception)
         implemented = spill.DEPTH_NAMES_BY_VALUE[spill.IMPLEMENTED_DEPTH]
         self.assertIn(f"{implemented!r}", msg)
-
 
 
 # ---------------------------------------------------------------------------

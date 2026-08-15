@@ -2518,9 +2518,41 @@ class PhaseFlipRuntime:
         # refusal is an event every rank sees.
         self._arm_seq = getattr(self, "_arm_seq", 0) + 1
         if self.blocking_guards:
-            msg = f"phase flip refused (guards): {', '.join(self.blocking_guards)}"
-            logger.warning("%s %s", LOG_PREFIX, msg)
-            return False, msg
+            # #662: THE THIRD DAMPER ON THE SAME PATH, and the last one.
+            #
+            # The policy hold and the seam's own abandon counter both learned
+            # to stand down while the arming condition persists; this one then
+            # blocked every entry anyway, so the seam was never re-priced.
+            # Measured: arms climbed 22, 23, 24, 25 against "seam unfundable:
+            # tp_to_pp abandoned 8 times consecutively" with 92k tokens
+            # pending. Three independent counters guarding one decision is how
+            # a fix keeps looking wrong after it is right.
+            #
+            # The abandon-cap guard is the only one that stands down: it is a
+            # statement about affordability, and affordability is exactly what
+            # a full pool changes. Every other blocking guard is a statement
+            # about SAFETY (a half-built stack, a missing carrier) and keeps
+            # refusing, because no amount of pending work makes those safe.
+            standing = [
+                g
+                for g in self.blocking_guards
+                if not g.startswith(SEAM_ABANDON_CAP_GUARD)
+            ]
+            if standing or not self._arming_condition_persists():
+                msg = (
+                    "phase flip refused (guards): "
+                    f"{', '.join(standing or self.blocking_guards)}"
+                )
+                logger.warning("%s %s", LOG_PREFIX, msg)
+                return False, msg
+            logger.info(
+                "%s abandon-cap guard STOOD DOWN at arm %d: work is still "
+                "waiting, so the seam is re-priced instead of refused unheard. "
+                "Affordability is what a full pool changes; safety guards are "
+                "unaffected and still refuse.",
+                LOG_PREFIX,
+                self._arm_seq,
+            )
         if direction not in _DIR_ID:
             return False, f"unknown flip direction {direction!r}"
         # #485: DAMP A REFUSAL THAT CANNOT CHANGE. Declining here rather than

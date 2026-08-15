@@ -276,9 +276,9 @@ def test_filter_batch_rebinds_are_still_what_this_file_assumes():
     src = inspect.getsource(ScheduleBatch.filter_batch)
     assert "not self.reqs[i].finished()" in src, "keep-criterion changed"
     assert "self.reqs = []" in src, "empty branch no longer rebinds"
-    assert (
-        "self.reqs = [self.reqs[i] for i in keep_indices]" in src
-    ), "survivor branch no longer rebinds"
+    assert "self.reqs = [self.reqs[i] for i in keep_indices]" in src, (
+        "survivor branch no longer rebinds"
+    )
     assert "self.return_logprob = any(" in src, "return_logprob no longer recomputed"
 
 

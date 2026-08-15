@@ -603,9 +603,16 @@ class ProposalTraceReasonTest(unittest.TestCase):
         # deficit is negative and "the cheaper tier covers the gap" is the
         # honest answer whatever the arena has done -- exhaustion only has
         # anything to say when the rung is being asked to pay.
-        pool = _FakePool(rows=1000)
-        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(100))
-        r._mark_exhausted(target=1)  # failed at the deepest possible ask
+        #
+        # AND a small live-set gap, because SLACK now overrides the marker:
+        # when the rows in front of the rung dwarf the ask, one earlier
+        # failure is not decisive and it tries anyway. Here the pool is nearly
+        # all live, so there is nothing to try with and the marker stands.
+        pool = _FakePool(rows=1000)  # chunkless: no extent can clear, so the
+        r = _relief(  # marker stands and slack is not evidence
+            pool, _FakeAllocator(1000), live=(5,), card=_Card(100)
+        )
+        r._mark_exhausted(target=1)
         out = self._propose_and_capture(r)
         self.assertIn("returned no driver bytes at a shrink to", out)
         self.assertNotIn("the cheaper tier covers the whole gap", out)

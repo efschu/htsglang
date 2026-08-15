@@ -56,9 +56,7 @@ class FakeKVPool:
     def __init__(self, layer_num=1, start_layer=0, alias_value=False):
         self.layer_num = layer_num
         self.start_layer = start_layer
-        self._k = [
-            torch.full((N_SLOTS, 4), float(7 + i)) for i in range(layer_num)
-        ]
+        self._k = [torch.full((N_SLOTS, 4), float(7 + i)) for i in range(layer_num)]
         self._v = (
             self._k
             if alias_value
@@ -89,9 +87,7 @@ class FakeBatch:
         # it. Defaults to each request's last output token, which is what
         # the two clocks look like when they AGREE.
         if input_ids is None:
-            input_ids = [
-                (r.output_ids or r.origin_input_ids)[-1] for r in self.reqs
-            ]
+            input_ids = [(r.output_ids or r.origin_input_ids)[-1] for r in self.reqs]
         self.input_ids = torch.tensor(input_ids, dtype=torch.int64)
 
 
@@ -157,9 +153,7 @@ def test_can_fail_committed_slots_would_overrun_on_req_seqlen():
     """
     sched, _ = make_scheduler()
     batch = make_batch()
-    seqlens = [
-        len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs
-    ]
+    seqlens = [len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs]
     assert seqlens == [4, 4]
     overrun = [
         sched.req_to_token_pool.req_to_token[r.req_pool_idx, :n].tolist()

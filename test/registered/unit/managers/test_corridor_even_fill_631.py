@@ -151,9 +151,7 @@ class TierBeatsCostTest(unittest.TestCase):
 
             return f
 
-        g.register(
-            "kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST
-        )
+        g.register("kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST)
         g.register(
             "rebalance",
             99,
@@ -179,9 +177,7 @@ class TierBeatsCostTest(unittest.TestCase):
         # Each provider is deliberately too small to satisfy the ask alone,
         # so the gate must walk the whole ladder and the order is observable.
         g.register("kvso", 1, spy("kvso", fleet.provider(0, 400)), tier=cg.RELIEF_HOST)
-        g.register(
-            "park", 1, spy("park", fleet.provider(0, 400)), tier=cg.RELIEF_PARK
-        )
+        g.register("park", 1, spy("park", fleet.provider(0, 400)), tier=cg.RELIEF_PARK)
         g.register(
             "rebalance",
             1,
@@ -379,7 +375,9 @@ class WhenRefusingIsFatalTest(unittest.TestCase):
 
         g.register("kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST)
         g.register(
-            "rebalance", 99, spy("rebalance", fleet.provider(0, 4000)),
+            "rebalance",
+            99,
+            spy("rebalance", fleet.provider(0, 4000)),
             tier=cg.RELIEF_REBALANCE,
         )
         r = g.ensure_headroom(900 * MIB, refusal_is_fatal=True)
@@ -432,7 +430,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         # NOTHING here, and that inaction is what the 19 MiB margin was.
         fleet = _Fleet([1100, 3000, 1600])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 0, _Clock())
 
         result = lender.maybe_lend("test")
@@ -449,7 +449,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         # card that is no longer the tightest -- the same unevenness, mirrored.
         fleet = _Fleet([1100, 3000, 1600])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 0, _Clock())
 
         result = lender.maybe_lend("test")
@@ -472,7 +474,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
 
             return wrapped
 
-        g.register("cache", 10, spy("cache", fleet.provider(0, 40)), tier=cg.RELIEF_LOCAL)
+        g.register(
+            "cache", 10, spy("cache", fleet.provider(0, 40)), tier=cg.RELIEF_LOCAL
+        )
         g.register("kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST)
         # PARK is reachable and must stay so: parking a cold payload in a peer
         # card's surplus VRAM IS the redistribution item 16 asks for. This
@@ -496,7 +500,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         # mean. Evacuating it would make the column less level, not more.
         fleet = _Fleet([800, 1200, 800])
         g = _guard(fleet, 1)
-        g.register("draft-weights", 20, fleet.provider(1, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(1, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 1, _Clock())
 
         self.assertIsNone(lender.maybe_lend("test"))
@@ -509,7 +515,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         # drafter restore for it would be thrash with a levelling excuse.
         fleet = _Fleet([1200, 1250, 1230])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 0, _Clock())
 
         self.assertIsNone(lender.maybe_lend("test"))
@@ -521,7 +529,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         # GOAL, not a defect. The trigger is the gate's own signal.
         fleet = _Fleet([4000, 9000, 4000])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 0, _Clock())
 
         self.assertIsNone(lender.maybe_lend("test"))
@@ -534,7 +544,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
         g = cg.CorridorGuard(
             0, floor_mib=1024, delta_mib=256, probe=fleet.probe(0), fleet_probe=list
         )
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         lender = _lender(g, 0, _Clock())
 
         self.assertIsNone(lender.maybe_lend("test"))
@@ -544,7 +556,9 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
     def test_the_rate_limiter_holds_the_hot_path(self):
         fleet = _Fleet([1100, 3000, 1600])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         clock = _Clock()
         lender = _lender(g, 0, clock)
 
@@ -666,7 +680,9 @@ class TheLenderIsCachedAndReportsItsOwnInertnessTest(unittest.TestCase):
     def test_the_inert_report_stops_once_the_lender_actually_lends(self):
         fleet = _Fleet([1100, 3000, 1600])
         g = _guard(fleet, 0)
-        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        g.register(
+            "draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE
+        )
         clock = _Clock()
         lender = _lender(g, 0, clock)
         lender.maybe_lend("lends")
