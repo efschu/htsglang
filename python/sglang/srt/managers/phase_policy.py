@@ -191,7 +191,11 @@ ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
 #
 # `decode_contention` is that measurement: the fraction of decode throughput
 # lost while a prefill is co-resident in TP. 1.0 = decode stops dead, which is
-# what this scheduler does with --disable-overlap-schedule. 0.0 means "not
+# what this scheduler does unconditionally: batch selection reads `if
+# new_batch is not None: # Run prefill first if possible`, so an iteration
+# with any prefill chunk pending runs THAT batch and never reaches the decode
+# branch. That is absolute prefill priority per iteration, not a property of
+# --disable-overlap-schedule or any other flag. 0.0 means "not
 # measured here" and keeps the old surcharge byte-identically, the same
 # measurement gate `flip_cost_s` already uses.
 #
@@ -485,13 +489,16 @@ def _differential_flip_threshold(
     on the prefill ladder. That matters operationally: this rig re-ships
     the serving instance on re-solved memory and KV vectors, and a calibration that
     needed ``r`` re-measured after every such change would be stale the moment
-    it landed. sigma = 1 is not a fitted constant either; it is what
-    ``--disable-overlap-schedule`` structurally does -- a prefill batch and a
-    decode batch cannot occupy the same step, so decode STOPS. Measured 1.000
-    at running_bs 2 and 3, on both the loose and the law-fitted vector, with
-    A-vs-A noise floors of 0.4 % and 0.0 %. ``r`` is consulted only for a
-    partial sigma, where a deployment that really does interleave would need
-    its own ladder anyway.
+    it landed. sigma = 1 is not a fitted constant either; it is what this
+    scheduler does by construction. Batch selection reads ``if new_batch is
+    not None: # Run prefill first if possible``, so an iteration with any
+    prefill chunk pending runs THAT batch and never reaches the decode
+    branch -- absolute prefill priority per iteration, decode getting zero
+    steps until the backlog is chunked through. Measured 1.000 at running_bs
+    2 and 3, on both the loose and the law-fitted vector, with A-vs-A noise
+    floors of 0.4 % and 0.0 %. ``r`` is consulted only for a partial sigma,
+    where a deployment that really does interleave would need its own ladder
+    anyway.
     """
     tp_tok_s = float(cfg.tp_prefill_tok_s)
     pp_tok_s = float(cfg.pp_prefill_tok_s)
