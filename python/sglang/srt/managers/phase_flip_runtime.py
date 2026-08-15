@@ -2545,6 +2545,15 @@ class PhaseFlipRuntime:
                 )
                 logger.warning("%s %s", LOG_PREFIX, msg)
                 return False, msg
+            if not self._storm_limiter_allows(direction):
+                msg = (
+                    f"phase flip {direction}: abandon-cap guard would stand "
+                    "down, but the arm RATE limiter is holding this attempt. "
+                    "Re-pricing is paced, never blocked -- the next attempt "
+                    "runs on schedule."
+                )
+                logger.debug("%s %s", LOG_PREFIX, msg)
+                return False, msg
             logger.info(
                 "%s abandon-cap guard STOOD DOWN at arm %d: work is still "
                 "waiting, so the seam is re-priced instead of refused unheard. "
@@ -4664,6 +4673,56 @@ class PhaseFlipRuntime:
             f"flip; serving continues in this layout and the flip is "
             f"retried when occupancy drops. " + self._kv_rung_verdict()
         )
+
+    #: Minimum seconds between arm ATTEMPTS on one direction while a damper is
+    #: standing down. Not a latch: it paces re-pricing, it never stops it, and
+    #: an attempt that made PROGRESS resets it to zero so a funding run is
+    #: never throttled.
+    SEAM_ARM_MIN_INTERVAL_S = 2.0
+
+    def _storm_limiter_allows(self, direction: str) -> bool:
+        """Pace arm attempts without ever blocking a funded one.
+
+        THE STORM IS REAL AND SO IS THE FIX THAT CAUSED IT. Removing three
+        dampers made the seam re-priceable, which is what let it fund at high
+        occupancy -- and also let arms run at ~20/min where boot E's pathology
+        was 179 in nine minutes. F1's pin is right to call that a storm.
+
+        A LATCH IS THE WRONG SHAPE, which is the whole lesson of this ticket:
+        every latch here blocked re-pricing while the arming condition
+        persisted, and each one cost the prefill layout. So this is a RATE
+        limiter. It bounds attempts per direction in time and nothing else:
+
+        * it never refuses because of a COUNT, only because of an interval;
+        * an attempt that made progress -- a completed flip, or a KV release
+          that moved the driver -- clears the interval immediately, so a run
+          that is actually funding is never throttled;
+        * it applies only where a damper is already standing down, so the
+          ordinary path is untouched.
+
+        The result is that a seam which CAN fund keeps funding at full speed,
+        and a seam which cannot stops burning a core on it.
+        """
+        now = time.monotonic()
+        if not hasattr(self, "_seam_last_arm_at"):
+            self._seam_last_arm_at = {}
+        last = self._seam_last_arm_at.get(direction)
+        if last is not None and (now - last) < self.SEAM_ARM_MIN_INTERVAL_S:
+            return False
+        self._seam_last_arm_at[direction] = now
+        return True
+
+    def note_seam_progress(self, direction: str) -> None:
+        """A flip completed or the rung released bytes: stop pacing this one.
+
+        Called on the paths that represent real progress, so the limiter can
+        never throttle a direction that is successfully funding itself.
+        """
+        try:
+            if hasattr(self, "_seam_last_arm_at"):
+                self._seam_last_arm_at.pop(direction, None)
+        except Exception:  # pragma: no cover - pacing must not raise
+            pass
 
     def _arming_condition_persists(self) -> bool:
         """Is there still work waiting that wants the other layout?
