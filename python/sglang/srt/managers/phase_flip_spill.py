@@ -1278,8 +1278,43 @@ def _cached_relief_estimate(device_index: int) -> int:
         return 0
 
 
-#: The only leg on which the KV rung may shrink. See the driver's docstring.
+#: The leg on which the KV rung shrinks WITHOUT QUESTION. See the driver's
+#: docstring.
 KV_RELIEF_DIRECTION = "pp_to_tp"
+
+#: #662: may the rung ALSO fund the ``tp_to_pp`` leg?
+#:
+#: It must, or that leg has no funder at all. Measured on metal 2026-08-15,
+#: max-KV vector, corridor at its law: every tp_to_pp arm abandoned with
+#: "seam entry margin short: want 2194 MiB, free 2892 -> 3098 MiB, reclaimed
+#: 206 MiB from [allocator-cache]" -- 206 MiB of torch cache against a
+#: 2194 MiB ask, because the exclusion below set ``relief = None`` and
+#: allocator-cache is the only other tier that pays. Eight such abandons
+#: install the "seam unfundable" guard and THE INSTANCE NEVER ENTERS THE
+#: PREFILL LAYOUT AGAIN -- which is exactly the reported defect: long
+#: prompts prefilled at TP speed because the stack could not leave TP.
+#:
+#: The original exclusion's reasoning is sound about COST and wrong about
+#: necessity. It says a shrink here "would be undone within the same flip"
+#: by the post-cutover ``recover_kv_backing``. True -- and that undo is the
+#: price of the flip happening at all. A cuMemCreate on the recovery path is
+#: strictly better than a phase the instance can never reach.
+#:
+#: THE POOL IS INACTIVE AT THIS POINT, which is what makes it safe. The gate
+#: runs BEFORE the cutover, so during the TP phase the PP layout's pool is
+#: holding nothing and its backing is spendable -- the same argument the
+#: pp_to_tp leg already makes about the TP phase. On this rig the pp_to_tp
+#: leg had already left it at 413910 rows against a floor of 635, so the
+#: bytes the tp_to_pp seam needed were sitting there unbacked-by-anything
+#: and simply unreachable.
+#:
+#: 0 restores the shipped one-leg behaviour exactly, as a VALUE of the same
+#: term rather than a second code path.
+ENV_FUND_TP_TO_PP = "SGLANG_SEAM_FUND_TP_TO_PP"
+
+
+def _may_fund_tp_to_pp() -> bool:
+    return os.environ.get(ENV_FUND_TP_TO_PP, "1") not in ("0", "false", "False")
 
 
 def collective_kv_backing_relief(
@@ -1364,7 +1399,7 @@ def collective_kv_backing_relief(
     # cannot silently disable it, which is exactly how the recovery came to be
     # rank-local in the first place.
     cap_relief = relief
-    if str(direction) != KV_RELIEF_DIRECTION:
+    if str(direction) != KV_RELIEF_DIRECTION and not _may_fund_tp_to_pp():
         # ONE LEG ONLY, and the asymmetry is structural rather than cautious.
         #
         # The scheduler's KV pool is the PP LAYOUT'S pool. Capping it on the
