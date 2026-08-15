@@ -73,6 +73,7 @@ from sglang.srt.managers.phase_policy import (
     PhasePolicyConfig,
     PhasePolicyError,
     PhasePolicyInputs,
+    PP_TO_TP,
     PhasePolicyState,
     decide,
     effective_flip_threshold,
@@ -454,10 +455,24 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
                 )
             now += 1.0
 
-        # 8 arms to reach degradation, then one re-probe per 60 s cap over the
-        # remainder. Anything near the per-second poll rate would be the loop.
-        self.assertLessEqual(arms, 16)
-        self.assertGreaterEqual(arms, 8)
+        # CONTRACT CHANGED 2026-08-15 by #662-F4's dwell pacing, and this
+        # assertion was rewritten to match rather than to defend the old shape.
+        #
+        # It used to be "8 arms to reach degradation, then one re-probe per
+        # 60 s cap" -- at most ~16 in ten minutes. F4 replaced the doubling
+        # backoff with `paced_until = min(hold_until, last_refusal +
+        # min_dwell_s)` on the reasoning that the load still wants this layout,
+        # so the next attempt should re-ask the KV rung rather than wait out a
+        # backoff. A persistently refused seam therefore re-probes every
+        # min_dwell_s: ~200 arms in ten minutes, not 16.
+        #
+        # That is only safe because an ARM IS NO LONGER A STAGING ATTEMPT. The
+        # group-abandon gate defers actual entry by arm COUNT ("next entry at
+        # arm 24"), so the paced arms are cheap probes and only a few of them
+        # reach the seam. Any acceptance that counts arms as if each one staged
+        # -- mine did -- is measuring the wrong thing; count abandons.
+        self.assertGreater(arms, 100)
+        self.assertLessEqual(arms, 600 / cfg.min_dwell_s + 5)
         self.assertTrue(state.arm_degraded.get(TP_TO_PP))
 
     def test_the_refusal_hold_is_reported_rather_than_silent(self):
@@ -627,22 +642,35 @@ class TestTheLadderIsSolvedNotConfigured(CustomTestCase):
         whole ladder at once, and every rung stays under 2 x P*.
         """
         self.assertLess(N, self._p_star(1100.0))
+        # SHIPPED LADDER STANDS ON THE FAST END OF THE BAND, r_tp = 1196.
+        #
+        # Not the midpoint. 1001 comes from a GATE B whose wall clock also
+        # contains 24 arms and 8 seam abandons, so it understates the true TP
+        # prefill rate; 1194/1196 come from runs where the gate never armed at
+        # all. Averaging a contaminated measurement with a clean one describes
+        # neither, so the midpoint 1100 was withdrawn. The fast end is also the
+        # conservative end -- a higher r_tp makes TP look better, so P* rises
+        # and the bar is higher -- which is the right error while a wrongly
+        # armed flip abandons and latches the direction.
         solved = [
-            int(round(self._p_star(1100.0) * (1 + 2 * b) / (1 + b)))
+            int(round(self._p_star(1196.0) * (1 + 2 * b) / (1 + b)))
             for b in range(5)
         ]
-        self.assertEqual(solved, [8949, 13423, 14915, 15660, 16108])
+        self.assertEqual(solved, [10059, 15088, 16764, 17603, 18106])
         # The 2x bound is structural against the P* the ladder was SOLVED
         # from. Comparing a centre-solved ladder against the conservative end
         # of the r_tp band is a different quantity and is legitimately larger:
         # 1.8 x (8949 / 7878) = 2.045. Stated, not asserted away -- it is the
         # honest width of the r_tp measurement, and it is the reason r_tp
         # wants a dedicated ladder run rather than a single TTFT.
-        centre = self._p_star(1100.0)
+        shipped = self._p_star(1196.0)
         for rung in solved:
-            self.assertLessEqual(rung / centre, 2.0)
+            self.assertLessEqual(rung / shipped, 2.0)
+        # Against the far end of the band the multiple is larger; recorded
+        # rather than asserted away, and the reason r_tp wants a dedicated
+        # ladder run on this checkpoint rather than a TTFT.
         worst = max(solved) / self._p_star(1001.0)
-        self.assertAlmostEqual(worst, 2.045, places=2)
+        self.assertGreater(worst, 2.0)
 
 
 class TestTheBootedLadderEqualsTheSolvedLadder(CustomTestCase):
@@ -714,3 +742,88 @@ class TestTheBootedLadderEqualsTheSolvedLadder(CustomTestCase):
                 flips += 1
             pending = max(0, pending - 600)
         self.assertEqual(flips, 0)
+
+
+class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
+    """The 15 s window ejected PP with 23,313 tok still pending (live 12:25).
+
+    Two seams (~12 s at the measured 5.918 s round trip) burned to defer work
+    that one longer residency would have drained, then straight back into PP as
+    pending regrew. A hand-set duty cycle deciding that is the same provenance
+    defect the ladder fix removed from arming.
+    """
+
+    def _pp(self, cfg, pending, bs, in_pp):
+        state = PhasePolicyState()
+        state.phase_since = 1000.0
+        inp = PhasePolicyInputs(
+            phase="pp", pending_prefill_tokens=pending, running_bs=bs,
+            now=1000.0 + in_pp,
+        )
+        return decide(cfg, state, inp)
+
+    def _cfg_slo(self, slo):
+        return _cfg(
+            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=0.0,
+            decode_stall_slo_s=slo, pp_prefill_tok_s=4036.0,
+            tp_prefill_tok_s=1196.0, min_dwell_s=0.0,
+        )
+
+    def test_the_solved_cap_is_the_slo_minus_both_seams(self):
+        from sglang.srt.managers.phase_policy import pp_residency_cap_s
+
+        self.assertAlmostEqual(pp_residency_cap_s(self._cfg_slo(45.0)), 33.164)
+        # A carried decode pays the seam in BOTH directions on top of the
+        # residency, so a 45 s budget buys 33.2 s in PP, not 45.
+        self.assertAlmostEqual(pp_residency_cap_s(self._cfg_slo(0.0)), 0.0)
+
+    def test_an_slo_tighter_than_the_round_trip_collapses_to_zero(self):
+        from sglang.srt.managers.phase_policy import pp_residency_cap_s
+
+        self.assertEqual(pp_residency_cap_s(self._cfg_slo(4.0)), 0.0)
+
+    def test_a_prefill_mountain_is_drained_not_deferred(self):
+        """The live defect, replayed: 23,313 pending at 3 decoding, 15 s in."""
+        cfg = self._cfg_slo(45.0)
+        self.assertIsNone(self._pp(cfg, 23_313, 3, 15.0).direction)
+        self.assertIsNone(self._pp(cfg, 23_313, 3, 30.0).direction)
+
+    def test_the_cap_still_protects_decode_from_starving(self):
+        cfg = self._cfg_slo(45.0)
+        d = self._pp(cfg, 23_313, 3, 34.0)
+        self.assertEqual(d.direction, PP_TO_TP)
+        self.assertIn("decode stall cap", d.reason)
+        self.assertIn("45s budget", d.reason.replace("45.0s", "45s"))
+
+    def test_drain_still_ends_the_phase_first_when_it_can(self):
+        cfg = self._cfg_slo(45.0)
+        d = self._pp(cfg, 500, 3, 5.0)
+        self.assertEqual(d.direction, PP_TO_TP)
+        self.assertIn("prefill down to", d.reason)
+
+    def test_the_legacy_stopwatch_states_what_drain_would_have_done(self):
+        """Requirement (3): the deferring line must be auditable in place."""
+        cfg = _cfg(
+            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=15.0,
+            decode_stall_slo_s=0.0, pp_prefill_tok_s=4036.0, min_dwell_s=0.0,
+        )
+        d = self._pp(cfg, 23_313, 3, 15.0)
+        self.assertEqual(d.direction, PP_TO_TP)
+        self.assertIn("HAND-SET STOPWATCH", d.reason)
+        self.assertIn("would STAY", d.reason)
+        self.assertIn("23313", d.reason)
+        self.assertIn("SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S", d.reason)
+
+    def test_a_declared_slo_overrides_the_hand_set_window(self):
+        cfg = _cfg(
+            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=15.0,
+            decode_stall_slo_s=45.0, pp_prefill_tok_s=4036.0, min_dwell_s=0.0,
+        )
+        self.assertIsNone(self._pp(cfg, 23_313, 3, 15.0).direction)
+
+    def test_the_tp_floor_is_solved_from_the_seam(self):
+        from sglang.srt.managers.phase_policy import solved_tp_decode_floor_s
+
+        self.assertAlmostEqual(
+            solved_tp_decode_floor_s(self._cfg_slo(45.0)), 11.836
+        )

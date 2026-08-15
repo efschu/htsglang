@@ -145,6 +145,33 @@ ENV_TP_TOK_S = "SGLANG_PHASE_POLICY_TP_TOK_S"
 #: from this module's 7245.5 had no way to say so, and silently solved N
 #: against another rig's number.
 ENV_PP_TOK_S = "SGLANG_PHASE_POLICY_PP_TOK_S"
+#: THE DECODE-STARVATION CONSTRAINT that replaces the PP stopwatch.
+#:
+#: `pp_window_s` was a hand-set duty cycle, and it ejected the PP phase on a
+#: clock regardless of what was left to drain. Live at 12:25 on 2026-08-15:
+#:
+#:   arming pp_to_tp: pp window 15.0s >= 15s with 3 req waiting to decode
+#:                    (23313 tok prefill deferred to the next pp window)
+#:
+#: 23k of prefill still standing, ~12 s of seam burned across two round trips
+#: to defer work that one longer window would have drained, then straight back
+#: into PP as pending regrew. That is a see-saw on a timer, and a hand-set
+#: constant deciding it is the same provenance defect the ladder fix removed
+#: from arming.
+#:
+#: What actually bounds a PP residency is not a duty cycle, it is how long a
+#: carried decode may be stalled -- a LATENCY constraint. Declare that, and the
+#: residency cap is SOLVED from it and the measured seam:
+#:
+#:     pp_residency_cap = decode_stall_slo_s - 2 * flip_cost_s
+#:
+#: The 2x is not a fudge: a decode carried into PP resumes only once the
+#: instance is back in TP, so it pays the seam in BOTH directions on top of the
+#: residency itself. 0 means no cap is declared and the phase is governed
+#: purely by drain, which is the existing default (`pp_window_s` also defaults
+#: to 0).
+ENV_DECODE_STALL_SLO = "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S"
+DEFAULT_DECODE_STALL_SLO_S = 0.0
 # TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
 # (2026-08-08, commit 2bcc6b7d25, quiet-gated ladder with zero contended
 # draws): 2134.1 / 1681.0 / 1484.1 at 2048 / 8192 / 32768, spreads 0.25 /
@@ -421,6 +448,31 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
 
 
+def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
+    """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
+
+    Returns 0 when nothing is declared, meaning drain alone governs the phase.
+    Never returns a negative cap: an SLO tighter than the round trip it must
+    contain cannot be honoured by leaving PP sooner, because the seams are
+    already inside it -- so it collapses to "leave as soon as the drain rule or
+    the dwell allows" rather than to a nonsense negative deadline.
+    """
+    if cfg.decode_stall_slo_s <= 0.0:
+        return 0.0
+    return max(0.0, cfg.decode_stall_slo_s - 2.0 * cfg.flip_cost_s)
+
+
+def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
+    """Minimum TP dwell, SOLVED: one full round trip.
+
+    A cycle that spends less time serving decode in TP than it just spent
+    entering and leaving TP has put more than half its wall clock into
+    cutovers. `2 * flip_cost_s` is therefore the floor below which the phase
+    machinery costs more than it moves -- measured, not chosen.
+    """
+    return 2.0 * cfg.flip_cost_s
+
+
 def with_decode_contention(
     cfg: "PhasePolicyConfig", value: object
 ) -> "PhasePolicyConfig":
@@ -593,6 +645,10 @@ class PhasePolicyConfig:
     #: the gate unreachable, and _differential_flip_threshold for the model
     #: this feeds.
     decode_contention: float = DEFAULT_DECODE_CONTENTION
+    #: Max seconds a carried decode may be stalled by a cutover, DECLARED as a
+    #: latency constraint. The PP residency cap is solved from it; see
+    #: ENV_DECODE_STALL_SLO. 0 = not declared, drain governs alone.
+    decode_stall_slo_s: float = DEFAULT_DECODE_STALL_SLO_S
     #: The prefill ladder the threshold is solved against. Only the RATIO
     #: matters to the differential model; ``flip_tokens`` already carries the
     #: absolute scale.
@@ -959,18 +1015,53 @@ def _decide_from_load(
         # fit waits for the next PP window. This is also the deadlock
         # breaker for a PP phase that cannot ADMIT its pending prefill (no
         # free state slot) -- see phase_purity's deadlock section.
-        if (
-            cfg.pp_window_s > 0
-            and state.phase_since is not None
-            and inp.running_bs > 0
-            and (inp.now - state.phase_since) >= cfg.pp_window_s
-        ):
+        # THE DECODE-STARVATION CAP, solved from the declared latency
+        # constraint and the measured seam. Unlike the stopwatch it replaces,
+        # this is the only thing that may cut a drain short, and it says why in
+        # units someone can argue with: a carried decode has been stalled for
+        # its whole budget.
+        in_pp = None if state.phase_since is None else inp.now - state.phase_since
+        cap = pp_residency_cap_s(cfg)
+        if cap > 0 and in_pp is not None and inp.running_bs > 0 and in_pp >= cap:
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"pp window {inp.now - state.phase_since:.1f}s >= "
-                f"{cfg.pp_window_s:g}s with {inp.running_bs} req waiting to "
-                f"decode ({inp.pending_prefill_tokens} tok prefill deferred "
-                f"to the next pp window)",
+                f"decode stall cap: {inp.running_bs} req stalled "
+                f"{in_pp + 2 * cfg.flip_cost_s:.1f}s of the "
+                f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
+                f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
+                f"{inp.pending_prefill_tokens} tok prefill still pending",
+            )
+
+        # LEGACY STOPWATCH. Retained so a deployment that set pp_window_s keeps
+        # its behaviour, but it now has to say what the drain-based policy
+        # would have done instead -- the whole point being that the next audit
+        # can compare the two without re-deriving anything.
+        if (
+            cap <= 0
+            and cfg.pp_window_s > 0
+            and in_pp is not None
+            and inp.running_bs > 0
+            and in_pp >= cfg.pp_window_s
+        ):
+            rung = effective_flip_threshold(cfg, inp.running_bs)
+            would_drain = inp.pending_prefill_tokens <= cfg.flip_tokens
+            drain_s = (
+                inp.pending_prefill_tokens / cfg.pp_prefill_tok_s
+                if cfg.pp_prefill_tok_s > 0
+                else float("nan")
+            )
+            return PhasePolicyDecision(
+                PP_TO_TP,
+                f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
+                f"{inp.running_bs} req waiting to decode "
+                f"({inp.pending_prefill_tokens} tok prefill deferred to the "
+                f"next pp window) -- HAND-SET STOPWATCH; drain-based policy "
+                f"would {'also leave' if would_drain else 'STAY'} "
+                f"(pending {inp.pending_prefill_tokens} vs drain target "
+                f"{cfg.flip_tokens}, active rung {rung}, ~{drain_s:.1f}s more "
+                f"in pp to drain at {cfg.pp_prefill_tok_s:g} tok/s vs "
+                f"{2 * cfg.flip_cost_s:.1f}s of seam to leave and return); "
+                f"declare {ENV_DECODE_STALL_SLO} to solve this instead",
             )
         if idle and cfg.rest_phase == PHASE_TP:
             if state.idle_since is None:
@@ -1239,6 +1330,9 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         # old one-sided form is kept, unchanged.
         decode_contention=_env_float(
             ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION
+        ),
+        decode_stall_slo_s=_env_float(
+            ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
         ),
         tp_prefill_tok_s=tp_tok_s,
         pp_prefill_tok_s=pp_tok_s,
