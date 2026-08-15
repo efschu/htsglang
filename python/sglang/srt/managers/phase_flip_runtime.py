@@ -335,6 +335,30 @@ def seam_cap_retire_hysteresis_bytes() -> int:
     return max(0, mib) * 1024 * 1024
 
 
+def _seam_transient_floor_bytes(law_floor_bytes: int) -> int:
+    """The floor a CUTOVER TRANSIENT is judged against: the band's lower edge.
+
+    The corridor law is a band and its verdict is the continuous minimum
+    against the floor, so a dip that lasts one wave walk is lawful down to the
+    floor. Judging a transient against the CENTRE reserves the band's whole
+    tolerance for nothing and delays flips the law permits.
+
+    Falls back to the value it was given if the band cannot be read: delaying a
+    legal flip costs throughput, entering an illegal one costs the law, so the
+    fallback goes the delaying way.
+    """
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+        mib = 1 << 20
+        floor_mib = int(
+            round((int(law_floor_bytes) / mib) * (1.0 - CORRIDOR_BAND_FRACTION))
+        )
+        return max(0, floor_mib) * mib
+    except Exception:  # pragma: no cover - the seam must not fail on this
+        return int(law_floor_bytes)
+
+
 def seam_entry_margin_bytes() -> int:
     """The designed headroom a seam must have ON TOP OF its staging ask.
 
@@ -4741,11 +4765,26 @@ class PhaseFlipRuntime:
             scheduler = getattr(self, "_census_scheduler", None)
             if scheduler is None:
                 return False
-            waiting = getattr(scheduler, "waiting_queue", None)
-            if waiting and len(waiting) > 0:
+            # QUEUED **OR RUNNING**, and the difference cost a whole boot.
+            #
+            # The first version of this asked only about the waiting queue,
+            # which is empty exactly when the work has been admitted -- so at
+            # 90k tokens resident the log read "#running-req: 1,
+            # #full token: 457724, #queue-req: 0" and the damper did NOT stand
+            # down, because by its reading nothing was waiting. The load that
+            # most wants the other layout is the load that is already in the
+            # machine.
+            for name in ("waiting_queue", "grammar_queue"):
+                q = getattr(scheduler, name, None)
+                if q and len(q) > 0:
+                    return True
+            running = getattr(scheduler, "running_batch", None)
+            reqs = getattr(running, "reqs", None) if running is not None else None
+            if reqs and len(reqs) > 0:
                 return True
-            grammar = getattr(scheduler, "grammar_queue", None)
-            return bool(grammar and len(grammar) > 0)
+            cur = getattr(scheduler, "cur_batch", None)
+            cur_reqs = getattr(cur, "reqs", None) if cur is not None else None
+            return bool(cur_reqs and len(cur_reqs) > 0)
         except Exception:  # noqa: BLE001 - a damper must not raise
             return False
 
@@ -5076,8 +5115,27 @@ class PhaseFlipRuntime:
         law_want = max(int(staging_bytes), measured_draw)
         predicted_trough = int(verdict.free_after) - law_want
         draw_short = measured_draw > 0 and predicted_trough < law_floor
+        # #662: THE SEAM TRANSIENT IS JUDGED AGAINST THE BAND FLOOR, second
+        # site of the same rule as the staging reserve (5658c9683f).
+        #
+        # The corridor is 1024 MiB +-20 % and its verdict is the continuous
+        # minimum against the FLOOR, so a cutover that dips to 819 for the
+        # length of a wave walk is lawful. Comparing against the CENTRE here
+        # delayed flips the law permits: measured 2026-08-15, want 2251 MiB
+        # against free 3206 leaves 955 -- which is 69 MiB under the centre and
+        # 136 MiB CLEAR of the floor -- and 21,480 tokens waited ~35 s for a
+        # flip that was legal the whole time.
+        #
+        # AND THE MARGIN WAS NEVER IN THIS COMPARISON. ``margin_bytes`` is an
+        # enable flag here, nothing more, yet the delay message named it -- so
+        # the log said "the 512 MiB C20 entry margin is not met" about an
+        # arithmetic in which 512 appears nowhere. That is why this read as a
+        # double-counted arming floor from outside; the arming floor is not in
+        # it either. The message below now names the number that actually
+        # bound.
+        seam_floor = _seam_transient_floor_bytes(law_floor)
         law_ok = margin_bytes > 0 and (
-            int(verdict.free_after) - int(staging_bytes) >= law_floor
+            int(verdict.free_after) - int(staging_bytes) >= seam_floor
         )
         # WHY THE MEASURED DRAW DOES NOT MOVE ``law_ok``, WHICH IS THE
         # OBVIOUS THING TO DO AND IS WRONG HERE.
@@ -5137,8 +5195,10 @@ class PhaseFlipRuntime:
             if spent < budget:
                 self.seam_margin_delays += 1
                 logger.warning(
-                    "%s seam entry DELAYED (%s): the corridor law is met but "
-                    "the %d MiB C20 entry margin is not (%s). The deepest "
+                    "%s seam entry DELAYED (%s): staging would leave less than "
+                    "the %d MiB seam floor (the corridor band's lower edge, "
+                    "which is what a cutover transient is judged against) "
+                    "(%s). The deepest "
                     "troughs of this corpus are made INSIDE a cutover and the "
                     "level recovers between them -- consecutive abandoned "
                     "attempts %d of a budget of %d, after which the law "
