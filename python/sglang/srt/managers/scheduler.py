@@ -461,6 +461,7 @@ class Scheduler(
         from sglang.srt.managers.phase_policy import config_from_env
 
         self.phase_policy_cfg = config_from_env(
+            chunk_tokens=int(getattr(server_args, "chunked_prefill_size", 0) or 0),
             enabled=(
                 getattr(server_args, "enable_phase_flip", False)
                 and getattr(server_args, "phase_flip_policy", "manual") == "auto"
@@ -498,14 +499,6 @@ class Scheduler(
             # The PP phase is drained when less than one chunk is left, and
             # the chunk size is a runtime fact, not a policy guess. Only fill
             # it in when the operator has not pinned one.
-            # The staging model needs the chunk width whether or not the
-            # operator pinned an exit threshold.
-            self.phase_policy_cfg = dataclasses.replace(
-                self.phase_policy_cfg,
-                prefill_chunk_tokens=int(
-                    getattr(server_args, "chunked_prefill_size", 0) or 0
-                ),
-            )
             if self.phase_policy_cfg.pp_exit_tokens <= 0:
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg,

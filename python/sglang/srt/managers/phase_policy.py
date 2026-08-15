@@ -1470,7 +1470,9 @@ def _env_int(name: str, default: int) -> int:
         raise PhasePolicyError(f"{name}={raw!r} is not an integer") from exc
 
 
-def config_from_env(enabled: bool) -> PhasePolicyConfig:
+def config_from_env(
+    enabled: bool, chunk_tokens: int = 0
+) -> PhasePolicyConfig:
     """Build the boot configuration.
 
     ``enabled`` comes from the server arg; the tuning knobs come from the
@@ -1540,6 +1542,10 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
         ),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
+        # Passed in rather than read from env: it is a runtime fact of THIS
+        # scheduler, and the armed line below prices the seam from it -- so it
+        # has to be known before that line is emitted, not filled in after.
+        prefill_chunk_tokens=int(chunk_tokens or 0),
         seam_staging_base_mib=_env_float(
             ENV_SEAM_STAGING_BASE_MIB, DEFAULT_SEAM_STAGING_BASE_MIB
         ),
