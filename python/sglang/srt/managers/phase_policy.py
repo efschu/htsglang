@@ -192,6 +192,46 @@ ENV_DECODE_STALL_SLO = "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S"
 #: leaves a partial chunk in flight and an ==0 test can miss it forever. The
 #: scheduler supplies its real chunked_prefill_size at boot.
 ENV_PP_EXIT_TOKENS = "SGLANG_PHASE_POLICY_PP_EXIT_TOKENS"
+
+# -- THE CHUNK-WIDTH TERM IN THE SEAM'S MEMORY MODEL (#665-F1 item 7) --------
+#
+# The funding solver used to discover the cost of a chunk-size change at ARM
+# time, by staging, being refused, and abandoning. Moving 512 -> 2048 raised
+# the pp_to_tp staging want from ~907 MiB to 2481 MiB and made the return leg
+# unfundable; nothing predicted it, and the first anyone knew was a run of
+# abandons on a live boot.
+#
+# The transient being priced is the live ACTIVATION set of one prefill chunk,
+# which the seam has to stage around. Measured on this rig 2026-08-15, three
+# boots, staging wants read off the abandon/fund records:
+#
+#     chunk 128 -> 856 MiB      chunk 512 -> 907 MiB     chunk 2048 -> 2481 MiB
+#
+# A linear model in the chunk width misses by up to 163 MiB and gets the shape
+# wrong (it over-prices 512 and under-prices 2048). A QUADRATIC one lands
+# within 24 MiB across a 16x range:
+#
+#     want_mib = base + quad * chunk_tokens^2
+#     base = 827.3 MiB, quad = 3.93934e-4 MiB/token^2
+#     residuals: 128 -22, 512 +24, 2048 -1
+#
+# c^2 is the expected shape, not a curve-fitting accident: the chunk's own
+# self-attention scratch grows with the square of its width while the
+# per-token weights and KV terms are linear and land in `base`.
+#
+# THE POINT IS THAT IT IS PRINTED AT BOOT. A chunk-size change is now a solved
+# number visible in the armed line before anyone runs load against it, instead
+# of a run of abandons discovered at 15:14 on a live instance.
+ENV_SEAM_STAGING_BASE_MIB = "SGLANG_PHASE_POLICY_SEAM_STAGING_BASE_MIB"
+ENV_SEAM_STAGING_QUAD = "SGLANG_PHASE_POLICY_SEAM_STAGING_QUAD"
+ENV_CORRIDOR_FLOOR_MIB = "SGLANG_PHASE_POLICY_CORRIDOR_FLOOR_MIB"
+DEFAULT_SEAM_STAGING_BASE_MIB = 827.3
+DEFAULT_SEAM_STAGING_QUAD = 3.93934e-4
+#: The band floor the staging must leave behind (1024 -20 %).
+DEFAULT_CORRIDOR_FLOOR_MIB = 819.0
+#: The anchors the fit came from, kept so a re-fit on other hardware starts
+#: from data rather than from these coefficients.
+SEAM_STAGING_ANCHORS_MIB = ((128, 856), (512, 907), (2048, 2481))
 DEFAULT_PP_EXIT_TOKENS = 0
 DEFAULT_DECODE_STALL_SLO_S = 0.0
 # TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
@@ -470,6 +510,29 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
 
 
+def seam_staging_want_mib(cfg: "PhasePolicyConfig", chunk_tokens: int = 0) -> float:
+    """Predicted seam staging want, in MiB, for a given prefill chunk width.
+
+    Priced rather than discovered. Returns 0 when the chunk width is unknown,
+    which reads as "no estimate" and must not be mistaken for "costs nothing".
+    """
+    c = int(chunk_tokens or cfg.prefill_chunk_tokens or 0)
+    if c <= 0:
+        return 0.0
+    return cfg.seam_staging_base_mib + cfg.seam_staging_quad * float(c) * float(c)
+
+
+def seam_headroom_needed_mib(cfg: "PhasePolicyConfig", chunk_tokens: int = 0) -> float:
+    """What the seam needs FREE to stage without breaching the band floor.
+
+    The staging itself plus the floor it may not spend into. This is the
+    number a corridor gate compares against, and pricing it here is what turns
+    a chunk-size change from a run of abandons into an arithmetic check.
+    """
+    want = seam_staging_want_mib(cfg, chunk_tokens)
+    return want + cfg.corridor_floor_mib if want > 0 else 0.0
+
+
 def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
     """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
 
@@ -715,6 +778,14 @@ class PhasePolicyConfig:
     #: real chunked_prefill_size at boot; see ENV_PP_EXIT_TOKENS for why this
     #: is emphatically not flip_tokens.
     pp_exit_tokens: int = DEFAULT_PP_EXIT_TOKENS
+    #: The scheduler's chunked_prefill_size, filled in at boot. Drives the
+    #: seam staging estimate below.
+    prefill_chunk_tokens: int = 0
+    #: Coefficients of the chunk-width -> staging-want model; see
+    #: ENV_SEAM_STAGING_BASE_MIB for the measurement they come from.
+    seam_staging_base_mib: float = DEFAULT_SEAM_STAGING_BASE_MIB
+    seam_staging_quad: float = DEFAULT_SEAM_STAGING_QUAD
+    corridor_floor_mib: float = DEFAULT_CORRIDOR_FLOOR_MIB
     #: The prefill ladder the threshold is solved against. Only the RATIO
     #: matters to the differential model; ``flip_tokens`` already carries the
     #: absolute scale.
@@ -1469,6 +1540,15 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
         ),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
+        seam_staging_base_mib=_env_float(
+            ENV_SEAM_STAGING_BASE_MIB, DEFAULT_SEAM_STAGING_BASE_MIB
+        ),
+        seam_staging_quad=_env_float(
+            ENV_SEAM_STAGING_QUAD, DEFAULT_SEAM_STAGING_QUAD
+        ),
+        corridor_floor_mib=_env_float(
+            ENV_CORRIDOR_FLOOR_MIB, DEFAULT_CORRIDOR_FLOOR_MIB
+        ),
         tp_prefill_tok_s=tp_tok_s,
         pp_prefill_tok_s=pp_tok_s,
         refusal_backoff_cap_s=_env_float(
@@ -1483,7 +1563,7 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
             "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g, "
             "decode contention %g, N ladder by decoding reqs %s, "
-            "resting layout %s (%s)",
+            "seam staging want %s, resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
@@ -1498,6 +1578,18 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             # top rung is exactly the defect #665-F1 was, and it is invisible
             # if only the first rung is logged.
             [effective_flip_threshold(cfg, b) for b in range(5)],
+            # PRICED, not discovered. A chunk-size change shows up here as a
+            # number before anyone runs load against it.
+            (
+                "unknown (no chunk width)"
+                if seam_staging_want_mib(cfg) <= 0
+                else (
+                    f"{seam_staging_want_mib(cfg):.0f} MiB @ chunk "
+                    f"{cfg.prefill_chunk_tokens} + floor "
+                    f"{cfg.corridor_floor_mib:.0f} = needs "
+                    f"{seam_headroom_needed_mib(cfg):.0f} MiB free"
+                )
+            ),
             cfg.rest_phase,
             cfg.rest_state,
         )
