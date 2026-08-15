@@ -921,6 +921,28 @@ class KvBackingRelief:
         """
         if self._bytes_per_row <= 0:
             return None
+        # THE MINIMUM ACROSS BUFFERS, not the average, and the difference is
+        # the whole point. ``backed_bytes`` is a SUM, so dividing it by the
+        # all-buffers per-row size gives an AVERAGE depth -- true only when the
+        # backing is uniform, which the waved seam guarantees it is not.
+        # ``decommit_range`` frees extents lying wholly above the keep point
+        # PER BUFFER, so a target derived from the average sits above the
+        # shallowest buffer's watermark and the shrink returns nothing while
+        # looking like a large one.
+        #
+        # Measured 2026-08-15, the 2048-chunk boot: read 591872 from the
+        # average, asked for 320217 and 352067, got 0 MiB nine times. The six
+        # shrinks that PAID were the ones whose target was below every buffer
+        # (73345 from 149504). Same defect class as reading the configured
+        # size, one level down: a number that is not what the shrink acts on.
+        uniform = getattr(self._pool, "uniform_backed_rows", None)
+        if uniform is not None:
+            try:
+                rows = int(uniform)
+            except (TypeError, ValueError):
+                rows = -1
+            if rows >= 0:
+                return rows
         raw = getattr(self._pool, "backed_bytes", None)
         if raw is None:
             return None

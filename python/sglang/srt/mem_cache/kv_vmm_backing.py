@@ -1045,9 +1045,9 @@ class KvVmmBufferOwner:
             self.ensure_prefix(self.page_size)
 
         for t in self.tensors:
-            assert (
-                t.is_cuda and t.device.index == self.device_id
-            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            assert t.is_cuda and t.device.index == self.device_id, (
+                f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            )
 
     # -- backing --------------------------------------------------------------
 
@@ -1238,6 +1238,39 @@ class KvVmmBufferOwner:
     @property
     def backed_bytes(self) -> int:
         return self._arena.backed_bytes if self._arena is not None else 0
+
+    @property
+    def uniform_backed_tokens(self) -> int:
+        """Tokens backed in EVERY buffer -- the depth a shrink can act on.
+
+        ``backed_bytes`` is a SUM across buffers, so dividing it by the
+        all-buffers per-row size yields an AVERAGE depth. That is only the
+        real depth when the backing is uniform, and it is not: the waved seam
+        releases and restores a layer at a time, and ``decommit_range`` frees
+        only extents lying wholly above the keep point PER BUFFER. So a caller
+        that trusts the average computes a keep point above the shallowest
+        buffer's watermark, and the shrink returns nothing while looking like
+        a large one.
+
+        Measured 2026-08-15 on the 2048-chunk boot: the rung read 591872 rows
+        from the average, asked to shrink to 320217 and 352067, and got 0 MiB
+        nine times; the shrinks that DID pay were the ones whose target was
+        below every buffer (73345 from 149504). This is that minimum.
+
+        Zero when the arena is gone, which reads as "nothing to give" -- the
+        safe direction for a number that decides how deep to cut.
+        """
+        if self._arena is None or not self._specs:
+            return 0
+        depths = []
+        for spec in self._specs:
+            committed = self._arena.committed_bytes(spec.offset)
+            row_bytes = int(getattr(spec.desc, "row_bytes", 0) or 0)
+            if row_bytes <= 0:
+                return 0
+            per_row = max(1, int(getattr(spec.desc, "tokens_per_row", 1) or 1))
+            depths.append((committed // row_bytes) * per_row)
+        return int(min(depths)) if depths else 0
 
     def close(self) -> None:
         self.tensors = []

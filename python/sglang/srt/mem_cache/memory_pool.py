@@ -2703,6 +2703,12 @@ class MHATokenToKVPool(KVCache):
         return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
 
     @property
+    def uniform_backed_rows(self) -> int:
+        """Rows backed in EVERY buffer. See KvVmmBufferOwner.uniform_backed_tokens."""
+        owner = self._post_capture_owner
+        return int(owner.uniform_backed_tokens) if owner is not None else 0
+
+    @property
     def store_bound_rows(self) -> int:
         """Rows the K/V buffers physically address = the largest
         ``size + page_size`` this pool can ever reach (#352).
@@ -3725,6 +3731,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def post_capture_backed_bytes(self) -> int:
         return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
+
+    @property
+    def uniform_backed_rows(self) -> int:
+        return int(getattr(self.full_kv_pool, "uniform_backed_rows", 0))
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
