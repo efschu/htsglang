@@ -576,10 +576,26 @@ class KvBackingRelief:
         #: overwritten by a second one, so a two-step relief still recovers to
         #: the boot reservation rather than to the intermediate step.
         self._rows_at_boot: Optional[int] = None
-        #: Set when a shrink returned no driver bytes. One such attempt is
-        #: evidence about the ARENA, not about this moment, so repeating it
-        #: can only cost time and risk -- and on metal it cost 2.5 GiB.
-        self._exhausted = False
+        #: THE BACKING LEVEL AT WHICH A SHRINK RETURNED NO DRIVER BYTES, or
+        #: None while this rank is willing to be asked. Read through the
+        #: :attr:`_exhausted` property, which compares it against the CURRENT
+        #: level -- so exhaustion expires the moment the backing moves.
+        #:
+        #: #662-F4: THIS USED TO BE A BOOL, AND IT LATCHED FOR THE LIFE OF THE
+        #: PROCESS. Measured on metal 2026-08-15: one shrink of a pool the
+        #: phase flip had already emptied returned zero bytes (it could not
+        #: have returned anything -- see :meth:`_current_rows`), the flag
+        #: latched, and from that instant the rung declined every ask on BOTH
+        #: legs while reporting ``slack=170368`` rows. The tp_to_pp seam then
+        #: abandoned nine times for want of ~500 MiB and the instance never
+        #: reached the prefill layout again.
+        #:
+        #: One shrink at one backing level is evidence about THAT level. It is
+        #: not evidence about the next one, and the cost of treating it as
+        #: permanent is the entire prefill layout. A retry is cheap now that a
+        #: failed shrink is never undone (:meth:`_shrink_to`): it engages a cap
+        #: and calls the dial in the SHRINK direction, which never allocates.
+        self._exhausted_at_rows: Optional[int] = None
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
@@ -593,6 +609,40 @@ class KvBackingRelief:
         self._trace_all = os.environ.get(KV_RELIEF_TRACE_ENV, "") == "1"
 
     # -- plumbing --------------------------------------------------------
+
+    @property
+    def _exhausted(self) -> bool:
+        """Is this rank declining to be asked RIGHT NOW?
+
+        True only while the backing still stands exactly where the failed
+        shrink left it. Any movement -- a recovery, a grow, the phase flip
+        restoring this layout -- re-arms the rung, because the arena that
+        could not pay at one level is a different proposition at another.
+        """
+        if self._exhausted_at_rows is None:
+            return False
+        # Read the level FIRST: ``_current_rows`` retires the marker when it
+        # sees an emptied layout, so the marker must be re-read afterwards
+        # rather than captured across the call.
+        current = int(self._current_rows())
+        marker = self._exhausted_at_rows
+        return marker is not None and current == int(marker)
+
+    @_exhausted.setter
+    def _exhausted(self, value: bool) -> None:
+        """Keep the boolean spelling, now meaning "exhausted AT THIS LEVEL".
+
+        Setting True latches against the backing as it stands right now, so
+        the statement stays true exactly as long as the evidence for it does.
+        """
+        if value:
+            self._mark_exhausted()
+        else:
+            self._exhausted_at_rows = None
+
+    def _mark_exhausted(self) -> None:
+        """Record the level at which the arena returned nothing."""
+        self._exhausted_at_rows = int(self._current_rows())
 
     def _free_bytes(self) -> int:
         if self._probe is not None:
@@ -620,11 +670,79 @@ class KvBackingRelief:
         its argument in BOTH directions, so that was a grow:
         ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY``, from inside relief,
         on the card that needed relieving.
+
+        #662-F4: AND ``full_pool_backed_rows`` IS NOT PHYSICAL EITHER. Its name
+        promises a measurement; it returns ``full_kv_pool.size``, a CONFIGURED
+        row count. That was harmless while the #330 dial was the only thing
+        moving the backing, because the dial writes ``size`` on every step. The
+        phase flip does not: ``release_backing`` / ``restore_backing`` unmap and
+        remap this pool's pages and say so in their own comment -- "SIZING IS
+        NOT TOUCHED". So for the whole of the TP phase the PP layout's pool
+        holds NO committed extents while ``size`` still reports its pre-flip
+        count.
+
+        Measured on metal 2026-08-15, tp_to_pp gate, all three ranks:
+
+            KV-BACKING proposal ... rows current=407051 floor=1157
+              (max_live=644 + admission reserve 512, slack=405894)
+            KV-BACKING shrink to 222081 rows reported 0 MiB but the driver's
+              free column did not move
+
+        Those 405894 rows of "slack" did not exist. The pool had been emptied
+        by the pp_to_tp cutover eighteen seconds earlier, so the shrink could
+        not have returned a byte -- and the zero it returned was then read as
+        evidence that the ARENA was exhausted, which latched the rung off for
+        the rest of the process (see :attr:`_exhausted_at_rows`).
+
+        So ask the arena. ``backed_bytes`` is the number the boot's own
+        exclusive-backing pin asserts on, and it cannot report backing that is
+        not mapped.
         """
-        rows = getattr(self._pool, "full_pool_backed_rows", None)
-        if rows is None:
-            return int(getattr(self._pool, "size", 0))
-        return int(rows)
+        backed = self._physical_backed_rows()
+        if backed is None:
+            rows = getattr(self._pool, "full_pool_backed_rows", None)
+            backed = (
+                int(rows) if rows is not None else int(getattr(self._pool, "size", 0))
+            )
+        if backed <= 0:
+            # SEEING AN EMPTY LAYOUT RETIRES THE EXHAUSTION MARKER, and this
+            # is the one place every caller passes through, which is why the
+            # invalidation lives here rather than in the property.
+            #
+            # A layout the flip has emptied carries no evidence about an
+            # arena: its extents went back to the driver, and the pages that
+            # return on the next restore are different handles. Worse, the
+            # level it comes back at can equal the level the failed shrink
+            # left behind -- so a marker compared only by level would survive
+            # a whole phase and go on declining. That is the process-lifetime
+            # latch wearing a level-shaped disguise, and it is the defect this
+            # work exists to remove.
+            self._exhausted_at_rows = None
+        return backed
+
+    def _physical_backed_rows(self) -> Optional[int]:
+        """Rows the ARENA has committed, or None when it cannot be measured.
+
+        Release is extent-granular, so this can exceed the exact row span by
+        less than one commit chunk per buffer. That overshoot is bounded and
+        in the safe direction: it never invents backing that is not there,
+        which is the only error mode that matters here.
+
+        None -- never 0 -- when the pool does not expose the reading, so a pool
+        that never flips keeps exactly its previous behaviour.
+        """
+        if self._bytes_per_row <= 0:
+            return None
+        raw = getattr(self._pool, "backed_bytes", None)
+        if raw is None:
+            return None
+        try:
+            backed = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if backed < 0:
+            return None
+        return backed // self._bytes_per_row
 
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
@@ -1242,7 +1360,7 @@ class KvBackingRelief:
             asked = int(current) - int(target)
             granularity = self._min_release_rows()
             if granularity <= 0 or asked >= granularity:
-                self._exhausted = True
+                self._mark_exhausted()
             logger.warning(
                 "%s shrink to %d rows reported %.0f MiB but the driver's free "
                 "column did not move, so this pool cannot pay: the arena has "
@@ -1354,7 +1472,7 @@ class KvBackingRelief:
             )
         else:
             self._rows_at_boot = None
-            self._exhausted = False
+            self._exhausted_at_rows = None
         self.recover_count += 1
         return max(0, now - was)
 
@@ -1410,7 +1528,7 @@ class KvBackingRelief:
         if self._rows_at_boot is None and target < self._reservation_rows():
             # Remember what this rank is entitled to before capping below it.
             self._rows_at_boot = self._reservation_rows()
-            self._exhausted = False
+            self._exhausted_at_rows = None
         return int(self.reconcile_to(target))
 
     def normalize_free_lists(self) -> None:
@@ -1538,7 +1656,7 @@ class KvBackingRelief:
         self._cap.sort_free_lists()
         if self._rows_at_boot is not None and level >= ceiling:
             self._rows_at_boot = None
-            self._exhausted = False
+            self._exhausted_at_rows = None
         after = self.exposed_rows()
         if after != before:
             logger.info(

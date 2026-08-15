@@ -1,0 +1,318 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""#662-F4: the rung disqualified itself for the life of the process.
+
+THE MEASUREMENT, from metal on 2026-08-15. A tp_to_pp gate, all three ranks:
+
+    KV-BACKING proposal on device 0: rows current=407051 floor=1157
+      (max_live=644 + admission reserve 512, slack=405894)
+      | need = floor 1536 + delta 256 + want 1522 = 3314 MiB
+    KV-BACKING shrink to 222081 rows reported 0 MiB but the driver's free
+      column did not move, so this pool cannot pay
+    ...
+    KV-BACKING proposal on device 0: rows current=222081 floor=51713
+      (max_live=51200 + admission reserve 512, slack=170368)
+      | this rank's arena is EXHAUSTED (a previous shrink returned no driver
+        bytes), so it stops asking; the deficit is not computed
+
+170 368 rows of slack, refused. The tp_to_pp seam then abandoned nine times
+for want of ~500 MiB and the instance never reached the prefill layout again.
+
+TWO DEFECTS, AND THE FIRST CAUSES THE SECOND.
+
+1. THE SLACK WAS FICTION. ``_current_rows`` read ``full_pool_backed_rows``,
+   whose name promises a measurement and which returns ``full_kv_pool.size``,
+   a CONFIGURED row count. The #330 dial writes ``size`` on every step, so the
+   two agreed for as long as the dial was the only writer. The phase flip is
+   not the dial: ``release_backing`` / ``restore_backing`` unmap and remap the
+   pages and state in their own comment that "SIZING IS NOT TOUCHED". So
+   during the TP phase the PP layout's pool holds no committed extents at all
+   while ``size`` still reports its pre-flip count. The shrink above could not
+   have returned a byte -- there was nothing mapped to release.
+
+2. THE ZERO WAS THEN READ AS PERMANENT. ``_exhausted`` was a bool set once and
+   never reconsidered, so one shrink of an emptied layout switched the only
+   rung that can pay real bytes off for the rest of the process -- on BOTH
+   legs, including the leg where the same pool is fully backed and can pay.
+
+Exhaustion is evidence about ONE backing level. These tests pin that reading:
+it survives while the backing stands still, and expires the moment it moves.
+
+Hermetic: tensor-backed fakes, no CUDA, no scheduler.
+"""
+
+from __future__ import annotations
+
+import unittest
+
+import torch
+
+from sglang.srt.managers import kv_backing_relief as kbr
+
+MIB = 1024 * 1024
+
+#: One row costs a MiB here, so rows and MiB read interchangeably.
+BYTES_PER_ROW = MIB
+
+#: The configured row count. ``size`` reports this forever; the flip does not
+#: touch it.
+CONFIGURED_ROWS = 4_000
+
+#: Rows a request in flight holds.
+LIVE_ROWS = 40
+
+RESERVE = 512
+
+
+class _FakeAllocator:
+    def __init__(self, size: int):
+        self.size = size
+        self.page_size = 1
+        self._free_listeners = []
+        self.free_pages = torch.arange(1, size + 1, dtype=torch.int64)
+        self.release_pages = torch.empty((0,), dtype=torch.int64)
+
+    def register_free_listener(self, on_free, on_clear=None):
+        self._free_listeners.append((on_free, on_clear))
+
+    def available_size(self):
+        return len(self.free_pages) + len(self.release_pages)
+
+    def free(self, idx):
+        self.free_pages = torch.cat((self.free_pages, idx))
+        for on_free, _ in self._free_listeners:
+            on_free(idx)
+
+
+class _FlipPool:
+    """A VA-reserved pool with the phase flip's two independent facts.
+
+    ``size`` is the CONFIGURED row count. ``backed_bytes`` is what the arena
+    actually has mapped. The flip moves the second and never the first, which
+    is the whole subject of this file, so the fake keeps them apart the way
+    the real pool does.
+
+    ``runtime_set_backing_rows`` releases from the PHYSICAL level, so asking an
+    emptied pool to shrink returns zero -- not because the arena refused, but
+    because there was nothing there.
+    """
+
+    def __init__(self, rows: int, card=None):
+        self.size = rows
+        self.page_size = 1
+        self._bytes_per_row = BYTES_PER_ROW
+        self._card = card
+        self.supports_backing_spans = True
+        self.calls = []
+        self.backed_bytes = rows * BYTES_PER_ROW
+
+    # -- what the phase flip does to this pool, and only this ------------
+    def flip_release(self) -> None:
+        """The seam hands this layout's pages back; ``size`` is untouched."""
+        self.backed_bytes = 0
+
+    def flip_restore(self) -> None:
+        """The seam remaps this layout at its unchanged addresses."""
+        self.backed_bytes = self.size * BYTES_PER_ROW
+
+    # -- the #330 dial ---------------------------------------------------
+    def runtime_set_backing_rows(self, rows: int) -> int:
+        # Converges in BOTH directions, like the real dial: a grow commits,
+        # a shrink releases, and the release is measured from the PHYSICAL
+        # level -- so asking an emptied pool to shrink returns zero.
+        rows = int(rows)
+        self.calls.append(rows)
+        want = rows * BYTES_PER_ROW
+        released = max(0, self.backed_bytes - want)
+        self.backed_bytes = want
+        self.size = rows
+        if self._card is not None:
+            self._card.free += released
+        return released
+
+
+class _Card:
+    def __init__(self, free_mib: int):
+        self.free = free_mib * MIB
+
+    def probe(self) -> int:
+        return self.free
+
+
+def _rig(card_free_mib: int = 1100):
+    card = _Card(card_free_mib)
+    pool = _FlipPool(CONFIGURED_ROWS, card=card)
+    alloc = _FakeAllocator(CONFIGURED_ROWS)
+    relief = kbr.KvBackingRelief(
+        pool,
+        alloc,
+        live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+        bytes_per_row=BYTES_PER_ROW,
+        probe=card.probe,
+        admission_reserve_rows=RESERVE,
+    )
+    return relief, pool, card, alloc
+
+
+class BackedRowsAreMeasuredNotConfiguredTest(unittest.TestCase):
+    """Defect 1: the rung believed a pool the flip had emptied was full."""
+
+    def test_a_resident_layout_reads_its_backing(self):
+        relief, pool, _card, _alloc = _rig()
+        self.assertEqual(relief.backed_rows(), CONFIGURED_ROWS)
+
+    def test_an_emptied_layout_reports_no_backing_not_its_configured_size(self):
+        # THE HEADLINE. During the TP phase the PP pool is unmapped, and
+        # ``size`` keeps reporting the pre-flip count. Before the fix this
+        # returned CONFIGURED_ROWS and every number downstream was fiction.
+        relief, pool, _card, _alloc = _rig()
+        pool.flip_release()
+        self.assertEqual(pool.size, CONFIGURED_ROWS, "the flip must not size")
+        self.assertEqual(relief.backed_rows(), 0)
+
+    def test_a_pool_without_the_reading_keeps_the_previous_behaviour(self):
+        # A pool that never flips does not expose ``backed_bytes``. It must
+        # fall back exactly as before, or this fix would be a regression for
+        # every non-flip boot.
+        class _Plain:
+            size = 1234
+            page_size = 1
+            supports_backing_spans = True
+
+            def runtime_set_backing_rows(self, rows):
+                return 0
+
+        relief = kbr.KvBackingRelief(
+            _Plain(),
+            _FakeAllocator(1234),
+            live_slots_fn=lambda: torch.tensor([1], dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+        )
+        self.assertEqual(relief.backed_rows(), 1234)
+
+
+class AnEmptiedLayoutIsNotAFundingOpportunityTest(unittest.TestCase):
+    """The proposal must not invent slack out of a configured row count."""
+
+    def test_the_rung_abstains_instead_of_proposing_a_phantom_shrink(self):
+        relief, pool, _card, _alloc = _rig()
+        pool.flip_release()
+        proposal = relief.propose(
+            want_bytes=1522 * MIB, floor_bytes=1536 * MIB, delta_bytes=256 * MIB
+        )
+        self.assertEqual(proposal, kbr.ABSTAIN)
+        # An abstention cancels the group's shrink, which is correct here:
+        # nobody has backing to give on this leg.
+        self.assertIsNone(kbr.collective_kv_target([proposal[0], 0, 0, 0]))
+
+    def test_no_shrink_is_attempted_against_an_emptied_layout(self):
+        relief, pool, _card, _alloc = _rig()
+        pool.flip_release()
+        relief.propose(
+            want_bytes=1522 * MIB, floor_bytes=1536 * MIB, delta_bytes=256 * MIB
+        )
+        self.assertEqual(pool.calls, [], "there is nothing mapped to release")
+
+    def test_an_emptied_layout_does_not_latch_the_rung_off(self):
+        # THE CHAIN, END TO END. The rung is consulted while the layout is
+        # emptied (the tp_to_pp gate), and must still be able to pay on the
+        # next leg, when the same pool is resident again. Before the fix the
+        # first consultation shrank a pool that could not pay, latched
+        # ``_exhausted``, and the rung never funded anything again.
+        relief, pool, card, _alloc = _rig()
+        pool.flip_release()
+        relief.propose(
+            want_bytes=1522 * MIB, floor_bytes=1536 * MIB, delta_bytes=256 * MIB
+        )
+        pool.flip_restore()
+        self.assertEqual(
+            relief.free_up_to(600 * MIB),
+            600 * MIB,
+            "a restored layout must be fundable again",
+        )
+
+
+class ExhaustionIsEvidenceAboutOneLevelTest(unittest.TestCase):
+    """Defect 2, and the inversion of the process-lifetime pin.
+
+    ``test_a_pool_that_paid_nothing_is_not_asked_twice`` in
+    ``test_kv_backing_relief_631`` still holds and still must: a rung that
+    paid nothing is not asked again AT THE SAME LEVEL. What it never meant --
+    and what cost the prefill layout -- is that it may never be asked again at
+    all.
+    """
+
+    def _futile(self):
+        """A rig whose shrink returns nothing while the card never moves."""
+        card = _Card(1100)
+        pool = _FlipPool(CONFIGURED_ROWS, card=None)  # card deliberately fixed
+        alloc = _FakeAllocator(CONFIGURED_ROWS)
+        relief = kbr.KvBackingRelief(
+            pool,
+            alloc,
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+        )
+        return relief, pool, card
+
+    def test_the_same_level_is_not_asked_twice(self):
+        relief, pool, _card = self._futile()
+        relief.free_up_to(600 * MIB)
+        relief.free_up_to(600 * MIB)
+        self.assertEqual(len(pool.calls), 1)
+
+    def test_a_moved_backing_re_arms_the_rung(self):
+        # The inverted pin. The arena that could not pay at one level is a
+        # different proposition at another, and one no-op is not a verdict on
+        # the process. Here the phase flip restores the layout underneath the
+        # rung -- exactly the metal sequence -- and the rung must ask again.
+        relief, pool, _card = self._futile()
+        relief.free_up_to(600 * MIB)
+        self.assertEqual(len(pool.calls), 1)
+        # The metal sequence: this layout goes inactive for a phase and comes
+        # back. Its pages were released to the driver and remapped from new
+        # handles, so the earlier no-op says nothing about the arena now. The
+        # rung IS consulted while the layout is down -- ``propose`` is on the
+        # gate's unconditional path, which is the property the collective
+        # depends on -- and that consultation is where it sees the zero.
+        pool.flip_release()
+        relief.propose(
+            want_bytes=512 * MIB, floor_bytes=1536 * MIB, delta_bytes=256 * MIB
+        )
+        pool.flip_restore()
+        relief.free_up_to(600 * MIB)
+        self.assertEqual(len(pool.calls), 2, "a moved backing is new evidence")
+
+    def test_the_trace_stops_blaming_the_arena_once_the_backing_moved(self):
+        relief, pool, _card = self._futile()
+        relief.free_up_to(600 * MIB)
+        self.assertTrue(relief._exhausted)
+        pool.flip_release()
+        self.assertFalse(relief._exhausted)
+
+    def test_recovery_still_clears_exhaustion_outright(self):
+        # Unchanged behaviour, pinned so the level-keying cannot quietly
+        # replace it: a full recovery clears the marker whatever the level.
+        relief, pool, card = self._futile()
+        relief.free_up_to(600 * MIB)
+        self.assertTrue(relief._exhausted)
+        card.free = 40_000 * MIB
+        relief.recover()
+        self.assertFalse(relief._exhausted)
+
+
+if __name__ == "__main__":
+    unittest.main()
