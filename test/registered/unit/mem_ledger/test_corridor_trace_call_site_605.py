@@ -18,6 +18,16 @@ made it a module the tree carried and never ran -- the desk-written-never-
 executed shape. The natural home is the scheduler tick, and the property that
 matters most is the one this file spends the most tests on: with the flag
 unset the tick must leave ZERO trace, no thread, no NVML call, no attribute.
+
+INVERTED 2026-08-15. That last property was the bug. "Off unless asked" meant
+a default boot could not see the corridor law, and the whole self-correcting
+chain hangs off this call site: the audit reports a breach only if the trace
+armed, and ``record_corridor_shortfall`` only ever writes a number the audit
+produced. Measured over two boots on this rig, an external 100 ms NVML sampler
+saw 57 and 15 breaches (minima 895 and 935 MiB) while the serving logs
+contained ZERO "CORRIDOR LAW BREACHED" lines and the seam records kept
+``corridor_shortfall_bytes: 0``. The pins now say the tick ARMS by default and
+that an explicit off still disarms it.
 """
 
 import os
@@ -46,27 +56,49 @@ def _tick(stub):
     return types.MethodType(Scheduler._corridor_trace_tick, stub)()
 
 
-class TestOffByDefault(unittest.TestCase):
+class TestArmedByDefault(unittest.TestCase):
+    """INVERTED 2026-08-15 together with the module default.
+
+    The tick is where the law becomes observable, so with the flag unset it
+    must ARM rather than stay silent. The old pins asserted the opposite and
+    were therefore certifying the bug.
+    """
+
     def setUp(self):
         os.environ.pop(corridor_trace.TRACE_ENV, None)
 
-    def test_the_tick_leaves_no_trace_when_the_flag_is_unset(self):
+    def test_the_tick_arms_the_trace_with_no_flag_set(self):
         stub = _Stub()
-        _tick(stub)
-        self.assertIsNone(stub._corridor_trace)
+        started = mock.MagicMock()
+        with mock.patch.object(corridor_trace, "start", return_value=started):
+            _tick(stub)
+        self.assertIs(stub._corridor_trace, started)
 
-    def test_the_sampler_is_never_constructed_when_the_flag_is_unset(self):
+    def test_the_sampler_is_constructed_with_no_flag_set(self):
         stub = _Stub()
         with mock.patch.object(corridor_trace, "CorridorTrace") as ctor:
             _tick(stub)
-        ctor.assert_not_called()
+        ctor.assert_called_once()
 
-    def test_repeated_ticks_stay_silent(self):
+    def test_it_still_arms_only_once_however_many_ticks_run(self):
         stub = _Stub()
         with mock.patch.object(corridor_trace, "CorridorTrace") as ctor:
             for _ in range(50):
                 _tick(stub)
+        ctor.assert_called_once()
+
+
+class TestTheOperatorCanStillDisarmIt(unittest.TestCase):
+    def setUp(self):
+        os.environ[corridor_trace.TRACE_ENV] = "0"
+        self.addCleanup(os.environ.pop, corridor_trace.TRACE_ENV, None)
+
+    def test_an_explicit_off_leaves_no_trace(self):
+        stub = _Stub()
+        with mock.patch.object(corridor_trace, "CorridorTrace") as ctor:
+            _tick(stub)
         ctor.assert_not_called()
+        self.assertIsNone(stub._corridor_trace)
 
 
 class TestTheFlagArmsIt(unittest.TestCase):
@@ -137,3 +169,68 @@ class TestItIsWiredIntoTheTick(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheWholeChainReachesTheRecord(unittest.TestCase):
+    """The bug was never the env alone -- it was that NOTHING downstream ran.
+
+    A breach has to travel: trace -> summary(breach) -> the audit's report ->
+    record_corridor_shortfall -> next boot's margin. Pinning only the arming
+    would leave three of those four links uncovered, which is how this stayed
+    dead while its own unit tests were green.
+    """
+
+    def setUp(self):
+        os.environ.pop(corridor_trace.TRACE_ENV, None)
+
+    def _breaching_stub(self, free_min_mib: int, law_mib: int = 1024):
+        stub = _Stub()
+        stub._corridor_trace_armed = True
+        trace = mock.MagicMock()
+        trace.summary.return_value = {
+            "breach": True,
+            "free_min_mib": free_min_mib,
+            "corridor_mib": law_mib,
+            "n": 600,
+            "span_s": 60.0,
+            "period_ms": 100,
+        }
+        stub._corridor_trace = trace
+        stub.server_args = object()
+        stub.phase_flip_runtime = types.SimpleNamespace(_rank=1)
+        return stub
+
+    def test_a_breach_is_written_down_for_the_next_boot(self):
+        stub = self._breaching_stub(free_min_mib=935)
+        with mock.patch(
+            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+        ) as rec:
+            _tick(stub)
+        rec.assert_called_once()
+        _args, _kw = rec.call_args
+        # 1024 - 935 = 89 MiB of depth, in bytes.
+        self.assertEqual(_args[2], 89 << 20)
+
+    def test_a_lawful_run_writes_nothing(self):
+        stub = self._breaching_stub(free_min_mib=1200)
+        stub._corridor_trace.summary.return_value["breach"] = False
+        with mock.patch(
+            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+        ) as rec:
+            _tick(stub)
+        rec.assert_not_called()
+
+    def test_only_a_DEEPER_breach_is_reported_again(self):
+        stub = self._breaching_stub(free_min_mib=935)
+        with mock.patch(
+            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+        ) as rec:
+            _tick(stub)
+            stub._corridor_trace_next_check = 0.0
+            _tick(stub)  # same depth: nothing new to say
+            self.assertEqual(rec.call_count, 1)
+            stub._corridor_trace.summary.return_value["free_min_mib"] = 800
+            stub._corridor_trace_next_check = 0.0
+            _tick(stub)
+        self.assertEqual(rec.call_count, 2)
+        self.assertEqual(rec.call_args[0][2], 224 << 20)

@@ -81,7 +81,23 @@ class TestTheInstrumentPublishesItsOwnCost(unittest.TestCase):
         self.assertEqual(trace.summary()["overruns"], 7)
 
 
-class TestOffByDefault(unittest.TestCase):
+class TestOnByDefault(unittest.TestCase):
+    """INVERTED 2026-08-15. This used to pin "no env, no thread".
+
+    That default made a law nobody could see. This sampler is the only
+    instrument here that answers the corridor law's own question -- the law is
+    a continuous minimum and everything else takes snapshots -- and the
+    self-correcting margin downstream is fed from it: the scheduler reports a
+    breach only if this armed, and `record_corridor_shortfall` only ever
+    writes a number that report produced.
+
+    Measured on this rig over two boots: an external 100 ms NVML sampler saw
+    57 and 15 breaches, minima 895 and 935 MiB, while "CORRIDOR LAW BREACHED"
+    appeared ZERO times in either serving log and `corridor_shortfall_bytes`
+    stayed 0. The price of the old default was one daemon thread; the price of
+    the bug was a pool sizer with nothing pulling it back above the law.
+    """
+
     def setUp(self):
         self._saved = os.environ.pop(corridor_trace.TRACE_ENV, None)
 
@@ -91,9 +107,20 @@ class TestOffByDefault(unittest.TestCase):
         else:
             os.environ.pop(corridor_trace.TRACE_ENV, None)
 
-    def test_no_env_no_thread(self):
+    def test_no_env_still_samples_at_the_corridor_cadence(self):
+        self.assertEqual(
+            corridor_trace.requested_period_ms(), corridor_trace.DEFAULT_PERIOD_MS
+        )
+
+    def test_the_operator_can_still_turn_it_off(self):
+        for off in ("0", "off", "false", "no"):
+            os.environ[corridor_trace.TRACE_ENV] = off
+            self.assertIsNone(corridor_trace.requested_period_ms(), off)
+            self.assertIsNone(corridor_trace.start(), off)
+
+    def test_a_negative_cadence_is_off_rather_than_a_busy_loop(self):
+        os.environ[corridor_trace.TRACE_ENV] = "-5"
         self.assertIsNone(corridor_trace.requested_period_ms())
-        self.assertIsNone(corridor_trace.start())
 
     def test_the_env_selects_the_corridor_cadence_by_default(self):
         os.environ[corridor_trace.TRACE_ENV] = "1"

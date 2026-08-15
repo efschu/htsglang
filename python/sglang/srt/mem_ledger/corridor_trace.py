@@ -262,14 +262,45 @@ class CorridorTrace:
 
 
 def requested_period_ms() -> Optional[int]:
+    """The sampling cadence in ms, or None when the operator turns it off.
+
+    ON BY DEFAULT SINCE 2026-08-15, and the inversion is a bug fix rather than
+    a preference.
+
+    This sampler is the ONLY instrument in the tree that can answer the
+    corridor law's own question, because the law is a continuous minimum and
+    everything else here takes snapshots. While it was opt-in, a default boot
+    could not see the law it is held to -- and worse, the self-correcting
+    machinery downstream is fed from it: ``Scheduler._corridor_trace_tick``
+    reports a breach only if this returns a trace, and
+    ``record_corridor_shortfall`` only ever writes a number that audit
+    produced. So on every default boot ``corridor_shortfall_bytes`` stayed 0
+    for ever, ``seam_margin_bytes`` stayed at its constant, and the pool
+    sizer's fixed point had nothing pulling it back above the law.
+
+    Measured on this rig, 2026-08-15, two boots: an external 100 ms NVML
+    sampler recorded 57 and 15 breaches with minima of 895 and 935 MiB, while
+    "CORRIDOR LAW BREACHED on this rank's card" appeared ZERO times in either
+    serving log. The instance believed it was holding the law throughout.
+
+    The cost this was avoiding is one daemon thread reading NVML every 100 ms.
+    That is not a price worth a law nobody can see, so the default flips and
+    the escape hatch stays: ``SGLANG_CORRIDOR_TRACE_MS=0`` (or ``off``) turns
+    it off, any positive value sets the cadence.
+    """
     raw = os.environ.get(TRACE_ENV)
-    if not raw:
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_PERIOD_MS
+    text = str(raw).strip().lower()
+    if text in ("0", "off", "false", "no"):
         return None
     try:
-        value = int(raw)
+        value = int(text)
     except (TypeError, ValueError):
         return DEFAULT_PERIOD_MS
-    return DEFAULT_PERIOD_MS if value <= 1 else value
+    if value <= 0:
+        return None
+    return DEFAULT_PERIOD_MS if value == 1 else value
 
 
 def start(capacity: int = DEFAULT_CAPACITY) -> Optional[CorridorTrace]:

@@ -169,3 +169,98 @@ class TestTheLawHasOneReader(CustomTestCase):
 
         os.environ[cg.LAW_ENV] = "not-a-number"
         self.assertEqual(cg.corridor_law_mib(), cg.CORRIDOR_LAW_MIB)
+
+
+# ---------------------------------------------------------------------------
+# #662: the reserve is a MEASURED draw where one exists -- and one existed.
+#
+# `arming_floor_mib`'s docstring already said the reserve is "the MEASURED
+# draw a seam makes while it runs, where a measurement exists; the default is
+# the shipped allowance". Nothing passed the measurement, so every boot with a
+# seam record on disk still armed on the 512 MiB default.
+#
+# Measured on this rig 2026-08-15: fixed draw 954 MiB (rank1) and 1595 MiB
+# (rank2) against a gate arming at 1024 + 512 = 1536. gpu0 reached 935 MiB at
+# the `weights_refill` stage with every allocation having cleared the gate --
+# the breach living exactly in the gap the threshold-pair line predicts.
+# ---------------------------------------------------------------------------
+
+import types as _types
+
+from sglang.srt.managers import corridor_guard as _cg
+from sglang.srt.managers import phase_flip_spill as _spill
+
+
+class _Reserve:
+    def __init__(self, total_mib, active=True):
+        self.total_fixed_bytes = total_mib << 20
+        self.active = active
+
+
+def _sched(rank=1):
+    return _types.SimpleNamespace(
+        phase_flip_runtime=_types.SimpleNamespace(_rank=rank),
+        server_args=object(),
+    )
+
+
+def test_the_measured_draw_is_read_for_this_rank(monkeypatch):
+    import sglang.srt.managers.phase_flip_seam_reserve as seam
+
+    monkeypatch.setattr(seam, "read_seam_reserve", lambda sa, r: _Reserve(954))
+    assert _spill._measured_seam_draw_mib(_sched(), object()) == 954
+
+
+def test_a_cold_record_leaves_the_shipped_allowance_in_force(monkeypatch):
+    import sglang.srt.managers.phase_flip_seam_reserve as seam
+
+    monkeypatch.setattr(seam, "read_seam_reserve", lambda sa, r: None)
+    assert _spill._measured_seam_draw_mib(_sched(), object()) == 0
+
+
+def test_an_inactive_record_is_not_a_measurement(monkeypatch):
+    import sglang.srt.managers.phase_flip_seam_reserve as seam
+
+    monkeypatch.setattr(
+        seam, "read_seam_reserve", lambda sa, r: _Reserve(954, active=False)
+    )
+    assert _spill._measured_seam_draw_mib(_sched(), object()) == 0
+
+
+def test_no_runtime_means_no_rank_means_no_measurement():
+    assert _spill._measured_seam_draw_mib(_types.SimpleNamespace(), object()) == 0
+
+
+def test_a_reader_that_raises_falls_back_rather_than_killing_the_boot(monkeypatch):
+    import sglang.srt.managers.phase_flip_seam_reserve as seam
+
+    def boom(sa, r):
+        raise RuntimeError("record went away")
+
+    monkeypatch.setattr(seam, "read_seam_reserve", boom)
+    assert _spill._measured_seam_draw_mib(_sched(), object()) == 0
+
+
+def test_the_measured_draw_raises_the_floor_above_the_shipped_pair():
+    """THE DEFECT, as arithmetic. 1536 was the shipped pair; the measured draw
+    puts the honest floor at 1024 + 954, and the breach lived in between."""
+    shipped = _cg.arming_floor_mib(law_mib=1024)
+    honest = _cg.arming_floor_mib(
+        seam_entry_reserve_mib=max(_cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, 954),
+        law_mib=1024,
+    )
+    assert shipped == 1536
+    assert honest == 1978
+    assert 935 < shipped, "the observed trough cleared the shipped gate"
+    assert honest > shipped, "and would not have cleared the honest one"
+
+
+def test_a_small_measured_draw_never_LOWERS_the_shipped_allowance():
+    """A raised floor over-reclaims; a lowered one launders breaches."""
+    assert (
+        _cg.arming_floor_mib(
+            seam_entry_reserve_mib=max(_cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, 227),
+            law_mib=1024,
+        )
+        == 1536
+    )

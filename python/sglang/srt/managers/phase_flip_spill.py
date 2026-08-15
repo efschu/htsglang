@@ -550,7 +550,7 @@ class VmmDraftWeightCarrier:
                 len(shared),
                 sum(v[0] for v in shared.values()) / _MIB,
                 ", ".join(
-                    f"{n} ({own/_MIB:.0f} MiB of a {st/_MIB:.0f} MiB storage)"
+                    f"{n} ({own / _MIB:.0f} MiB of a {st / _MIB:.0f} MiB storage)"
                     for n, (own, st) in biggest
                 ),
             )
@@ -1629,6 +1629,41 @@ def _late_bound_draft_provider(scheduler: Any):
     return free_up_to
 
 
+def _measured_seam_draw_mib(scheduler: Any, server_args: Any) -> int:
+    """This rank's MEASURED seam draw in MiB, or 0 when none is on record.
+
+    The seam reserve already measures and persists exactly this: the arena
+    tail the cutover must re-commit plus the drafter's restore, both one-shot
+    draws that happen while the seam runs. The gate's arming floor is defined
+    as the law plus that draw, so reading it here is not a new measurement --
+    it is the existing one finally reaching the number it was written for.
+
+    Zero on anything unreadable: a cold boot with no record, no runtime, no
+    rank. Zero leaves the shipped 512 MiB allowance in force, which is the
+    previous behaviour exactly and the safe direction for a term that can only
+    RAISE the floor.
+    """
+    try:
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        runtime = getattr(scheduler, "phase_flip_runtime", None)
+        rank = getattr(runtime, "_rank", None)
+        if rank is None or server_args is None:
+            return 0
+        reserve = seam.read_seam_reserve(server_args, int(rank))
+        if reserve is None or not reserve.active:
+            return 0
+        return int(reserve.total_fixed_bytes) // (1 << 20)
+    except Exception as e:  # noqa: BLE001 - sizing must not raise
+        logger.warning(
+            "%s could not read this rank's measured seam draw (%s); the gate "
+            "arms on the shipped allowance instead",
+            LOG_PREFIX,
+            e,
+        )
+        return 0
+
+
 def get_corridor_guard(scheduler: Any):
     """The rank's spill-before-alloc gate (#656 items 15a/15b/16), built once.
 
@@ -1683,7 +1718,34 @@ def get_corridor_guard(scheduler: Any):
         server_args, "phase_flip_corridor_floor_mib", None
     )
     law_mib = cg.corridor_law_mib()
-    floor_mib = int(configured) if configured else cg.arming_floor_mib(law_mib=law_mib)
+    # #662: THE RESERVE IS A MEASURED DRAW WHERE ONE EXISTS, and this rig has
+    # one. `arming_floor_mib`'s own docstring says the reserve is "the MEASURED
+    # draw a seam makes while it runs, where a measurement exists; the default
+    # is the shipped allowance" -- but nothing was passing the measurement, so
+    # the default 512 MiB was used on every boot that had a seam record sitting
+    # on disk with the real number in it.
+    #
+    # Measured here 2026-08-15: the seam's own record puts the fixed draw at
+    # 954 MiB on rank1 and 1595 MiB on rank2 (arena tail plus draft restore),
+    # against a gate arming at 1024 + 512 = 1536. The gap between 1536 and
+    # 1024 + 954 is exactly where the breach lived -- gpu0 reached 935 MiB at
+    # the `weights_refill` stage while every allocation had cleared the gate.
+    # That is the failure the threshold-pair log line below predicts in words
+    # and the corridor audit predicts in its own text ("the arming floor is
+    # the number to re-derive").
+    #
+    # HIGHEST WINS, never lowest. A raised arming floor makes the gate work
+    # EARLIER and can only over-reclaim; a floor below the real draw launders
+    # breaches as passed checks. So a configured value may raise the derived
+    # one and may not lower it.
+    measured_draw_mib = _measured_seam_draw_mib(scheduler, server_args)
+    derived_mib = cg.arming_floor_mib(
+        seam_entry_reserve_mib=max(
+            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, measured_draw_mib
+        ),
+        law_mib=law_mib,
+    )
+    floor_mib = max(int(configured) if configured else 0, derived_mib)
     cg.check_threshold_pair(floor_mib, law_mib)
     logger.warning(
         "%s THRESHOLD PAIR on device %d: corridor LAW %d MiB (the verdict, "
@@ -1699,7 +1761,16 @@ def get_corridor_guard(scheduler: Any):
         law_mib,
         floor_mib,
         floor_mib - law_mib,
-        f" (set by {CORRIDOR_FLOOR_ENV})" if configured else " (derived)",
+        (
+            f" (set by {CORRIDOR_FLOOR_ENV})"
+            if configured and int(configured) >= derived_mib
+            else (
+                f" (derived from this rank's MEASURED seam draw of "
+                f"{measured_draw_mib} MiB)"
+                if measured_draw_mib
+                else " (derived)"
+            )
+        ),
     )
     guard = cg.CorridorGuard(
         int(device_index),
