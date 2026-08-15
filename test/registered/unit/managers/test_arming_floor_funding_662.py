@@ -640,40 +640,42 @@ class TheFloorMustNotBePaidTwiceTest(unittest.TestCase):
             provenance=sr.PROVENANCE_STORED,
         )
 
-    def test_a_measured_record_has_already_reserved_the_whole_floor(self):
-        """THREE terms, and the solve arranges all three.
-
-        band floor + this rank's one-leg draw + the measurement's error bar --
-        which is exactly what the arming floor asks for, stated from the other
-        side. So a boot with a measured record owes nothing further.
-        """
+    def test_a_measured_record_has_already_reserved_the_floor_ITSELF(self):
+        """band floor + this rank's one-leg draw, which is the arming floor
+        stated from the other side. What is left to charge is the load margin
+        and nothing else."""
         r = self._warm()
         reserved = sr.seam_solve_reserved_free_bytes(r)
         floor = sr.arming_floor_target_bytes(
             measured_draw_mib=r.arming_draw_bytes() >> 20
         )
-        self.assertGreaterEqual(
-            reserved,
-            floor,
-            "the solve already leaves the floor free; anything more is a "
-            "second payment for one requirement",
+        self.assertAlmostEqual(
+            (floor - reserved) / MIB,
+            sr._arming_margin_bytes() / MIB,
+            delta=1.0,
         )
 
-    def test_the_error_bar_is_not_charged_twice_either(self):
-        """``seam_allowed_tokens`` solves against ``have - seam_margin``, so
-        that margin is additional free VRAM at the solved id space. The arming
-        floor adds its own load margin of the same size for the same reason.
-        Two error bars against one measurement is one, charged twice."""
+    def test_the_error_bar_is_NOT_counted_as_reserved(self):
+        """MEASURED, boot_678_final.log. Counting the solve's own margin drives
+        the charge to zero and the pool to 537076 -- and the cards then came up
+        at 987/2286/1475 MiB against arming floors of 1536/1633/2275, below the
+        floor on two of three ranks, with the pre-arm ladder finding 40-46 MiB
+        against a 650-726 MiB gap.
+
+        The excluded ``rung_fund`` term is why: the solve counts the KV rung as
+        a payer and lets the resting free column land that much lower, so the
+        paper margin is already spent. A pool whose cards cannot hold their own
+        arming floor is the defect this whole term exists to prevent.
+        """
         r = self._warm()
-        without_bar = (
-            sr._band_floor_bytes(sr._corridor_law_bytes()) + r.arming_draw_bytes()
-        )
         self.assertEqual(
-            sr.seam_solve_reserved_free_bytes(r) - without_bar,
-            sr.seam_margin_bytes(r),
+            sr.seam_solve_reserved_free_bytes(r),
+            sr._band_floor_bytes(sr._corridor_law_bytes()) + r.arming_draw_bytes(),
+            "the solve's own margin must not be counted as headroom the gate "
+            "can rely on",
         )
 
-    def test_the_charge_collapses_to_nothing_on_a_measured_record(self):
+    def test_the_charge_collapses_to_the_load_margin(self):
         r = self._warm()
         floor = sr.arming_floor_target_bytes(
             measured_draw_mib=r.arming_draw_bytes() >> 20
@@ -682,8 +684,12 @@ class TheFloorMustNotBePaidTwiceTest(unittest.TestCase):
             floor, sr.seam_solve_reserved_free_bytes(r)
         )
         law_only = sr.arming_floor_subtrahend_bytes(floor)
-        self.assertEqual(charge, 0, "the solve already covers the floor")
-        self.assertGreater(law_only, 0, "and the law-only charge was not zero")
+        self.assertEqual(charge, sr._arming_margin_bytes())
+        self.assertLess(
+            charge,
+            law_only // 4,
+            "a record that already paid must not be charged the whole floor",
+        )
 
     def test_a_COLD_record_still_pays_in_FULL(self):
         """The r2 behaviour must not regress. A cold solve reserves nothing

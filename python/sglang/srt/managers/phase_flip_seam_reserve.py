@@ -427,23 +427,26 @@ def seam_solve_reserved_free_bytes(reserve: "SeamReserve") -> int:
     what the pre-arm relief ladder is for. Reserving it here as well would be
     the third payment for one requirement.
 
-    AND THE MEASUREMENT'S ERROR BAR IS IN THERE TOO, which is the third and
-    last thing this was paying for twice. ``seam_allowed_tokens`` solves
-    against ``have_m = have - seam_margin_bytes``, i.e. it deliberately stands
-    ``DEFAULT_MARGIN_MIB`` back from the measured position -- so at the solved
-    id space that margin is ADDITIONAL free VRAM the solve arranged. The arming
-    floor then adds its own load margin of the same size and for the same
-    reason (a card sitting exactly on a level only holds it while nothing else
-    moves). Two error bars against one measurement is one error bar charged
-    twice, and the tail is what the pre-arm relief ladder exists to absorb.
+    THE MEASUREMENT'S ERROR BAR IS NOT COUNTED HERE, AND THE METAL SAYS WHY.
+    ``seam_allowed_tokens`` does solve against ``have - seam_margin_bytes``, so
+    on paper that margin is additional free VRAM at the solved id space, and
+    counting it drives the residual charge to zero. Booted (boot_678_final.log,
+    537076 tokens) the cards came up at 987/2286/1475 MiB against arming floors
+    of 1536/1633/2275 -- BELOW the floor on two of three ranks, with the
+    pre-arm ladder able to find only 40-46 MiB against a 650-726 MiB gap.
+
+    The reason is the ``rung_fund`` term excluded above: the solve counts the
+    KV rung as a payer, so it permits the resting free column to land that much
+    lower, and the paper margin is spent covering it. A baseline that assumes
+    both is optimistic by exactly the amount that matters. So the error bar
+    stays out, the charge stays at the load margin, and the pool the planner
+    picks is one whose cards can actually hold their own arming floor --
+    measured at 482490 tokens with free 2167/3056/3233 against 1536/1772/2414
+    and a full round trip under load.
     """
     if not reserve.active:
         return 0
-    return (
-        _band_floor_bytes(_corridor_law_bytes())
-        + reserve.arming_draw_bytes()
-        + seam_margin_bytes(reserve)
-    )
+    return _band_floor_bytes(_corridor_law_bytes()) + reserve.arming_draw_bytes()
 
 
 def arming_floor_subtrahend_bytes(
