@@ -740,7 +740,36 @@ class KvBackingRelief:
         if failed is None:
             return True
         granularity = max(1, self._min_release_rows())
-        return int(target) > int(failed) - granularity
+        if int(target) <= int(failed) - granularity:
+            # Deeper than the ask that failed: a different question, because
+            # release is extent-granular.
+            return False
+        # SLACK OVERRIDES THE MARKER, and this is the rule the original brief
+        # asked for and I twice failed to implement: "never per process, when
+        # slack >> need".
+        #
+        # Keying on the target alone refuses every SHALLOWER ask after a deep
+        # one failed -- and the asks that follow are always shallower, because
+        # the deficit only ever asks for what it needs. Measured 12:26:41: PP1
+        # held 112,126 rows of slack above its floor, priced a real +1009 MiB
+        # deficit, and still declined, because a deep shrink had failed
+        # earlier from a different level. Several GiB sat releasable behind a
+        # marker.
+        #
+        # One failed shrink is weak evidence and this is where it stops being
+        # decisive: when the slack in front of the rung dwarfs what is being
+        # asked for, the cost of trying is one cap and one dial call that
+        # cannot allocate, and the cost of not trying is the prefill layout.
+        chunked = self._min_release_rows()
+        if chunked <= 0:
+            # No commit chunk means no extent can clear at ANY depth, so slack
+            # is not evidence of anything and the marker stands. (Such a pool
+            # is disqualified from the rung entirely at construction; this is
+            # the belt.)
+            return True
+        current = self._current_rows()
+        slack = max(0, current - int(target))
+        return slack < 2 * chunked
 
     @_exhausted.setter
     def _exhausted(self, value: bool) -> None:

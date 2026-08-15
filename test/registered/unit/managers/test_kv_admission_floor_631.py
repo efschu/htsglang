@@ -96,7 +96,9 @@ class TheRungKeepsAnAdmissionReserveTest(unittest.TestCase):
             want_bytes=8 * GIB, floor_bytes=1 * GIB, delta_bytes=0
         )
         floor_rows = -int(proposal[1])
-        self.assertGreaterEqual(floor_rows, 4242 + 1 + kbr.DEFAULT_ADMISSION_RESERVE_ROWS)
+        self.assertGreaterEqual(
+            floor_rows, 4242 + 1 + kbr.DEFAULT_ADMISSION_RESERVE_ROWS
+        )
 
     def test_the_reserve_is_uniform_across_ranks_by_the_existing_reduction(self):
         """No new collective: MIN of the negated floors already yields the MAX.

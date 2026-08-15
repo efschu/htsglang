@@ -452,7 +452,9 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         """The wedge, gone, at the spendable figure the rig actually had."""
         r = self._runtime_on_the_rig()
         src, dst = self._sides()
-        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, r._flip_waves("pp_to_tp"))
+        need = r._staging_bytes(
+            self._plan(), "pp_to_tp", src, dst, r._flip_waves("pp_to_tp")
+        )
         gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
         ok, detail = gate._staging_affordable(need)
         self.assertTrue(ok, detail)
@@ -494,15 +496,12 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         r = self._runtime_on_the_rig(swappable=True)
         r._seam_restore_first = False
         waves = r._flip_waves("pp_to_tp")
-        self.assertEqual(
-            len(waves), 16, "rollback must restore the smallest-stage cap"
-        )
+        self.assertEqual(len(waves), 16, "rollback must restore the smallest-stage cap")
         for w in waves:
             for stage in self.LAYER_MAP:
                 self.assertTrue(
                     set(w) & set(stage),
-                    f"rollback must restore the proportional split; {w} "
-                    f"skips a stage",
+                    f"rollback must restore the proportional split; {w} skips a stage",
                 )
 
     def test_the_slack_accounting_follows_the_order(self):
@@ -519,9 +518,7 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         for restore_first in (True, False):
             r = self._runtime_on_the_rig(swappable=True)
             r._seam_restore_first = restore_first
-            charged[restore_first] = r._backing_slack_bytes(
-                "pp_to_tp", src, dst, waves
-            )
+            charged[restore_first] = r._backing_slack_bytes("pp_to_tp", src, dst, waves)
         self.assertGreater(
             charged[True],
             charged[False],
@@ -609,9 +606,7 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         waves = r_plain._flip_waves("pp_to_tp")
         small = r_swap._staging_bytes(
             self._plan(rows=1000), "pp_to_tp", src, dst, waves
-        ) - r_plain._staging_bytes(
-            self._plan(rows=1000), "pp_to_tp", src, dst, waves
-        )
+        ) - r_plain._staging_bytes(self._plan(rows=1000), "pp_to_tp", src, dst, waves)
         big = r_swap._staging_bytes(
             self._plan(), "pp_to_tp", src, dst, waves
         ) - r_plain._staging_bytes(self._plan(), "pp_to_tp", src, dst, waves)

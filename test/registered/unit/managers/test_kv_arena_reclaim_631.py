@@ -100,9 +100,7 @@ class TestArenaCommitReclaimsTorchCache(CustomTestCase):
             handle = self.backing._mem_create_reclaiming(1 << 21, object())
         self.assertEqual(handle, 4242)
         self.assertEqual(driver.calls, 1)
-        self.assertEqual(
-            self.events, [], "empty_cache must not run on the happy path"
-        )
+        self.assertEqual(self.events, [], "empty_cache must not run on the happy path")
 
     def test_oom_reclaims_then_retries_and_succeeds(self):
         """The measured crash, now survived."""

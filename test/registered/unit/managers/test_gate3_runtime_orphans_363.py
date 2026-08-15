@@ -165,9 +165,7 @@ class TestSpreadVetoIsRetired(CustomTestCase):
             rep = bands.report(a, b)
             named = {c["constant"] for c in rep["constants"]}
             self.assertIn("spread_veto_pct", named)
-            v = next(
-                c for c in rep["constants"] if c["constant"] == "spread_veto_pct"
-            )
+            v = next(c for c in rep["constants"] if c["constant"] == "spread_veto_pct")
             self.assertEqual(v["verdict"], "UNREACHED")
             self.assertIs(v["blocking_eligible"], False)
 

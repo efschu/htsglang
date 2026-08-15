@@ -168,9 +168,10 @@ def test_round_trip_a_matching_message_is_delivered():
     sender = _Rank()
     payload = {"hidden_states": torch.zeros(24, 4)}
     sender._pp_send_dict_to_next_stage(
-        payload, async_send=True, msg_type="proxy", stamp=sender._pp_proxy_stamp(
-            1, _FakeResult(24)
-        )
+        payload,
+        async_send=True,
+        msg_type="proxy",
+        stamp=sender._pp_proxy_stamp(1, _FakeResult(24)),
     )
     receiver = _Rank(wire=sender.pp_group.sent)
     got = receiver._pp_recv_proxy_tensors(mb_id=1)
@@ -182,7 +183,9 @@ def test_round_trip_a_matching_message_is_delivered():
 
 def test_an_unstamped_message_is_accepted_unchanged():
     """Backward compatibility: nothing else on this wire is stamped."""
-    receiver = _Rank(wire=[{"hidden_states": torch.zeros(3, 4), "__msg_type__": "proxy"}])
+    receiver = _Rank(
+        wire=[{"hidden_states": torch.zeros(3, 4), "__msg_type__": "proxy"}]
+    )
     got = receiver._pp_recv_proxy_tensors(mb_id=1)
     assert got["hidden_states"].shape[0] == 3
 
@@ -342,9 +345,7 @@ def test_the_stamp_is_stripped_before_the_model_sees_it():
     # travelled into PPProxyTensors in production. It is named here rather
     # than quietly tolerated: this fix does not widen that exposure, and the
     # assertion below fails the moment a THIRD kind of non-tensor appears.
-    non_tensors = {
-        k for k, v in got.tensors.items() if not isinstance(v, torch.Tensor)
-    }
+    non_tensors = {k for k, v in got.tensors.items() if not isinstance(v, torch.Tensor)}
     assert non_tensors == {"__msg_type__"}, (
         f"a new non-tensor entry reached model compute: {non_tensors}"
     )

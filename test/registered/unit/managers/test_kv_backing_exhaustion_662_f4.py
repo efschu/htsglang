@@ -601,3 +601,55 @@ class ExhaustionMustNotBeSelfLockingTest(unittest.TestCase):
         failed = relief._exhausted_target_rows
         deeper = max(0, failed - max(1, relief._min_release_rows()))
         self.assertFalse(relief._declines_target(deeper))
+
+
+class SlackOverridesTheMarkerTest(unittest.TestCase):
+    """ "Never per process, when slack >> need" -- the brief's own rule.
+
+    Keying on the failed TARGET alone refuses every SHALLOWER ask after a deep
+    one failed, and the asks that follow are always shallower, because the
+    deficit only ever asks for what it needs. Measured 12:26:41: PP1 held
+    112,126 rows of slack above its floor, priced a real +1009 MiB deficit,
+    and still declined -- several GiB releasable behind a marker set by one
+    earlier failure from a different level.
+    """
+
+    def _rig(self, live_rows):
+        card = _Card(1100)
+        pool = _FlipPool(CONFIGURED_ROWS, card=card)
+        # A CHUNKED arena, which is the shape the rung is registered against
+        # at all: without a commit chunk no extent can clear at any depth, so
+        # slack is not evidence and the marker rightly stands.
+        pool.backing_commit_chunk_bytes = 8 * MIB
+        return (
+            kbr.KvBackingRelief(
+                pool,
+                _FakeAllocator(CONFIGURED_ROWS),
+                live_slots_fn=lambda: torch.arange(1, live_rows + 1, dtype=torch.int64),
+                bytes_per_row=BYTES_PER_ROW,
+                probe=card.probe,
+                admission_reserve_rows=RESERVE,
+                buffers=1,
+            ),
+            pool,
+        )
+
+    def test_a_shallower_ask_with_room_in_front_of_it_is_tried_anyway(self):
+        relief, pool = self._rig(LIVE_ROWS)
+        relief._mark_exhausted(target=100)  # a DEEP ask failed
+        shallower = CONFIGURED_ROWS - 500  # far above it
+        self.assertFalse(
+            relief._declines_target(shallower),
+            "slack in front of the rung outweighs one earlier failure",
+        )
+
+    def test_with_no_room_the_marker_still_stands(self):
+        relief, pool = self._rig(LIVE_ROWS)
+        relief._mark_exhausted(target=relief.backed_rows())
+        # A target at the current level: nothing in front of the rung to try.
+        self.assertTrue(relief._declines_target(relief.backed_rows()))
+
+    def test_the_deeper_escape_still_works(self):
+        relief, pool = self._rig(LIVE_ROWS)
+        relief._mark_exhausted(target=3000)
+        self.assertFalse(relief._declines_target(1000))

@@ -913,9 +913,9 @@ class TestPlannerFeedAcceptance578(CustomTestCase):
         }
         candidates, notes = planner_candidates(
             _SERVER_ARGS_578,
-            solve_fn=lambda goal: solved.get(REGIME_PREFILL_HEAVY)
-            if goal == "enc"
-            else None,
+            solve_fn=lambda goal: (
+                solved.get(REGIME_PREFILL_HEAVY) if goal == "enc" else None
+            ),
         )
         self.assertTrue(candidates, f"the feed produced no stage; notes={notes}")
         plan = build_stage_table(
@@ -924,7 +924,8 @@ class TestPlannerFeedAcceptance578(CustomTestCase):
             declared_vectors=((2, 11, 10),),
         )
         self.assertGreaterEqual(
-            len(plan.flip_targets), 1,
+            len(plan.flip_targets),
+            1,
             "a measured stage in a declared vector must be a flip target; "
             "without one, act mode still has nowhere to go",
         )
@@ -1042,18 +1043,14 @@ class TestPhaseFlipAxis(CustomTestCase):
         """Same kv/vram, different regime: without the flip axis this is
         'no reachable axis' -- exactly as before #631."""
         actuator = RegimeActuator()
-        result = actuator.apply(
-            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
-        )
+        result = actuator.apply(_stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED)
         self.assertFalse(result.armed)
         self.assertIn("no reachable axis", result.reason)
         self.assertNotIn("phase", actuator.wired_axes)
 
     def test_wired_axis_arms_the_legal_direction(self):
         actuator, log = self._actuator("pp")
-        result = actuator.apply(
-            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
-        )
+        result = actuator.apply(_stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED)
         self.assertTrue(result.armed)
         self.assertEqual(log, [("pp_to_tp", ARM_SOURCE)])
         self.assertIn("phase", result.detail)
@@ -1062,31 +1059,23 @@ class TestPhaseFlipAxis(CustomTestCase):
 
     def test_return_direction_from_tp(self):
         actuator, log = self._actuator("tp")
-        result = actuator.apply(
-            _stage("pp-prefill", REGIME_PREFILL_HEAVY), BOOTED
-        )
+        result = actuator.apply(_stage("pp-prefill", REGIME_PREFILL_HEAVY), BOOTED)
         self.assertTrue(result.armed)
         self.assertEqual(log, [("tp_to_pp", ARM_SOURCE)])
 
     def test_same_phase_and_unmapped_regime_arm_nothing(self):
         actuator, log = self._actuator("tp")
-        result = actuator.apply(
-            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
-        )
+        result = actuator.apply(_stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED)
         self.assertFalse(result.armed)
         self.assertEqual(log, [])
         actuator2, log2 = self._actuator("pp")
-        result2 = actuator2.apply(
-            _stage("kvp", REGIME_KV_PRESSURE), BOOTED
-        )
+        result2 = actuator2.apply(_stage("kvp", REGIME_KV_PRESSURE), BOOTED)
         self.assertFalse(result2.armed)
         self.assertEqual(log2, [])
 
     def test_flip_refusal_passes_through_verbatim(self):
         actuator, log = self._actuator("pp", refuse=True)
-        result = actuator.apply(
-            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
-        )
+        result = actuator.apply(_stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED)
         self.assertFalse(result.armed)
         self.assertIn("REFUSED", result.detail["phase"])
         self.assertIn("PD disaggregation", result.detail["phase"])
@@ -1111,5 +1100,3 @@ class TestPhaseFlipAxis(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

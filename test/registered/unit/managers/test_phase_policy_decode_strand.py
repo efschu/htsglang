@@ -155,7 +155,5 @@ class TestTheRestingLayout(CustomTestCase):
     def test_it_stays_configurable_for_large_prompt_traffic(self):
         from sglang.srt.managers.phase_policy import PHASE_PP, REST_PREFILL
 
-        cfg = PhasePolicyConfig(
-            enabled=True, flip_tokens=7004, rest_state=REST_PREFILL
-        )
+        cfg = PhasePolicyConfig(enabled=True, flip_tokens=7004, rest_state=REST_PREFILL)
         self.assertEqual(cfg.rest_phase, PHASE_PP)

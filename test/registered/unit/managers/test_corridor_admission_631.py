@@ -424,9 +424,7 @@ def test_cooldown_prevents_a_second_empty_cache_in_the_same_instant():
     card = FakeCard(free_mib=900, hoard_mib=4000)
     clock = {"t": 0.0}
     scheduler = FakeScheduler(FakeReporter(qkv=0, ffn=0))
-    gate = PrefillAdmissionGate(
-        scheduler, cooldown_s=0.25, clock=lambda: clock["t"]
-    )
+    gate = PrefillAdmissionGate(scheduler, cooldown_s=0.25, clock=lambda: clock["t"])
     guard = build_guard(card)
     gate._guard = lambda: guard  # noqa: SLF001
     gate.before_admission(512)

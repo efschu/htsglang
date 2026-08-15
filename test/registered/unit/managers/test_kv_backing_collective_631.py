@@ -446,9 +446,7 @@ class RecoveryMayNotBreachTheCorridorItWasRelievingTest(unittest.TestCase):
         relief.recover()
         self.assertLessEqual(pool.full_pool_backed_rows, 400000 + 1976)
         self.assertGreater(pool.full_pool_backed_rows, 400000)
-        self.assertNotIn(
-            500000, pool.grew_to, "the full grow must never be attempted"
-        )
+        self.assertNotIn(500000, pool.grew_to, "the full grow must never be attempted")
 
     def test_a_partial_recovery_keeps_the_cap_at_the_level_it_reached(self):
         relief, pool, _card = self._rank_at(3000, 400000)
@@ -625,9 +623,7 @@ class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
                 os.environ[pfs.ENV_FUND_TP_TO_PP] = prev
         self.assertEqual(freed, 0)
         self.assertEqual(pool.calls, [], "the pool that is about to go live")
-        self.assertEqual(
-            len(calls), 1, "abstaining is not the same as walking away"
-        )
+        self.assertEqual(len(calls), 1, "abstaining is not the same as walking away")
 
 
 if __name__ == "__main__":

@@ -218,8 +218,7 @@ class SeamFundIsEvictableContentTest(unittest.TestCase):
         self.assertEqual(
             relief.fundable_bytes(),
             expected_rows * MIB,
-            "the rung may fund everything down to the RESIDENT half of the "
-            "live set",
+            "the rung may fund everything down to the RESIDENT half of the live set",
         )
         self.assertGreater(relief.fundable_bytes(), 8_000 * MIB)
 

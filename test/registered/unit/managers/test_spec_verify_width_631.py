@@ -85,9 +85,7 @@ class _Self:
 
 
 def _resolve(result, batch):
-    return SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-        _Self(), result, batch
-    )
+    return SchedulerBatchResultProcessor._resolve_spec_v2_tokens(_Self(), result, batch)
 
 
 # --------------------------------------------------------------------
