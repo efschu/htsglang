@@ -169,10 +169,10 @@ ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
 # `effective_flip_threshold` charges every decoding request a full PP window
 # for the stranding a cutover causes, and charges the alternative -- leaving
 # the prefill in TP -- nothing at all. That one-sidedness made the gate
-# unreachable in production: the ladder ran 7004 / 39835 / 72666 / 105498 /
-# 138329 tokens for 0..4 decoding requests, so at --max-running-requests 4 no
-# prompt this model can hold could ever flip, and a live 72,257-token backlog
-# at running_bs 2 was refused by 409 tokens.
+# unreachable on the dev instance: the ladder ran 7004 / 39835 / 72666 /
+# 105498 / 138329 tokens for 0..4 decoding requests, so at
+# --max-running-requests 4 no prompt this model can hold could ever flip, and
+# a live 72,257-token backlog at running_bs 2 was refused by 409 tokens.
 #
 # The premise behind the zero was never measured. It is false here. Measured
 # against the live instance (2 decode streams + one 72k prompt, client-side
@@ -428,7 +428,7 @@ def _differential_flip_threshold(
     AND AT sigma = 1 THE RATIO CANCELS. ``(1-r)`` divides out of numerator and
     denominator, so the whole threshold depends only on ``N0`` and ``B`` -- not
     on the prefill ladder. That matters operationally: this rig re-ships
-    production on re-solved memory and KV vectors, and a calibration that
+    the serving instance on re-solved memory and KV vectors, and a calibration that
     needed ``r`` re-measured after every such change would be stale the moment
     it landed. sigma = 1 is not a fitted constant either; it is what
     ``--disable-overlap-schedule`` structurally does -- a prefill batch and a

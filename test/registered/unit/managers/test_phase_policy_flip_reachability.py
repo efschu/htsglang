@@ -14,7 +14,7 @@ With the booted values (N 7004, C 3.2 s, W 15 s, weight 1) that is a ladder of
 live 72,257-token prefill backlog at running_bs 2 was refused by 409 tokens,
 and at `--max-running-requests 4` the gate wants 138,329 pending tokens -- more
 than a 120k prompt can supply. Whenever the server is busy, long prefills are
-pinned in the slow layout: the original NIAH complaint, back in production.
+pinned in the slow layout: the original NIAH complaint, back again.
 
 WHY THE COUNTERFACTUAL IS NOT FREE
 ----------------------------------
@@ -80,7 +80,7 @@ from sglang.srt.managers.phase_policy import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-# The booted production values, so the numbers below are the live ones.
+# The booted values on the dev instance, so the numbers below are live ones.
 N = 7004
 C = 3.2
 W = 15.0
@@ -180,7 +180,7 @@ class TestTheBoundIsStructural(CustomTestCase):
         self.assertEqual(effective_flip_threshold(cfg, 4), 0)
 
     def test_at_sigma_one_the_prefill_ladder_cancels_out(self):
-        """The calibration must not go stale when production is re-shipped.
+        """The calibration must not go stale when the instance is re-shipped.
 
         This rig re-solves its memory and KV vectors per boot, and the prefill
         ladder moves with them. At the measured sigma = 1 the (1 - r) factor
