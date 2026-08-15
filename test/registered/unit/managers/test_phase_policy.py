@@ -188,15 +188,35 @@ def test_pp_with_a_worthwhile_prefill_backlog_stays_in_pp():
 def test_batching_small_residual_prefill_does_not_pin_the_server_in_pp():
     """Continuous arrivals must not trap decode in the prefill layout.
 
-    Falsifier for an ``== 0`` drain rule: under batching the queue may
-    never reach exactly zero, and decoding in PP means decoding with no
-    speculation and no decode CUDA graphs.
+    CONTRACT CHANGED 2026-08-15 (#669). This used to assert that a residual
+    just under the ENTRY break-even N leaves PP immediately. That was wrong,
+    and it is what made the instance exit at ~10k pending and prefill the
+    remainder in TP at a third of the rate. N prices entry; once in PP the
+    return seam is due either way, so it cancels and what is left is R/r_pp
+    against R/r_tp -- leaving early loses for every R > 0.
+
+    The residual therefore STAYS in PP now. What still may not happen is
+    pinning, and that guarantee moved to the decode-starvation cap: a
+    sub-chunk residual drains and exits, and anything larger is bounded by the
+    SLO instead of by an entry threshold that never described this direction.
     """
-    c = cfg()
+    c = cfg(pp_exit_tokens=512, decode_stall_slo_s=45.0, flip_cost_s=5.918)
     st = PhasePolicyState()
-    d = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2))
-    assert d.direction == PP_TO_TP
-    assert "decoding" in d.reason
+    st.phase_since = 1000.0
+
+    # A residual well above one chunk is finished here, not carried to TP.
+    held = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2, now=1005.0))
+    assert held.direction is None, held.reason
+
+    # Drained below one chunk -> leave, and say so.
+    drained = decide(c, st, inp(PHASE_PP, pending=100, running=2, now=1005.0))
+    assert drained.direction == PP_TO_TP
+    assert "DRAINED" in drained.reason and "exit condition: drained" in drained.reason
+
+    # And it can still never pin: the starvation cap ends it regardless.
+    capped = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2, now=1040.0))
+    assert capped.direction == PP_TO_TP
+    assert "decode starvation cap" in capped.reason
 
 
 # -- falsifier 3: in-flight safety --------------------------------------------

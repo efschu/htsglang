@@ -171,6 +171,28 @@ ENV_PP_TOK_S = "SGLANG_PHASE_POLICY_PP_TOK_S"
 #: purely by drain, which is the existing default (`pp_window_s` also defaults
 #: to 0).
 ENV_DECODE_STALL_SLO = "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S"
+#: Tokens at or below which the PP phase is considered DRAINED.
+#:
+#: This is NOT the entry break-even N, and conflating the two was a real
+#: defect: the instance left PP at ~10k pending and prefilled the remainder in
+#: TP at a third of the rate. N prices ENTRY -- two seams against a mountain
+#: that has not been climbed yet. Once you are already IN PP the economics are
+#: asymmetric:
+#:
+#:   finish here : R / r_pp  + the return seam, which is due anyway
+#:   leave now   : the return seam NOW + R / r_tp
+#:
+#: The seam is common to both, so it cancels, and what remains is R/r_pp
+#: against R/r_tp. Since r_pp > r_tp by construction (it is why the PP layout
+#: exists), leaving early LOSES for every R > 0. There is no crossover to
+#: find: the correct exit is "the prefill is done", and the only thing allowed
+#: to cut it short is the decode-starvation SLO.
+#:
+#: "Done" means below one chunk, not exactly zero, because a chunked prefill
+#: leaves a partial chunk in flight and an ==0 test can miss it forever. The
+#: scheduler supplies its real chunked_prefill_size at boot.
+ENV_PP_EXIT_TOKENS = "SGLANG_PHASE_POLICY_PP_EXIT_TOKENS"
+DEFAULT_PP_EXIT_TOKENS = 0
 DEFAULT_DECODE_STALL_SLO_S = 0.0
 # TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
 # (2026-08-08, commit 2bcc6b7d25, quiet-gated ladder with zero contended
@@ -689,6 +711,10 @@ class PhasePolicyConfig:
     #: latency constraint. The PP residency cap is solved from it; see
     #: ENV_DECODE_STALL_SLO. 0 = not declared, drain governs alone.
     decode_stall_slo_s: float = DEFAULT_DECODE_STALL_SLO_S
+    #: Drained threshold for the PP phase, in tokens. Set from the scheduler's
+    #: real chunked_prefill_size at boot; see ENV_PP_EXIT_TOKENS for why this
+    #: is emphatically not flip_tokens.
+    pp_exit_tokens: int = DEFAULT_PP_EXIT_TOKENS
     #: The prefill ladder the threshold is solved against. Only the RATIO
     #: matters to the differential model; ``flip_tokens`` already carries the
     #: absolute scale.
@@ -1100,11 +1126,12 @@ def _decide_from_load(
         # running in whatever layout we are about to be in anyway. That
         # makes the two rules one hysteresis band around N instead of two
         # unrelated thresholds, so no arrival pattern can satisfy both.
-        if inp.pending_prefill_tokens <= cfg.flip_tokens and inp.running_bs > 0:
+        if inp.pending_prefill_tokens <= cfg.pp_exit_tokens and inp.running_bs > 0:
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"prefill down to {inp.pending_prefill_tokens} tok "
-                f"(<= N={cfg.flip_tokens}), {inp.running_bs} req decoding",
+                f"DRAINED: {inp.pending_prefill_tokens} tok remaining "
+                f"(<= one chunk of {cfg.pp_exit_tokens}), {inp.running_bs} req "
+                f"decoding -- exit condition: drained",
             )
         # THE PP WINDOW. The rule above needs prefill to DRAIN below N; a
         # sustained backlog never does, and under strict purity the PP
@@ -1129,7 +1156,8 @@ def _decide_from_load(
                 f"{in_pp + 2 * cfg.flip_cost_s:.1f}s of the "
                 f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
                 f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
-                f"{inp.pending_prefill_tokens} tok prefill still pending",
+                f"{inp.pending_prefill_tokens} tok prefill still pending -- exit "
+                f"condition: decode starvation cap",
             )
 
         # LEGACY STOPWATCH. Retained so a deployment that set pp_window_s keeps
@@ -1440,6 +1468,7 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         decode_stall_slo_s=_env_float(
             ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
         ),
+        pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
         tp_prefill_tok_s=tp_tok_s,
         pp_prefill_tok_s=pp_tok_s,
         refusal_backoff_cap_s=_env_float(

@@ -495,6 +495,14 @@ class Scheduler(
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg, prefill_runs_in_tp=False
                 )
+            # The PP phase is drained when less than one chunk is left, and
+            # the chunk size is a runtime fact, not a policy guess. Only fill
+            # it in when the operator has not pinned one.
+            if self.phase_policy_cfg.pp_exit_tokens <= 0:
+                self.phase_policy_cfg = dataclasses.replace(
+                    self.phase_policy_cfg,
+                    pp_exit_tokens=int(self.server_args.chunked_prefill_size or 0),
+                )
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this

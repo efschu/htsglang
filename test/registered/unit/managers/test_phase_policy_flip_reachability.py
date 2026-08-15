@@ -838,10 +838,16 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         self.assertIn("45s budget", d.reason.replace("45.0s", "45s"))
 
     def test_drain_still_ends_the_phase_first_when_it_can(self):
-        cfg = self._cfg_slo(45.0)
-        d = self._pp(cfg, 500, 3, 5.0)
+        """Drained means below ONE CHUNK, not below the entry break-even."""
+        import dataclasses
+
+        cfg = dataclasses.replace(self._cfg_slo(45.0), pp_exit_tokens=512)
+        d = self._pp(cfg, 100, 3, 5.0)
         self.assertEqual(d.direction, PP_TO_TP)
-        self.assertIn("prefill down to", d.reason)
+        self.assertIn("DRAINED", d.reason)
+        self.assertIn("exit condition: drained", d.reason)
+        # A residual above one chunk is finished in PP, where it is faster.
+        self.assertIsNone(self._pp(cfg, 9_000, 3, 5.0).direction)
 
     def test_the_legacy_stopwatch_states_what_drain_would_have_done(self):
         """Requirement (3): the deferring line must be auditable in place."""
