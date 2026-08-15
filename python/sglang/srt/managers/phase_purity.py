@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -253,7 +254,7 @@ def purity_from_server_args(server_args) -> PhasePurity:
         raw = os.environ.get(ENV_PURITY)
     purity = parse_purity(raw)
     logger.warning(
-        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP " "layout: %s",
+        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP layout: %s",
         LOG_PREFIX,
         purity.describe(),
         (
@@ -344,6 +345,74 @@ def stand_down_after() -> int:
     return max(1, n)
 
 
+def _decode_slo_s(scheduler) -> float:
+    """The operator's decode-stall SLO in seconds, or 0.0 when unset."""
+    try:
+        cfg = getattr(scheduler, "phase_policy_cfg", None)
+        if cfg is None:
+            return 0.0
+        return max(0.0, float(getattr(cfg, "decode_stall_slo_s", 0.0) or 0.0))
+    except Exception:  # noqa: BLE001 - a safety valve must not raise
+        return 0.0
+
+
+def _note_decode_starving(scheduler) -> None:
+    """Stamp the instant decode first became blocked with work to do.
+
+    GROUP UNIFORMITY, which is the property this file's other inputs are
+    chosen for. This is a wall clock, and the two existing causes are
+    group-REDUCED counters -- so it is the first non-uniform input here and
+    the choice is deliberate.
+
+    What makes it safe is the EVENT it is stamped from: the first iteration on
+    which decode is blocked in PP with a non-empty batch. Phase, purity and
+    batch are identical on every rank at that point, so every rank stamps on
+    the same iteration and crosses the SLO within ONE iteration of the others
+    -- the same bound the abandon streak already has, since that advances per
+    iteration too. A sub-iteration skew cannot split the group's decision for
+    longer than the iteration itself.
+    """
+    if getattr(scheduler, "_decode_starved_since", None) is None:
+        scheduler._decode_starved_since = time.monotonic()
+
+
+def _clear_decode_starving(scheduler) -> None:
+    """Decode is moving (or has nothing to do): retire the clock."""
+    if getattr(scheduler, "_decode_starved_since", None) is not None:
+        scheduler._decode_starved_since = None
+
+
+def _decode_starved_beyond_slo(scheduler) -> Optional[str]:
+    """The SLO cause: decode held past the operator's bound by a FUNDING
+    failure rather than by a terminal one.
+
+    THE HOLE THIS CLOSES. The two existing causes are COUNTS -- a blocking
+    guard, or an abandon streak reaching its bound. The SLO is a TIME. Nothing
+    bridged them, so a funding failure that never accumulates the count could
+    hold decode for ever inside the bound: on 2026-08-15 the seam abandoned
+    repeatedly with the rate limiter pacing the retries, and the abandon-cap
+    guard was deliberately stood down while work was waiting, so neither count
+    arrived. That window was harmless only because the running batch was
+    empty. With decodes resident it is an unbounded stall.
+
+    So time is a cause in its own right: whatever the counts say, decodes are
+    never held past the SLO by a funding failure.
+    """
+    slo = _decode_slo_s(scheduler)
+    if slo <= 0.0:
+        return None
+    since = getattr(scheduler, "_decode_starved_since", None)
+    if since is None:
+        return None
+    waited = time.monotonic() - since
+    if waited < slo:
+        return None
+    return (
+        f"decode has been held {waited:.1f}s by an unfunded flip, past the "
+        f"{slo:g}s decode-stall SLO"
+    )
+
+
 def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
     """Why the flip cannot serve ``work`` right now, or None.
 
@@ -363,6 +432,13 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
     ``tp_to_pp`` starves prefill and says nothing about decode. Relaxing on
     the wrong one is how a safety valve becomes the normal path.
     """
+    # THE SLO IS A CAUSE, and it is checked FIRST because it is the only one
+    # with a bound the operator stated. The two below are counts; this is the
+    # promise that no count can outlive.
+    if work == "decode":
+        starved = _decode_starved_beyond_slo(scheduler)
+        if starved is not None:
+            return starved
     rt = getattr(scheduler, "phase_flip_runtime", None)
     if rt is None:
         return None
@@ -427,8 +503,7 @@ def _relaxed(scheduler, work: str) -> bool:
         if getattr(scheduler, "_phase_purity_stood_down", None) is not None:
             scheduler._phase_purity_stood_down = None
             logger.warning(
-                "%s the flip is working again; the purity rule is back in "
-                "force for %s",
+                "%s the flip is working again; the purity rule is back in force for %s",
                 LOG_PREFIX,
                 work,
             )
@@ -475,9 +550,19 @@ def decode_blocked_here(scheduler, running_bs: int) -> bool:
     from sglang.srt.managers.phase_policy import PHASE_PP
 
     if _active_phase(scheduler) != PHASE_PP:
+        _clear_decode_starving(scheduler)
         return False
     if purity_of(scheduler).decode_allowed_in_pp(running_bs):
+        _clear_decode_starving(scheduler)
         return False
+    # THE CLOCK RUNS ONLY WHEN THERE IS DECODE TO HOLD. An empty batch is not
+    # starvation, and starting the clock on it would spend the SLO before a
+    # single request arrived -- which is exactly how today's window looked
+    # harmless: the mechanism was live, the batch was empty.
+    if int(running_bs) > 0:
+        _note_decode_starving(scheduler)
+    else:
+        _clear_decode_starving(scheduler)
     return not _relaxed(scheduler, "decode")
 
 
