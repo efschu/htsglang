@@ -95,6 +95,25 @@ class _FakeAllocator:
             on_free(idx)
 
 
+class _Desc:
+    def __init__(self, row_bytes: int):
+        self.row_bytes = row_bytes
+        self.tokens_per_row = 1
+
+
+class _Spec:
+    def __init__(self, row_bytes: int):
+        self.desc = _Desc(row_bytes)
+
+
+class _FakeOwner:
+    """One buffer carrying the whole per-row cost, which is all the geometry
+    reader needs: it sums ``row_bytes // tokens_per_row`` across specs."""
+
+    def __init__(self, bytes_per_row: int):
+        self._specs = [_Spec(bytes_per_row)]
+
+
 class _FlipPool:
     """A VA-reserved pool with the phase flip's two independent facts.
 
@@ -116,6 +135,10 @@ class _FlipPool:
         self.supports_backing_spans = True
         self.calls = []
         self.backed_bytes = rows * BYTES_PER_ROW
+        # The arena descriptors ``row_geometry`` prices against. A rebind
+        # re-derives geometry from the pool it moves to, so the fake has to
+        # carry the same shape the real pool family does.
+        self._post_capture_owner = _FakeOwner(BYTES_PER_ROW)
 
     # -- what the phase flip does to this pool, and only this ------------
     def flip_release(self) -> None:
@@ -316,3 +339,110 @@ class ExhaustionIsEvidenceAboutOneLevelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheFunderFollowsTheResidentLayoutTest(unittest.TestCase):
+    """#662-F4, second half: fund the seam from the pool that HAS pages.
+
+    The scheduler's KV pool is the PP layout's. On the pp_to_tp leg that is the
+    SOURCE -- backed, with slack above the live set, able to pay. On the
+    tp_to_pp leg the same pool is the DESTINATION, and the seam emptied it a
+    phase ago. A rung captured on it can only ever fund one of the two legs,
+    which is why the leg into the prefill layout still had no funder after the
+    exclusion in ``collective_kv_backing_relief`` was lifted.
+
+    The money on that leg is the TP layout's pool: it is the source, it is
+    fully backed, and the rows above its high-water mark hold nothing.
+    """
+
+    def _two_layouts(self):
+        card = _Card(1100)
+        pp = _FlipPool(CONFIGURED_ROWS, card=card)
+        tp = _FlipPool(CONFIGURED_ROWS, card=card)
+        alloc = _FakeAllocator(CONFIGURED_ROWS)
+        phase = {"active": "pp"}
+
+        def pool_fn():
+            return tp if phase["active"] == "tp" else pp
+
+        relief = kbr.KvBackingRelief(
+            pp,
+            alloc,
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+            pool_fn=pool_fn,
+        )
+        return relief, pp, tp, card, phase
+
+    def test_in_the_pp_phase_it_funds_from_the_scheduler_pool(self):
+        relief, pp, tp, _card, _phase = self._two_layouts()
+        self.assertEqual(relief.free_up_to(600 * MIB), 600 * MIB)
+        self.assertEqual(len(pp.calls), 1)
+        self.assertEqual(tp.calls, [], "the inactive layout is not touched")
+
+    def test_in_the_tp_phase_it_funds_from_the_resident_layout(self):
+        # THE HEADLINE. The flip has cut over, so the PP pool is empty and the
+        # TP pool holds the pages. Before this, the rung proposed against the
+        # empty one and released nothing.
+        relief, pp, tp, _card, phase = self._two_layouts()
+        phase["active"] = "tp"
+        pp.flip_release()
+        self.assertEqual(relief.free_up_to(600 * MIB), 600 * MIB)
+        self.assertEqual(tp.calls, [3400], "the resident layout pays")
+        self.assertEqual(pp.calls, [], "the emptied layout is not asked")
+
+    def test_the_bound_pool_is_never_asked_for_pages_it_does_not_have(self):
+        relief, pp, tp, _card, phase = self._two_layouts()
+        phase["active"] = "tp"
+        pp.flip_release()
+        relief.propose(
+            want_bytes=1522 * MIB, floor_bytes=1536 * MIB, delta_bytes=256 * MIB
+        )
+        self.assertEqual(pp.calls, [])
+
+    def test_exhaustion_does_not_follow_the_rung_across_layouts(self):
+        # A marker is a fact about ONE arena. Carrying it across a rebind would
+        # let a futile shrink of one layout silence the other.
+        relief, pp, tp, card, phase = self._two_layouts()
+        pp._card = None  # the release returns nothing the driver can see
+        self.assertEqual(relief.free_up_to(600 * MIB), 0, "a futile shrink")
+        self.assertTrue(relief._exhausted, "the PP arena is marked")
+        # Asked again in the same phase, the marked arena stays silent.
+        relief.free_up_to(600 * MIB)
+        self.assertEqual(len(pp.calls), 1)
+        # The other layout is a different arena and owes nothing to that mark.
+        phase["active"] = "tp"
+        self.assertEqual(relief.free_up_to(600 * MIB), 600 * MIB)
+        self.assertEqual(tp.calls, [3400])
+
+    def test_the_id_space_does_not_follow_the_rung_across_layouts(self):
+        # exposed_rows feeds the collective cap agreement. Letting it track
+        # whichever layout is resident would make the group's agreed id space
+        # depend on each rank's phase -- the capacity desync of HANDOFF_675 1a.
+        relief, pp, tp, _card, phase = self._two_layouts()
+        tp.size = CONFIGURED_ROWS // 2
+        before = relief.exposed_rows()
+        phase["active"] = "tp"
+        relief.backed_rows()  # force a rebind
+        self.assertEqual(relief.exposed_rows(), before)
+
+    def test_an_unresolvable_pool_keeps_the_previous_behaviour(self):
+        card = _Card(1100)
+        pp = _FlipPool(CONFIGURED_ROWS, card=card)
+
+        def boom():
+            raise RuntimeError("no stacks installed")
+
+        relief = kbr.KvBackingRelief(
+            pp,
+            _FakeAllocator(CONFIGURED_ROWS),
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+            pool_fn=boom,
+        )
+        self.assertEqual(relief.free_up_to(600 * MIB), 600 * MIB)
+        self.assertEqual(len(pp.calls), 1)

@@ -540,8 +540,27 @@ class KvBackingRelief:
         law_floor_bytes: int = 1024 * 1024 * 1024,
         admission_reserve_rows: int = DEFAULT_ADMISSION_RESERVE_ROWS,
         tree_cache_fn: Optional[Callable[[], Any]] = None,
+        pool_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._pool = pool
+        #: THE ID-SPACE OWNER, and it never moves. The scheduler holds ONE
+        #: allocator for the life of the process -- a single id space is what
+        #: makes a row identifiable across the flip at all -- so the cap, the
+        #: reservation and everything the collective cap agreement reads stay
+        #: anchored on the pool this object was built with, whatever pool the
+        #: backing calls are currently acting on.
+        self._id_space_pool = pool
+        #: #662: WHICH POOL HOLDS THE PAGES RIGHT NOW. The flip has two
+        #: layouts and two arenas, and only one of them is backed at a time.
+        #: Resolved per call rather than captured, for the reason the tree
+        #: cache is: a reference taken once is a reference to whichever layout
+        #: happened to be active when this object was built, and on the
+        #: tp_to_pp leg that is the EMPTY one. See :meth:`_rebind`.
+        self._pool_fn = pool_fn
+        #: Per-pool backing state, keyed by pool identity. Geometry, the boot
+        #: reservation and the exhaustion marker are all facts about ONE
+        #: arena and must not follow the rung across a rebind.
+        self._pool_state: dict = {}
         self._alloc = allocator
         self._live_slots_fn = live_slots_fn
         #: #662: the id-targeted evictor that lowers ``max_live`` itself.
@@ -609,6 +628,81 @@ class KvBackingRelief:
         self._trace_all = os.environ.get(KV_RELIEF_TRACE_ENV, "") == "1"
 
     # -- plumbing --------------------------------------------------------
+
+    def _rebind(self) -> None:
+        """Point the backing calls at the layout that actually holds pages.
+
+        THE RUNG WAS BOUND TO ONE POOL AND THE FLIP HAS TWO. The scheduler's
+        pool is the PP layout's, so on the pp_to_tp leg the rung is looking at
+        the source -- backed, with slack above the live set, able to pay. On
+        the tp_to_pp leg the SAME pool is the destination, and the seam emptied
+        it a phase ago: no extents, nothing to release, and every proposal it
+        makes is arithmetic over memory that is not there. That is why the leg
+        into the prefill layout had no funder even after the exclusion in
+        ``collective_kv_backing_relief`` was lifted.
+
+        The money on that leg is in the TP layout's pool: it is the SOURCE, it
+        is fully backed, and the rows above its live high-water mark hold
+        nothing. Releasing them early hands the gate exactly the bytes it is
+        about to refuse for -- and the seam was going to release that whole
+        layout at the cutover anyway, so this is the same memory arriving in
+        time to be useful rather than one gate too late.
+
+        WHAT DOES NOT MOVE: the cap and the id space. Both layouts index the
+        same allocator, so a target is a row id and means the same thing in
+        either pool; :meth:`_reservation_rows` and everything the collective
+        cap agreement reads stay on ``_id_space_pool``. Only geometry, the
+        boot reservation and the exhaustion marker are per-arena, and those
+        are carried in ``_pool_state``.
+        """
+        if self._pool_fn is None:
+            return
+        try:
+            pool = self._pool_fn()
+        except Exception as e:
+            logger.warning(
+                "%s could not resolve the active layout's pool (%s); staying "
+                "on the pool this rung was built with",
+                LOG_PREFIX,
+                e,
+            )
+            return
+        if pool is None or pool is self._pool:
+            return
+        # Park the state of the pool we are leaving.
+        self._pool_state[id(self._pool)] = {
+            "bytes_per_row": self._bytes_per_row,
+            "buffers": self._buffers,
+            "rows_at_boot": self._rows_at_boot,
+            "exhausted_at_rows": self._exhausted_at_rows,
+            "pool": self._pool,
+        }
+        state = self._pool_state.get(id(pool))
+        if state is None:
+            row_bytes, n_buffers = row_geometry(pool)
+            state = {
+                "bytes_per_row": int(row_bytes),
+                "buffers": int(n_buffers),
+                "rows_at_boot": None,
+                "exhausted_at_rows": None,
+                "pool": pool,
+            }
+            logger.info(
+                "%s now funding from the ACTIVE layout's pool on device %s: "
+                "%d B/row over %d arena buffers. The pool this rung was built "
+                "with is the other layout's and is unbacked while that layout "
+                "is inactive, so a proposal against it would be arithmetic "
+                "over memory that is not mapped.",
+                LOG_PREFIX,
+                self._device_index,
+                int(row_bytes),
+                int(n_buffers),
+            )
+        self._pool = pool
+        self._bytes_per_row = int(state["bytes_per_row"])
+        self._buffers = int(state["buffers"])
+        self._rows_at_boot = state["rows_at_boot"]
+        self._exhausted_at_rows = state["exhausted_at_rows"]
 
     @property
     def _exhausted(self) -> bool:
@@ -978,6 +1072,7 @@ class KvBackingRelief:
         Pure: it reads the live set and the backing and computes. It is on the
         gate's unconditional path, so it must not touch residency.
         """
+        self._rebind()
         if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
@@ -1022,6 +1117,7 @@ class KvBackingRelief:
         recoverable (the guard refuses, the flip is retried next round) while
         over-shrinking costs admission capacity that bought nothing.
         """
+        self._rebind()
         if not self._supported():
             return self._abstain(
                 "the pool has no runtime_set_backing_rows entry point, so this "
@@ -1248,6 +1344,7 @@ class KvBackingRelief:
         A rank that pays nothing and caps anyway loses admission capacity for
         no bytes; a rank that pays nothing and stays uncapped loses the group.
         """
+        self._rebind()
         if target_rows is None:
             return 0
         target = int(target_rows)
@@ -1268,6 +1365,7 @@ class KvBackingRelief:
         target comes from :func:`collective_kv_target` instead, because a
         capacity may not be decided locally.
         """
+        self._rebind()
         if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
@@ -1414,6 +1512,7 @@ class KvBackingRelief:
         Lifting the cap before the memory exists would re-admit ids that are
         still unmapped, which is the very fault the cap prevents.
         """
+        self._rebind()
         if self._rows_at_boot is None:
             return 0
         boot_rows = int(self._rows_at_boot)
@@ -1480,8 +1579,16 @@ class KvBackingRelief:
 
     def _reservation_rows(self) -> int:
         """Rows the allocator's id space spans -- the reservation, not the
-        backing. This is what an UNCAPPED allocator will hand out."""
-        return int(getattr(self._pool, "size", 0) or self._current_rows())
+        backing. This is what an UNCAPPED allocator will hand out.
+
+        READ FROM THE ID-SPACE OWNER, never from whichever layout the backing
+        calls are currently pointed at. This number feeds ``exposed_rows``,
+        which feeds the collective cap agreement, and the two layouts have
+        different row counts -- letting it follow a rebind would make the
+        group's agreed id space depend on which phase each rank happened to be
+        in, which is the capacity desync that wedged this instance once
+        already (HANDOFF_675 1a)."""
+        return int(getattr(self._id_space_pool, "size", 0) or self._current_rows())
 
     def exposed_rows(self) -> int:
         """The highest row id this rank's allocator may hand out.
@@ -1507,6 +1614,7 @@ class KvBackingRelief:
         value across ranks, and that minimum has to come from a public reading
         rather than from a private one the caller reaches around for.
         """
+        self._rebind()
         return int(self._current_rows())
 
     def level_recovery_to(self, target: int) -> int:
@@ -1820,7 +1928,42 @@ def kv_backing_provider(
         # cached. Reading it through the scheduler each time is the only
         # form that cannot go stale.
         tree_cache_fn=lambda: getattr(scheduler, "tree_cache", None),
+        # #662-F4: and the POOL is resolved per call for the same reason, with
+        # a sharper edge. The scheduler's pool is the PP layout's; during the
+        # TP phase the seam has released it and it holds no pages at all. A
+        # rung captured on it can only ever fund the pp_to_tp leg.
+        pool_fn=lambda: _active_layout_pool(scheduler, pool),
     )
+
+
+def _active_layout_pool(scheduler: Any, fallback: Any):
+    """The KV pool of the layout that is RESIDENT right now.
+
+    The flip's two layouts are two pools with two arenas and only one is
+    backed at a time. ``scheduler.phase_flip_active_stack`` says which, and it
+    is set at the cutover, so it is already correct by the time the next gate
+    runs.
+
+    Falls back to the scheduler's own pool whenever the answer is not
+    unambiguous -- no stacks installed, an unrecognised phase, a missing
+    worker. That reproduces the previous behaviour exactly, which is the right
+    direction for a resolution that decides where memory gets unmapped.
+    """
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    if stacks is None:
+        return fallback
+    phase = getattr(scheduler, "phase_flip_active_stack", None)
+    if str(phase) != "tp":
+        # PP resident (or unknown): the scheduler's own pool IS that layout's.
+        return fallback
+    worker = getattr(stacks, "tp_worker", None)
+    runner = getattr(worker, "model_runner", None) if worker is not None else None
+    tp_pool = getattr(runner, "token_to_kv_pool", None) if runner is not None else None
+    if tp_pool is None or not callable(
+        getattr(tp_pool, "runtime_set_backing_rows", None)
+    ):
+        return fallback
+    return tp_pool
 
 
 def _admission_reserve_rows(scheduler: Any) -> int:

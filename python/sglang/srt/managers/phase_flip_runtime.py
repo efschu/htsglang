@@ -1384,6 +1384,22 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             if _ladder is not None:
                 _ladder.on_enter_tp(stacks.draft_worker)
             arm_draft_bootstrap_all_reachable(scheduler, want_draft)
+
+            # #662-F4: AND THE MIRROR OF THE RECOVERY BELOW. Since the rung
+            # funds the seam from whichever layout is RESIDENT, the tp_to_pp
+            # leg pays out of the TP layout's pool -- the source, whose rows
+            # above the live set hold nothing. Entering TP makes that pool
+            # active again, so the relief taken against it has to be handed
+            # back here, exactly as the PP pool's is on the other leg.
+            #
+            # Without this the reduction is a RATCHET: the seam restores each
+            # layout to its own ``size``, which the shrink lowered, so the TP
+            # pool would come back smaller after every tp_to_pp and never
+            # climb. The grow is corridor-bounded inside ``recover``, so it
+            # cannot breach the law to do it.
+            from sglang.srt.managers.phase_flip_spill import recover_kv_backing
+
+            recover_kv_backing(scheduler, reduce_fn=reduce_fn)
         else:
             # ``stacks.draft_worker``, not ``want_draft``: want_draft is None
             # on this leg by design (that is the point of the leg), while the
@@ -3890,8 +3906,7 @@ class PhaseFlipRuntime:
             reduced = self._collective_min([vote])
         except Exception as exc:  # noqa: BLE001 -- a probe never kills the loop
             logger.debug(
-                "%s seam cap retire vote could not be reduced (%s); the "
-                "verdict stands",
+                "%s seam cap retire vote could not be reduced (%s); the verdict stands",
                 LOG_PREFIX,
                 exc,
             )
