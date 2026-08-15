@@ -283,6 +283,25 @@ def validate_purity_policy_pair(purity: PhasePurity, policy_cfg) -> None:
     window = float(getattr(policy_cfg, "pp_window_s", 0.0) or 0.0)
     if window > 0:
         return
+    # The SOLVED equivalent (#665-F1). What this guard actually requires is a
+    # BOUND on the PP residency, so that a phase which may not decode and
+    # cannot admit prefill still has an exit. The hand-set stopwatch was one
+    # way to supply it; a declared decode-stall SLO is another, and a better
+    # one -- it bounds the same residency in units of the thing being
+    # protected. Accept it, and only it: an SLO so tight that the solved cap
+    # collapses to zero is no bound at all and must still be refused.
+    slo = float(getattr(policy_cfg, "decode_stall_slo_s", 0.0) or 0.0)
+    if slo > 0:
+        seam = float(getattr(policy_cfg, "flip_cost_s", 0.0) or 0.0)
+        if slo - 2.0 * seam > 0:
+            return
+        raise PhasePurityError(
+            f"{LOG_PREFIX} purity={purity.describe()} has a decode stall SLO "
+            f"of {slo:g}s, but the measured seam is {seam:g}s each way, so the "
+            f"solved PP residency cap is {slo - 2 * seam:g}s -- not a bound, "
+            f"and the PP phase would have no exit. Declare an SLO above "
+            f"{2 * seam:g}s, or set SGLANG_PHASE_POLICY_PP_WINDOW_S > 0."
+        )
     raise PhasePurityError(
         f"{LOG_PREFIX} purity={purity.describe()} requires a positive "
         f"phase-policy PP window, but pp_window_s is {window!r}. Under "
@@ -290,8 +309,9 @@ def validate_purity_policy_pair(purity: PhasePurity, policy_cfg) -> None:
         f"admit its pending prefill (no free mamba/GDN slot, KV held by "
         f"paused decodes) has NO exit except the bounded window: the "
         f"load-triggered rule needs prefill to drain, and prefill cannot "
-        f"drain. Set SGLANG_PHASE_POLICY_PP_WINDOW_S > 0, or run "
-        f"--phase-flip-purity off."
+        f"drain. Declare SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (preferred: "
+        f"it bounds the residency in units of what is being protected), or set "
+        f"SGLANG_PHASE_POLICY_PP_WINDOW_S > 0, or run --phase-flip-purity off."
     )
 
 
