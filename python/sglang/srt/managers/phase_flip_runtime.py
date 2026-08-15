@@ -2534,6 +2534,34 @@ class PhaseFlipRuntime:
             self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
             self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
         retry_at = self._seam_retry_at_arm.get(direction, 0)
+        # #662: THE SECOND TIMER. The policy's own backoff was replaced with
+        # dwell-paced retry while the arming condition persists, and this
+        # counter then vetoed the retry anyway -- so the KV rung was still
+        # never asked. Measured on this rig: PP0 printed "the load still wants
+        # this layout, so the next attempt is in 0.2s and it will ask the KV
+        # rung again", and the very next arm was declined by "5 consecutive
+        # group abandons, next entry at arm 38 (this is arm 26)".
+        #
+        # Two independent dampers on one path is how a fix lands half-wired.
+        # While work is still waiting, this one stands down for the same
+        # reason the other did: waiting frees no memory, and the pool being
+        # full is what pays for the flip once the rung is reached.
+        #
+        # The counter is kept and still counts -- it is the right damper for
+        # its actual case, an arming condition that has GONE AWAY, where the
+        # bypass below is false and the skip applies exactly as before.
+        if self._arm_seq < retry_at and self._arming_condition_persists():
+            logger.info(
+                "%s %s abandon backoff STOOD DOWN at arm %d (would have "
+                "waited until %d): work is still waiting, so the attempt "
+                "proceeds and the KV rung gets asked. Waiting frees no "
+                "memory; the full pool is what funds the seam.",
+                LOG_PREFIX,
+                direction,
+                self._arm_seq,
+                retry_at,
+            )
+            retry_at = 0
         if self._arm_seq < retry_at:
             self.seam_backoff_skips[direction] = (
                 self.seam_backoff_skips.get(direction, 0) + 1
@@ -4604,6 +4632,31 @@ class PhaseFlipRuntime:
             f"flip; serving continues in this layout and the flip is "
             f"retried when occupancy drops. " + self._kv_rung_verdict()
         )
+
+    def _arming_condition_persists(self) -> bool:
+        """Is there still work waiting that wants the other layout?
+
+        Deliberately coarse: any queued request is enough. The POLICY has
+        already decided which layout this load wants and only issues an arm
+        when it wants one, so this is not a second opinion about the decision
+        -- it only distinguishes "the load is still there" from "the load has
+        gone away", which is the one distinction the abandon counter needs and
+        never had.
+
+        False on anything unreadable, which keeps the counter's old behaviour
+        exactly: an unreadable queue must not be able to disable a damper.
+        """
+        try:
+            scheduler = getattr(self, "_census_scheduler", None)
+            if scheduler is None:
+                return False
+            waiting = getattr(scheduler, "waiting_queue", None)
+            if waiting and len(waiting) > 0:
+                return True
+            grammar = getattr(scheduler, "grammar_queue", None)
+            return bool(grammar and len(grammar) > 0)
+        except Exception:  # noqa: BLE001 - a damper must not raise
+            return False
 
     def _kv_rung_verdict(self) -> str:
         """What the KV rung decided this round, for a REFUSAL message.
