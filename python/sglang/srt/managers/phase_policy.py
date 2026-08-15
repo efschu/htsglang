@@ -194,6 +194,26 @@ ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
 # what this scheduler does with --disable-overlap-schedule. 0.0 means "not
 # measured here" and keeps the old surcharge byte-identically, the same
 # measurement gate `flip_cost_s` already uses.
+#
+# THE TWO ALTERNATIVES, AND WHY THEY LOST.
+#
+# CAP THE SURCHARGE at some multiple of `flip_tokens`. It would work, and the
+# multiple would be fiat: nothing in the evidence picks one, and it would need
+# re-picking whenever the seam or the window moved, because the model under it
+# would still be one-sided. Pricing the counterfactual turns out to DERIVE the
+# cap instead -- 2 x N at sigma = 1 -- so this option is not so much rejected
+# as explained.
+#
+# ADMIT-THEN-FLIP-AT-DRAIN: admit the long prefill, queue the flip, take it
+# once the decodes drain below a bar. Rejected, and the measurement is what
+# rejects it. At sigma = 1 the decodes CANNOT drain while the admitted prefill
+# runs in TP -- the prefill is precisely what is stopping them -- so the
+# trigger waits on a condition its own admission prevents. It is also the trap
+# the block comment at DEFAULT_PP_WINDOW_S documents twice already: a
+# load-triggered predicate that a sustained backlog never satisfies, one
+# threshold further out. Making it terminate needs a deadline, i.e. a forced
+# flip, and forced flips are what raised the flip rate that killed three boots
+# with an allocation failure at the cutover seam.
 DEFAULT_DECODE_CONTENTION = 0.0
 
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
