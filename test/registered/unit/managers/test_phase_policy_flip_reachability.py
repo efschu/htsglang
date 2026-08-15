@@ -553,3 +553,93 @@ class TestTheRuntimeToggle(CustomTestCase):
             [effective_flip_threshold(back, b) for b in range(5)],
             [effective_flip_threshold(cfg, b) for b in range(5)],
         )
+
+
+class TestTheLadderIsSolvedNotConfigured(CustomTestCase):
+    """#584 provenance: every rung is DERIVED from measurements, not tuned.
+
+    All four inputs below come from the combined boot itself
+    (`/spinning/evidence-662-F4/boot_combined.log`, 2026-08-15), not from the
+    module constants, which were measured on a different checkpoint.
+
+    C_ROUNDTRIP -- 21 `PHASE-FLIP DONE` records, slowest rank per direction,
+    three complete tp_to_pp -> pp_to_tp round trips: 5901.0 / 5912.9 /
+    5939.8 ms. Mean 5.918 s, spread 0.7 %.
+
+    R_PP -- the PP phase may not decode under `prefill_in_tp` purity, so PP
+    wall-clock minus its opening seam IS prefill time. 85,233 prefill tokens
+    over three PP phases totalling 30 s, less 8.88 s of seams = 21.12 s, so
+    4036 tok/s.
+
+    R_TP -- taken from a prefill actually running in TP, which is the only
+    honest source: a TP phase's wall clock is mostly decode. GATE B put
+    72,000 tokens through TP with TTFT 71.9 s -> 1001 tok/s, and decode
+    contributes nothing during it (sigma = 1). Pre-fix baselines on the same
+    model gave 1194 and 1196 tok/s, so the band is 1001-1196.
+
+    P* = C / (1/r_tp - 1/r_pp) is then 7878 (r_tp 1001) to 10059 (r_tp 1196),
+    centre 8949.
+    """
+
+    C_ROUNDTRIP = 5.918
+    R_PP = 4036.0
+    R_TP_BAND = (1001.0, 1196.0)
+
+    @classmethod
+    def _p_star(cls, r_tp):
+        return cls.C_ROUNDTRIP / (1.0 / r_tp - 1.0 / cls.R_PP)
+
+    def test_p_star_on_this_checkpoint(self):
+        lo = self._p_star(self.R_TP_BAND[1])
+        hi = self._p_star(self.R_TP_BAND[0])
+        self.assertAlmostEqual(hi, 7878, delta=40)
+        self.assertAlmostEqual(lo, 10059, delta=40)
+
+    def test_every_rung_is_within_the_derived_margin_of_p_star(self):
+        """The margin is not chosen: it IS (1+2B)/(1+B), bounded by 2.
+
+        Rungs above P* are correct by construction -- P* is the B=0
+        break-even and higher rungs price stranded decodes. What must hold is
+        that the multiple is the derived one and never exceeds 2.
+        """
+        cfg = _cfg(decode_contention=1.0)
+        p_star = self._p_star(1001.0)  # most conservative r_tp -> smallest P*
+        for bs in range(5):
+            rung = effective_flip_threshold(cfg, bs)
+            derived = (1 + 2 * bs) / (1 + bs)
+            with self.subTest(bs=bs):
+                self.assertLessEqual(rung / p_star, 2.0)
+                self.assertLessEqual(rung / p_star, derived + 0.05)
+
+    def test_the_old_ladder_was_many_multiples_past_break_even(self):
+        """On record: what the shipped surcharge actually demanded."""
+        p_star = self._p_star(1100.0)  # centre of the band
+        old = [7004, 39835, 72666, 105498, 138329]
+        mult = [round(r / p_star, 1) for r in old]
+        self.assertEqual(mult, [0.8, 4.5, 8.1, 11.8, 15.5])
+
+    def test_the_booted_flip_cost_is_stale_against_the_measured_seam(self):
+        """The one real mis-calibration this run exposed.
+
+        `flip_cost_s` is booted at 3.2 s; the seam measures 5.918 s here, so
+        the B=0 rung sits BELOW break-even -- the gate fires slightly early
+        with nothing decoding. Re-deriving N from the measured seam fixes the
+        whole ladder at once, and every rung stays under 2 x P*.
+        """
+        self.assertLess(N, self._p_star(1100.0))
+        solved = [
+            int(round(self._p_star(1100.0) * (1 + 2 * b) / (1 + b)))
+            for b in range(5)
+        ]
+        self.assertEqual(solved, [8949, 13423, 14915, 15660, 16108])
+        # The 2x bound is structural against the P* the ladder was SOLVED
+        # from. Comparing a centre-solved ladder against the conservative end
+        # of the r_tp band is a different quantity and is legitimately larger:
+        # 1.8 x (8949 / 7878) = 2.045. Stated, not asserted away -- it is the
+        # honest width of the r_tp measurement, and it is the reason r_tp
+        # wants a dedicated ladder run rather than a single TTFT.
+        centre = self._p_star(1100.0)
+        for rung in solved:
+            self.assertLessEqual(rung / centre, 2.0)
+        worst = max(solved) / self._p_star(1001.0)
+        self.assertAlmostEqual(worst, 2.045, places=2)
