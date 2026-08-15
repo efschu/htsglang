@@ -61,6 +61,36 @@ lower bound for the features, not a projection of them. Stated once, not repeate
   provider is exhausted, REFUSES: the caller abandons the flip with every request intact rather than
   dying inside a no-return region. Providers are ordered by TIER before cost, so a cheap host spill
   can never overtake an expensive rebalance.
+- **The phase-flip threshold is SOLVED, and prints its own provenance** (#669): the decision to
+  leave the decode layout for the prefill layout is a break-even, `N = C / (1/r_tp - 1/r_pp)`, and
+  every input is measured on the instance that will use it — the seam round trip from the instance's
+  own `PHASE-FLIP DONE` records, and both prefill rates from ladders run against it. The armed line
+  states the arithmetic it solved, `N=12064 tok (break-even 5.918s / (1/1354.4 - 1/4036))`, so a
+  number inherited from other hardware is visible as such instead of passing for a measurement. The
+  shipped ladder over 0-4 decoding requests is `[12064, 18095, 20106, 21111, 21715]`.
+- **Stranding is priced against its own counterfactual** (#665): a cutover pauses every decoding
+  request, and the surcharge that priced it charged the alternative — leaving the prefill in the
+  decode layout — at zero. Measured, that alternative costs the decodes everything: decode does not
+  degrade beside a co-resident prefill, it STOPS, because batch selection runs a prefill batch to
+  the exclusion of the decode branch. Both branches are therefore priced as delay-seconds, which
+  yields `N x (1+2B)/(1+B)` — still rising with the number stranded, but bounded by `2N` instead of
+  diverging to a threshold no prompt could reach.
+- **The prefill phase ends when it is DRAINED, not on a clock** (#669): the exit used to fire on a
+  hand-set window, and separately compared against the ENTRY break-even. Both were wrong. Once in
+  the prefill layout the return seam is due either way and cancels, leaving `R/r_pp` against
+  `R/r_tp` — so leaving early loses for every remaining token. The phase now runs until less than
+  one chunk remains, and the only thing permitted to cut a drain short is a declared decode-stall
+  SLO, from which the residency cap is solved as `slo - 2 x seam` (twice, because a carried decode
+  pays the seam in both directions). Each exit names which condition fired and how much was left.
+- **The seam's cost is projected at boot, evaluated rather than fitted** (#669): a configuration
+  whose cutover cannot be paid for used to announce itself as a run of abandons on a live instance.
+  The boot now evaluates the same `_staging_bytes` the gate calls, against named live-set
+  assumptions, per rank — per rank because `arena_tail` and the layer map differ across them. A
+  cautionary note is preserved with it: an empirical `base + k*chunk^2` fit over three measured
+  anchors reproduced all three and was still wrong, because the anchors were one per RANK and the
+  curve was tracking per-rank offsets rather than the variable it named. It was caught only by a
+  held-out point. Fitting across configurations that differ in more than the variable of interest
+  produces a law-shaped coincidence; the exact formula was available the whole time.
 - **KV physical residency follows the phase** (#656): the KV pool sits on a VA reservation, so its
   addresses are fixed at boot and only the physical pages underneath move — which is what lets a
   residency change survive a captured CUDA graph. Entering the decode layout, the prefill layout's
