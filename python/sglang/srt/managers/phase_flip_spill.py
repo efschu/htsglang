@@ -832,7 +832,7 @@ def install_draft_weight_carrier(
     try:
         guaranteed = parse_purity(purity).decode_forbidden_in_pp
     except PhasePurityError:
-        # An unparseable mode is not a guarantee. Server-args validation is the
+        # An unparsable mode is not a guarantee. Server-args validation is the
         # place that reports WHY it is malformed; this guard must still fail in
         # its OWN currency, because callers catch PhaseFlipSpillError -- letting
         # a PhasePurityError through here changes the exception type a caller
@@ -1344,6 +1344,125 @@ ENV_FUND_TP_TO_PP = "SGLANG_SEAM_FUND_TP_TO_PP"
 
 def _may_fund_tp_to_pp() -> bool:
     return os.environ.get(ENV_FUND_TP_TO_PP, "1") not in ("0", "false", "False")
+
+
+#: #662-F4: WHICH SEAM DIRECTIONS MUST BE TREATED AS UNFUNDABLE.
+#:
+#: A FAULT INJECTION, and the only one in this file. It exists because the
+#: decode-stall SLO valve added in 1d1dbf9dba cannot be reached on metal by
+#: any honest configuration. The invariant it guards -- decodes are never held
+#: past the SLO by a funding failure -- needs the instance to be IN the PP
+#: layout, with a decode resident, while ``pp_to_tp`` cannot be funded. Every
+#: lever tried on 2026-08-15 made BOTH directions unfundable at once, so the
+#: instance never entered PP and the shape under test never occurred:
+#:
+#:   rung disabled globally -> pp_to_tp funded from the allocator cache
+#:                             anyway, and (because ``refusal_is_fatal`` opens
+#:                             the host tier for exactly this leg) from system
+#:                             RAM as well. Six flips DONE, nothing held.
+#:   arming floor raised    -> tp_to_pp was blocked with it, the instance
+#:                             rested in TP, and decode was never held at all.
+#:
+#: That is the catch-22 this term ends, and the property it needed is
+#: DIRECTION. With ``pp_to_tp`` named here, tp_to_pp still funds and the
+#: instance enters PP the ordinary way; the return leg then refuses, decode is
+#: held, and the SLO is the only thing left that can free it.
+#:
+#: WHAT IT DOES NOT DO, stated because a proof is worth only the mechanism it
+#: exercises. It does not simulate a card with no memory: the ladder still
+#: runs and still spends. It overrides the VERDICT the gate reached, at the
+#: single point where that verdict becomes the group's, so everything
+#: downstream is the real abandon path -- the same ``too_small`` vote, the
+#: same unanimous MIN, the same FLIP ABANDONED log, the same per-direction
+#: refusal hold and backoff. What is injected is the refusal; what is proven
+#: is what the system does with one.
+#:
+#: NOT A SERVING SETTING. Unset is the default and changes nothing.
+ENV_SEAM_UNFUNDABLE = "SGLANG_SEAM_UNFUNDABLE_DIRECTIONS"
+
+#: Resolved sets, keyed by the raw value, so the parse happens once per
+#: distinct setting rather than once per seam.
+_UNFUNDABLE_CACHE: dict = {}
+
+
+def _parse_unfundable(raw: str) -> frozenset:
+    """The named directions, or an EMPTY set on anything unrecognised.
+
+    AN UNPARSABLE VALUE INJECTS NOTHING, and does not raise. This term is
+    read on the seam's no-return path, where ``_abandon_parked_flip`` states
+    the law: a raise from inside a cutover climbs into the event loop and
+    takes the instance down. Refusing to guess is the gate's own currency --
+    it declines to object -- and the ERROR below is what stops that being
+    silent. An operator who mistypes a direction gets a healthy instance and
+    a log line saying the injection is not armed, which is the failure a
+    proof boot can notice; the alternative fails the whole instance to
+    protect a diagnostic.
+    """
+    from sglang.srt.managers.phase_policy import PP_TO_TP, TP_TO_PP
+
+    known = {PP_TO_TP, TP_TO_PP}
+    names = {part.strip() for part in str(raw).split(",")}
+    names.discard("")
+    unknown = sorted(names - known)
+    if unknown:
+        logger.error(
+            "%s %s names %s, which is not a flip direction; the unfundable "
+            "injection is NOT armed. Valid directions are %s.",
+            LOG_PREFIX,
+            ENV_SEAM_UNFUNDABLE,
+            ", ".join(repr(u) for u in unknown),
+            ", ".join(sorted(known)),
+        )
+        return frozenset()
+    return frozenset(names)
+
+
+def unfundable_seam_directions() -> frozenset:
+    """The configured set, announced ONCE when it is non-empty.
+
+    The announcement is not decoration. This corpus has shipped seven terms
+    that were present and inert, and a fault injection is the worst possible
+    place for that: an unarmed injection makes a flip that funded normally
+    look like the proof of a valve that never fired. So an armed injection
+    says so in the boot log, by name.
+    """
+    raw = os.environ.get(ENV_SEAM_UNFUNDABLE, "")
+    if not raw.strip():
+        return frozenset()
+    if raw not in _UNFUNDABLE_CACHE:
+        resolved = _parse_unfundable(raw)
+        _UNFUNDABLE_CACHE[raw] = resolved
+        if resolved:
+            logger.warning(
+                "%s [#662-F4 UNFUNDABLE-SEAM] ARMED for %s: every flip in "
+                "%s direction will be refused by the group as if no tier "
+                "could pay for it. This is a fault injection for the "
+                "decode-stall SLO proof and must not be set on an instance "
+                "that is meant to serve.",
+                LOG_PREFIX,
+                ", ".join(sorted(resolved)),
+                "that" if len(resolved) == 1 else "either",
+            )
+    return _UNFUNDABLE_CACHE[raw]
+
+
+def seam_unfundable_objection(direction: str) -> Optional[str]:
+    """The injected objection for ``direction``, or None.
+
+    Returns a string in the same currency as the corridor gate's own refusal
+    -- one clause naming why the seam may not enter -- so it joins
+    ``too_small`` and votes exactly like a refusal the gate reached itself.
+    It deliberately does NOT carry ``SEAM_MARGIN_DELAY_TAG``: a margin delay
+    is a bounded wait the seam retries out of, while what is being injected
+    is a funding failure, and calling it a delay would prove the wrong thing.
+    """
+    if str(direction) not in unfundable_seam_directions():
+        return None
+    return (
+        f"{direction} is configured unfundable by {ENV_SEAM_UNFUNDABLE} "
+        f"(fault injection for the decode-stall SLO proof), so the group "
+        f"refuses this seam whatever the ladder returned"
+    )
 
 
 def collective_kv_backing_relief(

@@ -5429,6 +5429,36 @@ class PhaseFlipRuntime:
             self._corridor_pp_refusals = 0
         return f"corridor gate refused the seam staging: {verdict.detail}"
 
+    def _seam_funding_verdict(self, staging_bytes: int, direction: str, **kw) -> str:
+        """The gate's verdict, with #662-F4's per-direction injection on top.
+
+        WHY THIS WRAPS THE GATE INSTEAD OF LIVING INSIDE IT. Everything
+        ``_corridor_gate`` runs -- the KV rung's reduction, the guard's
+        ladder, the C20 margin -- sits on a path every rank reaches
+        unconditionally, which is the entire argument
+        ``collective_kv_backing_relief`` makes for living where it lives. An
+        injection that short-circuited the gate would skip a reduction the
+        peers had already entered, the first time one rank read the variable
+        differently, and this file's standing rule is that "safe because a
+        value upstream is agreed" is precisely the reasoning that produces
+        collective hangs. So the gate always runs in full, and only its
+        VERDICT is overridden. The cost is one ladder that spent for nothing;
+        what it buys is that no rank can skip a collective.
+
+        The result joins ``too_small`` like any other objection, so the
+        abandon it produces is the real one: the same unanimous MIN, the same
+        FLIP ABANDONED log, the same per-direction hold and backoff. What the
+        gate itself decided is kept in the message, because a proof that hides
+        the state it overrode is not evidence.
+        """
+        from sglang.srt.managers.phase_flip_spill import seam_unfundable_objection
+
+        detail = self._corridor_gate(staging_bytes, direction, **kw)
+        injected = seam_unfundable_objection(direction)
+        if not injected:
+            return detail
+        return f"{injected} [the gate itself said: {detail or 'the seam was fundable'}]"
+
     # -- the move -------------------------------------------------------------
     def _pack_outgoing(
         self,
@@ -5733,7 +5763,7 @@ class PhaseFlipRuntime:
         # _agree_live_slots for the trigger this closes and why the count
         # agreement above it was not enough.
         slot_ballot: dict = {}
-        corridor_detail = self._corridor_gate(
+        corridor_detail = self._seam_funding_verdict(
             staging_bytes,
             direction,
             slots_digest=self._slots_membership_digest(slots),

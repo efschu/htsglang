@@ -513,8 +513,16 @@ class TestTheDecisionIsGroupUniform(unittest.TestCase):
         self.assertNotIn(
             "all_reduce", src, "the seam-entry margin must add no collective"
         )
+        # #662-F4's injection wraps the gate, so it is held to the same rule:
+        # it may override the verdict, it may not add a reduction.
+        wrapper_src = inspect.getsource(PhaseFlipRuntime._seam_funding_verdict)
+        self.assertNotIn(
+            "all_reduce",
+            wrapper_src,
+            "the unfundable injection must add no collective",
+        )
         exec_src = inspect.getsource(PhaseFlipRuntime._execute)
-        gate_at = exec_src.index("_corridor_gate")
+        gate_at = exec_src.index("_seam_funding_verdict")
         # The payload is BUILT from ``fits`` and then reduced -- #656 R2 added
         # the frame parts to it, so the literal call no longer carries the
         # list inline. The property under test is unchanged and is asserted

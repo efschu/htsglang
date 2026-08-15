@@ -172,8 +172,18 @@ class TheGateIsActuallyConsultedTest(unittest.TestCase):
     """The failure mode this whole file exists for: a gate nobody calls."""
 
     def test_execute_calls_the_gate(self):
+        """#662-F4 put ONE frame between them, so BOTH links are pinned.
+
+        ``_execute`` now consults ``_seam_funding_verdict``, which is the gate
+        plus the per-direction unfundable injection. Pinning only the outer
+        call would let the inner one be dropped and still pass -- which is
+        exactly the "a gate nobody calls" failure this file exists for, one
+        level down.
+        """
         src = inspect.getsource(PhaseFlipRuntime._execute)
-        self.assertIn("_corridor_gate", src)
+        self.assertIn("_seam_funding_verdict", src)
+        wrapper = inspect.getsource(PhaseFlipRuntime._seam_funding_verdict)
+        self.assertIn("_corridor_gate", wrapper)
 
     def test_the_refusal_is_folded_into_too_small(self):
         src = inspect.getsource(PhaseFlipRuntime._execute)
@@ -185,7 +195,7 @@ class TheGateIsActuallyConsultedTest(unittest.TestCase):
         # cheaper check refuses flips the gate could have funded.
         src = inspect.getsource(PhaseFlipRuntime._execute)
         self.assertLess(
-            src.index("_corridor_gate"),
+            src.index("_seam_funding_verdict"),
             src.index("_staging_affordable"),
         )
 
