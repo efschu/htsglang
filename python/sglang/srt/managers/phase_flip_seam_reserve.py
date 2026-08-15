@@ -831,6 +831,58 @@ def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
     return arena_fixed, fixed, per_row, "; ".join(parts)
 
 
+def _rung_fundable_for_seam(scheduler, arena_fixed: int, fixed: int) -> int:
+    """Bytes the KV rung can put toward the seam, bounded by the FIXED floor.
+
+    THE BOUND IS THE POINT. The rung's honest capacity is "everything above
+    the live high-water mark", which at rest is nearly the whole pool -- and
+    sizing against that would grow the id space without limit and then fail
+    under a live set the measurement never saw. So it may cover at most the
+    seam's FIXED floor: the weights-arena tail plus the drafter's restore.
+
+    Those two are one-shot commits at the cutover, which is exactly the moment
+    the rung can release rows and exactly the moment it takes them back again;
+    on this rig they are also the dominant term (854 MiB and 1456 MiB of arena
+    tail on the two 3080 ranks). The PER-ROW slack is deliberately NOT covered:
+    it is held across the whole wave walk and it scales with the very pool this
+    would be growing, which is the shape that runs away.
+
+    Returns 0 whenever the rung cannot answer -- no relief object, an
+    unreadable bound, a pool that cannot release. Zero reproduces the previous
+    sizing exactly, which is the direction a term that grows a pool must fail
+    in, and it is the can-fail arm: with the rung unable to pay, the reserve
+    must charge what it always charged.
+    """
+    from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+    if relief is None:
+        return 0
+    try:
+        fundable = int(relief.fundable_bytes())
+    except Exception as e:
+        logger.warning(
+            "%s could not price what the KV rung can put toward the seam "
+            "(%s); sizing as if it can put nothing",
+            LOG_PREFIX,
+            e,
+        )
+        return 0
+    ceiling = max(0, int(arena_fixed)) + max(0, int(fixed))
+    granted = max(0, min(fundable, ceiling))
+    logger.info(
+        "%s the KV rung can return %.0f MiB at the seam and the seam's fixed "
+        "floor is %.0f MiB, so %.0f MiB of it is counted as spendable. The "
+        "per-row slack stays charged to the pool: it is held across the whole "
+        "wave walk and scales with the pool this term would grow.",
+        LOG_PREFIX,
+        fundable / (1 << 20),
+        ceiling / (1 << 20),
+        granted / (1 << 20),
+    )
+    return granted
+
+
 def measure_and_record(scheduler, runtime) -> None:
     """Measure this boot's seam and leave the record for the next one.
 
@@ -853,10 +905,19 @@ def measure_and_record(scheduler, runtime) -> None:
     except Exception:
         free_bytes = 0
     law = _corridor_law_bytes()
+    rung_fund = _rung_fundable_for_seam(scheduler, arena_fixed, fixed)
     # THE MEASURED POSITION. Taken with every unnamed post already resident
     # -- activation reserve, capture peak, arena, TP stack, carve-out -- so
     # the next boot's correction needs no model of any of them.
-    have = max(0, free_bytes - law)
+    #
+    # #662: AND FREE VRAM IS NO LONGER THE ONLY THING THAT CAN PAY. The KV
+    # relief rung returns unoccupied backing at the seam and takes it back
+    # after the cutover, which is bytes arriving exactly when the commit needs
+    # them. Counting only the free column is what made the pool shrink until
+    # enough VRAM sat idle to cover the seam -- the ~12.7 GiB this ticket
+    # exists to remove. See _rung_fundable_for_seam for what it may cover and
+    # why that bound is the fixed floor and not a token more.
+    have = max(0, free_bytes - law) + rung_fund
     id_space = max(0, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
     path = write_seam_reserve(
         scheduler.server_args,

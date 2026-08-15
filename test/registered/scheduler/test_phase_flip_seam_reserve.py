@@ -313,3 +313,76 @@ def test_the_budget_helper_carries_the_survivability_through():
     )
     assert survivable > fatal, "the law-bounded cut must leave a larger budget"
     assert survivable <= budget, "and must still never GROW the budget"
+
+
+# ---------------------------------------------------------------------------
+# #662: free VRAM is no longer the only thing that can pay for the seam.
+#
+# The KV relief rung returns unoccupied backing at the cutover and takes it
+# back afterwards, which is bytes arriving exactly when the commit needs them.
+# Counting only the free column is what made the pool shrink until enough VRAM
+# sat idle to cover the seam.
+#
+# The BOUND is the whole design: the rung may cover at most the seam's FIXED
+# floor (arena tail + draft restore), which are one-shot commits at the
+# cutover. The per-row slack is held across the whole wave walk and scales
+# with the pool this term would grow, so it stays charged.
+# ---------------------------------------------------------------------------
+
+
+class _Rung:
+    def __init__(self, fundable):
+        self._fundable = fundable
+
+    def fundable_bytes(self):
+        if isinstance(self._fundable, Exception):
+            raise self._fundable
+        return self._fundable
+
+
+class _Sched:
+    def __init__(self, rung):
+        setattr(self, "phase_flip_kv_backing_relief", rung)
+
+
+def test_the_rung_may_cover_the_fixed_floor_and_not_a_byte_more():
+    arena, fixed = 1456 * MIB, 139 * MIB
+    sched = _Sched(_Rung(40 * (1 << 30)))  # rung offers 40 GiB at rest
+    granted = sr._rung_fundable_for_seam(sched, arena, fixed)
+    assert granted == arena + fixed, "bounded by the seam's own fixed floor"
+
+
+def test_a_rung_that_can_pay_little_grants_only_that():
+    arena, fixed = 1456 * MIB, 139 * MIB
+    granted = sr._rung_fundable_for_seam(_Sched(_Rung(200 * MIB)), arena, fixed)
+    assert granted == 200 * MIB
+
+
+def test_no_rung_means_the_previous_sizing_exactly():
+    """The can-fail arm. With nothing able to pay at the seam, the reserve
+    must charge what it always charged."""
+    assert sr._rung_fundable_for_seam(_Sched(None), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_an_unreadable_rung_is_treated_as_unable_to_pay():
+    sched = _Sched(_Rung(RuntimeError("pool went away")))
+    assert sr._rung_fundable_for_seam(sched, 1456 * MIB, 139 * MIB) == 0
+
+
+def test_a_scheduler_without_the_attribute_is_not_an_error():
+    class _Bare:
+        pass
+
+    assert sr._rung_fundable_for_seam(_Bare(), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_the_granted_fund_raises_the_allowed_id_space():
+    """The point of the term, as arithmetic: spendable goes up, so the cut
+    the reserve has to take goes down."""
+    need = 484 * MIB
+    without = sr.seam_allowed_tokens(CELL, _reserve(need, have=BOOT_G_HAVE))
+    with_rung = sr.seam_allowed_tokens(
+        CELL, _reserve(need, have=BOOT_G_HAVE + 400 * MIB)
+    )
+    assert with_rung > without
+    assert with_rung - without == (400 * MIB) // CELL
