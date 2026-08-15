@@ -179,6 +179,30 @@ class TestTheBoundIsStructural(CustomTestCase):
         cfg = _cfg(decode_contention=1.0, prefill_runs_in_tp=False)
         self.assertEqual(effective_flip_threshold(cfg, 4), 0)
 
+    def test_at_sigma_one_the_prefill_ladder_cancels_out(self):
+        """The calibration must not go stale when production is re-shipped.
+
+        This rig re-solves its memory and KV vectors per boot, and the prefill
+        ladder moves with them. At the measured sigma = 1 the (1 - r) factor
+        divides out, so the threshold depends only on the break-even and the
+        number of decodes -- nothing here needs re-measuring after a re-ship.
+        """
+        ladders = [(1681.0, 7245.5), (1194.0, 7245.5), (1322.0, 6842.6)]
+        for bs in range(5):
+            got = {
+                effective_flip_threshold(
+                    _cfg(
+                        decode_contention=1.0,
+                        tp_prefill_tok_s=tp,
+                        pp_prefill_tok_s=pp,
+                    ),
+                    bs,
+                )
+                for tp, pp in ladders
+            }
+            with self.subTest(bs=bs):
+                self.assertEqual(len(got), 1, f"ladder-dependent at bs={bs}")
+
 
 class TestTheMeasurementIsValidated(CustomTestCase):
     def test_a_fraction_outside_zero_to_one_is_refused(self):
@@ -221,6 +245,43 @@ class TestAntiThrashStillHolds(CustomTestCase):
         for bs in range(5):
             with self.subTest(bs=bs):
                 self.assertIsNone(_drive(cfg, N - 1, bs).direction)
+
+
+class TestTheLiveCaptureReplay(CustomTestCase):
+    """Replay of a capture taken from the running instance, 2026-08-15.
+
+    One 72k prompt injected against 2 live decode streams. Chunked prefill
+    (--chunked-prefill-size 512) walks the backlog up in steps, and the policy
+    was sampled at each; these are the six distinct
+    `PHASE-POLICY holding in tp: pending prefill ...` records it emitted, from
+    /spinning/evidence-qwen38/boot_qwen38.log. Over the whole run the log
+    shows 103 holds and ZERO tp_to_pp arms, and the prefill took 60.6 s in the
+    TP layout with decode emitting nothing.
+    """
+
+    CAPTURE = [9205, 19957, 31221, 42997, 55797, 69109]
+    RUNNING_BS = 2
+
+    def test_the_old_model_refuses_every_single_sample(self):
+        cfg = _cfg(decode_contention=0.0)
+        armed = [
+            n
+            for n in self.CAPTURE
+            if _drive(cfg, n, self.RUNNING_BS).direction is not None
+        ]
+        self.assertEqual(armed, [])
+
+    def test_the_measured_model_arms_once_the_backlog_is_worth_it(self):
+        """It arms at 19,957 -- and still refuses 9,205, which genuinely is
+        too small to repay a round trip. Reachable, not trigger-happy."""
+        cfg = _cfg(decode_contention=1.0)
+        armed = [
+            n
+            for n in self.CAPTURE
+            if _drive(cfg, n, self.RUNNING_BS).direction is not None
+        ]
+        self.assertEqual(armed, [19957, 31221, 42997, 55797, 69109])
+        self.assertEqual(effective_flip_threshold(cfg, self.RUNNING_BS), 11673)
 
 
 def _drive(cfg, pending, bs, phase=PHASE_TP):
