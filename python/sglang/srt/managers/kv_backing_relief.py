@@ -734,6 +734,34 @@ class KvBackingRelief:
         else:
             self._exhausted_at_rows = None
 
+    def last_proposal_summary(self) -> str:
+        """One line describing this rung's most recent decision, or why none.
+
+        For the caller that REFUSES: at that moment the reader needs to know
+        whether the rung declined, abstained, or was never reached, and those
+        three have very different fixes. Returns a sentence rather than a
+        dict, because it is going straight into a refusal message.
+        """
+        t = getattr(self, "_last_proposal_terms", None)
+        if t is None:
+            return (
+                "the KV rung produced NO proposal this round -- it was not "
+                "reached, which is a different defect from declining"
+            )
+        verdict = (
+            f"SHRINK to {t['desire']}" if t["desire"] < t["current"] else "no change"
+        )
+        why = t["skipped"] or (
+            "the cheaper tier covered the gap"
+            if t["deficit"] <= 0
+            else "KV capacity is the funder"
+        )
+        return (
+            f"KV rung: current={t['current']} rows, floor={t['floor_rows']}, "
+            f"slack={max(0, t['current'] - t['floor_rows'])}, deficit="
+            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why})"
+        )
+
     def _mark_exhausted(self) -> None:
         """Record the level at which the arena returned nothing."""
         self._exhausted_at_rows = int(self._current_rows())
@@ -1298,6 +1326,16 @@ class KvBackingRelief:
         sign = 1 if t["deficit"] > 0 else 0
         edge = sign != self._last_deficit_sign
         self._last_deficit_sign = sign
+        # RETAINED EVEN WHEN NOT LOGGED, so a REFUSAL can print the terms.
+        #
+        # The edge trigger keeps a steady state quiet, which is right, but a
+        # refusal is not an edge -- and at a refusal the silence is exactly
+        # the ambiguity this method's own docstring warns about. Measured the
+        # hard way on 2026-08-15: the seam was refused by 59 MiB, this rung
+        # had emitted nothing for five minutes, and I read that as "the rung
+        # was never consulted" and went looking for a missing call. It was
+        # consulted every gate and had simply declined quietly.
+        self._last_proposal_terms = dict(t)
         if not (edge or self._trace_all):
             return
         logger.info(

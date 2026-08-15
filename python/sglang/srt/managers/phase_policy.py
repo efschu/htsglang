@@ -435,6 +435,9 @@ class PhasePolicyState:
     arm_refusals: dict = field(default_factory=dict)
     #: Clock, per direction, before which no further arm may be issued.
     arm_hold_until: dict = field(default_factory=dict)
+    #: Per direction, the length of the hold currently in force. Only used to
+    #: recover when that hold STARTED; see `_last_refusal_at`.
+    arm_hold_last_span: dict = field(default_factory=dict)
     #: The runtime's own words for a direction that has been refused past
     #: ``refusal_degrade_after``. Truthy = degraded; cleared by a success.
     arm_degraded: dict = field(default_factory=dict)
@@ -501,16 +504,59 @@ def decide(
     if hold_until is not None and inp.now < hold_until:
         k = state.arm_refusals.get(d.direction, 0)
         degraded = state.arm_degraded.get(d.direction)
+        # #662: WHILE THE WORK IS STILL THERE, A REFUSAL IS NOT A REASON TO
+        # WAIT -- IT IS A REASON TO PAY.
+        #
+        # Reaching here means `_decide_from_load` already said this load wants
+        # the other layout, so the arming condition PERSISTS. Backing off then
+        # is not damping, it is the defect with a timer on it: measured on
+        # this rig, tp_to_pp was refused for want of ~380 MiB while tens of
+        # thousands of tokens sat pending, the direction was declared
+        # unfundable, and the instance held in TP at 1000-1600 tok/s where the
+        # PP layout does 4000-7000. Waiting 48 s changed nothing, because
+        # nothing about waiting frees memory.
+        #
+        # What DOES free memory is the KV rung: the pool being full is what
+        # makes the flip worth taking AND what pays for it, once the rung is
+        # actually asked. So while the condition holds we re-attempt at the
+        # plain dwell cadence -- each attempt runs the gate, which asks the
+        # rung -- instead of doubling a backoff or honouring a degrade latch.
+        #
+        # The exponential backoff and the latch both survive for the case they
+        # were written for: a load that has STOPPED wanting the flip, where
+        # `wants_flip` is false and this branch is never reached.
+        paced_until = hold_until
+        if k > 0:
+            paced_until = min(
+                hold_until, _last_refusal_at(state, d.direction) + cfg.min_dwell_s
+            )
+        if inp.now >= paced_until:
+            return d
         if degraded:
             return _no(
                 f"{d.direction} refused {k} times and treated as unfundable "
-                f"({degraded}); re-probing in {hold_until - inp.now:.1f}s"
+                f"({degraded}); the load still wants this layout, so the next "
+                f"attempt is in {paced_until - inp.now:.1f}s and it will ask "
+                f"the KV rung again rather than wait out a backoff"
             )
         return _no(
-            f"{d.direction} arm refused {k} in a row, backoff holds for "
-            f"{hold_until - inp.now:.1f}s more"
+            f"{d.direction} arm refused {k} in a row; the load still wants "
+            f"this layout, so the next attempt is in "
+            f"{paced_until - inp.now:.1f}s (dwell-paced, not backed off)"
         )
     return d
+
+
+def _last_refusal_at(state: "PhasePolicyState", direction: str) -> float:
+    """When the current hold started, derived from the hold itself.
+
+    The state carries the hold's END, not its start, so the start is recovered
+    by subtracting the backoff that produced it. Kept as a helper so the
+    arithmetic has one home and the caller reads as intent.
+    """
+    return float(state.arm_hold_until.get(direction, 0.0)) - float(
+        state.arm_hold_last_span.get(direction, 0.0)
+    )
 
 
 def _decide_from_load(
@@ -536,8 +582,7 @@ def _decide_from_load(
     since_flip = inp.now - state.last_flip_at
     if state.last_flip_at > 0 and since_flip < cfg.min_dwell_s:
         return _no(
-            f"min dwell: {since_flip:.1f}s since last flip < "
-            f"{cfg.min_dwell_s:g}s"
+            f"min dwell: {since_flip:.1f}s since last flip < {cfg.min_dwell_s:g}s"
         )
 
     if inp.phase == PHASE_TP:
@@ -571,9 +616,7 @@ def _decide_from_load(
             # nothing decoding there is nothing to protect, and an arriving
             # long prompt should reach the PP layout inside its TTFT.
             in_phase = (
-                None
-                if state.phase_since is None
-                else inp.now - state.phase_since
+                None if state.phase_since is None else inp.now - state.phase_since
             )
             if (
                 cfg.tp_decode_floor_s > 0
@@ -603,9 +646,7 @@ def _decide_from_load(
                     f"idle {idle_for:.1f}s >= {cfg.idle_dwell_s:g}s, "
                     f"returning to the {cfg.rest_state} resting layout",
                 )
-            return _no(
-                f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell"
-            )
+            return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
         if inp.pending_prefill_tokens:
             # Unreachable under purity: tp_threshold is 0 there, so any
             # non-zero pending already armed above. Reaching it would mean
@@ -669,9 +710,7 @@ def _decide_from_load(
                     f"idle {idle_for:.1f}s >= {cfg.idle_dwell_s:g}s, "
                     f"returning to the {cfg.rest_state} resting layout",
                 )
-            return _no(
-                f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell"
-            )
+            return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
         if idle:
             return _no("idle at rest")
         return _no(f"prefilling in pp ({inp.pending_prefill_tokens} tok pending)")
@@ -782,6 +821,9 @@ def note_flip_outcome(
     state.arm_refusals_total += 1
     hold = min(cfg.min_dwell_s * (2**k), cfg.refusal_backoff_cap_s)
     state.arm_hold_until[direction] = now + hold
+    # The span, so a persisting arming condition can pace from the refusal
+    # instant rather than from the end of a backoff it is going to ignore.
+    state.arm_hold_last_span[direction] = hold
     detail = (message or "no reason given").strip()
 
     if k >= cfg.refusal_degrade_after and not state.arm_degraded.get(direction):

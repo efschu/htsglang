@@ -446,3 +446,67 @@ class TheFunderFollowsTheResidentLayoutTest(unittest.TestCase):
         )
         self.assertEqual(relief.free_up_to(600 * MIB), 600 * MIB)
         self.assertEqual(len(pp.calls), 1)
+
+
+class ARefusalMustSayWhatTheRungDecidedTest(unittest.TestCase):
+    """A silent decline is indistinguishable from a rung that never ran.
+
+    The proposal trace is edge-triggered on the deficit's sign, which keeps a
+    steady state quiet -- correct -- but a REFUSAL is not an edge, so at the
+    one moment a reader needs the terms there are none. Measured the hard way
+    on 2026-08-15: the seam was refused by 59 MiB, this rung had emitted
+    nothing for five minutes, and that was read as "the rung was never
+    consulted", sending the diagnosis after a missing call that did not exist.
+    It had been consulted at every gate and had declined quietly.
+
+    "Declined", "abstained" and "never reached" have three different fixes, so
+    the refusal has to distinguish them.
+    """
+
+    def _relief(self):
+        card = _Card(4000)
+        pool = _FlipPool(CONFIGURED_ROWS, card=card)
+        return kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(CONFIGURED_ROWS),
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+        )
+
+    def test_a_rung_that_never_proposed_says_exactly_that(self):
+        summary = self._relief().last_proposal_summary()
+        self.assertIn("NO proposal", summary)
+        self.assertIn("not reached", summary)
+
+    def test_a_quiet_decline_is_still_reportable(self):
+        relief = self._relief()
+        # Plenty free, so the deficit is negative and the trace stays silent.
+        relief.propose(
+            want_bytes=10 * MIB,
+            floor_bytes=10 * MIB,
+            delta_bytes=0,
+            cheap_relief_bytes=0,
+        )
+        summary = relief.last_proposal_summary()
+        self.assertIn("KV rung:", summary)
+        self.assertIn("no change", summary)
+        self.assertIn("slack=", summary), "the number the refusal argument turns on"
+
+    def test_the_terms_survive_even_when_the_trace_did_not_log(self):
+        relief = self._relief()
+        relief.propose(want_bytes=10 * MIB, floor_bytes=10 * MIB, delta_bytes=0)
+        first = relief.last_proposal_summary()
+        # A second identical round is not an edge, so nothing logs -- and the
+        # summary must still be available.
+        relief.propose(want_bytes=10 * MIB, floor_bytes=10 * MIB, delta_bytes=0)
+        self.assertEqual(relief.last_proposal_summary(), first)
+
+    def test_an_emptied_layout_reports_its_abstention_not_a_decline(self):
+        relief = self._relief()
+        relief._pool.flip_release()
+        relief.propose(want_bytes=10 * MIB, floor_bytes=10 * MIB, delta_bytes=0)
+        # An abstain never reaches the trace, so the summary correctly reports
+        # that no proposal was made rather than inventing one.
+        self.assertIn("NO proposal", relief.last_proposal_summary())
