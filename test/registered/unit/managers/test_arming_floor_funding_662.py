@@ -640,21 +640,40 @@ class TheFloorMustNotBePaidTwiceTest(unittest.TestCase):
             provenance=sr.PROVENANCE_STORED,
         )
 
-    def test_a_measured_record_has_already_reserved_about_the_floor(self):
+    def test_a_measured_record_has_already_reserved_the_whole_floor(self):
+        """THREE terms, and the solve arranges all three.
+
+        band floor + this rank's one-leg draw + the measurement's error bar --
+        which is exactly what the arming floor asks for, stated from the other
+        side. So a boot with a measured record owes nothing further.
+        """
         r = self._warm()
         reserved = sr.seam_solve_reserved_free_bytes(r)
         floor = sr.arming_floor_target_bytes(
             measured_draw_mib=r.arming_draw_bytes() >> 20
         )
-        # Within the load margin: the two are the same requirement stated
-        # twice, so what is left to charge is the margin and nothing else.
-        self.assertAlmostEqual(
-            (floor - reserved) / MIB,
-            sr._arming_margin_bytes() / MIB,
-            delta=1.0,
+        self.assertGreaterEqual(
+            reserved,
+            floor,
+            "the solve already leaves the floor free; anything more is a "
+            "second payment for one requirement",
         )
 
-    def test_the_charge_collapses_to_the_margin_on_a_measured_record(self):
+    def test_the_error_bar_is_not_charged_twice_either(self):
+        """``seam_allowed_tokens`` solves against ``have - seam_margin``, so
+        that margin is additional free VRAM at the solved id space. The arming
+        floor adds its own load margin of the same size for the same reason.
+        Two error bars against one measurement is one, charged twice."""
+        r = self._warm()
+        without_bar = (
+            sr._band_floor_bytes(sr._corridor_law_bytes()) + r.arming_draw_bytes()
+        )
+        self.assertEqual(
+            sr.seam_solve_reserved_free_bytes(r) - without_bar,
+            sr.seam_margin_bytes(r),
+        )
+
+    def test_the_charge_collapses_to_nothing_on_a_measured_record(self):
         r = self._warm()
         floor = sr.arming_floor_target_bytes(
             measured_draw_mib=r.arming_draw_bytes() >> 20
@@ -663,11 +682,8 @@ class TheFloorMustNotBePaidTwiceTest(unittest.TestCase):
             floor, sr.seam_solve_reserved_free_bytes(r)
         )
         law_only = sr.arming_floor_subtrahend_bytes(floor)
-        self.assertLess(
-            charge,
-            law_only // 4,
-            "a record that already paid must not be charged the whole floor",
-        )
+        self.assertEqual(charge, 0, "the solve already covers the floor")
+        self.assertGreater(law_only, 0, "and the law-only charge was not zero")
 
     def test_a_COLD_record_still_pays_in_FULL(self):
         """The r2 behaviour must not regress. A cold solve reserves nothing

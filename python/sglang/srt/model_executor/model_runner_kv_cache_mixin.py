@@ -5676,19 +5676,32 @@ class ModelRunnerKVCacheMixin:
             if flips_on
             else 0
         )
-        floor_charge = seam.arming_floor_subtrahend_bytes(arming_floor)
-        if floor_charge:
+        # ONE CHARGE, COMPUTED ONCE, LOGGED AND APPLIED. #678 caught this line
+        # reporting the law-baseline number while
+        # ``seam_adjusted_budget_bytes`` applied the residual one -- a log that
+        # disagrees with the arithmetic it describes, which is worse than no
+        # log because it is the number an operator reads back.
+        already_reserved = seam.seam_solve_reserved_free_bytes(reserve)
+        floor_charge = seam.arming_floor_subtrahend_bytes(
+            arming_floor, already_reserved
+        )
+        if floor_charge or arming_floor:
             logger.info(
-                "%s (rank %d): ARMING FLOOR %d MiB (corridor law + the flip's "
-                "entry reserve + load margin) must stay free for a flip to arm "
-                "at all, and the sizer already holds the %d MiB law free, so "
-                "the pool gives up the %d MiB difference. Charged on a COLD "
-                "record too: a first boot not knowing what a flip COSTS is not "
-                "the same as it not knowing what level the gate WANTS.",
+                "%s (rank %d): ARMING FLOOR %d MiB (corridor law + this rank's "
+                "measured one-leg seam draw + load margin) must stay free for a "
+                "flip to arm at all. Already held free by %s: %d MiB, so the "
+                "pool gives up the %d MiB difference and no more -- charging the "
+                "whole floor over a solve that already reserved it is what "
+                "returned 284181 tokens where 550000 arms and flips.",
                 seam.LOG_PREFIX,
                 self._seam_world_rank(),
                 arming_floor >> 20,
-                seam._corridor_law_bytes() >> 20,
+                (
+                    "the seam solve"
+                    if already_reserved > seam._corridor_law_bytes()
+                    else "the corridor law"
+                ),
+                max(already_reserved, seam._corridor_law_bytes()) >> 20,
                 floor_charge >> 20,
             )
         if not reserve.active:

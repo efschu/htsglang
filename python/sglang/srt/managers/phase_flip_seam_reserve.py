@@ -426,10 +426,24 @@ def seam_solve_reserved_free_bytes(reserve: "SeamReserve") -> int:
     time, so a gap of that size can remain -- and covering it is precisely
     what the pre-arm relief ladder is for. Reserving it here as well would be
     the third payment for one requirement.
+
+    AND THE MEASUREMENT'S ERROR BAR IS IN THERE TOO, which is the third and
+    last thing this was paying for twice. ``seam_allowed_tokens`` solves
+    against ``have_m = have - seam_margin_bytes``, i.e. it deliberately stands
+    ``DEFAULT_MARGIN_MIB`` back from the measured position -- so at the solved
+    id space that margin is ADDITIONAL free VRAM the solve arranged. The arming
+    floor then adds its own load margin of the same size and for the same
+    reason (a card sitting exactly on a level only holds it while nothing else
+    moves). Two error bars against one measurement is one error bar charged
+    twice, and the tail is what the pre-arm relief ladder exists to absorb.
     """
     if not reserve.active:
         return 0
-    return _band_floor_bytes(_corridor_law_bytes()) + reserve.arming_draw_bytes()
+    return (
+        _band_floor_bytes(_corridor_law_bytes())
+        + reserve.arming_draw_bytes()
+        + seam_margin_bytes(reserve)
+    )
 
 
 def arming_floor_subtrahend_bytes(
