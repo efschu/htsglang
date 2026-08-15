@@ -195,6 +195,9 @@ class WatchdogSpec:
     max_restarts: int = 5
     restart_window_s: int = 3600
     enabled: bool = True
+    #: See Policy.generation_probe_enabled. Retired by user order
+    #: 2026-08-14; False unless a config explicitly says otherwise.
+    generation_probe_enabled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -397,6 +400,8 @@ def _build(raw: dict, source: str) -> StackConfig:
                                                (30, 60, 120, 300, 600))),
         max_restarts=int(wd.get("max_restarts", 5)),
         restart_window_s=int(wd.get("restart_window_s", 3600)),
+        generation_probe_enabled=bool(
+            wd.get("generation_probe_enabled", False)),
         enabled=bool(wd.get("enabled", True)))
     if not watchdog.backoff_s:
         raise_refusal(REFUSE_CONFIG_INCOMPLETE, "watchdog.backoff_s", "<empty>",

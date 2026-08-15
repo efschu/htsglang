@@ -85,6 +85,14 @@ class Policy:
 
     poll_s: float = 20.0
     generation_probe_s: float = 120.0
+    #: Generation-based liveness probing. RETIRED by user order 2026-08-14:
+    #: nothing on this box may prove liveness by generating on a timer.
+    #: Detection stays passive -- port open, ``/get_model_info``, boot-log
+    #: age, NVML -- and a real generation is run ONCE, by hand, at teardown
+    #: or restore. The default is False so that a bare ``Policy()`` cannot
+    #: reintroduce the probe by omission; the config key of the same name
+    #: is the only way to turn it back on.
+    generation_probe_enabled: bool = False
     wedge_confirmations: int = 3
     backoff_s: Tuple[int, ...] = (30, 60, 120, 300, 600)
     max_restarts: int = 5
@@ -245,7 +253,24 @@ def step(state: WatchdogState, obs: Observation, now: float,
                              + (" while the port stays open"
                                 if obs.port_open else " and the port is shut"))
 
-    # 3. reachable -- now the only question is whether it GENERATES.
+    # 3. reachable. With the generation probe retired, passive reachability
+    #    IS the verdict, and what that gives up is named rather than hidden:
+    #    the #622 wedge (HTTP 200, no tokens) cannot be detected without
+    #    generating. It is covered by the one-shot verify at teardown/restore,
+    #    not by this loop. Crash detection is unaffected -- a lane that stops
+    #    answering still reaches DEAD and still restarts, above.
+    if obs.generation is None and not policy.generation_probe_enabled:
+        was = state.phase
+        new = dataclasses.replace(state, phase=HEALTHY, gen_failures=0)
+        return Decision(
+            state=new, action=ACT_NONE,
+            reason=("healthy: API answers; generation probe retired"
+                    if was == HEALTHY else
+                    f"recovered ({was} -> healthy): API answers; generation "
+                    "probe retired"))
+
+    # 3b. reachable and the probe is enabled -- the only question is whether
+    #     it GENERATES.
     if obs.generation is None:
         due = (state.last_gen_probe_at is None
                or now - state.last_gen_probe_at >= policy.generation_probe_s)

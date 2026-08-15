@@ -82,11 +82,16 @@ class TestBootGrace(CustomTestCase):
 
 
 class TestWedgeDetection(CustomTestCase):
-    def test_http_200_alone_never_reaches_healthy(self):
-        """THE falsifier. An API that answers but has not generated is not
-        healthy -- it is exactly the #622 wedge until a token proves otherwise.
+    def test_http_200_alone_never_reaches_healthy_WHEN_PROBING(self):
+        """THE falsifier, now scoped to the probing configuration.
+
+        CONTRACT CHANGED 2026-08-15 (standing order: retire the generation
+        prober). This still holds WHEN the probe is enabled, which is why the
+        policy here opts in. Under the shipped retired default the opposite is
+        true and is asserted in TestProberRetired below -- deliberately, with
+        the blind spot named.
         """
-        p = _pol()
+        p = _pol(generation_probe_enabled=True)
         s = W.initial(0.0, p)
         # Reachable, no generation verdict, forever.
         for t in (10.0, 200.0, 5000.0, 100000.0):
@@ -97,13 +102,13 @@ class TestWedgeDetection(CustomTestCase):
             s = d.state
 
     def test_api_back_after_boot_demands_a_generation_probe(self):
-        p = _pol()
+        p = _pol(generation_probe_enabled=True)
         d = W.step(W.initial(0.0, p), W.Observation(True, True, None), 10.0, p)
         self.assertEqual(d.action, W.ACT_PROBE_GENERATION)
         self.assertEqual(d.state.phase, W.SUSPECT)
 
     def test_one_failed_probe_is_not_a_wedge(self):
-        p = _pol()
+        p = _pol(generation_probe_enabled=True)
         s = _healthy(W.initial(0.0, p), p, 10.0)
         d = W.step(s, W.Observation(True, True, False), 200.0, p)
         self.assertEqual(d.action, W.ACT_NONE)
@@ -124,7 +129,7 @@ class TestWedgeDetection(CustomTestCase):
         self.assertIn("200", d.reason)
 
     def test_success_resets_the_suspicion_counter(self):
-        p = _pol()
+        p = _pol(generation_probe_enabled=True)
         s = _healthy(W.initial(0.0, p), p, 10.0)
         s = W.step(s, W.Observation(True, True, False), 200.0, p).state
         s = W.step(s, W.Observation(True, True, False), 300.0, p).state
@@ -134,12 +139,55 @@ class TestWedgeDetection(CustomTestCase):
         self.assertEqual(s.gen_failures, 0)
 
     def test_probe_is_due_on_cadence_not_every_tick(self):
-        p = _pol(generation_probe_s=100)
+        p = _pol(generation_probe_s=100, generation_probe_enabled=True)
         s = _healthy(W.initial(0.0, p), p, 10.0)
         self.assertEqual(W.step(s, W.Observation(True, True), 50.0, p).action,
                          W.ACT_NONE)
         self.assertEqual(W.step(s, W.Observation(True, True), 111.0, p).action,
                          W.ACT_PROBE_GENERATION)
+
+
+
+class TestProberRetired(CustomTestCase):
+    """The shipped default: passive evidence is the verdict.
+
+    WHAT THIS GIVES UP, stated rather than discovered later: with generation
+    retired there is no periodic check that can see a #622 wedge (HTTP 200,
+    no tokens), because seeing it requires generating. That is covered by the
+    one-shot real generation at teardown/restore and by boot-log age, not by
+    the watchdog.
+    """
+
+    def test_default_is_retired(self):
+        self.assertFalse(W.Policy(
+            poll_s=10, generation_probe_s=100, wedge_confirmations=3,
+            backoff_s=(30, 60, 120), max_restarts=3,
+            restart_window_s=1000, boot_grace_s=500).generation_probe_enabled)
+
+    def test_passive_evidence_alone_is_healthy(self):
+        p = _pol()
+        s = W.initial(0.0, p)
+        for t in (10.0, 200.0, 5000.0, 100000.0):
+            d = W.step(s, W.Observation(True, True, None), t, p)
+            self.assertEqual(d.state.phase, W.HEALTHY)
+            self.assertEqual(d.action, W.ACT_NONE)
+            s = d.state
+
+    def test_no_tick_ever_schedules_a_generation(self):
+        p = _pol(generation_probe_s=100)
+        s = _healthy(W.initial(0.0, p), p, 10.0)
+        for t in (50.0, 111.0, 10_000.0):
+            self.assertNotEqual(
+                W.step(s, W.Observation(True, True), t, p).action,
+                W.ACT_PROBE_GENERATION,
+                f"generation scheduled at t={t} despite retirement")
+
+    def test_crash_detection_survives_retirement(self):
+        """The half that must NOT be given up."""
+        p = _pol()
+        s = _healthy(W.initial(0.0, p), p, 10.0)
+        d = W.step(s, W.Observation(False, False), 60.0, p)
+        self.assertNotEqual(d.state.phase, W.HEALTHY)
 
 
 class TestCrashPath(CustomTestCase):
