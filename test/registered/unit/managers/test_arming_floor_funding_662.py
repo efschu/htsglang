@@ -218,6 +218,49 @@ class TheDefaultIsByteIdenticalTest(unittest.TestCase):
                     (budget, 0),
                 )
 
+    def test_a_WARM_record_still_gives_up_the_floor(self):
+        """THE ORDERING DEFECT, AS A TEST. Caught on boot_slo_proof_r3.
+
+        The charge used to be applied to the budget BEFORE
+        ``min(budget, allowed * cell)``. That is not equivalent: whenever the
+        seam solve binds -- which is whenever a MEASURED record exists -- the
+        min picks ``allowed * cell`` and the subtraction is silently discarded.
+
+        So the term worked on the COLD boot that wrote the record and did
+        nothing at all on the next one. Measured: pool 385927 -> 491445, free
+        landing at 1515/3130/1983 MiB against guard floors of 1772/1964/2414 --
+        below the floor on two of three ranks, the exact condition the term
+        exists to prevent. A charge that only fires on a first boot is worse
+        than no charge, because the second boot looks like the fixed one.
+        """
+        # A record whose solve binds well below the budget.
+        reserve = sr.SeamReserve(
+            fixed_bytes=455 * MIB,
+            have_bytes=2000 * MIB,
+            id_space=100000,
+            provenance=sr.PROVENANCE_STORED,
+        )
+        self.assertTrue(reserve.active)
+        cell = 4096
+        budget = 20 * GIB
+        floor = sr.arming_floor_target_bytes()
+        charge = sr.arming_floor_subtrahend_bytes(floor)
+        self.assertGreater(charge, 0, "this rig must have a floor above the law")
+
+        without, allowed = sr.seam_adjusted_budget_bytes(budget, cell, reserve)
+        self.assertLess(
+            allowed * cell, budget, "the seam solve must BIND for this to test"
+        )
+        with_floor, _ = sr.seam_adjusted_budget_bytes(
+            budget, cell, reserve, arming_floor_bytes=floor
+        )
+        self.assertEqual(
+            with_floor,
+            without - charge,
+            "a warm record must give up the floor too -- charging before the "
+            "min lets the min throw the charge away",
+        )
+
     def test_a_measured_record_still_charges_its_measured_staging(self):
         """The floor is ADDITIONAL to the seam reserve, not a replacement:
         they are different quantities at different instants."""
@@ -335,21 +378,67 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
             r._prearm_floor_relief(TP_TO_PP)
         self.assertEqual(g.asks[0][0], FLOOR - g.law_floor_bytes)
 
-    def test_a_short_floor_with_the_host_tier_FULL_refuses_with_the_numbers(self):
-        """The operator's second required shape, and the message is the
-        deliverable: how much was short, and what the ladder actually freed."""
+    def test_a_short_floor_with_the_host_tier_FULL_still_lets_the_arm_PROCEED(self):
+        """THE SPLIT-ARM DEFECT, AS A TEST. Added after boot_slo_proof_r3.
+
+        The first version returned False here, arguing that "a rank that
+        refuses simply does not arm, which the consensus round already
+        handles". On metal PP0 sat at 3130 MiB against its 1728 MiB floor and
+        armed, while PP1 and PP2 sat below theirs and refused -- and the armed
+        rank parked at the entry, "WITHHOLDING presence (8854 rounds so far)",
+        spinning for ever with all three cards at 0%.
+
+        A verdict keyed to this rank's FREE VRAM is never group-uniform, so
+        this rung may spend the ladder and may not decide. The seam gate
+        refuses, and it reduces its verdict.
+        """
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with _PatchedGuard(g):
             ok, msg = r._prearm_floor_relief(TP_TO_PP)
-        self.assertFalse(ok)
-        self.assertIn("900", msg)
-        self.assertIn("1523", msg)
-        self.assertIn("short by", msg)
-        self.assertIn("freed", msg)
+        self.assertTrue(
+            ok,
+            "a rank-local shortfall must NOT refuse the arm -- that splits the "
+            "group and parks whichever rank did clear its floor",
+        )
+        self.assertEqual(len(g.asks), 1, "it must still have spent the ladder")
+
+    def test_the_shortfall_is_reported_with_the_numbers(self):
+        """The operator asked for how much was short and what the ladder
+        freed. That still has to be in the log; it just must not be a
+        decision."""
+        r = _runtime()
+        g = _Guard(free=900 * MIB, deliverable=0)
+        with _PatchedGuard(g):
+            with self.assertLogs(
+                "sglang.srt.managers.phase_flip_runtime", level="WARNING"
+            ) as cm:
+                r._prearm_floor_relief(TP_TO_PP)
+        joined = "\n".join(cm.output)
+        self.assertIn("900", joined)
+        self.assertIn("1523", joined)
+        self.assertIn("freed", joined)
+
+    def test_arm_does_not_branch_on_the_relief_verdict(self):
+        """Structural, not a promise: the caller must discard the bool.
+
+        Asserted on the source because "this value is not used to decide" is
+        not observable from a single call -- and a future edit that re-adds the
+        branch would restore the split arm.
+        """
+        import inspect
+
+        src = inspect.getsource(PhaseFlipRuntime.arm)
+        self.assertIn("self._prearm_floor_relief(direction)", src)
+        self.assertNotIn("if not floor_ok", src)
 
     def test_the_relief_is_bounded_and_stops_asking(self):
-        """An unbounded relief loop spills the instance flat."""
+        """An unbounded relief loop spills the instance flat.
+
+        The bound stops the LADDER, not the flip: every one of these calls
+        still lets the arm proceed, because a rank-local shortfall may not
+        decide for the group.
+        """
         r = _runtime()
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
@@ -357,10 +446,9 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
             _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="2"),
         ):
             for _ in range(6):
-                ok, msg = r._prearm_floor_relief(TP_TO_PP)
-                self.assertFalse(ok)
+                ok, _msg = r._prearm_floor_relief(TP_TO_PP)
+                self.assertTrue(ok)
         self.assertEqual(len(g.asks), 2, "the bound must stop the ladder")
-        self.assertIn("bounded relief attempts", msg)
 
     def test_the_bound_is_per_direction(self):
         r = _runtime()

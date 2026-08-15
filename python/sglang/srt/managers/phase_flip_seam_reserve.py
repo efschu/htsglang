@@ -814,21 +814,33 @@ def seam_adjusted_budget_bytes(
       a cold record, a disabled term or a configurator with no single
       per-token cell still charges nothing for it.
 
-    Charging the floor first is what makes the fix work at all. Before this,
-    a cold record returned the budget unchanged and the pool filled to the
-    corridor, leaving rank 1 at ~875 MiB against a 1536 MiB floor -- a boot
-    that could not arm a flip in either direction, unrecoverable at runtime
-    because the pool is fixed at boot.
+    THE FLOOR IS CHARGED LAST, AFTER THE MIN, AND THAT ORDERING IS THE FIX.
+    Charging it against the budget FIRST looks equivalent and is not: the
+    result is ``min(budget, allowed * cell)``, so whenever the seam solve binds
+    -- which is whenever a MEASURED record exists -- the min picks
+    ``allowed * cell`` and the subtraction is silently discarded.
+
+    Measured, and it cost a boot. The first version of this charge worked on a
+    COLD record (``allowed`` is 0 there, so the budget path applies) and did
+    nothing at all on the WARM one written by that same boot: pool 385927 ->
+    491445, free landing at 1515/3130/1983 MiB against guard floors of
+    1772/1964/2414 -- below the floor on two of three ranks, which is the exact
+    condition this term exists to prevent. A term that only fires on a first
+    boot is worse than no term, because the second boot looks like the fixed
+    one.
+
+    So the charge is applied to whatever the two solves settle on. It can only
+    ever REDUCE the result, which is why it is safe to apply after a min that
+    already never grows it.
     """
-    budget = max(
-        0, int(budget_bytes) - arming_floor_subtrahend_bytes(arming_floor_bytes)
-    )
+    charge = arming_floor_subtrahend_bytes(arming_floor_bytes)
+    budget = int(budget_bytes)
     if not reserve.active or int(cell_bytes) <= 0:
-        return budget, 0
+        return max(0, budget - charge), 0
     allowed = seam_allowed_tokens(
         cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
     )
-    return min(budget, allowed * int(cell_bytes)), allowed
+    return max(0, min(budget, allowed * int(cell_bytes)) - charge), allowed
 
 
 def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:

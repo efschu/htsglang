@@ -2606,35 +2606,49 @@ class PhaseFlipRuntime:
 
     # -- arming (replicated callers) -----------------------------------------
     def _prearm_floor_relief(self, direction: str) -> Tuple[bool, str]:
-        """Free the ARMING FLOOR before arming, or refuse with the numbers.
+        """SPILL for the arming floor before arming. NEVER refuse for it.
 
         "IT CAN ALWAYS BE SPILLED" IS TRUE BEFORE ARMING, AND ONLY BEFORE.
-        The sizer now charges the floor at boot, so a correctly planned
-        instance never reaches this. What reaches it is the transient: a
-        co-tenant, a capture peak, a rank that drifted. Refusing an arm for a
-        condition the host tier could fix in one call is the same mistake as
-        sizing without the floor -- it turns a recoverable dip into a phase
-        the instance cannot enter.
+        The sizer charges the floor at boot, so a correctly planned instance
+        never reaches this. What reaches it is the transient a sizer cannot
+        see: a co-tenant, a capture peak, a rank that drifted. Letting that
+        stop a flip is the same mistake as sizing without the floor -- it turns
+        a recoverable dip into a phase the instance cannot enter.
 
-        WHY HERE AND NOT AT THE SEAM GATE. The gate already spills, but it
-        runs after the arm is committed, at the last point before the
-        no-return region -- by then the group has agreed to a flip and the
-        staged fund must stay hard-resident, so anything freed underneath it
-        is the evictable-seam-fund mistake that produced the served-nothing
-        class in #656 boots E/G. This rung is strictly earlier: nothing is
-        armed, no rank has entered the seam, no collective has been reached,
-        and a refusal here is free. It is the same argument #485 makes for
-        declining at arm rather than inside ``_execute``.
+        IT DOES NOT REFUSE, AND THE FIRST VERSION OF THIS METHOD DID. That
+        version returned False when the ladder could not reach the floor, on
+        the argument that "a rank that refuses simply does not arm, which the
+        consensus round already handles". METAL SAYS OTHERWISE, and it is the
+        second time the same error was made in one day, one layer apart.
 
-        RANK-LOCAL BY CONSTRUCTION, AND THAT IS SAFE. A rank that refuses
-        here simply does not arm, which the consensus round already handles:
-        arming is reduced across the group and a rank that did not arm holds
-        the flip back without anyone entering the seam. This adds no
-        collective and cannot desync one.
+        Measured on boot_slo_proof_r3.log: PP0 sat at 3130 MiB against its 1728
+        MiB floor and ARMED; PP1 and PP2 sat at 1514 and 1982 against 1772 and
+        2414 and REFUSED. The group split, and the armed rank parked at the
+        entry -- "WITHHOLDING presence (8854 rounds so far) -- still owes a
+        chain send" -- spinning for ever, no decode, all three cards at 0%.
 
-        BOUNDED, because an unbounded relief loop is a hot loop that spills
-        the instance flat. Attempts are counted per direction and reset the
-        moment the floor is clear, so a rig that dips once pays one ladder.
+        The existing blocking guards get away with being rank-local because
+        they are config facts, identical on every rank in practice. A verdict
+        keyed to this rank's FREE VRAM never is. So this rung keeps the half
+        that is safe and rank-local -- SPENDING the ladder, which frees memory
+        and cannot desync anything -- and leaves the REFUSING to the seam gate,
+        which reduces its verdict across the group and already prints the
+        numbers. One unanimous decision, not two.
+
+        WHY THE RELIEF STILL BELONGS HERE rather than at that gate. The gate
+        runs after the arm is committed, at the last point before the no-return
+        region; by then the group has agreed to a flip and the staged fund must
+        stay hard-resident, so freeing underneath it is the evictable-seam-fund
+        mistake that produced the served-nothing class in #656 boots E/G. Here
+        nothing is armed and nothing is staged, so a spill is free.
+
+        BOUNDED, because an unbounded relief loop spills the instance flat.
+        Attempts are counted per direction and reset the moment the floor is
+        clear, so a rig that dips once pays one ladder.
+
+        The (bool, str) shape is kept so the caller reads like every other
+        precondition, but the bool is now always True: this rung reports, it
+        does not decide.
         """
         if not _prearm_relief_enabled():
             return True, ""
@@ -2674,16 +2688,23 @@ class PhaseFlipRuntime:
         spent = int(self._prearm_relief_attempts.get(direction, 0))
         bound = _prearm_relief_attempts()
         if spent >= bound:
-            msg = (
-                f"phase flip {direction} refused: free {free >> 20} MiB is "
-                f"below the {floor >> 20} MiB arming floor, short by "
-                f"{(floor - free) >> 20} MiB, and {spent} bounded relief "
-                f"attempts did not recover it. The pool is sized with the "
-                f"floor charged, so a persistent shortfall here is a "
-                f"co-tenant or a leak, not a sizing error."
+            # THE LADDER IS SPENT, AND THE ARM STILL PROCEEDS. The bound stops
+            # a hot loop from spilling the instance flat; it is not a verdict.
+            # The seam gate decides, unanimously, a few rounds from here.
+            logger.warning(
+                "%s %s arming floor still short: free %d MiB below %d MiB by "
+                "%d MiB after %d bounded relief attempts. The arm PROCEEDS and "
+                "the seam gate refuses if it must -- a rank-local refusal here "
+                "split the group once already (r3: PP0 armed, its peers did "
+                "not, and the armed rank parked at the entry for ever).",
+                LOG_PREFIX,
+                direction,
+                free >> 20,
+                floor >> 20,
+                (floor - free) >> 20,
+                spent,
             )
-            logger.warning("%s %s", LOG_PREFIX, msg)
-            return False, msg
+            return True, ""
         self._prearm_relief_attempts[direction] = spent + 1
         # ``ensure_headroom`` guarantees ``free_after - want >= law``, so the
         # ask that lands the card ON the arming floor is the floor MINUS the
@@ -2720,15 +2741,25 @@ class PhaseFlipRuntime:
             )
             self._prearm_relief_attempts[direction] = 0
             return True, ""
-        msg = (
-            f"phase flip {direction} refused: free {free >> 20} MiB is below "
-            f"the {floor >> 20} MiB arming floor, short by "
-            f"{(floor - free) >> 20} MiB. The relief ladder freed "
-            f"{reclaimed >> 20} MiB from {list(providers) or ['nothing']} and "
-            f"the floor is still not covered (attempt {spent + 1} of {bound})"
+        # SHORT, AND SAID SO WITH THE NUMBERS -- but not a refusal. The
+        # operator asked for "how much was short and what the ladder freed",
+        # and that is exactly what this line carries; what it must not carry is
+        # a rank-local decision about whether the group flips.
+        logger.warning(
+            "%s %s arming floor NOT funded: free %d MiB is below %d MiB by "
+            "%d MiB; the ladder freed %d MiB from %s (attempt %d of %d). The "
+            "arm proceeds; the seam gate reduces the verdict.",
+            LOG_PREFIX,
+            direction,
+            free >> 20,
+            floor >> 20,
+            (floor - free) >> 20,
+            reclaimed >> 20,
+            list(providers) or ["nothing"],
+            spent + 1,
+            bound,
         )
-        logger.warning("%s %s", LOG_PREFIX, msg)
-        return False, msg
+        return True, ""
 
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
         """Arm a flip. Replicated call; the consensus round commits it once
@@ -2853,13 +2884,17 @@ class PhaseFlipRuntime:
                 direction,
                 source,
             )
-        # #662-F4 / A0: the floor is SPILLED FOR before it is refused for, and
-        # this is the last point at which relief is still free -- nothing is
-        # armed, no rank has entered the seam, and the staged fund does not
-        # exist yet to be pulled out from under.
-        floor_ok, floor_msg = self._prearm_floor_relief(direction)
-        if not floor_ok:
-            return False, floor_msg
+        # #662-F4 / A0: SPILL for the arming floor here, where relief is still
+        # free -- nothing is armed, no rank has entered the seam, and the
+        # staged fund does not exist yet to be pulled out from under.
+        #
+        # ITS VERDICT IS DELIBERATELY DISCARDED. This rung is rank-local, and a
+        # rank-local refusal splits the arm: on r3 PP0 cleared its floor and
+        # armed while its peers did not, and the armed rank parked at the entry
+        # for ever. Refusing is the seam gate's job, because the gate reduces
+        # its verdict across the group. Ignoring the return value here is what
+        # makes that structural rather than a promise in a docstring.
+        self._prearm_floor_relief(direction)
         self._pending = direction
         # A fresh arm starts a fresh round sequence. The epoch already
         # distinguishes this arm from any earlier one, so the round
