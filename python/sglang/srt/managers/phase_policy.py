@@ -755,6 +755,11 @@ class PhasePolicyState:
     #: Per direction, the length of the hold currently in force. Only used to
     #: recover when that hold STARTED; see `_last_refusal_at`.
     arm_hold_last_span: dict = field(default_factory=dict)
+    #: When a staging attempt last ABANDONED, per direction. The storm guard
+    #: is paced off this and nothing else -- see the rate-limiter block in
+    #: `decide`. Cleared by a completion, so a funded path never carries a
+    #: penalty from an earlier failure.
+    last_abandon_at: dict = field(default_factory=dict)
     #: The runtime's own words for a direction that has been refused past
     #: ``refusal_degrade_after``. Truthy = degraded; cleared by a success.
     arm_degraded: dict = field(default_factory=dict)
@@ -817,6 +822,60 @@ def decide(
     d = _decide_from_load(cfg, state, inp)
     if not d.wants_flip:
         return d
+
+    # THE STORM GUARD, as a RATE LIMITER rather than a latch.
+    #
+    # Two dampers were removed from this path: the doubling backoff became
+    # dwell pacing, and the guards-layer latch that blocked re-pricing after 8
+    # abandons is going. This is what remains, and it has one job -- bound the
+    # rate of EXPENSIVE failures without ever refusing a flip that could now be
+    # funded.
+    #
+    # So it paces on abandons, not on arms. An arm that never reaches staging
+    # costs a broadcast; an arm that stages and abandons costs the seam's
+    # memory peak, and 12 of those in four minutes once killed three boots.
+    # Decoupling the two is the whole point: probes stay cheap and frequent,
+    # expensive failures get a floor between them.
+    #
+    # The floor is SOLVED, not chosen: one failed staging per
+    # `solved_tp_decode_floor_s` = 2 x flip_cost_s. That is already the period
+    # below which cutover work exceeds half the wall clock, so applying it to
+    # failed work bounds waste by the same rule that bounds useful work.
+    #
+    # It is not a latch and cannot become one: it holds nothing, remembers one
+    # timestamp, never exceeds 2 x flip_cost_s, and a COMPLETION clears it
+    # outright. The instant conditions allow funding, the next arm goes.
+    last_abandon = state.last_abandon_at.get(d.direction)
+    if last_abandon is not None:
+        # Interval starts at one round trip and doubles per consecutive
+        # abandon, capped. Doubling because a second failure against the same
+        # conditions is evidence the conditions have not moved; capped because
+        # they might, and past the cap the right behaviour is to keep asking
+        # once a minute forever rather than to give up -- which is the
+        # difference between a rate limiter and a latch.
+        k = max(1, state.arm_refusals.get(d.direction, 1))
+        # The base interval is one round trip WHERE THE SEAM WAS MEASURED, and
+        # min_dwell_s where it was not. A safety limiter must not switch itself
+        # off for want of a measurement -- that is the right gate for a
+        # threshold term, and exactly the wrong one here, where the failure
+        # mode is an arm storm against an unfundable seam.
+        base_s = (
+            solved_tp_decode_floor_s(cfg)
+            if cfg.flip_cost_s > 0
+            else cfg.min_dwell_s
+        )
+        floor_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+        since = inp.now - last_abandon
+        if floor_s > 0 and since < floor_s:
+            return _no(
+                f"{d.direction} arm refused by the staging rate limit: {k} "
+                f"consecutive abandons, "
+                f"last {since:.1f}s ago, next staging in {floor_s - since:.1f}s "
+                f"(interval {floor_s:.1f}s = {base_s:.1f}s doubled {k}x, capped "
+                f"at {cfg.refusal_backoff_cap_s:g}s) "
+                f"-- a rate limit, not a latch: it never stops re-probing and "
+                f"a completion clears it outright"
+            )
     hold_until = state.arm_hold_until.get(d.direction)
     if hold_until is not None and inp.now < hold_until:
         k = state.arm_refusals.get(d.direction, 0)
@@ -861,6 +920,7 @@ def decide(
             f"this layout, so the next attempt is in "
             f"{paced_until - inp.now:.1f}s (dwell-paced, not backed off)"
         )
+
     return d
 
 
@@ -1179,6 +1239,11 @@ def note_flip_outcome(
         state.idle_since = pending[2]
         state.flips_armed = max(0, state.flips_armed - 1)
 
+    # An outcome of False means a staging attempt was made and ABANDONED --
+    # the expensive failure, the one with a memory peak at the seam. Arms that
+    # never reach staging do not land here, which is what lets the storm guard
+    # be paced on real cost instead of on probe count.
+    state.last_abandon_at[direction] = now
     k = state.arm_refusals.get(direction, 0) + 1
     state.arm_refusals[direction] = k
     state.arm_refusals_total += 1
@@ -1236,6 +1301,7 @@ def note_flip_completed(
     state.flips_completed += 1
     state.arm_refusals.pop(direction, None)
     state.arm_hold_until.pop(direction, None)
+    state.last_abandon_at.pop(direction, None)
     if state.arm_degraded.pop(direction, None):
         logger.warning(
             "%s %s completed a cutover and is fundable again after being "
