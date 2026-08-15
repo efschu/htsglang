@@ -590,11 +590,24 @@ class ProposalTraceReasonTest(unittest.TestCase):
         return "\n".join(cm.output)
 
     def test_an_exhausted_arena_says_so_instead_of_blaming_the_cheap_tier(self):
+        """RESTATED 2026-08-15: the trace still names the ARENA rather than
+        blaming the cheap tier, but it now names the FAILED TARGET too.
+
+        Keying exhaustion to the level alone was self-locking -- a shrink that
+        releases nothing leaves the level unchanged, so the marker marked the
+        level the rung was stuck at and nothing could ever move it. Measured:
+        47 s of declining with 72981 rows of slack in front of it. The refusal
+        now has to say which ask it is refusing, so a deeper one can be
+        recognised as a different question."""
+        # A TIGHT card, so a shrink is actually wanted. With plenty free the
+        # deficit is negative and "the cheaper tier covers the gap" is the
+        # honest answer whatever the arena has done -- exhaustion only has
+        # anything to say when the rung is being asked to pay.
         pool = _FakePool(rows=1000)
-        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(2000))
-        r._exhausted = True
+        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(100))
+        r._mark_exhausted(target=1)  # failed at the deepest possible ask
         out = self._propose_and_capture(r)
-        self.assertIn("EXHAUSTED", out)
+        self.assertIn("returned no driver bytes at a shrink to", out)
         self.assertNotIn("the cheaper tier covers the whole gap", out)
 
     def test_no_slack_above_the_live_set_says_so(self):

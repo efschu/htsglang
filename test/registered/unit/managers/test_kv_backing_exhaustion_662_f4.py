@@ -510,3 +510,94 @@ class ARefusalMustSayWhatTheRungDecidedTest(unittest.TestCase):
         # An abstain never reaches the trace, so the summary correctly reports
         # that no proposal was made rather than inventing one.
         self.assertIn("NO proposal", relief.last_proposal_summary())
+
+
+class ExhaustionMustNotBeSelfLockingTest(unittest.TestCase):
+    """The deadlock, pinned. Keying exhaustion to the LEVEL alone cannot work.
+
+    A shrink that releases nothing leaves the physical level exactly where it
+    was. So a marker keyed only to the level marks the level the rung is stuck
+    at, and the only thing that could move it is a successful shrink -- which
+    the marker now prevents. Measured on this rig 2026-08-15: a shrink to
+    94955 rows returned no driver bytes at 12:16:00, and 47 seconds later all
+    three ranks were still declining with 72981 rows of slack in front of
+    them, at an unchanged level, while 77k tokens sat pending.
+
+    The target is what makes the evidence falsifiable: "a shrink to X returned
+    nothing" says nothing about a shrink deeper than X, because release is
+    extent-granular and a deeper ask clears extents a shallower one cannot.
+    """
+
+    def _rig(self):
+        card = _Card(1100)
+        pool = _FlipPool(CONFIGURED_ROWS, card=None)  # shrinks return nothing
+        alloc = _FakeAllocator(CONFIGURED_ROWS)
+        relief = kbr.KvBackingRelief(
+            pool,
+            alloc,
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+        )
+        return relief, pool, card
+
+    def test_the_same_ask_is_still_declined(self):
+        relief, pool, _card = self._rig()
+        relief.free_up_to(600 * MIB)
+        self.assertTrue(relief._declines_target(pool.size))
+
+    def test_a_DEEPER_ask_is_a_different_question(self):
+        """The escape from the deadlock, and the whole point of the target."""
+        relief, pool, _card = self._rig()
+        relief.free_up_to(600 * MIB)
+        failed = relief._exhausted_target_rows
+        self.assertIsNotNone(failed)
+        deeper = max(0, failed - max(1, relief._min_release_rows()))
+        self.assertFalse(
+            relief._declines_target(deeper),
+            "a target below the failed one by a release granularity must re-arm",
+        )
+
+    def test_a_shallower_ask_is_the_same_question(self):
+        relief, pool, _card = self._rig()
+        relief.free_up_to(600 * MIB)
+        failed = relief._exhausted_target_rows
+        self.assertTrue(relief._declines_target(failed + 1000))
+
+    def test_the_level_alone_can_never_unstick_it(self):
+        """Why the level test is not sufficient on its own.
+
+        The metal case is an arena with nothing to release: the shrink clears
+        no extent, so the PHYSICAL level does not move either. A marker keyed
+        to that level then marks the level the rung is stuck at, for ever.
+        Modelled faithfully here -- the ordinary `_FlipPool` models the
+        retain-handles variant instead, where the backing moves and only the
+        driver's column does not."""
+
+        class _NothingToRelease(_FlipPool):
+            def runtime_set_backing_rows(self, rows):
+                self.calls.append(int(rows))
+                self.size = int(rows)  # the dial's assertion...
+                return 0  # ...but the arena cleared no extent
+
+        card = _Card(1100)
+        pool = _NothingToRelease(CONFIGURED_ROWS, card=None)
+        relief = kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(CONFIGURED_ROWS),
+            live_slots_fn=lambda: torch.arange(1, LIVE_ROWS + 1, dtype=torch.int64),
+            bytes_per_row=BYTES_PER_ROW,
+            probe=card.probe,
+            admission_reserve_rows=RESERVE,
+        )
+        before = relief.backed_rows()
+        relief.free_up_to(600 * MIB)
+        self.assertEqual(
+            relief.backed_rows(), before, "a zero-byte shrink moves no pages"
+        )
+        self.assertTrue(relief._exhausted, "so the level-keyed marker still holds")
+        # ...and only the target escape can answer a deeper ask.
+        failed = relief._exhausted_target_rows
+        deeper = max(0, failed - max(1, relief._min_release_rows()))
+        self.assertFalse(relief._declines_target(deeper))
