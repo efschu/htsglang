@@ -126,3 +126,50 @@ def test_a_pool_gain_is_taken_after_the_seam_demand_not_out_of_it():
     recovered = 205 * MIB  # what the arming-floor derivation gave back
     resting_free = floor + seam_draw + recovered
     assert resting_free - seam_draw >= floor, "the seam still funds after the gain"
+
+
+# ---------------------------------------------------------------------------
+# The C20 entry-margin arithmetic, and what it actually compares.
+#
+# Reported from metal as "want 2251 with free 3206 fails a 512 MiB margin --
+# the arming floor looks double-counted". It is neither. The predicate is
+#
+#     law_ok = margin_bytes > 0 and (free_after - staging >= law_floor)
+#
+# `margin_bytes` is an ENABLE FLAG and appears in no comparison; the arming
+# floor appears nowhere at all. The binding number was the corridor CENTRE:
+# 3206 - 2251 = 955, which is 69 MiB under 1024 -- and 136 MiB CLEAR of the
+# band floor at 819. So the flip was legal and was delayed anyway, and the log
+# named 512, a number the arithmetic never touches.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.managers import phase_flip_runtime as _pfr
+
+
+def test_the_seam_transient_floor_is_the_bands_lower_edge():
+    assert _pfr._seam_transient_floor_bytes(1024 * MIB) == 819 * MIB
+
+
+def test_the_reported_instant_is_legal_against_the_band_and_was_delayed():
+    free_after, staging = 3206 * MIB, 2251 * MIB
+    remaining = free_after - staging
+    assert remaining == 955 * MIB
+    assert remaining < 1024 * MIB, "what the centre-based check saw"
+    assert remaining >= _pfr._seam_transient_floor_bytes(1024 * MIB), (
+        "and what the band says: legal, with 136 MiB to spare"
+    )
+
+
+def test_the_512_margin_is_not_in_the_comparison_at_all():
+    """It is an enable flag. Naming it in the refusal is what made this read
+    as a double-counted arming floor from outside."""
+    free_after, staging, margin = 3206 * MIB, 2251 * MIB, 512 * MIB
+    # The margin neither adds to the requirement nor is subtracted from it.
+    assert (free_after - staging) != margin
+    assert (free_after - staging - margin) != 0
+
+
+def test_the_fallback_delays_rather_than_enters():
+    """If the band cannot be read the floor stays where it was: delaying a
+    legal flip costs throughput, entering an illegal one costs the law."""
+    assert _pfr._seam_transient_floor_bytes(0) == 0

@@ -84,3 +84,52 @@ class TheLimiterPacesButNeverBlocks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheArmingConditionIncludesRunningWork(unittest.TestCase):
+    """Queued OR running, and the difference cost a whole boot.
+
+    The first version asked only about the waiting queue -- which is empty
+    exactly when the work has been ADMITTED. Measured 12:49:20 with 90k tokens
+    resident: "#running-req: 1, #full token: 457724, #queue-req: 0". The
+    damper did not stand down, because by its reading nothing was waiting.
+    The load that most wants the other layout is the load already in the
+    machine.
+    """
+
+    def _rt_with(self, **sched):
+        rt = _rt()
+        rt._census_scheduler = types.SimpleNamespace(**sched)
+        return rt
+
+    def test_a_queued_request_counts(self):
+        rt = self._rt_with(waiting_queue=[object()])
+        self.assertTrue(rt._arming_condition_persists())
+
+    def test_a_RUNNING_request_counts(self):
+        rt = self._rt_with(
+            waiting_queue=[], running_batch=types.SimpleNamespace(reqs=[object()])
+        )
+        self.assertTrue(rt._arming_condition_persists())
+
+    def test_the_current_batch_counts(self):
+        rt = self._rt_with(
+            waiting_queue=[],
+            running_batch=None,
+            cur_batch=types.SimpleNamespace(reqs=[object()]),
+        )
+        self.assertTrue(rt._arming_condition_persists())
+
+    def test_a_genuinely_idle_instance_does_not(self):
+        """The case every damper was written for, and which must still work:
+        the load has GONE AWAY, so the counters apply exactly as before."""
+        rt = self._rt_with(
+            waiting_queue=[],
+            grammar_queue=[],
+            running_batch=types.SimpleNamespace(reqs=[]),
+            cur_batch=types.SimpleNamespace(reqs=[]),
+        )
+        self.assertFalse(rt._arming_condition_persists())
+
+    def test_no_scheduler_is_not_a_licence_to_disable_the_damper(self):
+        self.assertFalse(_rt()._arming_condition_persists())
