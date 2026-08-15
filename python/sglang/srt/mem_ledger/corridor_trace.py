@@ -231,8 +231,20 @@ class CorridorTrace:
             "free_max_mib": max(free) // MIB,
             "free_last_mib": free[-1] // MIB,
             "corridor_mib": corridor_mib,
-            # The verdict the law actually asks for: did the WORST instant hold.
-            "breach": bool(floor // MIB < corridor_mib),
+            # THE VERDICT IS THE BAND FLOOR; THE TARGET IS THE CENTRE.
+            #
+            # The corridor is a band (corridor_guard.CORRIDOR_BAND_FRACTION):
+            # below its floor is a breach, and nothing inside it is. The
+            # margin is still measured to the CENTRE, because that is the
+            # number the self-correcting sizing pulls back to -- a mechanism
+            # that aims at the edge of its own tolerance has none left.
+            #
+            # Reported separately so a reader can never confuse "how far from
+            # the target" with "did the law hold": on this rig the cutover
+            # transient sat at 895-935 MiB, which is 89-129 MiB from the
+            # centre and comfortably inside the band.
+            "corridor_band_floor_mib": _band_floor_mib(corridor_mib),
+            "breach": bool(floor // MIB < _band_floor_mib(corridor_mib)),
             "margin_mib": floor // MIB - corridor_mib,
             "arena_backed_min_mib": min(s.kv_arena_backed_bytes for s in samples)
             // MIB,
@@ -259,6 +271,21 @@ class CorridorTrace:
             json.dump(payload, handle)
         os.replace(tmp, path)
         return path
+
+
+def _band_floor_mib(corridor_mib: int) -> int:
+    """The breach threshold for a given corridor centre.
+
+    DERIVED FROM THE CENTRE IT IS GIVEN, not from the global law, so an
+    explicit ``corridor_mib`` still decides the verdict -- that parameter
+    exists precisely so a caller can audit against a corridor other than the
+    one in force, and a band read from the global would silently ignore it.
+    The FRACTION comes from the one declaration in ``corridor_guard``, so the
+    tolerance itself cannot drift between the instrument and the gate.
+    """
+    from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+    return int(corridor_mib - corridor_mib * CORRIDOR_BAND_FRACTION)
 
 
 def requested_period_ms() -> Optional[int]:

@@ -196,6 +196,46 @@ def corridor_law_bytes() -> int:
     return corridor_law_mib() * _MIB
 
 
+#: THE CORRIDOR IS A BAND, NOT A POINT (user relaxation, 2026-08-15).
+#:
+#: The law was stated as "~1024 MiB free per card, best-filled", and both
+#: halves were being read as an exact target: a sample at 1000 MiB counted as
+#: a breach and a card resting at 2500 MiB counted as over-filled. Neither
+#: reading is what the number is for. The operator's relaxation makes the
+#: tolerance explicit at +-20 %, which is what lets the boot-time gate and the
+#: planner solve be simple: a solve that has to land on a point has no
+#: feasible region, and one that has to land in a band does.
+#:
+#: The centre stays the target -- the self-correcting margin pulls back to it,
+#: because a mechanism that aims at the edge of its own tolerance has none.
+#: The FLOOR is the verdict: below it is a breach, and nothing inside the band
+#: is. Measured consequence on this rig: the cutover transient at the
+#: `weights_refill` stage bottomed at 895-935 MiB on gpu0, which is inside the
+#: band, so that class stops being chased.
+CORRIDOR_BAND_FRACTION = 0.20
+
+
+def corridor_band_floor_mib() -> int:
+    """Below this is a breach. The law minus its tolerance."""
+    law = corridor_law_mib()
+    return int(law - law * CORRIDOR_BAND_FRACTION)
+
+
+def corridor_band_ceiling_mib() -> int:
+    """Above this at REST is over-filled: VRAM buying no tokens.
+
+    The second half of "best-filled", and the one a boot-time gate needs in
+    order to refuse a configuration that leaves gibibytes idle.
+    """
+    law = corridor_law_mib()
+    return int(law + law * CORRIDOR_BAND_FRACTION)
+
+
+def corridor_band_mib():
+    """``(floor, centre, ceiling)`` -- the whole band in one read."""
+    return corridor_band_floor_mib(), corridor_law_mib(), corridor_band_ceiling_mib()
+
+
 def arming_floor_mib(
     seam_entry_reserve_mib: int = DEFAULT_SEAM_ENTRY_RESERVE_MIB,
     law_mib: int = CORRIDOR_LAW_MIB,
@@ -207,8 +247,17 @@ def arming_floor_mib(
     Deriving it means an operator cannot raise one number and leave the
     other behind, which is the failure this function exists to make
     impossible.
+
+    BUILT ON THE BAND FLOOR, not the centre. The gate exists to keep the
+    worst instant out of breach, and breach is now defined at
+    :func:`corridor_band_floor_mib`. Arming from the centre instead would
+    reserve the band's whole tolerance on top of the seam's draw on every
+    card, for every boot -- roughly 205 MiB per rank here -- which is pool
+    given up to protect a threshold that is not the verdict. The centre is
+    what the self-correcting margin aims at; the floor is what the gate
+    defends.
     """
-    return int(law_mib) + max(0, int(seam_entry_reserve_mib))
+    return corridor_band_floor_mib() + max(0, int(seam_entry_reserve_mib))
 
 
 def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> None:
@@ -219,7 +268,7 @@ def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> No
     laundering a breach as a passed check, which is the one thing its own
     refusal message says it must never do.
     """
-    if int(arming_mib) < int(law_mib):
+    if int(arming_mib) < corridor_band_floor_mib():
         raise ValueError(
             f"corridor arming floor {arming_mib} MiB is BELOW the corridor "
             f"law {law_mib} MiB. The gate would clear allocations the law "
@@ -614,10 +663,10 @@ class CorridorGuard:
         if host_blocked and not ok:
             self.host_blocked_count += 1
         detail = (
-            f"want {want/_MIB:.0f} MiB, free {free_before/_MIB:.0f} -> "
-            f"{free_now/_MIB:.0f} MiB, reclaimed {reclaimed/_MIB:.0f} MiB "
+            f"want {want / _MIB:.0f} MiB, free {free_before / _MIB:.0f} -> "
+            f"{free_now / _MIB:.0f} MiB, reclaimed {reclaimed / _MIB:.0f} MiB "
             f"from [{', '.join(used) or 'nothing'}], arming floor "
-            f"{self.floor_bytes/_MIB:.0f} MiB, corridor law "
+            f"{self.floor_bytes / _MIB:.0f} MiB, corridor law "
             f"{self.law_floor_mib} MiB" + (f" ({reason})" if reason else "")
         )
         if host_forced and used_host:
@@ -827,13 +876,13 @@ class CorridorGuard:
         # lend with any memory ANOTHER process released between the two
         # probes. It over-reports in the permissive direction.
         detail = (
-            f"lent {measured/_MIB:.0f} MiB of a {bound/_MIB:.0f} MiB "
-            f"water-fill bound, free {free_before/_MIB:.0f} -> "
-            f"{free_now/_MIB:.0f} MiB, from [{', '.join(used) or 'nothing'}], "
+            f"lent {measured / _MIB:.0f} MiB of a {bound / _MIB:.0f} MiB "
+            f"water-fill bound, free {free_before / _MIB:.0f} -> "
+            f"{free_now / _MIB:.0f} MiB, from [{', '.join(used) or 'nothing'}], "
             f"column {[int(f // _MIB) for f in column]} MiB, spread "
             f"{free_spread_mib(column)} MiB"
             + (
-                f" (providers claimed {claimed/_MIB:.0f} MiB)"
+                f" (providers claimed {claimed / _MIB:.0f} MiB)"
                 if claimed != measured
                 else ""
             )

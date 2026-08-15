@@ -45,11 +45,20 @@ class TestTheMinimumDecides(unittest.TestCase):
 
         summary = trace.summary(corridor_mib=1024)
         self.assertEqual(summary["free_min_mib"], 940)
+        # UPDATED 2026-08-15: the corridor is a BAND and 940 is inside it, so
+        # this sample is no longer a breach. The property under test survives
+        # the relaxation and is restated one trough deeper: the MINIMUM
+        # decides, never the mean.
+        self.assertFalse(summary["breach"], "940 MiB is inside the band")
+        self.assertEqual(summary["margin_mib"], 940 - 1024, "margin is to the centre")
+
+        trace.samples.append(_sample(700, t=5.0))
+        deep = trace.summary(corridor_mib=1024)
+        self.assertEqual(deep["free_min_mib"], 700)
         self.assertTrue(
-            summary["breach"],
-            "a single sample under the law is a breach; the mean is not the law",
+            deep["breach"],
+            "one sample BELOW THE BAND is a breach; the mean is still not the law",
         )
-        self.assertEqual(summary["margin_mib"], 940 - 1024)
 
     def test_a_run_that_never_dips_reports_no_breach_and_a_positive_margin(self):
         trace = CorridorTrace()
