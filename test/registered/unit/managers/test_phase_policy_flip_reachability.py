@@ -284,6 +284,90 @@ class TestTheLiveCaptureReplay(CustomTestCase):
         self.assertEqual(effective_flip_threshold(cfg, self.RUNNING_BS), 11673)
 
 
+class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
+    """Reachability must be safe on a vector that cannot fund the cutover.
+
+    The dev instance is being re-shipped on a corridor-tight vector that
+    reclaims the seam-staging headroom into the KV pool, on the reasoning that
+    the flip gate barely fires anyway. That reasoning is downstream of the
+    defect this branch fixes, so once the gate IS reachable the arms arrive on
+    a vector whose corridor guard will refuse them.
+
+    That must not become an arm/refuse loop. It does not: `note_flip_outcome`
+    already backs off per direction, doubling from min_dwell_s to
+    refusal_backoff_cap_s, and after refusal_degrade_after consecutive
+    refusals declares the direction unfundable and only re-probes. This test
+    pins that the combination is bounded, so the fix can land ahead of any
+    decision about the vector -- it simply does not pay off until the seam is
+    fundable, rather than doing harm.
+    """
+
+    def test_a_permanently_refused_seam_arms_a_bounded_number_of_times(self):
+        from sglang.srt.managers.phase_policy import (
+            note_flip_armed,
+            note_flip_outcome,
+        )
+
+        cfg = _cfg(
+            decode_contention=1.0,
+            min_dwell_s=3.0,
+            refusal_backoff_cap_s=60.0,
+            refusal_degrade_after=8,
+        )
+        state = PhasePolicyState()
+        now = 1000.0
+        end = now + 600.0  # ten minutes of a sustained qualifying backlog
+        arms = 0
+        while now < end:
+            inp = PhasePolicyInputs(
+                phase=PHASE_TP,
+                pending_prefill_tokens=60_000,
+                running_bs=2,
+                now=now,
+            )
+            observe_idle(state, inp)
+            d = decide(cfg, state, inp)
+            if d.direction is not None:
+                arms += 1
+                note_flip_armed(state, d, now)
+                note_flip_outcome(
+                    cfg, state, d.direction, False,
+                    "corridor guard refused the seam staging", now,
+                )
+            now += 1.0
+
+        # 8 arms to reach degradation, then one re-probe per 60 s cap over the
+        # remainder. Anything near the per-second poll rate would be the loop.
+        self.assertLessEqual(arms, 16)
+        self.assertGreaterEqual(arms, 8)
+        self.assertTrue(state.arm_degraded.get(TP_TO_PP))
+
+    def test_the_refusal_hold_is_reported_rather_than_silent(self):
+        from sglang.srt.managers.phase_policy import (
+            note_flip_armed,
+            note_flip_outcome,
+        )
+
+        cfg = _cfg(decode_contention=1.0, min_dwell_s=3.0)
+        state = PhasePolicyState()
+        now = 1000.0
+        inp = PhasePolicyInputs(
+            phase=PHASE_TP, pending_prefill_tokens=60_000, running_bs=2, now=now
+        )
+        observe_idle(state, inp)
+        d = decide(cfg, state, inp)
+        self.assertEqual(d.direction, TP_TO_PP)
+        note_flip_armed(state, d, now)
+        note_flip_outcome(cfg, state, d.direction, False, "corridor guard", now)
+
+        nxt = decide(cfg, state, PhasePolicyInputs(
+            phase=PHASE_TP, pending_prefill_tokens=60_000, running_bs=2,
+            now=now + 1.0,
+        ))
+        self.assertIsNone(nxt.direction)
+        self.assertIn("refused", nxt.reason)
+
+
 def _drive(cfg, pending, bs, phase=PHASE_TP):
     state = PhasePolicyState()
     inp = PhasePolicyInputs(
