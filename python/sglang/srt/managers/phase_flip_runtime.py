@@ -405,6 +405,24 @@ def seam_backoff_skips(consecutive_abandons: int, backoff_max: int) -> int:
     return min((1 << (k - 1)) - 1, max(0, int(backoff_max)))
 
 
+def _seam_staging_reserve_bytes(server_args) -> int:
+    """The user reserve, minus the band tolerance the seam may transiently use.
+
+    Returns BYTES. Falls back to the reserve itself if the band cannot be
+    read, which is the previous behaviour and the safe direction: a seam that
+    reserves too much refuses a flip, while one that reserves too little
+    breaches the law it is supposed to respect.
+    """
+    reserve_mib = int(getattr(server_args, "rank_user_reserve_mib", None) or 1024)
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+        floor_mib = int(round(reserve_mib * (1.0 - CORRIDOR_BAND_FRACTION)))
+    except Exception:  # pragma: no cover - the band must never break a boot
+        floor_mib = reserve_mib
+    return max(0, floor_mib) * 1024 * 1024
+
+
 def park_deadline_s() -> float:
     try:
         return float(os.environ.get(ENV_PARK_DEADLINE, DEFAULT_PARK_DEADLINE_S))
@@ -1703,11 +1721,28 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         # The flip must leave the user's reserve alone, so it takes the
         # number from the same flag the rest of the server does rather than
         # carrying a second opinion about how much VRAM is not ours.
-        staging_reserve_bytes=int(
-            (getattr(server_args, "rank_user_reserve_mib", None) or 1024)
-        )
-        * 1024
-        * 1024,
+        #
+        # #662: BUT THE SEAM IS A TRANSIENT, AND THE RESERVE IS A BAND. The
+        # operator's corridor is 1024 MiB +-20 %, and the verdict is the
+        # continuous minimum against the band FLOOR -- a cutover that dips to
+        # 819 MiB for the length of a wave walk is lawful, which is the whole
+        # reason the band was granted. Holding the CENTRE as a hard reserve
+        # during staging spends that tolerance on nothing and refuses flips
+        # the law permits.
+        #
+        # Measured on this rig 2026-08-15, GATE C, device 0:
+        #   staging 1059 MiB needed, only 1000 MiB spendable, refused by 59;
+        #   eight consecutive refusals then latched the direction "unfundable"
+        #   and the instance held in TP with 50k+ tokens pending at
+        #   1000-1600 tok/s, where the PP layout does 4000-7000.
+        # Against the band floor the same instant offers 2024 - 819 = 1205
+        # MiB and the flip funds.
+        #
+        # SCOPED TO THE SEAM DELIBERATELY. This is the staging reserve, not
+        # the corridor law: the guard still judges every ordinary allocation
+        # against the centre, and only the cutover -- bounded, unanimous and
+        # over in seconds -- may reach into the band's tolerance.
+        staging_reserve_bytes=_seam_staging_reserve_bytes(server_args),
         # Label it as OURS: a shared helper reporting under its own
         # module's name sent a live wedge into the wrong subsystem.
         collective_min=flip_collective_min,
