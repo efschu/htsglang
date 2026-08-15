@@ -1801,7 +1801,13 @@ def _measured_seam_draw_mib(scheduler: Any, server_args: Any) -> int:
         reserve = seam.read_seam_reserve(server_args, int(rank))
         if reserve is None or not reserve.active:
             return 0
-        return int(reserve.total_fixed_bytes) // (1 << 20)
+        # #678: THE DRAW OF ONE LEG, not the sum of two cross-leg maxima.
+        # total_fixed_bytes adds the arena tail (committed only on tp_to_pp)
+        # to the drafter's restore (committed only on pp_to_tp) and so prices
+        # a commit no seam makes -- 1595 MiB on this rig's rank 2 against a
+        # worst leg of 1456. The sizer reads the same accessor, so the gate
+        # and the pool cannot disagree about the number.
+        return int(reserve.arming_draw_bytes()) // (1 << 20)
     except Exception as e:  # noqa: BLE001 - sizing must not raise
         logger.warning(
             "%s could not read this rank's measured seam draw (%s); the gate "

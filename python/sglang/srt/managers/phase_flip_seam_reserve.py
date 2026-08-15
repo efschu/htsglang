@@ -194,6 +194,27 @@ class SeamReserve:
     #: of a measurement, which is what keeps it from becoming another
     #: constant carried between rigs (#656).
     corridor_shortfall_bytes: int = 0
+    #: #678: the largest commit ONE LEG actually makes, ``max`` over the two
+    #: directions of that direction's own ``arena tail + draft restore``.
+    #:
+    #: WHY THIS EXISTS SEPARATELY FROM ``total_fixed_bytes``. The two stored
+    #: terms are each a ``max`` over BOTH directions, and they are maxed by
+    #: DIFFERENT legs: on every record this rig has written, the arena tail is
+    #: committed only on ``tp_to_pp`` (entering PP refills the weights arena)
+    #: and the drafter's restore only on ``pp_to_tp`` (the drafter comes back
+    #: with the TP layout). Summing the two maxima therefore prices a seam
+    #: that commits both, which no seam does.
+    #:
+    #: Measured on rank 2, record 03d16efef3ad:
+    #:   tp_to_pp: arena tail 1456 + draft restore 0    = 1456 MiB
+    #:   pp_to_tp: arena tail 0    + draft restore 139  =  139 MiB
+    #:   total_fixed_bytes (the sum of the maxima)      = 1595 MiB
+    #: 1595 is not a draw any leg makes; 1456 is the honest worst leg.
+    #:
+    #: ZERO on a record written before this field existed, and callers fall
+    #: back to ``total_fixed_bytes`` there -- the previous arithmetic exactly,
+    #: which is what makes an old record readable.
+    worst_leg_fixed_bytes: int = 0
     provenance: str = PROVENANCE_COLD
     written_at: Optional[str] = None
     detail: str = ""
@@ -202,8 +223,25 @@ class SeamReserve:
     def total_fixed_bytes(self) -> int:
         """The seam's whole at-rest floor: the additive term plus the
         alternative one. What a caller wants when it needs ONE number for
-        "the seam costs at least this much with an empty live set"."""
+        "the seam costs at least this much with an empty live set".
+
+        NOT THE RIGHT NUMBER FOR AN ARMING FLOOR -- see
+        :attr:`worst_leg_fixed_bytes` and :meth:`arming_draw_bytes`. It is a
+        bound on what the seam machinery holds across a whole flip cycle, and
+        it is deliberately left as it was so the sizing solve that was fitted
+        against it does not move under this change.
+        """
         return max(0, int(self.arena_fixed_bytes)) + max(0, int(self.fixed_bytes))
+
+    def arming_draw_bytes(self) -> int:
+        """What ONE seam draws -- the number a gate arming per flip wants.
+
+        Falls back to :attr:`total_fixed_bytes` when the per-leg measurement
+        is absent, so a pre-#678 record is priced exactly as before rather
+        than optimistically.
+        """
+        leg = max(0, int(self.worst_leg_fixed_bytes))
+        return leg if leg > 0 else self.total_fixed_bytes
 
     @property
     def active(self) -> bool:
@@ -361,20 +399,66 @@ def _arming_margin_bytes() -> int:
     return DEFAULT_ARMING_MARGIN_MIB << 20
 
 
-def arming_floor_subtrahend_bytes(arming_floor_bytes: int) -> int:
+def seam_solve_reserved_free_bytes(reserve: "SeamReserve") -> int:
+    """Free VRAM the SEAM SOLVE already arranges to leave at rest, or 0.
+
+    #678. ``seam_allowed_tokens`` picks the largest id space with
+    ``have(T) >= need(T)``, and ``have`` was measured as
+    ``free - band_floor + rung_fund``. Targeting equality therefore sizes the
+    pool so that the resting free column is about
+    ``band_floor + seam_draw - rung_fund``. That is not a coincidence and it is
+    not slack: it is the same requirement the arming floor states, arrived at
+    from the other side.
+
+    So a boot with a MEASURED record has already paid for the arming floor
+    once, inside the solve. Charging the whole floor again on top is the
+    "double insurance paid twice" this rig measured: the unpinned solve came
+    back at 284181 tokens where the hand-pinned 550000 arms, flips 219+ times
+    and clears its guard.
+
+    ZERO WITHOUT AN ACTIVE RECORD, which is the case that must still pay in
+    full. A cold boot's solve reserves nothing for the seam, so nothing has
+    been paid and the floor is charged whole -- exactly the r2 behaviour that
+    landed every rank above its floor.
+
+    The ``rung_fund`` term is deliberately NOT added back. The solve counts the
+    KV rung as a payer at seam time while the gate wants free VRAM at arm
+    time, so a gap of that size can remain -- and covering it is precisely
+    what the pre-arm relief ladder is for. Reserving it here as well would be
+    the third payment for one requirement.
+    """
+    if not reserve.active:
+        return 0
+    return _band_floor_bytes(_corridor_law_bytes()) + reserve.arming_draw_bytes()
+
+
+def arming_floor_subtrahend_bytes(
+    arming_floor_bytes: int, already_reserved_bytes: int = 0
+) -> int:
     """KV bytes the pool must give up so the floor is actually free.
 
-    THE SIZER ALREADY HOLDS THE CORRIDOR LAW FREE, so charging the whole floor
-    would reserve the law twice and cost the pool a gigabyte it did not owe --
-    the same double-count ``required_free_bytes`` refuses with its ``max``.
-    What the pool owes is the DIFFERENCE: the per-rank free target becomes
-    ``max(law, arming floor + load margin)``, which is the user's stated rule.
+    WHAT IS ALREADY HELD FREE IS NOT OWED AGAIN. Two things can already be
+    holding memory back at this point, and the charge is the shortfall against
+    the larger of them:
 
-    Zero when the floor is already covered by the law, so a rig whose arming
-    floor sits below its corridor is sized exactly as before.
+    * the corridor LAW, which the sizer holds free on every boot. Charging the
+      whole floor over it would reserve the law twice -- the same double-count
+      ``required_free_bytes`` refuses with its ``max``.
+    * the SEAM SOLVE, on a boot with a measured record. See
+      :func:`seam_solve_reserved_free_bytes` for why that solve already leaves
+      about the arming floor free, and for the 284181-vs-550000 measurement
+      that charging it twice produced.
+
+    Zero when the floor is covered already, so a rig whose arming floor sits
+    below its corridor -- or whose seam solve already reserves more than the
+    floor -- is sized exactly as before.
+
+    ``already_reserved_bytes`` defaults to 0, which reduces to the law-only
+    baseline: the previous arithmetic, and what every caller that knows
+    nothing about a seam record should get.
     """
-    law = _corridor_law_bytes()
-    return max(0, int(arming_floor_bytes) - int(law))
+    baseline = max(int(_corridor_law_bytes()), max(0, int(already_reserved_bytes)))
+    return max(0, int(arming_floor_bytes) - baseline)
 
 
 def record_path(server_args, world_rank: int) -> str:
@@ -430,6 +514,10 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             # zero it defaults to reproduces that record's own arithmetic
             # exactly rather than guessing a split for it.
             arena_fixed_bytes=int(rec.get("arena_fixed_bytes", 0)),
+            # ABSENT ON A PRE-#678 RECORD, and 0 makes arming_draw_bytes fall
+            # back to total_fixed_bytes -- the previous pricing exactly, which
+            # is what keeps an old record readable rather than optimistic.
+            worst_leg_fixed_bytes=int(rec.get("worst_leg_fixed_bytes", 0)),
             per_row_bytes=float(rec["per_row_bytes"]),
             have_bytes=int(rec.get("have_bytes", 0)),
             id_space=int(rec.get("id_space", 0)),
@@ -454,6 +542,7 @@ def write_seam_reserve(
     have_bytes: int = 0,
     id_space: int = 0,
     arena_fixed_bytes: int = 0,
+    worst_leg_fixed_bytes: int = 0,
 ) -> Optional[str]:
     """Persist this boot's measurement for the next one. Never raises.
 
@@ -475,6 +564,7 @@ def write_seam_reserve(
     payload = {
         "fixed_bytes": int(fixed_bytes),
         "arena_fixed_bytes": int(arena_fixed_bytes),
+        "worst_leg_fixed_bytes": int(worst_leg_fixed_bytes),
         "per_row_bytes": float(per_row_bytes),
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),
@@ -833,7 +923,13 @@ def seam_adjusted_budget_bytes(
     ever REDUCE the result, which is why it is safe to apply after a min that
     already never grows it.
     """
-    charge = arming_floor_subtrahend_bytes(arming_floor_bytes)
+    # #678: the charge is the shortfall against what is ALREADY held free --
+    # the law always, and the seam solve too when a measured record made it
+    # reserve. Charging the whole floor over the solve is what collapsed the
+    # unpinned pool to 284181 tokens where 550000 arms and flips.
+    charge = arming_floor_subtrahend_bytes(
+        arming_floor_bytes, seam_solve_reserved_free_bytes(reserve)
+    )
     budget = int(budget_bytes)
     if not reserve.active or int(cell_bytes) <= 0:
         return max(0, budget - charge), 0
@@ -893,8 +989,8 @@ def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:
     return arena_tail, draft_restore
 
 
-def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
-    """(arena_fixed_bytes, fixed_bytes, per_row_bytes, detail) for this boot.
+def measure_at_rest(runtime) -> Tuple[int, int, float, str, int]:
+    """(arena_fixed, fixed, per_row, detail, worst_leg_fixed) for this boot.
 
     FOUR VALUES SINCE #656 MERGE-R9 12.4, not three. The arena tail and the
     drafter's restore used to be folded into one ``max`` here, matching the
@@ -924,6 +1020,7 @@ def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
     id_space = max(1, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
     fixed = 0
     arena_fixed = 0
+    worst_leg = 0
     per_row = 0.0
     parts = []
     for direction in ("pp_to_tp", "tp_to_pp"):
@@ -961,6 +1058,12 @@ def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
         d_per_row = float(slack) / float(id_space)
         fixed = max(fixed, d_fixed)
         arena_fixed = max(arena_fixed, arena)
+        # #678: AND THE WORST SINGLE LEG, which is not the sum of the two
+        # maxima above. Those are maxed independently and, on this rig, by
+        # DIFFERENT directions -- the arena tail only on tp_to_pp, the
+        # drafter's restore only on pp_to_tp -- so their sum prices a commit
+        # no leg makes. A gate that arms per flip needs what one flip draws.
+        worst_leg = max(worst_leg, int(arena) + int(d_fixed))
         per_row = max(per_row, d_per_row)
         mib = 1 << 20
         parts.append(
@@ -970,7 +1073,7 @@ def measure_at_rest(runtime) -> Tuple[int, int, float, str]:
             f"slack {slack / mib:.0f} MiB over an id space of {id_space} = "
             f"{d_per_row:.1f} B/token [this rank holds {int(src.num_rows)} rows]"
         )
-    return arena_fixed, fixed, per_row, "; ".join(parts)
+    return arena_fixed, fixed, per_row, "; ".join(parts), worst_leg
 
 
 def _band_floor_bytes(law_bytes: int) -> int:
@@ -1074,7 +1177,7 @@ def measure_and_record(scheduler, runtime) -> None:
     if not seam_reserve_enabled():
         return
     try:
-        arena_fixed, fixed, per_row, detail = measure_at_rest(runtime)
+        arena_fixed, fixed, per_row, detail, worst_leg = measure_at_rest(runtime)
     except Exception as e:
         logger.warning("%s could not measure the seam at rest: %s", LOG_PREFIX, e)
         return
@@ -1130,6 +1233,7 @@ def measure_and_record(scheduler, runtime) -> None:
         have_bytes=have,
         id_space=id_space,
         arena_fixed_bytes=arena_fixed,
+        worst_leg_fixed_bytes=worst_leg,
     )
     logger.info(
         "%s MEASURED (rank %d): floor %.0f MiB (%.0f arena tail ADDITIVE "

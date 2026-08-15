@@ -220,9 +220,18 @@ from sglang.srt.managers import phase_flip_spill as _spill
 
 
 class _Reserve:
-    def __init__(self, total_mib, active=True):
+    """#678: the stub carries ``arming_draw_bytes`` because the real record
+    does, and the gate reads THAT -- the draw of one leg, not the sum of two
+    cross-leg maxima. ``worst_leg_mib=None`` models a pre-#678 record, which
+    falls back to the old number."""
+
+    def __init__(self, total_mib, active=True, worst_leg_mib=None):
         self.total_fixed_bytes = total_mib << 20
+        self.worst_leg_fixed_bytes = (worst_leg_mib or 0) << 20
         self.active = active
+
+    def arming_draw_bytes(self):
+        return self.worst_leg_fixed_bytes or self.total_fixed_bytes
 
 
 def _sched(rank=1):
@@ -237,6 +246,19 @@ def test_the_measured_draw_is_read_for_this_rank(monkeypatch):
 
     monkeypatch.setattr(seam, "read_seam_reserve", lambda sa, r: _Reserve(954))
     assert _spill._measured_seam_draw_mib(_sched(), object()) == 954
+
+
+def test_the_draw_is_the_WORST_LEG_where_the_record_has_one(monkeypatch):
+    """#678. The two stored terms are maxed over both directions and, on this
+    rig, by different ones -- arena tail on tp_to_pp, draft restore on
+    pp_to_tp -- so their sum prices a commit no seam makes. rank 2 measured
+    1456 + 139 = 1595 against a worst leg of 1456."""
+    import sglang.srt.managers.phase_flip_seam_reserve as seam
+
+    monkeypatch.setattr(
+        seam, "read_seam_reserve", lambda sa, r: _Reserve(1595, worst_leg_mib=1456)
+    )
+    assert _spill._measured_seam_draw_mib(_sched(), object()) == 1456
 
 
 def test_a_cold_record_leaves_the_shipped_allowance_in_force(monkeypatch):

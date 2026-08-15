@@ -60,6 +60,7 @@ for the arming half. No CUDA, no model, no collectives.
 from __future__ import annotations
 
 import os
+import types
 import unittest
 
 from sglang.srt.managers import phase_flip_runtime as pfr
@@ -244,8 +245,15 @@ class TheDefaultIsByteIdenticalTest(unittest.TestCase):
         cell = 4096
         budget = 20 * GIB
         floor = sr.arming_floor_target_bytes()
-        charge = sr.arming_floor_subtrahend_bytes(floor)
-        self.assertGreater(charge, 0, "this rig must have a floor above the law")
+        # #678: the charge is now the shortfall against what the SEAM SOLVE
+        # already leaves free, not against the law alone. The property under
+        # test is unchanged -- whatever the charge is, the min must not throw
+        # it away -- so it is computed the same way the code computes it
+        # rather than restated as a constant.
+        charge = sr.arming_floor_subtrahend_bytes(
+            floor, sr.seam_solve_reserved_free_bytes(reserve)
+        )
+        self.assertGreater(charge, 0, "there must be a charge left to discard")
 
         without, allowed = sr.seam_adjusted_budget_bytes(budget, cell, reserve)
         self.assertLess(
@@ -588,3 +596,182 @@ class TheKnobsAreReadableTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheFloorMustNotBePaidTwiceTest(unittest.TestCase):
+    """#678: THE CALIBRATION DEFECT, and it cost 47% of the pool.
+
+    The operator's steer: the gap between the unpinned solve (284181 tokens)
+    and the empirical bound (550000, which arms, flips 219+ times and clears
+    its guard) is a CALIBRATION DEFECT, not a trade to accept. The corridor law
+    demands best-filled -- twice too much free is the same defect class as too
+    little -- and a permanent hand-pin would violate the "must work
+    automatically" order that produced the floor charge in the first place.
+
+    TWO THINGS WERE BEING PAID TWICE, and they are separable.
+
+    1. THE FLOOR ITSELF. ``seam_allowed_tokens`` targets equality on
+       ``have(T) >= need(T)`` where ``have`` was measured as
+       ``free - band_floor + rung_fund``, so a boot with a measured record is
+       already sized to leave about ``band_floor + seam_draw`` free at rest.
+       That is the arming floor, arrived at from the other side. Charging the
+       whole floor again on top is the second payment.
+
+    2. THE CROSS-LEG SUM. ``total_fixed_bytes`` adds two maxima that are taken
+       over BOTH directions and, on every record this rig has written, are
+       maxed by DIFFERENT ones -- the arena tail only on tp_to_pp, the
+       drafter's restore only on pp_to_tp. See TheDrawIsOneLegTest.
+
+    WHAT IS DELIBERATELY *NOT* RESERVED, because it is the third payment: the
+    ``rung_fund`` term. The solve counts the KV rung as a payer at seam time
+    while the gate wants free VRAM at arm time, so a gap of that size can
+    remain -- and the pre-arm relief ladder exists precisely to cover it. A
+    floor priced at worst case PLUS a ladder is double insurance paid twice.
+    """
+
+    def _warm(self):
+        return sr.SeamReserve(
+            fixed_bytes=139 * MIB,
+            arena_fixed_bytes=1456 * MIB,
+            worst_leg_fixed_bytes=1456 * MIB,
+            per_row_bytes=553.6,
+            have_bytes=1772 * MIB,
+            id_space=406600,
+            provenance=sr.PROVENANCE_STORED,
+        )
+
+    def test_a_measured_record_has_already_reserved_about_the_floor(self):
+        r = self._warm()
+        reserved = sr.seam_solve_reserved_free_bytes(r)
+        floor = sr.arming_floor_target_bytes(
+            measured_draw_mib=r.arming_draw_bytes() >> 20
+        )
+        # Within the load margin: the two are the same requirement stated
+        # twice, so what is left to charge is the margin and nothing else.
+        self.assertAlmostEqual(
+            (floor - reserved) / MIB,
+            sr._arming_margin_bytes() / MIB,
+            delta=1.0,
+        )
+
+    def test_the_charge_collapses_to_the_margin_on_a_measured_record(self):
+        r = self._warm()
+        floor = sr.arming_floor_target_bytes(
+            measured_draw_mib=r.arming_draw_bytes() >> 20
+        )
+        charge = sr.arming_floor_subtrahend_bytes(
+            floor, sr.seam_solve_reserved_free_bytes(r)
+        )
+        law_only = sr.arming_floor_subtrahend_bytes(floor)
+        self.assertLess(
+            charge,
+            law_only // 4,
+            "a record that already paid must not be charged the whole floor",
+        )
+
+    def test_a_COLD_record_still_pays_in_FULL(self):
+        """The r2 behaviour must not regress. A cold solve reserves nothing
+        for the seam, so nothing has been paid and the floor is owed whole --
+        that is the boot that landed every rank above its floor."""
+        cold = sr.SeamReserve(provenance=sr.PROVENANCE_COLD)
+        floor = sr.arming_floor_target_bytes()
+        self.assertEqual(sr.seam_solve_reserved_free_bytes(cold), 0)
+        self.assertEqual(
+            sr.arming_floor_subtrahend_bytes(
+                floor, sr.seam_solve_reserved_free_bytes(cold)
+            ),
+            sr.arming_floor_subtrahend_bytes(floor),
+        )
+
+    def test_the_baseline_never_drops_below_the_law(self):
+        """A tiny or absent reservation may not make the charge LARGER than
+        the law-only one -- the law is held free on every boot regardless."""
+        floor = sr.arming_floor_target_bytes()
+        self.assertEqual(
+            sr.arming_floor_subtrahend_bytes(floor, 1),
+            sr.arming_floor_subtrahend_bytes(floor),
+        )
+
+    def test_the_pool_recovers_most_of_what_the_double_charge_took(self):
+        """The number the operator is judging this by."""
+        r = self._warm()
+        floor = sr.arming_floor_target_bytes(
+            configured_mib=1536, measured_draw_mib=r.arming_draw_bytes() >> 20
+        )
+        double = sr.arming_floor_subtrahend_bytes(floor)
+        once = sr.arming_floor_subtrahend_bytes(
+            floor, sr.seam_solve_reserved_free_bytes(r)
+        )
+        self.assertGreater(
+            (double - once) / MIB,
+            1000,
+            "the double charge was worth more than a GiB on this rank alone",
+        )
+
+
+class TheDrawIsOneLegTest(unittest.TestCase):
+    """#678: 1595 MiB is not a draw any seam makes.
+
+    ``measure_at_rest`` keeps two maxima -- ``arena_fixed`` and ``fixed`` --
+    each taken over BOTH directions, and ``total_fixed_bytes`` sums them. On
+    every record this rig has written they are maxed by different legs:
+
+        rank 2, record 03d16efef3ad
+          tp_to_pp: arena tail 1456 + draft restore    0  = 1456 MiB
+          pp_to_tp: arena tail    0 + draft restore  139  =  139 MiB
+          total_fixed_bytes (the sum of the two maxima)   = 1595 MiB
+
+    A gate that arms per flip must be priced at what one flip draws.
+    """
+
+    def test_the_sum_of_the_maxima_overstates_the_worst_leg(self):
+        r = sr.SeamReserve(
+            fixed_bytes=139 * MIB,
+            arena_fixed_bytes=1456 * MIB,
+            worst_leg_fixed_bytes=1456 * MIB,
+        )
+        self.assertEqual(r.total_fixed_bytes >> 20, 1595)
+        self.assertEqual(r.arming_draw_bytes() >> 20, 1456)
+
+    def test_a_pre_678_record_falls_back_to_the_old_number(self):
+        """Absent means unknown, and unknown must price the OLD way rather
+        than optimistically -- an old record is readable, not cheaper."""
+        old = sr.SeamReserve(fixed_bytes=139 * MIB, arena_fixed_bytes=1456 * MIB)
+        self.assertEqual(old.worst_leg_fixed_bytes, 0)
+        self.assertEqual(old.arming_draw_bytes(), old.total_fixed_bytes)
+
+    def test_the_gate_and_the_sizer_read_the_SAME_accessor(self):
+        """Two numbers that must be equal, computed in two places, is the
+        defect 48ba9fe72a already fixed once. Pinned on the source."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_spill
+
+        guard_src = inspect.getsource(phase_flip_spill._measured_seam_draw_mib)
+        # The RETURN, not merely a mention: the prose below it explains why
+        # total_fixed_bytes is the wrong number, so a bare "not in" would fail
+        # on the explanation.
+        self.assertIn("return int(reserve.arming_draw_bytes())", guard_src)
+        self.assertNotIn("return int(reserve.total_fixed_bytes)", guard_src)
+
+    def test_a_record_round_trips_the_new_term(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            args = types.SimpleNamespace(_measured_kv_budget_registry_path=d)
+            path = sr.write_seam_reserve(
+                args,
+                2,
+                139 * MIB,
+                553.6,
+                "detail",
+                have_bytes=1772 * MIB,
+                id_space=406600,
+                arena_fixed_bytes=1456 * MIB,
+                worst_leg_fixed_bytes=1456 * MIB,
+            )
+            with open(path) as fh:
+                self.assertEqual(json.load(fh)["worst_leg_fixed_bytes"], 1456 * MIB)
+            back = sr.read_seam_reserve(args, 2)
+            self.assertEqual(back.arming_draw_bytes() >> 20, 1456)

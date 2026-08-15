@@ -5670,7 +5670,7 @@ class ModelRunnerKVCacheMixin:
             seam.arming_floor_target_bytes(
                 configured_mib=seam.configured_arming_floor_mib(self.server_args),
                 measured_draw_mib=(
-                    int(reserve.total_fixed_bytes) >> 20 if reserve.active else 0
+                    int(reserve.arming_draw_bytes()) >> 20 if reserve.active else 0
                 ),
             )
             if flips_on
