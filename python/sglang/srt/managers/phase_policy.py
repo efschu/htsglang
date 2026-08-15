@@ -214,6 +214,25 @@ ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
 # threshold further out. Making it terminate needs a deadline, i.e. a forced
 # flip, and forced flips are what raised the flip rate that killed three boots
 # with an allocation failure at the cutover seam.
+#
+# WHAT THIS COSTS, STATED PLAINLY. TP->PP arms at the effective threshold while
+# PP->TP arms at plain `flip_tokens`, so the two rules form a hysteresis band.
+# Making the gate reachable NARROWS that band -- at running_bs 2 it goes from
+# [7004, 72666] to [7004, 11673] -- and a narrower band is easier to cross
+# twice. It does not raise the rate CEILING, which `min_dwell_s` and
+# `tp_decode_floor_s` already own: a cycle cannot be shorter than
+# tp_decode_floor + seam + min_dwell + seam, ~16 s with the booted 10 / 3.2 / 3,
+# i.e. at most ~7 flips/min. But before this change the load-driven direction
+# essentially never armed, so the REALISED rate was ~0 and that ceiling was
+# theoretical; now it is reachable, and 12 flips in four minutes is the rate
+# that once killed three boots.
+#
+# So the realised rate under sustained load is a number that has to be
+# MEASURED, not argued (see acceptance GATE C in
+# /spinning/evidence-665-f1/acceptance_665_f1.py, which reports flips/min
+# alongside a 100 ms NVML corridor series). If it comes out too high, the
+# remedy is `tp_decode_floor_s` -- the knob that already exists for exactly
+# this -- and not a third mechanism bolted on here.
 DEFAULT_DECODE_CONTENTION = 0.0
 
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
