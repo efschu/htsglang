@@ -615,6 +615,8 @@ class KvBackingRelief:
         #: failed shrink is never undone (:meth:`_shrink_to`): it engages a cap
         #: and calls the dial in the SHRINK direction, which never allocates.
         self._exhausted_at_rows: Optional[int] = None
+        #: The target whose shrink returned nothing. A DEEPER ask re-arms.
+        self._exhausted_target_rows: Optional[int] = None
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
@@ -675,6 +677,7 @@ class KvBackingRelief:
             "buffers": self._buffers,
             "rows_at_boot": self._rows_at_boot,
             "exhausted_at_rows": self._exhausted_at_rows,
+            "exhausted_target_rows": getattr(self, "_exhausted_target_rows", None),
             "pool": self._pool,
         }
         state = self._pool_state.get(id(pool))
@@ -703,6 +706,7 @@ class KvBackingRelief:
         self._buffers = int(state["buffers"])
         self._rows_at_boot = state["rows_at_boot"]
         self._exhausted_at_rows = state["exhausted_at_rows"]
+        self._exhausted_target_rows = state.get("exhausted_target_rows")
 
     @property
     def _exhausted(self) -> bool:
@@ -721,6 +725,22 @@ class KvBackingRelief:
         current = int(self._current_rows())
         marker = self._exhausted_at_rows
         return marker is not None and current == int(marker)
+
+    def _declines_target(self, target: int) -> bool:
+        """Is this rank still declining, GIVEN what is being asked of it?
+
+        Exhaustion holds only while the ask is no deeper than the one that
+        failed. A target at least one release granularity below the failed one
+        is a different question and gets a different answer -- which is what
+        stops the marker from being a deadlock (see :meth:`_mark_exhausted`).
+        """
+        if not self._exhausted:
+            return False
+        failed = getattr(self, "_exhausted_target_rows", None)
+        if failed is None:
+            return True
+        granularity = max(1, self._min_release_rows())
+        return int(target) > int(failed) - granularity
 
     @_exhausted.setter
     def _exhausted(self, value: bool) -> None:
@@ -762,9 +782,26 @@ class KvBackingRelief:
             f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why})"
         )
 
-    def _mark_exhausted(self) -> None:
-        """Record the level at which the arena returned nothing."""
+    def _mark_exhausted(self, target: Optional[int] = None) -> None:
+        """Record the level AND the target at which the arena returned nothing.
+
+        BOTH, because the level alone is self-locking. A shrink that releases
+        nothing leaves the physical level exactly where it was, so a marker
+        keyed only to the level marks the level the rung is stuck at -- and the
+        only thing that could move it is a successful shrink, which the marker
+        now prevents. Measured on this rig 2026-08-15: a shrink to 94955 rows
+        returned no driver bytes at 12:16:00, and 47 seconds later the rung was
+        still declining with 72981 rows of slack in front of it, at the same
+        level, for ever.
+
+        The target is what makes the evidence falsifiable. "A shrink to X
+        returned nothing" says nothing about a shrink to something deeper than
+        X -- release is extent-granular, so a deeper ask clears extents a
+        shallower one could not touch. That is the same argument the granularity
+        rounding in :meth:`free_up_to` already makes.
+        """
         self._exhausted_at_rows = int(self._current_rows())
+        self._exhausted_target_rows = None if target is None else int(target)
 
     def _free_bytes(self) -> int:
         if self._probe is not None:
@@ -1195,17 +1232,20 @@ class KvBackingRelief:
         # worse than one that states none, because the next reader stops
         # looking.
         skipped = ""
-        if self._exhausted:
-            skipped = (
-                "this rank's arena is EXHAUSTED (a previous shrink returned no "
-                "driver bytes), so it stops asking; the deficit is not computed"
-            )
-        elif floor_rows >= current:
+        if floor_rows >= current:
             skipped = (
                 f"no slack above the live set: floor_rows {floor_rows} >= "
                 f"current {current}, so there is nothing this rung may give up"
             )
-        if floor_rows < current and not self._exhausted:
+        # THE DEFICIT IS COMPUTED BEFORE EXHAUSTION IS CONSULTED, and the order
+        # is the fix. Exhaustion used to short-circuit here, which meant the
+        # rung could not tell how DEEP an ask it was refusing -- and since a
+        # shrink that releases nothing leaves the level unchanged, the marker
+        # keyed to that level could never expire. Measured: 47 s of declining
+        # with 72981 rows of slack in front of it, at a level nothing could
+        # move. Pricing first costs one free-memory probe and makes the refusal
+        # answerable: a target deeper than the one that failed is new evidence.
+        if floor_rows < current:
             free_now = self._free_bytes()
             need = int(floor_bytes) + int(delta_bytes) + max(0, int(want_bytes))
             deficit = need - free_now - max(0, int(cheap_relief_bytes))
@@ -1217,6 +1257,15 @@ class KvBackingRelief:
                 page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
                 desire = max(floor_rows, current - rows)
                 desire = int(math.ceil(desire / page) * page)
+                if self._declines_target(desire):
+                    failed = getattr(self, "_exhausted_target_rows", None)
+                    skipped = (
+                        "this rank's arena returned no driver bytes at a "
+                        f"shrink to {failed}, and this ask ({desire}) is not "
+                        "deeper than that by a release granularity, so it is "
+                        "the same question and gets the same answer"
+                    )
+                    desire = current
         self._trace_proposal(
             current=current,
             floor_rows=floor_rows,
@@ -1496,7 +1545,7 @@ class KvBackingRelief:
             asked = int(current) - int(target)
             granularity = self._min_release_rows()
             if granularity <= 0 or asked >= granularity:
-                self._mark_exhausted()
+                self._mark_exhausted(target)
             logger.warning(
                 "%s shrink to %d rows reported %.0f MiB but the driver's free "
                 "column did not move, so this pool cannot pay: the arena has "
