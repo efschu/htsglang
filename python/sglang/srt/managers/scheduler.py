@@ -2949,6 +2949,35 @@ class Scheduler(
     #: wedged.
     BOTH_BLOCKED_EVICT_INTERVAL_S = 5.0
 
+    def _uniform_kv_available(self):
+        """Rank-uniform KV rows available, or None (#708).
+
+        The BOTH-BLOCKED decline names its binding resource from this. It must
+        be the GROUP MIN, not the local pool: every PhasePolicyInputs field is
+        replicated by contract, and under uneven DCP the local availability
+        differs per rank, so a local value would make the decline text -- and
+        anything later keyed on it -- rank-dependent. That is the #616g
+        divergence class this codebase already pays to avoid.
+        ``uniform_avail_for_evict`` is the existing accessor: it returns the
+        published group-min floor when the pools are uneven and the live local
+        value when they agree.
+
+        Returns None rather than a guess when it cannot be read, so the policy
+        can say "not measured" instead of asserting.
+        """
+        try:
+            tree = getattr(self, "tree_cache", None)
+            if tree is None:
+                return None
+            allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+            if allocator is None:
+                return None
+            from sglang.srt.mem_cache.common import uniform_avail_for_evict
+
+            return int(uniform_avail_for_evict(tree, allocator))
+        except Exception:  # noqa: BLE001 - a diagnosis must never break a round
+            return None
+
     def _apply_both_blocked_relief(self, decision, inp) -> None:
         """Actually run the eviction the BOTH-BLOCKED receipt promises.
 
@@ -8603,6 +8632,14 @@ class Scheduler(
                 or 0
             ),
             queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
+            # #708: the RANK-UNIFORM availability, so the BOTH-BLOCKED decline
+            # names its binding resource from a measurement. Group MIN via the
+            # existing accessor, never this rank's local pool -- every field on
+            # PhasePolicyInputs is replicated by contract, and a local value
+            # would make the decline rank-dependent (#616g). None when it
+            # cannot be read, which the policy reports as "not measured"
+            # instead of guessing.
+            kv_available_tokens=self._uniform_kv_available(),
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
