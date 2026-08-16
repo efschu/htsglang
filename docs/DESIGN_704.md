@@ -696,6 +696,44 @@ Note which ranks are exposed in the slice-1a pair: rank0 keeps `start=0` and
 rank2 keeps `start=48`, so only **rank1** moves its base (28 → 29). It is the
 one rank where a naive rebuild would corrupt silently.
 
+### 3.12 OPEN — the ladder enumerates rungs the canonical solver declines to price
+
+Converging on Slot-2's `solve_rung_pool` (`planner/rung_pool.py`, `949a882d17`)
+surfaced a tension worth stating plainly rather than working around.
+
+His entry point requires `reserve_for` and `rest_for` **recovered from a boot of
+that layout**, and its refusal message is explicit: the per-rank reserve tracks
+CUDA-graph capture, does **not** transfer between layouts (measured
+6.53 / 3.48 / 5.05 GiB within one boot), so it "cannot be defaulted or carried
+from another rung — supply the reserve recovered from a boot of THIS layout, or
+do not claim a pool."
+
+That is exactly right for gating a boot. But a **ladder is mostly unbooted
+rungs**: enumeration prices thousands of candidate cuts, none of which has ever
+run. So the two uses need different provenance, and conflating them would
+either paralyse the ladder or launder an extrapolation into a boot gate.
+
+The split adopted: rung pools inside the ladder are **extrapolated and
+self-labelled** (`measured=False`), and are never a boot gate. Only a cut that
+has actually booted gets a measured pool, and only a measured pool may gate a
+window. This is the same discipline already applied to the arming floor
+(§3.3's ±32,000-token uncertainty on unbooted rungs) — one more term with the
+same provenance problem.
+
+**The consequence that is not yet modelled, and it connects to §3.11.** If the
+reserve tracks CUDA-graph capture, and a rung change forces recapture (§3.11a),
+then **a rung change changes the reserve**, and therefore changes the pool — by
+a quantity my ladder currently treats as constant across rungs. At 3.48–6.53 GiB
+per rank the reserve is far too large to assume away. This does not affect the
+weights or KV movement results (both remain zero), but it does mean a rung's
+pool is not simply its free-memory arithmetic.
+
+Needed, in order: a reserve-versus-layout model (does it scale with layers per
+rank, with captured graph count, or with neither?), and until one exists, every
+extrapolated rung pool in this document carries an unquantified reserve term on
+top of its arming-floor uncertainty. Raised with Slot-2 as the natural owner of
+the pool model; it is his refusal message that identifies the term.
+
 ### 3.10 Slice 1a-i — what the timing pair can and cannot pin
 
 Landed as `planner/timing_calibration.py`, 9 hermetic tests.
