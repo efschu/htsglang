@@ -2906,7 +2906,9 @@ class Scheduler(
             return
         phase = getattr(self, "phase_flip_active_stack", None)
         self._parked_decode_verdict = (phase, bool(decode_blocked))
-        reqs = list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        reqs = (
+            list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        )
         self.parked_decode_set.sync_carriers(
             [getattr(r, "rid", "") for r in reqs],
             len(getattr(running_batch, "reqs", None) or []),
@@ -4140,8 +4142,18 @@ class Scheduler(
             return
         if min_avail is None or (max_avail is not None and min_avail >= max_avail):
             tree.uniform_avail_floor = None
+            # #694: the ledger corrects a floor; with no floor there is nothing
+            # to correct, and a value left over from a previous generation
+            # would be charged against the NEXT one.
+            tree.uniform_admitted_since_floor = 0
             return
         tree.uniform_avail_floor = int(min_avail)
+        # #694: RESET IN THE SAME CALL THAT PUBLISHES, so the ledger never
+        # outlives the number it corrects. The floor is a snapshot of this
+        # instant; allocations charged against the PREVIOUS snapshot have
+        # already been reflected in this new MIN, and charging them twice would
+        # drive the predicate to zero and evict on every allocation.
+        tree.uniform_admitted_since_floor = 0
 
     #: What a rank with no host tier contributes to the host pair, so the
     #: reduce payload width never depends on a per-rank capability. Large
@@ -5882,9 +5894,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -8700,9 +8711,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert (
-        scheduler.disaggregation_mode == DisaggregationMode.NULL
-    ), "phase flip x PD disaggregation is refused at argument time"
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
