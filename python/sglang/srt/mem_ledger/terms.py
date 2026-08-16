@@ -112,6 +112,13 @@ class Provenance(str, enum.Enum):
     """
 
     MODELED = "modeled"
+    #: #605: read from THIS boot's own flight-recorder marks -- the difference
+    #: between two phase boundaries the recorder was already taking. Not
+    #: ``MODELED`` (no formula of ours produces it) and not ``CALIBRATED`` (it
+    #: is not a cached probe under a fingerprint; it is re-measured every
+    #: boot). The kind the standing directive asks for: demand from
+    #: measurement, not estimate.
+    MEASURED = "measured"
     CALIBRATED = "calibrated"
     REPORTED = "reported"
     DECLARED = "declared"
@@ -289,7 +296,27 @@ class CardVramLedger:
     #: Items that belong on this card, are known to exist, and could be
     #: neither computed nor mechanism-bounded. A non-empty tuple is a refusal:
     #: the ledger cannot answer, so it must not pretend to.
+    #:
+    #: RESIDENT posts only, since #605's transient split. A resident post that
+    #: cannot be priced makes the card unfittable, because the bytes are
+    #: claimed for the life of the boot and the residual is computed against
+    #: them.
     unbounded: Tuple[str, ...] = ()
+    #: TRANSIENT posts that could not be summarised -- a peak above the
+    #: resident set, not a claim on the card. These do NOT block ``fits``.
+    #:
+    #: WHY THEY ARE SEPARATE, MEASURED. ``fits`` was ``not unbounded and
+    #: committed <= total``, so ONE inherently-unbounded transient made every
+    #: card unfittable forever: the load transient refuses on EVIDENCE (563
+    #: boots, a 0-18486 MiB spread, above the 50% refusal rule) and that
+    #: refusal is correct and permanent. The old flag therefore conflated "a
+    #: post could not be priced" with "the card is overcommitted", and on this
+    #: rig it could never again say a configuration fits.
+    #:
+    #: A PRECISION, NOT A WEAKENING. The refusal still travels, with its
+    #: evidence attached, and is rendered beside the verdict as a risk band.
+    #: Nothing is estimated in either bucket.
+    unbounded_transient: Tuple[str, ...] = ()
     #: Ranks placed on this card. Purely descriptive -- co-location is already
     #: priced inside the individual terms -- but a refusal has to name them.
     ranks: Tuple[int, ...] = ()
@@ -313,6 +340,9 @@ class CardVramLedger:
     def __post_init__(self) -> None:
         object.__setattr__(self, "terms", tuple(self.terms))
         object.__setattr__(self, "unbounded", tuple(self.unbounded))
+        object.__setattr__(
+            self, "unbounded_transient", tuple(self.unbounded_transient)
+        )
         object.__setattr__(self, "ranks", tuple(self.ranks))
         if self.user_reserve_mib < 0:
             raise LedgerError(
@@ -451,6 +481,7 @@ class CardVramLedger:
             "fits": self.fits,
             "ranks": list(self.ranks),
             "unbounded": list(self.unbounded),
+            "unbounded_transient": list(self.unbounded_transient),
             "terms": [t.to_json() for t in self.terms],
         }
 

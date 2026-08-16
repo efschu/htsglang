@@ -151,8 +151,24 @@ class TestMeasuredBeatsInherited(unittest.TestCase):
 
 
 class TestAWidePostRefusesRatherThanAverages(unittest.TestCase):
-    def test_a_refused_transient_band_makes_the_term_unbounded(self):
-        """0-18486 MiB is not a constant; the ledger must refuse, not average."""
+    def test_a_refused_transient_band_is_a_RISK_BAND_not_a_fit_blocker(self):
+        """0-18486 MiB is not a constant; the ledger must refuse, not average.
+
+        UPDATED BY #605's TRANSIENT SPLIT, and the refusal itself is unchanged
+        -- what moved is which bucket carries it. `fits` was
+        ``not unbounded and committed <= total``, so this ONE inherently
+        unbounded transient made every card on this rig unfittable forever,
+        conflating "a post could not be priced" with "the card is
+        overcommitted". The load transient is a peak ABOVE the resident set,
+        not a claim on the card, so it now travels in
+        ``unbounded_transient`` -- with its evidence -- and the verdict is
+        free to be about residency again.
+
+        A PRECISION, NOT A WEAKENING: nothing is estimated, the refusal still
+        carries its spread and its boot count, and
+        ``test_an_unbounded_RESIDENT_post_still_forces_fits_False`` pins that
+        the blocking direction is intact.
+        """
         ledger = _build(
             history=_history(
                 _band(
@@ -166,9 +182,53 @@ class TestAWidePostRefusesRatherThanAverages(unittest.TestCase):
             )
         )
         self.assertIsNone(_term(ledger, TERM_LOAD_TRANSIENT))
-        joined = " ".join(ledger.unbounded)
+        joined = " ".join(ledger.unbounded_transient)
         self.assertIn(TERM_LOAD_TRANSIENT, joined)
-        self.assertIn("18486", joined)
+        self.assertIn("18486", joined, "the evidence must travel with the refusal")
+        self.assertNotIn(
+            TERM_LOAD_TRANSIENT,
+            " ".join(ledger.unbounded),
+            "a transient must not sit in the bucket that blocks the verdict",
+        )
+
+    def test_a_transient_refusal_alone_does_not_make_the_card_unfittable(self):
+        ledger = _build(
+            history=_history(
+                _band(
+                    POST_LOAD_TRANSIENT,
+                    None,
+                    0,
+                    18486,
+                    refused=True,
+                    reason="spans 0-18486 MiB over 462 boots",
+                )
+            )
+        )
+        if not ledger.unbounded:
+            self.assertTrue(
+                ledger.fits,
+                "only a RESIDENT refusal may block the fit verdict: "
+                f"{ledger.unbounded_transient}",
+            )
+
+    def test_an_unbounded_RESIDENT_post_still_forces_fits_False(self):
+        """THE OTHER DIRECTION. The split must not become a way for a resident
+        post that could not be priced to slip past the verdict -- those bytes
+        are claimed for the life of the boot and the residual is computed
+        against them."""
+        import dataclasses as _dc
+
+        ledger = _build(history=_history())
+        blocked = _dc.replace(
+            ledger, unbounded=("model weights (shards) on GPU 0: synthetic refusal",)
+        )
+        self.assertFalse(blocked.fits)
+        self.assertTrue(
+            _dc.replace(ledger, unbounded=()).fits
+            or _dc.replace(ledger, unbounded=()).committed_mib
+            > _dc.replace(ledger, unbounded=()).total_mib,
+            "control: without the resident refusal the verdict is arithmetic again",
+        )
 
     def test_a_refused_residual_band_falls_back_to_the_calibration(self):
         """A refusal on a term the probe CAN measure keeps the probe's number,

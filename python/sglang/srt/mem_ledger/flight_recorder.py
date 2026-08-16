@@ -752,6 +752,130 @@ def mark_serving(
     )
 
 
+def measured_card_posts(
+    directory: Optional[str] = None, *, boot: Optional[str] = None
+) -> Dict[str, Dict[str, int]]:
+    """Per CARD, the posts this boot's own marks actually measured (#605).
+
+    ``{card_uuid: {"weights_mib": .., "capture_mib": .., "activation_upper_mib": ..}}``
+
+    NOT A NEW MEASUREMENT PATH. Every number here is a difference between two
+    marks the recorder was already taking; this function only reads them. That
+    matters because the ledger's dominant post was being MODELED from a shard
+    vector the pin path never computes, and dumped as a priced zero, while the
+    measurement of the same post sat on disk from the same boot.
+
+    A KEY IS ABSENT RATHER THAN ZERO when the marks cannot supply it. The
+    caller must refuse the term, not price a 0 -- which is the whole defect
+    this exists to end.
+
+    ``weights_mib`` is the FIRST ``pre_weight_load -> weights_loaded`` reserved
+    delta. A phase-flip boot loads three times (two layouts and the drafter);
+    the term names the model's shards, so a later pair would price the drafter
+    as the model. The other layout's bytes are the seam's arena post and are
+    not this term.
+
+    ``capture_mib`` is the first ``capture_begin -> capture_end`` reserved
+    delta. RECORDED, DELIBERATELY NOT FED, AND NOW KNOWN TO BE INCOMPLETE.
+
+    Measured on this rig 2026-08-16, across the same two marks:
+
+        card           reserved delta    NVML free drop    blind to
+        5090                184 MiB           282 MiB        98 MiB
+        3080                182 MiB           324 MiB       142 MiB
+        3080                182 MiB           324 MiB       142 MiB
+
+    So the reserved-bytes delta IS structurally blind to part of the capture
+    cost -- the private-pool/driver-side component CUDA graphs take, which an
+    OOM on this rig named directly ("71.21 MiB allocated in private pools").
+    Feeding ``capture_mib`` would under-charge by ~100-140 MiB per card, and
+    an under-charge is the direction that OOMs.
+
+    THE PROBE DOES NOT NEED REPLACING; THE FIELD DOES. The honest quantity is
+    the NVML free delta across the same boundaries, which these marks already
+    record. It is not exposed here yet because the ledger's refusal also
+    carries an inherited "3.3-3.8x low" falsification that does NOT reproduce
+    on this configuration (estimate ~192 MiB against a measured 282-324, i.e.
+    1.5-1.7x low), so that figure has to be re-derived on this regime rather
+    than carried into a new term -- the same cross-regime transfer that cost
+    #678 a whole task. One caveat travels with the NVML reading: it is
+    card-wide, so a foreign process allocating during the capture window
+    inflates it.
+
+    ``activation_upper_mib`` is an UPPER BOUND and never a point estimate:
+    ``max(allocated_peak) over the serving samples - allocated at
+    boot_complete``. The marks do not reset the peak counters -- doing so
+    would change what every other reader of those fields sees -- so what this
+    returns is a monotone envelope since process start. Upper bounds are safe
+    in the OOM direction, which is why it is usable at all; a per-phase point
+    estimate needs the reset and is future work. Absent unless SERVING samples
+    exist, because the boot marks stop at ``first_forward`` and cannot bound
+    activation under load.
+    """
+    directory = directory or os.environ.get(DIR_ENV)
+    out: Dict[str, Dict[str, int]] = {}
+    if not directory or not os.path.isdir(directory):
+        return out
+
+    def _by_card(groups):
+        rows: Dict[str, List[dict]] = {}
+        for marks in groups.values():
+            for m in marks:
+                uuid = m.get("card_uuid")
+                if uuid:
+                    rows.setdefault(str(uuid), []).append(m)
+        for marks in rows.values():
+            marks.sort(key=lambda x: x.get("wall") or 0.0)
+        return rows
+
+    try:
+        boot_rows = _by_card(read_marks(directory, boot=boot))
+    except Exception as e:  # pragma: no cover - a reader never breaks a boot
+        logger.warning("flight recorder: measured posts unreadable (%s)", e)
+        return out
+    try:
+        serving_rows = _by_card(read_serving_marks(directory, boot=boot))
+    except Exception:  # pragma: no cover
+        serving_rows = {}
+
+    def _first_delta(marks, begin: str, end: str) -> Optional[int]:
+        """Reserved bytes gained across the FIRST complete begin->end pair."""
+        opened = None
+        for m in marks:
+            phase = m.get("phase")
+            if phase == begin:
+                opened = m
+            elif phase == end and opened is not None:
+                delta = int(m.get("reserved_bytes", 0)) - int(
+                    opened.get("reserved_bytes", 0)
+                )
+                if delta > 0:
+                    return delta
+                opened = None
+        return None
+
+    for uuid, marks in boot_rows.items():
+        card: Dict[str, int] = {}
+        weights = _first_delta(marks, "pre_weight_load", "weights_loaded")
+        if weights is not None:
+            card["weights_mib"] = weights // MIB
+        capture = _first_delta(marks, "capture_begin", "capture_end")
+        if capture is not None:
+            card["capture_mib"] = capture // MIB
+        resting = None
+        for m in marks:
+            if m.get("phase") == "boot_complete":
+                resting = int(m.get("allocated_bytes", 0))
+        samples = serving_rows.get(uuid) or ()
+        if resting is not None and samples:
+            peak = max(int(x.get("allocated_peak_bytes", 0)) for x in samples)
+            if peak > resting:
+                card["activation_upper_mib"] = (peak - resting) // MIB
+        if card:
+            out[uuid] = card
+    return out
+
+
 def read_serving_marks(
     directory: str, *, boot: Optional[str] = None
 ) -> Dict[int, List[dict]]:

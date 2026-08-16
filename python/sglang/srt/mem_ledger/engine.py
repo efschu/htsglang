@@ -943,6 +943,17 @@ def build_card_ledgers(
     nccl_unresolved = [v for v in nccl_verdicts or () if not v.resolved]
     nccl_building = [v for v in nccl_verdicts or () if v.builds_nccl]
 
+    # #605: the boot's OWN measurements, read once. The recorder already marks
+    # every phase boundary; these are differences between marks, not a new
+    # probe. Used where a MODELED term cannot be computed -- never to override
+    # one that can.
+    try:
+        from sglang.srt.mem_ledger.flight_recorder import measured_card_posts
+
+        measured_posts = measured_card_posts()
+    except Exception:  # noqa: BLE001 - the ledger never fails on its instrument
+        measured_posts = {}
+
     ledgers: List[CardVramLedger] = []
     for card in cards:
         ranks = _ranks_on(card.gpu_id, rank_gpu_id)
@@ -950,26 +961,85 @@ def build_card_ledgers(
             continue
         terms: List[LedgerTerm] = []
         unbounded: List[str] = []
+        unbounded_transient: List[str] = []
+        measured = measured_posts.get(card.uuid, {})
         n_co = len(ranks)
 
         # -- weights ---------------------------------------------------------
         weights = sum(int(inputs.weight_mib_per_rank[r]) for r in ranks)
-        terms.append(
-            LedgerTerm(
-                name=TERM_WEIGHTS,
-                mib=weights,
-                provenance=Provenance.MODELED,
-                derivation=(
-                    "sum of the resident shard footprint of rank(s) "
-                    + ", ".join(
-                        f"{r}={int(inputs.weight_mib_per_rank[r])} MiB" for r in ranks
-                    )
-                    + "; the shard vector comes from the uneven-TP partition, so "
-                    "an uneven split moves this line and nothing else"
-                ),
-                inputs=("rank_tp_ratio", "model_path", "quantization", "dtype"),
+        if weights > 0:
+            terms.append(
+                LedgerTerm(
+                    name=TERM_WEIGHTS,
+                    mib=weights,
+                    provenance=Provenance.MODELED,
+                    derivation=(
+                        "sum of the resident shard footprint of rank(s) "
+                        + ", ".join(
+                            f"{r}={int(inputs.weight_mib_per_rank[r])} MiB"
+                            for r in ranks
+                        )
+                        + "; the shard vector comes from the uneven-TP partition, "
+                        "so an uneven split moves this line and nothing else"
+                    ),
+                    inputs=("rank_tp_ratio", "model_path", "quantization", "dtype"),
+                )
             )
-        )
+        elif "weights_mib" in measured:
+            # #605: THE PIN PATH LEAVES THE SHARD VECTOR AT ZERO, and this
+            # term is the ledger's dominant post. Pinning
+            # --rank-gpu-memory-mib skips the planner that computes the
+            # vector, so the modeled number is 0 and was DUMPED as a price --
+            # indistinguishable in the JSON from a model that needs no
+            # weights. Measured 2026-08-16 on the shipped recipe: 0 MiB
+            # booked against 16196 / 10194 / 10832 MiB actually loaded.
+            #
+            # The recorder was already measuring it. This reads the delta
+            # between the marks that boot took anyway.
+            terms.append(
+                LedgerTerm(
+                    name=TERM_WEIGHTS,
+                    mib=int(measured["weights_mib"]),
+                    provenance=Provenance.MEASURED,
+                    derivation=(
+                        "reserved-bytes delta across this boot's own "
+                        "pre_weight_load -> weights_loaded marks on this card "
+                        f"({int(measured['weights_mib'])} MiB). The modeled "
+                        "shard vector is all-zero because --rank-gpu-memory-mib "
+                        "pins the budget and the pin path skips the planner "
+                        "that computes it; the measurement stands in for it "
+                        "rather than a zero being priced"
+                    ),
+                    inputs=("flight_recorder marks",),
+                )
+            )
+        else:
+            # NO MARKS TO STAND IN, so the term stays exactly as it was -- a
+            # zero, and a loud one. `reconcile.completeness_failures` already
+            # names this case ("the PIN PATH signature") and `require_complete`
+            # raises on it, so the detection lives there and is not duplicated
+            # here. Adding a second refusal inside the engine would change the
+            # verdict of every card whose shard vector is legitimately absent
+            # at this point in the boot -- including the pre-planner ledger
+            # whose residual is the RANK BUDGET, not the KV pool.
+            terms.append(
+                LedgerTerm(
+                    name=TERM_WEIGHTS,
+                    mib=weights,
+                    provenance=Provenance.MODELED,
+                    derivation=(
+                        "sum of the resident shard footprint of rank(s) "
+                        + ", ".join(
+                            f"{r}={int(inputs.weight_mib_per_rank[r])} MiB"
+                            for r in ranks
+                        )
+                        + "; the shard vector comes from the uneven-TP "
+                        "partition, so an uneven split moves this line and "
+                        "nothing else"
+                    ),
+                    inputs=("rank_tp_ratio", "model_path", "quantization", "dtype"),
+                )
+            )
 
         # -- load transient, PER RANK ----------------------------------------
         # #612. An allocator peak above the resident set that no other term
@@ -985,7 +1055,7 @@ def build_card_ledgers(
             # The post is not a constant on this rig, so no constant is honest.
             # UNBOUNDED rather than the inherited 70 MiB: a falsified figure
             # that still prints is the failure mode this ledger exists to end.
-            unbounded.append(
+            unbounded_transient.append(
                 f"{TERM_LOAD_TRANSIENT} on {card.name}: the boot history "
                 f"refuses to summarise this post -- {transient_band.reason}. "
                 "The inherited "
@@ -1062,7 +1132,41 @@ def build_card_ledgers(
         missing_activation = [
             r for r in ranks if inputs.activation_mib_per_rank[r] is None
         ]
-        if missing_activation:
+        if missing_activation and "activation_upper_mib" in measured:
+            # #605(d): AN HONESTLY LABELLED UPPER BOUND, not a point estimate.
+            #
+            # The serving marks sample `allocated_peak_bytes` under real load,
+            # which is the counter `probe_activation.py` reads -- but they
+            # never RESET it, because doing so would change what every other
+            # reader of those fields sees. So this is a monotone envelope
+            # since process start, above the resting resident set, and it can
+            # only ever be too large. That direction is the safe one: an
+            # upper bound over-reserves, and the failure this ledger exists to
+            # end is the under-charge that OOMs.
+            #
+            # A per-phase point estimate needs the peak reset and is future
+            # work; until then the reserve side gets a bound it can trust
+            # rather than a refusal it cannot use.
+            terms.append(
+                LedgerTerm(
+                    name=TERM_ACTIVATION,
+                    mib=int(measured["activation_upper_mib"]),
+                    provenance=Provenance.MEASURED,
+                    derivation=(
+                        "UPPER BOUND, not a point estimate: the highest "
+                        "allocated_peak this boot's serving marks observed on "
+                        "this card, above the resident set at boot_complete "
+                        f"({int(measured['activation_upper_mib'])} MiB). The "
+                        "marks do not reset the peak counters, so this is a "
+                        "monotone envelope since process start and is "
+                        "over-stated by an unknown amount; it is used because "
+                        "over-reserving is the safe direction. A per-phase "
+                        "point estimate needs the reset (future work)"
+                    ),
+                    inputs=("flight_recorder serving marks",),
+                )
+            )
+        elif missing_activation:
             unbounded.append(
                 f"{TERM_ACTIVATION} on {card.name} (rank(s) "
                 f"{', '.join(str(r) for r in missing_activation)}): no phase "
@@ -1603,6 +1707,7 @@ def build_card_ledgers(
                 user_reserve_mib=int(user_reserve_mib.get(card.gpu_id, 0)),
                 terms=tuple(terms),
                 unbounded=tuple(unbounded),
+                unbounded_transient=tuple(unbounded_transient),
                 ranks=ranks,
             )
         )
