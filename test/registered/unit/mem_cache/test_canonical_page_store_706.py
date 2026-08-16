@@ -23,6 +23,7 @@ explicitly rather than described:
 
 import os
 import tempfile
+import time
 import unittest
 
 import torch
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     page_is_complete,
     part_path,
     read_slice,
+    sweep_partials,
     window_for_layers,
     write_slice,
 )
@@ -442,6 +444,51 @@ class TestWindowFromPools(CustomTestCase):
         host._bytes = 7 * CELL + 1
         with self.assertRaises(CanonicalPageError):
             build_page_window(ATTN_LAYER_IDS, pool, host)
+
+
+class TestPartialSweep(CustomTestCase):
+    """Orphaned partials: invisible to readers, untracked by the LRU evictor
+    (it walks ``.bin`` only), so nothing else would ever reap them."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        os.makedirs(os.path.join(self.root, "ca"), exist_ok=True)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _write(self, name, age_s=0.0):
+        path = os.path.join(self.root, "ca", name)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 16)
+        if age_s:
+            old = time.time() - age_s
+            os.utime(path, (old, old))
+        return path
+
+    def test_old_orphans_are_reaped(self):
+        part = self._write("cafe.bin.part706", age_s=7200)
+        marker = self._write("cafe.bin.slots706", age_s=7200)
+        self.assertEqual(sweep_partials(self.root, older_than_s=3600), 2)
+        self.assertFalse(os.path.exists(part))
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_live_partial_is_left_alone(self):
+        """The dangerous direction: reaping a partial another stage is still
+        filling would silently undo its work and the page would never
+        complete. Age is the only safe signal available."""
+        part = self._write("cafe.bin.part706", age_s=5)
+        self.assertEqual(sweep_partials(self.root, older_than_s=3600), 0)
+        self.assertTrue(os.path.exists(part))
+
+    def test_complete_pages_are_never_touched(self):
+        page = self._write("cafe.bin", age_s=99999)
+        self.assertEqual(sweep_partials(self.root, older_than_s=1), 1 - 1)
+        self.assertTrue(os.path.exists(page))
+
+    def test_sweeping_a_missing_directory_is_harmless(self):
+        self.assertEqual(
+            sweep_partials(os.path.join(self.root, "nope"), older_than_s=1), 0
+        )
 
 
 if __name__ == "__main__":

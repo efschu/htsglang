@@ -956,6 +956,11 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # #706: age at which an orphaned canonical partial page/blob (.part706 and
+    # its .slots706 marker) is reaped at attach. Must stay comfortably longer
+    # than the time all writers of one page need, or a live partial is reaped
+    # from under a stage that is still filling it.
+    SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S = EnvFloat(3600.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

@@ -14,17 +14,31 @@ geometry the bytes still depend on**". Make the page complete across stages and
 the suffix has nothing left to name -- which is the same argument
 ``dcp_owner_mode`` already used to drop the tp suffix on the token axis.
 
-The protocol, in one paragraph. A page file is full width from the moment it is
-created (``spec.page_bytes``, sparse until filled). A writer holds an exclusive
-lock on the page, ``pwrite``s its own slot window at the window's GLOBAL byte
-offset, and sets those bits in a small sidecar marker. The writer that sets the
-last bit fsyncs the data and ``os.replace``s the page to its final ``.bin``
-name, deleting the sidecars. Readers only ever open ``.bin``: an incomplete
-page is not "readable with holes", it is INVISIBLE, so a half-written page can
-never be served. That is the "slot bitmap + rename-on-complete" marker
+The protocol, in one paragraph. A blob file is full width from the moment it is
+created (sparse until filled). A writer takes an exclusive lock on the partial
+file, ``pwrite``s its own extents at their GLOBAL byte offsets, and records
+those ranges in a small sidecar marker. The writer that covers the last byte
+fsyncs the data and ``os.replace``s the blob to its final ``.bin`` name,
+deleting the marker. Readers only ever open ``.bin``: an incomplete blob is not
+"readable with holes", it is INVISIBLE, so a half-written one can never be
+served. That is the "completeness marker + rename-on-complete" protocol
 ``DESIGN_706_mechanism.md`` says must be built, and both halves are load
-bearing -- the bitmap is how a writer knows the page is done, the rename is how
+bearing -- the marker is how a writer knows the blob is done, the rename is how
 a reader is prevented from finding out too early.
+
+It carries two pools. The KV page (all 16 attention layers of one token) is the
+one-extent case. The GDN/mamba blob is the reason the protocol is expressed in
+extents at all: its layer cut is two disjoint ranges and its head cut is three
+sub-block ranges per layer. Both matter, because a KV-only prefix is worth
+nothing on a hybrid checkpoint -- ``batch_exists_v2`` takes the MINIMUM across
+pools, so a missing GDN blob truncates the whole KV prefix to zero
+(``test_mamba_gates_the_hit_706.py``).
+
+Completeness is tracked in BYTES rather than slots for the same reason. A KV
+layer is written by exactly one writer (kv-heads are replicated, tokens are
+sharded), but under TP one GDN layer's bytes arrive from several ranks, so a
+layer-granular marker would call a layer complete when a third of its channels
+were present.
 
 Two traps this file is shaped around:
 
@@ -57,6 +71,7 @@ import fcntl
 import logging
 import os
 import struct
+import time
 from collections.abc import Sequence
 from typing import Optional
 
@@ -75,11 +90,71 @@ logger = logging.getLogger(__name__)
 # for, so neither of these can ever be mistaken for a servable page.
 PART_SUFFIX = ".part706"
 MARKER_SUFFIX = ".slots706"
-LOCK_SUFFIX = ".lock706"
 
-_MARKER_MAGIC = b"SGL706\x01"
-# magic | num_attn_layers (u16) | cell bytes (u32) | bitmap
-_MARKER_HEADER = struct.Struct("<HI")
+_MARKER_MAGIC = b"SGL706\x02"
+# magic | total bytes (u64) | interval count (u16) | that many (start, end) pairs
+_MARKER_HEADER = struct.Struct("<QH")
+_MARKER_INTERVAL = struct.Struct("<QQ")
+
+
+@dataclasses.dataclass(frozen=True)
+class CanonicalExtentWindow:
+    """The byte ranges one rank owns inside a canonical blob.
+
+    The KV page is the one-extent case (a PP stage's attention layers are a
+    contiguous run of slots). The mamba blob is the reason this generalisation
+    exists: its layer cut is TWO disjoint ranges -- the blob is temporal state
+    for every layer followed by conv state for every layer, so a stage's layers
+    are contiguous within each region but the regions are far apart -- and under
+    TP the head cut adds three sub-block ranges per layer. Both are just extent
+    lists, so one protocol carries both.
+
+    ``extents`` are in PAYLOAD order: the caller's flat buffer is consumed
+    front to back across them, which is the order ``temporal_extents`` /
+    ``conv_extents`` / ``layer_extents`` already return.
+    """
+
+    total_bytes: int
+    extents: tuple[tuple[int, int], ...]
+    label: str = "page"
+
+    def __post_init__(self) -> None:
+        if int(self.total_bytes) <= 0:
+            raise CanonicalPageError(
+                f"a canonical {self.label} cannot be {self.total_bytes} bytes."
+            )
+        if not self.extents:
+            raise CanonicalPageError(
+                f"a rank with no bytes in the canonical {self.label} has no "
+                "window; it must not take part in the protocol at all."
+            )
+        seen: list[tuple[int, int]] = []
+        for off, length in self.extents:
+            if int(length) <= 0:
+                raise CanonicalPageError(f"extent at offset {off} has length {length}.")
+            if int(off) < 0 or int(off) + int(length) > int(self.total_bytes):
+                raise CanonicalPageError(
+                    f"extent [{off}, {int(off) + int(length)}) runs outside the "
+                    f"{self.total_bytes}-byte canonical {self.label}."
+                )
+            seen.append((int(off), int(off) + int(length)))
+        seen.sort()
+        for (a_lo, a_hi), (b_lo, _b_hi) in zip(seen, seen[1:]):
+            if b_lo < a_hi:
+                raise CanonicalPageError(
+                    f"extents [{a_lo}, {a_hi}) and [{b_lo}, ...) of this "
+                    f"{self.label} window overlap. A rank writes its OWN bytes "
+                    "once; an overlap means the cut is wrong, and the payload "
+                    "would land twice at one offset."
+                )
+
+    @property
+    def payload_bytes(self) -> int:
+        return sum(int(length) for _off, length in self.extents)
+
+    @property
+    def is_whole(self) -> bool:
+        return self.payload_bytes == int(self.total_bytes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,6 +210,14 @@ class CanonicalPageWindow:
     @property
     def is_whole_page(self) -> bool:
         return int(self.num_slots) == int(self.spec.num_attn_layers)
+
+    def as_extents(self) -> CanonicalExtentWindow:
+        """The KV window as the generic one-extent case."""
+        return CanonicalExtentWindow(
+            total_bytes=self.spec.page_bytes,
+            extents=((self.byte_offset, self.byte_length),),
+            label="KV page",
+        )
 
 
 def window_for_layers(
@@ -295,13 +378,237 @@ def build_page_window(
     return window
 
 
+def local_mamba_layer_range(
+    mamba_pool, mamba_layer_ids: Sequence[int]
+) -> tuple[int, int]:
+    """This rank's GDN layers as an index range into the model's layer list.
+
+    ``MambaPool.mamba_map`` maps GLOBAL layer id to local index, filtered by the
+    runner's own stage bounds -- the same construction that makes the KV side's
+    ``full_attention_layer_id_mapping`` global. The blob is laid out in the
+    model's mamba-layer ORDER, so what the protocol needs is the position of
+    this rank's first and last layer in that list, not the layer ids.
+
+    Refuses rather than guesses, for the reason the KV resolver refuses: a pool
+    that cannot name its global layers would deposit the right number of bytes
+    at the wrong offsets, and both regions of the blob would be wrong at once.
+    """
+    ids = [int(i) for i in mamba_layer_ids]
+    mapping = getattr(mamba_pool, "mamba_map", None)
+    if not mapping:
+        raise CanonicalPageError(
+            f"{type(mamba_pool).__name__} does not expose mamba_map, so which "
+            "GDN layers this rank holds cannot be established. The canonical "
+            "blob addresses layers globally; refusing to guess from a count."
+        )
+    local = sorted(int(i) for i in mapping.keys())
+    try:
+        positions = [ids.index(i) for i in local]
+    except ValueError as e:
+        raise CanonicalPageError(
+            f"this rank holds GDN layers {local}, which are not all in the "
+            f"model's mamba layer list {ids}."
+        ) from e
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        raise CanonicalPageError(
+            f"this rank's GDN layers map to positions {positions}, which is not "
+            "a contiguous run. A PP stage owns a contiguous layer range, so a "
+            "gap means the list is not this stage's range."
+        )
+    return positions[0], positions[-1] + 1
+
+
+def derive_mamba_blob_spec(model_config, mamba_pool, *, num_linear_layers: int):
+    """FULL (unsharded) GDN blob geometry for this checkpoint.
+
+    Reuses ``qwen3_5_mamba_spec`` -- the recipe the offline migration already
+    trusts -- rather than re-deriving the field arithmetic here. The itemsizes
+    come from the live pool, because the blob's bytes are the pool's bytes; the
+    head/channel counts come from the model config, because the canonical blob
+    is the UNSHARDED one and the pool only knows its own shard.
+
+    Raises ``CanonicalPageError`` when the config does not expose the GDN
+    fields. That refusal is deliberate and load-bearing: a hybrid model whose
+    blob cannot be made canonical must not run with canonical KV pages alone,
+    since a KV-only prefix hits nothing at all.
+    """
+    from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
+
+    text = getattr(model_config, "hf_text_config", None) or model_config
+    fields = (
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+        "linear_key_head_dim",
+        "linear_num_key_heads",
+        "linear_conv_kernel_dim",
+    )
+    missing = [f for f in fields if getattr(text, f, None) is None]
+    if missing:
+        raise CanonicalPageError(
+            f"the model config does not expose {', '.join(missing)}, so the "
+            "canonical GDN blob geometry cannot be derived. Only the Qwen3.5/3.6 "
+            "GDN family is described today (hicache_migrate.qwen3_5_mamba_spec); "
+            "another linear-attention family needs its own spec before its blob "
+            "can be made phase-uniform."
+        )
+    # Itemsizes from whichever mamba pool the caller has: the host pool exposes
+    # them directly, the device pool through the cache it mirrors. Both are the
+    # same numbers -- MambaPoolHost reads exactly these two attributes.
+    temporal_itemsize = getattr(mamba_pool, "temporal_dtype", None)
+    conv_itemsize = getattr(mamba_pool, "conv_dtype", None)
+    if temporal_itemsize is None or conv_itemsize is None:
+        cache = getattr(mamba_pool, "mamba_cache", None)
+        temporal = getattr(cache, "temporal", None)
+        conv = getattr(cache, "conv", None)
+        temporal_itemsize = getattr(temporal, "dtype", None)
+        conv_itemsize = (
+            getattr(conv[0], "dtype", None)
+            if isinstance(conv, (list, tuple)) and conv
+            else getattr(conv, "dtype", None)
+        )
+    if temporal_itemsize is None or conv_itemsize is None:
+        raise CanonicalPageError(
+            f"{type(mamba_pool).__name__} exposes neither temporal_dtype / "
+            "conv_dtype nor a mamba_cache to read them from, so the blob's byte "
+            "sizes cannot be established."
+        )
+    # MambaBlobSpec models exactly ONE conv region per layer, while
+    # MambaPoolHost.get_data_page emits one all-layers region per tensor in
+    # ``mamba_cache.conv`` (a list). Every shape builder in this tree returns a
+    # single-element list, so the two agree today -- but a config with two conv
+    # tensors would lay the page out as [temporal][conv0][conv1] and the spec
+    # would describe [temporal][conv0], silently mis-cutting every extent past
+    # the first conv region. Checked, not assumed.
+    conv_tensors = getattr(getattr(mamba_pool, "mamba_cache", None), "conv", None)
+    if isinstance(conv_tensors, (list, tuple)) and len(conv_tensors) != 1:
+        raise CanonicalPageError(
+            f"this pool carries {len(conv_tensors)} conv state tensors per "
+            "layer; the canonical blob layout describes exactly one "
+            "(MambaBlobSpec.conv_dim = key_dim*2 + value_dim). Refusing rather "
+            "than cutting extents against the wrong region boundaries."
+        )
+    # gdn_tp_units, with the runtime's own fallback: the key-head count when the
+    # model does not coarsen it (mamba_utils.Mamba2StateShape.create).
+    units = getattr(text, "gdn_tp_units", None) or int(text.linear_num_key_heads)
+    return qwen3_5_mamba_spec(
+        {f: getattr(text, f) for f in fields},
+        num_linear_layers=int(num_linear_layers),
+        units=int(units),
+        temporal_itemsize=int(temporal_itemsize.itemsize),
+        conv_itemsize=int(conv_itemsize.itemsize),
+    )
+
+
+def _merge_sequential(
+    extents,
+) -> tuple[tuple[int, int], ...]:
+    """Merge ranges that are adjacent in BOTH payload order and target offset.
+
+    Order-preserving on purpose: a global sort-merge could reorder the payload,
+    and the payload is consumed front to back across the extents. Merging only
+    what is already consecutive keeps the write count down (three PP stages
+    write two ranges each instead of dozens) without touching which byte goes
+    where.
+    """
+    out: list[list[int]] = []
+    for off, length in extents:
+        if out and out[-1][0] + out[-1][1] == int(off):
+            out[-1][1] += int(length)
+        else:
+            out.append([int(off), int(length)])
+    return tuple((off, length) for off, length in out)
+
+
+def build_mamba_window(
+    spec, *, ratios: Sequence[int], rank: int, layer_lo: int, layer_hi: int
+) -> CanonicalExtentWindow:
+    """This rank's window in the canonical ``{hash}.mamba`` blob.
+
+    Composed from the cut definitions that already exist (``hicache_migrate``),
+    never re-derived:
+
+    * ``temporal_extents`` -- one range per layer, this rank's head slice;
+    * ``conv_extents`` -- THREE ranges per layer, one per ``[q | k | v]``
+      sub-block, each sharded independently by heads. A rank's conv shard is
+      those three concatenated, not a flat slice of ``conv_dim``; flattening it
+      is the documented way to get the wrong channels.
+
+    The LAYER axis (what PP shards) is then a selection over those per-layer
+    entries, which is why the two axes compose without either knowing about the
+    other: the head cut decides the SIZE of a layer's ranges, the layer cut
+    decides WHICH layers' ranges are taken.
+
+    With full heads (``ratios=[1]``) the result merges back to exactly
+    ``layer_extents(spec, layer_lo, layer_hi)`` -- two disjoint ranges, temporal
+    and conv -- and a test pins that equality, so this composition cannot drift
+    from the definition it is supposed to reuse.
+    """
+    from sglang.srt.mem_cache.hicache_migrate import conv_extents, temporal_extents
+
+    lo, hi = int(layer_lo), int(layer_hi)
+    if not 0 <= lo < hi <= int(spec.num_layers):
+        raise CanonicalPageError(
+            f"mamba layer range [{lo}, {hi}) is not within "
+            f"[0, {spec.num_layers}) -- a stage cannot own layers the blob does "
+            "not describe."
+        )
+    temporal = temporal_extents(spec, list(ratios), int(rank))[lo:hi]
+    conv = conv_extents(spec, list(ratios), int(rank))[3 * lo : 3 * hi]
+    window = CanonicalExtentWindow(
+        total_bytes=spec.total_bytes,
+        extents=_merge_sequential(list(temporal) + list(conv)),
+        label="mamba blob",
+    )
+    # The size this rank's own blob has, according to the spec API itself. If
+    # the composition above and the spec disagree, the geometry-free key would
+    # name bytes of a different shape -- so it is checked, not assumed.
+    own = spec.shard_for_rank(list(ratios), int(rank)).for_layers(lo, hi)
+    if window.payload_bytes != own.total_bytes:
+        raise CanonicalPageError(
+            f"composed mamba window is {window.payload_bytes} bytes but this "
+            f"rank's own blob is {own.total_bytes} bytes "
+            f"(ratios={list(ratios)}, rank={rank}, layers=[{lo}, {hi}))."
+        )
+    return window
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtentWriteResult:
+    """Outcome of depositing one window into a canonical blob."""
+
+    completed: bool  # this write covered the last missing byte
+    already_complete: bool  # the blob was whole before this call
+    coverage: tuple[tuple[int, int], ...]  # byte ranges present afterwards
+
+    @property
+    def missing_bytes(self) -> int:
+        total = self.coverage[-1][1] if self.coverage else 0
+        return max(0, total - sum(hi - lo for lo, hi in self.coverage))
+
+
 @dataclasses.dataclass(frozen=True)
 class SliceWriteResult:
-    """Outcome of depositing one window into a page."""
+    """Outcome of depositing one window into a KV page."""
 
     completed: bool  # this write set the last missing slot
     already_complete: bool  # the page was whole before this call
     missing: tuple[int, ...]  # slots still absent afterwards
+
+
+def _missing_slots_from_coverage(
+    coverage: Sequence[tuple[int, int]], spec: CanonicalPageSpec
+) -> tuple[int, ...]:
+    """KV slots not FULLY covered, expressed through Slot-3's contract object.
+
+    Fully is the operative word: a slot whose bytes are partly present is
+    missing, exactly as it would be under a per-slot bitmap.
+    """
+    completeness = PageCompleteness(spec)
+    for slot in range(int(spec.num_attn_layers)):
+        lo, hi = spec.layer_span(slot)
+        if any(c_lo <= lo and hi <= c_hi for c_lo, c_hi in coverage):
+            completeness.mark(slot)
+    return completeness.missing()
 
 
 def part_path(final_path: str) -> str:
@@ -312,47 +619,120 @@ def marker_path(final_path: str) -> str:
     return final_path + MARKER_SUFFIX
 
 
-def lock_path(final_path: str) -> str:
-    return final_path + LOCK_SUFFIX
+def sweep_partials(root_dir: str, *, older_than_s: float) -> int:
+    """Reap orphaned ``.part706`` / ``.slots706`` files. Returns the count.
 
+    A partial blob is invisible to every reader and untracked by the LRU
+    evictor, which walks ``.bin`` only -- so a page whose other writers never
+    arrive (a stage that crashed, a prefix evicted from the device tier before
+    the last stage got to it) leaves a full-width sparse file with no owner.
+    That is the same lifecycle gap today's ``.tmp.`` staging files have, and the
+    same answer: reap by age, never by guessing intent.
 
-def _bitmap_bytes(num_slots: int) -> int:
-    return (int(num_slots) + 7) // 8
-
-
-def _encode_marker(spec: CanonicalPageSpec, written: set[int]) -> bytes:
-    bitmap = bytearray(_bitmap_bytes(spec.num_attn_layers))
-    for slot in written:
-        bitmap[int(slot) // 8] |= 1 << (int(slot) % 8)
-    return (
-        _MARKER_MAGIC
-        + _MARKER_HEADER.pack(
-            int(spec.num_attn_layers), int(spec.kv_bytes_per_token_per_attn_layer)
+    ``older_than_s`` must be comfortably longer than the time all writers of one
+    page need. Anything younger is presumed live and left alone -- reaping a
+    partial another stage is still filling would silently undo its work, and the
+    page would simply never complete.
+    """
+    cutoff = time.time() - float(older_than_s)
+    reaped = 0
+    for path in _iter_partial_files(root_dir):
+        try:
+            if os.stat(path).st_mtime >= cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        _unlink_quiet(path)
+        reaped += 1
+    if reaped:
+        logger.info(
+            "Reaped %d orphaned canonical partial file(s) older than %.0fs in %s.",
+            reaped,
+            older_than_s,
+            root_dir,
         )
-        + bytes(bitmap)
-    )
+    return reaped
 
 
-def _decode_marker(blob: bytes, spec: CanonicalPageSpec) -> Optional[set[int]]:
-    """Slots recorded as present, or ``None`` when the marker is unusable.
+def _iter_partial_files(root_dir: str):
+    """Every partial/marker file under the store, shard directories included."""
+    try:
+        with os.scandir(root_dir) as it:
+            top = list(it)
+    except FileNotFoundError:
+        return
+    for entry in top:
+        if entry.is_dir():
+            try:
+                with os.scandir(entry.path) as shard_it:
+                    children = list(shard_it)
+            except OSError:
+                continue
+        else:
+            children = [entry]
+        for child in children:
+            if child.name.endswith((PART_SUFFIX, MARKER_SUFFIX)):
+                yield child.path
 
-    ``None`` covers a truncated marker and a marker written under a DIFFERENT
-    page geometry. Both mean the partial page on disk cannot be reasoned about,
-    and since a page is only ever a cache entry the answer is to discard it and
-    start again -- loudly, never by reinterpreting foreign bytes.
+
+def _merge(intervals: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Sorted, non-overlapping, adjacency-merged coverage."""
+    out: list[list[int]] = []
+    for lo, hi in sorted((int(a), int(b)) for a, b in intervals):
+        if out and lo <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return tuple((lo, hi) for lo, hi in out)
+
+
+def _covers(coverage: Sequence[tuple[int, int]], total_bytes: int) -> bool:
+    return len(coverage) == 1 and coverage[0] == (0, int(total_bytes))
+
+
+def _encode_marker(total_bytes: int, coverage: Sequence[tuple[int, int]]) -> bytes:
+    """Completeness as BYTE coverage, not a slot bitmap.
+
+    The KV page could be tracked by layer slot, because its kv-heads are
+    replicated and token-sharded -- a layer is written by exactly one writer, so
+    the layer is the atom. The mamba blob cannot: under TP its state is
+    HEAD-sharded, so one layer's bytes arrive from several ranks, and a
+    layer-granular marker would call a layer complete when a third of its
+    channels were present. Bytes are the only unit both axes agree on, so both
+    pools use it and there is one marker format rather than one per pool.
+    """
+    merged = _merge(coverage)
+    body = b"".join(_MARKER_INTERVAL.pack(lo, hi) for lo, hi in merged)
+    return _MARKER_MAGIC + _MARKER_HEADER.pack(int(total_bytes), len(merged)) + body
+
+
+def _decode_marker(
+    blob: bytes, total_bytes: int
+) -> Optional[tuple[tuple[int, int], ...]]:
+    """Recorded coverage, or ``None`` when the marker is unusable.
+
+    ``None`` covers a truncated marker and one written for a blob of a
+    DIFFERENT size, i.e. under a different geometry. Both mean the partial file
+    on disk cannot be reasoned about, and since it is only ever a cache entry
+    the answer is to discard it and start again -- loudly, never by
+    reinterpreting foreign bytes.
     """
     head = len(_MARKER_MAGIC) + _MARKER_HEADER.size
     if len(blob) < head or blob[: len(_MARKER_MAGIC)] != _MARKER_MAGIC:
         return None
-    num_slots, cell = _MARKER_HEADER.unpack(blob[len(_MARKER_MAGIC) : head])
-    if num_slots != int(spec.num_attn_layers) or cell != int(
-        spec.kv_bytes_per_token_per_attn_layer
-    ):
+    recorded_total, count = _MARKER_HEADER.unpack(blob[len(_MARKER_MAGIC) : head])
+    if recorded_total != int(total_bytes):
         return None
-    bitmap = blob[head:]
-    if len(bitmap) != _bitmap_bytes(num_slots):
+    body = blob[head:]
+    if len(body) != count * _MARKER_INTERVAL.size:
         return None
-    return {slot for slot in range(num_slots) if bitmap[slot // 8] & (1 << (slot % 8))}
+    intervals = []
+    for i in range(count):
+        lo, hi = _MARKER_INTERVAL.unpack_from(body, i * _MARKER_INTERVAL.size)
+        if not 0 <= lo < hi <= int(total_bytes):
+            return None
+        intervals.append((lo, hi))
+    return _merge(intervals)
 
 
 def _as_bytes(payload: torch.Tensor) -> memoryview:
@@ -361,30 +741,56 @@ def _as_bytes(payload: torch.Tensor) -> memoryview:
     return memoryview(payload.contiguous().numpy()).cast("B")
 
 
-class _PageLock:
-    """Exclusive lock over one page, held across processes.
+class PageComplete(Exception):
+    """Raised inside the lock when another writer finished the blob first."""
 
-    The three PP stages are three PROCESSES writing disjoint ranges of one file
-    plus a shared marker; the read-modify-write of that marker is what has to be
-    serialised, and a lock file is the only primitive all three share. The lock
-    is per PAGE, so writers of different pages never wait on each other.
+
+def _open_part_locked(part: str, final_path: str) -> int:
+    """Open the partial blob and hold an exclusive lock on it.
+
+    The lock IS the ``.part706`` file rather than a separate ``.lock`` file, and
+    that is a correctness-shaped choice, not a tidiness one: a dedicated lock
+    file has no lifecycle -- nothing may delete it while another process might
+    be about to lock it -- so it accumulates one inode per page, forever. The
+    partial file already has a lifecycle: the rename that publishes the page
+    takes its name away.
+
+    The cost is the classic lock-the-file-you-opened race: a writer can be
+    granted a lock on an inode that has since been renamed to the final name, or
+    replaced. Both are detected -- the final path is re-checked, and the fd's
+    inode is compared against the path's -- and the answer is to retry, never to
+    write into a file that is no longer the one this path names.
+
+    Raises ``PageComplete`` when the blob was finished while waiting.
     """
-
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._fd = -1
-
-    def __enter__(self) -> _PageLock:
-        self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *exc) -> None:
+    for _attempt in range(8):
+        fd = os.open(part, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if os.path.exists(final_path):
+            _close_unlocked(fd)
+            raise PageComplete()
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._fd)
-            self._fd = -1
+            on_disk = os.stat(part).st_ino
+        except FileNotFoundError:
+            _close_unlocked(fd)
+            continue
+        if on_disk == os.fstat(fd).st_ino:
+            return fd
+        # The file at this path is no longer the one we locked: another writer
+        # renamed or replaced it. Drop the stale inode and take the new one.
+        _close_unlocked(fd)
+    raise CanonicalPageError(
+        f"could not obtain a stable lock on {os.path.basename(part)} after 8 "
+        "attempts; the partial page is being replaced faster than it can be "
+        "written."
+    )
+
+
+def _close_unlocked(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _unlink_quiet(path: str) -> None:
@@ -395,6 +801,108 @@ def _unlink_quiet(path: str) -> None:
             logger.warning("Could not remove %s: %s", path, e)
 
 
+def write_extents(
+    final_path: str,
+    window: CanonicalExtentWindow,
+    payload: torch.Tensor,
+    *,
+    fsync: bool = True,
+) -> ExtentWriteResult:
+    """Deposit one window's bytes into the canonical blob at ``final_path``.
+
+    The single write path for every pool. Returns without touching anything when
+    the blob is already complete: blobs are content-addressed, so a complete one
+    already holds exactly these bytes and rewriting them would only risk tearing
+    a file a reader is using.
+    """
+    data = _as_bytes(payload)
+    if data.nbytes != window.payload_bytes:
+        raise CanonicalPageError(
+            f"this {window.label} window expects {window.payload_bytes} bytes "
+            f"across {len(window.extents)} extent(s), got {data.nbytes}. A rank "
+            "whose shard size differs from the canonical form is not writing "
+            "that form -- refusing rather than padding."
+        )
+
+    if os.path.exists(final_path):
+        return ExtentWriteResult(
+            completed=False, already_complete=True, coverage=((0, window.total_bytes),)
+        )
+
+    part = part_path(final_path)
+    marker = marker_path(final_path)
+    try:
+        fd = _open_part_locked(part, final_path)
+    except PageComplete:
+        return ExtentWriteResult(
+            completed=False,
+            already_complete=True,
+            coverage=((0, window.total_bytes),),
+        )
+    try:
+        covered: tuple[tuple[int, int], ...] = ()
+        fresh = os.fstat(fd).st_size == 0
+        if not fresh:
+            try:
+                with open(marker, "rb") as f:
+                    decoded = _decode_marker(f.read(), window.total_bytes)
+            except FileNotFoundError:
+                decoded = None
+            if decoded is None:
+                logger.warning(
+                    "Resetting partial canonical %s %s: its completeness marker "
+                    "is missing or describes a different geometry.",
+                    window.label,
+                    os.path.basename(part),
+                )
+                # Reset in place rather than unlink: the lock lives on this
+                # inode, so replacing the file would hand a waiter a lock on a
+                # file nobody else can see.
+                os.ftruncate(fd, 0)
+            else:
+                covered = decoded
+
+        if os.fstat(fd).st_size != window.total_bytes:
+            # Full width from creation: every writer addresses absolute offsets,
+            # so the file cannot grow into its own layout.
+            os.ftruncate(fd, window.total_bytes)
+        taken = 0
+        for off, length in window.extents:
+            os.pwrite(fd, data[taken : taken + length], off)
+            taken += length
+        # Re-writing bytes this rank already wrote is legitimate (a crashed run
+        # resumes; the bytes are content-addressed and identical), which is why
+        # coverage is a union rather than a strict claim.
+        coverage = _merge(
+            list(covered) + [(off, off + length) for off, length in window.extents]
+        )
+
+        if not _covers(coverage, window.total_bytes):
+            with open(marker, "wb") as f:
+                f.write(_encode_marker(window.total_bytes, coverage))
+            return ExtentWriteResult(
+                completed=False, already_complete=False, coverage=coverage
+            )
+
+        if fsync:
+            # The blob becomes visible by rename, so the DATA must reach the
+            # medium before the name does; otherwise a crash can publish a
+            # complete-looking file with unwritten holes. The directory entry
+            # itself is deliberately not synced: losing the rename costs a cache
+            # miss, which is free.
+            os.fsync(fd)
+        # Publish while still holding the lock: a waiter that wakes after this
+        # finds the final path present and returns "already complete" without
+        # touching the inode it locked.
+        os.replace(part, final_path)
+        _unlink_quiet(marker)
+        return ExtentWriteResult(
+            completed=True, already_complete=False, coverage=coverage
+        )
+    finally:
+        _close_unlocked(fd)
+
+
 def write_slice(
     final_path: str,
     window: CanonicalPageWindow,
@@ -402,110 +910,32 @@ def write_slice(
     *,
     fsync: bool = True,
 ) -> SliceWriteResult:
-    """Deposit one window's bytes into the canonical page at ``final_path``.
+    """The KV page's view of ``write_extents``: slots instead of byte ranges."""
+    outcome = write_extents(final_path, window.as_extents(), payload, fsync=fsync)
+    return SliceWriteResult(
+        completed=outcome.completed,
+        already_complete=outcome.already_complete,
+        missing=_missing_slots_from_coverage(outcome.coverage, window.spec),
+    )
 
-    Returns without touching anything when the page is already complete: pages
-    are content-addressed, so a complete page already holds exactly these bytes
-    and rewriting them would only risk tearing a page a reader is using.
+
+def read_extents(
+    final_path: str, window: CanonicalExtentWindow, out: torch.Tensor
+) -> bool:
+    """Read this window's extents out of a COMPLETE canonical blob.
+
+    False means "not served": the file does not exist, or exists only as an
+    incomplete ``.part706``. There is no third answer -- a partial blob is never
+    handed back, whatever the caller happens to need, because a page missing
+    another stage's layers (or a GDN blob missing another rank's channels) is a
+    prefix nobody can continue from.
     """
-    spec = window.spec
-    data = _as_bytes(payload)
-    if data.nbytes != window.byte_length:
-        raise CanonicalPageError(
-            f"window [{window.first_slot}, {window.first_slot + window.num_slots}) "
-            f"expects {window.byte_length} bytes, got {data.nbytes}. A rank whose "
-            "per-layer KV size differs from the page spec is not writing the "
-            "canonical form -- refusing rather than padding."
-        )
-
-    if os.path.exists(final_path):
-        return SliceWriteResult(completed=False, already_complete=True, missing=())
-
-    part = part_path(final_path)
-    marker = marker_path(final_path)
-    with _PageLock(lock_path(final_path)):
-        # Re-check under the lock: another stage may have completed the page
-        # between the check above and the lock being granted.
-        if os.path.exists(final_path):
-            return SliceWriteResult(completed=False, already_complete=True, missing=())
-
-        written: set[int] = set()
-        if os.path.exists(part):
-            try:
-                with open(marker, "rb") as f:
-                    decoded = _decode_marker(f.read(), spec)
-            except FileNotFoundError:
-                decoded = None
-            if decoded is None:
-                logger.warning(
-                    "Discarding partial canonical page %s: its completeness "
-                    "marker is missing or describes a different page geometry.",
-                    os.path.basename(part),
-                )
-                _unlink_quiet(part)
-            else:
-                written = decoded
-
-        fd = os.open(part, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            if os.fstat(fd).st_size != spec.page_bytes:
-                # Full width from creation: every writer addresses absolute slot
-                # offsets, so the file cannot grow into its own layout.
-                os.ftruncate(fd, spec.page_bytes)
-            os.pwrite(fd, data, window.byte_offset)
-
-            completeness = PageCompleteness(spec)
-            for slot in written:
-                completeness.mark(slot)
-            for slot in window.slots:
-                # Re-writing a slot this rank already wrote is legitimate (a
-                # crashed run resumes; the bytes are content-addressed and
-                # identical). ``PageCompleteness`` treats a repeat as a layout
-                # bug, which is the right rule INSIDE one process and the wrong
-                # one across a restart, so the persisted marker is idempotent
-                # and the strict object is only fed slots it has not seen.
-                if slot not in written:
-                    completeness.mark(slot)
-            now_written = set(written) | set(window.slots)
-            missing = completeness.missing()
-
-            if not completeness.is_complete():
-                with open(marker, "wb") as f:
-                    f.write(_encode_marker(spec, now_written))
-                return SliceWriteResult(
-                    completed=False, already_complete=False, missing=missing
-                )
-
-            if fsync:
-                # The page becomes visible by rename, so the DATA must reach the
-                # medium before the name does; otherwise a crash can publish a
-                # complete-looking page with unwritten holes. The directory
-                # entry itself is deliberately not synced: losing the rename
-                # costs a cache miss, which is free.
-                os.fsync(fd)
-        finally:
-            os.close(fd)
-
-        os.replace(part, final_path)
-        _unlink_quiet(marker)
-        return SliceWriteResult(completed=True, already_complete=False, missing=())
-
-
-def read_slice(final_path: str, window: CanonicalPageWindow, out: torch.Tensor) -> bool:
-    """Read this window's slots out of a COMPLETE canonical page.
-
-    False means "not served": the page does not exist, or exists only as an
-    incomplete ``.part706``. There is no third answer -- a partial page is never
-    handed back, whatever slots the caller happens to need, because a page that
-    is missing another stage's layers is a prefix nobody can continue from.
-    """
-    expected = window.byte_length
+    expected = window.payload_bytes
     buf = _as_bytes(out)
     if buf.nbytes != expected:
         raise CanonicalPageError(
-            f"read target holds {buf.nbytes} bytes but window "
-            f"[{window.first_slot}, {window.first_slot + window.num_slots}) is "
-            f"{expected} bytes."
+            f"read target holds {buf.nbytes} bytes but this {window.label} "
+            f"window is {expected} bytes."
         )
     try:
         fd = os.open(final_path, os.O_RDONLY)
@@ -513,33 +943,44 @@ def read_slice(final_path: str, window: CanonicalPageWindow, out: torch.Tensor) 
         return False
     try:
         size = os.fstat(fd).st_size
-        if size != window.spec.page_bytes:
+        if size != window.total_bytes:
             logger.warning(
-                "Canonical page %s is %d bytes, expected %d; refusing to cut a "
-                "slice out of a page of the wrong width.",
+                "Canonical %s %s is %d bytes, expected %d; refusing to cut a "
+                "slice out of a file of the wrong width.",
+                window.label,
                 os.path.basename(final_path),
                 size,
-                window.spec.page_bytes,
+                window.total_bytes,
             )
             return False
-        got = 0
-        while got < expected:
-            chunk = os.pread(fd, expected - got, window.byte_offset + got)
-            if not chunk:
-                break
-            buf[got : got + len(chunk)] = chunk
-            got += len(chunk)
+        taken = 0
+        for off, length in window.extents:
+            got = 0
+            while got < length:
+                chunk = os.pread(fd, length - got, off + got)
+                if not chunk:
+                    break
+                buf[taken + got : taken + got + len(chunk)] = chunk
+                got += len(chunk)
+            if got != length:
+                logger.warning(
+                    "Short read of canonical %s %s: %d of %d bytes at offset %d.",
+                    window.label,
+                    os.path.basename(final_path),
+                    got,
+                    length,
+                    off,
+                )
+                return False
+            taken += length
     finally:
         os.close(fd)
-    if got != expected:
-        logger.warning(
-            "Short read of canonical page %s: %d of %d bytes.",
-            os.path.basename(final_path),
-            got,
-            expected,
-        )
-        return False
     return True
+
+
+def read_slice(final_path: str, window: CanonicalPageWindow, out: torch.Tensor) -> bool:
+    """The KV page's view of ``read_extents``."""
+    return read_extents(final_path, window.as_extents(), out)
 
 
 def page_is_complete(final_path: str) -> bool:
@@ -554,14 +995,22 @@ def missing_slots(final_path: str, spec: CanonicalPageSpec) -> tuple[int, ...]:
     """
     if os.path.exists(final_path):
         return ()
+    coverage = recorded_coverage(final_path, spec.page_bytes)
+    if coverage is None:
+        return tuple(range(int(spec.num_attn_layers)))
+    return _missing_slots_from_coverage(coverage, spec)
+
+
+def recorded_coverage(
+    final_path: str, total_bytes: int
+) -> Optional[tuple[tuple[int, int], ...]]:
+    """Byte ranges an INCOMPLETE blob already holds, or ``None`` if unknown.
+
+    ``None`` means there is nothing usable to reason about -- no marker, a
+    truncated one, or one written for a different geometry.
+    """
     try:
         with open(marker_path(final_path), "rb") as f:
-            decoded = _decode_marker(f.read(), spec)
+            return _decode_marker(f.read(), int(total_bytes))
     except FileNotFoundError:
-        decoded = None
-    if decoded is None:
-        return tuple(range(int(spec.num_attn_layers)))
-    completeness = PageCompleteness(spec)
-    for slot in decoded:
-        completeness.mark(slot)
-    return completeness.missing()
+        return None

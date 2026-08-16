@@ -17,7 +17,10 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.canonical_page_store import CanonicalPageWindow
+    from sglang.srt.mem_cache.canonical_page_store import (
+        CanonicalExtentWindow,
+        CanonicalPageWindow,
+    )
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,14 @@ class HiCacheStorageConfig:
     # as well -- the same argument dcp_owner_mode above already made on the token
     # axis. The key then carries content alone: model identity and token hash.
     canonical_kv_page: Optional[CanonicalPageWindow] = None
+    # #706 slice 2: this rank's window in the canonical {hash}.mamba blob, on
+    # the same protocol. Required whenever the model HAS GDN/mamba layers and
+    # the canonical page is active, because a KV-only prefix is worth nothing:
+    # batch_exists_v2 takes the MINIMUM across pools and the mamba pool is
+    # registered TRAILING_PAGES, so a missing blob truncates the whole KV
+    # prefix to zero (test_mamba_gates_the_hit_706.py), and the device-side
+    # MambaRadixCache match advances only at nodes that carry mamba state.
+    canonical_mamba_blob: Optional[CanonicalExtentWindow] = None
 
 
 @dataclass
@@ -517,6 +528,22 @@ class HiCacheFile(HiCacheStorage):
         # #706: this rank's window in the canonical (full-width) page. None on
         # every default path, and the ONLY thing that moves a key.
         self.canonical_kv_page = getattr(storage_config, "canonical_kv_page", None)
+        self.canonical_mamba_blob = getattr(
+            storage_config, "canonical_mamba_blob", None
+        )
+        # Precomputed once: the KV page's generic (one-extent) form, so the hot
+        # path does not rebuild and revalidate it per page.
+        self._canonical_kv_extents = (
+            self.canonical_kv_page.as_extents()
+            if self.canonical_kv_page is not None
+            else None
+        )
+        if self.canonical_mamba_blob is not None and self.canonical_kv_page is None:
+            raise NotImplementedError(
+                "The #706 canonical mamba blob was configured without the "
+                "canonical KV page. The two travel together: a neutral GDN blob "
+                "beside pp-suffixed KV pages still misses across the flip."
+            )
         if self.canonical_kv_page is not None and attn_cp_size > 1:
             raise NotImplementedError(
                 "The #706 canonical KV page and NSA context parallel both claim "
@@ -568,6 +595,24 @@ class HiCacheFile(HiCacheStorage):
         # Shard directories created so far (see page_shard): keeps the write path
         # to one makedirs per shard instead of one per page.
         self._known_shards: set[str] = set()
+
+        # #706: orphaned partials are invisible to readers AND untracked by the
+        # LRU evictor (it walks .bin only), so nothing else would ever reap a
+        # page whose remaining writers never arrived. One sweep at attach, by
+        # age, on the same principle as the .tmp. staging files: never reap
+        # something a live writer might still be filling.
+        self._partial_ttl_s = float(
+            envs.SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S.get() or 3600.0
+        )
+        if self.canonical_kv_page is not None or self.canonical_mamba_blob is not None:
+            from sglang.srt.mem_cache.canonical_page_store import sweep_partials
+
+            try:
+                sweep_partials(self.file_path, older_than_s=self._partial_ttl_s)
+            except OSError as e:
+                # A store that cannot be swept is still usable; orphans only
+                # cost disk, and the free-space watchdog still sees them.
+                logger.warning("Could not sweep canonical partial files: %s", e)
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -649,6 +694,17 @@ class HiCacheFile(HiCacheStorage):
             )
         return f"{tensor_path}.tmp.{uuid.uuid4().hex[:min(16, room)]}"
 
+    def _is_draft_key(self, key: str) -> bool:
+        """Draft pages, excluded from every neutralisation rule BY NAME.
+
+        Draft KV is the exact MIRROR of target KV: head-SHARDED and
+        token-COMPLETE, written by every rank under its own suffix. No suffix
+        rule can neutralise that, so the draft pool starts cold after a flip or
+        a reboot -- the designed shape, and the reason a cross-phase hit is
+        expected to be PARTIAL rather than total.
+        """
+        return key.endswith(f".{PoolName.DRAFT}")
+
     def _is_shared_kv_key(self, key: str) -> bool:
         """True for the keys whose bytes are geometry-independent.
 
@@ -673,10 +729,26 @@ class HiCacheFile(HiCacheStorage):
         """
         return "." not in key
 
+    def _is_shared_mamba_key(self, key: str) -> bool:
+        """True when the GDN/mamba blob for this key is the canonical one.
+
+        Gated on the window existing, because only then are the blob's bytes
+        full-width in both axes (every layer, every head) instead of this
+        rank's shard. Without it the blob stays per-rank and per-stage, exactly
+        as it is today.
+        """
+        return self.canonical_mamba_blob is not None and key.endswith(
+            f".{PoolName.MAMBA}"
+        )
+
     def _get_suffixed_key(self, key: str) -> str:
+        if self._is_draft_key(key):
+            return key + self.config_suffix
         if (
             self.dcp_owner_mode or self.canonical_kv_page is not None
         ) and self._is_shared_kv_key(key):
+            return key + self.kv_config_suffix
+        if self._is_shared_mamba_key(key):
             return key + self.kv_config_suffix
         return key + self.config_suffix
 
@@ -765,36 +837,52 @@ class HiCacheFile(HiCacheStorage):
             # (dcp_owner_mode on the token axis, #706 on the layer axis) carry
             # the geometry-free kv_config_suffix instead.
             if stem.endswith(self.config_suffix) or (
-                (self.dcp_owner_mode or self.canonical_kv_page is not None)
+                (
+                    self.dcp_owner_mode
+                    or self.canonical_kv_page is not None
+                    or self.canonical_mamba_blob is not None
+                )
                 and stem.endswith(self.kv_config_suffix)
             ):
                 self.metadata_cache.add(stem)
 
-    def _canonical_kv_io(self, key: str) -> bool:
-        """True when this key is served by the #706 whole-page protocol."""
-        return self.canonical_kv_page is not None and self._is_shared_kv_key(key)
+    def _canonical_window(self, key: str):
+        """The canonical window serving this key, or None for the normal path.
+
+        One dispatch for both pools: the KV page's window in its generic
+        one-extent form, or the mamba blob's extent window. Draft keys never
+        reach either (excluded by name), and any other component pool keeps its
+        per-rank key because no canonical form is defined for it.
+        """
+        if self._is_draft_key(key):
+            return None
+        if self._canonical_kv_extents is not None and self._is_shared_kv_key(key):
+            return self._canonical_kv_extents
+        if self._is_shared_mamba_key(key):
+            return self.canonical_mamba_blob
+        return None
 
     def _get_canonical_slice(
-        self, key: str, target_location: torch.Tensor
+        self, key: str, window, target_location: torch.Tensor
     ) -> torch.Tensor | None:
-        """Cut this rank's slots out of the canonical page (#706).
+        """Cut this rank's extents out of the canonical blob (#706).
 
         Both phases arrive here with the SAME key and leave with different
-        bytes: the PP stage takes the byte range of the layers it owns, the TP
-        decode phase takes all 16 slots. That is the read-time cut the token
-        axis already does for kv-heads, one axis over.
+        bytes: a PP stage takes the byte ranges of the layers it owns, a TP rank
+        takes its head channels across every layer. That is the read-time cut
+        the token axis already does for kv-heads, on the other two axes.
         """
-        from sglang.srt.mem_cache.canonical_page_store import read_slice
+        from sglang.srt.mem_cache.canonical_page_store import read_extents
 
         suffixed = self._get_suffixed_key(key)
         tensor_path = self._existing_path(suffixed)
         try:
-            served = read_slice(tensor_path, self.canonical_kv_page, target_location)
+            served = read_extents(tensor_path, window, target_location)
         except CanonicalPageError as e:
-            # A geometry that cannot cut this page is a configuration error, not
+            # A geometry that cannot cut this blob is a configuration error, not
             # a cache miss. Loud and per-page rather than raised, because this
             # runs on the prefetch worker and a dead worker is a wedge.
-            logger.error("Canonical page read refused for %s: %s", key, e)
+            logger.error("Canonical read refused for %s: %s", key, e)
             return None
         if not served:
             if self.metadata_cache is not None:
@@ -805,18 +893,18 @@ class HiCacheFile(HiCacheStorage):
             self.metadata_cache.add(suffixed)
         return target_location
 
-    def _set_canonical_slice(self, key: str, value: torch.Tensor) -> bool:
-        """Deposit this rank's slots into the canonical page (#706).
+    def _set_canonical_slice(self, key: str, window, value: torch.Tensor) -> bool:
+        """Deposit this rank's extents into the canonical blob (#706).
 
-        The page becomes visible only once every slot is present, so a stage
-        writing alone leaves nothing readable behind -- see
+        The blob becomes visible only once every byte is present, so a writer
+        acting alone leaves nothing readable behind -- see
         ``canonical_page_store`` for the marker and the rename.
         """
-        from sglang.srt.mem_cache.canonical_page_store import write_slice
+        from sglang.srt.mem_cache.canonical_page_store import write_extents
 
         suffixed = self._get_suffixed_key(key)
         if self.exists(key):
-            # A complete page is content-addressed: it already holds exactly
+            # A complete blob is content-addressed: it already holds exactly
             # these bytes. Refresh recency, write nothing.
             self._evictor.touch(suffixed, self._existing_path(suffixed))
             return True
@@ -824,16 +912,14 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = self._sharded_path(suffixed)
         reserved = False
         try:
-            # Charged per SLICE: the three stages together account for one page,
-            # and the writer that completes it has ``commit`` correct the
-            # estimate to the page's real allocation.
-            if not self._evictor.reserve(
-                suffixed, self.canonical_kv_page.byte_length, key=key
-            ):
+            # Charged per SLICE: the writers together account for one blob, and
+            # the one that completes it has ``commit`` correct the estimate to
+            # the file's real allocation.
+            if not self._evictor.reserve(suffixed, window.payload_bytes, key=key):
                 return False
             reserved = True
             self._ensure_shard_dir(tensor_path)
-            result = write_slice(tensor_path, self.canonical_kv_page, value)
+            result = write_extents(tensor_path, window, value)
             self._evictor.commit(suffixed)
             if (
                 result.completed or result.already_complete
@@ -841,7 +927,7 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.add(suffixed)
             return True
         except Exception as e:
-            logger.error(f"Failed to save canonical page slot for {key}: {e}")
+            logger.error(f"Failed to save canonical slice for {key}: {e}")
             if reserved:
                 self._evictor.abort(suffixed)
             return False
@@ -852,8 +938,9 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        if self._canonical_kv_io(key):
-            return self._get_canonical_slice(key, target_location)
+        window = self._canonical_window(key)
+        if window is not None:
+            return self._get_canonical_slice(key, window, target_location)
         suffixed = self._get_suffixed_key(key)
         tensor_path = self._existing_path(suffixed)
         try:
@@ -906,8 +993,9 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        if self._canonical_kv_io(key):
-            return self._set_canonical_slice(key, value)
+        window = self._canonical_window(key)
+        if window is not None:
+            return self._set_canonical_slice(key, window, value)
         suffixed = self._get_suffixed_key(key)
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
