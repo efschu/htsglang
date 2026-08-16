@@ -130,15 +130,24 @@ layers are split. That asymmetry is the entire argument, and it is structural.
 Decoupling is not a marginal improvement to the ladder. It is the difference
 between a controller that must retreat under load and one that never does.
 
-**Amendment after the actuator survey (§2.4, §3.7).** The table above prices
+**Amendment after the actuator survey (§2.4, §3.7).** The shape above prices
 the ladder as if a rung's weights were resident only at that rung. No
 cross-rank weight mover exists, so the actuator is an arena refill whose VRAM
-is sized for the *deepest* rung and resident at *every* rung. Under that
-constraint Part A alone yields 1.231x pipelined at a top-rung pool of 390,700
-— i.e. **it costs ~10% pool to buy up to 23% prefill**, and standing alone it
-is a marginal trade rather than a win. The Part B row is unaffected in kind:
-its pool is cut-independent, so it absorbs the arena's fixed weight residency
-and still lands near 478,000 live-equivalent with 2.0x prefill.
+is sized for the *deepest* rung and resident at *every* rung. Part A alone
+therefore **buys prefill speed at a real pool cost** at every rung, which makes
+it a marginal trade standing alone rather than a win. (Specific figures
+previously quoted here — 1.231x at 390,700, "~10% pool for 23% prefill" — came
+from the withdrawn model and are not restated; the *sign* of the trade is what
+the arena argument establishes, and that is unaffected.)
+
+Part B is unaffected in kind: its pool is cut-independent, so it absorbs the
+arena's fixed weight residency once and does not pay again per rung.
+
+Two further findings tighten this, and both point the same way. The arena makes
+a rung's pool depend on its attention count, so rungs inside one attention
+plateau barely trade at all (E4). And no cut keeping rank2 = layers 48-63 can
+beat the incumbent pool at all, so the coupled ladder is boxed in by whichever
+rank owns the tail.
 
 The order of the argument therefore inverts: **Part B is not the follow-on that
 removes Part A's ceiling — Part B is what makes Part A worth doing at all.**
