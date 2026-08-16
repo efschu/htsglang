@@ -527,7 +527,17 @@ def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
     return max(PROGRESS_STALL_CHUNKS * (chunk / rate), floor)
 
 
-def prefill_suppressed_in_tp(cfg: "PhasePolicyConfig", phase: str) -> bool:
+#: #677: after how many consecutive REFUSED tp_to_pp arms drain mode stops
+#: suppressing prefill in the TP layout. Not a new number -- the seam entry
+#: margin already yields after two consecutive abandoned attempts, and an
+#: instance should not wait longer to stop IDLING than it waits to lower its
+#: own guard.
+DRAIN_SUPPRESSION_YIELD_AFTER = 2
+
+
+def prefill_suppressed_in_tp(
+    cfg: "PhasePolicyConfig", phase: str, tp_arm_refusals: int = 0
+) -> bool:
     """#677 hot fix 2: may prefill be admitted while the TP layout is up?
 
     Under drain mode, no. The TP window exists to finish a decode bundle, and
@@ -540,10 +550,37 @@ def prefill_suppressed_in_tp(cfg: "PhasePolicyConfig", phase: str) -> bool:
     never finishes costs a whole extra round trip and returns the same
     carriers.
 
+    IT YIELDS WHEN THE FLIP CANNOT BE FUNDED, and that clause is the whole
+    lesson of 2026-08-16 06:47:48. CorridorGuard refused the seam staging on
+    two ranks with static numbers -- PP1 want 2163 MiB against 2456 free with
+    an arming floor of 1536, PP2 want 2858 against 3560 -- because the staging
+    a 4-carrier bundle needs EXCEEDS the floor that was supposed to guarantee
+    it. Every degradation had already stood down; the arm refused 76 times in
+    a row.
+
+    That alone would have been a slow boot. It became a TOTAL wedge because
+    suppressing prefill in TP removed the fallback the instance used to have:
+    before drain mode, a refused tp_to_pp still prefilled in the TP layout and
+    the backlog drained slowly instead of not at all. An idle server with
+    727004 tokens waiting is strictly worse than a slow one.
+
+    So the rule that hot fix 1 was built on applies here too -- a failure must
+    degrade to the fallback, never to a wedge. Once the seam has PROVED it
+    cannot be funded, the TP layout goes back to prefilling.
+
+    NOT A LATCH. ``arm_refusals`` is reset by the first successful arm, so an
+    instance that recovers returns to the user's semantics by itself. This
+    chain has spent four tasks removing one-way ratchets; it is not adding a
+    fifth.
+
     False for every phase but TP, and False everywhere when drain mode is off,
     so a deployment that has not opted in is byte-identical.
     """
-    return bool(cfg.drain_mode) and phase == PHASE_TP
+    if not bool(cfg.drain_mode) or phase != PHASE_TP:
+        return False
+    if int(tp_arm_refusals) >= DRAIN_SUPPRESSION_YIELD_AFTER:
+        return False
+    return True
 
 
 def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
@@ -1720,6 +1757,7 @@ __all__ = [
     "PP_TO_TP",
     "TP_TO_PP",
     "prefill_suppressed_in_tp",
+    "DRAIN_SUPPRESSION_YIELD_AFTER",
     "REST_PREFILL",
     "REST_DECODE",
     "REST_STATES",
