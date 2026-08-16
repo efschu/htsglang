@@ -965,5 +965,87 @@ class TestTheDemandGateIsConsultedBothWays(unittest.TestCase):
         )
 
 
+class TestReplaySsmRadixSeam(unittest.TestCase):
+    """#700: the ReplaySSM ring vs the radix/prefix-cache seam.
+
+    The kernel header of ``fla/fused_recurrent_linear_replayssm.py`` states the
+    feature is "NOT yet wired into the memory pool / radix cache / scheduler /
+    backend dispatch". These tests EXECUTE the pool half of that claim, because
+    a doc read alone cannot distinguish a stale comment from an unwired path.
+
+    The seam that matters: ``temporal[slot]`` lags the live state by the slot's
+    unflushed ring depth, so any donate/copy of an un-flushed slot would pair a
+    stale checkpoint with a longer key. ``MambaPool.copy_from`` documents the
+    invariant (source must satisfy ``write_pos == 0``) and names its three
+    compliant callers.
+    """
+
+    def _pool(self):
+        _tree, _alloc, pool, _mk = _build_tree(None, enable_linear_replayssm=True)
+        return pool.mamba_pool
+
+    def test_flag_actually_allocates_the_rings_and_cursor(self):
+        """Execution proof that the flag engages the POOL wiring."""
+        mp = self._pool()
+        self.assertIsNotNone(mp.replayssm_write_pos)
+        d = mp.mamba_cache.replayssm_d
+        k = mp.mamba_cache.replayssm_k
+        g = mp.mamba_cache.replayssm_g
+        for t in (d, k, g):
+            self.assertIsNotNone(t)
+        # Documented layout: d [layers, slots, HV, L, V]; k [layers, slots, H, L, K];
+        # g [layers, slots, HV, L]. Pin the invariants, not the rig's dims.
+        self.assertEqual(d.ndim, 5)
+        self.assertEqual(k.ndim, 5)
+        self.assertEqual(g.ndim, 4)
+        self.assertEqual(d.shape[:2], k.shape[:2])
+        self.assertEqual(d.shape[:2], g.shape[:2])
+        # The ring depth L is the same axis in all three.
+        self.assertEqual(d.shape[3], k.shape[3])
+        self.assertEqual(d.shape[3], g.shape[3])
+        # The gate ring is fp32 even when the state rings are not.
+        self.assertEqual(g.dtype, torch.float32)
+        # One cursor per slot, plus the guard row.
+        self.assertEqual(mp.replayssm_write_pos.ndim, 1)
+        self.assertEqual(mp.replayssm_write_pos.shape[0], d.shape[1])
+
+    def test_copy_from_resets_the_destination_cursor(self):
+        """A copied checkpoint has no pending ring entries, so dst must be 0."""
+        mp = self._pool()
+        src = torch.tensor([1], dtype=torch.int64)
+        dst = torch.tensor([2], dtype=torch.int64)
+        mp.replayssm_write_pos[dst] = 5
+        mp.copy_from(src, dst)
+        self.assertEqual(int(mp.replayssm_write_pos[dst].item()), 0)
+
+    def test_unflushed_source_is_caught_when_the_debug_guard_is_on(self):
+        """The can-fail proof: the documented invariant really can trip."""
+        mp = self._pool()
+        src = torch.tensor([1], dtype=torch.int64)
+        dst = torch.tensor([2], dtype=torch.int64)
+        mp.replayssm_write_pos[src] = 3
+        mp.debug_memory_pool = True
+        with self.assertRaises(AssertionError):
+            mp.copy_from(src, dst)
+
+    def test_unflushed_source_is_NOT_guarded_in_production(self):
+        """Pins the gap as a fact, not a wish.
+
+        The ``copy_from`` invariant is enforced only under ``debug_memory_pool``,
+        which is off by default. In production the invariant rests entirely on
+        caller discipline documented in a docstring, so a fourth caller added
+        later would violate it silently. This test exists so that if the guard
+        is ever made unconditional, it fails and someone deletes this test on
+        purpose rather than the protection regressing unnoticed.
+        """
+        mp = self._pool()
+        src = torch.tensor([1], dtype=torch.int64)
+        dst = torch.tensor([2], dtype=torch.int64)
+        mp.replayssm_write_pos[src] = 3
+        mp.debug_memory_pool = False
+        mp.copy_from(src, dst)  # silently proceeds
+        self.assertEqual(int(mp.replayssm_write_pos[dst].item()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
