@@ -212,6 +212,40 @@ class TheRecordedPingPongStateMustNotArm(unittest.TestCase):
         self.assertIn("evict", d.reason.lower())
 
 
+class TheRecordedPrematureArmMustNotArm(unittest.TestCase):
+    """THE 2026-08-16 10:47:42 STATE, REPLAYED. The bs=1 defect's cause.
+
+        Prefill batch, #new-seq: 1, #new-token: 25, #cached-token: 25600,
+        full token usage: 0.05, mamba usage: 0.50, #running-req: 0,
+        #queue-req: 1, #pending-token: 51250
+        -> arming pp_to_tp: IDLE-LOCKED (1 req resident, 25625 tok pending)
+
+    The pool was 5% used with ~446k rows free, 6 of 12 GDN slots were free and
+    a request was still queued. PP could obviously have admitted more. The arm
+    fired because ``nothing_can_run`` meant "this round happened to build
+    nothing", which a single transient empty round satisfies -- and because
+    #688 outranks #689 by design, the premature arm BYPASSED window formation
+    and opened the decode window at ONE carrier. That is the bs=1 defect.
+
+    With the current-layout term simulated as well, a layout that CAN admit
+    does not report that nothing can run, whatever one round happened to do.
+    """
+
+    def test_a_layout_that_can_still_admit_does_not_arm(self):
+        d = decide(
+            cfg(),
+            PhasePolicyState(),
+            inputs(
+                phase=PHASE_PP,
+                running_bs=1,
+                pending_prefill_tokens=25625,
+                nothing_can_run=False,   # the simulation says PP can admit
+                target_can_admit=True,
+            ),
+        )
+        self.assertNotIn("IDLE-LOCKED", d.reason or "")
+
+
 class AnIdleServerIsNotADeadlock(unittest.TestCase):
     """"No batch" alone is not the trigger, deliberately.
 

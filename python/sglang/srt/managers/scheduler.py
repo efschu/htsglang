@@ -2981,59 +2981,26 @@ class Scheduler(
             evictable = 0
         return max(0, avail) + max(0, evictable)
 
-    def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
-        """``(nothing_can_run, target_admissible)`` for the policy.
+    def _layout_admits(self, phase: str, running_bs: int, pending_tokens: int) -> bool:
+        """Can the layout ``phase`` build a batch of the class it is allowed?
 
-        THE FIRST VERSION OF THIS FUNCTION PING-PONGED ON METAL, and the
-        correction is the whole point of the rewrite. It returned
-        "work of that class exists" as if it were "the target can run it":
+        ONE SIMULATION, USED FOR BOTH SIDES. The current layout and the target
+        layout are the same question asked of two phases, so they must not be
+        answered by two different mechanisms -- that asymmetry is exactly what
+        produced the 10:24 ping-pong (target simulated, current inferred) and
+        then the 10:47 premature arm (current inferred from a single round).
 
-            pp -> tp:  running_bs > 0
-            tp -> pp:  pending_tokens > 0
-
-        On 2026-08-16 10:24 both were permanently true -- 2 requests resident,
-        910140 tokens queued -- while NEITHER layout could actually run: PP
-        could not admit a prefill because the carriers' KV filled the pool,
-        and TP could not decode those carriers either. Two blocked layouts,
-        each certified as the other's escape:
-
-            10:24:18 arming tp_to_pp: IDLE-LOCKED ...
-            10:24:21 arming pp_to_tp: IDLE-LOCKED ...
-            10:24:25 arming tp_to_pp: IDLE-LOCKED ...
-
-        every three to four seconds. That is worse than the gap it replaced.
-
-        So the target term is now SIMULATED against the target layout's real
-        constraint, not inferred from the existence of work:
-
-        * pp -> tp: a resident carrier is decodable only if the pool can back
-          its next decode step -- one row per carrier per step, and under
-          NEXTN a whole draft window per carrier, not one row for the batch.
-        * tp -> pp: a queued prefill is admissible only if a CHUNK of it fits
-          AND a GDN state slot is free for the new request. The state slot is
-          the term the old proxy could not see at all, and it is exactly what
-          was exhausted in the specimen.
-
-        BOTH-BLOCKED IS NOT A FLIP. When neither side is admissible the answer
-        is to free KV, not to change layout; the policy declines and the
-        caller routes to the evict rung. Returning "arm" there is what built
-        the loop.
+        PP may only prefill: it needs a CHUNK of rows and a free GDN state
+        slot for the incoming request. TP may only decode under drain purity:
+        it needs the pool to back one decode step for the residents, which
+        under NEXTN is a draft window per carrier rather than one row for the
+        batch. Rows are counted POST-EVICT, because the cache is not a claim
+        on the pool.
         """
-        if not bool(getattr(self, "_round_built_nothing", False)):
-            return False, False
-        phase = getattr(self, "phase_flip_active_stack", None)
         rows = self._post_evict_rows()
         if phase == "pp":
-            # Target TP: can the pool back one decode step for the carriers?
-            per_req = max(
-                1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
-            )
-            need = max(1, int(running_bs)) * per_req
-            return True, rows >= need
-        if phase == "tp":
-            # Target PP: can one queued prefill chunk actually land?
             if int(pending_tokens) <= 0:
-                return True, False
+                return False
             chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
             need = min(chunk, int(pending_tokens))
             mamba = getattr(
@@ -3041,11 +3008,50 @@ class Scheduler(
             )
             try:
                 slots = int(mamba.available_size()) if mamba is not None else 1
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 - a probe must not break the round
                 slots = 0
-            return True, (rows >= need and slots >= 1)
-        # No flip enabled, or a phase this rule says nothing about: never arm.
-        return False, False
+            return rows >= need and slots >= 1
+        if phase == "tp":
+            if int(running_bs) <= 0:
+                return False
+            per_req = max(
+                1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
+            )
+            return rows >= int(running_bs) * per_req
+        return False
+
+    def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
+        """``(nothing_can_run, target_admissible)`` for the policy.
+
+        BOTH TERMS ARE SIMULATED NOW. Each was a proxy once and each cost a
+        live defect, in the same shape:
+
+        * ``target_can_admit`` was "work of that class exists". On 2026-08-16
+          10:24 that was permanently true on both sides while NEITHER layout
+          could run, and the policy ping-ponged every 3-4 seconds.
+        * ``nothing_can_run`` was "the round happened to build nothing". On
+          2026-08-16 10:47:42 that fired on a single transient empty round
+          with the pool 5% used, 6 of 12 GDN slots free and a request still
+          queued -- PP could plainly have admitted more. The arm bypassed
+          window formation (correctly, #688 outranks #689) and the decode
+          window opened at ONE carrier, which is the bs=1 defect #689 exists
+          to remove.
+
+        A ROUND THAT BUILT NOTHING IS NECESSARY BUT NOT SUFFICIENT. It is kept
+        as the trigger -- the check is worthless if it fires while batches are
+        being built -- but the verdict is now whether the layout CAN build
+        one, not whether it just did.
+        """
+        if not bool(getattr(self, "_round_built_nothing", False)):
+            return False, False
+        phase = getattr(self, "phase_flip_active_stack", None)
+        if phase not in ("pp", "tp"):
+            # No flip enabled, or a phase this rule says nothing about.
+            return False, False
+        other = "tp" if phase == "pp" else "pp"
+        here = self._layout_admits(phase, running_bs, pending_tokens)
+        there = self._layout_admits(other, running_bs, pending_tokens)
+        return (not here), there
 
     def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
         """Record this round's purity verdict and reconcile the parked set.
@@ -5380,6 +5386,12 @@ class Scheduler(
             and self.phase_flip_runtime.pending is not None
             and not chunk_blocks_quiescence(self.chunked_req)
         ):
+            # A round withheld for a PENDING FLIP is not a round that could
+            # not build a batch -- it is one that deliberately did not try. It
+            # must not leave the previous round's verdict standing, or the
+            # arming gate reads a stale "nothing can run" from before the flip
+            # was armed.
+            self._round_built_nothing = False
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         if self.dllm_config is not None:
