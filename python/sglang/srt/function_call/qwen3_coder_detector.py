@@ -363,9 +363,28 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # fragments at the uninitialised index -1 that no downstream
             # consumer could bind to a call.
             if current_slice.startswith(self.parameter_prefix) and (
-                self.current_func_name is not None
+                self.is_inside_tool_call
+                or self.current_func_name is not None
                 or self.rejected_func_name is not None
             ):
+                if self.current_func_name is None and self.rejected_func_name is None:
+                    # Parameters inside a <tool_call> that never opened a
+                    # function. This is the dominant malformed shape in
+                    # practice: the model writes <parameter=Bash> where
+                    # <function=Bash> belongs, so the tool name arrives as
+                    # a parameter and the call has no function at all. The
+                    # block is passed through as text from here on — the
+                    # alternative, emitting nothing, leaves the caller with
+                    # an empty reply and no clue why, which is how a single
+                    # malformed turn became a run of identical retries.
+                    logger.warning(
+                        "Parameters inside %s with no function opened; "
+                        "streaming the block as text instead of emitting a "
+                        "nameless tool call.",
+                        self.tool_call_start_token,
+                    )
+                    self.rejected_func_name = ""
+
                 name_end = current_slice.find(">")
                 if name_end != -1:
                     value_start_idx = name_end + 1
@@ -470,9 +489,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 # route. Nothing is open, so there is nothing to close.
                 if self.current_func_name is None:
                     logger.warning(
-                        "Ignoring %s with no open function in the stream.",
+                        "%s with no open function; streaming it as text.",
                         self.function_end_token,
                     )
+                    normal_text_chunks.append(self.function_end_token)
                     self.parsed_pos += len(self.function_end_token)
                     continue
 
