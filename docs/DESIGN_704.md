@@ -1084,6 +1084,73 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #702 — THE PP CUT SOLVED FOR PREFILL SPEED
+
+The user's question, unowned since 2026-08-16: **more layers on the 5090 — what
+does it cost?** The capacity solver answers "what cut holds the most context",
+which is a different objective, so it never covered this. Solved by
+`planner/prefill_frontier.py`, 9 hermetic tests.
+
+Three prices are charged against every candidate, because quoting only the first
+is how a cut gets recommended that cannot serve.
+
+| cut | attn | compute | coupled pool | decoupled pool | ovh | **net now** | **net + lever** | needs lever |
+|---|---|---|---|---|---|---|---|---|
+| `[28,17,19]` | (7,4,5) | 1.120x | 200,288 (−54%) | 514,034 | 14.3% | **0.980** | 1.120 | |
+| `[31,16,17]` | (7,4,5) | 1.250x | 303,005 (−31%) | 514,034 | 15.8% | 1.079 | 1.250 | |
+| `[33,15,16]` | (8,4,4) | 1.330x | 363,179 (−17%) | 514,034 | 13.6% | 1.171 | 1.330 | |
+| `[34,15,15]` | (8,4,4) | 1.333x | 331,079 (−24%) | 514,034 | 7.6% | 1.239 | 1.333 | |
+| `[36,14,14]` | (9,3,4) | 1.429x | 240,120 (−45%) | 514,034 | 8.6% | 1.316 | 1.429 | |
+| `[38,13,13]` | (9,3,4) | 1.538x | 183,055 (−58%) | 514,034 | 9.7% | 1.403 | 1.538 | |
+| `[40,12,12]` | (10,3,3) | 1.667x | 115,994 (−73%) | 514,034 | 6.7% | 1.561 | 1.667 | |
+| **`[42,11,11]`** | (10,3,3) | 1.818x | 64,636 (−85%) | 514,034 | 9.5% | **1.660** ← best today | 1.818 | |
+| `[43,10,11]` | (10,3,3) | 1.934x | 38,956 (−91%) | 514,034 | 18.7% | 1.630 | 1.934 | **YES** |
+| **`[44,10,10]`** | (11,2,3) | 2.000x | 14,437 (−97%) | 514,034 | 27.5% | 1.569 | **2.000** ← best with lever | **YES** |
+
+**Two decisions fall out, and they are independent.**
+
+**1. Coupled or decoupled — and coupled cannot buy depth at any price.** In the
+regime that exists today the pool collapses: `[33,15,16]` costs 17% of context
+for 1.33x, and `[42,11,11]` costs **85%** for 1.82x. Nothing past roughly
+`[34,15,15]` is purchasable. Under decoupling (#704b) the pool is **exactly
+cut-independent at 514,034 — +17.7% over the incumbent's observed 436,766** —
+because total weight bytes and total GDN state are invariant under a re-cut;
+only their distribution moves. **So the pool price of depth is not merely
+affordable under decoupling, it is negative.** That inverts the usual framing:
+decoupling is not a cost centre bought for speed, it is what makes the speed
+free of context loss.
+
+**2. With or without the pipelining lever — and this one has a trap.** Net
+speedup without cross-chunk pipelining **is not monotone in depth**. It peaks at
+`[42,11,11]` (1.660x) and then *falls*: 1.630x at `[43,10,11]`, 1.569x at
+`[44,10,10]`. Past the peak the collective overhead grows faster than the
+compute gain, so a deeper cut is **actively worse**, not merely diminishing.
+A frontier reporting only compute speedup would recommend exactly those cuts —
+which is why they carry `needs_pipelining`.
+
+**Recommendation, stated as a pick rather than a verdict:**
+
+* **Today, decoupled, no lever:** `[42,11,11]` — **1.660x net at +17.7% pool.**
+* **With the lever built:** `[44,10,10]` — **2.000x net at +17.7% pool.** The
+  lever is worth the last 0.34x, and nothing else.
+* **Coupled, if decoupling slips:** `[34,15,15]` — 1.333x for −24% pool, or
+  `[33,15,16]` for 1.330x at −17%. Beyond that the context loss is not a trade,
+  it is a failure.
+* **Do not pick `[28,17,19]`**: decoupled, it is **net 0.980x — slower than the
+  incumbent**, because at incumbent depth the collective buys nothing and still
+  costs its overhead. Decoupling does not pay for itself until roughly
+  `[29,17,18]`.
+
+**Caveats, all self-labelled and none folded into the numbers.** Every speedup
+is an **upper bound** until slice 1a-i lands the timing intercept (`fixed_ms`
+defaults to zero, the optimistic end). Pool figures use the four-boot gate's
+metal `available_bytes` at the incumbent, extrapolated across cuts by weights
+and GDN state, and carry the **unquantified reserve term** pending Slot-2's
+instrument boot — the solver reports `measured=False` for exactly this reason.
+The overhead column uses measured links with the authoritative card mapping
+(§4.2e). No rig constant appears in the solver; this rig's figures are
+calibration data in the test.
+
 ### 4.2g CROSS-CHUNK PIPELINING DESK SPEC — the exposure lever
 
 Written against the code, no changes made. Removes 15.8–21.4 ms of exposure per
