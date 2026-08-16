@@ -5769,8 +5769,24 @@ class ModelRunnerKVCacheMixin:
             vec = getattr(self.server_args, "phase_flip_tp_vector", None)
             if isinstance(vec, str):
                 vec = [float(x) for x in vec.split(",") if x.strip()]
+            # THE LIST LIVES ON hf_text_config, NOT ON model_config. The flip
+            # runtime reads exactly this path
+            # (tp_model_config.hf_text_config.full_attention_layer_ids) and its
+            # own comment explains why: the attention registry reads it via
+            # runner.mambaish_config. Reading model_config directly returned an
+            # EMPTY list here and silently disarmed the whole derivation --
+            # measured, tp_vector and num_hidden=64 and pp_size=3 all present,
+            # full_attention_layer_ids=0 entries. model_config is kept as a
+            # fallback because the PP stack's copy is the mutated one and an
+            # empty list from either source must not look like "no attention".
             ids = list(
-                getattr(self.model_config, "full_attention_layer_ids", None) or []
+                getattr(
+                    getattr(self.model_config, "hf_text_config", None),
+                    "full_attention_layer_ids",
+                    None,
+                )
+                or getattr(self.model_config, "full_attention_layer_ids", None)
+                or []
             )
             n_hidden = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
             pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
