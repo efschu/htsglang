@@ -2365,124 +2365,165 @@ def solve_pp_cut_for_prefill_speed(
 
 
 # ---------------------------------------------------------------------------
-# #702 revision -- CO-SOLVING the KV/mamba token vector with the layer cut.
+# #702 revision 3 -- the KV pool is priced PER PHASE.
 #
-# Revision 1 of this objective reported a "pool cost" per candidate while
-# holding the KV token vector PINNED. That is single-family optimization and
-# the #485 phase-matrix doctrine forbids it: the vector is not a constant of
-# the problem, it is a second free variable that moves WITH the cut.
+# Revision 2 priced the pool as the SUM of per-rank token capacities with a
+# free-proportional vector, reported "world pool conservation is exact", and on
+# that basis recommended [42,11,11]. That arm was armed and OOM'd on rank0 at
+# KV pool commit, twice.
 #
-# The mechanics that make it move: a layer relocated to rank0 frees exactly its
-# weight bytes on the rank it left. Those bytes are immediately available to the
-# uneven-DCP / rank-kv-ratio machinery, which relocates the displaced KV share
-# onto them (the #320 capacity-matched pattern -- prefill 10,1,1 against a kv
-# vector 2,11,10). Rank0's VRAM cap therefore bounds rank0's SHARE of the token
-# split; it does not bound the world pool.
+# The defect was a phase confusion. The SUM rule is the TP-phase rule: under
+# tensor parallelism the model is width-sharded, every rank holds a slice of
+# all layers, per-token cost is uniform, tokens are sharded across ranks, and
+# the vector CAN relieve a tight rank. Under PP PREFILL the pool is
+# LAYER-sharded: every rank stores KV for ALL tokens, for ITS OWN layers, so
 #
-# Consequence, and it is exact rather than approximate: total VRAM is fixed and
-# the same 64 layers of weights exist wherever they sit, so total free bytes are
-# invariant under the cut. Under DCP the KV is token-sharded -- a rank holds the
-# full layer stack for its share of tokens -- so a token of world capacity costs
-# the same total bytes on any cut. The world pool is CONSERVED, and the only
-# honest residual is second-order: seam/staging in both directions and the
-# TP-phase vector redistribution, which are itemized rather than lumped.
+#     pool = min_i( free_i / (layers_i * kv_cost_per_token_per_layer) )
+#
+# and the token vector does not enter. Metal proof: rank0's vector share was
+# cut 4.3x between the two failed attempts and rank0's memory moved by ZERO
+# (identical reserved 30.60 GiB both times).
+#
+# Consequence: the pool does not conserve under the cut, it COLLAPSES, because
+# the deepest rank's capacity is divided by its own layer count. Prefill speed
+# and pool capacity are in DIRECT OPPOSITION along the cut axis. Revision 2
+# priced only the first, which is why it recommended the worst cuts.
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
-class WorldMemory:
-    """Per-rank memory facts needed to co-solve the token vector."""
+class PhasePoolModel:
+    """Per-rank memory facts, census-calibrated.
 
-    vram_mib: Tuple[float, ...]
-    nonlayer_weight_mib: Tuple[float, ...]
+    ``free_mib`` is free memory BEFORE layer weights are placed.
+    ``weight_mib_per_layer`` is the census flat equivalent (450.7 for this
+    hybrid checkpoint: 374.2 full-attention / 476.2 linear), NOT the 724.3 that
+    revision 2 assumed.
+    """
+
+    free_mib: Tuple[float, ...]
     weight_mib_per_layer: float
     kv_mib_per_token_per_layer: float
 
 
+def stage_pp_capacities(
+    counts: Sequence[int], model: PhasePoolModel
+) -> Tuple[float, ...]:
+    """Per-rank PP-phase token capacity: ``free_i / (layers_i * cost)``."""
+    caps: List[float] = []
+    for r, n in enumerate(counts):
+        n = int(n)
+        if n <= 0:
+            raise ValueError(f"rank{r} holds {n} layers; a PP stage needs at least 1.")
+        free = float(model.free_mib[r]) - float(model.weight_mib_per_layer) * n
+        if free < 0.0:
+            raise ValueError(
+                f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers need "
+                f"{float(model.weight_mib_per_layer) * n:,.1f} MiB of weights "
+                f"against {float(model.free_mib[r]):,.1f} MiB free, i.e. "
+                f"{-free:,.1f} MiB short."
+            )
+        caps.append(free / (n * float(model.kv_mib_per_token_per_layer)))
+    return tuple(caps)
+
+
+def pp_phase_pool(counts: Sequence[int], model: PhasePoolModel, **forbidden) -> float:
+    """PP-phase pool bound: the MIN over ranks.
+
+    Takes NO KV-vector argument, deliberately. Under PP the pool is
+    layer-sharded, so a rank's footprint is ``max_total_tokens * layers_r`` and
+    the token vector cannot relieve it.
+    """
+    if forbidden:
+        raise TypeError(
+            "pp_phase_pool takes no KV-token-vector argument. Under PP prefill "
+            "the pool is LAYER-sharded: rank r stores KV for all tokens for its "
+            "own layers, so its footprint is max_total_tokens * layers_r and "
+            "the vector does not enter. Proven on metal in #702: cutting "
+            "rank0's vector share 4.3x moved its memory by zero. Passing a "
+            "vector here is the TP-phase rule applied to the PP phase, which is "
+            f"the bug this signature exists to prevent. Refused: {sorted(forbidden)}"
+        )
+    return min(stage_pp_capacities(counts, model))
+
+
+def tp_phase_pool(counts: Sequence[int], model: PhasePoolModel) -> float:
+    """TP-phase pool: the SUM over ranks, and independent of the PP cut.
+
+    Under TP the weights are width-sharded, so every rank carries a slice of
+    every layer regardless of how the PP phase cuts them. This column IS
+    vector-relievable; the PP column is not. They are reported separately
+    because conflating them is exactly what failed arm B.
+    """
+    n_ranks = len(model.free_mib)
+    total_layers = int(sum(counts))
+    per_rank_layers = total_layers / float(n_ranks)
+    per_token = total_layers * float(model.kv_mib_per_token_per_layer)
+    total = 0.0
+    for r in range(n_ranks):
+        free = (
+            float(model.free_mib[r])
+            - float(model.weight_mib_per_layer) * per_rank_layers
+        )
+        if free < 0.0:
+            raise ValueError(
+                f"TP phase is infeasible on rank{r}: a {per_rank_layers:.2f}-layer "
+                f"width shard needs "
+                f"{float(model.weight_mib_per_layer) * per_rank_layers:,.1f} MiB "
+                f"against {float(model.free_mib[r]):,.1f} MiB free."
+            )
+        total += free / per_token
+    return total
+
+
 @dataclasses.dataclass(frozen=True)
-class CoSolvedCut:
+class PrefillTradeoff:
     counts: Tuple[int, ...]
-    serial_ms: float
-    pipelined_ms: float
     serial_speedup: float
     pipelined_speedup: float
-    kv_token_vector: Tuple[float, ...]
-    world_pool_tokens: float
-    world_pool_delta: float
-    second_order: Dict[str, float]
+    pp_pool_tokens: float
+    tp_pool_tokens: float
+    pp_pool_ratio: float
 
 
-def _free_mib(counts: Sequence[int], world: WorldMemory) -> List[float]:
-    free: List[float] = []
-    for r, n in enumerate(counts):
-        f = (
-            float(world.vram_mib[r])
-            - float(world.nonlayer_weight_mib[r])
-            - float(world.weight_mib_per_layer) * float(n)
-        )
-        if f < 0.0:
-            raise ValueError(
-                f"cut {tuple(counts)} is infeasible on rank{r}: "
-                f"{n} layers need "
-                f"{float(world.weight_mib_per_layer) * float(n):,.1f} MiB of "
-                f"weights plus {float(world.nonlayer_weight_mib[r]):,.1f} MiB "
-                f"non-layer against {float(world.vram_mib[r]):,.1f} MiB of "
-                f"VRAM, i.e. {-f:,.1f} MiB short. This is a weight overflow, "
-                "not a small pool."
-            )
-        free.append(f)
-    return free
-
-
-def _world_pool(
-    counts: Sequence[int],
-    world: WorldMemory,
-    overhead: Mapping[str, float],
-) -> Tuple[float, Tuple[float, ...]]:
-    """Return (world_pool_tokens, per-rank token vector).
-
-    Token-sharded (DCP): a rank holds the full layer stack for its SHARE of the
-    tokens, so one token costs ``kv_mib_per_token_per_layer * total_layers``
-    wherever it lands. That is what makes the world pool cut-invariant.
-    """
-    total_layers = int(sum(counts))
-    per_token = float(world.kv_mib_per_token_per_layer) * float(total_layers)
-    free = _free_mib(counts, world)
-    raw = [f / per_token for f in free]
-    pool = (sum(free) - float(sum(overhead.values()))) / per_token
-    scale = 1.0 if sum(raw) == 0 else pool / sum(raw)
-    return pool, tuple(x * scale for x in raw)
-
-
-def cosolve_prefill_cut(
-    counts: Sequence[int],
-    world: WorldMemory,
+def solve_prefill_cut_tradeoff(
+    total_layers: int,
     timing: PrefillTiming,
+    model: PhasePoolModel,
     incumbent: Sequence[int] = (28, 20, 16),
-    overhead_fn: Optional[Callable[[Sequence[int]], Mapping[str, float]]] = None,
-) -> CoSolvedCut:
-    """Price one cut on time AND on a co-solved KV/mamba token vector.
+    min_layers_per_stage: int = 1,
+    min_pool_ratio: Optional[float] = None,
+    top: Optional[int] = None,
+) -> List[PrefillTradeoff]:
+    """Enumerate cuts and report BOTH sides of the real trade.
 
-    ``overhead_fn`` returns the itemized second-order MiB terms for a cut
-    (seam/staging both directions, TP-phase redistribution). It is injected so
-    this solver invents no memory number it has not been given; absent it, the
-    residual is zero and the conservation result stands unqualified.
+    ``min_pool_ratio`` filters to cuts retaining at least that fraction of the
+    incumbent's PP pool -- the actual decision procedure, since an unfiltered
+    speed ranking recommends exactly the cuts that cannot hold the context.
     """
-    counts = tuple(int(n) for n in counts)
-    ov = dict(overhead_fn(counts)) if overhead_fn is not None else {}
-    base_ov = dict(overhead_fn(incumbent)) if overhead_fn is not None else {}
-    pool, vector = _world_pool(counts, world, ov)
-    base_pool, _ = _world_pool(incumbent, world, base_ov)
-    s = serial_prefill_ms(counts, timing)
-    p = pipelined_prefill_ms(counts, timing)
-    return CoSolvedCut(
-        counts=counts,
-        serial_ms=s,
-        pipelined_ms=p,
-        serial_speedup=serial_prefill_ms(incumbent, timing) / s,
-        pipelined_speedup=pipelined_prefill_ms(incumbent, timing) / p,
-        kv_token_vector=vector,
-        world_pool_tokens=pool,
-        world_pool_delta=pool - base_pool,
-        second_order=ov,
-    )
+    stages = len(incumbent)
+    base_serial = serial_prefill_ms(incumbent, timing)
+    base_pipe = pipelined_prefill_ms(incumbent, timing)
+    base_pool = pp_phase_pool(incumbent, model)
+    out: List[PrefillTradeoff] = []
+    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage):
+        try:
+            pool = pp_phase_pool(counts, model)
+            tp = tp_phase_pool(counts, model)
+        except ValueError:
+            continue
+        ratio = pool / base_pool
+        if min_pool_ratio is not None and ratio < float(min_pool_ratio):
+            continue
+        out.append(
+            PrefillTradeoff(
+                counts=counts,
+                serial_speedup=base_serial / serial_prefill_ms(counts, timing),
+                pipelined_speedup=base_pipe / pipelined_prefill_ms(counts, timing),
+                pp_pool_tokens=pool,
+                tp_pool_tokens=tp,
+                pp_pool_ratio=ratio,
+            )
+        )
+    out.sort(key=lambda c: -c.pipelined_speedup)
+    return out if top is None else out[: int(top)]
