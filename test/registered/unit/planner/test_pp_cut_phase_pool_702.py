@@ -1,36 +1,38 @@
-"""#702 revision 3: the KV pool is priced PER PHASE, and PP uses the MIN rule.
+"""#702 revision 5: attention-layer divisor + per-layout SOLVED arming floor.
 
-Arm B `[42,11,11]` was armed on this solver's advice and OOM'd on rank0 at KV
-pool commit, twice. The defect was mine and it was a phase confusion:
+Revision history, because three of five were wrong and the corrections matter:
 
-* Revision 2 computed the world pool as the SUM of per-rank token capacities
-  with a free-proportional vector. That is the **TP-phase** rule -- under
-  tensor parallelism the model is width-sharded, every rank holds a slice of
-  all 64 layers, per-token cost is uniform, tokens are sharded across ranks,
-  so the pool is a sum and the vector CAN relieve a tight rank.
-* Under **PP prefill the pool is layer-sharded**: every rank stores KV for ALL
-  tokens, for its OWN layers. So
+* rev 2 -- pool as the SUM of per-rank capacities (the TP rule). Arm B
+  [42,11,11] was armed on it and OOM'd twice.
+* rev 3 -- SUM corrected to MIN (PP is layer-sharded), but still divided by the
+  rank's TOTAL layer count.
+* rev 4 -- divisor corrected to the rank's FULL-ATTENTION layer count
+  (Slot-3's claim, verified below). Its "metal discriminator" test was
+  CIRCULAR: the two free constants were solved from the two metal points, so
+  reproducing them validated nothing.
+* rev 5 -- here: the per-layout arming floor is consumed, and the calibration's
+  limits are stated rather than implied.
 
-      pool = min_i( free_i / (layers_i * kv_cost_per_token_per_layer) )
+THE ADJUDICATED KV-SCALING RULE. Token-scaling KV lives ONLY on full-attention
+layers. ``HybridLinearKVPool`` is documented "KV cache with separate pools for
+full and linear attention layers" (``mem_cache/memory_pool.py:3606``); its
+``full_kv_pool`` takes ``layer_num=self.full_layer_nums`` (``:3688``) and
+``full_layer_nums = len(full_attention_layer_ids)`` (``:3637``). Linear/GDN
+layers hold per-SEQUENCE MambaPool slots -- a residency term, never a divisor.
 
-  and the token vector does not enter at all.
+WHAT THE TWO METAL POINTS DO AND DO NOT SETTLE. On this checkpoint the
+attention layers are uniformly every 4th, so any multiple-of-4 cut has
+``total/attention == 4`` on every rank and rev 3 and rev 4 agree exactly. Both
+[28,20,16] and [32,16,16] are multiple-of-4, so **neither point discriminates
+the two rules**. The rule is adopted on the allocator source, not on these
+boots. The discriminating cut is a non-multiple-of-4 one such as [33,15,16].
 
-The metal proof that the vector cannot relieve the deep rank: rank0's vector
-share was cut 4.3x (13 -> 3 of 64) between the two attempts and rank0's memory
-moved by *zero* -- identical `reserved 30.60 GiB` both times.
-
-So revision 2's headline result, "world pool conservation is exact", was an
-artifact of applying the wrong phase's rule. Under the min-rule the pool
-COLLAPSES as the cut deepens, because the deepest rank's capacity is divided by
-its own layer count. Prefill speed and pool capacity are in direct opposition
-along the cut axis, and revision 2 priced only the first.
-
-`stage_kv_capacities` in this same module already implemented the min-rule
-machinery. The co-solve did not use it.
-
-Calibration is F4-r4's census, reproduced here to ~0.02%: the model is ~14%
-pessimistic in absolute terms (it puts the incumbent at 384,203 where the live
-boot solves 434,878), so the RANKING is load-bearing and the absolutes are not.
+THE COMMON MODE. Both rules over-predicted [32,16,16] by +9.6 % (456,715
+against a live 416,796) -- larger than the disagreement between them. The
+arming floor moves with the layout (2255/1728/2467 measured on [32,16,16]
+against 1728/1825/2467 on the incumbent) while both models held it fixed.
+Rank0's floor rises 527 MiB, which at 8 attention layers and 2048 B/token is
+33,728 tokens: **84 % of the 39,919-token gap**, leaving ~1.5 % residual.
 
 Hermetic: pure arithmetic, no CUDA.
 """
@@ -41,150 +43,146 @@ from sglang.srt.planner.pp_cut import (
     PhasePoolModel,
     pp_phase_pool,
     stage_pp_capacities,
-    tp_phase_pool,
 )
 
 INCUMBENT = (28, 20, 16)
+ARM_C2 = (32, 16, 16)
 ARM_B = (42, 11, 11)
-LIVE_INCUMBENT_POOL = 434_878.0
+DISCRIMINATOR = (33, 15, 16)
 
-# Census-calibrated (FINDING_702_weight_term.md): the hybrid checkpoint measures
-# 374.2 MiB/layer full-attention and 476.2 linear, a flat equivalent of 450.7 --
-# NOT the 724.3 revision 2 used (+61%). Real, but not the cause of the failure.
-CENSUS_WEIGHT_MIB_PER_LAYER = 450.7
+LIVE_INCUMBENT = 436_766.0
+LIVE_ARM_C2 = 416_796.0
+BOTH_RULES_PREDICTED_C2 = 456_715.0
+
+# fp8_e4m3 KV (from the boot log), 2 * 4 kv-heads * 256 head_dim = 2048 B per
+# token per ATTENTION layer. FIXED at its physical value, never fitted.
+KV_MIB_PER_TOKEN_PER_ATTN_LAYER = 2048.0 / 1_048_576.0
+
+MEASURED_FLOORS = {
+    INCUMBENT: (1728.0, 1825.0, 2467.0),
+    ARM_C2: (2255.0, 1728.0, 2467.0),
+}
 
 
-def _model():
+def _model(floors, free=(23_189.8, 15_104.3, 14_561.0)):
     return PhasePoolModel(
-        free_mib=(26721.2, 16051.3, 13984.3),
-        weight_mib_per_layer=CENSUS_WEIGHT_MIB_PER_LAYER,
-        kv_mib_per_token_per_layer=450.7 / 492129.0,
+        free_mib=free,
+        weight_mib_per_layer=450.7,
+        kv_mib_per_token_per_attn_layer=KV_MIB_PER_TOKEN_PER_ATTN_LAYER,
+        arming_floor_mib=floors,
     )
 
 
-def test_pp_pool_is_the_min_not_the_sum():
-    """The whole defect in one assertion."""
-    m = _model()
-    caps = stage_pp_capacities(INCUMBENT, m)
-    assert pp_phase_pool(INCUMBENT, m) == pytest.approx(min(caps), rel=1e-12)
-    # And it is emphatically NOT the sum revision 2 reported.
-    assert pp_phase_pool(INCUMBENT, m) < sum(caps) / 2
+def _attn(counts):
+    """Full-attention layers per contiguous stage: every 4th layer (i % 4 == 3)."""
+    out, start = [], 0
+    for c in counts:
+        out.append(sum(1 for i in range(start, start + c) if i % 4 == 3))
+        start += c
+    return tuple(out)
 
 
-def test_backtest_reproduces_arm_b_failure():
-    """CAN-FAIL PROOF: the solver must now predict the boot that OOM'd.
-
-    A model that cannot reproduce the observed failure has not been fixed, it
-    has been re-parameterized.
-    """
-    m = _model()
-    bound = pp_phase_pool(ARM_B, m)
-    assert bound == pytest.approx(201_298.0, rel=0.01)
-    # rank0 is the binding rank, and it is bound by its own layer count.
-    caps = stage_pp_capacities(ARM_B, m)
-    assert caps[0] == min(caps)
-    # Against the incumbent's live pin the arm cannot hold the context: this is
-    # the corridor violation that OOM'd on metal, not a near miss.
-    assert bound < LIVE_INCUMBENT_POOL / 2
+def test_attention_pattern_helper_matches_the_census():
+    assert sum(_attn((64,))) == 16
+    assert _attn(INCUMBENT) == (7, 5, 4)  # matches census n_attn_layers 7/5/4
+    assert _attn(ARM_C2) == (8, 4, 4)
 
 
-def test_sanity_anchor_32_16_16():
-    """F4-r4's recommended calibration arm: ~3% under the incumbent."""
-    m = _model()
-    bound = pp_phase_pool((32, 16, 16), m)
-    assert bound == pytest.approx(419_734.0, rel=1e-3)
-    shortfall = 1.0 - bound / LIVE_INCUMBENT_POOL
-    assert 0.02 < shortfall < 0.05
+def test_multiple_of_four_cuts_cannot_discriminate_the_two_rules():
+    """States the limit of the available metal, so nobody claims otherwise."""
+    for cut in (INCUMBENT, ARM_C2, (24, 20, 20)):
+        for n, a in zip(cut, _attn(cut)):
+            assert n / a == 4.0
+    # The discriminating cut is not uniform, which is what makes it a test.
+    ratios = [n / a for n, a in zip(DISCRIMINATOR, _attn(DISCRIMINATOR))]
+    assert len(set(ratios)) > 1
 
 
-def test_incumbent_matches_the_censused_table():
-    m = _model()
-    caps = stage_pp_capacities(INCUMBENT, m)
-    assert caps[0] == pytest.approx(550_000.0, rel=5e-3)
-    assert caps[1] == pytest.approx(384_203.0, rel=5e-3)
-    assert caps[2] == pytest.approx(462_223.0, rel=5e-3)
-    assert pp_phase_pool(INCUMBENT, m) == pytest.approx(384_203.0, rel=5e-3)
-
-
-def test_the_pool_peaks_and_then_collapses():
-    """The real shape: NOT conservation (rev 2) and NOT monotone decline either.
-
-    The binding rank switches. At the incumbent rank1 binds -- it carries 20
-    layers -- so moving layers OFF rank1 RAISES the pool. Past the crossover
-    rank0 binds and the pool collapses as its layer count grows. The incumbent
-    is therefore not pool-optimal, which no previous revision noticed.
-    """
-    m = _model()
-    inc = pp_phase_pool(INCUMBENT, m)
-    peak = pp_phase_pool((30, 18, 16), m)
-    assert peak > inc  # the incumbent is beatable on pool
-    assert peak == pytest.approx(462_231.0, rel=5e-3)
-    # Past the crossover it is monotone collapse.
-    tail = [
-        pp_phase_pool(c, m)
-        for c in [(32, 16, 16), (34, 15, 15), (38, 13, 13), (42, 11, 11), (46, 9, 9)]
-    ]
-    assert tail == sorted(tail, reverse=True)
-    # [46,9,9] looked like the dominating arm on speed; it is the WORST on pool.
-    assert tail[-1] == pytest.approx(141_000.0, rel=0.02)
-
-
-def test_the_binding_rank_switches_across_the_cut():
-    """Which rank binds is the whole structure, so pin it."""
-    m = _model()
-    assert (
-        stage_pp_capacities(INCUMBENT, m).index(min(stage_pp_capacities(INCUMBENT, m)))
-        == 1
-    )
-    caps = stage_pp_capacities((42, 11, 11), m)
-    assert caps.index(min(caps)) == 0
-
-
-def test_the_vector_cannot_relieve_the_deep_rank():
-    """Encodes the metal fact as a refusal, not a comment.
-
-    Cutting rank0's vector share 4.3x moved its memory by zero. Under PP the
-    token vector is not an input to the pool bound, so passing one is a
-    category error and is refused loudly rather than silently ignored.
-    """
-    m = _model()
+def test_the_floor_must_be_supplied_per_layout_not_defaulted():
+    """A constant floor is the defect; the model must consume a solved one."""
     with pytest.raises(TypeError):
-        pp_phase_pool(ARM_B, m, kv_token_vector=(3, 30, 31))  # noqa
+        PhasePoolModel(
+            free_mib=(1.0, 1.0, 1.0),
+            weight_mib_per_layer=1.0,
+            kv_mib_per_token_per_attn_layer=1.0,
+        )
 
 
-def test_tp_phase_pool_is_a_separate_column_and_cut_independent():
-    """Under TP the weights are width-sharded, so the PP cut does not enter."""
-    m = _model()
-    a = tp_phase_pool(INCUMBENT, m)
-    b = tp_phase_pool(ARM_B, m)
-    assert a == pytest.approx(b, rel=1e-12)
-    # And it is a SUM, so it exceeds any single rank's share.
-    assert a > pp_phase_pool(INCUMBENT, m)
+def test_both_metal_points_reproduce_with_solved_floors():
+    for cut, pool in ((INCUMBENT, LIVE_INCUMBENT), (ARM_C2, LIVE_ARM_C2)):
+        m = _model(MEASURED_FLOORS[cut])
+        assert pp_phase_pool(cut, _attn(cut), m) == pytest.approx(pool, rel=3e-3)
 
 
-def test_census_weight_term_changes_the_capacities():
-    """450.7 vs the 724.3 revision 2 used: real, and not the cause."""
-    census = _model()
-    inflated = PhasePoolModel(
-        free_mib=census.free_mib,
-        weight_mib_per_layer=724.3,
-        kv_mib_per_token_per_layer=census.kv_mib_per_token_per_layer,
+def test_the_binding_rank_switches_between_the_two_points():
+    inc = _model(MEASURED_FLOORS[INCUMBENT])
+    c2 = _model(MEASURED_FLOORS[ARM_C2])
+    caps_i = stage_pp_capacities(INCUMBENT, _attn(INCUMBENT), inc)
+    caps_c = stage_pp_capacities(ARM_C2, _attn(ARM_C2), c2)
+    assert caps_i.index(min(caps_i)) == 1  # rank1: 20 layers / 5 attention
+    assert caps_c.index(min(caps_c)) == 0  # rank0: 32 layers / 8 attention
+
+
+def test_the_sign_of_the_32_16_16_move_is_negative():
+    """Rev 3's fatal error, pinned. Metal: [32,16,16] LOSES 4.4 %."""
+    inc = pp_phase_pool(INCUMBENT, _attn(INCUMBENT), _model(MEASURED_FLOORS[INCUMBENT]))
+    c2 = pp_phase_pool(ARM_C2, _attn(ARM_C2), _model(MEASURED_FLOORS[ARM_C2]))
+    assert c2 < inc
+    assert c2 / inc == pytest.approx(LIVE_ARM_C2 / LIVE_INCUMBENT, rel=5e-3)
+
+
+def test_the_floor_delta_explains_most_of_the_common_mode():
+    """Quantifies F4-r4's suspect instead of asserting it."""
+    stale = _model(MEASURED_FLOORS[INCUMBENT])  # the wrong floor for this cut
+    solved = _model(MEASURED_FLOORS[ARM_C2])
+    lost = pp_phase_pool(ARM_C2, _attn(ARM_C2), stale) - pp_phase_pool(
+        ARM_C2, _attn(ARM_C2), solved
     )
-    # The inflated term makes every rank look poorer.
-    assert pp_phase_pool(INCUMBENT, inflated) < pp_phase_pool(INCUMBENT, census)
-    # And it encodes the two competing diagnoses of the SAME failure, which is
-    # why the first write-up blamed the weight term and had to be retracted:
-    #  * at 724.3, arm B looks like a WEIGHT OVERFLOW -- rank0 cannot even hold
-    #    42 layers of weights, so the cut never gets as far as a pool number;
-    with pytest.raises(ValueError, match="rank0"):
-        pp_phase_pool(ARM_B, inflated)
-    #  * at the census 450.7 the weights fit comfortably and the arm still
-    #    fails, on the pool min-rule. That is the actual cause.
-    assert pp_phase_pool(ARM_B, census) == pytest.approx(201_298.0, rel=0.01)
-    assert pp_phase_pool(ARM_B, census) < pp_phase_pool(INCUMBENT, census)
+    assert lost == pytest.approx(33_728.0, rel=0.02)
+    assert lost / (BOTH_RULES_PREDICTED_C2 - LIVE_ARM_C2) > 0.8
 
 
-def test_a_rank_whose_weights_exceed_its_card_is_refused():
-    m = _model()
+def test_arm_b_remains_far_below_the_pin():
+    """[42,11,11] OOM'd, so metal gives an INEQUALITY, not a point. Do not fit it."""
+    m = _model((2255.0, 1728.0, 2467.0))
+    assert pp_phase_pool(ARM_B, _attn(ARM_B), m) < LIVE_INCUMBENT * 0.6
+
+
+def test_rank2_is_not_identified_by_two_metal_points():
+    """Honesty guard: 2 equations, 3 unknowns.
+
+    Rank1 binds at the incumbent and rank0 at [32,16,16]; rank2 binds at
+    neither, so its free constant is BOUNDED, not identified. Perturbing it
+    upward changes neither reproduced point -- which is exactly why it cannot be
+    reported as calibrated.
+    """
+    a = _model(MEASURED_FLOORS[ARM_C2])
+    b = _model(MEASURED_FLOORS[ARM_C2], free=(23_189.8, 15_104.3, 19_000.0))
+    assert pp_phase_pool(ARM_C2, _attn(ARM_C2), a) == pytest.approx(
+        pp_phase_pool(ARM_C2, _attn(ARM_C2), b), rel=1e-12
+    )
+
+
+def test_linear_layers_do_not_scale_the_token_cost():
+    """The adjudicated rule itself: only attention layers divide."""
+    m = PhasePoolModel(
+        free_mib=(20_000.0,) * 3,
+        weight_mib_per_layer=0.0,  # isolate the divisor from the weight term
+        kv_mib_per_token_per_attn_layer=KV_MIB_PER_TOKEN_PER_ATTN_LAYER,
+        arming_floor_mib=(0.0, 0.0, 0.0),
+    )
+    a = stage_pp_capacities((20, 22, 22), (5, 6, 5), m)[0]
+    b = stage_pp_capacities((28, 18, 18), (5, 6, 5), m)[0]
+    assert a == pytest.approx(b, rel=1e-12)
+
+
+def test_a_stage_with_no_attention_layer_is_refused():
+    m = _model(MEASURED_FLOORS[INCUMBENT])
+    with pytest.raises(ValueError, match="attention"):
+        pp_phase_pool((3, 45, 16), (0, 12, 4), m)
+
+
+def test_weight_overflow_is_refused_by_name():
+    m = _model(MEASURED_FLOORS[INCUMBENT])
     with pytest.raises(ValueError, match="rank0"):
-        pp_phase_pool((60, 2, 2), m)
+        pp_phase_pool((60, 2, 2), (15, 0, 1), m)

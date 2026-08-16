@@ -2365,165 +2365,137 @@ def solve_pp_cut_for_prefill_speed(
 
 
 # ---------------------------------------------------------------------------
-# #702 revision 3 -- the KV pool is priced PER PHASE.
+# #702 revision 4 -- the PP pool divides by ATTENTION layers.
 #
-# Revision 2 priced the pool as the SUM of per-rank token capacities with a
-# free-proportional vector, reported "world pool conservation is exact", and on
-# that basis recommended [42,11,11]. That arm was armed and OOM'd on rank0 at
-# KV pool commit, twice.
+# Rev 2 used the SUM of per-rank capacities (the TP rule); arm B was armed on it
+# and OOM'd. Rev 3 corrected SUM -> MIN but kept dividing by the rank's TOTAL
+# layer count. Rev 4 divides by its FULL-ATTENTION layer count, because that is
+# where token-scaling KV actually lives:
 #
-# The defect was a phase confusion. The SUM rule is the TP-phase rule: under
-# tensor parallelism the model is width-sharded, every rank holds a slice of
-# all layers, per-token cost is uniform, tokens are sharded across ranks, and
-# the vector CAN relieve a tight rank. Under PP PREFILL the pool is
-# LAYER-sharded: every rank stores KV for ALL tokens, for ITS OWN layers, so
+#   HybridLinearKVPool -- "KV cache with separate pools for full and linear
+#   attention layers" (mem_cache/memory_pool.py:3606); full_kv_pool is built
+#   with layer_num=self.full_layer_nums (:3688), and
+#   full_layer_nums = len(full_attention_layer_ids) (:3637).
 #
-#     pool = min_i( free_i / (layers_i * kv_cost_per_token_per_layer) )
+# The GDN/linear layers hold no token-scaling KV at all. They hold per-SEQUENCE
+# MambaPool slots, which is a RESIDENCY term (subtract from free) and not a
+# divisor.
 #
-# and the token vector does not enter. Metal proof: rank0's vector share was
-# cut 4.3x between the two failed attempts and rank0's memory moved by ZERO
-# (identical reserved 30.60 GiB both times).
-#
-# Consequence: the pool does not conserve under the cut, it COLLAPSES, because
-# the deepest rank's capacity is divided by its own layer count. Prefill speed
-# and pool capacity are in DIRECT OPPOSITION along the cut axis. Revision 2
-# priced only the first, which is why it recommended the worst cuts.
+# The metal discriminator that forced rev 4: [28,20,16] solves 434,878 tokens
+# live, [32,16,16] solves 416,796 (boot_armC2.log). Metal says the move LOSES
+# 4.2 %; rev 3 predicted it WINS 9.2 %. Rev 3 had the sign backwards, which is
+# fatal for a solver whose whole output is a ranking. Rev 4 reproduces both
+# points, rank1 binding at the incumbent and rank0 at [32,16,16].
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
 class PhasePoolModel:
-    """Per-rank memory facts, census-calibrated.
+    """Per-rank memory facts for the PP-phase pool.
 
-    ``free_mib`` is free memory BEFORE layer weights are placed.
-    ``weight_mib_per_layer`` is the census flat equivalent (450.7 for this
-    hybrid checkpoint: 374.2 full-attention / 476.2 linear), NOT the 724.3 that
-    revision 2 assumed.
+    ``free_mib`` is free memory BEFORE layer weights, mamba states and the
+    arming floor. ``kv_mib_per_token_per_attn_layer`` prices the FULL-ATTENTION
+    layers only (fp8_e4m3 KV on this checkpoint: 2 x 4 kv-heads x 256 head_dim
+    = 2048 B).
+
+    ``arming_floor_mib`` is PER RANK and PER LAYOUT, and it has no default on
+    purpose. It moves with the cut -- measured 2255/1728/2467 MiB on [32,16,16]
+    against 1728/1825/2467 on [28,20,16] -- and treating it as a constant was
+    responsible for ~84 % of the +9.6 % common-mode over-prediction that both
+    competing KV-scaling rules shared. Callers must pass the value solved for
+    THIS layout by the #676 machinery
+    (``phase_flip_seam_reserve.arming_floor_target_bytes``), never a constant.
+
+    KNOWN GAP: that solver derives the floor from a MEASURED seam draw, so a
+    layout that has never booted has no solved floor. Predicting one needs a
+    draw-versus-layout model that does not exist yet, and until it does every
+    row for an unbooted cut carries the floor uncertainty of its proxy -- about
+    +-500 MiB, which at 8 attention layers is +-32,000 tokens (~7 %).
     """
 
     free_mib: Tuple[float, ...]
     weight_mib_per_layer: float
-    kv_mib_per_token_per_layer: float
+    kv_mib_per_token_per_attn_layer: float
+    arming_floor_mib: Tuple[float, ...]
+    mamba_mib_per_linear_layer_per_slot: float = 0.0
+    mamba_slots: int = 0
 
 
 def stage_pp_capacities(
-    counts: Sequence[int], model: PhasePoolModel
+    counts: Sequence[int],
+    attn_counts: Sequence[int],
+    model: PhasePoolModel,
 ) -> Tuple[float, ...]:
-    """Per-rank PP-phase token capacity: ``free_i / (layers_i * cost)``."""
+    """Per-rank PP-phase token capacity.
+
+    ``free_i / (attention_layers_i * kv_per_token_per_attn_layer)``, with the
+    weights of ALL the rank's layers and its per-sequence mamba states removed
+    from free first.
+    """
     caps: List[float] = []
-    for r, n in enumerate(counts):
-        n = int(n)
-        if n <= 0:
-            raise ValueError(f"rank{r} holds {n} layers; a PP stage needs at least 1.")
-        free = float(model.free_mib[r]) - float(model.weight_mib_per_layer) * n
+    for r, (n, a) in enumerate(zip(counts, attn_counts)):
+        n, a = int(n), int(a)
+        linear = n - a
+        free = (
+            float(model.free_mib[r])
+            - float(model.weight_mib_per_layer) * n
+            - float(model.mamba_mib_per_linear_layer_per_slot)
+            * linear
+            * int(model.mamba_slots)
+            - float(model.arming_floor_mib[r])
+        )
         if free < 0.0:
             raise ValueError(
-                f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers need "
-                f"{float(model.weight_mib_per_layer) * n:,.1f} MiB of weights "
-                f"against {float(model.free_mib[r]):,.1f} MiB free, i.e. "
-                f"{-free:,.1f} MiB short."
+                f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers of "
+                f"weights, its mamba states and a "
+                f"{float(model.arming_floor_mib[r]):,.1f} MiB arming floor "
+                f"exceed the {float(model.free_mib[r]):,.1f} MiB free by "
+                f"{-free:,.1f} MiB."
             )
-        caps.append(free / (n * float(model.kv_mib_per_token_per_layer)))
+        if a <= 0:
+            raise ValueError(
+                f"rank{r} holds no full-attention layer, so it carries no "
+                "token-scaling KV and its token capacity is unbounded. That is a "
+                "modelling artifact, not a real configuration: refusing to price "
+                f"cut {tuple(counts)} with attention counts {tuple(attn_counts)}."
+            )
+        caps.append(free / (a * float(model.kv_mib_per_token_per_attn_layer)))
     return tuple(caps)
 
 
-def pp_phase_pool(counts: Sequence[int], model: PhasePoolModel, **forbidden) -> float:
+def pp_phase_pool(
+    counts: Sequence[int],
+    attn_counts: Sequence[int],
+    model: PhasePoolModel,
+    **forbidden,
+) -> float:
     """PP-phase pool bound: the MIN over ranks.
 
-    Takes NO KV-vector argument, deliberately. Under PP the pool is
-    layer-sharded, so a rank's footprint is ``max_total_tokens * layers_r`` and
-    the token vector cannot relieve it.
+    Takes NO KV-vector argument. Under PP the pool is layer-sharded, so a rank's
+    footprint is ``max_total_tokens * attention_layers_r`` and the token vector
+    cannot relieve it -- proven on metal in #702, where cutting rank0's vector
+    share 4.3x moved its memory by zero.
     """
     if forbidden:
         raise TypeError(
             "pp_phase_pool takes no KV-token-vector argument. Under PP prefill "
-            "the pool is LAYER-sharded: rank r stores KV for all tokens for its "
-            "own layers, so its footprint is max_total_tokens * layers_r and "
-            "the vector does not enter. Proven on metal in #702: cutting "
-            "rank0's vector share 4.3x moved its memory by zero. Passing a "
-            "vector here is the TP-phase rule applied to the PP phase, which is "
-            f"the bug this signature exists to prevent. Refused: {sorted(forbidden)}"
+            "the pool is LAYER-sharded, so the vector does not enter; passing "
+            "one is the TP-phase rule applied to the PP phase, which is the bug "
+            f"this signature exists to prevent. Refused: {sorted(forbidden)}"
         )
-    return min(stage_pp_capacities(counts, model))
+    return min(stage_pp_capacities(counts, attn_counts, model))
 
 
-def tp_phase_pool(counts: Sequence[int], model: PhasePoolModel) -> float:
-    """TP-phase pool: the SUM over ranks, and independent of the PP cut.
+def tp_phase_pool(total_attn_layers: int, n_ranks: int, model: PhasePoolModel) -> float:
+    """TP-phase pool: the SUM over ranks, independent of any PP cut.
 
-    Under TP the weights are width-sharded, so every rank carries a slice of
-    every layer regardless of how the PP phase cuts them. This column IS
-    vector-relievable; the PP column is not. They are reported separately
-    because conflating them is exactly what failed arm B.
+    Under TP every rank holds a width shard of every layer, so its per-token
+    cost is ``total_attention_layers / n_ranks`` layers' worth. This column IS
+    vector-relievable; the PP column is not.
     """
-    n_ranks = len(model.free_mib)
-    total_layers = int(sum(counts))
-    per_rank_layers = total_layers / float(n_ranks)
-    per_token = total_layers * float(model.kv_mib_per_token_per_layer)
-    total = 0.0
-    for r in range(n_ranks):
-        free = (
-            float(model.free_mib[r])
-            - float(model.weight_mib_per_layer) * per_rank_layers
-        )
-        if free < 0.0:
-            raise ValueError(
-                f"TP phase is infeasible on rank{r}: a {per_rank_layers:.2f}-layer "
-                f"width shard needs "
-                f"{float(model.weight_mib_per_layer) * per_rank_layers:,.1f} MiB "
-                f"against {float(model.free_mib[r]):,.1f} MiB free."
-            )
-        total += free / per_token
-    return total
-
-
-@dataclasses.dataclass(frozen=True)
-class PrefillTradeoff:
-    counts: Tuple[int, ...]
-    serial_speedup: float
-    pipelined_speedup: float
-    pp_pool_tokens: float
-    tp_pool_tokens: float
-    pp_pool_ratio: float
-
-
-def solve_prefill_cut_tradeoff(
-    total_layers: int,
-    timing: PrefillTiming,
-    model: PhasePoolModel,
-    incumbent: Sequence[int] = (28, 20, 16),
-    min_layers_per_stage: int = 1,
-    min_pool_ratio: Optional[float] = None,
-    top: Optional[int] = None,
-) -> List[PrefillTradeoff]:
-    """Enumerate cuts and report BOTH sides of the real trade.
-
-    ``min_pool_ratio`` filters to cuts retaining at least that fraction of the
-    incumbent's PP pool -- the actual decision procedure, since an unfiltered
-    speed ranking recommends exactly the cuts that cannot hold the context.
-    """
-    stages = len(incumbent)
-    base_serial = serial_prefill_ms(incumbent, timing)
-    base_pipe = pipelined_prefill_ms(incumbent, timing)
-    base_pool = pp_phase_pool(incumbent, model)
-    out: List[PrefillTradeoff] = []
-    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage):
-        try:
-            pool = pp_phase_pool(counts, model)
-            tp = tp_phase_pool(counts, model)
-        except ValueError:
-            continue
-        ratio = pool / base_pool
-        if min_pool_ratio is not None and ratio < float(min_pool_ratio):
-            continue
-        out.append(
-            PrefillTradeoff(
-                counts=counts,
-                serial_speedup=base_serial / serial_prefill_ms(counts, timing),
-                pipelined_speedup=base_pipe / pipelined_prefill_ms(counts, timing),
-                pp_pool_tokens=pool,
-                tp_pool_tokens=tp,
-                pp_pool_ratio=ratio,
-            )
-        )
-    out.sort(key=lambda c: -c.pipelined_speedup)
-    return out if top is None else out[: int(top)]
+    per_token = (
+        float(total_attn_layers)
+        * float(model.kv_mib_per_token_per_attn_layer)
+        / float(n_ranks)
+    )
+    return sum(float(f) / per_token for f in model.free_mib)
