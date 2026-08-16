@@ -1008,6 +1008,41 @@ def _probe_allocated_extent(scheduler, reqs) -> None:
         logger.warning("%s flip extent probe failed: %s", LOG_PREFIX, exc)
 
 
+_DISK_TIER_ARM_WARNED = False
+
+
+def _warn_first_disk_tier_arm(server_args) -> None:
+    """Say once, on the first flip arm carrying a disk tier, that this path has
+    a history (#703 review gate).
+
+    A refusal here would be the counter-vs-actuator pattern -- the defect it
+    named is fixed and covered -- but the path DID wedge once, so silence is
+    not right either. Warning, not blocker, per corridor canon: the line exists
+    so that a future regression is attributed in one grep instead of a
+    bisect.
+    """
+    global _DISK_TIER_ARM_WARNED
+    if _DISK_TIER_ARM_WARNED:
+        return
+    if not getattr(server_args, "enable_hierarchical_cache", False):
+        return
+    backend = getattr(server_args, "hicache_storage_backend", None)
+    if not backend:
+        return
+    _DISK_TIER_ARM_WARNED = True
+    logger.warning(
+        "PHASE FLIP arming with a HiCache DISK tier (backend=%r). This "
+        "combination wedged at warmup once (#630: PP x disk HiCache). It is "
+        "ALLOWED because that wedge's root fix -- 9da9dfd025, bounded "
+        "collectives in mem_cache/hicache_collective.py -- is an ancestor of "
+        "this build, and test/registered/unit/mem_cache/"
+        "test_hicache_bounded_waits_630.py is the active protection, not a "
+        "refusal in flip_blocking_guards. If a warmup hang reappears on this "
+        "path, start from that suite and that commit.",
+        backend,
+    )
+
+
 def flip_blocking_guards(scheduler) -> List[str]:
     """Features that refuse flip arming (DESIGN_631 3.7). Mirrors the
     #297 Stage-A guard shape, plus the #630 PP x disk-HiCache wedge."""
@@ -1042,6 +1077,12 @@ def flip_blocking_guards(scheduler) -> List[str]:
     # the KV key's pp suffix, which is a statement about BYTES and belongs with
     # the whole-page format (#706) -- refusing the backend never protected the
     # bytes, it only prevented anyone from reaching them.
+    #
+    # WARNING-NOT-BLOCKER (corridor canon): this path did wedge once for real,
+    # so the first arm that carries a disk tier says so exactly once. If
+    # anything ever regresses here, this line is the attribution -- it names the
+    # defect, the commit that fixed it, and the suite that keeps it fixed.
+    _warn_first_disk_tier_arm(server_args)
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which
     # made the host half of spec items 6/12/15c and the phase flip mutually

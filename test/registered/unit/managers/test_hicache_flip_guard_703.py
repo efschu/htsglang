@@ -159,3 +159,69 @@ class TestHiCacheFlipV1Blocker703(CustomTestCase):
         self.assertIn("dp-size", msg, msg)
         msg = self._blockers(dual_group_lane=True)
         self.assertIn("dual-group", msg, msg)
+
+
+class TestDiskTierFirstArmWarning703(CustomTestCase):
+    """#703 review-gate addition: warning-not-blocker on the disk-tier path.
+
+    The refusal is gone because its defect is fixed and covered. But this path
+    wedged once for real, so the first arm carrying a disk tier announces
+    itself exactly once -- enough for one-grep attribution if it ever regresses,
+    without reinstating a blocker.
+    """
+
+    def setUp(self):
+        from sglang.srt.managers import phase_flip_runtime
+
+        phase_flip_runtime._DISK_TIER_ARM_WARNED = False
+
+    def _arm(self, sched):
+        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+
+        return flip_blocking_guards(sched)
+
+    def test_warns_once_and_does_not_block(self):
+        from sglang.srt.managers import phase_flip_runtime
+
+        sched = _sched(enable_hierarchical_cache=True, hicache_storage_backend="file")
+        with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm:
+            guards = self._arm(sched)
+        self.assertEqual(guards, [], "the warning must NOT become a blocker")
+        joined = "\n".join(cm.output)
+        for token in ("#630", "9da9dfd025", "test_hicache_bounded_waits_630"):
+            self.assertIn(token, joined, f"attribution token {token!r} missing")
+
+        # second arm: silent. assertNoLogs is 3.10+, so assert by counting.
+        with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm2:
+            phase_flip_runtime.logger.warning("sentinel")
+            self._arm(sched)
+        self.assertEqual(
+            [r for r in cm2.output if "#630" in r],
+            [],
+            "the disk-tier warning must fire only on the FIRST arm",
+        )
+
+    def test_silent_without_a_disk_tier(self):
+        """CAN-FAIL BOUNDARY: host-only HiCache must not trip the disk warning.
+        A version that warned unconditionally passes the test above."""
+        from sglang.srt.managers import phase_flip_runtime
+
+        for backend in (None, ""):
+            with self.subTest(backend=backend):
+                phase_flip_runtime._DISK_TIER_ARM_WARNED = False
+                sched = _sched(
+                    enable_hierarchical_cache=True, hicache_storage_backend=backend
+                )
+                with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm:
+                    phase_flip_runtime.logger.warning("sentinel")
+                    self._arm(sched)
+                self.assertEqual([r for r in cm.output if "#630" in r], [])
+
+    def test_silent_when_hierarchical_cache_is_off(self):
+        from sglang.srt.managers import phase_flip_runtime
+
+        sched = _sched(enable_hierarchical_cache=False, hicache_storage_backend="file")
+        with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm:
+            phase_flip_runtime.logger.warning("sentinel")
+            self._arm(sched)
+        self.assertEqual([r for r in cm.output if "#630" in r], [])
