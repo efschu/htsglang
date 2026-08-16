@@ -139,6 +139,10 @@ def _sched(
         return s._avail
 
     s.uniform_min_avail = _uniform_min_avail
+    # A RANK-LOCAL availability that DISAGREES with the group value, so a rung
+    # that read the wrong one produces a different verdict instead of an
+    # AttributeError. Catching the mutation by accident is not catching it.
+    s.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 10 * CHUNK)
     s.kv_session_offload = kvso
     s.admission_limiter = None
     s.server_args = SimpleNamespace(chunked_prefill_size=CHUNK)
@@ -212,6 +216,45 @@ class TheTriggerSpendsNothingWhenComfortableTest(unittest.TestCase):
         with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
             self.assertEqual(s._maybe_spend_admission_relief(_Batch()), 0)
         self.assertEqual(kvso.calls, [])
+
+
+class TheDecisionsAreGroupUniformTest(unittest.TestCase):
+    """Guard (b) of the build brief, and the constraint the whole ladder is
+    shaped by: a rung entered on a RANK-LOCAL size splits the group -- the
+    binding rank relieves, its peers do not, the batches diverge, and the ranks
+    stop agreeing on which collectives run. That is a hang.
+
+    The stub deliberately carries a rank-local availability that DISAGREES with
+    the reduced one (10x the chunk, i.e. comfortable) while the group value is
+    starved. A ladder reading the local number would conclude there is nothing
+    to do and spend no rung at all.
+    """
+
+    def test_a_starved_GROUP_spends_rungs_even_when_this_rank_looks_fine(self):
+        kvso = _Kvso(regions=1)
+        s = _sched(avail=0, kvso=kvso)
+        self.assertGreater(
+            s.token_to_kv_pool_allocator.available_size(),
+            CHUNK,
+            "fixture precondition: this rank must look comfortable locally",
+        )
+        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1, SGLANG_ADMISSION_RELIEF_RETRACT=1):
+            s._maybe_spend_admission_relief(_Batch())
+        self.assertEqual(
+            kvso.calls,
+            [CHUNK],
+            "the ladder read this rank's own pool instead of the group's, so "
+            "a rank whose peers are starved would spend nothing while they do",
+        )
+
+    def test_the_shortfall_is_sized_from_the_GROUP_value(self):
+        """#583 one layer up: ranks that size the ask differently retract
+        different numbers of victims."""
+        kvso = _Kvso(regions=1)
+        s = _sched(avail=200, kvso=kvso)
+        with _Env(SGLANG_ADMISSION_RELIEF_LADDER=1):
+            s._maybe_spend_admission_relief(_Batch())
+        self.assertEqual(kvso.calls, [CHUNK - 200])
 
 
 class TheRungsRunInOrderTest(unittest.TestCase):
