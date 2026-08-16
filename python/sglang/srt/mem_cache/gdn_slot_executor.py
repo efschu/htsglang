@@ -101,10 +101,32 @@ class ExecResult(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
+#: Volatility classes (#711, from the #423 analysis). What a lost blob costs is
+#: the only thing that decides which tier may hold it, so the class travels
+#: with the put rather than being fixed when the store is built.
+RECONSTRUCTIBLE = "reconstructible"
+NON_RECONSTRUCTIBLE = "non_reconstructible"
+VOLATILITY_CLASSES = (RECONSTRUCTIBLE, NON_RECONSTRUCTIBLE)
+
+
 class BlobStore:
     """Where a vacated GDN state waits. Three methods, no lifecycle."""
 
-    def put(self, session_id: str, blob: Any) -> None:
+    def put(
+        self,
+        session_id: str,
+        blob: Any,
+        volatility: Optional[str] = None,
+        tier_hint: Any = None,
+    ) -> None:
+        """Park a blob.
+
+        ``volatility`` names what a loss would cost (#711). ``None`` is the
+        pre-#711 behaviour byte-for-byte: every store keeps whatever placement
+        it had before the class existed, so no caller is forced to classify.
+        ``tier_hint`` overrides resolution entirely, for a caller that already
+        knows the destination.
+        """
         raise NotImplementedError
 
     def pop(self, session_id: str) -> Any:
@@ -129,7 +151,16 @@ class LocalGdnBlobStore(BlobStore):
     def __init__(self) -> None:
         self._blobs: Dict[str, Any] = {}
 
-    def put(self, session_id: str, blob: Any) -> None:
+    def put(
+        self,
+        session_id: str,
+        blob: Any,
+        volatility: Optional[str] = None,
+        tier_hint: Any = None,
+    ) -> None:
+        # The local tier IS the durable-by-locality one: it never leaves the
+        # process, so no class can be mis-placed here. Both arguments are
+        # accepted and ignored, which keeps the interface uniform.
         self._blobs[str(session_id)] = blob
 
     def pop(self, session_id: str) -> Any:
@@ -221,18 +252,75 @@ class TieredGdnBlobStore(BlobStore):
     destination controller does for KV tails.
     """
 
-    def __init__(self, tier, key_fn: Callable[[str], str]):
+    def __init__(
+        self,
+        tier,
+        key_fn: Callable[[str], str],
+        tiers_by_class: Optional[Dict[str, Any]] = None,
+        registry: Any = None,
+    ):
         self._tier = tier
         self._key_fn = key_fn
         self._manifests: Dict[str, Any] = {}
         self._local = LocalGdnBlobStore()
+        # #711: per-CLASS destinations. Empty means "one tier for everything",
+        # which is exactly the pre-#711 store.
+        self._tiers_by_class: Dict[str, Any] = dict(tiers_by_class or {})
+        # #407 registry, consulted only when the explicit map has no answer.
+        self._registry = registry
 
-    def put(self, session_id: str, blob: Any) -> None:
+    def _resolve_tier(self, volatility: Optional[str], tier_hint: Any):
+        """Which tier may hold a blob of this class.
+
+        Order: explicit hint, explicit per-class map, #407 registry, default.
+        Unclassified (``None``) resolves to the default tier, which is what
+        makes the pre-#711 path byte-identical.
+        """
+        if tier_hint is not None:
+            return tier_hint
+        if volatility is None:
+            return self._tier
+        if volatility not in VOLATILITY_CLASSES:
+            raise ValueError(
+                f"unknown volatility class {volatility!r}; known classes are "
+                f"{list(VOLATILITY_CLASSES)}. Refusing to place a blob whose "
+                "loss cost is not stated -- a typo here would silently pick "
+                "the default tier, which is the failure #711 exists to remove."
+            )
+        if volatility in self._tiers_by_class:
+            return self._tiers_by_class[volatility]
+        if self._registry is not None:
+            chosen = self._registry.tier_for_class(volatility)
+            if chosen is not None:
+                return chosen
+        if volatility == NON_RECONSTRUCTIBLE:
+            # No durable destination was configured for state whose loss KILLS
+            # the request. Staying local is strictly safer than shipping it to
+            # a tier that may lose it independently: local dies only with the
+            # process, which is already fatal for the session.
+            return None
+        return self._tier
+
+    def put(
+        self,
+        session_id: str,
+        blob: Any,
+        volatility: Optional[str] = None,
+        tier_hint: Any = None,
+    ) -> None:
         sid = str(session_id)
+        tier = self._resolve_tier(volatility, tier_hint)
+        if tier is None:
+            self._local.put(sid, blob)
+            return
         try:
             manifest, flat = flatten_blob(blob)
-            if self._tier.put(self._key_fn(sid), flat):
-                self._manifests[sid] = (manifest, flat.numel())
+            if tier.put(self._key_fn(sid), flat):
+                # #711: record the DESTINATION, not just the manifest. With
+                # per-class tiers the writer and the default are no longer the
+                # same object, and popping from the default would report a
+                # perfectly good blob as unrecoverable.
+                self._manifests[sid] = (manifest, flat.numel(), tier)
                 return
         except Exception as exc:  # noqa: BLE001 -- tier failure = stay local
             logger.warning(
@@ -250,12 +338,12 @@ class TieredGdnBlobStore(BlobStore):
         sid = str(session_id)
         if self._local.has(sid):
             return self._local.pop(sid)
-        manifest, nbytes = self._manifests.pop(sid)
+        manifest, nbytes, tier = self._manifests.pop(sid)
         buf = torch.zeros(nbytes, dtype=torch.uint8)
-        if not self._tier.get_into(self._key_fn(sid), buf):
+        if not tier.get_into(self._key_fn(sid), buf):
             raise GdnSlotError(
                 f"GDN state blob for session {sid} is not readable from tier "
-                f"{getattr(self._tier, 'name', '?')!r}. The session's "
+                f"{getattr(tier, 'name', '?')!r}. The session's "
                 "recurrent state is unrecoverable from here; failing loudly "
                 "instead of resuming it on a zeroed slot."
             )
