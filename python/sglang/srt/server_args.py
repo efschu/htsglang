@@ -7760,12 +7760,13 @@ class ServerArgs:
         # runtime clause is not enough -- this one refuses at parse time, before
         # a scheduler exists, so both must move together or the flag is still
         # unusable.
-        if self.enable_hierarchical_cache and self.hicache_storage_backend:
-            blockers.append(
-                "--enable-hierarchical-cache with --hicache-storage-backend "
-                f"{self.hicache_storage_backend!r} (#630: PP x disk HiCache "
-                "wedges at warmup)"
-            )
+        # #703 stage 2: the #630 blocker is REMOVED, matching its runtime twin
+        # in phase_flip_runtime.flip_blocking_guards. The disk tier is the
+        # retention store the design needs (user decision: disk is plentiful,
+        # host RAM is not), and the wedge that earned this blocker was fixed by
+        # 9da9dfd025 with a green suite. See the comment at the runtime clause
+        # for why the pp-suffix decision, not the backend allowance, is the
+        # thing that stays gated on #706's whole-page format.
         if getattr(self, "dual_group_lane", False):
             blockers.append("--dual-group-lane")
         if self.dp_size > 1:

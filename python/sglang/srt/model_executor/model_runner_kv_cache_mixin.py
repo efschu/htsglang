@@ -893,9 +893,16 @@ class ModelRunnerKVCacheMixin:
         # must agree and are computed twice is a shape this corpus has paid for
         # repeatedly; here the second computation lives in a different process
         # and could not even be compared.
+        # World rank, not tp_rank: under the flip's primary topology (tp=1,
+        # pp=N) every PP stage has tp_rank 0, so labelling with tp_rank names
+        # stage 0's card three times -- the #201 defect the budget-exhausted
+        # path already guards against a few lines below. Confirmed on metal:
+        # the first boot carrying this line emitted "[rank 0]" for PP0, PP1 and
+        # PP2 alike. _rank_vector_index() is the existing accessor and falls
+        # back to tp_rank when server_args is stubbed.
         logger.info(
-            "[rank %d] KV budget posts (GiB): %s | rest=%.3f",
-            self.tp_rank,
+            "[world_rank %d] KV budget posts (GiB): %s | rest=%.3f",
+            self._rank_vector_index(),
             ", ".join(f"{name}={gb:.3f}" for name, gb in budget_posts),
             rest_memory,
         )
