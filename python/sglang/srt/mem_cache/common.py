@@ -527,6 +527,31 @@ def fundable_extend_tokens(tree_cache) -> int:
     return max(0, avail) + max(0, evictable)
 
 
+def published_fundable_floor(tree_cache) -> Optional[int]:
+    """`fundable_extend_tokens`, but ONLY when a group floor was published.
+
+    #681. The chunked gate one function up may safely read a 0 from
+    `fundable_extend_tokens`: 0 means "park this chunk and retry next round",
+    a self-clearing state. The NEW-request gate uses the same number as a
+    BUDGET CEILING, and there a spurious 0 is not a park -- it admits nothing,
+    for every request, on every subsequent round. A read failure would wedge
+    the instance harder than the crash this ticket is about.
+
+    `fundable_extend_tokens` cannot distinguish "the pool really is empty"
+    from "the pool could not be read": every failure path returns 0. So the
+    ceiling is applied only when the scheduler actually PUBLISHED a group
+    floor -- i.e. the ranks' pools are uneven, which is the one state the
+    ceiling exists for. With no floor (single rank, or pools that agree) the
+    local budget is already the group's budget, the ceiling adds nothing, and
+    returning None keeps the reference boot byte-identical.
+    """
+    if tree_cache is None:
+        return None
+    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+        return None
+    return fundable_extend_tokens(tree_cache)
+
+
 #: #679 rung 1-3: may an admission spend RELIEF before it parks?
 #:
 #: OFF BY DEFAULT, and the default is the whole compatibility argument: with
