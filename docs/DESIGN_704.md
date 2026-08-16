@@ -1084,6 +1084,74 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #701 WIRING — landed (defect b only), plus the flip spec for F4-r4
+
+### What is wired
+
+`ChunkedCommitmentLedger` is now visible to `PrefillAdder`, flag-gated
+**default ON** (`chunked_admission_enabled`). Off restores the pre-#701
+arithmetic byte-for-byte, so the flag is the A/B arm for a reviewed window.
+
+**The ledger is owned by the SCHEDULER, never by the adder.** A `PrefillAdder`
+is rebuilt every pass, so anything it held itself would forget a resident
+chunked request's outstanding prefill exactly when the next pass needs it —
+which *is* defect (b). It is passed in and never constructed there.
+
+The subtraction lands at the single chokepoint, `rem_total_tokens`, via
+`effective_rem_total_tokens(budget, ledger)`. That covers **all four sibling
+sites at once** (`:1569-1610`, `:1388-1407`, `:1230-1276`, `:1124-1141`),
+because every one of them reads that property rather than recomputing the
+budget. The diff is 4 hunks; `:734-737` is deliberately **untouched** so the
+merge train with Slot-2's branch stays clean.
+
+Falsifier: the **two-actor** deadlock through the real `PrefillAdder`. A
+resident request commits 80,000 tokens; a *fresh* adder (the rebuild) then
+reports 100,000 unwired and 20,000 wired. Spending returns the budget
+incrementally; release returns it fully; a missing ledger is not an error.
+
+### Defect (a) is NOT wired, and that is deliberate
+
+An earlier draft priced `rem_total_tokens` against "actually recoverable"
+rather than `full_evictable_size()`. **That hypothesis is refuted** (#694,
+Slot-2 `704240ce83`): evictable and protected are **disjoint by construction**
+— `inc_lock_ref` moves tokens out of `evictable_size_` into `protected_size_`
+(`radix_cache.py:605-606`) — and the readable specimen's LRU evictable size
+matched an independent traversal exactly. The real root was a **stale floor**
+(`uniform_avail_for_evict` published once per iteration, never charged by later
+allocations), fixed on Slot-2's branch. The change and its tests were reverted
+rather than left passing against a mock of a distinction the code does not
+make.
+
+### Integration spec for F4-r4 — what the flip controller must ask
+
+Not built here by boundary: `phase_flip_runtime` and the idle-flip integration
+stay with F4-r4. The contract is small:
+
+1. **Before arming a flip, ask the ledger whether the instance is idle.**
+   `deferred_head_blocks_idle_flip(deferred_head_count)` returns True when the
+   head of the queue is deferred. A deferred head is **pending work, not
+   idleness**: `effective_running_bs` counts resident chunked requests but not
+   deferred-waiting ones, so without this check a flip can park an instance
+   that has work it has not yet served.
+2. **Count resident chunked requests into the running batch size.**
+   `effective_running_bs(running_bs, resident_chunked)` — #631 defect O: a
+   resident-but-batchless chunked request appears in no `running_batch.reqs`,
+   so a raw count reads zero while the request is mid-prefill.
+3. **The flip must not strand an outstanding commitment.** `outstanding_tokens()`
+   is non-zero exactly while some request's prefill is unfinished. Arming a
+   layout change across that is the #690 seam move applied to KV that is still
+   being written; the safe rule is to drain or refuse, and which one is F4-r4's
+   call since he owns the window economics.
+
+None of these require the ledger to move; they are three read-only questions
+against an object the scheduler already holds.
+
+### If a third site appears
+
+Per the standing instruction: any further place where `rem_total_tokens` is
+funded by a quantity the relief path cannot deliver is to be **reported with
+file:line, not fixed inline**. None found beyond the two defects above.
+
 ## #701 — RETRACTED. My analysis re-derived a story the tree had already refuted.
 
 **This section previously carried a reachability analysis concluding

@@ -47,6 +47,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.planner.chunked_admission import (
+    ChunkedCommitmentLedger,
+    effective_rem_total_tokens,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -617,7 +621,17 @@ class PrefillAdder:
         prefill_spill_region_tokens: int = 0,
         prefill_spill_deep: bool = False,
         fundable_extend_floor: Optional[int] = None,
+        commitment_ledger: Optional[ChunkedCommitmentLedger] = None,
+        chunked_admission_enabled: bool = True,
     ):
+        # #701 defect (b). The ledger is owned by the SCHEDULER, not by this
+        # adder: a PrefillAdder is rebuilt every pass, so anything held here
+        # would forget a resident chunked request's outstanding prefill exactly
+        # when the next pass needs to see it. Passed in, never constructed here.
+        self.commitment_ledger = commitment_ledger
+        # DEFAULT ON: a wedge is strictly worse than a refusal. Off restores the
+        # pre-#701 arithmetic byte-for-byte, for A/B on a reviewed window.
+        self.chunked_admission_enabled = bool(chunked_admission_enabled)
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -841,10 +855,21 @@ class PrefillAdder:
         # IS, so the floor is spent down by this round's admissions exactly as
         # the local term is. None -> no reduce published -> untouched.
         if self.fundable_extend_floor is None:
-            return local_budget
-        return min(
-            local_budget, self.fundable_extend_floor - self.rem_total_token_offset
-        )
+            budget = local_budget
+        else:
+            budget = min(
+                local_budget, self.fundable_extend_floor - self.rem_total_token_offset
+            )
+        # #701 defect (b): CROSS-PASS RESERVATION. PrefillAdder is rebuilt every
+        # pass and reserves only remaining DECODE, so a resident chunked
+        # request's remaining PREFILL is invisible here and later admissions
+        # spend its committed future -- the two-actor deadlock. The ledger is
+        # scheduler-owned and survives the rebuild, so subtracting it is what
+        # makes the commitment visible across passes. Single chokepoint: every
+        # sibling admission site reads this property.
+        if not self.chunked_admission_enabled:
+            return budget
+        return effective_rem_total_tokens(budget, self.commitment_ledger)
 
     @property
     def rem_swa_tokens(self):

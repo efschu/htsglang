@@ -231,3 +231,64 @@ class TheDeferredHeadIsVisibleToTheFlip(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# WIRING falsifiers (#701). Both defects, through the REAL PrefillAdder, red on
+# unwired (chunked_admission_enabled=False) and green on wired. The flag is the
+# A/B arm, so each test asserts the SAME adder both ways.
+# ---------------------------------------------------------------------------
+
+
+# NOTE (#694, Slot-2 704240ce83): an earlier draft of this block tested a
+# "paper-evictable vs recoverable" distinction. That hypothesis is REFUTED --
+# evictable and protected are DISJOINT by construction (inc_lock_ref moves
+# tokens out of evictable_size_ into protected_size_, radix_cache.py:605-606),
+# and the readable specimen's LRU evictable size matched an independent
+# traversal exactly. The real #694 root was a STALE FLOOR
+# (uniform_avail_for_evict published once per iteration and never charged by
+# later allocations), fixed on Slot-2's branch. Those tests are removed rather
+# than left passing against a mock of a distinction the code does not make.
+
+
+class TheTwoActorDeadlockAcrossPasses(unittest.TestCase):
+    """#701 defect (b). A resident chunked request's committed future must be
+    visible to a LATER pass, whose PrefillAdder is a fresh object."""
+
+    def _fresh_pass(self, ledger, enabled):
+        # A NEW adder each pass, exactly as the scheduler builds it. Anything
+        # the adder held itself would be forgotten here -- which is the bug.
+        return _adder(
+            _tree_cache(evictable=0),
+            _allocator(available=100_000),
+            commitment_ledger=ledger,
+            chunked_admission_enabled=enabled,
+        )
+
+    def test_unwired_a_later_pass_spends_the_resident_request_s_future(self):
+        led = ChunkedCommitmentLedger()
+        led.commit("resident", 80_000)  # actor 1, mid-prefill
+        adder = self._fresh_pass(led, enabled=False)
+        # Actor 2 sees the whole pool and will admit on top of a commitment
+        # that is already spoken for.
+        self.assertEqual(adder.rem_total_tokens, 100_000)
+
+    def test_wired_the_commitment_survives_the_rebuild(self):
+        led = ChunkedCommitmentLedger()
+        led.commit("resident", 80_000)
+        adder = self._fresh_pass(led, enabled=True)
+        self.assertEqual(adder.rem_total_tokens, 20_000)
+
+    def test_spending_the_commitment_returns_the_budget(self):
+        """As chunks commit, the reservation shrinks and the budget recovers."""
+        led = ChunkedCommitmentLedger()
+        led.commit("resident", 80_000)
+        led.spend("resident", 30_000)
+        self.assertEqual(self._fresh_pass(led, True).rem_total_tokens, 50_000)
+        led.release("resident")
+        self.assertEqual(self._fresh_pass(led, True).rem_total_tokens, 100_000)
+
+    def test_no_ledger_is_not_an_error(self):
+        """A caller that has not wired the ledger yet must not crash."""
+        adder = self._fresh_pass(None, enabled=True)
+        self.assertEqual(adder.rem_total_tokens, 100_000)
