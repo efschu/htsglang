@@ -473,6 +473,21 @@ class BudgetHarness:
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
     _local_host_avail = Scheduler._local_host_avail
     _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
+    # #639b: the reduce grew a MAMBA pair, the same way #616g and #639 grew
+    # theirs, and the same way it was missed both previous times -- both
+    # admission cases failed with
+    # ``AttributeError: 'BudgetHarness' object has no attribute
+    # '_local_mamba_avail'``. This harness has no ``req_to_token_pool``, so
+    # the production reader finds no allocator and the sentinel rides,
+    # exactly as it does for the host tier above.
+    #
+    # ``_publish_uniform_mamba_floor`` was NOT the attribute that failed: it
+    # was the next one queued to fail, found by the drift guard below rather
+    # than by a fourth red. Binding only the reported name would have shipped
+    # the same incident again.
+    _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
+    _local_mamba_avail = Scheduler._local_mamba_avail
+    _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
     if hasattr(Scheduler, "uniform_budget_deficit"):
@@ -587,3 +602,92 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# S3b -- the harness must track the production surface (#624 stub drift)
+# ---------------------------------------------------------------------------
+
+
+def _self_attributes_read_by(func) -> set:
+    """Names this function reads off ``self`` (assignment targets excluded).
+
+    Source-level on purpose. The drift being caught is "someone added a
+    ``self.X`` to the reduce and did not bind X on the harness", and that is a
+    property of the method's TEXT. Executing the method to find out would need
+    the very stand-in whose completeness is in question.
+    """
+    import inspect
+    import re
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(func))
+    assigned = set(re.findall(r"self\.([A-Za-z_]\w*)\s*=", src))
+    return set(re.findall(r"self\.([A-Za-z_]\w*)", src)) - assigned
+
+
+class TheHarnessTracksTheProductionSurface(unittest.TestCase):
+    """#624 stub-drift class, closed for this harness.
+
+    ``BudgetHarness`` binds a hand-written subset of ``Scheduler``. Three times
+    now the reduce has grown a member and the subset has not: #616g added
+    ``_publish_uniform_evict_floor``, #639 the HOST pair, #639b the MAMBA pair.
+    Each was found by both admission cases going red with an ``AttributeError``
+    naming ONE attribute, which is the worst possible signal -- it reports the
+    first missing name, not the set, so fixing it can leave the next one
+    queued. That is exactly what happened here: the red named
+    ``_local_mamba_avail`` while ``_publish_uniform_mamba_floor`` was also
+    missing.
+
+    So the harness is checked against the real method instead of against the
+    last incident. A member added to the reduce and not bound here fails THIS
+    case, with the full list, before it can fail the admission cases with a
+    single name.
+
+    SCOPE, STATED. Direct ``self.X`` in ``_update_uniform_pool_budget``, plus
+    one level through the Scheduler methods it calls (which is what carries
+    the sentinel constants like ``_MAMBA_AVAIL_ABSENT``). Deeper transitive
+    reads are not covered: every one of the three incidents was a direct
+    member of the reduce, and a guard that tried to close the whole transitive
+    surface would fail on attributes the harness legitimately never needs.
+    """
+
+    def _required(self) -> set:
+        needed = _self_attributes_read_by(Scheduler._update_uniform_pool_budget)
+        # One level down, through the helpers the reduce itself calls.
+        for name in sorted(needed):
+            member = getattr(Scheduler, name, None)
+            if callable(member):
+                needed = needed | _self_attributes_read_by(member)
+        return needed
+
+    def test_every_member_the_reduce_touches_is_on_the_harness(self):
+        harness = BudgetHarness(None, 1, 1)
+        missing = sorted(n for n in self._required() if not hasattr(harness, n))
+        self.assertEqual(
+            missing,
+            [],
+            "BudgetHarness has drifted behind Scheduler._update_uniform_pool_budget: "
+            f"{missing}. Bind these from Scheduler (or give the harness a "
+            "stand-in field) so the admission cases keep exercising the real "
+            "contract instead of failing with an AttributeError.",
+        )
+
+    def test_the_guard_can_fail(self):
+        """A drift detector that cannot report a drift is decoration.
+
+        Stands in for the next incident: the reduce grows a member nothing has
+        bound. The guard must name it rather than pass.
+        """
+        harness = BudgetHarness(None, 1, 1)
+        required = self._required() | {"_a_member_added_next_quarter"}
+        missing = sorted(n for n in required if not hasattr(harness, n))
+        self.assertEqual(missing, ["_a_member_added_next_quarter"])
+
+    def test_the_extractor_separates_reads_from_writes(self):
+        """``_uniform_min_avail`` is ASSIGNED by the reduce, not read from the
+        harness. Counting it would demand a binding that must not exist."""
+        reads = _self_attributes_read_by(Scheduler._update_uniform_pool_budget)
+        self.assertNotIn("_uniform_min_avail", reads)
+        self.assertNotIn("_uniform_budget_deficit", reads)
+        self.assertIn("_local_mamba_avail", reads)
