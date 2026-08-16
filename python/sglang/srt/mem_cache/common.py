@@ -408,16 +408,30 @@ def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
     """
     if evicted >= asked:
         return ""
-    try:
-        evictable = int(tree_cache.evictable_size())
-    except Exception:  # noqa: BLE001 - a diagnostic must not raise
-        evictable = -1
+    #: `evictable_size()` RAISES NotImplementedError on MambaRadixCache and
+    #: SWARadixCache -- both split the count in two and say so -- and that is
+    #: the class this note was written for, so the original single call
+    #: reported -1 on exactly the boot it was meant to explain. Ask for the
+    #: full-attention count first and fall back only for the flat classes.
+    evictable = -1
+    for name in ("full_evictable_size", "evictable_size"):
+        getter = getattr(tree_cache, name, None)
+        if getter is None:
+            continue
+        try:
+            evictable = int(getter())
+            break
+        except Exception:  # noqa: BLE001 - a diagnostic must not raise
+            continue
     return (
         f"\nEVICTION UNDER-DELIVERED: asked for {asked} tokens, freed "
-        f"{evicted}. The tree still reports {evictable} evictable tokens, but "
-        f"`evict` can only reach the LEAF FRONTIER -- tokens behind a locked "
-        f"chain are counted and unreachable. This is the failure, not a full "
-        f"pool: admission budgeted against a count the actuator cannot pay."
+        f"{evicted}. The tree still reports {evictable} evictable tokens. "
+        f"THIS LINE SHOULD BE UNREACHABLE: since #681 the frontier can pay "
+        f"every unlocked leaf it selects (mamba tombstone leaves included), so "
+        f"the count and the actuator's capability agree. If you are reading "
+        f"it, treat it as a REGRESSION SIGNAL -- a new class of node is being "
+        f"counted that the peel cannot consume -- not as the expected shape of "
+        f"an out-of-memory."
     )
 
 
@@ -938,11 +952,17 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int) -
             #   Try to allocate 512 tokens.
             #   Available full tokens: 66039 (available=273 + evictable=65766)
             # 512 needed, 65766 reported evictable, allocation failed anyway.
-            # ``evict`` walks the LEAF FRONTIER -- it pops evictable leaves and
-            # re-pushes a parent only once all its children are gone and it is
-            # unlocked -- while ``evictable_size_`` counts unlocked tokens
-            # ANYWHERE in the tree. Tokens behind a locked chain are counted and
-            # unreachable, so the counter promises what the actuator cannot pay.
+            # #681 FOLLOW-UP, CORRECTING THIS COMMENT'S FIRST VERSION: the gap
+            # was NOT "tokens behind a locked chain". Locking walks a node to
+            # the ROOT and `_split_node` copies the ref onto the new upper half,
+            # so an unlocked node can never have a locked descendant and the
+            # peel always reaches it -- pinned by
+            # test_evictable_reachability_681.TestLockRefsAreAncestorClosed.
+            # The real gap was at the other end of the frontier: an unlocked
+            # MAMBA TOMBSTONE LEAF was counted, was selected first, and made
+            # `_evict_leaf_node` ASSERT rather than under-deliver. That is now
+            # paid in `MambaRadixCache.evict_full`, so the receipt below should
+            # always equal the request.
             result = tree_cache.evict(EvictParams(num_tokens=num_tokens))
             return int(getattr(result, "num_tokens_evicted", 0) or 0)
     return 0

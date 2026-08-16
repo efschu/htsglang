@@ -399,7 +399,22 @@ class TheEvictionReceiptIsReadTest(unittest.TestCase):
         self.assertIn("UNDER-DELIVERED", note)
         self.assertIn("512", note)
         self.assertIn("65766", note)
-        self.assertIn("LEAF FRONTIER", note)
+        # The first version of this assertion pinned the wording "LEAF
+        # FRONTIER", i.e. the #681 explanation that tokens behind a LOCKED
+        # chain were counted but unreachable. That explanation is false --
+        # locking is ancestor-closed, so an unlocked node never has a locked
+        # descendant (test_evictable_reachability_681). Pinning a wrong
+        # mechanism in a diagnostic is worse than pinning none, so what is
+        # pinned now is the property the note must carry: that firing at all
+        # is a REGRESSION, because the frontier can pay what the counter
+        # promises.
+        self.assertIn("REGRESSION SIGNAL", note)
+        self.assertIn("UNREACHABLE", note)
+        self.assertNotIn(
+            "behind a locked chain",
+            note,
+            "the falsified mechanism must not come back",
+        )
 
     def test_a_delivering_eviction_adds_no_note(self):
         self.assertEqual(

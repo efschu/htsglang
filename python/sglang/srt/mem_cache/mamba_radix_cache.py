@@ -1041,8 +1041,41 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
-            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
-            full_num_evicted += full_num_evicted_delta
+            if x.mamba_value is None:
+                # #681: AN UNLOCKED TOMBSTONE LEAF, WHICH THE SELECTOR OFFERS
+                # AND THE OLD CONSUMER REFUSED.
+                #
+                # `get_leaf_lru_no_lock` asks for unlocked and childless;
+                # `_evict_leaf_node` additionally demands a mamba value and
+                # asserted when it was missing. That combination is reachable
+                # WITHOUT any invariant being broken:
+                # `_iteratively_delete_tombstone_leaf` breaks on
+                # `node.parent.full_lock_ref > 0`, so a tombstone that loses
+                # its last child while a request holds it survives as a LOCKED
+                # tombstone leaf -- and when that request finishes, nothing
+                # revisits it. It is then unlocked, childless, counted in
+                # `full_evictable_size_`, and first in line at the frontier.
+                #
+                # Measured 2026-08-16 01:46:10: the tree all three ranks
+                # printed held exactly one (node 5937 -- fr=0, mv=None,
+                # childless, in the full LRU list). Replaying that dumped tree
+                # through this function selects it and dies on the assert,
+                # which kills the whole group over a state the cache itself
+                # produced and can perfectly well pay.
+                #
+                # Freeing it here is not a new capability: it is the same
+                # deletion `_iteratively_delete_tombstone_leaf` would have
+                # performed one step earlier, taken now that the lock which
+                # deferred it is gone. Deliberately NOT extended past a lock --
+                # a LOCKED tombstone leaf is still refused, because reaching
+                # behind a live reference is a different repair.
+                x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
+                full_num_evicted += self._free_tombstone_leaf(x)
+                x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
+                full_num_evicted += leaf_full_num_evicted
+            else:
+                full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
+                full_num_evicted += full_num_evicted_delta
 
             # if parent has no more children, it is a leaf. It is possible that this node is lru, so
             # we need to get the first leaf node in the lru list
@@ -1645,18 +1678,35 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # if locked, means node is in use, skip
             if node.parent.full_lock_ref > 0:
                 break
-            assert (
-                node.parent.mamba_lock_ref == 0
-            ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
-            self.full_lru_list.remove_node(node.parent)
-            self._delete_tombstone_leaf(node.parent)
+            full_num_evicted += self._free_tombstone_leaf(node.parent)
             node = node.parent
 
         return node, full_num_evicted
+
+    def _free_tombstone_leaf(self, node: TreeNode) -> int:
+        """Free one UNLOCKED, childless mamba tombstone. Returns tokens freed.
+
+        The single place a tombstone leaf is paid for, shared by the cleanup
+        walk above and by the ``evict_full`` frontier (#681), so both routes
+        keep ``full_evictable_size_`` and the LRU list in step by construction.
+        """
+        assert (
+            node.mamba_value is None
+        ), f"not a tombstone, {node.id=}, {len(node.mamba_value)=}"
+        assert len(node.children) == 0, f"tombstone is not a leaf, {node.id=}"
+        assert (
+            node.full_lock_ref == 0
+        ), f"tombstone is locked, {node.id=}, {node.full_lock_ref=}"
+        assert (
+            node.mamba_lock_ref == 0
+        ), f"tombstone mamba_lock_ref should always be 0, {node.full_lock_ref=}, {node.mamba_lock_ref=}, {node.id=}"
+        self._record_remove_event(node)
+        self.token_to_kv_pool_allocator.free(node.value)
+        freed = len(node.value)
+        self.full_lru_list.remove_node(node)
+        self._delete_tombstone_leaf(node)
+        return freed
 
     def _delete_leaf(self, node: TreeNode) -> None:
         assert (
