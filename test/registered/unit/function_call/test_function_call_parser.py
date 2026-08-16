@@ -2215,6 +2215,149 @@ class TestQwen3CoderDetector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+    # ==================== Malformed tool-call structure ====================
+    # The streaming state machine used to act on <function=>, <parameter=>
+    # and </function> wherever those literals appeared, without checking
+    # that a tool call — let alone a NAMED one — was actually open. Each
+    # test below reproduces a shape observed in production serving logs
+    # where that produced a nameless tool call at tool_index=-1, i.e. an
+    # argument fragment with nothing to attach it to downstream.
+
+    def _stream(self, chunks, tools=None):
+        """Feed chunks to a fresh detector; return (calls, normal_text)."""
+        detector = Qwen3CoderDetector()
+        calls = []
+        text = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(
+                chunk, self.tools if tools is None else tools
+            )
+            calls.extend(result.calls)
+            if result.normal_text:
+                text.append(result.normal_text)
+        return calls, "".join(text)
+
+    def test_function_end_without_open_function_emits_no_call(self):
+        """A stray </function> must not fabricate a nameless tool call.
+
+        Specimen: "Dropping tool_call argument delta with no open tool_use
+        block: '{'" immediately followed by the same for '}'.
+        """
+        calls, _ = self._stream(["<tool_call>", "</function>", "</tool_call>"])
+
+        self.assertEqual(
+            calls,
+            [],
+            f"a </function> with no open function must emit nothing: {calls}",
+        )
+
+    def test_parameter_without_open_function_emits_no_call(self):
+        """A stray <parameter=> must not fabricate a nameless tool call.
+
+        Specimen: "Tool 'None' is not defined in the tools list." followed
+        by a dropped argument fragment.
+        """
+        calls, _ = self._stream(
+            [
+                "<tool_call>",
+                "<parameter=command>",
+                "ls -la",
+                "</parameter>",
+                "</tool_call>",
+            ]
+        )
+
+        self.assertEqual(
+            calls,
+            [],
+            f"a <parameter=> with no open function must emit nothing: {calls}",
+        )
+
+    def test_no_call_ever_carries_a_negative_tool_index(self):
+        """tool_index=-1 is the uninitialised value, never a real call."""
+        calls, _ = self._stream(
+            [
+                "<tool_call>",
+                "</function>",
+                "<parameter=x>1</parameter>",
+                "</tool_call>",
+            ]
+        )
+
+        self.assertEqual(
+            [c for c in calls if c.tool_index < 0],
+            [],
+            "no emitted call may carry the uninitialised tool_index",
+        )
+
+    def test_unknown_function_name_does_not_open_a_tool_call(self):
+        """Specimen 2026-08-16 20:50:18: a tool_use block named "command".
+
+        The model wrote <function=command> where "command" is a PARAMETER
+        of the intended tool, not a tool. The detector committed to the
+        name and streamed a name delta before the mismatch was noticed one
+        parameter later, so a tool call that does not exist reached the
+        client as a genuine invocation.
+        """
+        calls, text = self._stream(
+            [
+                "<tool_call>",
+                "<function=command>",
+                "<parameter=foo>bar</parameter>",
+                "</function>",
+                "</tool_call>",
+            ]
+        )
+
+        self.assertEqual(
+            [c.name for c in calls if c.name],
+            [],
+            f"an undefined tool name must not be emitted as a call: {calls}",
+        )
+        self.assertIn(
+            "command",
+            text,
+            "the rejected block must survive as text rather than vanish",
+        )
+
+    def test_tags_outside_a_tool_call_block_stay_text(self):
+        """<function=...> outside <tool_call> is prose, not an invocation.
+
+        detect_and_parse only ever matches inside <tool_call>...</tool_call>;
+        the streaming path has to agree or the two disagree on what counts
+        as a tool call.
+        """
+        calls, text = self._stream(
+            ["The syntax is ", "<function=get_current_weather>", " in the template."]
+        )
+
+        self.assertEqual(
+            calls, [], f"tags outside a tool_call block must not emit calls: {calls}"
+        )
+        self.assertIn("get_current_weather", text)
+
+    def test_well_formed_call_is_unchanged(self):
+        """Control: the happy path must keep its exact delta sequence."""
+        calls, _ = self._stream(
+            [
+                "<tool_call>",
+                "<function=get_current_weather>",
+                "<parameter=location>Boston</parameter>",
+                "</function>",
+                "</tool_call>",
+            ]
+        )
+
+        self.assertEqual(
+            [(c.tool_index, c.name, c.parameters) for c in calls],
+            [
+                (0, "get_current_weather", ""),
+                (0, None, "{"),
+                (0, None, '"location": "Boston"'),
+                (0, None, "}"),
+            ],
+        )
+
 
 class TestGptOssDetector(unittest.TestCase):
     def setUp(self):
