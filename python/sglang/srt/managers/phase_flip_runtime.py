@@ -5065,8 +5065,10 @@ class PhaseFlipRuntime:
                 logger.info(
                     "%s seam staging asked the corridor guard for %.0f MiB "
                     "(%s): ok=%s, spendable now %.0f MiB against a need of "
-                    "%.0f MiB. The binding rank's inactive-layout arena is the "
-                    "occupant this ask exists to reclaim.",
+                    "%.0f MiB. ok=False here means the ladder RELEASED nothing "
+                    "(must_reclaim judges the delta, not the free column), so "
+                    "the shortfall is real and every registered provider is "
+                    "dry.",
                     LOG_PREFIX,
                     shortfall / (1024 * 1024),
                     direction,
