@@ -454,6 +454,24 @@ class HiCacheController:
                     "Weighted uneven-DCP HiCache storage requires page_size == 1, "
                     f"got {self.page_size}."
                 )
+        # #706 whole-page protocol: same two conditions, for the layer axis.
+        # Only the file backend can assemble one page from several stages
+        # (partial byte-range writes), and a canonical page is ONE token's
+        # attention layers. The boot-time twin of this check lives in
+        # ServerArgs._handle_phase_flip; both exist because this one also
+        # covers a storage backend attached at RUNTIME, where no ServerArgs
+        # validation runs.
+        if self.storage_config.canonical_kv_page is not None:
+            if storage_backend != "file":
+                raise NotImplementedError(
+                    "The #706 canonical KV page currently supports only the "
+                    f"'file' backend, got '{storage_backend}'."
+                )
+            if self.page_size != 1:
+                raise NotImplementedError(
+                    "The #706 canonical KV page requires page_size == 1, got "
+                    f"{self.page_size}."
+                )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -634,6 +652,34 @@ class HiCacheController:
             else None
         )
 
+        # #706: this rank's window in the geometry-neutral page. Built only
+        # when the format is switched on, and built from the pools that KNOW
+        # their global layer ids -- never inferred from a layer count, because
+        # the host pool's own start_layer is 0 on every PP stage.
+        canonical_kv_page = None
+        if server_args is not None and getattr(
+            server_args, "phase_flip_canonical_kv_page", False
+        ):
+            from sglang.srt.mem_cache.canonical_page_store import build_page_window
+
+            model_config = server_args.get_model_config()
+            attn_layer_ids = getattr(model_config, "full_attention_layer_ids", None)
+            if not attn_layer_ids:
+                # A model with no hybrid split: every layer carries KV, so the
+                # attention-layer list is the layer list.
+                attn_layer_ids = list(range(int(model_config.num_hidden_layers)))
+            canonical_kv_page = build_page_window(
+                attn_layer_ids, self.mem_pool_device, self.mem_pool_host
+            )
+            logger.info(
+                "#706 canonical KV page active: slots [%d, %d) of %d, %d B per "
+                "slot; KV keys carry content only (no tp/pp suffix).",
+                canonical_kv_page.first_slot,
+                canonical_kv_page.first_slot + canonical_kv_page.num_slots,
+                canonical_kv_page.spec.num_attn_layers,
+                canonical_kv_page.cell_bytes,
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -653,6 +699,8 @@ class HiCacheController:
             # Weighted uneven-DCP: KV pages are token-sharded with FULL
             # replicated kv-heads -> owner-written, rank-shared page files.
             dcp_owner_mode=self._dcp_owner_ctx() is not None,
+            # #706: full-width pages, stage-offset writes, suffix-free KV keys.
+            canonical_kv_page=canonical_kv_page,
         )
 
     def reset(self):

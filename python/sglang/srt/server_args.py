@@ -5504,6 +5504,31 @@ class ServerArgs:
             "fallback SGLANG_PHASE_FLIP_SPILL_DEPTH.",
         ),
     ] = None
+    phase_flip_canonical_kv_page: A[
+        bool,
+        Arg(
+            help="#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL "
+            "whole-page format, so tokens produced by the same model do not "
+            "miss between the PP prefill phase and the TP decode phase, or "
+            "across a reboot. A stored page carries EVERY attention layer of "
+            "one token (page_size 1, layer-major, global layer order); each PP "
+            "stage deposits only its own slots at their global offset into one "
+            "shared page and a completeness marker keeps the page invisible "
+            "until the last slot arrives. Because the bytes then stop "
+            "depending on the cut, the KV key drops BOTH geometry suffixes "
+            "(_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}) and carries "
+            "content alone -- the same argument weighted uneven-DCP already "
+            "used on the token axis, and the reason this is gated on the "
+            "format rather than applied to every PP run: the key carries "
+            "exactly the geometry the bytes still depend on. Draft pages are "
+            "excluded by name (head-sharded and token-complete, so no suffix "
+            "rule can neutralise them: the draft pool starts cold after a flip "
+            "and a cross-phase hit is PARTIAL by design), and component "
+            "(mamba/SWA) pools keep their per-rank keys. Requires "
+            "--enable-phase-flip, the 'file' storage backend and page_size 1. "
+            "Default off = keys and bytes byte-identical to today.",
+        ),
+    ] = False
     enable_vram_dial: A[
         bool,
         Arg(
@@ -7620,6 +7645,15 @@ class ServerArgs:
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
                 )
+            if self.phase_flip_canonical_kv_page:
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page requires "
+                    "--enable-phase-flip: the geometry-neutral page exists so "
+                    "the two phases can name the same bytes, and with one "
+                    "layout there is no second geometry to be neutral "
+                    "towards. Refused rather than ignored -- silently "
+                    "accepting it would move every KV key for nothing."
+                )
             if self.phase_flip_spill_depth is not None:
                 raise ValueError(
                     "--phase-flip-spill-depth requires --enable-phase-flip: "
@@ -7794,6 +7828,30 @@ class ServerArgs:
                 )
         if blockers:
             raise ValueError(f"--enable-phase-flip V1 refuses: {', '.join(blockers)}.")
+        if self.phase_flip_canonical_kv_page:
+            # #706: the two conditions the whole-page protocol is defined on.
+            # Both are checkable here, and both are silent corruption if left
+            # to be discovered later -- a backend that cannot do a partial
+            # write has no way to assemble a page across stages, and a
+            # multi-token page would span token owners, which is why
+            # dcp_owner_mode already requires page_size 1.
+            if self.hicache_storage_backend != "file":
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page needs "
+                    "--hicache-storage-backend file, got "
+                    f"{self.hicache_storage_backend!r}. The whole-page format "
+                    "assembles one page from several stages by writing byte "
+                    "ranges into it; no other backend implements that, and the "
+                    "disk tier is where the format has to live anyway for "
+                    "context to survive a reboot."
+                )
+            if self.page_size != 1:
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page requires --page-size 1, "
+                    f"got {self.page_size}. A canonical page is ONE token's "
+                    "attention layers; a multi-token page would span token "
+                    "owners, the same limit weighted uneven-DCP already sets."
+                )
 
     def _handle_regime_controller(self):
         """#363: validate the mode and, for 'act', the entry gate.
