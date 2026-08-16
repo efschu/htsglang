@@ -490,6 +490,43 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
 
 
+#: How many chunk-cadences of silence make a stall a WEDGE rather than a slow
+#: tick. Small on purpose: the rule already refuses to fire while anything is
+#: moving, so its only job is to outlast ordinary jitter between chunks.
+PROGRESS_STALL_CHUNKS = 3
+
+
+def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
+    """How long prefill may make NO progress before PP is declared wedged.
+
+    SOLVED, NOT SET, and from the two quantities that already describe the
+    phase: one chunk takes ``pp_exit_tokens / pp_prefill_tok_s`` seconds at the
+    measured rate, so several of those passing with nothing admitted is not a
+    slow drain, it is a drain that has stopped.
+
+    FLOORED AT ``2 * flip_cost_s``. A cutover is the one interval in which
+    prefill legitimately makes no progress at all, so a rig fast enough to
+    solve a window shorter than its own seam would otherwise exit on the seam
+    it just paid for -- arming a flip because it was flipping.
+
+    0 disables the rule, which is what an unusable rate must produce: a
+    division by zero here would be a wedge-breaker that wedges.
+
+    WHY THIS IS NOT ANOTHER STOPWATCH, and the distinction is the whole point
+    of #677(a). The user's pure-drain decision removed the clock deliberately:
+    a real drain must never be cut short however long it takes. This rule
+    cannot cut one short, because ANY progress resets it -- one chunk per
+    window is enough to hold PP forever. It fires only when the thing the
+    drain is waiting for has stopped happening.
+    """
+    rate = float(cfg.pp_prefill_tok_s)
+    chunk = int(cfg.pp_exit_tokens)
+    floor = 2.0 * float(cfg.flip_cost_s)
+    if rate <= 0 or chunk <= 0:
+        return 0.0
+    return max(PROGRESS_STALL_CHUNKS * (chunk / rate), floor)
+
+
 def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
     """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
 
@@ -862,6 +899,16 @@ class PhasePolicyState:
     #: flip" rather than as a retry tally.
     arm_refusals_total: int = 0
     arm_degrade_events: int = 0
+    #: #677(a): the last tick at which prefill DEMONSTRABLY moved -- pending
+    #: strictly decreased. Maintained by ``observe_idle`` so ``decide`` stays
+    #: pure, the same split the idle clock uses. None means not yet observed,
+    #: which reads as "inapplicable" rather than "stalled since t=0": a caller
+    #: that reaches ``decide`` without observing must degrade to the previous
+    #: behaviour, never to an immediate exit.
+    last_prefill_progress_at: Optional[float] = None
+    #: What pending was at the previous observation, so a DECREASE can be
+    #: recognised. Compared, never trusted as a level.
+    last_pending_prefill_tokens: Optional[int] = None
     #: Cutovers that actually MOVED BYTES. Distinct from ``flips_armed`` on
     #: purpose: boot E armed 179 flips and completed none, and every summary
     #: that read the arm count called that instance healthy.
@@ -1156,6 +1203,44 @@ def _decide_from_load(
                 f"(<= one chunk of {cfg.pp_exit_tokens}), {inp.running_bs} req "
                 f"decoding -- exit condition: drained",
             )
+        # #677(a) BLOCKED ADMISSION, CHECKED BEFORE THE RESIDENCY CAP.
+        #
+        # Measured live 2026-08-16 06:04: pending frozen at 403779 tok from
+        # 06:04:47 with running bs 4 -- every max_running_requests slot held by
+        # a carried decode. PP may not decode under strict purity, so no slot
+        # could free; admission needs a slot, so no chunk could land; and the
+        # DRAINED rule waits for pending to fall below one chunk, which it
+        # never would. The instance was not slow, it was waiting for an event
+        # that could no longer happen, and the user saw a dead server.
+        #
+        # This is not a deadline. It fires on the absence of PROGRESS, which
+        # any single admitted chunk resets, so a genuine drain is never cut
+        # short however long it takes -- the property the pure-drain decision
+        # requires. See `pp_progress_stall_window_s` for the solve.
+        stall_window = pp_progress_stall_window_s(cfg)
+        stalled_for = (
+            None
+            if state.last_prefill_progress_at is None
+            else inp.now - state.last_prefill_progress_at
+        )
+        if (
+            stall_window > 0
+            and stalled_for is not None
+            and stalled_for >= stall_window
+            and inp.pending_prefill_tokens > cfg.pp_exit_tokens
+            and inp.running_bs > 0
+        ):
+            return PhasePolicyDecision(
+                PP_TO_TP,
+                f"blocked admission: pending frozen at "
+                f"{inp.pending_prefill_tokens} tok for {stalled_for:.1f}s with "
+                f"bs {inp.running_bs} carried (no chunk admitted in "
+                f"{stall_window:.1f}s, solved as {PROGRESS_STALL_CHUNKS}x the "
+                f"{cfg.pp_exit_tokens}tok/{cfg.pp_prefill_tok_s:g}tok-s chunk "
+                f"cadence, floored at 2x{cfg.flip_cost_s:g}s seam) -- exit "
+                f"condition: blocked admission",
+            )
+
         # THE PP WINDOW. The rule above needs prefill to DRAIN below N; a
         # sustained backlog never does, and under strict purity the PP
         # phase may not decode at all, so without this bound the instance
@@ -1251,6 +1336,21 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     if state.last_phase != inp.phase:
         state.last_phase = inp.phase
         state.phase_since = inp.now
+        # A fresh phase inherits no stall. The clock restarts here so a wedge
+        # has to be demonstrated in THIS residency, not carried in from the
+        # last one.
+        state.last_prefill_progress_at = inp.now
+        state.last_pending_prefill_tokens = None
+    # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
+    # frozen at a value while every slot is held by a carried decode, so the
+    # observable that separates it from a slow drain is whether the backlog
+    # ever goes DOWN. Recorded here rather than derived in `decide` for the
+    # same reason the idle clock is: a decision that measures its own history
+    # is not reproducible from its inputs.
+    prev = state.last_pending_prefill_tokens
+    if prev is None or inp.pending_prefill_tokens < prev:
+        state.last_prefill_progress_at = inp.now
+    state.last_pending_prefill_tokens = inp.pending_prefill_tokens
 
 
 def note_flip_armed(
