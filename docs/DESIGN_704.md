@@ -1084,6 +1084,62 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #677 — PHASE WINDOW ECONOMICS: length solved, not set
+
+A static window is wrong in both directions — too short at high load (the
+backlog never clears) and too long at low load (decodes wait behind an empty
+prefill window). Solved by `planner/phase_window.py`, 13 hermetic tests.
+
+**The amortization argument.** Over a cycle `C = T_p + T_d + flips·F`, the work
+arriving in `C` must clear in `C`, so `T_p = ρ_p·C`, `T_d = ρ_d·C` and
+
+* **stability floor** `C ≥ flips·F / (1 − ρ)` — below it the backlog grows
+  without bound however the windows are split;
+* **latency ceiling** `C ≤ (budget − F) / ρ_d` — a request arriving just after
+  the prefill window shuts waits out the whole decode window plus a flip.
+
+Flip overhead is `flips·F / C`, which *falls* as the cycle lengthens. So
+throughput always wants a longer window and **the economic choice is the
+largest admissible cycle**, floored by stability — not a midpoint, and not a
+constant.
+
+Solved on this rig (10 s TTFT budget, 2 arrivals/s, batch queue 4):
+
+| F | ρ | floor | ceiling | cycle | T_pre | T_dec | overhead | |
+|---|---|---|---|---|---|---|---|---|
+| 2.0 s | 0.30 | 5.7 | 53.3 | 53.3 | 8.0 | 8.0 | **7.5%** | |
+| 2.0 s | 0.50 | 8.0 | 32.0 | 32.0 | 8.0 | 8.0 | 12.5% | |
+| 2.0 s | 0.80 | 20.0 | 20.0 | — | — | — | — | **REFUSED** |
+| 3.0 s | 0.50 | 12.0 | 28.0 | 28.0 | 7.0 | 7.0 | 21.4% | |
+| 4.2 s | 0.50 | 16.8 | 23.2 | 23.2 | 5.8 | 5.8 | **36.2%** | |
+| 4.2 s | 0.80 | 42.0 | 14.5 | — | — | — | — | **REFUSED** |
+
+**The sharpest result, and it reprices #690.** The two constraints move in
+**opposite** directions with `F`: the floor rises as `flips·F` while the ceiling
+falls as `−F/ρ_d`. A dearer flip does not merely add an overhead line — **it
+closes the feasible band from both ends**, and past some `F` the band shuts
+entirely: *no window length works, at any split*. At ρ = 0.8 with a 10 s budget
+this rig is already refused at every measured flip cost. So halving the flip
+cost does not halve an overhead; it **reopens configurations that are currently
+impossible**, which is a much stronger argument for #690 than "2-4 s is slow".
+
+**Two refusals, because a policy that quietly does the impossible is worse than
+one that stops.**
+
+* **The seam must be able to arm.** If the layout's free column no longer clears
+  its arming floor, there is no flip to schedule at any window length — this
+  composes directly with #707's closed form and the n0 ≤ 51 depth bound it
+  implies. Checked *before* any arithmetic.
+* **The decode window must be worth entering.** Batch formation (#689) collapses
+  toward size 1 below a queue threshold, so flipping early buys a fraction of
+  the decode rate for a full flip cost. That is a floor on the cycle —
+  `C ≥ q / (λ·ρ_p)` — and at light load it **binds instead of stability**, which
+  is exactly the regime where a static window over-flips.
+
+Every quantity is injected; the rig's figures are calibration data in the test,
+with a foreign profile (flip 0.05 s, ρ = 0.8, 2 s budget, 50 arrivals/s) pinning
+the generality.
+
 ## #702 — THE PP CUT SOLVED FOR PREFILL SPEED
 
 The user's question, unowned since 2026-08-16: **more layers on the 5090 — what
