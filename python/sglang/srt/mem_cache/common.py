@@ -397,13 +397,37 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     return extra
 
 
+def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
+    """One clause naming the promise-versus-delivery gap, or ''.
+
+    #681. The allocation error used to report ``available + evictable`` and
+    nothing else, so an operator read "66039 tokens available" beside "failed
+    to allocate 512" and had no way to see that the eviction in between had
+    under-delivered. Naming it here is the difference between a confusing
+    message and a diagnosis.
+    """
+    if evicted >= asked:
+        return ""
+    try:
+        evictable = int(tree_cache.evictable_size())
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        evictable = -1
+    return (
+        f"\nEVICTION UNDER-DELIVERED: asked for {asked} tokens, freed "
+        f"{evicted}. The tree still reports {evictable} evictable tokens, but "
+        f"`evict` can only reach the LEAF FRONTIER -- tokens behind a locked "
+        f"chain are counted and unreachable. This is the failure, not a full "
+        f"pool: admission budgeted against a count the actuator cannot pay."
+    )
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evicted = evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
     if backup_state:
@@ -446,6 +470,7 @@ def alloc_token_slots(
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
+            f"{_eviction_shortfall_note(tree_cache, num_tokens, evicted)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
@@ -859,12 +884,19 @@ def peer_needs_mamba_evict(tree_cache, need: int = 1) -> bool:
     return int(floor) < int(need)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int) -> int:
+    """Evict toward ``num_tokens``. Returns tokens ACTUALLY evicted (#681).
+
+    The return value is the whole point: ``evictable_size_`` is a COUNT of
+    unlocked tokens in the tree, while ``evict`` can only reach the leaf
+    frontier. When those disagree the caller must know, because the next thing
+    it does is allocate on the strength of the count.
+    """
     if tree_cache is None:
-        return
+        return 0
 
     if tree_cache.is_chunk_cache():
-        return
+        return 0
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
@@ -876,9 +908,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
+            result = tree_cache.evict(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
+            return int(getattr(result, "num_tokens_evicted", 0) or 0)
     else:
         # Standard allocator
         #
@@ -895,7 +928,24 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # single rank) => the live local value, unchanged.
         avail = uniform_avail_for_evict(tree_cache, allocator)
         if avail < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            # #681: READ THE RECEIPT. ``evict`` returns how many tokens it
+            # ACTUALLY freed, and this call site threw that away -- so an
+            # eviction that under-delivered was indistinguishable from one that
+            # worked, and the allocation three lines later raised with a
+            # message reporting plenty of memory.
+            #
+            # Measured 2026-08-16 01:46:10, all three ranks identically:
+            #   Try to allocate 512 tokens.
+            #   Available full tokens: 66039 (available=273 + evictable=65766)
+            # 512 needed, 65766 reported evictable, allocation failed anyway.
+            # ``evict`` walks the LEAF FRONTIER -- it pops evictable leaves and
+            # re-pushes a parent only once all its children are gone and it is
+            # unlocked -- while ``evictable_size_`` counts unlocked tokens
+            # ANYWHERE in the tree. Tokens behind a locked chain are counted and
+            # unreachable, so the counter promises what the actuator cannot pay.
+            result = tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            return int(getattr(result, "num_tokens_evicted", 0) or 0)
+    return 0
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -962,6 +1012,20 @@ def alloc_paged_token_slots_extend(
     else:
         out_cache_loc = out
 
+    if out_cache_loc is None:
+        # #681 RULE 3: every alloc path reachable from prefill admission gets
+        # the same net. This is the page_size > 1 twin of alloc_token_slots and
+        # it had none -- the audit found three raise sites on this path
+        # (alloc_req_slots, alloc_token_slots, this one) and only one covered.
+        freed = _attempt_extend_relief(extend_num_tokens)
+        if freed > 0:
+            logger.warning(
+                "paged extend allocation of %d tokens failed; rank-local "
+                "relief returned %d tokens. Admission should have prevented "
+                "this -- treat a recurring line here as an admission defect.",
+                extend_num_tokens,
+                freed,
+            )
     if out_cache_loc is None:
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
@@ -1058,6 +1122,12 @@ def alloc_req_slots(
                 "free -- raise --max-mamba-cache-size, or look for mamba slots "
                 "held by unevictable radix checkpoints"
             )
+        # #681 RULE 3: the third raise site on the prefill admission path.
+        # This one exhausts REQUEST SLOTS (and mamba states), not KV tokens, so
+        # a token-shaped relief cannot pay it -- the net is asked anyway
+        # because a provider may free a whole request, and the ask is what
+        # tells an operator the site was covered rather than forgotten.
+        _attempt_extend_relief(len(reqs))
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
             "Please set a smaller number for `--max-running-requests`. " + detail

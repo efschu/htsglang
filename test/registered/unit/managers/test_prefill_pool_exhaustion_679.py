@@ -344,3 +344,115 @@ class TheWiringIsPinnedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheEvictionReceiptIsReadTest(unittest.TestCase):
+    """#681: the allocation failed with 65,766 evictable tokens on the books.
+
+    THE CRASH, 2026-08-16 01:46:10, all three ranks reporting identically:
+
+        Try to allocate 512 tokens.
+        Available full tokens: 66039 (available=273 + evictable=65766)
+
+    512 needed, 65,766 reported evictable, allocation failed anyway -- and pool
+    usage was 0.85, so this was never exhaustion. The pools agreed across ranks,
+    so `uniform_avail_floor` was None, so the trigger used the local value
+    (273 < 512) and eviction DID run. It simply did not deliver.
+
+    WHY: `evict` walks the LEAF FRONTIER -- it pops evictable leaves and
+    re-pushes a parent only once all its children are gone and it is unlocked --
+    while `evictable_size_` counts unlocked tokens ANYWHERE in the tree. Tokens
+    behind a locked chain are counted and unreachable. The counter promises what
+    the actuator cannot pay.
+
+    AND NOBODY LOOKED AT THE RECEIPT. `evict` returns num_tokens_evicted;
+    `evict_from_tree_cache` discarded it, so an under-delivery was
+    indistinguishable from success and the error three lines later reported
+    plenty of memory. That is the defect this class pins.
+    """
+
+    def test_the_evicted_count_is_returned_not_discarded(self):
+        class _Cache(_TreeCache):
+            def __init__(self, delivers):
+                super().__init__(available=0, evictable=65766)
+                self.delivers = delivers
+
+            def evict(self, params):
+                self.evicted.append(params)
+                return type("R", (), {"num_tokens_evicted": self.delivers})()
+
+        self.assertEqual(mc.evict_from_tree_cache(_Cache(512), 512), 512)
+        self.assertEqual(mc.evict_from_tree_cache(_Cache(0), 512), 0)
+
+    def test_no_eviction_needed_reports_zero_rather_than_lying(self):
+        tc = _TreeCache(available=4096, evictable=0)
+        self.assertEqual(mc.evict_from_tree_cache(tc, 512), 0)
+        self.assertEqual(tc.evicted, [], "nothing to evict, nothing evicted")
+
+    def test_the_error_NAMES_the_under_delivery(self):
+        """The operator must be able to read, from the failure itself, that
+        eviction under-delivered -- not infer it from a number that looks
+        healthy."""
+        note = mc._eviction_shortfall_note(
+            _TreeCache(available=273, evictable=65766), 512, 0
+        )
+        self.assertIn("UNDER-DELIVERED", note)
+        self.assertIn("512", note)
+        self.assertIn("65766", note)
+        self.assertIn("LEAF FRONTIER", note)
+
+    def test_a_delivering_eviction_adds_no_note(self):
+        self.assertEqual(
+            mc._eviction_shortfall_note(_TreeCache(available=0, evictable=0), 512, 512),
+            "",
+        )
+
+    def test_the_note_survives_a_cache_that_cannot_report_evictable(self):
+        class _Mute(_TreeCache):
+            def evictable_size(self):
+                raise RuntimeError("no accessor")
+
+        note = mc._eviction_shortfall_note(_Mute(), 512, 0)
+        self.assertIn("UNDER-DELIVERED", note)
+
+
+class EveryPrefillAllocPathHasTheNetTest(unittest.TestCase):
+    """#681 closes rule 3 of DESIGN_679: parking/relief must be reachable from
+    EVERY alloc path, not the one that happened to crash first.
+
+    The audit of prepare_for_extend -> alloc_for_extend found THREE raise sites
+    and only one covered:
+
+        alloc_req_slots                 request slots (and mamba states)
+        alloc_token_slots               page_size == 1   <- the one covered
+        alloc_paged_token_slots_extend  page_size > 1
+    """
+
+    def test_all_three_prefill_raise_sites_ask_the_net(self):
+        import inspect
+
+        for fn in (
+            mc.alloc_token_slots,
+            mc.alloc_paged_token_slots_extend,
+            mc.alloc_req_slots,
+        ):
+            with self.subTest(site=fn.__name__):
+                src = inspect.getsource(fn)
+                self.assertIn(
+                    "_attempt_extend_relief",
+                    src,
+                    f"{fn.__name__} can raise on the prefill admission path "
+                    "with no relief attempted -- rule 3 violated",
+                )
+
+    def test_the_net_is_asked_BEFORE_each_raise(self):
+        import inspect
+
+        for fn in (mc.alloc_token_slots, mc.alloc_paged_token_slots_extend):
+            with self.subTest(site=fn.__name__):
+                src = inspect.getsource(fn)
+                self.assertLess(
+                    src.index("_attempt_extend_relief"),
+                    src.index("raise RuntimeError"),
+                    "relief after the raise is relief that never runs",
+                )
