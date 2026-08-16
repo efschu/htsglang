@@ -2900,6 +2900,13 @@ class Scheduler(
             "on" if getattr(self.server_args, "enable_phase_flip", False) else "off",
         )
 
+    #: Rounds the target layout may take to build its first batch after a
+    #: policy-armed flip before the arm is declared wrong. Small, because the
+    #: thing being caught is a loop that re-armed every 3-4 seconds; large
+    #: enough that one empty round during the post-cutover settle is not an
+    #: accusation.
+    ARM_VERDICT_ROUNDS = 8
+
     def _note_round_build_outcome(self, ret, running_batch) -> None:
         """Record that this round built nothing while both classes had work.
 
@@ -2917,6 +2924,31 @@ class Scheduler(
         with no benefit -- so "no batch" alone is deliberately not the
         trigger.
         """
+        watch = getattr(self, "_arm_watch", None)
+        if watch is not None:
+            if ret is not None:
+                # The target ran. The verdict is vindicated; stop watching.
+                self._arm_watch = None
+            else:
+                watch["rounds"] += 1
+                if watch["rounds"] == self.ARM_VERDICT_ROUNDS:
+                    logger.warning(
+                        "PHASE-POLICY ARM-VERDICT-WRONG: armed %s (%s) but the "
+                        "target layout built no batch in %d rounds. The "
+                        "admissibility inputs that produced this arm were "
+                        "running_bs=%d pending=%d nothing_can_run=%s "
+                        "target_can_admit=%s ready_carriers=%d. If this repeats "
+                        "in alternating directions it is the 2026-08-16 10:24 "
+                        "ping-pong and the target term is lying again.",
+                        watch["direction"],
+                        watch["reason"],
+                        watch["rounds"],
+                        watch["running_bs"],
+                        watch["pending"],
+                        watch["nothing_can_run"],
+                        watch["target_can_admit"],
+                        watch["ready_carriers"],
+                    )
         if ret is not None:
             self._round_built_nothing = False
             return
@@ -2927,29 +2959,91 @@ class Scheduler(
             pending = 0
         self._round_built_nothing = bool(resident > 0 or pending > 0)
 
+    def _post_evict_rows(self) -> int:
+        """KV rows this rank could hand out if the cache gave up everything.
+
+        POST-EVICT, because the cache is not a claim on the pool -- it is a
+        cache. The 10:30:50 boot died with ``full_available_size=0`` and
+        ``full_evictable_size=151040`` in the same message: an allocator that
+        looked empty while 151040 rows sat there evictable. An admissibility
+        answer computed from ``available`` alone would call that layout
+        unusable and be wrong by 151040 rows.
+        """
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        tree = getattr(self, "tree_cache", None)
+        try:
+            avail = int(alloc.available_size()) if alloc is not None else 0
+        except Exception:  # noqa: BLE001 - a probe must not break the round
+            avail = 0
+        try:
+            evictable = int(tree.evictable_size()) if tree is not None else 0
+        except Exception:  # noqa: BLE001
+            evictable = 0
+        return max(0, avail) + max(0, evictable)
+
     def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
-        """``(nothing_can_run, target_can_admit)`` for the policy.
+        """``(nothing_can_run, target_admissible)`` for the policy.
 
-        ONE-SIDED BY CONSTRUCTION, which is what makes the arm safe without a
-        dwell floor underneath it. ``target_can_admit`` asks whether the OTHER
-        layout can run one of the classes this one cannot:
+        THE FIRST VERSION OF THIS FUNCTION PING-PONGED ON METAL, and the
+        correction is the whole point of the rewrite. It returned
+        "work of that class exists" as if it were "the target can run it":
 
-        * in PP, decode is forbidden, so a resident carrier is work only TP
-          can do -- the target admits iff something is resident;
-        * in TP, prefill is forbidden under drain purity, so queued tokens are
-          work only PP can do -- the target admits iff prefill is pending.
+            pp -> tp:  running_bs > 0
+            tp -> pp:  pending_tokens > 0
 
-        After the flip the target therefore runs BY PREMISE, so the condition
-        cannot immediately hold again on the other side and the pair cannot
-        ping-pong. No interval, no counter, no floor.
+        On 2026-08-16 10:24 both were permanently true -- 2 requests resident,
+        910140 tokens queued -- while NEITHER layout could actually run: PP
+        could not admit a prefill because the carriers' KV filled the pool,
+        and TP could not decode those carriers either. Two blocked layouts,
+        each certified as the other's escape:
+
+            10:24:18 arming tp_to_pp: IDLE-LOCKED ...
+            10:24:21 arming pp_to_tp: IDLE-LOCKED ...
+            10:24:25 arming tp_to_pp: IDLE-LOCKED ...
+
+        every three to four seconds. That is worse than the gap it replaced.
+
+        So the target term is now SIMULATED against the target layout's real
+        constraint, not inferred from the existence of work:
+
+        * pp -> tp: a resident carrier is decodable only if the pool can back
+          its next decode step -- one row per carrier per step, and under
+          NEXTN a whole draft window per carrier, not one row for the batch.
+        * tp -> pp: a queued prefill is admissible only if a CHUNK of it fits
+          AND a GDN state slot is free for the new request. The state slot is
+          the term the old proxy could not see at all, and it is exactly what
+          was exhausted in the specimen.
+
+        BOTH-BLOCKED IS NOT A FLIP. When neither side is admissible the answer
+        is to free KV, not to change layout; the policy declines and the
+        caller routes to the evict rung. Returning "arm" there is what built
+        the loop.
         """
         if not bool(getattr(self, "_round_built_nothing", False)):
             return False, False
         phase = getattr(self, "phase_flip_active_stack", None)
+        rows = self._post_evict_rows()
         if phase == "pp":
-            return True, int(running_bs) > 0
+            # Target TP: can the pool back one decode step for the carriers?
+            per_req = max(
+                1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
+            )
+            need = max(1, int(running_bs)) * per_req
+            return True, rows >= need
         if phase == "tp":
-            return True, int(pending_tokens) > 0
+            # Target PP: can one queued prefill chunk actually land?
+            if int(pending_tokens) <= 0:
+                return True, False
+            chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
+            need = min(chunk, int(pending_tokens))
+            mamba = getattr(
+                getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+            )
+            try:
+                slots = int(mamba.available_size()) if mamba is not None else 1
+            except Exception:  # noqa: BLE001
+                slots = 0
+            return True, (rows >= need and slots >= 1)
         # No flip enabled, or a phase this rule says nothing about: never arm.
         return False, False
 
@@ -8332,6 +8426,26 @@ class Scheduler(
             rt_for_funding.armed_idle_locked = bool(
                 (decision.reason or "").startswith(POLICY_IDLE_LOCKED)
             )
+        # #688 ANTI-OSCILLATION AS A RUNTIME INVARIANT, not a test premise.
+        #
+        # The hermetic test asserted that the target runs after the flip by
+        # FEEDING that assumption in by hand, so it could not have caught the
+        # 10:24 ping-pong -- the assumption was the bug. The property has to
+        # be checked where it can actually be false: on metal, after the flip,
+        # against what the target layout then does. If the target does not
+        # build a batch within a few rounds, the admissibility verdict that
+        # armed this flip was WRONG, and the inputs that produced it are what
+        # a reader needs.
+        self._arm_watch = {
+            "direction": decision.direction,
+            "reason": (decision.reason or "")[:120],
+            "running_bs": int(inp.running_bs),
+            "pending": int(inp.pending_prefill_tokens),
+            "nothing_can_run": bool(getattr(inp, "nothing_can_run", False)),
+            "target_can_admit": bool(getattr(inp, "target_can_admit", False)),
+            "ready_carriers": int(getattr(inp, "ready_carriers", 0) or 0),
+            "rounds": 0,
+        }
         note_flip_armed(state, decision, inp.now)
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason

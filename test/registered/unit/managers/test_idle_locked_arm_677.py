@@ -160,6 +160,58 @@ class TheConditionIsOneSided(unittest.TestCase):
         self.assertNotIn("IDLE-LOCKED", post.reason or "")
 
 
+class TheRecordedPingPongStateMustNotArm(unittest.TestCase):
+    """THE 2026-08-16 10:24 STATE, REPLAYED. This is the regression.
+
+        10:24:18 arming tp_to_pp: IDLE-LOCKED ... (2 req resident, 910140 tok)
+        10:24:21 arming pp_to_tp: IDLE-LOCKED ...
+        10:24:25 arming tp_to_pp: IDLE-LOCKED ...
+
+    Two requests resident, 910140 tokens queued, the KV pool full of those
+    carriers' own KV. NEITHER layout could run: PP could not admit a prefill
+    because the pool was full, and TP could not decode the carriers either.
+    The first version of the rule certified each layout as the other's escape
+    and flipped every three to four seconds -- worse than the gap it replaced.
+
+    With admissibility SIMULATED rather than inferred, the target term is
+    False on both sides, and the correct verdict is not a flip at all: the
+    binding resource is KV, so it is an evict trigger.
+    """
+
+    def _both_blocked(self, phase):
+        return decide(
+            cfg(),
+            PhasePolicyState(),
+            inputs(
+                phase=phase,
+                running_bs=2,
+                pending_prefill_tokens=910140,
+                nothing_can_run=True,
+                target_can_admit=False,
+            ),
+        )
+
+    def test_it_does_not_arm_from_pp(self):
+        d = self._both_blocked(PHASE_PP)
+        self.assertIsNone(d.direction)
+        self.assertIn("BOTH BLOCKED", d.reason)
+
+    def test_it_does_not_arm_from_tp(self):
+        d = self._both_blocked(PHASE_TP)
+        self.assertIsNone(d.direction)
+        self.assertIn("BOTH BLOCKED", d.reason)
+
+    def test_neither_direction_can_be_reached_from_the_other(self):
+        """The loop itself: replay both legs and require no flip on either."""
+        self.assertIsNone(self._both_blocked(PHASE_PP).direction)
+        self.assertIsNone(self._both_blocked(PHASE_TP).direction)
+
+    def test_the_refusal_names_the_binding_resource(self):
+        d = self._both_blocked(PHASE_PP)
+        self.assertIn("KV", d.reason)
+        self.assertIn("evict", d.reason.lower())
+
+
 class AnIdleServerIsNotADeadlock(unittest.TestCase):
     """"No batch" alone is not the trigger, deliberately.
 

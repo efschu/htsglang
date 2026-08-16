@@ -1377,6 +1377,26 @@ def _decide_from_load(
     # therefore safe in exactly this branch and nowhere else -- which is why
     # it is written here, above the dwell, rather than as an exception inside
     # it.
+    if inp.nothing_can_run and not inp.target_can_admit:
+        # BOTH SIDES BLOCKED IS AN EVICT PROBLEM, NOT A LAYOUT PROBLEM.
+        #
+        # This branch exists because the first version of this rule did not
+        # have it, and shipped a flip loop: on 2026-08-16 10:24 the policy
+        # armed tp_to_pp, pp_to_tp and tp_to_pp again in seven seconds, with
+        # 2 requests resident and 910140 tokens queued, because each layout
+        # was certified as the other's escape while NEITHER could run. When
+        # the target is not admissible either, changing layout cannot help --
+        # the binding resource is KV, and the action that unblocks a side is
+        # freeing it. Declining here is what routes the caller to the evict
+        # rung instead of to a cutover.
+        return _no(
+            f"BOTH BLOCKED: nothing can run in the {inp.phase} layout and the "
+            f"target cannot admit either ({inp.running_bs} req resident, "
+            f"{inp.pending_prefill_tokens} tok pending) -- the binding "
+            f"resource is KV, not the layout, so this is an evict trigger and "
+            f"NOT a flip. Flipping here is the 10:24 ping-pong."
+        )
+
     if inp.nothing_can_run and inp.target_can_admit:
         direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
         return PhasePolicyDecision(
