@@ -142,6 +142,7 @@ class DraftBootstrapError(RuntimeError):
 # to the file, so the consumer that ALLOCATES imports the same check as
 # the producer that harvests.
 from sglang.srt.managers.phase_flip_resident_carry import (  # noqa: E402
+    IN_FLIGHT_CHUNKED_ALLOWANCE,
     ResidentCarryError,
     _reqs_of,
 )
@@ -427,17 +428,30 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
     # with a batch from elsewhere, and the allocation happens HERE. A
     # consumer that can be ruined by an implausible input checks that
     # input itself rather than trusting every present and future caller.
-    ceiling = getattr(scheduler, "max_running_requests", None)
+    #
+    # #682: the bound is cap + IN_FLIGHT_CHUNKED_ALLOWANCE, not cap. The
+    # scheduler suspends the running-request cap while a chunked prefill is
+    # in flight (the allowance's definition quotes the comment that says so),
+    # and this leg runs on exactly the configuration that produced the
+    # 02:07:22 crash -- PP->TP with NEXTN -- so repairing only
+    # ``harvest_resident_batches`` would have moved that raise one function
+    # later. The allowance is IMPORTED rather than re-derived: two guards
+    # asserting two different bounds is the same defect with a longer fuse.
+    cap = getattr(scheduler, "max_running_requests", None)
     try:
-        ceiling = int(ceiling) if ceiling else None
+        cap = int(cap) if cap else None
     except (TypeError, ValueError):
-        ceiling = None
+        cap = None
+    ceiling = None if cap is None else cap + IN_FLIGHT_CHUNKED_ALLOWANCE
     if ceiling is not None and len(reqs) > ceiling:
         raise ResidentCarryError(
             f"{LOG_PREFIX} refusing to arm draft state for {len(reqs)} "
-            f"carried request(s), above max_running_requests={ceiling}. "
-            f"committed_slots would allocate one tensor per request. This "
-            f"is defect M: the resident set is corrupted, not large."
+            f"carried request(s), above the {ceiling} this scheduler can "
+            f"hold (max_running_requests={cap} plus "
+            f"{IN_FLIGHT_CHUNKED_ALLOWANCE} for an in-flight chunked "
+            f"prefill). committed_slots would allocate one tensor per "
+            f"request. This is defect M: the resident set is corrupted, "
+            f"not large."
         )
 
     slot_rows = committed_slots(scheduler, batch)
