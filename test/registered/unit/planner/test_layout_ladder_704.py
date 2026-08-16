@@ -18,6 +18,9 @@ Hermetic: pure arithmetic, no CUDA.
 import pytest
 from sglang.srt.planner.layout_ladder import (
     LadderInputs,
+    arena_layers_for,
+    rung_family,
+    solve_arena_ladder,
     solve_layout_ladder,
 )
 from sglang.srt.planner.pp_cut import FamilyPoolModel, layer_families_from_config
@@ -261,3 +264,61 @@ def test_a_rung_whose_move_cannot_be_funded_is_pruned():
         _rig_inputs(link_mib_per_s=(0.5, 0.5, 0.5), prefill_tokens_per_s=200_000.0)
     )
     assert len(crawling.transitions) < len(fast.transitions)
+
+
+# --------------------------------------------------------------------------
+# The arena ladder: one resident weight arena per rank, sized for the deepest
+# rung. This is the model that matches the only weight-move primitive that
+# exists (`weights_arena.py` refill); the plain solver above models the
+# alternative where weights are reallocated per rung.
+# --------------------------------------------------------------------------
+
+
+def test_arena_is_the_per_rank_max_over_the_family():
+    fam = rung_family(_rig_inputs(), 31, 38)
+    arena = arena_layers_for(fam)
+    for r in range(3):
+        assert arena[r] == max(c[r] for c in fam)
+
+
+def test_under_an_arena_equal_attention_profiles_have_equal_pool():
+    """The structural consequence that reshapes the ladder.
+
+    With free memory pinned by the arena, a rung's pool depends only on its
+    attention count. Two rungs sharing an attention profile therefore price
+    identically, so the faster one strictly dominates and they are NOT a ladder
+    pair. The ladder's real axis under an arena is the attention vector, not
+    the raw layer cut.
+    """
+    ladder = solve_arena_ladder(_rig_inputs(), 38, 31)
+    seen = {}
+    for r in ladder.rungs:
+        assert r.attn_counts not in seen, (
+            f"rungs {seen.get(r.attn_counts)} and {r.counts} share attention "
+            f"profile {r.attn_counts}; one of them is dominated"
+        )
+        seen[r.attn_counts] = r.counts
+
+
+def test_a_deeper_ladder_costs_the_shallow_rungs_pool():
+    """The arena trade must be visible, not hidden.
+
+    Asking to reach deeper enlarges the arena, which is resident at EVERY rung,
+    so the top rung gets poorer. A model that reported the top rung's pool as
+    unchanged would be advertising memory that the arena is holding.
+    """
+    narrow = solve_arena_ladder(_rig_inputs(), 36, 31)
+    wide = solve_arena_ladder(_rig_inputs(), 40, 31)
+    assert wide.rungs[0].pool_tokens < narrow.rungs[0].pool_tokens
+
+
+def test_an_unaffordable_arena_is_refused_with_the_shortfall():
+    """A ladder whose arena cannot fit must fail loudly at solve time."""
+    with pytest.raises(ValueError, match="short"):
+        solve_arena_ladder(_rig_inputs(), 60, 1)
+
+
+def test_arena_ladder_rungs_still_clear_the_corridor_floor():
+    ladder = solve_arena_ladder(_rig_inputs(), 38, 31)
+    for r in ladder.rungs:
+        assert r.pool_tokens >= _rig_inputs().min_pool_tokens
