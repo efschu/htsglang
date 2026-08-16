@@ -1,30 +1,29 @@
-"""#703 retention stage 1: the #630 flip guard must ask what HiCache IS, not
-whether it is configured.
+"""#703: the #630 flip guard is stale in BOTH of its copies, and is removed.
 
-WHY THIS CHANGES A PINNED INVARIANT. `flip_blocking_guards` refuses flip
-arming whenever `enable_hierarchical_cache` is set at all, citing "#630: PP x
-disk HiCache wedges at warmup". That wedge was real, and it was FIXED:
-`9da9dfd025` introduced bounded collectives (mem_cache/hicache_collective.py),
-the fix is an ancestor of the deployed commit 9925a2e4fa, and its suite
-(test_hicache_bounded_waits_630.py) passes 14 tests + 14 subtests hermetically.
-The guard outlived its defect.
+HISTORY, because this file changed contract twice and the second change was a
+correction of the first.
 
-The cost of leaving it is not theoretical: because the guard refuses the flip
-outright, the deployment runs with `enable_hierarchical_cache=False`, i.e. NO
-cache tier whatsoever on the serving line. The operator must choose between
-the phase flip and any prefix retention at all.
+Stage 1 narrowed the guard from "hierarchical cache is enabled" to "a storage
+backend is configured", keeping the disk tier refused pending its own evidence.
+Stage 2 removes the clause entirely, because "its own evidence" turned out to
+be the SAME evidence that cleared the host tier:
 
-The precedent for the fix shape is three lines below the guard itself: the
-kv-session-offload guard was already converted from "is it CONFIGURED" to
-"what is it DOING" (#656, kvso_flip_contract), because refusing on mere
-configuration made kvso and the flip mutually exclusive. This is the same
-defect in the same function.
+  * the #630 wedge was PP x disk HiCache at warmup;
+  * its root fix is 9da9dfd025 (bounded collectives,
+    mem_cache/hicache_collective.py);
+  * that commit is an ancestor of every deployed commit since;
+  * test_hicache_bounded_waits_630.py passes 14 tests + 14 subtests hermetically.
 
-STAGE 1 IS DELIBERATELY NARROW. The #630 wedge specifically involved the DISK
-tier at warmup. So the guard keeps refusing when a storage backend is
-configured, and stands down only for the device+host-local configuration --
-"PP-phase-local HiCache". Widening to the disk tier is a separate step behind
-its own evidence.
+A guard cannot be justified by a defect a green suite says is fixed. Keeping
+the disk tier refused was conservatism, not caution, and it blocked the disk L3
+that is the actual retention store (host RAM cannot hold it -- the flip's own
+host weight images take 20.50 of 25.87 GB usable).
+
+WHAT IS STILL GATED: the KV key's `_{pp_size}_{pp_rank}` suffix. That is a
+claim about BYTES -- a PP-written page really does contain only one stage's
+layers -- and it drops only when #706's whole-page format makes the page
+complete across stages. Refusing the backend never protected those bytes; it
+only stopped anyone from reaching them.
 """
 
 from types import SimpleNamespace
@@ -45,8 +44,6 @@ def _sched(**server_args_over):
         server_args=SimpleNamespace(**sa),
         kv_session_offload=None,
         is_dual_group_lane=False,
-        # the guard also enumerates the tree cache; give it a conforming stub
-        # so this file isolates the HiCache clause and nothing else.
         tree_cache=SimpleNamespace(all_values_flatten=lambda: None),
     )
     sched.disaggregation_mode = DisaggregationMode.NULL
@@ -60,52 +57,57 @@ def _hicache_guards(sched):
 
 
 class TestHiCacheFlipGuard703(CustomTestCase):
-    def test_off_is_unguarded(self):
-        """Baseline, unchanged: no HiCache, no HiCache guard."""
-        self.assertEqual(_hicache_guards(_sched()), [])
+    """Runtime clause: gates flip ARMING."""
 
-    def test_device_host_local_hicache_no_longer_blocks_the_flip(self):
-        """THE CHANGE. Hierarchical cache with no storage backend is the
-        PP-phase-local configuration; the wedge it was refused for is fixed
-        and shipped, so it must not refuse flip arming."""
-        sched = _sched(enable_hierarchical_cache=True, hicache_storage_backend=None)
-        self.assertEqual(
-            _hicache_guards(sched),
-            [],
-            "device+host-local HiCache must not block flip arming: the #630 "
-            "wedge is fixed (9da9dfd025, bounded collectives) and its suite "
-            "is green",
+    def test_no_hicache_config_blocks_arming(self):
+        for backend in (None, "file", "mooncake", "hf3fs"):
+            for enabled in (False, True):
+                with self.subTest(backend=backend, enabled=enabled):
+                    sched = _sched(
+                        enable_hierarchical_cache=enabled,
+                        hicache_storage_backend=backend,
+                    )
+                    self.assertEqual(
+                        _hicache_guards(sched),
+                        [],
+                        "no HiCache configuration may refuse flip arming; the "
+                        "#630 root fix ships and its suite is green",
+                    )
+
+    def test_other_guards_still_fire(self):
+        """CAN-FAIL PROOF. Removing the HiCache clause must not have neutered
+        the function. A change that returned [] unconditionally would pass
+        every assertion above and fail here."""
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+
+        sched = _sched(dual_group_lane=True)
+        self.assertTrue(
+            any("dual-group" in g for g in flip_blocking_guards(sched)),
+            "dual-group lane must still refuse arming",
         )
 
-    def test_storage_backend_still_blocks(self):
-        """STAGE 1 BOUNDARY, and the can-fail proof for this file: the guard
-        must still fire for the disk tier, which is the configuration #630
-        actually wedged on. A change that simply deleted the guard would pass
-        the test above and FAIL this one."""
-        for backend in ("file", "mooncake", "hf3fs"):
-            with self.subTest(backend=backend):
-                sched = _sched(
-                    enable_hierarchical_cache=True, hicache_storage_backend=backend
-                )
-                guards = _hicache_guards(sched)
-                self.assertTrue(
-                    guards,
-                    f"storage backend {backend!r} must still refuse flip arming",
-                )
+        sched = _sched()
+        sched.tree_cache = SimpleNamespace()  # no all_values_flatten
+        self.assertTrue(
+            any("tree cache" in g for g in flip_blocking_guards(sched)),
+            "a tree cache without enumeration must still refuse arming",
+        )
 
-    def test_storage_backend_alone_without_hierarchical_is_unguarded(self):
-        """A storage backend set while hierarchical cache is off builds no
-        tier at all (scheduler.py gates tier construction on
-        enable_hierarchical_cache alone), so there is nothing to refuse."""
-        sched = _sched(enable_hierarchical_cache=False, hicache_storage_backend="file")
-        self.assertEqual(_hicache_guards(sched), [])
+        modes = [m for m in DisaggregationMode if m != DisaggregationMode.NULL]
+        if modes:
+            sched = _sched()
+            sched.disaggregation_mode = modes[0]
+            self.assertTrue(
+                any("disagg" in g.lower() for g in flip_blocking_guards(sched)),
+                "PD disaggregation must still refuse arming",
+            )
 
 
 class TestHiCacheFlipV1Blocker703(CustomTestCase):
-    """The BOOT-TIME twin. `flip_blocking_guards` gates arming; this one
-    refuses at ServerArgs parse time, before a scheduler exists. Fixing only
-    the runtime clause leaves --enable-hierarchical-cache unusable, which is
-    exactly what a live boot proved:
+    """Boot-time twin, in ServerArgs. Refuses at parse time, before a scheduler
+    exists -- so fixing only the runtime clause left the flag unusable, which a
+    live boot proved:
 
       ValueError: --enable-phase-flip V1 refuses:
       --enable-hierarchical-cache (#630: PP x disk HiCache wedges at warmup).
@@ -115,9 +117,6 @@ class TestHiCacheFlipV1Blocker703(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         sa = ServerArgs.__new__(ServerArgs)
-        # the validator walks the whole phase-flip surface before it reaches
-        # the blocker list; give it a minimal VALID flip config so the only
-        # thing under test is the HiCache clause.
         sa.enable_phase_flip = True
         sa.phase_flip_policy = "auto"
         sa.phase_flip_tp_vector = "32,16,16"
@@ -143,12 +142,20 @@ class TestHiCacheFlipV1Blocker703(CustomTestCase):
             self.skipTest("validator not named _handle_phase_flip")
         return ""
 
-    def test_device_host_local_hicache_boots(self):
-        msg = self._blockers(enable_hierarchical_cache=True)
-        self.assertNotIn("hierarchical", msg, msg)
+    def test_disk_l3_boots(self):
+        """The configuration the retention design actually needs."""
+        for backend in ("file", "mooncake", "hf3fs"):
+            with self.subTest(backend=backend):
+                msg = self._blockers(
+                    enable_hierarchical_cache=True, hicache_storage_backend=backend
+                )
+                self.assertNotIn("hierarchical", msg, msg)
 
-    def test_storage_backend_still_refused(self):
-        msg = self._blockers(
-            enable_hierarchical_cache=True, hicache_storage_backend="file"
-        )
-        self.assertIn("hierarchical", msg, msg)
+    def test_other_v1_blockers_still_fire(self):
+        """CAN-FAIL PROOF for the boot-time clause: the surrounding refusals
+        must survive. Proven reachable -- an earlier version of this fixture
+        never reached the blocker list at all and passed vacuously."""
+        msg = self._blockers(dp_size=2)
+        self.assertIn("dp-size", msg, msg)
+        msg = self._blockers(dual_group_lane=True)
+        self.assertIn("dual-group", msg, msg)

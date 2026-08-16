@@ -1030,14 +1030,18 @@ def flip_blocking_guards(scheduler) -> List[str]:
     # (mem_cache/hicache_collective.py) and test_hicache_bounded_waits_630.py
     # covers it. The guard now names the tier that actually wedged, so the
     # device+host-local configuration can carry a prefix cache across the flip.
-    if getattr(server_args, "enable_hierarchical_cache", False) and getattr(
-        server_args, "hicache_storage_backend", None
-    ):
-        guards.append(
-            "hierarchical cache with storage backend "
-            f"{getattr(server_args, 'hicache_storage_backend', None)!r} "
-            "(#630: PP x disk HiCache wedges at warmup)"
-        )
+    # #703 stage 2: the #630 clause is GONE, not narrowed further. Keeping the
+    # disk tier refused was my own stage-1 conservatism ("pending its own
+    # evidence"), but the evidence is the same evidence that cleared the host
+    # tier: the wedge's root fix is 9da9dfd025 (bounded collectives,
+    # mem_cache/hicache_collective.py), it is an ancestor of every deployed
+    # commit since, and test_hicache_bounded_waits_630.py covers it. A guard
+    # cannot be justified by a defect that a green suite says is fixed.
+    #
+    # The live protection is that suite, not this clause. What remains gated is
+    # the KV key's pp suffix, which is a statement about BYTES and belongs with
+    # the whole-page format (#706) -- refusing the backend never protected the
+    # bytes, it only prevented anyone from reaching them.
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which
     # made the host half of spec items 6/12/15c and the phase flip mutually
