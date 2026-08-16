@@ -111,3 +111,52 @@ rebalancing rank0/rank1.
 The incumbent's binder is **PP2**, per the boot log (PP1 cap 463,406, PP2
 436,766). My rev5 calibration assigned it to rank1 and solved a free constant
 from that assumption; the derivation above needs no such fit and supersedes it.
+
+---
+
+## 7 — The ~14 % mamba discrepancy, RESOLVED: my model was right, the POST is short
+
+The operator flagged the metal mamba posts (0.895 / 0.639 / 0.511 GiB) as
+~14 % below my derived 50.85 MiB/GDN-layer, with the suspected cause "an
+over-charged spec-slot sub-term" in my model. That suspicion is **wrong**, and
+the allocator's own instrument settles it without any new code: MambaPool
+already logs every sub-term at construction (`memory_pool.py:756-765`,
+`"Mamba Cache is allocated. ... conv_state size / ssm_state size /
+intermediate_ssm_state_cache size / intermediate_conv_window_cache size"`).
+
+Read off the live boots:
+
+| rank | GDN layers | conv | ssm | inter_ssm | inter_cw | allocated | per layer | budget post | post/alloc |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PP0 | 21 | 0.02 | 0.40 | 0.62 | 0.01 | 1.05 GiB | **51.20 MiB** | 0.895 | **0.852** |
+| PP1 | 15 | 0.01 | 0.29 | 0.44 | 0.01 | 0.75 GiB | **51.20 MiB** | 0.639 | **0.852** |
+| PP2 | 12 | 0.01 | 0.23 | 0.35 | 0.01 | 0.60 GiB | **51.20 MiB** | 0.511 | **0.852** |
+
+Two facts fall out:
+
+**(a) The derivation in §3 is confirmed.** 50.85 MiB/GDN-layer against a
+measured 51.20 — inside the log's own 2-decimal GiB rounding (each of four
+terms rounds to 0.01 GiB, so ±1 MiB/layer). The individual terms match too:
+`ssm_state` is exactly `layers x 13 slots x 1.5 MiB` on every rank (21 -> 0.400,
+15 -> 0.286, 12 -> 0.229 GiB), and `intermediate_ssm` is exactly
+`layers x 5 spec slots x 4 draft x 1.5 MiB` (30.0 MiB/layer measured on all
+three). So the spec-slot count of 5 is right, not over-charged.
+
+**(b) The BUDGET POST under-charges the allocation by a constant 14.8 %.**
+`post/allocated` is **0.852 on all three ranks** — exactly constant, so this is
+a systematic formula divergence, not rounding and not noise. The sizer hands
+out ~158 / 111 / 89 MiB more mamba memory than it charges to its own budget.
+
+**Consequence for the retro-prediction gate.** The pool solve must consume the
+ALLOCATED figure (the `Mamba Cache is allocated` line), not the budget post.
+A solve fed the post is optimistic by ~150 MiB/rank, and that error is
+systematic rather than averaging out. This also means the earlier plan to feed
+`PhasePoolModel` from the budget posts alone would have baked the under-charge
+into the model.
+
+What is NOT established: which term in `handle_max_mamba_cache` produces the
+0.852. It is exactly constant, so it is one factor, not an accumulation of
+approximations, but naming it needs a read of that function rather than more
+arithmetic from outside — the same discipline that produced this resolution.
+Recorded as the open sub-item; it does not block the gate, because the gate
+now consumes the allocation.
