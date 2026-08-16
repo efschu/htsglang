@@ -1084,6 +1084,79 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #699 — LIVENESS FROM PROGRESS, BECAUSE HEALTH 200 IS BLIND
+
+On 2026-08-16 the server sat wedged for 52+ minutes while `/health` returned
+200. **Two independent blind spots** produced that, and the second is the one
+nobody had named. Landed as `managers/progress_liveness.py`, 16 hermetic tests.
+
+**1. `/health` answers "is the process up", not "is work moving".** Known.
+
+**2. The shipped watchdog is blind to admission wedges *by construction*.**
+`create_scheduler_watchdog`
+(`managers/scheduler_components/invariant_checker.py:536-540`) wires:
+
+```
+get_counter = lambda: scheduler.forward_ct
+is_active   = lambda: (scheduler.is_initializing
+                       or scheduler.cur_batch_for_debug is not None)
+```
+
+It only arms **while a batch exists**. An admission wedge is exactly the state
+where *no batch exists while work is pending* (`#running-req: 0` on 90.6% of
+prefill rounds in the specimen). So `is_active` is False for the entire wedge
+and the timer never starts. **The watchdog was not slow — it was switched off.**
+That is why a 52-minute wedge produced no alarm from either mechanism.
+
+### The signal
+
+Progress is **any one** of three counters advancing over a sliding window:
+
+| counter | why it is required |
+|---|---|
+| `prefill_chunks` | the only one that moves in a long pure-prefill run — a 640-chunk prompt completes nothing for minutes |
+| `decode_steps` | moves in pure decode, where no chunk is admitted |
+| `completions` | moves when requests finish |
+
+Requiring *all three* would call a healthy pure-prefill server wedged;
+requiring only `completions` would do the same. That is precisely the trap, so
+the rule is disjunctive.
+
+### The refusals, which are what make the alarm worth listening to
+
+* **An idle box is not a wedge.** Zero progress with zero pending work is a
+  server with nothing to do. Only queue depth and pending tokens separate it
+  from the wedge — the progress counters are *identical*. Alarming here is how a
+  real alarm gets ignored.
+* **A deliberate pause is not a wedge.** A flip is 2.0-4.2 s of legitimate
+  silence (#690) and a maintenance hold is longer; an `inhibited` sample
+  suppresses the verdict rather than tripping it.
+* **A counter reset is not a wedge.** After a restart the counters return to
+  zero, so a negative delta means *restarted*, not *stalled*. Reading it as a
+  wedge would make every restart trigger another.
+* **A cold start is not judged.** Fewer than two samples yields `unknown`.
+
+### Wiring and policy
+
+`build_liveness_is_active(scheduler)` replaces the shipped gate: it arms
+whenever **work is pending**, not when a batch happens to exist — which is the
+condition that actually distinguishes a wedge from an idle box, and the exact
+inversion of the failure above.
+
+The escalation is defined rather than implied: `confirmations` consecutive
+wedged windows before an alarm (so one slow window cannot trip it),
+`restart_after_alarms` before a restart, and a `restart_cooldown_s` so **a wedge
+that survives a restart does not become a restart loop**. Restart can be
+disabled outright.
+
+`to_monitoring_dict()` exposes the **deltas and pending counts alongside the
+verdict**, deliberately: an operator who sees only `wedged` cannot tell an
+admission wedge from a stalled forward pass, and those need different responses.
+
+Every threshold is a deployment input. The can-fail test is the real specimen
+shape — health 200, zero progress, nonzero pending — which must alarm, and which
+a health-200 check calls fine.
+
 ## #690 — WHAT THE FIXED FLIP COST IS MADE OF
 
 The flip has been carried as a scalar (~2.0-4.2 s) with an unexplained
