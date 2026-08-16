@@ -689,6 +689,22 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.
+        # It reads the GDN slot pool off req_to_token_pool.mamba_allocator,
+        # and that attribute is assigned four lines up -- AFTER
+        # init_model_worker() has already returned. Sitting next to the
+        # admission limiter (inside init_model_worker) put it before its own
+        # input existed and killed every rank on the first boot that got far
+        # enough to reach it:
+        #     line 1420, in init_model_worker -> self.init_parked_decode_set()
+        #     AttributeError: 'Scheduler' object has no attribute
+        #     'req_to_token_pool'                     (metal, 2026-08-16 09:00)
+        # The two earlier boots died at build_flip_draft_worker before ever
+        # reaching the call, which is exactly why a stand-in unit test could
+        # not have caught this: the ordering bug lives in the constructor, and
+        # the tests bind the methods to an object that already has the fields.
+        self.init_parked_decode_set()
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -1417,7 +1433,6 @@ class Scheduler(
         # it further for KV capacity). The limit that admission honours
         # floats below it and lives in the limiter.
         self.init_admission_limiter()
-        self.init_parked_decode_set()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
