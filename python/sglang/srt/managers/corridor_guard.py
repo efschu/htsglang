@@ -605,6 +605,7 @@ class CorridorGuard:
         reason: str = "",
         raise_on_refusal: bool = False,
         refusal_is_fatal: bool = False,
+        must_reclaim: bool = False,
     ) -> GuardResult:
         """Make ``want_bytes`` allocatable without breaching the floor.
 
@@ -632,7 +633,14 @@ class CorridorGuard:
         # allocation that is ABOUT to happen, which is the entire difference
         # between this and a threshold observer: after the fact, a breach has
         # already been recorded by a 100 ms sampler and cannot be undone.
-        if free_before - want >= self.floor_bytes:
+        # #689: THIS BRANCH IS WHERE THE FALSE SUCCESS RETURNED. Telling a
+        # caller "no reclaim needed" is correct for an allocator about to
+        # allocate `want`, and misleading for one that already accounted the
+        # free column and needs this ladder to RELEASE more -- the 12:29 seam
+        # asks returned here three times, ok=True, having freed nothing, while
+        # spendable sat at 609 against a need of 788. Under must_reclaim the
+        # ladder actually runs and the verdict is the measured delta.
+        if free_before - want >= self.floor_bytes and not must_reclaim:
             return GuardResult(
                 True, free_before, free_before, want, 0, (), "no reclaim needed"
             )
@@ -641,6 +649,15 @@ class CorridorGuard:
         # Free to the UPPER watermark, not merely to the floor, so the next
         # few allocations do not each pay a spill.
         target = self.floor_bytes + self.delta_bytes + want
+        if must_reclaim:
+            # #689 THE TARGET IS RELATIVE UNDER must_reclaim. The ladder spends
+            # only against a DEFICIT (`deficit = target - free_now`), so with
+            # 1428 MiB free and a 178 MiB ask there is no deficit and it
+            # correctly spends nothing -- which is why the 12:29 asks freed
+            # zero. A caller that already accounted the free column is asking
+            # for `want` MORE bytes, so the target has to be measured from
+            # where the column stands now, not from the floor.
+            target = max(target, free_before + want)
         # Item 16: read the fleet ONCE, before spending. Re-reading it after
         # each provider would let a rebalance that just filled a peer card
         # close the host gate mid-ladder on the strength of its own effect,
@@ -696,6 +713,35 @@ class CorridorGuard:
             f"{self.floor_bytes / _MIB:.0f} MiB, corridor law "
             f"{self.law_floor_mib} MiB" + (f" ({reason})" if reason else "")
         )
+        # #689 A RECLAIM ASK IS JUDGED BY WHAT MOVED.
+        #
+        # ``free_now >= want`` asks "is want allocatable", which is exactly
+        # right for an allocator about to allocate it -- every existing caller
+        # is one, so their verdict is untouched and must_reclaim defaults off.
+        #
+        # It is the WRONG question for a caller that already accounted the
+        # memory and needs this ladder to FREE more. Measured 2026-08-16
+        # 12:29, three consecutive seam asks on the binding rank:
+        #     asked the corridor guard for 178 MiB (pp_to_tp): ok=True,
+        #     spendable now 609 MiB against a need of 788 MiB
+        # 609 never moved. With 1428 MiB of driver-free, "are 178 MiB free"
+        # was trivially true while the ladder reclaimed nothing, so the seam
+        # was told it was funded and abandoned anyway. A success that is true
+        # of the world before the call is not a report about the call.
+        #
+        # It also propagates: fundable_width's pre-arm picture is built from
+        # what this returns, so an optimistic guard forms a window the seam
+        # cannot carry and moves the failure later, into an abandon.
+        if must_reclaim and ok and reclaimed < want:
+            ok = False
+            detail = (
+                f"{detail} -- REFUSED under must_reclaim: the ladder reclaimed "
+                f"{reclaimed / _MIB:.0f} MiB of the {want / _MIB:.0f} MiB "
+                f"asked. {free_now / _MIB:.0f} MiB was already free before "
+                f"this call and the caller has already accounted it, so free "
+                f"memory it did not release cannot fund the ask. Providers "
+                f"available: {', '.join(self.providers) or 'none'}"
+            )
         if host_forced and used_host:
             detail += (
                 "; host tier admitted on an UNLEVEL fleet because refusal "

@@ -5051,6 +5051,14 @@ class PhaseFlipRuntime:
                     shortfall,
                     reason=f"seam staging {direction}",
                     refusal_is_fatal=(direction == PP_TO_TP),
+                    # #689: the seam has ALREADY accounted the free column --
+                    # `usable` above is computed from it. It needs the ladder
+                    # to RELEASE `shortfall` more, so the ask must be judged by
+                    # the measured delta. Without this the guard answered "are
+                    # 178 MiB free" (trivially yes at 1428 free), reported
+                    # success three times having freed nothing, and the seam
+                    # abandoned believing it was funded.
+                    must_reclaim=True,
                 )
                 driver_free, cached_free = probe()
                 usable = max(0, driver_free - reserve)

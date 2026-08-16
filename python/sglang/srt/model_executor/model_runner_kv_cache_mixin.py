@@ -5705,7 +5705,82 @@ class ModelRunnerKVCacheMixin:
                 floor_charge >> 20,
             )
         if not reserve.active:
-            return max(0, int(budget_bytes) - floor_charge)
+            # #685 COLD BOOT: PRICE THE SEAM FROM THE LAYOUT, do not skip it.
+            #
+            # Reproduced live 2026-08-16 12:04, all three ranks "seam reserve
+            # is COLD ... sizes with NO flip-seam term": the pool came out at
+            # the raw 550000 pin where the warm boot minutes later solved
+            # 467708 against the same budget. A cold boot sized ~17% above
+            # what the same configuration knows to be safe, and the first flip
+            # then meets a pool that was never priced for it.
+            #
+            # There is no measured record to read, but the SLOPE does not need
+            # one: it is a property of the layout (which layers this rank
+            # receives) and the KV geometry (bytes per token per attention
+            # layer), both known at boot. The measured record adds the fixed
+            # and arena terms and the id-space anchor; without it we charge
+            # the per-token term alone, which UNDERCHARGES relative to warm and
+            # is deliberately the safe direction to be wrong in on a first
+            # boot -- strictly better than charging nothing.
+            #
+            # R' IS NET OF THE FLOOR CHARGE. The arming floor must stay free
+            # for a flip to arm at all; it is a reservation, never a spendable
+            # balance, so it cannot become KV. Solving against the
+            # pre-subtraction budget would price it as if it could, which is
+            # the same overshoot by another route. The warm branch returns
+            # this same net quantity, so both branches answer "how many bytes
+            # could become KV" with one number.
+            #
+            # AND THE FLOOR IS CHARGED ONCE. This returns min(net, allowed *
+            # cell) -- never net minus the charge a second time, which would
+            # hold a whole arming floor free for the life of the instance.
+            net = max(0, int(budget_bytes) - floor_charge)
+            cold_slope = 0.0
+            try:
+                attn_local = (
+                    attn_counts[rank]
+                    if received_layers is not None and attn_counts
+                    else 0
+                )
+                if received_layers and attn_local > 0 and int(cell) > 0:
+                    kv_per_attn_layer = float(cell) / float(attn_local)
+                    cold_slope = float(received_layers) * kv_per_attn_layer
+            except Exception:  # noqa: BLE001 - sizing must not fail on a probe
+                cold_slope = 0.0
+            if cold_slope <= 0.0 or int(cell) <= 0:
+                logger.info(
+                    "%s (rank %s): COLD and the seam slope could not be "
+                    "derived (received=%s cell=%s); sizing with NO per-token "
+                    "seam term, the pre-#685 behaviour.",
+                    seam.LOG_PREFIX,
+                    self._seam_world_rank(),
+                    received_layers,
+                    cell,
+                )
+                return net
+            allowed_cold = seam.solve_pool_tokens(
+                net, int(cell), 0, cold_slope, 0, received_layers=received_layers
+            )
+            priced = max(0, min(net, allowed_cold * int(cell)))
+            logger.info(
+                "%s (rank %s): COLD seam priced from the layout -- receives %d "
+                "layer(s), %.1f B/token/attn-layer, slope %.1f B/token; R' = "
+                "%d MiB net of the %d MiB floor charge -> %d tokens, budget "
+                "%d -> %d MiB. No measured record, so the fixed and arena "
+                "terms are NOT charged; this undercharges versus warm, which "
+                "is the safe direction on a first boot.",
+                seam.LOG_PREFIX,
+                self._seam_world_rank(),
+                int(received_layers or 0),
+                (float(cell) / float(attn_counts[rank])) if attn_counts else 0.0,
+                cold_slope,
+                net >> 20,
+                floor_charge >> 20,
+                allowed_cold,
+                net >> 20,
+                priced >> 20,
+            )
+            return priced
 
         # Per-RANK per-token bytes, which is what the record's slope means.
         # A configurator with no single cell (hybrid SWA, MiniMax sparse)
