@@ -298,7 +298,7 @@ rank, every stage holds ≥1 attention layer, and the rung clears
 `min_pool_tokens`.
 
 A stage with **zero** attention layers is refused rather than priced as
-infinite capacity (`pp_cut.py`, `stage_family_capacities`). Reporting unbounded
+infinite capacity (rev5 `pp_cut.stage_pp_capacities`). Reporting unbounded
 capacity for a stage that cannot serve a token is how a boot that cannot run
 gets armed.
 
