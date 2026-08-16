@@ -156,6 +156,51 @@ MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
 
+
+def _note_mamba_component(runner, name: str, gb: float) -> None:
+    """Record one NAMED sub-term of the lumped mamba budget post (#704).
+
+    Module-level and duck-typed ON PURPOSE. As a bound method it required
+    every test double to grow an attribute it had no reason to have -- the
+    #624 stub-drift class -- and it broke eleven ceiling-fit tests the moment
+    it landed. Production must not demand more of a stand-in than the
+    behaviour under test actually needs.
+    """
+    acc = getattr(runner, "_mamba_budget_components", None)
+    if acc is None:
+        acc = {}
+        setattr(runner, "_mamba_budget_components", acc)
+    acc[name] = acc.get(name, 0.0) + float(gb)
+
+
+def decompose_mamba_budget_post(total_gb: float, components: dict):
+    """Split the lumped mamba budget post into its three NAMED components.
+
+    The label has always named three terms; the post emitted one number. That
+    lump is why an accounting gap could not be attributed: the post nominally
+    covers MORE than the "Mamba Cache is allocated" line (it adds the prefill
+    activation reserve) yet measures 0.155 / 0.111 / 0.089 GiB LESS on the three
+    stages of the live boot. A term covering more cannot legitimately measure
+    less, and with one number there is no way to say which part carries it.
+
+    ``components`` holds the sub-terms the sizer actually measured. Whatever
+    they do not explain IS the state pool, so it is emitted under that name
+    rather than left as an anonymous remainder -- the parts always sum to the
+    lump exactly, and a NEGATIVE residual is reported rather than clamped,
+    because a negative state pool is precisely the error this instrument exists
+    to surface.
+
+    With no components (the other budget branches never populate them) the lump
+    is returned unchanged, so nothing else has to know about this.
+    """
+    if not components:
+        return [(MAMBA_BUDGET_POST, float(total_gb))]
+    named = sum(float(v) for v in components.values())
+    out = [("mamba state pool", float(total_gb) - named)]
+    out.extend((str(k), float(v)) for k, v in components.items())
+    return out
+
+
 #: State-slot count a pipeline stage WITHOUT any linear-attention layers in
 #: its layer window contributes to the world MIN-agreement on
 #: max_mamba_cache_size (#201 slice 3). Such a stage allocates zero state
@@ -726,7 +771,12 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-            budget_posts.append((MAMBA_BUDGET_POST, before_mamba_gb - rest_memory))
+            budget_posts.extend(
+                decompose_mamba_budget_post(
+                    before_mamba_gb - rest_memory,
+                    getattr(self, "_mamba_budget_components", {}) or {},
+                )
+            )
 
         # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
         # a scratch buffer before the large-M cuBLAS GEMM, and targets above
@@ -1894,6 +1944,8 @@ class ModelRunnerKVCacheMixin:
         return fitted
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
+        # #704: start a fresh component ledger for THIS sizing pass.
+        self._mamba_budget_components = {}
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
@@ -1940,7 +1992,9 @@ class ModelRunnerKVCacheMixin:
                     # secondary rung can exceed the boot shape's draft tokens.
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         elif self._auto_mamba_demand_active():
             # === Demand-driven mamba pool (uneven-DCP auto-sizing) ===========
             # Size the pool to the real serving concurrency, NOT to a fixed
@@ -2012,11 +2066,14 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             # Fold prefill-activation headroom back OUT of the KV budget so the
             # token pool does not grow to the physical ceiling and starve the
             # transient DCP-extend prefix-gather scratch (which OOMs a large
             # prefill). This lets the default --rank-auto-reserve-mib stand.
+            _note_mamba_component(self, "prefill activation reserve", reserve_gb)
             total_rest_memory = total_rest_memory - reserve_gb
         elif (
             server_args.disable_radix_cache
@@ -2075,7 +2132,9 @@ class ModelRunnerKVCacheMixin:
                     * server_args.max_mamba_cache_size
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         else:
             # Use ratio-based calculation to auto-fit available memory
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
@@ -2114,7 +2173,9 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
@@ -2290,9 +2351,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -2316,9 +2377,9 @@ class ModelRunnerKVCacheMixin:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                assert not self.server_args.enable_mamba_extra_buffer_lazy(), (
+                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -2473,9 +2534,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-hybrid-Mamba yet"
+        )
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -2549,9 +2610,9 @@ class ModelRunnerKVCacheMixin:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-SWA hybrid yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:
@@ -3983,9 +4044,9 @@ class ModelRunnerKVCacheMixin:
                     self._kv_sess_attach_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
+                    )
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
@@ -6159,9 +6220,9 @@ class ModelRunnerKVCacheMixin:
             # caller-supplied pool config it is supposed to RESOLVE, and
             # every rank died here with "Draft worker requires
             # memory_pool_config" (measured, boot 15, 2026-08-08).
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
