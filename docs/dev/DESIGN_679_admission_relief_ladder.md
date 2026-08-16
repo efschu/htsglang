@@ -257,3 +257,101 @@ failure and it is cheap to test hermetically on both sides.
   and therefore how many spills the ladder gets before falling through to
   retraction, has not been measured under the 5-lane load that produced the
   #679 crash.
+
+## 6. Boot validation — what one loaded window must show to turn it ON
+
+Written after the ladder landed (`82ba7e2c10`). The ladder is **off by default**;
+this is the evidence required to change that.
+
+### 6.1 The window
+
+- Boot the ladder arm **without rung 3**: `SGLANG_ADMISSION_RELIEF_LADDER=1`,
+  `SGLANG_ADMISSION_RELIEF_RETRACT` unset. Rungs 1–2 cost bandwidth and latency;
+  rung 3 destroys decode progress. Judge the cheap arm first.
+- **Five lanes**, the load that produced #679 and #680.
+- **≥ 30 minutes.** Both crashes arrived ~19 minutes in; a shorter window that
+  shows nothing has shown nothing.
+- A **ladder-off control** at comparable pressure. The `3374029942` boot is one.
+
+### 6.2 The null result, stated first
+
+If `KV-ADMISSION-LADDER` never appears, the window **proves nothing** — the
+pressure regime was not reached. That is a null result, not a pass, and it must
+not be recorded as one. Every criterion below is conditional on engagement.
+
+### 6.3 Accept
+
+1. **Engagement.** `KV-ADMISSION-LADDER` present, with its before/after
+   availability line.
+2. **Parks fall per engagement.** See §6.5 — the ratio, not the count.
+3. **No hard OOM.** Zero `Out of memory. Try to lower your batch size`.
+4. **No `NO relief provider is registered`.** That line means admission let
+   unfunded work reach the allocator, which the ladder was supposed to make
+   less likely, not more.
+5. **Both flip directions still commit.** The ladder must not starve the seam
+   by spilling or retracting what the flip needed.
+6. **No new wedge.** No `WITHHOLDING presence` spin, no rank divergence. The
+   split-batch class is an immediate reject, not a regression to weigh.
+
+### 6.4 Interaction with the #680 warning — do not read them independently
+
+`draft_token arrived as torch.int32 ... #680` fires when the **trivial verify
+path** is taken, and that path is entered when **drafting is disabled at high
+batch size** (or on a flip bootstrap).
+
+The ladder pushes on exactly that input. Rung 2 lowers inflow and rung 3
+retracts victims; both **shrink the batch**, which can re-enable drafting and
+make the trivial path *less* frequent.
+
+Two consequences, and both are easy to get backwards:
+
+- **The #680 warning going quiet is NOT evidence that the #680 fix is inert.**
+  It may be evidence the ladder is working. Do not conclude "the dtype fix never
+  fires, so it was unnecessary" from a ladder-on window.
+- **The #680 warning becoming MORE frequent is a ladder warning sign.** It would
+  mean the ladder is driving the instance into the degenerate-batch regime —
+  retracting or throttling so hard that batches collapse into the trivial path.
+  That is a rung-3 over-actuation signal, not a speculation bug.
+
+So the #680 line is read here as a **batch-shape probe**, not as a dtype signal.
+
+### 6.5 Interaction with the park counters — the ratio is the metric
+
+The ladder runs immediately before the park decision, so **every ladder
+engagement is a park that was about to happen**:
+
+```
+engagements   = KV-ADMISSION-LADDER lines
+parks_after   = "chunked prefill PARKED" lines
+rungs_paid    = engagements - parks_after        (relief that prevented a park)
+```
+
+- **Judge `parks_after / engagements`, never `parks_after` alone.** More parks
+  can simply mean more pressure. A ladder that engaged 100 times and still
+  parked 100 times freed nothing.
+- A ratio near **1.0** with engagement present is the **host-region bound**
+  showing itself — rung 1 exhausted and rung 3 disabled in this arm. That is
+  the quantity §5 says has never been measured, and this window measures it.
+  It is a finding, not a failure: it says the cheap arm cannot pay here and
+  rung 3 is required.
+- A ratio near **0** means rungs 1–2 carry the load and rung 3 may never be
+  needed on this rig.
+
+### 6.6 Rung 3, only as a second window
+
+Enable `SGLANG_ADMISSION_RELIEF_RETRACT=1` only after 6.3 passes. Additional
+requirement, because rung 3 is the only rung that can lose work:
+
+- **Every retracted request must come back.** `KV cache pool is full. Retract
+  requests.` lines must be matched by those requests completing afterwards. The
+  shared actuator requeues them (`_add_request_to_queue(..., is_retracted=True)`)
+  and a test pins that, but a leak here costs a user their request, so it is
+  confirmed on metal rather than assumed.
+- Watch the #680 line per §6.4: rung 3 is the rung most able to collapse batches.
+
+### 6.7 Reject
+
+Any of: a hard OOM; a rank divergence or wedge; retracted requests that do not
+return; parks not falling per engagement **while rungs report they paid** (which
+would mean the accounting lies); or a decode-latency regression beyond what the
+spill's host bandwidth explains.
