@@ -701,8 +701,17 @@ class TestSchedulerSideHelpers(CustomTestCase):
         from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         self.assertEqual(flip_blocking_guards(self._fake_scheduler()), [])
+        # #703: the HiCache clause was NARROWED from "is it enabled" to "is the
+        # DISK tier configured". Enabling hierarchical cache alone no longer
+        # refuses arming -- that refusal is what forced the serving line to run
+        # with no cache tier at all, and the wedge behind it (#630) is fixed and
+        # shipped (9da9dfd025 bounded collectives; see
+        # test_hicache_bounded_waits_630.py and
+        # test/registered/unit/managers/test_hicache_flip_guard_703.py).
         sched = self._fake_scheduler()
         sched.server_args.enable_hierarchical_cache = True
+        self.assertEqual(flip_blocking_guards(sched), [])
+        sched.server_args.hicache_storage_backend = "file"
         guards = flip_blocking_guards(sched)
         self.assertTrue(any("#630" in g for g in guards), guards)
         sched = self._fake_scheduler(is_dual_group_lane=True)

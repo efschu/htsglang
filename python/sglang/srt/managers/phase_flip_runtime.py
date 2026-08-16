@@ -1020,8 +1020,24 @@ def flip_blocking_guards(scheduler) -> List[str]:
             guards.append("PD disaggregation")
     except ImportError:
         pass
-    if getattr(server_args, "enable_hierarchical_cache", False):
-        guards.append("hierarchical cache (#630: PP x disk HiCache wedges at warmup)")
+    # HiCache is a TIER SHAPE, not a feature flag (#703, same lesson the kvso
+    # clause below already learned). This used to refuse arming whenever
+    # hierarchical cache was merely ENABLED, which made the phase flip and any
+    # prefix retention mutually exclusive: the deployment answered by running
+    # `enable_hierarchical_cache=False`, i.e. with no cache tier at all on the
+    # serving line. The wedge that earned the guard was specifically the DISK
+    # tier at warmup, and it was fixed -- 9da9dfd025 bounded the collectives
+    # (mem_cache/hicache_collective.py) and test_hicache_bounded_waits_630.py
+    # covers it. The guard now names the tier that actually wedged, so the
+    # device+host-local configuration can carry a prefix cache across the flip.
+    if getattr(server_args, "enable_hierarchical_cache", False) and getattr(
+        server_args, "hicache_storage_backend", None
+    ):
+        guards.append(
+            "hierarchical cache with storage backend "
+            f"{getattr(server_args, 'hicache_storage_backend', None)!r} "
+            "(#630: PP x disk HiCache wedges at warmup)"
+        )
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which
     # made the host half of spec items 6/12/15c and the phase flip mutually
