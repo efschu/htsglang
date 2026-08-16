@@ -1,119 +1,107 @@
-# DESIGN 704 — the reserve-vs-layout model
+# DESIGN 704 — the holdback: CONFIRMED MODEL
 
-Owner: Slot-2. Desk-only. Every number below is read from an instrumented boot;
-nothing is fitted except where a fit is explicitly labelled and its residual
-published.
-
-**Why this outranks the levers.** The per-rank reserve tracks CUDA-graph
-capture, so a rung change forces recapture and therefore changes the reserve. At
-3.5-6.7 GiB per rank it is larger than most rung-to-rung pool deltas, and every
-`measured=False` rung in the ladder currently carries it unquantified.
+Owner: Slot-2. **Status: SOLVED on metal.** All fitted candidates in earlier
+revisions of this document are retired, as is the [33,15,16] discriminator
+fallback. The form is exact, deterministic, and needs no regression.
 
 ---
 
-## 0 — Verdict
+## 0 — The model
 
-**The model is UNDETERMINED on existing data, but not for the reason expected,
-and two things are settled:**
+    allowed_tokens = id_space + (free_at_measure - arming_floor - margin) / cell
+    adjusted_bytes = allowed_tokens * cell
+    holdback_frac  = 1 - allowed_tokens / (profiled_bytes / cell)
 
-1. **Single-factor layer models are FALSIFIED** — not merely unresolved. The
-   reserve is *not monotone* in layers.
-2. **layers / attention / GDN cannot be told apart on any multiple-of-4 cut**,
-   as an exact algebraic identity rather than a sampling limitation.
+`cell = attention_layers_on_rank * 2048 B` (fp8_e4m3, config-derived).
 
-The recommended next step is **not a fit**. It is the fourth instrument.
+Source: `phase_flip_seam_reserve.floor_allowed_tokens` — *"largest id space
+whose RESTING FREE COLUMN still holds the arming floor"* — reached via
+`seam_adjusted_budget_bytes` from `_seam_adjusted_budget`, the single funnel
+every sizing path crosses.
 
-## 1 — Correction to my own gate-close reasoning
+**Verified against the instrumented boot on all three ranks:**
 
-At the gate I said only the BINDER's reserve is determinate. That is true of the
-*pinned* `available_bytes` (which I derived as `pool x cell`), and false of the
-**emitted** one. The boot publishes each rank's own capacity — 594,766 /
-463,079 / 436,446 tokens, all different — and the world pool is the min taken
-afterwards. So `reserve = rest - available_bytes` is determinate on **every**
-rank. Three points, not one.
-
-| rank | layers | attn | gdn | budget MiB | **reserve MiB** |
+| rank | profiled/cell (raw T) | allowed | model holdback | reported | slack above floor |
 |---|---:|---:|---:|---:|---:|
-| PP0 | 28 | 7 | 21 | 31,800 | **6,687.8** |
-| PP1 | 20 | 5 | 15 | 18,800 | **3,561.2** |
-| PP2 | 16 | 4 | 12 | 19,800 | **5,166.3** |
+| PP0 | 1,083,904 | 594,614 | 45.141 % | **45.143 %** | 2,177.7 MiB |
+| PP1 | 827,699 | 462,918 | 44.072 % | **44.074 %** | 269.4 MiB |
+| PP2 | 1,097,728 | 436,278 | 60.256 % | **60.258 %** | 7.4 MiB |
 
-## 2 — Falsified: any single-factor positive scaling in layers
+Agreement is 0.002 pp — the residual is MiB rounding in the logged budget.
+`id_space = 435,334`, identical on all three ranks.
 
-PP1 and PP2 are **both 3080s**. PP1 carries **more** layers (20 vs 16) and has
-**less** reserve (3,561 vs 5,166 MiB). Reserve is therefore non-monotone in
-layers, and no `a + b*layers` with `b > 0` can produce the observed triple. The
-same holds for attention and GDN counts, which are proportional to layers here.
+## 1 — The three questions, answered
 
-This is a refutation from three points, and it does not depend on any fit.
+**What computes 45.1 / 44.1 / 60.3 %?** Not a memory reserve in the intuitive
+sense. The pool is CAPPED so that the rank's resting free column still holds its
+arming floor — an equality, solved, not a subtrahend approximated. The percentage
+is whatever that cap costs relative to the raw byte capacity, so it is a
+consequence, not a parameter.
 
-## 3 — The confound is exact, not statistical
+**Why does the PP pass pay and the TP pass not?** The charge exists so a flip
+can ARM. The PP-phase pool is the layout a flip departs from, so it must rest
+above the floor; the TP-stack pass has no flip to arm from that layout and
+spends its whole profiled budget — confirmed by `holdback = 0.000 %` on all
+three ranks in the second sizing at 22:13:27.
 
-On the incumbent, `attn = layers / 4` on **every** rank (28/7, 20/5, 16/4 — all
-exactly 4.0), and `gdn = 3 x attn`. The three regressors are perfectly
-collinear, so the three hypotheses produce **identical residuals to the digit**:
+**Why is the BINDER the largest fraction?** Because both extremes meet on PP2:
 
-| form | a | b | residuals (MiB) | max abs |
-|---|---:|---:|---|---:|
-| a + b·layers | 1,628.9 | 164.51 | +452.6, −1,357.9, +905.3 | 1,357.9 |
-| a + b·attn | 1,628.9 | 658.04 | +452.6, −1,357.9, +905.3 | 1,357.9 |
-| a + b·gdn | 1,628.9 | 219.35 | +452.6, −1,357.9, +905.3 | 1,357.9 |
-| a + b·budget | 616.3 | 0.19 | −56.5, −678.0, +734.4 | 734.4 |
+* it has the **smallest cell** (4 attention layers -> 8192 B), so its raw byte
+  budget is the LARGEST token capacity of the three (1,097,728);
+* its resting free column sits **7.4 MiB above its arming floor** — essentially
+  exactly on it — so `allowed` is pinned at barely more than `id_space`.
 
-This is the **same degeneracy** that made [28,20,16] and [32,16,16]
-non-discriminating for the pool divisor. It was broken there by an absolute
-value (`cell_size`); here no absolute value is available, because the reserve is
-not emitted in decomposed form.
+Largest raw capacity divided by the tightest floor slack gives the largest
+holdback. It binds for the same reason it holds back most, which is why the two
+facts always co-occurred and looked like a coincidence.
 
-Two-factor forms (`a + b·layers + c·budget`) have three parameters for three
-points and fit exactly, with zero residual and zero information. They are
-**unidentifiable** and must not be published as models.
+## 2 — Why every earlier attempt failed
 
-## 4 — Recommendation: the fourth instrument, not a fit
+The quantity was never a graph-capture reserve, which is what I kept modelling.
+Three external re-derivations missed by +20 %, −3.8 % and −12 %; a fit over
+three points was falsified (non-monotone in layers) and confounded (`attn =
+layers/4` exactly, so layers/attn/gdn gave identical residuals). All of that was
+curve-fitting a term the process solves in closed form. The fourth instrument
+made it readable in one boot.
 
-Every previous blocker in this ticket dissolved the same way — the sizer already
-computed the term and simply did not emit it (budget posts, then
-`available_bytes`, then the mamba post's components). This is the fourth
-instance.
+`derived_rank_auto_reserve_mib`'s uniform 4,160 MiB was never this number and
+never claimed to be — it is a different reserve entirely.
 
-`derived_rank_auto_reserve_mib` returns **4,160 MiB uniformly** when called
-directly with this boot's arguments, while the metal reserves are 6,688 / 3,561
-/ 5,166. So the held-back amount is **not** that function's output alone, and
-fitting a curve through three points would be modelling a black box whose
-contents the process already knows.
+## 3 — Hand-off: exact rung pools for the ladder
 
-**Proposal:** emit what the sizer actually holds back, per rank, at the point it
-is applied — the same one-line pattern as the previous three. One boot then
-settles the functional form outright instead of a multi-boot regression that
-cannot separate collinear regressors anyway.
+Slot-3's rung pools can go from `extrapolated` to **exact**, without booting
+each rung, because every input is either config-derived or shifts computably:
 
-## 5 — If a boot must discriminate instead: use a non-multiple-of-4 cut
+* `cell` — config (`kv_mib_per_token_per_attn_layer_from_config` x attention
+  layers on that rank for the candidate cut);
+* `id_space`, `free_at_measure`, `margin` — the seam record of the CURRENT boot;
+* `arming_floor` — the #676 solver, per layout, already required by
+  `LadderInputs`;
+* the layout shift — `free_at_measure` moves by the weight and mamba deltas
+  between the current cut and the candidate, both already established:
 
-Any cut where `layers/attn` is not uniform breaks the collinearity. [33,15,16]
-does: its ratios are 4.125 / 3.75 / 4.0. Predictions per hypothesis, so the
-boot is a free calibration point whichever way it lands:
+      free_at_measure(cut) = free_at_measure(booted)
+                             - delta_weights(cut)      # per-family census
+                             - delta_mamba(cut)        # 51.20 MiB/GDN-layer
 
-| form | PP0 | PP1 | PP2 |
-|---|---:|---:|---:|
-| a + b·layers | 7,058 | 4,097 | 4,261 |
-| a + b·attn | 6,893 | 4,261 | 4,261 |
-| a + b·gdn | 7,113 | 4,042 | 4,261 |
-| a + b·budget | 6,658 | 4,188 | 4,378 |
+  and `delta_weights` uses the per-family figures (374.2 MiB full-attention,
+  476.2 linear).
 
-PP0 separates the forms by 165-455 MiB and PP1 by up to 219 MiB — both well
-above the ~2k-token boot noise expressed in these units. **PP2 is predicted
-identical (4,261) by three of the four forms**, which is the rank2 blind spot
-again: it holds 16 layers / 4 attn in every candidate cut.
+So a rung's pool is computable from one booted layout plus config. **What
+remains extrapolated is only `free_at_measure`'s shift**, which is arithmetic
+over two measured constants rather than an unknown reserve — a far smaller
+claim than "carry another layout's capture behaviour", and it should be labelled
+as such rather than as `measured`.
 
-Note that [33,15,16] no longer needs to be booted for the pool divisor — that
-was settled on absolute grounds by `cell_size` — so if it is booted at all, this
-is now its reason.
+## 4 — Retired
 
-## 6 — Discipline retained
+* the fitted candidates (`a + b*layers`, `attn`, `gdn`, `budget`) — superseded;
+* the [33,15,16] prediction table and the request that it be booted to
+  discriminate. The form is settled, so that boot has no calibration value. The
+  rank2 blind-spot note is preserved below because it still governs TIMING
+  calibration, which this does not touch.
 
-Any rung pool computed with a reserve carried from another layout is
-`measured=False` and self-labels as extrapolated, per the ratified split. This
-note does not license carrying a reserve across layouts; it quantifies how wrong
-that would be — **up to ~1.6 GiB per rank between two ranks of the same card
-type in a single boot**, which is larger than most rung-to-rung pool deltas and
-is exactly why the ladder's extrapolated rungs cannot gate a window.
+**Preserved — rank2 blind spot (timing only):** every candidate cut keeps rank2
+at 16 layers, so a boot pair that does not move it cannot identify its timing
+term at any sample size (`calibration_coverage` returns `inf`). That is
+unaffected by this result, which concerns the pool.
