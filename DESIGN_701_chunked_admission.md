@@ -22,7 +22,37 @@ Two properties make it terminal rather than merely tight:
   request that is trying to grow it. The #698 relief now correctly REPORTS
   `freed 0` — it made the failure legible, and could not fix it.
 
-## 2 — Root cause, in one sentence
+## 2 — Root cause — REVISED, the first version was wrong
+
+> **Revision 2 (review gate).** The mechanism below is **retracted**. I verified
+> both of the gate's counter-claims directly in the code:
+>
+> * `schedule_policy.py:1464` already gates the FULL lifetime —
+>   `total_tokens >= self.rem_total_tokens -> NO_TOKEN`. There is no missing
+>   full-length gate at first admission, so the "640x under-charge" story is
+>   false.
+> * The site I cited, `:1389-1407`, is the **`ignore_eos`** branch, reachable
+>   only with `ignore_eos AND tree_cache.disable`. The serving line runs radix
+>   ON, so the specimen went through the MAIN chunked branch at `:1569-1610`.
+>
+> The two real holes:
+>
+> 1. **Cross-pass commitment invisibility.** `PrefillAdder` is rebuilt each
+>    pass; `_get_running_request_total_token_offset` reserves only remaining
+>    DECODE, and only for requests present in `running_batch.reqs` — which a
+>    resident-but-batchless chunked request need not be (#631 defect O). A live
+>    chunked request's remaining PREFILL is therefore represented nowhere in
+>    later passes, so later admissions spend its committed future and the
+>    deadlock returns **with two actors**. This is the actual deadlock channel
+>    and it is what `ChunkedCommitmentLedger` closes.
+> 2. **Paper-evictable overcount on hybrid-SSM.** `rem_total_tokens` counts
+>    `full_evictable_size()` while the allocator can recover only
+>    mamba-recoverable bytes — stated in-code at `:734-737`. The gate passes on
+>    paper-evictable and relief later frees 0, which is exactly the specimen's
+>    signature and does **not** require the chain to be locked, only
+>    mamba-coupled.
+>
+> The paragraph below is kept as the retracted record.
 
 **Chunked prefill bounds the COMPUTE per step, not the KV COMMITMENT — and
 admission was reading the compute bound as if it were a memory decision.**

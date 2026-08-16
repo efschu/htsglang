@@ -2515,6 +2515,10 @@ def tp_phase_pool(total_attn_layers: int, n_ranks: int, model: PhasePoolModel) -
 # Fitting this cell against an observed pool is what produced the "0.83 of
 # observed" fudge in an earlier revision of DESIGN_704, and with it a bf16
 # reading of a checkpoint that ships fp8_e4m3.
+#
+# Converged from feat/704-prefill-ladder (Slot-3) into this module by
+# Slot-2, verbatim, so the KV cell has ONE implementation rather than two
+# that must agree.
 # ---------------------------------------------------------------------------
 
 _KV_DTYPE_WIDTH_BYTES = {

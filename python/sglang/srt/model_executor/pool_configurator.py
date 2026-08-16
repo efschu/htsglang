@@ -451,6 +451,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        # #704: emit the LAST link of the sizing chain.
+        #
+        # The chain is: budget - sum(budget_posts) = rest (already emitted at
+        # the profiler's success path), then rest MINUS a per-rank reserve
+        # becomes `available_bytes`, then // cell_size becomes tokens. The
+        # reserve is the only term never emitted anywhere, and on this rig it
+        # is large and wildly non-uniform -- backed out of the live boot it is
+        # 8,848 / 3,818 / 5,164 MiB across the three stages, a 2.3x spread. It
+        # is not derivable from config: it tracks per-rank CUDA-graph capture,
+        # which depends on the shard. planner/plan.py's auto_reserve_mib
+        # docstring says the value is one "which the boot itself derives and
+        # logs" -- the deriving is real, the logging was not; a 172 MB boot log
+        # contains only the server_args echo.
+        #
+        # With this line the reserve is recoverable as (rest - available_bytes)
+        # without a fourth external re-derivation, all three of which missed
+        # (+20 %, -3.8 %, -12 %).
+        logger.info(
+            "KV pool sizing: available_bytes=%d (%.3f GiB), cell_size=%d, "
+            "page_size=%d -> max_total_num_tokens=%d",
+            int(available_bytes),
+            float(available_bytes) / (1 << 30),
+            int(self._cell_size),
+            int(page_size),
+            int(max_total_num_tokens),
+        )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
