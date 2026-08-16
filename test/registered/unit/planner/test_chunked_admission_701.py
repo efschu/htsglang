@@ -1,20 +1,31 @@
-"""#701: the chunked-prefill self-deadlock falsifier.
+"""#701: the chunked-prefill admission rule (arithmetic half).
 
-Specimen: ONE chunked request (new-seq 1, new-token 512, cached 0) drove pool
-usage 0.95 -> 1.00 with no retract, abort or finish. Root cause
-(DESIGN_701_chunked_admission.md): chunked prefill bounds the COMPUTE per step,
-not the KV COMMITMENT, and `schedule_policy.py:1389-1407` charged the budget
-`trunc_len` -- one 512-token chunk -- while admitting a request whose real
-commitment is its entire remaining length. A 327,680-token request was admitted
-on a 512-token affordability check, a 640x under-charge, and its own locked
-prefix then made the pool unfreeable.
+CORRECTED after the review gate. The original version of this file carried a
+mechanism story that the gate refuted and that I verified false in-code:
 
-The falsifier the ticket asked for is `test_required_exceeding_fundable_is_never_admitted`.
+* it claimed a request was "admitted on a 512-token affordability check", a
+  640x under-charge. In fact ``schedule_policy.py:1464`` already gates the FULL
+  lifetime (``total_tokens >= self.rem_total_tokens -> NO_TOKEN``). There is no
+  missing full-length gate at first admission.
+* it cited ``:1389-1407`` as the defect site. That is the ``ignore_eos`` branch,
+  reachable only with ``ignore_eos AND tree_cache.disable``. The serving line
+  runs radix ON, so the specimen went through the MAIN chunked branch at
+  ``:1569-1610``.
 
-Per the binding generality clause the rule is pool ARITHMETIC, never a rig
-threshold: `test_no_rig_threshold_only_arithmetic` pins that a request at 99 %
-of a large pool is admissible while one at 101 % of a small pool is refused,
-under the same function with no constant between them.
+The two real holes, and where each is tested:
+
+1. **Cross-pass commitment invisibility** -- a resident chunked request's
+   remaining PREFILL is represented in no later pass. Tested against the REAL
+   ``PrefillAdder`` in
+   ``test/registered/unit/managers/test_chunked_commitment_701.py``, because
+   arithmetic on this module alone cannot fail against scheduler behaviour.
+2. **Paper-evictable overcount on hybrid-SSM** -- ``rem_total_tokens`` counts
+   ``full_evictable_size()`` while the allocator recovers only mamba-recoverable
+   bytes (``:734-737``). That is the likely specimen mechanism, and it is why
+   ``PoolState`` now takes ``recoverable_evictable_tokens`` and refuses the old
+   field name outright.
+
+This file keeps the threshold-free arithmetic half.
 
 Hermetic: pure arithmetic, no CUDA, no scheduler import.
 """
@@ -28,91 +39,95 @@ from sglang.srt.planner.chunked_admission import (
 )
 
 
-def _pool(free, unlocked, locked=0.0, capacity=437_000.0, spillable=0.0):
+def _pool(free, recoverable, locked=0.0, capacity=437_000.0, permanent=0.0, spill=0.0):
     return PoolState(
         free_tokens=free,
-        evictable_unlocked_tokens=unlocked,
+        recoverable_evictable_tokens=recoverable,
         locked_tokens=locked,
         total_capacity_tokens=capacity,
-        spillable_tokens=spillable,
+        permanent_reserve_tokens=permanent,
+        spillable_tokens=spill,
     )
 
 
 def test_required_exceeding_fundable_is_never_admitted():
     """THE FALSIFIER. Must not admit into the deadlock."""
-    pool = _pool(free=20_000.0, unlocked=5_000.0)
-    d = decide_chunked_admission(remaining_tokens=100_000, pool=pool)
+    d = decide_chunked_admission(100_000, _pool(free=20_000.0, recoverable=5_000.0))
     assert d.verdict in ("defer", "refuse")
     assert not d.admitted
 
 
 def test_the_specimen_is_not_admitted():
-    """327,680 tokens against a pool with 437k capacity but ~20k free."""
-    pool = _pool(free=20_000.0, unlocked=1_000.0, locked=416_000.0)
-    d = decide_chunked_admission(remaining_tokens=327_680, pool=pool)
+    d = decide_chunked_admission(
+        327_680, _pool(free=20_000.0, recoverable=1_000.0, locked=416_000.0)
+    )
     assert not d.admitted
     assert d.required_tokens == 327_680
 
 
-def test_verdict_does_not_depend_on_chunk_size():
-    """The precise substitution the bug makes.
-
-    The old code decided on `trunc_len`. The rule must be a function of the
-    REMAINING LENGTH and the pool only -- there is no chunk parameter to pass,
-    and that is the point.
-    """
-    pool = _pool(free=20_000.0, unlocked=1_000.0)
-    a = decide_chunked_admission(remaining_tokens=327_680, pool=pool)
-    # A caller who "affords" a 512-token chunk gets the same answer, because the
-    # chunk never enters the arithmetic.
-    b = decide_chunked_admission(remaining_tokens=327_680, pool=pool)
-    assert a.verdict == b.verdict == "defer"
+def test_the_chunk_is_unrepresentable():
+    """The substitution the original code made cannot even be expressed."""
+    pool = _pool(free=20_000.0, recoverable=1_000.0)
+    assert decide_chunked_admission(327_680, pool).verdict == "defer"
     with pytest.raises(TypeError):
-        decide_chunked_admission(remaining_tokens=327_680, pool=pool, chunk_tokens=512)  # noqa
+        decide_chunked_admission(327_680, pool, chunk_tokens=512)  # noqa
 
 
-def test_larger_than_total_capacity_is_refused_loudly_not_deferred():
-    """Refuse and defer are different verdicts: one can never succeed."""
-    pool = _pool(free=400_000.0, unlocked=30_000.0, capacity=437_000.0)
-    d = decide_chunked_admission(remaining_tokens=500_000, pool=pool)
+def test_above_the_achievable_ceiling_is_refused_loudly():
+    """Refuse and defer differ: one can never succeed at any future time."""
+    d = decide_chunked_admission(500_000, _pool(free=400_000.0, recoverable=30_000.0))
     assert d.verdict == "refuse"
-    assert "capacity" in d.reason.lower()
+    assert "achievable" in d.reason.lower()
 
 
 def test_a_request_that_fits_is_admitted():
-    pool = _pool(free=200_000.0, unlocked=150_000.0)
-    d = decide_chunked_admission(remaining_tokens=327_680, pool=pool)
+    d = decide_chunked_admission(327_680, _pool(free=200_000.0, recoverable=150_000.0))
     assert d.verdict == "admit"
-    assert d.admitted
 
 
 def test_locked_tokens_are_not_fundable():
-    """The whole deadlock in one assertion: a locked chain cannot pay for growth."""
-    generous_but_locked = _pool(free=1_000.0, unlocked=0.0, locked=430_000.0)
-    d = decide_chunked_admission(remaining_tokens=100_000, pool=generous_but_locked)
+    """The deadlock in one assertion: a locked chain cannot pay for growth."""
+    d = decide_chunked_admission(
+        100_000, _pool(free=1_000.0, recoverable=0.0, locked=430_000.0)
+    )
     assert not d.admitted
     assert d.fundable_tokens == 1_000.0
 
 
+def test_paper_evictable_is_not_representable_as_fundable():
+    """Defect 2: the old field name funded the specimen through the new rule."""
+    with pytest.raises(TypeError):
+        PoolState(
+            free_tokens=1.0,
+            evictable_unlocked_tokens=2.0,  # noqa - removed on purpose
+            locked_tokens=0.0,
+            total_capacity_tokens=3.0,
+        )
+
+
 def test_no_rig_threshold_only_arithmetic():
     """GENERALITY: same rule, opposite verdicts, no constant between them."""
-    big = _pool(free=990_000.0, unlocked=0.0, capacity=1_000_000.0)
+    big = _pool(free=990_000.0, recoverable=0.0, capacity=1_000_000.0)
     assert decide_chunked_admission(990_000, big).verdict == "admit"
-    small = _pool(free=100.0, unlocked=0.0, capacity=1_000.0)
+    small = _pool(free=100.0, recoverable=0.0, capacity=1_000.0)
     assert decide_chunked_admission(1_010, small).verdict == "refuse"
 
 
+def test_permanent_reserves_lower_the_refusal_bound():
+    """Defect 3: refusing at RAW capacity leaves a forever-defer band."""
+    pool = _pool(free=10_000.0, recoverable=0.0, capacity=437_000.0, permanent=50_000.0)
+    assert decide_chunked_admission(400_000, pool).verdict == "refuse"
+    assert decide_chunked_admission(300_000, pool).verdict == "defer"
+
+
 def test_a_spill_capability_raises_fundable_without_changing_the_rule():
-    """Future-proofing (a): spill plugs in, the rule is not re-derived."""
-    without = _pool(free=20_000.0, unlocked=1_000.0)
-    with_spill = _pool(free=20_000.0, unlocked=1_000.0, spillable=400_000.0)
+    without = _pool(free=20_000.0, recoverable=1_000.0)
+    with_spill = _pool(free=20_000.0, recoverable=1_000.0, spill=400_000.0)
     assert decide_chunked_admission(327_680, without).verdict == "defer"
     assert decide_chunked_admission(327_680, with_spill).verdict == "admit"
 
 
 def test_effective_running_bs_counts_resident_chunked_requests():
-    """#631 defect O as a counting truth: resident-but-batchless is RUNNING."""
+    """#631 defect O: resident-but-batchless is RUNNING."""
     assert effective_running_bs(running_bs=0, resident_chunked=1) == 1
     assert effective_running_bs(running_bs=3, resident_chunked=2) == 5
-    # And the idle conclusion every consumer draws must now be false.
-    assert effective_running_bs(running_bs=0, resident_chunked=1) > 0
