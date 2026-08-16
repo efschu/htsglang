@@ -319,6 +319,12 @@ class SeamReserve:
     #: back to the subtrahend there -- the previous arithmetic exactly.
     free_at_measure_bytes: int = 0
     rung_fund_bytes: int = 0
+    #: #696: what the KV rung is GUARANTEED to deliver, as distinct from
+    #: ``rung_fund_bytes`` which is what it happened to hold when the record
+    #: was written. Zero means "no guarantee has ever been measured", never
+    #: "guaranteed zero is fine" -- the arming floor treats the two the same
+    #: way on purpose, by declining to excuse anything.
+    rung_guaranteed_bytes: int = 0
     provenance: str = PROVENANCE_COLD
     written_at: Optional[str] = None
     detail: str = ""
@@ -385,8 +391,43 @@ class SeamReserve:
         if leg <= 0:
             return self.total_fixed_bytes
         arena = max(0, int(self.arena_fixed_bytes))
-        rung = max(0, int(self.rung_fund_bytes))
-        if arena > 0 and rung >= arena:
+        # #696 THE EXCUSE NOW REQUIRES A GUARANTEE, NOT A SIGHTING.
+        #
+        # This read ``rung_fund_bytes`` -- what the rung HELD when the record
+        # was written -- and used it to cancel a PERMANENT reservation. The two
+        # are not the same quantity, and the difference is the whole defect.
+        #
+        # Measured 2026-08-16 under lane load: PP1 arena 814.9 MiB,
+        # rung_fund_bytes 953.8 MiB, so the draw fell 815 -> 138.9 and 815 MiB
+        # stopped being reserved. The pool was sized that much larger. Then, at
+        # the fill where a seam actually runs:
+        #
+        #     current=473088 rows, floor=471983, slack=1105  -> 12.3 MiB
+        #     staging 733 MiB needed but only 691 MiB is spendable      (x8)
+        #
+        # 954 MiB promised, 12.3 MiB delivered, 42 MiB short -- the same figure
+        # eight times over, because it is a SIZING constant and not a runtime
+        # fluctuation. pp_to_tp abandoned every ~3 s, three ARM-UNFUNDED in
+        # nine seconds, decode at 187.5 s against a 180 s budget.
+        #
+        # The rung's deliverable is ``(current_rows - floor_rows) * bytes_per_row``
+        # and ``floor_rows`` tracks the LIVE SET, so the funding collapses
+        # exactly when occupancy is high -- which is exactly when a seam is
+        # hard to fund. An excuse granted at low fill is spent at high fill.
+        #
+        # WHICH IS WHY THE TWO OBVIOUS REPAIRS ARE ONE REPAIR. "Price the
+        # excuse against the worst case at max fill" and "drop the excuse" give
+        # the same answer, because at max fill ``current`` approaches
+        # ``floor_rows`` and the guaranteed deliverable is ZERO. So the
+        # predicate is written in the general form and reads a GUARANTEE; a
+        # record that has never measured one excuses nothing. The mechanism is
+        # preserved for a future measurement rather than deleted, and #685's
+        # own words -- "conditional on the recorded funding, never an
+        # unconditional removal" -- finally hold, because the condition is now
+        # a bound the rung cannot fall below instead of a number it was once
+        # observed at.
+        guaranteed = max(0, int(self.rung_guaranteed_bytes))
+        if arena > 0 and guaranteed >= arena:
             return max(0, leg - arena, max(0, int(self.fixed_bytes)))
         return leg
 
@@ -684,6 +725,7 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             worst_leg_fixed_bytes=int(rec.get("worst_leg_fixed_bytes", 0)),
             free_at_measure_bytes=int(rec.get("free_at_measure_bytes", 0)),
             rung_fund_bytes=int(rec.get("rung_fund_bytes", 0)),
+            rung_guaranteed_bytes=int(rec.get("rung_guaranteed_bytes", 0)),
             per_row_bytes=float(rec["per_row_bytes"]),
             have_bytes=int(rec.get("have_bytes", 0)),
             id_space=int(rec.get("id_space", 0)),
@@ -711,6 +753,7 @@ def write_seam_reserve(
     worst_leg_fixed_bytes: int = 0,
     free_at_measure_bytes: int = 0,
     rung_fund_bytes: int = 0,
+    rung_guaranteed_bytes: int = 0,
 ) -> Optional[str]:
     """Persist this boot's measurement for the next one. Never raises.
 
@@ -769,6 +812,7 @@ def write_seam_reserve(
         "worst_leg_fixed_bytes": int(worst_leg_fixed_bytes),
         "free_at_measure_bytes": int(free_at_measure_bytes),
         "rung_fund_bytes": int(rung_fund_bytes),
+        "rung_guaranteed_bytes": int(rung_guaranteed_bytes),
         "per_row_bytes": float(per_row_bytes),
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),

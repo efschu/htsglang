@@ -1098,15 +1098,15 @@ class TheShipPinIsDerivedFromThisRegime(unittest.TestCase):
         0: dict(fixed_bytes=238763008, per_row_bytes=2360.3031340235552,
                 have_bytes=3880139776, id_space=435319, arena_fixed_bytes=0,
                 worst_leg_fixed_bytes=238763008, free_at_measure_bytes=4500160512,
-                rung_fund_bytes=238763008, floor_mib=1728),
+                rung_fund_bytes=238763008, rung_guaranteed_bytes=238763008, floor_mib=1728),
         1: dict(fixed_bytes=145652736, per_row_bytes=424.1172657292698,
                 have_bytes=2337502976, id_space=435319, arena_fixed_bytes=854522624,
                 worst_leg_fixed_bytes=854522624, free_at_measure_bytes=2196111360,
-                rung_fund_bytes=1000175360, floor_mib=1825),
+                rung_fund_bytes=1000175360, rung_guaranteed_bytes=1000175360, floor_mib=1825),
         2: dict(fixed_bytes=145652736, per_row_bytes=550.6682501797533,
                 have_bytes=3408306688, id_space=435319, arena_fixed_bytes=1526867456,
                 worst_leg_fixed_bytes=1526867456, free_at_measure_bytes=2594570240,
-                rung_fund_bytes=1672520192, floor_mib=2467),
+                rung_fund_bytes=1672520192, rung_guaranteed_bytes=1672520192, floor_mib=2467),
     }
 
     #: #685: the bar is now the DEMONSTRATED-SAFE pool. Before the arena-tail
@@ -1281,6 +1281,14 @@ class TheArenaTailIsNotChargedTwice(unittest.TestCase):
             # the worst single leg is the larger of them, not their sum.
             worst_leg_fixed_bytes=max(arena_mib, draft_mib) * self.MIB,
             rung_fund_bytes=rung_mib * self.MIB,
+            # #696: the relief is conditional on what the rung is GUARANTEED to
+            # deliver, not on what it was once seen holding. These fixtures
+            # mean "the rung can pay", so they now say so in the field that
+            # carries that meaning. Production records have no guarantee
+            # recorded yet and therefore get no excuse -- which is the point:
+            # on metal the rung delivered 12.3 MiB of an 815 MiB tail at the
+            # fill where the seam actually ran.
+            rung_guaranteed_bytes=rung_mib * self.MIB,
             per_row_bytes=550.0,
             have_bytes=3 * (1 << 30),
             id_space=435319,
