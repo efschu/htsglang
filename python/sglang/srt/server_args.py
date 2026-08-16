@@ -7751,9 +7751,19 @@ class ServerArgs:
         blockers = []
         if self.disaggregation_mode != "null":
             blockers.append("--disaggregation-mode")
-        if self.enable_hierarchical_cache:
+        # #703: the BOOT-TIME twin of the runtime clause in
+        # phase_flip_runtime.flip_blocking_guards, narrowed identically and for
+        # the same reason. The #630 wedge was the DISK tier at warmup; its root
+        # was fixed by 9da9dfd025 (bounded collectives,
+        # mem_cache/hicache_collective.py). Refusing on the mere flag forced the
+        # serving line to run with no cache tier of any kind. Fixing only the
+        # runtime clause is not enough -- this one refuses at parse time, before
+        # a scheduler exists, so both must move together or the flag is still
+        # unusable.
+        if self.enable_hierarchical_cache and self.hicache_storage_backend:
             blockers.append(
-                "--enable-hierarchical-cache (#630: PP x disk HiCache "
+                "--enable-hierarchical-cache with --hicache-storage-backend "
+                f"{self.hicache_storage_backend!r} (#630: PP x disk HiCache "
                 "wedges at warmup)"
             )
         if getattr(self, "dual_group_lane", False):

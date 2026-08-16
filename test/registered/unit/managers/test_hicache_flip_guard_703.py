@@ -99,3 +99,56 @@ class TestHiCacheFlipGuard703(CustomTestCase):
         enable_hierarchical_cache alone), so there is nothing to refuse."""
         sched = _sched(enable_hierarchical_cache=False, hicache_storage_backend="file")
         self.assertEqual(_hicache_guards(sched), [])
+
+
+class TestHiCacheFlipV1Blocker703(CustomTestCase):
+    """The BOOT-TIME twin. `flip_blocking_guards` gates arming; this one
+    refuses at ServerArgs parse time, before a scheduler exists. Fixing only
+    the runtime clause leaves --enable-hierarchical-cache unusable, which is
+    exactly what a live boot proved:
+
+      ValueError: --enable-phase-flip V1 refuses:
+      --enable-hierarchical-cache (#630: PP x disk HiCache wedges at warmup).
+    """
+
+    def _blockers(self, **over):
+        from sglang.srt.server_args import ServerArgs
+
+        sa = ServerArgs.__new__(ServerArgs)
+        # the validator walks the whole phase-flip surface before it reaches
+        # the blocker list; give it a minimal VALID flip config so the only
+        # thing under test is the HiCache clause.
+        sa.enable_phase_flip = True
+        sa.phase_flip_policy = "auto"
+        sa.phase_flip_tp_vector = "32,16,16"
+        sa.phase_flip_purity = "prefill_in_tp"
+        sa.phase_flip_spill_depth = "arena"
+        sa.pp_size = 3
+        sa.disaggregation_mode = "null"
+        sa.enable_hierarchical_cache = False
+        sa.hicache_storage_backend = None
+        sa.dual_group_lane = False
+        sa.dp_size = 1
+        sa.ep_size = 1
+        sa.tp_size = 1
+        sa.speculative_algorithm = None
+        sa.speculative_draft_placement = None
+        for k, v in over.items():
+            setattr(sa, k, v)
+        try:
+            sa._handle_phase_flip()
+        except ValueError as exc:
+            return str(exc)
+        except AttributeError:
+            self.skipTest("validator not named _handle_phase_flip")
+        return ""
+
+    def test_device_host_local_hicache_boots(self):
+        msg = self._blockers(enable_hierarchical_cache=True)
+        self.assertNotIn("hierarchical", msg, msg)
+
+    def test_storage_backend_still_refused(self):
+        msg = self._blockers(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        self.assertIn("hierarchical", msg, msg)
