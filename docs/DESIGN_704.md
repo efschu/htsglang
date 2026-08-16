@@ -1038,6 +1038,84 @@ probe, and stage compute away from the incumbent is **extrapolated** with
 cost would mean less compute at deep cuts, hence less to hide behind). Every
 "hidden" verdict above is therefore an upper bound on how much hides.
 
+### 4.2f B1 DESK SPEC — the cross-PP-stage group
+
+Written against the code, no changes made. Engine work does not start while the
+boot cycle is owned elsewhere; this exists so it is ready-to-build when it
+frees.
+
+**The membership already exists; the TYPE does not.** With `tp_size=1`,
+`pp_size=3` (confirmed from the restored boot: `tp_size=1 pp_size=3
+dcp_size=1`), `world_size=3` and the PP group is built as
+`range(pp_group_idx, world_size, world_size // pp_size)` =
+`range(0, 3, 1)` = **`[0,1,2]`** (`parallel_state.py:3355-3372`). That is
+already every stage. Generally, for `tp_size > 1` there is one PP group per TP
+position and its members are that position's pipeline ranks — which is exactly
+the set across which KV should be token-sharded. **So no new rank layout has to
+be invented: the required membership is the PP group's, at every topology.**
+
+**But `_PP` cannot be used as-is, and the reason is a silent-wrongness path.**
+The attention backends read `attn_dcp_size` / `attn_dcp_rank` **once in the
+constructor and cache them** on the instance; `dcp_enabled` is
+`get_dcp_group_no_assert() is not None and dcp_size > 1`
+(`dcp_group_guard.py:14-19`). Handed a communicator that is not a
+**DCP-typed** group, they cache `dcp_size=1`, `uneven_dcp_owner_bounds()`
+returns `None` on **every** rank, the owner rule is bypassed, and every rank
+treats every global slot as its own local row — all ranks write the same token
+to the same row, last write wins, each reads the whole sequence as local.
+`dcp_group_guard.py:21-27` states the consequence exactly: *"The result is
+silently wrong output. There is no error and no hang to follow."*
+
+So B1 is: **a DCP-typed group whose rank sets come from the PP dimension
+instead of from chunking TP groups.**
+
+**Change point.** `parallel_state.py:3143-3159` builds `_DCP` by chunking each
+TP group:
+```
+for tp_group in group_ranks:
+    for start in range(0, len(tp_group), decode_context_parallel_size):
+        dcp_group_ranks.append(tp_group[start : start + decode_context_parallel_size])
+```
+With `tp_size=1` each TP group is a single rank, so every DCP group is a single
+rank — which is why PP prefill runs `dcp_size=1` with no usable group. The
+decoupled path needs those rank sets derived from the PP layout.
+
+**Ordering constraint, and it is load-bearing.** `_DCP` is built at `:3152`;
+`_PP` is built at **`:3365`, afterwards**. So the new construction **must not
+read `_PP`** — it must recompute the same pure arithmetic inline
+(`range(idx, world_size, world_size // pp_size)`). Reading a group that does not
+exist yet is the ordering class the DCP guard was written to catch.
+
+**Creation point relative to the guard.** `assert_dcp_group_formed`
+(`dcp_group_guard.py:63`) compares `server_args.dcp_size` against what a backend
+constructed *now* would cache, and refuses on mismatch. So the group must exist
+**before attention-backend construction**, and `server_args.dcp_size` must be
+set to the number of participating stages. The guard is then a no-op — and if
+the ordering is ever broken it names the construction step rather than failing
+downstream.
+
+**Collectives that run on it:** Q broadcast; partial-output + LSE all-gather via
+the existing `cp_lse_ag_out_ar_mha_uneven` (`layers/dcp/comm.py:228-262`, N-way,
+rank-ordered by the all_gather); and the KV placement writes (§4.2a).
+
+**Refusal conditions, each traced to an existing guard:**
+
+| condition | refuse because | citation |
+|---|---|---|
+| `dcp_size` ≠ participating stage count | backends would cache the wrong size and bypass the owner rule silently | `dcp_group_guard.py:63-100` |
+| `page_size != 1` | the owner rule `L % S ∈ [lo,hi)` is defined on single-token slots; a paged allocator has no owner for a page | `dcp_group_guard.py:170-177` |
+| `disaggregation_mode == "decode"` without uneven-TP + mooncake | stock head-sharded DCP receive is refused on first transfer | `dcp_group_guard.py:139-166` |
+| `tp_size > 1` with an ambiguous shard set | membership must be one PP group per TP position, not a mixture | new — no existing guard |
+
+Note `page_size == 1` is **already mandatory** for Option A independently
+(#706: a multi-token page would span owner ranks), so the two constraints agree
+rather than compete.
+
+**Still open, routed to the survey in flight:** the #616 group-MIN-floor
+interaction, whether an extra communicator carries a budgeted per-group cost,
+and whether any census/registry must be told about a new group. Those are
+recorded as unknown rather than assumed benign.
+
 ### 4.2b The prize and the purpose contradict — quantified
 
 The phase-uniform vector is the TP vector `[14,10,8]`, i.e. shares
