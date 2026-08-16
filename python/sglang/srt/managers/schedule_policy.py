@@ -1162,7 +1162,58 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
                     return req
-                _rem_tokens = self.rem_chunk_tokens
+                # #679: DO NOT SCHEDULE A CHUNK THE POOL CANNOT FUND.
+                #
+                # Overriding a zero budget with ``rem_chunk_tokens`` is what
+                # killed the instance at 23:41:01. The budget said nothing was
+                # available, this line admitted a 512-token chunk anyway,
+                # ``alloc_token_slots`` found available 0 / evictable 0, its
+                # only relief (evict_from_tree_cache) was a no-op with nothing
+                # evictable, and the hard RuntimeError took all three ranks
+                # down together. The override exists for a real reason -- a
+                # chunked request that leaves this function unhandled leaks --
+                # but "admit it anyway" is not the only way to keep it.
+                #
+                # PARKING IS ALREADY A FIRST-CLASS STATE. The hybrid-SWA branch
+                # above returns the request unmodified, and the scheduler
+                # documents the result at the chunked-request stash: a parked
+                # chunk "leaves extend_range.end == len(prefix_indices), so
+                # there is nothing new to cache and stashing would be a no-op".
+                # So the request stays the chunked request, is retried next
+                # round, and nothing leaks -- the same contract, without the
+                # allocation that cannot succeed.
+                #
+                # THE PREDICATE IS GROUP-UNIFORM. ``fundable_extend_tokens``
+                # reads the published availability floor rather than this
+                # rank's own, so every rank parks on the same iteration.
+                # Deciding this from a rank-local size would split the group
+                # across different batches, which is a hang rather than a
+                # stall.
+                from sglang.srt.mem_cache.common import (
+                    chunk_tokens_the_pool_can_fund,
+                    fundable_extend_tokens,
+                )
+
+                fundable = fundable_extend_tokens(self.tree_cache)
+                grant = chunk_tokens_the_pool_can_fund(
+                    fundable, self.page_size, self.rem_chunk_tokens
+                )
+                if grant <= 0:
+                    req.set_extend_range(
+                        len(req.prefix_indices), len(req.prefix_indices)
+                    )
+                    logger.warning(
+                        "chunked prefill PARKED: the pool can fund %d tokens, "
+                        "below one page (%d). The request keeps its place and "
+                        "is retried when memory frees; admitting it here is "
+                        "what took the instance down on 2026-08-15.",
+                        fundable,
+                        self.page_size,
+                    )
+                    return req
+                # Fundable, but only just: take what the pool can actually
+                # give rather than the nominal chunk size.
+                _rem_tokens = grant
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
