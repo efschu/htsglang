@@ -877,6 +877,29 @@ class ModelRunnerKVCacheMixin:
             torch.cuda.memory_reserved(),
         )
 
+        # #704: EMIT the budget decomposition on the SUCCESS path too.
+        #
+        # Until now ``budget_posts`` was built on every boot and handed to
+        # ``budget_exhausted_message`` only when the budget RAN OUT -- so the
+        # sizer named every term of its own arithmetic exactly when it failed,
+        # and discarded the naming when it worked. The planner therefore had no
+        # instrument for the reserve it must not double-count, and re-deriving
+        # it from config missed the measured boot by +20 %, -3.8 % and -12 % on
+        # three independent attempts (NOTE_704_retro_prediction_terms.md).
+        #
+        # This line is the instrument that closes that gap: the pool solve
+        # CONSUMES these posts instead of recomputing them, which is the same
+        # discipline the #676 arming floor already follows. Two numbers that
+        # must agree and are computed twice is a shape this corpus has paid for
+        # repeatedly; here the second computation lives in a different process
+        # and could not even be compared.
+        logger.info(
+            "[rank %d] KV budget posts (GiB): %s | rest=%.3f",
+            self.tp_rank,
+            ", ".join(f"{name}={gb:.3f}" for name, gb in budget_posts),
+            rest_memory,
+        )
+
         return int(rest_memory * (1 << 30))  # return in bytes
 
     # ------------------------------------------------------------------
