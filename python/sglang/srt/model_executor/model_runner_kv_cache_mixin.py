@@ -155,6 +155,105 @@ MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
 
+#: The names :func:`decompose_mamba_budget_post` emits, in order. Anything that
+#: sums "the mamba post" must accept BOTH shapes -- the lump and these parts --
+#: or it silently reads zero on exactly the boots that carry the instrument.
+MAMBA_POST_PART_NAMES = (
+    "mamba state pool",
+    "speculative intermediate state",
+    "prefill activation reserve",
+)
+
+
+def mamba_post_total_gb(posts) -> float:
+    """The mamba post total, whether it was emitted lumped or decomposed.
+
+    Exists because the decomposition broke the ceiling hint in
+    ``budget_exhausted_message``: that summed posts named ``MAMBA_BUDGET_POST``,
+    which matches nothing once the post is emitted as three parts, so the
+    ``--max-running-requests-ceiling`` advice disappeared from the refusal
+    message precisely on the boots that have the new instrument. Callers should
+    use this rather than matching a name.
+    """
+    return sum(
+        gb
+        for name, gb in posts
+        if name == MAMBA_BUDGET_POST or name in MAMBA_POST_PART_NAMES
+    )
+
+
+def _note_mamba_component(runner, name: str, gb: float) -> None:
+    """Record one NAMED sub-term of the lumped mamba budget post (#704).
+
+    Module-level and duck-typed ON PURPOSE. As a bound method it required
+    every test double to grow an attribute it had no reason to have -- the
+    #624 stub-drift class -- and it broke eleven ceiling-fit tests the moment
+    it landed. Production must not demand more of a stand-in than the
+    behaviour under test actually needs.
+    """
+    acc = getattr(runner, "_mamba_budget_components", None)
+    if acc is None:
+        acc = {}
+        setattr(runner, "_mamba_budget_components", acc)
+    acc[name] = acc.get(name, 0.0) + float(gb)
+
+
+def budget_holdback_mib(profiled_bytes: int, adjusted_bytes: int) -> float:
+    """The TRUE per-rank holdback, in MiB (#704, fourth instrument).
+
+    The quantity between the profiler's ``rest`` and what the configurator
+    actually receives. On metal it lands at 6,688 / 3,561 / 5,166 MiB while
+    ``derived_rank_auto_reserve_mib`` returns 4,160 UNIFORMLY for the same
+    boot's arguments -- so the holdback is not that function's output, and with
+    three exactly-collinear data points its form cannot be fitted (single-factor
+    layer models are already falsified by non-monotonicity; see
+    DESIGN_704_reserve_vs_layout.md). Emitting it settles the form in one boot
+    instead of a regression that cannot separate collinear regressors.
+
+    Reports rather than sanitises. A NEGATIVE holdback means the seam handed
+    budget back, which is a real and loud state; clamping it to zero would hide
+    exactly the accounting-error class this ticket has spent four instruments
+    chasing.
+    """
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(1 << 20)
+
+
+def budget_holdback_fraction(profiled_bytes: int, adjusted_bytes: int):
+    """Holdback as a fraction of the profiled budget, or ``None`` if there was
+    no budget to hold back from -- a division nobody should have to guard."""
+    if not profiled_bytes:
+        return None
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(profiled_bytes)
+
+
+def decompose_mamba_budget_post(total_gb: float, components: dict):
+    """Split the lumped mamba budget post into its three NAMED components.
+
+    The label has always named three terms; the post emitted one number. That
+    lump is why an accounting gap could not be attributed: the post nominally
+    covers MORE than the "Mamba Cache is allocated" line (it adds the prefill
+    activation reserve) yet measures 0.155 / 0.111 / 0.089 GiB LESS on the three
+    stages of the live boot. A term covering more cannot legitimately measure
+    less, and with one number there is no way to say which part carries it.
+
+    ``components`` holds the sub-terms the sizer actually measured. Whatever
+    they do not explain IS the state pool, so it is emitted under that name
+    rather than left as an anonymous remainder -- the parts always sum to the
+    lump exactly, and a NEGATIVE residual is reported rather than clamped,
+    because a negative state pool is precisely the error this instrument exists
+    to surface.
+
+    With no components (the other budget branches never populate them) the lump
+    is returned unchanged, so nothing else has to know about this.
+    """
+    if not components:
+        return [(MAMBA_BUDGET_POST, float(total_gb))]
+    named = sum(float(v) for v in components.values())
+    out = [(MAMBA_POST_PART_NAMES[0], float(total_gb) - named)]
+    out.extend((str(k), float(v)) for k, v in components.items())
+    return out
+
+
 #: State-slot count a pipeline stage WITHOUT any linear-attention layers in
 #: its layer window contributes to the world MIN-agreement on
 #: max_mamba_cache_size (#201 slice 3). Such a stage allocates zero state
@@ -570,7 +669,7 @@ class ModelRunnerKVCacheMixin:
         short_mib = math.ceil(-rest_memory_gb * 1024)
         total_gb, outside_gb = occupancy
         ceiling_note = ""
-        mamba_post_gb = sum(gb for name, gb in posts if name == MAMBA_BUDGET_POST)
+        mamba_post_gb = mamba_post_total_gb(posts)
         if ceiling and mamba_post_gb > 0.005:
             # The post is (slots + admitted*D) * per_req + a constant reserve,
             # and both slot terms are proportional to the ceiling -- so the
@@ -725,7 +824,12 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-            budget_posts.append((MAMBA_BUDGET_POST, before_mamba_gb - rest_memory))
+            budget_posts.extend(
+                decompose_mamba_budget_post(
+                    before_mamba_gb - rest_memory,
+                    getattr(self, "_mamba_budget_components", {}) or {},
+                )
+            )
 
         # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
         # a scratch buffer before the large-M cuBLAS GEMM, and targets above
@@ -1893,6 +1997,8 @@ class ModelRunnerKVCacheMixin:
         return fitted
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
+        # #704: start a fresh component ledger for THIS sizing pass.
+        self._mamba_budget_components = {}
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
@@ -1939,7 +2045,9 @@ class ModelRunnerKVCacheMixin:
                     # secondary rung can exceed the boot shape's draft tokens.
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         elif self._auto_mamba_demand_active():
             # === Demand-driven mamba pool (uneven-DCP auto-sizing) ===========
             # Size the pool to the real serving concurrency, NOT to a fixed
@@ -2011,11 +2119,14 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             # Fold prefill-activation headroom back OUT of the KV budget so the
             # token pool does not grow to the physical ceiling and starve the
             # transient DCP-extend prefix-gather scratch (which OOMs a large
             # prefill). This lets the default --rank-auto-reserve-mib stand.
+            _note_mamba_component(self, "prefill activation reserve", reserve_gb)
             total_rest_memory = total_rest_memory - reserve_gb
         elif (
             server_args.disable_radix_cache
@@ -2074,7 +2185,9 @@ class ModelRunnerKVCacheMixin:
                     * server_args.max_mamba_cache_size
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         else:
             # Use ratio-based calculation to auto-fit available memory
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
@@ -2113,7 +2226,9 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
@@ -6003,7 +6118,23 @@ class ModelRunnerKVCacheMixin:
         # #656: charge the flip seam HERE, the one funnel every sizing path
         # reaches. Keyed to the post-capture path instead, it never fired at
         # all on the ship config, whose pool is decided pre-capture (boot H).
+        _profiled_bytes = budget_bytes
         budget_bytes = self._seam_adjusted_budget(budget_bytes, configurator)
+        # #704: EMIT the true per-rank holdback at the one funnel every sizing
+        # path reaches. This is the term that lands at 6,688 / 3,561 / 5,166 MiB
+        # on metal while derived_rank_auto_reserve_mib reports 4,160 uniformly,
+        # and the term no external re-derivation reproduced (+20 %, -3.8 %,
+        # -12 % on three attempts). With it emitted, one boot identifies the
+        # form that three collinear points could not.
+        _frac = budget_holdback_fraction(_profiled_bytes, budget_bytes)
+        logger.info(
+            "KV budget holdback: profiled=%.1f MiB, adjusted=%.1f MiB, "
+            "holdback=%.1f MiB (%s of profiled)",
+            _profiled_bytes / (1 << 20),
+            budget_bytes / (1 << 20),
+            budget_holdback_mib(_profiled_bytes, budget_bytes),
+            "n/a" if _frac is None else f"{_frac:.3%}",
+        )
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
