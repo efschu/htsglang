@@ -1094,25 +1094,63 @@ which is a different objective, so it never covered this. Solved by
 Three prices are charged against every candidate, because quoting only the first
 is how a cut gets recommended that cannot serve.
 
-| cut | attn | compute | coupled pool | decoupled pool | ovh | **net now** | **net + lever** | needs lever |
-|---|---|---|---|---|---|---|---|---|
-| `[28,17,19]` | (7,4,5) | 1.120x | 200,288 (−54%) | 514,034 | 14.3% | **0.980** | 1.120 | |
-| `[31,16,17]` | (7,4,5) | 1.250x | 303,005 (−31%) | 514,034 | 15.8% | 1.079 | 1.250 | |
-| `[33,15,16]` | (8,4,4) | 1.330x | 363,179 (−17%) | 514,034 | 13.6% | 1.171 | 1.330 | |
-| `[34,15,15]` | (8,4,4) | 1.333x | 331,079 (−24%) | 514,034 | 7.6% | 1.239 | 1.333 | |
-| `[36,14,14]` | (9,3,4) | 1.429x | 240,120 (−45%) | 514,034 | 8.6% | 1.316 | 1.429 | |
-| `[38,13,13]` | (9,3,4) | 1.538x | 183,055 (−58%) | 514,034 | 9.7% | 1.403 | 1.538 | |
-| `[40,12,12]` | (10,3,3) | 1.667x | 115,994 (−73%) | 514,034 | 6.7% | 1.561 | 1.667 | |
-| **`[42,11,11]`** | (10,3,3) | 1.818x | 64,636 (−85%) | 514,034 | 9.5% | **1.660** ← best today | 1.818 | |
-| `[43,10,11]` | (10,3,3) | 1.934x | 38,956 (−91%) | 514,034 | 18.7% | 1.630 | 1.934 | **YES** |
-| **`[44,10,10]`** | (11,2,3) | 2.000x | 14,437 (−97%) | 514,034 | 27.5% | 1.569 | **2.000** ← best with lever | **YES** |
+| cut | attn | compute | coupled pool | decoupled pool | ovh | **net now** | **net + lever** | lever | pool |
+|---|---|---|---|---|---|---|---|---|---|
+| `[28,20,16]` incumbent | (7,5,4) | 1.000x | 436,275 | 513,875 | 6.3% | 0.941 | 1.000 | | **MEASURED** |
+| `[31,16,17]` | (7,4,5) | 1.250x | 397,957 (−9%) | 513,875 | 15.8% | 1.079 | 1.250 | | extrap |
+| `[33,15,16]` | (8,4,4) | 1.330x | **415,859 (−5%)** | 513,875 | 13.6% | 1.171 | 1.330 | | extrap |
+| `[34,15,15]` | (8,4,4) | 1.333x | 382,106 (−12%) | 513,875 | 7.6% | 1.239 | 1.333 | | extrap |
+| `[36,14,14]` | (9,3,4) | 1.429x | 336,833 (−23%) | 513,875 | 8.6% | 1.316 | 1.429 | | extrap |
+| `[38,13,13]` | (9,3,4) | 1.538x | 276,827 (−37%) | 513,875 | 9.7% | 1.403 | 1.538 | | extrap |
+| `[40,12,12]` | (10,3,3) | 1.667x | 246,610 (−43%) | 513,875 | 6.7% | 1.561 | 1.667 | | extrap |
+| **`[42,11,11]`** | (10,3,3) | 1.818x | 192,604 (−56%) | 513,875 | 9.5% | **1.660** ← best now | 1.818 | | extrap |
+| `[43,10,11]` | (10,3,3) | 1.934x | 165,601 (−62%) | 513,875 | 18.7% | 1.630 | 1.934 | **YES** | extrap |
+| **`[44,10,10]`** | (11,2,3) | **2.000x** ← peak | 172,791 (−60%) | 513,875 | 27.5% | 1.569 | **2.000** ← best w/ lever | **YES** | extrap |
+| `[47,6,11]` | (11,2,3) | 1.915x | 99,146 (−77%) | 513,875 | 26.4% | 1.489 | 1.915 | **YES** | extrap |
+| `[51,1,12]` | (12,1,3) | 1.727x | 43,767 (−90%) | 513,875 | 26.0% | 1.371 | 1.727 | **YES** | extrap |
+
+Pool now comes from **Slot-2's #707 closed form**, not from an extrapolation of
+mine: `allowed_tokens = id_space + (free_at_measure − arming_floor − margin) /
+cell`, with `holdback_frac = 1 − allowed / (profiled/cell)`. It reproduces the
+instrument boot's reported holdbacks (45.143 / 44.074 / 60.258 %) to **0.000 pp**.
+Only the layout *shift* of `free_at_measure` is extrapolated — per family,
+374.2 MiB per attention layer and 476.2 per linear, plus 51.20 per GDN layer.
+Everything else is exact, and the incumbent row is **measured**.
+
+**Three things the closed form changed, one of them a correction to me.**
+
+1. **Coupled is far kinder than I reported.** My extrapolation put `[33,15,16]`
+   at −17% and `[42,11,11]` at −85%. The truth is **−5%** and −56%, because
+   `allowed_tokens` is floored at `id_space`, which does not shrink with the
+   cut. So the first few layers onto the 5090 are nearly free in the regime that
+   exists **today** — `[33,15,16]` buys 1.330x for 5% of context, without
+   decoupling at all.
+2. **The seam cap bounds the depth.** Past `n0 = 51` a rank's free column no
+   longer clears its arming floor, so the layout **cannot arm a flip**. Those
+   cuts are refused by the provider and never reach the frontier — absent, not
+   priced as a tiny pool. An extrapolation cannot produce that boundary.
+3. **Both optima are interior, for two different reasons.** Without the lever,
+   overhead outgrows the compute gain past `[42,11,11]`. *With* it, the raw
+   compute speedup itself peaks at `[44,10,10]` and then falls — piling layers
+   onto the fast card eventually makes a **tail stage** the bottleneck. "More
+   layers on the 5090" has a limit that is not about memory at all.
+
+**Why the binder holds back most, and it is not waste.** PP2's bracket
+(`free_at_measure − arming_floor − margin`) is **0.0 MiB** — it sits exactly at
+its arming floor — against PP0's 2164.8 and PP1's 260.2. So its allowed tokens
+collapse to `id_space`, i.e. it *sets* the pool. It simultaneously has the
+smallest cell (4 attention layers), hence the largest raw capacity and therefore
+the largest holdback *fraction*. Binding and holding back most co-occur **by
+construction**. Reading PP2's 60.3% as waste is exactly backwards. And the TP
+pass holds back 0.000% on every rank for the matching reason: there is no flip
+to arm from.
 
 **Two decisions fall out, and they are independent.**
 
-**1. Coupled or decoupled — and coupled cannot buy depth at any price.** In the
-regime that exists today the pool collapses: `[33,15,16]` costs 17% of context
-for 1.33x, and `[42,11,11]` costs **85%** for 1.82x. Nothing past roughly
-`[34,15,15]` is purchasable. Under decoupling (#704b) the pool is **exactly
+**1. Coupled or decoupled — and coupled buys the first steps cheaply.** In the
+regime that exists today `[33,15,16]` costs only **5%** of context for 1.330x,
+and `[31,16,17]` costs 9% for 1.250x. The decline is real but not a collapse
+until depth: `[42,11,11]` costs 56%. Under decoupling (#704b) the pool is **exactly
 cut-independent at 514,034 — +17.7% over the incumbent's observed 436,766** —
 because total weight bytes and total GDN state are invariant under a re-cut;
 only their distribution moves. **So the pool price of depth is not merely
@@ -1133,9 +1171,10 @@ which is why they carry `needs_pipelining`.
 * **Today, decoupled, no lever:** `[42,11,11]` — **1.660x net at +17.7% pool.**
 * **With the lever built:** `[44,10,10]` — **2.000x net at +17.7% pool.** The
   lever is worth the last 0.34x, and nothing else.
-* **Coupled, if decoupling slips:** `[34,15,15]` — 1.333x for −24% pool, or
-  `[33,15,16]` for 1.330x at −17%. Beyond that the context loss is not a trade,
-  it is a failure.
+* **Coupled, available TODAY with no new machinery:** `[33,15,16]` — **1.330x
+  for −5% pool**. This is the cheapest real win on the whole frontier and it
+  needs neither decoupling nor the lever. `[34,15,15]` gives 1.333x for −12%.
+  Past `[38,13,13]` (−37%) the context loss stops being a trade.
 * **Do not pick `[28,17,19]`**: decoupled, it is **net 0.980x — slower than the
   incumbent**, because at incumbent depth the collective buys nothing and still
   costs its overhead. Decoupling does not pay for itself until roughly

@@ -58,6 +58,11 @@ class FrontierPoint:
     #: True when no shallower candidate is worse without pipelining, i.e. this
     #: cut is only reachable once the lever is built.
     needs_pipelining: bool
+    #: Provenance of THIS cut's pool, per layout. A booted layout's
+    #: available_bytes are read from its own sizing lines and are exact; every
+    #: other cut is extrapolated and says so. One global flag would let a
+    #: measured row launder an extrapolated one.
+    pool_measured: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,8 +70,9 @@ class PrefillFrontier:
     points: tuple[FrontierPoint, ...]
     incumbent: tuple[int, ...]
     incumbent_pool_tokens: float
-    #: Self-labelling. False whenever any input was extrapolated rather than
-    #: measured, so a caller cannot mistake a projection for an observation.
+    #: True only when EVERY point is measured. A frontier over candidate cuts is
+    #: therefore almost never measured, which is the honest default: read
+    #: ``FrontierPoint.pool_measured`` per row instead.
     measured: bool
 
     def best_without_pipelining(self) -> FrontierPoint:
@@ -89,13 +95,19 @@ def solve_prefill_frontier(
     gather_mib_per_attn_layer: float,
     link_mib_per_s: Sequence[float],
     max_rank0_layers: int | None = None,
-    measured: bool = False,
+    measured_for: Callable[[Sequence[int]], bool] | None = None,
 ) -> PrefillFrontier:
     """Enumerate cuts and price each on speed, pool and overhead.
 
     ``available_bytes_for(counts, attn_counts)`` returns the per-rank bytes
     left for KV under that cut. It is injected because it depends on the
     boot's own budget instruments, which no arithmetic here can invent.
+
+    ``measured_for(counts)`` says whether THAT cut's bytes came from its own
+    boot. Provenance is per layout rather than per frontier: a booted cut is
+    exact, and every other row is extrapolated across a holdback that is known
+    to vary by rank (45.1 / 44.1 / 60.3 % measured in one PP sizing pass) and is
+    therefore not safe to treat as constant.
     """
     incumbent = tuple(int(c) for c in incumbent)
     if len(incumbent) != n_stages:
@@ -115,6 +127,10 @@ def solve_prefill_frontier(
     base = pipelined(incumbent)
     points: list[FrontierPoint] = []
 
+    # The incumbent is always a row, even when it is not the fastest split at
+    # its own depth -- and on this rig it is not. The user needs to see where
+    # they are standing, not only where they could go.
+    candidates: list[tuple[int, ...]] = [incumbent]
     for n0 in range(int(incumbent[0]), int(total_layers) - (n_stages - 1) + 1):
         if max_rank0_layers is not None and n0 > int(max_rank0_layers):
             break
@@ -126,13 +142,24 @@ def solve_prefill_frontier(
             ms = pipelined(counts)
             if ms < best_ms - 1e-12:
                 best_ms, best = ms, counts
-        if best is None:
-            continue
+        if best is not None and best not in candidates:
+            candidates.append(best)
+
+    for best in candidates:
+        best_ms = pipelined(best)
 
         attn = tuple(int(a) for a in attn_counts_for(best))
         if any(a <= 0 for a in attn):
             continue
-        avail = [float(x) for x in available_bytes_for(best, attn)]
+        try:
+            avail = [float(x) for x in available_bytes_for(best, attn)]
+        except ValueError:
+            # The provider refused this layout. Under the #707 seam cap that
+            # means a rank's free column no longer clears its arming floor, so
+            # the cut cannot ARM a flip -- it is not a small pool, it is not a
+            # configuration. Skipping is the whole point of asking a provider
+            # that can refuse.
+            continue
         if min(avail) <= 0.0:
             continue
 
@@ -162,6 +189,7 @@ def solve_prefill_frontier(
                 net_no_pipelining=base / with_gather,
                 net_pipelined=base / best_ms,
                 needs_pipelining=False,
+                pool_measured=bool(measured_for(best)) if measured_for else False,
             )
         )
 
@@ -178,7 +206,7 @@ def solve_prefill_frontier(
         points=tuple(finished),
         incumbent=incumbent,
         incumbent_pool_tokens=float(incumbent_pool_tokens),
-        measured=bool(measured),
+        measured=all(p.pool_measured for p in finished) if finished else False,
     )
 
 
