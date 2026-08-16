@@ -2445,8 +2445,36 @@ class MHATokenToKVPool(KVCache):
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
         device_id = dev.index if dev.index is not None else torch.cuda.current_device()
+        # DEFAULT 8 MiB, MEASURED UNDER LOAD 2026-08-16 (#688).
+        #
+        # It was 0, which made the shipped row-blocking machinery INERT:
+        # `_effective_row_blocks` returns 1 when the arena cannot do span ops,
+        # and without a commit chunk it cannot. The 16-block default sat
+        # unreachable in every fresh deployment.
+        #
+        # Priced by three boots of 7b706e8b89, same argv, same 4x25625-token
+        # load, one variable, at matched live-slot counts:
+        #
+        #   chunk 0 -> 16   staging reserved per rank, 131 / ~25.7k slots
+        #     PP0   1438.25 / 1510.21  ->  1061.53 / 1133.43   -377 MiB (-26%)
+        #     PP1   1229.24 / 1301.20  ->   959.67 / 1031.58   -270 MiB (-22%)
+        #     PP2   1870.46 / 1942.42  ->  1654.92 / 1726.83   -216 MiB (-12%)
+        #
+        # A CONSTANT OFFSET, not a slope: the same absolute saving at 131 and
+        # at 25.7k live slots, which is what makes it worth a default -- it is
+        # margin the seam gets back at every size. Corridor law warnings over
+        # the same load fell 6 -> 3, and 216-377 MiB is the range the 06:47:48
+        # wedge was short by (PP1 missed by 293).
+        #
+        # WHY 8 AND NOT 16. Measured separately, 8 -> 16 changes nothing:
+        # slopes 0.00195 vs 0.00206 MiB/slot and intercepts within 3%, because
+        # the arena chunk floor binds at both. The knob's own comment predicted
+        # exactly this ("B=32 returns EXACTLY the B=16 numbers"). 8 is the
+        # cheaper value that buys the whole shrink, and it is the value this
+        # rig's operator env has been running all along -- so the default now
+        # matches proven practice instead of trailing it.
         seam_chunk, retain = seam_chunk_and_retention(
-            int(os.environ.get("SGLANG_FLIP_SEAM_CHUNK_MIB", "0") or 0),
+            int(os.environ.get("SGLANG_FLIP_SEAM_CHUNK_MIB", "8") or 0),
             swappable=bool(self.swappable_backing),
             retain_env=os.environ.get("SGLANG_FLIP_SEAM_RETAIN_HANDLES", ""),
         )
