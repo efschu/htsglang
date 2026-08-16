@@ -5989,6 +5989,8 @@ class Scheduler(
             prefill_spill_regions = self.kv_session_offload.prefill_spill_free_regions()
 
         # Prefill policy
+        from sglang.srt.mem_cache.common import published_fundable_floor
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -6011,6 +6013,20 @@ class Scheduler(
             prefill_spill_regions=prefill_spill_regions,
             prefill_spill_region_tokens=prefill_spill_region_tokens,
             prefill_spill_deep=prefill_spill_deep,
+            # #681: the NEW-request half of #679's park. `add_chunked_req`
+            # already refuses to schedule a chunk the pool cannot fund, on the
+            # group-published floor; without this the sibling gate for fresh
+            # requests still branches on THIS rank's pool and admits batches
+            # `alloc_for_extend` then dies on. Read once per iteration, from
+            # the same helper the chunked gate uses, so both gates agree by
+            # construction rather than by two copies of the arithmetic.
+            #
+            # `published_fundable_floor` and not `fundable_extend_tokens`
+            # directly: as a CEILING a mis-read 0 would admit nothing forever,
+            # so the cap is applied only where a group floor was actually
+            # published. See that helper for why the two gates read the same
+            # number through different doors.
+            fundable_extend_floor=published_fundable_floor(self.tree_cache),
         )
 
         if self.chunked_req is not None:
