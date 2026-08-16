@@ -13,8 +13,20 @@ sharded with a DCP vector at the bandwidth proportion 2.4:1:1.
 
 ## 0 — Verdict
 
+> **Revision 2 correction (planner-rules pass).** Re-expressing this verdict as
+> planner rules (`planner/family_split.py`, per the PLAN_PERF_PIPELINE binding
+> directive) surfaced an error below: §2 priced concentration against an **equal
+> 1/3 shard**, where the slow 3080s bind. But this fork ships **uneven TP**
+> (`--rank-tp-ratio`), so the honest baseline is a **bandwidth-proportional**
+> shard, under which every rank finishes together and the family costs
+> `bytes / sum(bandwidth)` = 1.73 ms rather than 2.51 ms. Against that faster
+> baseline concentration has more to repay and **the gate roughly doubles, from
+> 14.3 us to 30.5 us**. The 14.3 us figure below understated the bar; the
+> solver derives both and `test_the_baseline_shard_POLICY_moves_the_threshold_twofold`
+> pins them. Everything else in this note stands.
+
 **The desk-net is positive if and only if a blocking TP all-reduce costs more
-than 14.3 microseconds on this rig.** Everything else is priced below; the whole
+than 30.5 microseconds on this rig (14.3 us against an equal-shard baseline).** Everything else is priced below; the whole
 question collapses to that one threshold, which is measurable and is the only
 number this desk could not source.
 
