@@ -343,9 +343,52 @@ class SeamReserve:
         Falls back to :attr:`total_fixed_bytes` when the per-leg measurement
         is absent, so a pre-#678 record is priced exactly as before rather
         than optimistically.
+
+        #685: THE ARENA TAIL DROPS OUT WHERE THE RUNG DEMONSTRABLY FUNDS IT,
+        and this is the "third payment" ``arming_floor_subtrahend_bytes``
+        already warns about, finally made true.
+
+        The tail is real and is not disputed here: ``arena_fixed_bytes`` is
+        ``max(0, pp_bytes - tp_bytes)``, the weights the PP layout needs
+        beyond the TP layout's on this rank, and on the 2026-08-16 boot it
+        reconciles three independent ways -- the ``rung 3 released`` lines,
+        this record, and that definition (PP0 0, PP1 815, PP2 1456 MiB). It is
+        largest on the SMALLEST card because uneven TP shrinks that card's TP
+        shard while PP still hands it a full stage. Geometry, not a defect.
+
+        What was wrong was charging it to the arming floor, which is a
+        PERMANENT free-VRAM reservation, when the same record already showed
+        the KV rung able to pay it AT FLIP TIME: PP1 954 MiB of rung_fund
+        against an 815 MiB tail, PP2 1595 against 1456. Reserved permanently,
+        it cost the binding rank its whole headroom -- 2474 MiB free at rest
+        against a 2467 MiB floor, an equality solve with 7 MiB to spare, and
+        ~47k tokens of pool.
+
+        CONDITIONAL ON THE RECORDED FUNDING, never an unconditional removal. A
+        rank whose rung cannot cover its own tail keeps paying for it in the
+        floor, because for that rank the ladder genuinely cannot find it; and
+        ``rung_fund_bytes`` is 0 on a record that never measured one, which
+        means "no funding known", never "funded".
+
+        NEVER BELOW THE LEG THE RUNG DOES NOT FUND. The drafter's restore is
+        not arena tail and is not paid by this provider, so it floors the
+        result -- relieving the arena must not relieve the other leg by
+        arithmetic accident.
+
+        GATED ON METAL. The rung that must pay was latched off until
+        38c1161fd4 (its recovery aimed above the arena's immutable
+        reservation and failed 59/59). On the boot carrying that fix the log
+        shows the tail released 22 times at flip cadence and no recovery
+        failures, which is the evidence this relief was held back for.
         """
         leg = max(0, int(self.worst_leg_fixed_bytes))
-        return leg if leg > 0 else self.total_fixed_bytes
+        if leg <= 0:
+            return self.total_fixed_bytes
+        arena = max(0, int(self.arena_fixed_bytes))
+        rung = max(0, int(self.rung_fund_bytes))
+        if arena > 0 and rung >= arena:
+            return max(0, leg - arena, max(0, int(self.fixed_bytes)))
+        return leg
 
     @property
     def active(self) -> bool:

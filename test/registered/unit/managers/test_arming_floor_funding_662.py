@@ -1109,9 +1109,12 @@ class TheShipPinIsDerivedFromThisRegime(unittest.TestCase):
                 rung_fund_bytes=1672520192, floor_mib=2467),
     }
 
-    #: What the recorded inputs support TODAY, with a little tolerance. The
-    #: sizer must not slip below this without the change being seen.
-    REGRESSION_FLOOR = 430000
+    #: #685: the bar is now the DEMONSTRATED-SAFE pool. Before the arena-tail
+    #: relief the recorded inputs supported ~435696 and this floor sat at
+    #: 430000; the relief lands them at ~483723, so the guard moves up to the
+    #: bracket it was always meant to protect. A regression below the pool this
+    #: rig measured safe is now red.
+    REGRESSION_FLOOR = 480000
     CELL_BYTES = 20480
 
     def setUp(self):
@@ -1123,13 +1126,23 @@ class TheShipPinIsDerivedFromThisRegime(unittest.TestCase):
         self._dir.cleanup()
 
     def _round_trip(self, rank):
-        """Write this rank's record the way the boot does, then read it back."""
+        """Write this rank's record the way the boot does, then read it back.
+
+        THE FLOOR IS DERIVED, NOT PINNED (#685). ``floor_mib`` is what the gate
+        solved on the boot; everything in it EXCEPT the one-leg seam draw is
+        held fixed (that residue carries rank 0's corridor-shortfall term, so
+        pinning the total would freeze it too). The draw itself is recomputed
+        from the record, which is what makes this test sensitive to a change in
+        what the floor charges instead of asserting yesterday's total.
+        """
         r = dict(self.RECORDS[rank])
-        floor = r.pop("floor_mib") * self.MIB
+        observed_floor = r.pop("floor_mib") * self.MIB
+        residue = observed_floor - int(r["worst_leg_fixed_bytes"])
         path = os.path.join(self._dir.name, f"seam-rank{rank}.json")
         sr.record_path = lambda server_args, world_rank, _p=path: _p
         sr.write_seam_reserve(None, rank, detail="regime basis", **r)
-        return sr.read_seam_reserve(None, rank), floor
+        reserve = sr.read_seam_reserve(None, rank)
+        return reserve, residue + reserve.arming_draw_bytes()
 
     def _solved_pool(self):
         per_rank = {}
@@ -1185,17 +1198,121 @@ class TheShipPinIsDerivedFromThisRegime(unittest.TestCase):
         self.assertEqual(sr.SHIP_PIN.basis_per_row_bytes, slopes)
         self.assertEqual(sr.SHIP_PIN.basis_arming_floor_mib, floors)
 
-    def test_the_remaining_gap_to_the_safe_bracket_is_named_not_hidden(self):
-        """HONEST ABOUT WHAT IS STILL OPEN.
+    def test_the_sizer_reaches_the_pool_this_rig_demonstrated_safe(self):
+        """THE ACCEPTANCE, INVERTED BY #685 EXACTLY AS IT WAS DESIGNED TO BE.
 
-        The sizer lands ~47k below the pool this rig demonstrated safe. That
-        is real and it is follow-up work, not something this bar should paper
-        over by lowering the safe number to meet it.
+        It was written as the open-gap marker -- "the sizer lands ~47k below
+        the pool this rig demonstrated safe, and that is follow-up work, not
+        something this bar should paper over by lowering the safe number to
+        meet it" -- and it asserted ``pool < demonstrated_safe``.
+
+        The follow-up landed. The ~47k was the arena tail charged to the
+        arming floor on the binding ranks while the record already showed the
+        KV rung funding it, so the floor stopped charging it where the rung
+        covers it and the solve went 435696 -> ~483723.
+
+        The number it must clear is the artifact's, not a literal: when the
+        pin is re-derived under a new regime this bar moves with it.
         """
-        pool, _ = self._solved_pool()
-        self.assertLess(
+        pool, per_rank = self._solved_pool()
+        self.assertGreaterEqual(
             pool,
             sr.SHIP_PIN.demonstrated_safe_tokens,
-            "if the sizer now reaches the demonstrated-safe pool, this test "
-            "has done its job and the follow-up investigation can close",
+            f"solved {pool}, below the demonstrated-safe "
+            f"{sr.SHIP_PIN.demonstrated_safe_tokens}: {per_rank}",
         )
+
+    def test_the_relief_did_not_buy_the_pool_past_the_unsafe_bracket(self):
+        """THE PROPERTY, NOT A CONSTANT. Whatever the solve lands on, it is
+        checked against the measured-unsafe number in the artifact -- so a
+        future relief that overshoots is caught by the same test that
+        certified this one, without anyone remembering to update a literal."""
+        pool, per_rank = self._solved_pool()
+        self.assertLess(
+            pool,
+            sr.SHIP_PIN.demonstrated_unsafe_tokens,
+            f"relief overshot into the measured-unsafe band: {pool} {per_rank}",
+        )
+        self.assertGreater(
+            sr.SHIP_PIN.demonstrated_unsafe_tokens - pool,
+            0,
+            "the margin to the unsafe bracket must be positive by construction",
+        )
+
+
+class TheArenaTailIsNotChargedTwice(unittest.TestCase):
+    """#685: the floor stops reserving what the rung demonstrably funds.
+
+    THE TAIL IS REAL, and this does not dispute it. `arena_fixed_bytes` is
+    `max(0, pp_bytes - tp_bytes)`: the weights the PP layout needs beyond the
+    TP layout's on this rank. It reconciles three ways on the 2026-08-16 boot
+    -- the `rung 3 released ...` lines, the record, and the definition:
+
+        PP0  pp 15790.5  tp 16329.9  -> max(0, -539) =    0 MiB
+        PP1  pp  9792.8  tp  8977.8  ->              =  815 MiB
+        PP2  pp 10434.0  tp  8977.8  ->              = 1456 MiB
+
+    It is largest on the SMALLEST card because uneven TP shrinks that card's
+    TP shard while PP still hands it a full stage. Geometry, not a defect.
+
+    WHAT WAS WRONG WAS THE TREATMENT. The tail was charged to the arming
+    floor -- a permanent free-VRAM reservation -- while the record already
+    showed the KV rung could pay it at flip time (PP1 954 > 815, PP2 1595 >
+    1456). `arming_floor_subtrahend_bytes` names this exact hazard: "Reserving
+    it here as well would be the third payment for one requirement."
+
+    IT IS CONDITIONAL ON THE RECORDED FUNDING, never unconditional removal. A
+    rank whose rung cannot cover its own tail keeps paying for it in the
+    floor, because for that rank the ladder genuinely cannot find it.
+
+    GATED ON METAL, NOT ON ARITHMETIC. The rung that must pay was latched off
+    until 38c1161fd4; on the boot carrying it the log shows the arena tail
+    being released 22 times at flip cadence and no recovery failures. The
+    relief was not built before that evidence existed.
+    """
+
+    MIB = 1 << 20
+
+    def _reserve(self, arena_mib, draft_mib, rung_mib):
+        return sr.SeamReserve(
+            fixed_bytes=draft_mib * self.MIB,
+            arena_fixed_bytes=arena_mib * self.MIB,
+            # This rig's shape: the two maxima come from DIFFERENT legs, so
+            # the worst single leg is the larger of them, not their sum.
+            worst_leg_fixed_bytes=max(arena_mib, draft_mib) * self.MIB,
+            rung_fund_bytes=rung_mib * self.MIB,
+            per_row_bytes=550.0,
+            have_bytes=3 * (1 << 30),
+            id_space=435319,
+            provenance=sr.PROVENANCE_STORED,
+        )
+
+    def test_a_covered_tail_drops_out_of_the_one_leg_draw(self):
+        """PP2's numbers: the rung covers 1456 with 1595."""
+        draw = self._reserve(1456, 139, 1595).arming_draw_bytes()
+        self.assertEqual(139 * self.MIB, draw)
+
+    def test_an_uncovered_tail_is_still_charged_in_full(self):
+        """The relief is conditional. A rung that cannot pay changes nothing."""
+        draw = self._reserve(1456, 139, 900).arming_draw_bytes()
+        self.assertEqual(1456 * self.MIB, draw)
+
+    def test_the_draw_never_falls_below_the_leg_the_rung_does_not_fund(self):
+        """The drafter's restore is not arena tail and is not funded by it.
+
+        Relieving the arena must not be allowed to relieve the OTHER leg by
+        arithmetic accident.
+        """
+        draw = self._reserve(1456, 700, 5000).arming_draw_bytes()
+        self.assertEqual(700 * self.MIB, draw)
+
+    def test_a_rank_with_no_tail_is_untouched(self):
+        """PP0 has none; its draw is the drafter's restore, before and after."""
+        draw = self._reserve(0, 228, 1595).arming_draw_bytes()
+        self.assertEqual(228 * self.MIB, draw)
+
+    def test_a_record_that_never_measured_a_rung_keeps_the_old_charge(self):
+        """rung_fund_bytes is absent on a pre-#678 record, and 0 must mean
+        'no funding known', never 'funded'."""
+        draw = self._reserve(1456, 139, 0).arming_draw_bytes()
+        self.assertEqual(1456 * self.MIB, draw)
