@@ -5112,7 +5112,14 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif phase_prefill_blocked_here(self):
+        elif phase_prefill_blocked_here(
+            self,
+            running_bs=(
+                len(running_batch.reqs)
+                if running_batch is not None and running_batch.reqs is not None
+                else 0
+            ),
+        ):
             # #631 STRICT PHASE PURITY: not a single token is prefilled in
             # the TP layout. The prefill batch is not BUILT (nothing is
             # allocated and then dropped) -- the work stays queued and is

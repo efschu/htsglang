@@ -590,7 +590,7 @@ def _relaxed(scheduler, work: str) -> bool:
     return True
 
 
-def prefill_blocked_here(scheduler) -> bool:
+def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
     """True when a prefill batch must NOT be built this iteration.
 
     Rank-uniform by construction, which is the load-bearing property: the
@@ -643,7 +643,7 @@ def prefill_blocked_here(scheduler) -> bool:
         except Exception:  # noqa: BLE001 - a guard never breaks the loop
             unavailable = None
     if policy is not None and prefill_suppressed_in_tp(
-        policy, PHASE_TP, flip_unavailable=bool(unavailable)
+        policy, PHASE_TP, flip_unavailable=bool(unavailable), running_bs=running_bs
     ):
         return True
     # THE YIELD IS A RECEIPT-BEARING EVENT, and loud on purpose. Prefilling in
