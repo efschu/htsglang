@@ -2907,6 +2907,85 @@ class Scheduler(
     #: accusation.
     ARM_VERDICT_ROUNDS = 8
 
+    #: Minimum seconds between BOTH-BLOCKED evict attempts. The decline is
+    #: evaluated every round, and an unbounded evict call there would be a
+    #: tight loop over the whole radix tree while the instance is already
+    #: wedged.
+    BOTH_BLOCKED_EVICT_INTERVAL_S = 5.0
+
+    def _apply_both_blocked_relief(self, decision, inp) -> None:
+        """Actually run the eviction the BOTH-BLOCKED receipt promises.
+
+        #698 THE INVARIANT WAS COMMENT-ONLY, and that is what a 54-minute
+        outage was made of. phase_policy's branch says:
+
+            "Declining here is what routes the caller to the evict rung
+             instead of to a cutover."
+
+        The caller did no such thing. Every decline was handled identically --
+        one throttled log line, return None -- so the system printed "this is
+        an evict trigger and NOT a flip" 350 times over 54 minutes while no
+        evict was ever attempted. Health returned 200 throughout, three GPUs
+        sat at 0%, and 10.5M tokens queued behind a pool nothing would free.
+        That is the fourth counter-vs-actuator member found in one day, and
+        the first where the actuator was described in prose and never written.
+
+        BOUNDED, AND HONEST ABOUT DELIVERING NOTHING. The decline is evaluated
+        every round, so the call is rate-limited; and it REPORTS what eviction
+        actually returned, because "the remedy ran and freed 0" and "the remedy
+        never ran" are the two states this outage could not distinguish.
+
+        A ZERO HERE IS A FINDING, NOT A FAILURE OF THIS CODE. At the 16:23
+        specimen the pool was held by an in-flight CHUNKED request's protected
+        prefix -- a chunked request is resident but sits in no batch (#631
+        defect O), which is why the scheduler read `#running-req: 0` while its
+        prefix was locked. Eviction cannot free a locked chain, so on that
+        specimen this routing would have delivered 0 and said so. Naming that
+        in one line is what turns a silent wedge into a diagnosis.
+        """
+        try:
+            from sglang.srt.managers.phase_policy import BOTH_BLOCKED
+
+            if (decision.reason or "").find(BOTH_BLOCKED) != 0:
+                return
+            now = float(inp.now)
+            last = getattr(self, "_both_blocked_evict_at", 0.0)
+            if last and (now - last) < self.BOTH_BLOCKED_EVICT_INTERVAL_S:
+                return
+            self._both_blocked_evict_at = now
+            tree = getattr(self, "tree_cache", None)
+            if tree is None:
+                return
+            from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+            want = int(
+                getattr(self.server_args, "chunked_prefill_size", 0) or 0
+            ) or 512
+            freed = int(evict_from_tree_cache(tree, want) or 0)
+            rows = self._post_evict_rows()
+            logger.warning(
+                "PHASE-POLICY BOTH-BLOCKED RELIEF: asked the tree cache for "
+                "%d rows, it freed %d; %d rows now reachable. %s",
+                want,
+                freed,
+                rows,
+                (
+                    "Eviction delivered NOTHING while both layouts are blocked "
+                    "-- the pool is held by something the frontier cannot "
+                    "reach (an in-flight chunked request's protected prefix is "
+                    "the known case). This is the state to escalate, not to "
+                    "retry."
+                    if freed <= 0
+                    else "The remedy the receipt names has now actually run."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - relief must never break a round
+            logger.warning(
+                "PHASE-POLICY BOTH-BLOCKED RELIEF could not run (%r); the "
+                "decline stands and nothing was freed.",
+                exc,
+            )
+
     def _note_round_build_outcome(self, ret, running_batch) -> None:
         """Record that this round built nothing while both classes had work.
 
@@ -8508,6 +8587,7 @@ class Scheduler(
                     inp.pending_prefill_tokens,
                     inp.running_bs,
                 )
+            self._apply_both_blocked_relief(decision, inp)
             return None
         # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
         # its seam has moved the zero-GPU window one stage right instead of

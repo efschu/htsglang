@@ -117,6 +117,7 @@ LOG_PREFIX = "PHASE-POLICY"
 # importable (and unit-testable) without the flip runtime.
 PHASE_PP = "pp"
 PHASE_TP = "tp"
+BOTH_BLOCKED = "BOTH BLOCKED"
 PP_TO_TP = "pp_to_tp"
 #: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
 #: formation gate must recognise that decision and refuse to hold it, and a
@@ -1390,7 +1391,7 @@ def _decide_from_load(
         # freeing it. Declining here is what routes the caller to the evict
         # rung instead of to a cutover.
         return _no(
-            f"BOTH BLOCKED: nothing can run in the {inp.phase} layout and the "
+            f"{BOTH_BLOCKED}: nothing can run in the {inp.phase} layout and the "
             f"target cannot admit either ({inp.running_bs} req resident, "
             f"{inp.pending_prefill_tokens} tok pending) -- the binding "
             f"resource is KV, not the layout, so this is an evict trigger and "
