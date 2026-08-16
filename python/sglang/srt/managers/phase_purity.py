@@ -599,10 +599,32 @@ def prefill_blocked_here(scheduler) -> bool:
     would split the group across branches with mismatched collectives --
     the failure family documented at ``_update_uniform_pool_budget``.
     """
-    from sglang.srt.managers.phase_policy import PHASE_TP
+    from sglang.srt.managers.phase_policy import (
+        PHASE_TP,
+        prefill_suppressed_in_tp,
+    )
 
     if _active_phase(scheduler) != PHASE_TP:
         return False
+    # #677 HOT FIX 2: DRAIN MODE OUTRANKS THE PURITY MODE ON THIS ONE AXIS.
+    #
+    # Checked BEFORE `prefill_allowed_in_tp` on purpose. The deployed purity
+    # mode is prefill_in_tp -- the 2026-08-14 correction that let the policy's
+    # break-even N decide -- and that correction stands for its own workload.
+    # Drain mode is a different contract, chosen by the user for this one:
+    # prefill until empty, decode the bundle to completion, prefill again. A
+    # TP window entered to finish a bundle must not admit the work it was
+    # entered to escape, which is what "Prefill batch" lines inside TP were.
+    #
+    # Rank-uniform on the same argument as the rest of this function: the
+    # drain-mode flag is static boot config and the phase is replicated.
+    # The attribute is `phase_policy_cfg`. Named wrong once while writing
+    # this, which a getattr default turns into a feature that silently never
+    # fires -- the same shape as the #684 serving tick's NameError. Pinned by
+    # `test_the_purity_hook_reads_the_real_scheduler_attribute`.
+    policy = getattr(scheduler, "phase_policy_cfg", None)
+    if policy is not None and prefill_suppressed_in_tp(policy, PHASE_TP):
+        return True
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
     return not _relaxed(scheduler, "prefill")
