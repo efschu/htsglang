@@ -5798,6 +5798,24 @@ class ModelRunnerKVCacheMixin:
                         else "Nonzero: the measured per-token slope stands."
                     ),
                 )
+            else:
+                # THE GUARD MUST SPEAK WHEN IT REFUSES. The first version
+                # logged only on the success branch, so a falsy input left
+                # received_layers=None with NO line anywhere and the fix sat
+                # inert through two boots looking like it had simply not been
+                # reached. A silent precondition is indistinguishable from
+                # dead code.
+                logger.info(
+                    "%s: received-layer derivation SKIPPED -- tp_vector=%s "
+                    "full_attention_layer_ids=%d entr(y/ies) num_hidden=%s "
+                    "pp_size=%s. The falsy one is the missing input; the "
+                    "per-token seam charge stays at its measured value.",
+                    seam.LOG_PREFIX,
+                    vec,
+                    len(ids),
+                    n_hidden,
+                    pp_size,
+                )
         except Exception as exc:  # noqa: BLE001 - sizing must not fail on a probe
             logger.info(
                 "%s: received-layer derivation unavailable (%r); the per-token "
