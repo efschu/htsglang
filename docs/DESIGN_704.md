@@ -557,6 +557,57 @@ at quiescence**, where no live state exists to preserve; every `FlipDelta`
 carries `requires_quiescence=True` and an `out_of_scope` string saying so, and
 a test asserts both. Live-state transfer is slice 1b.
 
+### 3.9 Slice 1a-ii — moving the boundary at runtime is a range mutation
+
+Landed as `model_executor/layout_boundary.py`, 14 hermetic tests. The model
+turned out to permit this almost directly, and three verified facts fix the
+whole design:
+
+* `make_layers` (`utils/common.py:1970-2010`) builds a ModuleList of length
+  `num_hidden_layers` with `PPMissingLayer` placeholders outside the owned
+  range — so **layer indices are GLOBAL on every rank** and a boundary change
+  is not an index shift;
+* `start_layer`/`end_layer` are **properties** over mutable `_start_layer` /
+  `_end_layer` backing fields (`models/qwen3_5.py:1452-1457`);
+* the decoder forward iterates `range(self.start_layer, self.end_layer)`
+  (`qwen3_5.py:1483`), reading those properties **on every pass**.
+
+A real layer module parked outside the active range is therefore simply not
+executed. The boundary change is a **range mutation** — no module swapping, no
+reallocation, no bytes. Combined with §3.8's union arena, a rung change moves
+nothing at all; a test pins that every parameter keeps its `data_ptr()` across
+a flip while the executed set changes.
+
+Note `models/qwen3_next.py` is **not** the PP model — it asserts
+`is_first_rank and is_last_rank` at `:1165`. `qwen3_5.py` is the PP-capable one.
+
+**Load wide, run narrow.** At boot a rank builds and loads real modules for the
+UNION of the ranges it may occupy, then runs whichever sub-range the ladder
+selects. The union must be in force during *loading* too, because weight
+loading is gated on the same range (`qwen3_5.py:1563-1564`, `:1707-1708`).
+
+Two failure modes are enforced rather than documented:
+
+1. **Entering a non-resident range is silently wrong, not loud.**
+   `PPMissingLayer` is a pass-through (`layers/utils/common.py:109-127`), so
+   executing a range whose weights never loaded yields *plausible output from a
+   shallower model* rather than an error. Every flip verifies residency first.
+2. **A half-applied boundary is worse than no flip.** Dependent structures
+   (the KV pool's `full_attention_layer_ids` filter, GDN state maps) are keyed
+   by the owned range. Observers run inside the flip; if one raises, the range
+   is **rolled back** and the flip fails.
+
+A third came out of a test failure rather than foresight: the actuator
+originally *assumed* the model already sat at its current rung. Under load-wide
+it does not — it arrives wide — so the constructor now performs the narrowing
+step explicitly. Left as it was, the actuator's belief and the model's actual
+range would have disagreed from the first forward, silently executing a layer
+the rank did not own.
+
+World-level tiling is validated separately (`validate_world_tiling`), because
+it cannot be checked locally: a gap silently drops layers and an overlap
+computes them twice, while every individual rank's range looks sensible.
+
 ### 3.6 Interaction with the flip controller's seam funding
 
 The ladder and the phase flip both move bytes over the same links, and they
@@ -858,7 +909,7 @@ document is an upper bound** until a second measured cut pins the intercept.
 | **0 — landed** | Family-split pool rule + ladder solver, hermetic, 3 hardware profiles | done | 26 tests green |
 | **0b — landed** | Rung controller (decision function) + oscillation falsifiers | done | 10 tests green, can-fail verified |
 | **1a-i — ticket ready** | Two STATIC boots, `[28,20,16]` ↔ `[29,19,16]`, one variable (`--pp-layer-ratio`). **Zero new code.** Both are (7,5,4), layer 28 is linear, so no attention layer and no KV row moves | 1 short window | A1 pool within 2.5k of 436,766; A2 PP2 binds; A3 K sizes unchanged. Plus **T1: the second timing cut** |
-| **1a-ii — machinery landed** | Union arena (`weights_arena_union.py`, 13 tests) + runtime wiring: load the union per rank, size the arena for the union, flip `start_layer`/`end_layer` and the PP send/recv boundary at quiescence | 1-2 windows | flip completes, output byte-identical across a flip and back, graphs survive |
+| **1a-ii — desk-complete** | Union arena (`weights_arena_union.py`, 13 tests) + boundary actuator (`layout_boundary.py`, 14 tests): load the union per rank, size the arena for the union, mutate `_start_layer`/`_end_layer` at quiescence with observer rollback. Remaining for a window: boot-time union load + the dependent-structure observers | 1 window | flip completes, output byte-identical across a flip and back, graphs survive |
 | **1b** | Wire the controller to 1a on a pair that actually trades: `[35,14,15]` ↔ `[38,13,13]` (attn0 8→9) | 1 window | hysteresis proven on metal, no oscillation under load |
 | **2** | Measure real move cost on the pair matrix **and the CUDA-graph recapture cost**, to decide arena vs realloc (§3.7); re-solve | 0.5 window | move time within 20% of solved; the arena/realloc fork closed on numbers |
 | **3a** | **B1**: build a cross-PP-stage process group at boot, using the manifest-verify-then-create pattern from `parallel_state.py:3422-3517` | 1-2 windows | group forms and survives a boot; collective round-trips |
