@@ -4926,7 +4926,9 @@ class PhaseFlipRuntime:
         if torch.cuda.is_available():  # pragma: no cover - needs a device
             torch.cuda.empty_cache()
 
-    def _staging_affordable(self, staging_bytes: int) -> Tuple[bool, str]:
+    def _staging_affordable(
+        self, staging_bytes: int, direction: str = ""
+    ) -> Tuple[bool, str]:
         """Can this rank stage ``staging_bytes`` without eating the reserve?
 
         THE TWO POOLS OF MEMORY ARE NOT EQUIVALENT, and conflating them
@@ -5009,6 +5011,70 @@ class PhaseFlipRuntime:
         usable = from_driver
         if staging_bytes <= usable:
             return True, ""
+
+        # #689 THE GUARD IS ASKED BEFORE THE FLIP IS ABANDONED.
+        #
+        # THE MEASUREMENT THAT PUT THIS HERE. At an ABANDONED instant the
+        # staging budget census read, per rank:
+        #     rank0 5090 : needs 1305, spendable 1599, arena    0  -> fits
+        #     rank1 3080 : needs 1059, spendable  867, arena  815  -> SHORT 192
+        #     rank2 3080 : needs 1763, spendable 2051, arena 1456  -> fits
+        # The binding rank was short by 192 MiB while holding 815 MiB of the
+        # INACTIVE layout's weights -- 4.2x the shortfall -- and its headroom
+        # over the corridor floor was 150 MiB against 1606 and 1334 on the
+        # peers. So the seam was not failing on the corridor floor and not on
+        # the live set: one rank was holding the OTHER layout's arena while
+        # trying to stage this one, and nothing ever asked it to give it back.
+        #
+        # ensure_headroom IS THE DESIGNED COMPOSITION POINT, not a new
+        # mechanism -- its own docstring discusses the seam ("at the seam:
+        # abandon the flip") and refusal_is_fatal for exactly this leg. The
+        # draft-weights provider is already registered in the rebalance tier;
+        # it simply was never asked from here.
+        #
+        # refusal_is_fatal ON pp_to_tp, for the reason that docstring gives:
+        # strict purity forbids decode in PP, so a refused pp_to_tp starves
+        # decode and NOTHING IN PP CAN FREE the memory that would end the
+        # refusal. That leg has no survivable wait, so the host tier opens.
+        shortfall = int(staging_bytes) - int(usable)
+        guard = None
+        try:
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            sched = getattr(self, "_census_scheduler", None)
+            guard = get_corridor_guard(sched) if sched is not None else None
+        except Exception:  # noqa: BLE001 - never break the refusal path
+            guard = None
+        if guard is not None and shortfall > 0:
+            try:
+                res = guard.ensure_headroom(
+                    shortfall,
+                    reason=f"seam staging {direction}",
+                    refusal_is_fatal=(direction == PP_TO_TP),
+                )
+                driver_free, cached_free = probe()
+                usable = max(0, driver_free - reserve)
+                logger.info(
+                    "%s seam staging asked the corridor guard for %.0f MiB "
+                    "(%s): ok=%s, spendable now %.0f MiB against a need of "
+                    "%.0f MiB. The binding rank's inactive-layout arena is the "
+                    "occupant this ask exists to reclaim.",
+                    LOG_PREFIX,
+                    shortfall / (1024 * 1024),
+                    direction,
+                    getattr(res, "ok", "?"),
+                    usable / (1024 * 1024),
+                    staging_bytes / (1024 * 1024),
+                )
+                if staging_bytes <= usable:
+                    return True, ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s seam staging could not ask the corridor guard (%r); "
+                    "falling through to the abandon path unchanged.",
+                    LOG_PREFIX,
+                    exc,
+                )
         mib = 1024 * 1024
         return False, (
             f"staging {staging_bytes / mib:.0f} MiB needed but only "
@@ -6174,7 +6240,9 @@ class PhaseFlipRuntime:
             too_small.append(slot_detail)
         if corridor_detail:
             too_small.append(corridor_detail)
-        affordable, staging_detail = self._staging_affordable(staging_bytes)
+        affordable, staging_detail = self._staging_affordable(
+            staging_bytes, direction
+        )
         if not affordable:
             too_small.append(staging_detail)
 
