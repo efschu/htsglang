@@ -462,6 +462,10 @@ class Scheduler(
 
         self.phase_policy_cfg = config_from_env(
             chunk_tokens=int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+            # #689: a decode window should open at the width the pools were
+            # built for, not at whatever single carrier happened to finish
+            # first. max_running_requests IS that width.
+            formation_target=int(getattr(server_args, "max_running_requests", 0) or 0),
             enabled=(
                 getattr(server_args, "enable_phase_flip", False)
                 and getattr(server_args, "phase_flip_policy", "manual") == "auto"
@@ -8113,6 +8117,9 @@ class Scheduler(
 
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
         from sglang.srt.managers.phase_policy import (
+            IDLE_LOCKED as POLICY_IDLE_LOCKED,
+        )
+        from sglang.srt.managers.phase_policy import (
             PhasePolicyDecision,
             PhasePolicyInputs,
             decide,
@@ -8218,6 +8225,18 @@ class Scheduler(
             # stand-in without the observation has not observed anything, and
             # "not observed" must mean "do not arm on it" -- the pre-change
             # behaviour -- rather than an AttributeError in the arming path.
+            # #689 FORMATION INPUTS. ready_carriers is the PARKED count, not
+            # running_bs: with #677 phase-1 parking live, carriers PP cannot
+            # decode are discounted from the admission cap, so running_bs
+            # reads 0 exactly when the window is fullest. Both terms are
+            # replicated -- the parked set is reconciled from the same
+            # resident batch on every rank, and the queue is the replicated
+            # waiting queue.
+            ready_carriers=int(
+                getattr(getattr(self, "parked_decode_set", None), "resident_count", 0)
+                or 0
+            ),
+            queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
@@ -8302,6 +8321,17 @@ class Scheduler(
                     inp.running_bs,
                 )
             return None
+        # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
+        # its seam has moved the zero-GPU window one stage right instead of
+        # removing it (live specimen 09:43:11Z: staging 1706 MiB needed
+        # against 1635 spendable -- 71 MiB short, with 364884 cached rows
+        # sitting there). Recorded on the runtime so the funding path can see
+        # WHY this flip was armed; cleared by the runtime once it is read.
+        rt_for_funding = getattr(self, "phase_flip_runtime", None)
+        if rt_for_funding is not None:
+            rt_for_funding.armed_idle_locked = bool(
+                (decision.reason or "").startswith(POLICY_IDLE_LOCKED)
+            )
         note_flip_armed(state, decision, inp.now)
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason

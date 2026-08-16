@@ -5015,7 +5015,24 @@ class PhaseFlipRuntime:
             f"{self._staging_reserve_bytes / mib:.0f} MiB kept free). The "
             f"KV pool is too full to carry its own contents across the "
             f"flip; serving continues in this layout and the flip is "
-            f"retried when occupancy drops. " + self._kv_rung_verdict()
+            f"retried when occupancy drops. "
+            + (
+                # #688: when the flip was armed because NOTHING can run, an
+                # unfunded seam is an idle window, not a deferral. Say so, name
+                # the shortfall, and name the event that can change it -- an
+                # operator reading "retried when occupancy drops" has no way to
+                # know that occupancy cannot drop, because the only thing that
+                # would drop it is the flip being refused here.
+                f"ARMED IDLE-LOCKED, so this is a STALL, not a deferral: "
+                f"{(staging_bytes - usable) / mib:.0f} MiB short after the "
+                f"relief rung was asked for the margin as mandatory. Nothing "
+                f"in this layout can admit or decode, so occupancy will NOT "
+                f"drop on its own; the next event that can change this is a "
+                f"resident request completing or being aborted. "
+                if bool(getattr(self, "armed_idle_locked", False))
+                else ""
+            )
+            + self._kv_rung_verdict()
         )
 
     #: Minimum seconds between arm ATTEMPTS on one direction while a damper is
@@ -5278,13 +5295,27 @@ class PhaseFlipRuntime:
             # with ``available_size() == 0``. The margin's shortfall has a
             # graded answer (delay, then yield) and the staging's does not, so
             # the margin is the half that may be bounded and the staging is not.
+            # #688: AN IDLE-LOCKED FLIP HAS NO MARGIN TO PROTECT. The C20
+            # entry margin is discretionary because the rung pays for it out
+            # of ADMISSION CAPACITY, and an unbounded ask once drove the rung
+            # to its floor 42 times. But this flip was armed precisely because
+            # nothing can be ADMITTED in this layout, so the capacity that
+            # bound protects cannot be spent by anyone -- and leaving the
+            # margin unfunded is exactly what leaves the seam short
+            # (09:43:11Z: 1706 MiB needed, 1635 spendable, 71 MiB short).
+            # Mandatory in that one state, discretionary everywhere else.
+            discretionary_margin = (
+                0
+                if bool(getattr(self, "armed_idle_locked", False))
+                else int(margin_bytes)
+            )
             kv_freed = collective_kv_backing_relief(
                 scheduler,
                 self._collective_min,
                 want_bytes=int(ask_bytes),
                 guard=guard,
                 direction=direction,
-                discretionary_bytes=int(margin_bytes),
+                discretionary_bytes=int(discretionary_margin),
                 # #656 C22-d rides here too. See _agree_live_slots.
                 slots_digest=int(slots_digest),
                 max_live_row=int(max_live_row),

@@ -118,6 +118,11 @@ LOG_PREFIX = "PHASE-POLICY"
 PHASE_PP = "pp"
 PHASE_TP = "tp"
 PP_TO_TP = "pp_to_tp"
+#: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
+#: formation gate must recognise that decision and refuse to hold it, and a
+#: literal repeated in two modules is a rename away from silently
+#: reintroducing the idle window.
+IDLE_LOCKED = "IDLE-LOCKED"
 TP_TO_PP = "tp_to_pp"
 
 # Which layout the server returns to when it has nothing to do.
@@ -829,6 +834,19 @@ class PhasePolicyConfig:
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: #689 WINDOW FORMATION. How many completed carriers a PP window should
+    #: accumulate before the tp-ward arm is allowed, normally
+    #: max_running_requests. 0 or 1 disables the gate entirely and restores
+    #: the previous behaviour exactly.
+    formation_target: int = 0
+    #: The latency bound on that accumulation. A PLAIN TIME CAP, chosen from
+    #: this rig's own receipts rather than from an economics term: one flip
+    #: EXECUTES in 2459-3186 ms (five FLIP DONE receipts, 2026-08-16), so
+    #: spending up to about one flip's worth of waiting to quadruple the
+    #: window it opens is obviously worth it, and spending much more is not
+    #: obviously anything. #677's economics replaces this number later; until
+    #: then it is a bound, not an optimum, and it is written here as such.
+    formation_cap_s: float = 3.0
     #: The MEASURED seam round trip (s) that ``flip_tokens`` was derived from.
     #: 0.0 means "not measured here", which disables the stranded-decode
     #: surcharge below and reproduces the previous policy exactly. The
@@ -1015,6 +1033,10 @@ class PhasePolicyState:
     #: purpose: boot E armed 179 flips and completed none, and every summary
     #: that read the arm count called that instance healthy.
     flips_completed: int = 0
+    #: When the current PP window began accumulating carriers, or 0.0 when it
+    #: is not accumulating. Stamped by ``observe_idle`` (the caller), because
+    #: ``decide`` is pure and may not mutate state.
+    formation_started_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1052,6 +1074,16 @@ class PhasePolicyInputs:
     #: condition cannot immediately hold again in the new layout.
     target_can_admit: bool = False
 
+    #: #689: completed carriers waiting for a decode window. NOT running_bs --
+    #: with #677 phase-1 parking live, carriers PP cannot decode are
+    #: deliberately discounted from the admission cap, so the two numbers have
+    #: diverged and a formation rule keyed on running_bs would read 0 exactly
+    #: when the window is fullest.
+    ready_carriers: int = 0
+    #: Whether anything is still queued behind them. When the queue is empty
+    #: there is nothing left to accumulate and the window opens at once.
+    queue_nonempty: bool = False
+
 
 @dataclass(frozen=True)
 class PhasePolicyDecision:
@@ -1068,6 +1100,108 @@ def _no(reason: str) -> PhasePolicyDecision:
 
 
 def decide(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    inp: PhasePolicyInputs,
+) -> PhasePolicyDecision:
+    """The load rules, then batch formation. Pure, mutates nothing.
+
+    #689 WINDOW FORMATION IS APPLIED HERE, AS A WRAPPER, so it sits at ONE
+    place instead of at the nine ``return PhasePolicyDecision`` sites inside
+    the rules. It only ever converts a pp_to_tp arm into a wait; it can never
+    create an arm, and it never sees the tp_to_pp direction at all.
+    """
+    d = _decide_rules(cfg, state, inp)
+    if d.direction != PP_TO_TP:
+        return d
+    if (d.reason or "").startswith(IDLE_LOCKED):
+        # #688 OUTRANKS #689, STRUCTURALLY. The idle-locked arm fires only
+        # when the current layout can build NOTHING; holding it to accumulate
+        # carriers would be waiting for a wider window inside a layout that
+        # cannot fill one, which is the exact zero-GPU window #688 removes.
+        # Caught by test_the_deadlock_escape_is_not_delayed_by_formation,
+        # which failed on the first draft of this wrapper.
+        return d
+    return _apply_formation_gate(cfg, state, inp, d)
+
+
+def _formation_target(cfg: PhasePolicyConfig, inp: PhasePolicyInputs) -> int:
+    want = int(getattr(cfg, "formation_target", 0) or 0)
+    return max(0, want)
+
+
+def _apply_formation_gate(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    inp: PhasePolicyInputs,
+    d: PhasePolicyDecision,
+) -> PhasePolicyDecision:
+    """Hold a tp-ward arm until the decode window is worth opening.
+
+    THE DEFECT, MEASURED. Decode ran bs=1 on 261 of 288 batches and bs=4 on
+    12, while 13 requests sat queued, token usage was 0.44 and the mamba pool
+    held 2 of 12 slots. Nothing was throttling ADMISSION -- what was wrong was
+    WINDOW FORMATION. Under pure drain a TP window can only decode the
+    carriers whose prefill finished in the PRECEDING PP window, and the flip
+    was fired by stall caps rather than by readiness, so a window opened with
+    one ready carrier and then served bs=1 for its whole length while the
+    other twelve waited for the next one.
+
+    So the arm waits for carriers to ACCUMULATE, bounded two ways:
+
+    * it never waits when the queue is empty -- there is nothing left to
+      accumulate, and waiting would be pure latency;
+    * it never waits longer than ``formation_cap_s``, so a single carrier
+      that no one follows still gets its window.
+
+    IT CANNOT REINTRODUCE THE IDLE WINDOW. The #688 idle-locked arm is
+    returned by ``_decide_rules`` BEFORE any of this and is not a load rule,
+    so a layout that can run nothing leaves immediately and is never held
+    here. This gate only ever fires while the PP layout is still doing work,
+    which is the whole difference between "shape the window" and "stall".
+
+    DELIBERATELY A PLAIN TIME CAP, not an economics term. #677's window
+    economics is a separate piece of work; this is the bounded first cut that
+    makes bs=4 real, and it is labelled as such rather than presented as the
+    optimum.
+    """
+    target = _formation_target(cfg, inp)
+    if target <= 1:
+        return d
+    ready = int(getattr(inp, "ready_carriers", 0) or 0)
+    if ready >= target:
+        return d
+    if not bool(getattr(inp, "queue_nonempty", False)):
+        # Nothing more can arrive to fill the window; opening it now is right.
+        return d
+    started = float(state.formation_started_at or 0.0)
+    if started <= 0.0:
+        # First round of this formation window. The caller stamps the clock;
+        # a pure function cannot, so the wait begins on the NEXT round and
+        # this one still holds -- one round, not one cap.
+        return PhasePolicyDecision(
+            None,
+            f"forming decode window: {ready} of {target} carrier(s) ready, "
+            f"queue still filling -- holding the tp-ward arm",
+        )
+    waited = float(inp.now) - started
+    cap = float(getattr(cfg, "formation_cap_s", 0.0) or 0.0)
+    if cap > 0.0 and waited >= cap:
+        return PhasePolicyDecision(
+            d.direction,
+            f"{d.reason} [formation cap: {ready} of {target} carrier(s) after "
+            f"{waited:.1f}s >= {cap:g}s -- opening the window short rather "
+            f"than making the ready carrier wait longer]",
+        )
+    return PhasePolicyDecision(
+        None,
+        f"forming decode window: {ready} of {target} carrier(s) ready after "
+        f"{waited:.1f}s of {cap:g}s -- holding the tp-ward arm so the window "
+        f"opens at width instead of at 1",
+    )
+
+
+def _decide_rules(
     cfg: PhasePolicyConfig,
     state: PhasePolicyState,
     inp: PhasePolicyInputs,
@@ -1247,7 +1381,7 @@ def _decide_from_load(
         direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
         return PhasePolicyDecision(
             direction,
-            f"IDLE-LOCKED: no batch of either work class can be built in the "
+            f"{IDLE_LOCKED}: no batch of either work class can be built in the "
             f"{inp.phase} layout ({inp.running_bs} req resident, "
             f"{inp.pending_prefill_tokens} tok prefill pending) and the "
             f"target layout can run one -- arming immediately rather than "
@@ -1528,6 +1662,23 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
             state.idle_since = inp.now
     else:
         state.idle_since = None
+
+    # #689 FORMATION CLOCK. Stamped on the first round in which a PP window
+    # holds a carrier but not yet a full one; cleared whenever the window is
+    # full, the queue drains, or the phase is not PP. Kept HERE, in the
+    # observer, for the same reason the idle clock is: ``decide`` is pure and
+    # must not mutate, and a clock driven by the policy's own verdict would
+    # restart every time the verdict changed.
+    forming = (
+        inp.phase == PHASE_PP
+        and int(getattr(inp, "ready_carriers", 0) or 0) > 0
+        and bool(getattr(inp, "queue_nonempty", False))
+    )
+    if forming:
+        if not state.formation_started_at:
+            state.formation_started_at = inp.now
+    else:
+        state.formation_started_at = 0.0
     # Phase-entry clock for the fairness bound. Driven by the OBSERVED
     # phase rather than by the policy's own verdict, so it is correct for
     # the first phase (no flip has happened yet, last_flip_at == 0) and for
@@ -1744,7 +1895,7 @@ ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
 
 
 def config_from_env(
-    enabled: bool, chunk_tokens: int = 0
+    enabled: bool, chunk_tokens: int = 0, formation_target: int = 0
 ) -> PhasePolicyConfig:
     """Build the boot configuration.
 
@@ -1801,6 +1952,12 @@ def config_from_env(
         rest_state=rest_state,
         pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
         tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
+        # #689: the caller passes max_running_requests; the env can override
+        # it, and 0/1 disables the gate and restores the previous behaviour.
+        formation_target=int(
+            _env_float("SGLANG_PHASE_FORMATION_TARGET", float(formation_target))
+        ),
+        formation_cap_s=_env_float("SGLANG_PHASE_FORMATION_CAP_S", 3.0),
         # The seam cost the threshold was derived from, carried so the
         # stranded-decode surcharge can price a cutover against the
         # generations it would pause. Without this the surcharge is inert.
