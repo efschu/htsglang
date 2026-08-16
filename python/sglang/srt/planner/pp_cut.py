@@ -1696,3 +1696,132 @@ def world_kv_floor_at_seam_fixed_point(
             return floor
         tokens = floor
     return floor
+
+
+# ---------------------------------------------------------------------------
+# #602: the remaining residency terms, measured from the flight recorder
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasuredResidency:
+    """One rank's cut-invariant overhead and its OBSERVED transient draw.
+
+    ``fixed_overhead_mib`` is an at-rest quantity and the boot marks settle it
+    exactly: what is resident at ``boot_complete`` that is not weights, not the
+    KV pool and not the draft runner -- CUDA context, the NCCL init, the
+    attention workspace, graph capture, the boot tail.
+
+    ``observed_transient_mib`` is NOT settled by the recorder and the name says
+    so. It is the peak draw over the serving window the recorder happened to
+    cover, which on a short window is far gentler than the worst state the
+    deployment will serve (law 31: 742 MiB observed here against 1989-3148 MiB
+    on a 22-minute soak). ``covers_worst_load_state`` is therefore always False
+    from this reader: only a soak-length window could justify True, and nothing
+    in the marks proves the window was one. Charge
+    ``max(observed, worst known)`` -- a gate that gets cheaper by looking at a
+    shorter window is the C1 defect this field is shaped to prevent.
+    """
+
+    pid: int
+    card_uuid: str
+    boot_id: str
+    source: str
+    fixed_overhead_mib: float
+    observed_transient_mib: float
+    serving_samples: int
+    serving_window_seconds: float
+    covers_worst_load_state: bool = False
+
+
+def residency_terms_from_flight(
+    directory: str, *, boot: Optional[str] = None
+) -> Dict[int, MeasuredResidency]:
+    """Measure per-rank fixed overhead and observed transient, by pid.
+
+    Raises :class:`DraftResidencyUnavailable` when the boot marks, the
+    ``boot_complete`` mark, or the serving marks are missing. None of the three
+    may be defaulted: zero overhead and zero transient are both meaningful
+    values, so producing them from an absent measurement is the #606 defect.
+    """
+    try:
+        from sglang.srt.mem_ledger import flight_recorder
+    except ImportError as exc:  # pragma: no cover - packaging accident
+        raise DraftResidencyUnavailable(
+            f"flight recorder module is not importable: {exc}"
+        ) from exc
+
+    try:
+        boot_by_pid = flight_recorder.read_marks(directory, boot=boot)
+    except Exception as exc:
+        raise DraftResidencyUnavailable(
+            f"could not read flight marks from {directory!r}: {exc}"
+        ) from exc
+    if not boot_by_pid:
+        raise DraftResidencyUnavailable(f"no flight marks under {directory!r}")
+
+    try:
+        serving_by_pid = flight_recorder.read_serving_marks(directory, boot=boot)
+    except Exception:
+        serving_by_pid = {}
+
+    out: Dict[int, MeasuredResidency] = {}
+    for pid, marks in boot_by_pid.items():
+        ordered = sorted(marks, key=lambda m: m.get("monotonic") or 0.0)
+        complete = [m for m in ordered if str(m.get("phase")) == "boot_complete"]
+        if not complete:
+            raise DraftResidencyUnavailable(
+                f"pid {pid} under {directory!r} has no boot_complete mark, so "
+                "its at-rest residency is not established. The overhead cannot "
+                "be differenced from an unfinished boot."
+            )
+        at_rest = int(complete[-1].get("nvml_self_bytes") or 0) / MIB
+
+        sums: Dict[Tuple[str, Optional[bool]], float] = {}
+        for prev, cur in zip(ordered, ordered[1:]):
+            flag = (cur.get("extra") or {}).get("draft_worker")
+            flag = None if flag is None else bool(flag)
+            delta = (
+                int(cur.get("nvml_self_bytes") or 0)
+                - int(prev.get("nvml_self_bytes") or 0)
+            ) / MIB
+            key = (str(cur.get("phase")), flag)
+            sums[key] = sums.get(key, 0.0) + delta
+
+        weights_target = sums.get(("weights_loaded", False), 0.0)
+        kv_target = sums.get(("kv_pool_sized", False), 0.0)
+        weights_draft = sums.get(_DRAFT_WEIGHT_KEY, 0.0)
+        gap = sums.get(_INTER_RUNNER_GAP_KEY, 0.0)
+        kv_draft = sums.get(("kv_pool_sized", True), 0.0)
+        net_draft = weights_draft + gap
+        overhead = at_rest - weights_target - kv_target - net_draft - kv_draft
+
+        serving = serving_by_pid.get(pid) or []
+        if not serving:
+            raise DraftResidencyUnavailable(
+                f"pid {pid} under {directory!r} has no serving marks, so no "
+                "transient draw was observed at all. Zero would be a claim "
+                "that nothing is drawn; arm the serving recorder and re-read."
+            )
+        s_ordered = sorted(serving, key=lambda m: m.get("monotonic") or 0.0)
+        peak = max(int(m.get("nvml_self_bytes") or 0) for m in s_ordered) / MIB
+        span = float(s_ordered[-1].get("monotonic") or 0.0) - float(
+            s_ordered[0].get("monotonic") or 0.0
+        )
+
+        uuids = [m.get("card_uuid") for m in ordered if m.get("card_uuid")]
+        boots = [m.get("boot_id") for m in ordered if m.get("boot_id")]
+        out[int(pid)] = MeasuredResidency(
+            pid=int(pid),
+            card_uuid=str(sorted(uuids)[0]) if uuids else "?",
+            boot_id=str(boots[0]) if boots else "?",
+            source=str(directory),
+            fixed_overhead_mib=overhead,
+            observed_transient_mib=max(0.0, peak - at_rest),
+            serving_samples=len(s_ordered),
+            serving_window_seconds=span,
+            # Never True from a reader: nothing in the marks proves the window
+            # covered the worst state the deployment will serve.
+            covers_worst_load_state=False,
+        )
+    return out
