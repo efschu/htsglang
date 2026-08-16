@@ -1,0 +1,6 @@
+[2026-08-16 20:20:26 PP0] [rank 0] KV budget posts (GiB): weights + runtime state=15.688, mamba state pool + speculative intermediate state + prefill activation reserve=0.895, GGUF dequant scratch=0.000 | rest=14.472
+[2026-08-16 20:20:26 PP1] [rank 0] KV budget posts (GiB): weights + runtime state=9.826, mamba state pool + speculative intermediate state + prefill activation reserve=0.639, GGUF dequant scratch=0.000 | rest=7.894
+[2026-08-16 20:20:26 PP2] [rank 0] KV budget posts (GiB): weights + runtime state=10.449, mamba state pool + speculative intermediate state + prefill activation reserve=0.511, GGUF dequant scratch=0.000 | rest=8.375
+[2026-08-16 20:22:42 PP2] [rank 2] KV budget posts (GiB): weights + runtime state=7.035, mamba state pool + speculative intermediate state + prefill activation reserve=0.511, GGUF dequant scratch=0.000 | rest=11.789
+[2026-08-16 20:22:42 PP0] [rank 0] KV budget posts (GiB): weights + runtime state=10.385, mamba state pool + speculative intermediate state + prefill activation reserve=1.023, GGUF dequant scratch=0.000 | rest=19.647
+[2026-08-16 20:22:42 PP1] [rank 1] KV budget posts (GiB): weights + runtime state=5.576, mamba state pool + speculative intermediate state + prefill activation reserve=0.511, GGUF dequant scratch=0.000 | rest=12.272
