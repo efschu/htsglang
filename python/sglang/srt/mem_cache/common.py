@@ -754,6 +754,28 @@ def _attempt_extend_relief(num_tokens: int) -> int:
     return freed
 
 
+def _ledger_tokens(value) -> int:
+    """Read a per-iteration ledger attribute safely. THE NAMED LIST (#624).
+
+    Both floor correctors -- the DEVICE one in
+    :func:`uniform_avail_for_evict` and the HOST one in
+    :func:`uniform_host_avail_for_backup` -- read a ledger attribute off the
+    tree cache. Real caches declare it on ``BasePrefixCache`` with a 0 default;
+    a test double usually does not, and ``int(Mock())`` is **1**, not 0. So an
+    unconfigured stand-in silently shaved one token off whichever floor it fed:
+    measured as ``499 != 500`` against the device ledger
+    (test_a_published_floor_is_returned) and reproducible against the host one.
+
+    Third appearance of the stub-drift class, so the guard lives in ONE place
+    rather than as two isinstance checks that would drift apart. ``bool`` is
+    excluded deliberately: it is an ``int`` subclass, and a truthy flag landing
+    here would charge 1 token for the same reason a Mock did.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return int(value)
+
+
 def uniform_avail_for_evict(tree_cache, allocator) -> int:
     """The availability a cache-mutation trigger must decide from (#616g).
 
@@ -783,15 +805,7 @@ def uniform_avail_for_evict(tree_cache, allocator) -> int:
     floor = getattr(tree_cache, "uniform_avail_floor", None)
     if floor is None:
         return int(allocator.available_size())
-    admitted = getattr(tree_cache, "uniform_admitted_since_floor", 0)
-    # A stand-in without the attribute yields a Mock, and ``int(Mock())`` is
-    # **1**, not 0 -- so an unconfigured double silently shaved a token off the
-    # floor. Caught by test_a_published_floor_is_returned (499 != 500). Real
-    # caches declare the field on BasePrefixCache, so this only ever guards
-    # doubles; treating a non-int as zero keeps production behaviour exact and
-    # stops the #624 stub-drift class biting a third time.
-    if not isinstance(admitted, int) or isinstance(admitted, bool):
-        admitted = 0
+    admitted = _ledger_tokens(getattr(tree_cache, "uniform_admitted_since_floor", 0))
     return max(0, int(floor) - admitted)
 
 
@@ -839,8 +853,14 @@ def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
     floor = getattr(tree_cache, "uniform_host_avail_floor", None)
     if floor is None:
         return int(mem_pool_host.available_size())
-    admitted = getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
-    return max(0, int(floor) - int(admitted))
+    #: #624 (third appearance): guarded through the shared reader for the same
+    #: reason the device sibling is -- an unconfigured double yields a Mock and
+    #: ``int(Mock())`` is 1, which moved this floor too (reproduced at 499 vs
+    #: 500 before the guard).
+    admitted = _ledger_tokens(
+        getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
+    )
+    return max(0, int(floor) - admitted)
 
 
 def uniform_host_floor_active(tree_cache) -> bool:

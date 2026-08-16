@@ -130,3 +130,51 @@ class TheLedgerMirrorsTheHostSibling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BothLedgerReadsShareOneGuard(unittest.TestCase):
+    """#624, third appearance: the guard belongs in ONE place, not two.
+
+    ``int(Mock())`` is 1, not 0, so an unconfigured double silently shaved a
+    token off whichever floor it fed. That bit the DEVICE ledger
+    (test_a_published_floor_is_returned, 499 != 500) and the HOST ledger
+    carries the identical exposure. Two isinstance checks would drift; one
+    helper is the named list.
+    """
+
+    def test_the_helper_treats_a_mock_as_zero(self):
+        from sglang.srt.mem_cache.common import _ledger_tokens
+
+        self.assertEqual(_ledger_tokens(MagicMock()), 0)
+
+    def test_the_helper_passes_real_ints_through(self):
+        from sglang.srt.mem_cache.common import _ledger_tokens
+
+        self.assertEqual(_ledger_tokens(4096), 4096)
+        self.assertEqual(_ledger_tokens(0), 0)
+
+    def test_the_helper_rejects_bool_which_is_an_int_subclass(self):
+        from sglang.srt.mem_cache.common import _ledger_tokens
+
+        self.assertEqual(_ledger_tokens(True), 0)
+
+    def test_the_host_ledger_is_guarded_too(self):
+        """The sibling fix: an unconfigured double must not move the host floor."""
+        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+
+        tc = MagicMock()
+        tc.uniform_host_avail_floor = 500
+        # deliberately NOT configuring uniform_host_admitted_since_floor
+        host = MagicMock()
+        host.available_size.return_value = 999
+        self.assertEqual(uniform_host_avail_for_backup(tc, host), 500)
+
+    def test_the_host_ledger_still_charges_a_real_value(self):
+        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+
+        tc = MagicMock()
+        tc.uniform_host_avail_floor = 500
+        tc.uniform_host_admitted_since_floor = 120
+        host = MagicMock()
+        host.available_size.return_value = 999
+        self.assertEqual(uniform_host_avail_for_backup(tc, host), 380)
