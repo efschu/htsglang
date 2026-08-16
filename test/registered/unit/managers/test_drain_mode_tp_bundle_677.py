@@ -269,7 +269,7 @@ class TheGateIsReachableFromABoot(unittest.TestCase):
 
 
 class SuppressionYieldsWhenTheFlipCannotBeFunded(unittest.TestCase):
-    """LIVE INCIDENT 2026-08-16 06:47:48, and the defect is in hot fix 2.
+    """LIVE INCIDENT 2026-08-16 06:47:48, and the defect was in hot fix 2.
 
     The policy armed tp_to_pp every ~3 s and CorridorGuard refused the seam
     staging on two ranks with static numbers:
@@ -293,54 +293,150 @@ class SuppressionYieldsWhenTheFlipCannotBeFunded(unittest.TestCase):
     suppression YIELDS once the flip has proved it cannot be funded -- the same
     shape, and the same threshold, as the seam entry margin's own
     "YIELDED after 2 consecutive abandoned attempts".
+
+    SUPERSEDED BY THE 07:02 WEDGE, and kept because the reasoning survived
+    even though the mechanism did not. The refusal COUNTER was the wrong key
+    -- see `TheValveOutranksDrainModeSuppression` -- but the rule it encoded,
+    that suppression must not outlive the reachability of the layout it is
+    waiting for, is the rule that fix keeps. These cases now assert the rule
+    through its final key.
     """
 
-    def test_suppression_holds_while_the_flip_is_still_viable(self):
-        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 0))
-        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 1))
-
-    def test_it_yields_once_the_seam_has_proved_unfundable(self):
-        """THE INCIDENT. At 76 refusals the layout must prefill again."""
-        self.assertFalse(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 76))
-        self.assertFalse(
-            pp.prefill_suppressed_in_tp(
-                _cfg(), pp.PHASE_TP, pp.DRAIN_SUPPRESSION_YIELD_AFTER
-            )
+    def test_suppression_holds_while_the_flip_is_reachable(self):
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, flip_unavailable=False)
         )
 
-    def test_the_yield_threshold_matches_the_seam_margins_own(self):
-        """Not a new number: the codebase already yields its entry margin
-        after two consecutive abandons, and one instance should not wait
-        longer to stop idling than the other waits to lower its guard."""
-        self.assertEqual(2, pp.DRAIN_SUPPRESSION_YIELD_AFTER)
+    def test_it_yields_once_the_seam_cannot_be_entered(self):
+        """THE INCIDENT, through the key that catches both of its shapes."""
+        self.assertFalse(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, flip_unavailable=True)
+        )
 
-    def test_a_funded_flip_restores_suppression(self):
-        """The yield is not a latch. `arm_refusals` is reset by the first
-        success, so a rig that recovers goes straight back to the user's
-        semantics -- the fifth latch of this chain is not being added here."""
-        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 0))
+    def test_a_reachable_flip_restores_suppression(self):
+        """Not a latch: the valve closes by itself on the first commit, so a
+        rig that recovers returns to the user's semantics with nothing having
+        to remember to restore it."""
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, flip_unavailable=False)
+        )
 
-    def test_the_purity_hook_passes_the_refusal_count(self):
-        """THE CALL SITE. A yield the hook never learns about is a yield that
-        never happens -- twice now this file has caught that shape."""
+
+class TheValveOutranksDrainModeSuppression(unittest.TestCase):
+    """LIVE WEDGE #3, 2026-08-16 07:02, on my own deploy ed7df3ec93.
+
+    THIRD SHAPE, SAME TRAP, AND THIS TIME MY FIX WAS THE CAUSE. tp_to_pp
+    could not enter: PP2 yielded its entry margin while PP1 WITHHELD the
+    yield (a measured 710 MiB draw against 2522 MiB free predicts an 864 MiB
+    trough, under the 1024 MiB law). The ranks disagreed and "consecutive
+    delayed attempts" climbed 15/16/17 with no exit, because the withhold
+    emits a DELAY, which is deliberately exempt from the stand-down cap.
+
+    My hot-fix-2 yield never engaged: it counted `arm_refusals`, and these
+    were DELAYS. A different counter, the same wedge -- the fourth time this
+    chain has shipped a path that was not told its state.
+
+    BUT THE VALVE WAS ALREADY RIGHT. `flip_unavailable_reason` reads BOTH
+    books -- `_seam_abandons_in_a_row` (which the delays DO advance, to 17)
+    and `arm_refusals` -- against a bound of 4. It would have opened, and the
+    documented degradation would have run. It never got the chance, because
+    hot fix 2 was checked BEFORE `prefill_allowed_in_tp` and returned True
+    first. I made the valve a dead letter, which is why the WITHHELD line's
+    promise that "the purity valve lets the starved work class run meanwhile"
+    was false on metal: bs 0, GPU 0%, zero prefill batches.
+
+    So suppression now defers to the valve instead of outranking it. Drain
+    mode's premise is "prefill belongs in PP, so wait for PP" -- valid only
+    while PP is REACHABLE. When the seam cannot enter, the premise is false.
+
+    REQUIREMENT (b) IS SUPERSEDED, not dropped: the user's 2026-08-16
+    decision removes the withhold entirely (warn-and-proceed), so the seam no
+    longer needs to verify the valve's state -- there is no unbounded wait
+    left to justify. The valve still has to be REAL, because point 1 leaves
+    transient delays and bs 0 must never mean an idle box.
+
+    ONE BOUND, NOT TWO. This deletes DRAIN_SUPPRESSION_YIELD_AFTER. Keying on
+    the valve inherits its bound of 4 and its two books, so the refusal shape
+    (wedge #2, 76 refusals) and the delay shape (wedge #3, 17 delays) exit
+    through the SAME door. A second threshold of my own was one more counter
+    that could be told the wrong thing.
+    """
+
+    def test_suppression_holds_while_the_flip_is_reachable(self):
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, flip_unavailable=False)
+        )
+
+    def test_it_yields_the_moment_the_flip_is_unreachable(self):
+        self.assertFalse(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, flip_unavailable=True)
+        )
+
+    def test_my_competing_threshold_is_gone(self):
+        """One bound, and it is the valve's."""
+        self.assertFalse(hasattr(pp, "DRAIN_SUPPRESSION_YIELD_AFTER"))
+
+    def test_the_delay_shape_opens_the_valve_through_the_hook(self):
+        """THE WEDGE. 17 consecutive DELAYS, zero refusals -- the shape my
+        refusal counter was blind to -- must let the TP layout prefill."""
         import types
 
         from sglang.srt.managers import phase_purity
 
-        stub = types.SimpleNamespace(
+        rt = types.SimpleNamespace(
+            _seam_abandons_in_a_row={"tp_to_pp": 17}, blocking_guards=()
+        )
+        sched = types.SimpleNamespace(
+            phase_policy_cfg=_cfg(),
+            phase_policy_state=pp.PhasePolicyState(arm_refusals={}),
+            phase_flip_runtime=rt,
+            server_args=None,
+            _phase_purity=None,
+        )
+        with unittest.mock.patch.object(
+            phase_purity, "_active_phase", lambda s: pp.PHASE_TP
+        ):
+            self.assertFalse(
+                phase_purity.prefill_blocked_here(sched),
+                "17 delays must open the valve; only refusals were counted",
+            )
+
+    def test_the_refusal_shape_still_opens_it(self):
+        """Wedge #2 must not regress now that the counter changed."""
+        import types
+
+        from sglang.srt.managers import phase_purity
+
+        rt = types.SimpleNamespace(_seam_abandons_in_a_row={}, blocking_guards=())
+        sched = types.SimpleNamespace(
             phase_policy_cfg=_cfg(),
             phase_policy_state=pp.PhasePolicyState(
                 arm_refusals={pp.TP_TO_PP: 76}
             ),
+            phase_flip_runtime=rt,
+            server_args=None,
+            _phase_purity=None,
         )
         with unittest.mock.patch.object(
             phase_purity, "_active_phase", lambda s: pp.PHASE_TP
-        ), unittest.mock.patch.object(
-            phase_purity, "purity_of", lambda s: types.SimpleNamespace(
-                prefill_allowed_in_tp=lambda: True
-            )
         ):
-            self.assertFalse(
-                phase_purity.prefill_blocked_here(stub),
-                "an unfundable seam must let the TP layout prefill again",
-            )
+            self.assertFalse(phase_purity.prefill_blocked_here(sched))
+
+    def test_a_reachable_flip_still_suppresses_through_the_hook(self):
+        """The user's semantics are the DEFAULT and must survive all this."""
+        import types
+
+        from sglang.srt.managers import phase_purity
+
+        rt = types.SimpleNamespace(_seam_abandons_in_a_row={}, blocking_guards=())
+        sched = types.SimpleNamespace(
+            phase_policy_cfg=_cfg(),
+            phase_policy_state=pp.PhasePolicyState(arm_refusals={}),
+            phase_flip_runtime=rt,
+            server_args=None,
+            _phase_purity=None,
+        )
+        with unittest.mock.patch.object(
+            phase_purity, "_active_phase", lambda s: pp.PHASE_TP
+        ):
+            self.assertTrue(phase_purity.prefill_blocked_here(sched))

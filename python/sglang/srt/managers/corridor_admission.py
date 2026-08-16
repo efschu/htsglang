@@ -408,7 +408,13 @@ class PrefillAdmissionGate:
             logger.error("%s gate failed to evaluate: %s", LOG_PREFIX, e)
             return None
         self.reclaimed_bytes += int(getattr(verdict, "reclaimed", 0) or 0)
-        if verdict.ok:
+        # THE DIP IS THE EVENT HERE, not the verdict. This gate never refused
+        # anything -- it admits regardless and returns evidence -- so its
+        # shortfall counter is a FILL-QUALITY signal. Since the corridor law
+        # stopped gating (user decision 2026-08-16) a dip comes back as
+        # ok=True with `law_breached` set, and a counter keyed on `ok` alone
+        # would have quietly reported a perfect corridor forever.
+        if verdict.ok and not getattr(verdict, "law_breached", False):
             self.cleared += 1
             logger.info("%s cleared before prefill: %s", LOG_PREFIX, verdict.detail)
         else:

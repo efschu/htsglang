@@ -445,6 +445,10 @@ class GuardResult:
     reclaimed: int
     used_providers: Tuple[str, ...]
     detail: str = ""
+    #: The verdict HELD but the residual sits under the corridor law. Carried
+    #: so the caller can WARN (user decision 2026-08-16: the law is advisory
+    #: at seam entry, and a dip has to be sayable to be warned about).
+    law_breached: bool = False
 
     @property
     def reclaimed_mib(self) -> float:
@@ -656,11 +660,34 @@ class CorridorGuard:
         )
 
         self.reclaimed_total += reclaimed
-        # Judged against the LAW, not the arming watermark: see __init__.
-        ok = (free_now - want) >= self.law_floor_bytes
+        # USER DECISION 2026-08-16: THE LAW IS ADVISORY HERE, OOM IS NOT.
+        #
+        # This line used to read `ok = (free_now - want) >= law_floor_bytes`,
+        # and that single comparison produced the 06:47:48 wedge: PP1's want
+        # of 2163 MiB FIT inside 2456 MiB free, but the 293 MiB residual sat
+        # under the law, so the seam was refused 76 times in a row while
+        # 727004 tokens waited on an idle GPU. It protected a few hundred MiB
+        # of headroom by stopping the machine.
+        #
+        # The ~1024 line exists because the planner was not filling VRAM well
+        # enough. It is a FILL-QUALITY target and it remains the planner's
+        # job; it was never a safety device, and it may not block, delay or
+        # refuse anything on its own. What it still does is SPEAK: a dip is
+        # carried out on the verdict and warned about by the caller.
+        #
+        # WHAT STAYS HARD is the only thing that was ever unsurvivable -- an
+        # allocation larger than free. That is not a corridor dip, it is an
+        # OOM, and softening it would trade a warning for a dead worker.
+        ok = free_now >= want
+        law_breached = ok and (free_now - want) < self.law_floor_bytes
         if not ok:
             self.refuse_count += 1
-        if host_blocked and not ok:
+        # COUNTED WHEN IT MATTERED, and "mattered" is no longer the same as
+        # "refused". Since the law stopped gating (2026-08-16), a withheld
+        # host tier usually ends in a verdict that HOLDS but dips under the
+        # law -- item 16's decision is exactly as consequential as before, so
+        # a counter keyed on refusal alone would silently stop recording it.
+        if host_blocked and (not ok or law_breached):
             self.host_blocked_count += 1
         detail = (
             f"want {want / _MIB:.0f} MiB, free {free_before / _MIB:.0f} -> "
@@ -692,7 +719,21 @@ class CorridorGuard:
             clause = describe_water_fill(column)
             if clause:
                 detail += f". {clause}"
-        if ok:
+        if ok and law_breached:
+            self.law_dip_count = getattr(self, "law_dip_count", 0) + 1
+            logger.warning(
+                "%s CANNOT FULLY HOLD THE CORRIDOR FLOOR through this seam "
+                "entry on device %d: predicted trough %d MiB below the %d MiB "
+                "law. PROCEEDING -- the law is a fill-quality target, not a "
+                "gate (user decision 2026-08-16), and the allocation itself "
+                "fits, so this is a dip and not an OOM. %s",
+                LOG_PREFIX,
+                self.device_index,
+                (self.law_floor_bytes - (free_now - want)) / _MIB,
+                self.law_floor_mib,
+                detail,
+            )
+        elif ok:
             logger.info(
                 "%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail
             )
@@ -709,7 +750,14 @@ class CorridorGuard:
             if raise_on_refusal:
                 raise CorridorBreachRefused(f"{LOG_PREFIX} {detail}")
         return GuardResult(
-            ok, free_before, free_now, want, reclaimed, tuple(used), detail
+            ok,
+            free_before,
+            free_now,
+            want,
+            reclaimed,
+            tuple(used),
+            detail,
+            law_breached=law_breached,
         )
 
     # -- the ladder, shared by the gate and the lender ---------------------

@@ -290,7 +290,17 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
         self.assertTrue(r.ok, r.detail)
         self.assertEqual(g.refuse_count, 0)
 
-    def test_the_law_still_refuses_what_the_law_forbids(self):
+    def test_the_law_now_warns_where_it_used_to_refuse(self):
+        """SUPERSEDED BY THE USER DECISION 2026-08-16, and kept pointing at
+        the same numbers so the change of policy is legible rather than
+        silently deleted.
+
+        900 MiB out of 1100 free leaves 200, under the 1024 law. This used to
+        REFUSE. It now proceeds and reports the dip, because the law is a
+        fill-quality target rather than a gate -- refusing here is what idled
+        the box at 06:47:48 with 727004 tokens waiting. The allocation fits;
+        only an allocation LARGER than free is still refused.
+        """
         from sglang.srt.managers import corridor_guard as cg
 
         free = [1100 * MIB]
@@ -301,7 +311,11 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
             probe=lambda: free[0],
             fleet_probe=lambda: list(free),
         )
-        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.ok)
+        self.assertTrue(r.law_breached)
+        # The boundary the decision did NOT move.
+        self.assertFalse(g.ensure_headroom(5000 * MIB).ok)
 
     def test_by_default_the_two_floors_coincide(self):
         from sglang.srt.managers import corridor_guard as cg

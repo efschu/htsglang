@@ -601,7 +601,6 @@ def prefill_blocked_here(scheduler) -> bool:
     """
     from sglang.srt.managers.phase_policy import (
         PHASE_TP,
-        TP_TO_PP,
         prefill_suppressed_in_tp,
     )
 
@@ -624,20 +623,55 @@ def prefill_blocked_here(scheduler) -> bool:
     # fires -- the same shape as the #684 serving tick's NameError. Pinned by
     # `test_the_purity_hook_reads_the_real_scheduler_attribute`.
     policy = getattr(scheduler, "phase_policy_cfg", None)
-    # THE REFUSAL COUNT IS PART OF THE QUESTION, not context for it. A seam
-    # that cannot be funded makes suppression a wedge rather than a policy --
-    # measured 2026-08-16 06:47:48, 76 refused arms with 727004 tok waiting --
-    # so the hook has to pass what it knows about the flip's viability.
-    # Rank-uniform: `arm_refusals` advances off the group's own arm outcomes.
-    pstate = getattr(scheduler, "phase_policy_state", None)
-    refusals = 0
-    if pstate is not None:
+    # THE VALVE OUTRANKS DRAIN MODE. Measured 2026-08-16 07:02 on the boot
+    # that carried the first fix: tp_to_pp was DELAYED, not refused -- one
+    # rank withheld its entry-margin yield on a predicted sub-law trough,
+    # which is exempt from the stand-down cap, so the delay streak climbed to
+    # 17 with no exit while the box sat at bs 0, GPU 0%, 794179 tok pending.
+    #
+    # `flip_unavailable_reason` had the answer all along: it reads the seam's
+    # `_seam_abandons_in_a_row` (which delays DO advance) AND the policy's
+    # `arm_refusals`, against one bound. What broke was ORDER -- suppression
+    # was checked FIRST and returned True, so the valve never ran and the
+    # seam's own promise that "the purity valve lets the starved work class
+    # run meanwhile" was FALSE on metal. Asking the valve first makes that
+    # promise true, and both wedge shapes leave through the same door.
+    unavailable = None
+    if policy is not None and bool(getattr(policy, "drain_mode", False)):
         try:
-            refusals = int(getattr(pstate, "arm_refusals", {}).get(TP_TO_PP, 0))
+            unavailable = flip_unavailable_reason(scheduler, "prefill")
         except Exception:  # noqa: BLE001 - a guard never breaks the loop
-            refusals = 0
-    if policy is not None and prefill_suppressed_in_tp(policy, PHASE_TP, refusals):
+            unavailable = None
+    if policy is not None and prefill_suppressed_in_tp(
+        policy, PHASE_TP, flip_unavailable=bool(unavailable)
+    ):
         return True
+    # THE YIELD IS A RECEIPT-BEARING EVENT, and loud on purpose. Prefilling in
+    # the TP layout is what drain mode exists to forbid; it resumes only
+    # because an idle instance is worse. EDGE-TRIGGERED -- this runs every
+    # scheduler iteration, and a per-iteration line would bury the signal it
+    # exists to raise. Cleared on recovery, so a flapping rig logs each
+    # engagement rather than only the first in the process's life.
+    if unavailable:
+        if not getattr(scheduler, "_drain_yield_announced", False):
+            scheduler._drain_yield_announced = True
+            logger.warning(
+                "%s DRAIN-MODE SUPPRESSION YIELDED: %s. This TP layout resumes "
+                "PREFILLING -- the behaviour drain mode exists to forbid, taken "
+                "only because idling the instance with work waiting is worse. "
+                "THE SEAM COULD NOT BE ENTERED, and that is the defect this "
+                "line points at; the yield is the symptom. Clears on the first "
+                "flip that commits.",
+                LOG_PREFIX,
+                unavailable,
+            )
+    elif getattr(scheduler, "_drain_yield_announced", False):
+        scheduler._drain_yield_announced = False
+        logger.warning(
+            "%s the seam is reachable again; drain mode is back in force and "
+            "the TP layout has stopped prefilling.",
+            LOG_PREFIX,
+        )
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
     return not _relaxed(scheduler, "prefill")

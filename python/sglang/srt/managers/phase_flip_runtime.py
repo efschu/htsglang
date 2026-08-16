@@ -5558,31 +5558,40 @@ class PhaseFlipRuntime:
             # once decode drains in the degraded layout the memory comes back
             # and the very next round enters with room.
             if draw_short:
-                self.seam_yields_withheld = getattr(self, "seam_yields_withheld", 0) + 1
+                # USER DECISION 2026-08-16: WARN, DO NOT WITHHOLD.
+                #
+                # This branch used to return a margin-delay tag, which is
+                # EXEMPT from the stand-down cap by design -- so when the
+                # condition did not clear, nothing bounded it. Measured at
+                # 07:02:15: PP1 withheld on a predicted 864 MiB trough while
+                # PP2 yielded, the ranks disagreed, "consecutive delayed
+                # attempts" climbed 15/16/17 with no exit, and the instance
+                # sat at bs 0, GPU 0%, with 794179 tok pending.
+                #
+                # Its safety argument was also self-defeating: it justified
+                # waiting by pointing at the purity valve, but the valve opens
+                # on the stand-down cap that this very tag is exempt from.
+                #
+                # The law is a fill-quality target, not a gate. A predicted
+                # dip is now SAID and stepped over. The prediction keeps its
+                # job -- it sizes the warning, and it is what the pre-flip
+                # spill rung aims at -- it just no longer stops the machine.
+                self.seam_law_warned = getattr(self, "seam_law_warned", 0) + 1
                 logger.warning(
-                    "%s seam entry margin YIELD WITHHELD (%s): the budget of "
-                    "%d attempts is spent, but this rank's own worst MEASURED "
-                    "draw of %d MiB against %d MiB free predicts a %d MiB "
-                    "trough, below the %d MiB corridor law. Entering on the "
-                    "law alone is what made every breach in this corpus, so "
-                    "the seam waits instead. This objection is a DELAY, not "
-                    "an abandon: it does not spend the stand-down cap, and "
-                    "the purity valve lets the starved work class run in the "
-                    "current layout meanwhile, so the instance keeps serving "
-                    "while the memory comes back.",
+                    "%s CANNOT FULLY HOLD THE CORRIDOR FLOOR through this "
+                    "seam entry (%s): predicted trough %d MiB below the %d "
+                    "MiB law -- this rank's worst MEASURED draw of %d MiB "
+                    "against %d MiB free. PROCEEDING ANYWAY: the law is a "
+                    "fill-quality target and only OOM is hard (user decision "
+                    "2026-08-16). The seam is no longer delayed on a margin "
+                    "prediction; an idle instance was never the cheaper side "
+                    "of this trade.",
                     LOG_PREFIX,
                     direction,
-                    budget,
-                    measured_draw // (1024 * 1024),
-                    int(verdict.free_after) // (1024 * 1024),
                     predicted_trough // (1024 * 1024),
                     law_floor // (1024 * 1024),
-                )
-                return (
-                    f"{SEAM_MARGIN_DELAY_TAG}: measured draw "
-                    f"{measured_draw // (1024 * 1024)} MiB predicts a "
-                    f"{predicted_trough // (1024 * 1024)} MiB trough under "
-                    f"the {law_floor // (1024 * 1024)} MiB law ({direction})"
+                    measured_draw // (1024 * 1024),
+                    int(verdict.free_after) // (1024 * 1024),
                 )
             self.seam_margin_yields += 1
             logger.warning(

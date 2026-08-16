@@ -101,7 +101,10 @@ class HostSpillIsGatedOnTheWholeFleetTest(unittest.TestCase):
         g = _guard(fleet, 0)
         g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
         r = g.ensure_headroom(900 * MIB, reason="kv grow")
-        self.assertFalse(r.ok)
+        # The verdict itself no longer refuses (the law stopped gating on
+        # 2026-08-16); what this test is about is that the HOST TIER was not
+        # spent, which the assertions below state directly.
+        self.assertTrue(r.law_breached)
         self.assertEqual(r.used_providers, ())
         self.assertEqual(g.host_blocked_count, 1)
         self.assertIn("not level", r.detail)
@@ -122,7 +125,11 @@ class HostSpillIsGatedOnTheWholeFleetTest(unittest.TestCase):
         fleet = _Fleet([1100, 1150, 5000])
         g = _guard(fleet, 0)
         g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
-        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+        # Post-2026-08-16 the verdict holds and reports the dip; the point of
+        # this test is the withheld host tier, asserted directly.
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.law_breached)
+        self.assertEqual(r.used_providers, ())
 
     def test_without_a_fleet_probe_the_host_tier_stays_shut(self):
         # A guard that cannot see the fleet cannot prove the fleet is level,
@@ -131,7 +138,10 @@ class HostSpillIsGatedOnTheWholeFleetTest(unittest.TestCase):
         g = cg.CorridorGuard(0, probe=fleet.probe(0))
         g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
         r = g.ensure_headroom(900 * MIB)
-        self.assertFalse(r.ok)
+        # The verdict itself no longer refuses (the law stopped gating on
+        # 2026-08-16); what this test is about is that the HOST TIER was not
+        # spent, which the assertions below state directly.
+        self.assertTrue(r.law_breached)
         self.assertEqual(g.host_blocked_count, 1)
 
 
@@ -357,7 +367,11 @@ class WhenRefusingIsFatalTest(unittest.TestCase):
         fleet = _Fleet([1100, 6000, 3000])
         g = _guard(fleet, 0)
         g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
-        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+        # Post-2026-08-16 the verdict holds and reports the dip; the point of
+        # this test is the withheld host tier, asserted directly.
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.law_breached)
+        self.assertEqual(r.used_providers, ())
         self.assertEqual(g.host_forced_count, 0)
 
     def test_rebalance_is_still_spent_first_even_when_refusal_is_fatal(self):
