@@ -6753,6 +6753,20 @@ class PhaseFlipRuntime:
         # destination allocator", and those have opposite fixes. Straddling
         # the cutover answers it directly: if the unaccounted page is
         # already there BEFORE, the enumeration is innocent.
+        # #690: TIME THE TAIL, because it is most of the flip and nothing
+        # measured it. read/exchange/write cover the wave loop only -- the
+        # backing swap included, since t_write0 is taken before it -- so
+        # everything below fell into the residual. Measured over 291
+        # same-regime DONE lines that residual is 2.0-2.1 s and FLAT across a
+        # 3600x range of live slots (123 -> 440095), i.e. 81 % of a
+        # low-occupancy flip. A term that large cannot stay a subtraction:
+        # #677 prices windows against it and #692 prices depth against it.
+        #
+        # Split into movers vs cutover because they have different fixes. The
+        # movers are occupancy-INDEPENDENT by construction (the weights arena
+        # refill is the same bytes whatever the KV live set is), which is the
+        # leading explanation for the flatness; the cutover is the group step.
+        t_movers0 = self._clock()
         self._pool_census("pre-cutover", direction)
         for fn in self._pre_cutover_fns:
             fn(direction)
@@ -6760,9 +6774,12 @@ class PhaseFlipRuntime:
             # have different sizes AND different fixes, so one combined
             # "pre_cutover" bar would be unattributable.
             seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
+        movers_ms = (self._clock() - t_movers0) * 1000.0
+        t_cutover0 = self._clock()
         self._cutover_fn(direction)
         seam_census.mark("cutover")
         self._pool_census("post-cutover", direction)
+        cutover_ms = (self._clock() - t_cutover0) * 1000.0
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
         self._armed_at = None
@@ -6784,6 +6801,10 @@ class PhaseFlipRuntime:
             "read_ms": read_ms,
             "exchange_ms": xfer_ms,
             "write_ms": write_ms,
+            # #690: the tail, so the fixed cost is a MEASUREMENT and not a
+            # residual anyone has to regress for.
+            "movers_ms": movers_ms,
+            "cutover_ms": cutover_ms,
             "total_ms": total_ms,
         }
         self.last_stats = stats
@@ -6791,7 +6812,8 @@ class PhaseFlipRuntime:
             "%s DONE %s (epoch %d) in %.1f ms over %d seam wave(s): %d live "
             "slots, sent %d cells / %.2f MiB, received %d cells / %.2f MiB, "
             "local %.2f MiB, staging reserved %.2f MiB (read %.1f ms, "
-            "exchange %.1f ms, write %.1f ms)",
+            "exchange %.1f ms, write %.1f ms, movers %.1f ms, "
+            "cutover %.1f ms)",
             LOG_PREFIX,
             direction,
             self._epoch,
@@ -6807,6 +6829,8 @@ class PhaseFlipRuntime:
             read_ms,
             xfer_ms,
             write_ms,
+            movers_ms,
+            cutover_ms,
         )
         census = seam_census.end()
         if census is not None:
