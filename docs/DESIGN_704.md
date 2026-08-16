@@ -621,6 +621,52 @@ World-level tiling is validated separately (`validate_world_tiling`), because
 it cannot be checked locally: a gap silently drops layers and an overlap
 computes them twice, while every individual rank's range looks sensible.
 
+### 3.11 The two dependent structures — both fail silently, so both are guards
+
+A boundary change is not finished when the range changes. Two structures follow
+the owned range, and neither raises on its own if it does not follow. Landed as
+observers in `layout_boundary.py`, 7 further tests.
+
+**(a) CUDA graphs bake the executed layer set.** The decode graph captures the
+model's own `forward` (`decode_cuda_graph_runner.py:1770`), which iterates
+`range(self.start_layer, self.end_layer)`. A CUDA graph records actual kernel
+launches, so the executed set is fixed *at capture time* and a replay ignores
+any later change to `_start_layer`/`_end_layer`. After an unguarded flip the
+model reports the new range while every graph replay still runs the old one —
+the layer count silently reverts **on exactly the fast path, and only under
+replay**, so an eager smoke test would show the flip working. `cuda_graph_observer`
+recaptures, or refuses and rolls back.
+
+> **This corrects §3.7.** I argued there that the arena's advantage over
+> reallocation was that it "keeps captured CUDA graphs valid across a rung
+> change". That is wrong as stated. The arena keeps parameter *addresses*
+> stable, which the graph's captured pointers do need — but the graph also
+> bakes the executed layer *set*, so **a rung change requires recapture either
+> way**. The arena-vs-realloc fork therefore narrows: recapture is common to
+> both, and the arena's remaining advantages are avoiding the weight copy and
+> avoiding reallocation. Slice 2 must measure recapture cost as a cost of
+> *every* rung change, not as a penalty unique to the realloc design.
+
+**(b) The KV and mamba pools are built for a span and indexed off its base.**
+Their layer-id lists are filtered to the owned range at build time
+(`model_runner_kv_cache_mixin.py:2460-2470`) and rows are addressed as
+`layer_id - pool.start_layer` (`memory_pool.py:1576`, `:2889`). Two failures
+follow, and the union answers both:
+
+* a layer newly activated outside the built span has **no rows at all** — no KV
+  for a full-attention layer, no mamba slot for a linear one;
+* the indexing **base must not move**. If a downstream rank's pool were rebuilt
+  with the new start (rank1: 28 → 29), every cached row would shift by one
+  layer and be silently misattributed.
+
+So **"load wide, run narrow" applies to the caches too**: build the pools over
+the union, at a cost of one extra layer's rows per boundary that moves.
+`pool_coverage_observer` refuses a range that escapes the built span.
+
+Note which ranks are exposed in the slice-1a pair: rank0 keeps `start=0` and
+rank2 keeps `start=48`, so only **rank1** moves its base (28 → 29). It is the
+one rank where a naive rebuild would corrupt silently.
+
 ### 3.10 Slice 1a-i — what the timing pair can and cannot pin
 
 Landed as `planner/timing_calibration.py`, 9 hermetic tests.

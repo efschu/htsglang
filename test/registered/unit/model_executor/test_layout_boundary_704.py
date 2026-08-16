@@ -331,3 +331,124 @@ def test_the_two_halves_of_slice_1a_compose():
     log.clear()
     model(torch.zeros(4))
     assert log == list(range(29))
+
+
+# --------------------------------------------------------------------------
+# Dependent-structure observers. A boundary change is not complete when the
+# range changes; these are the structures that must follow it, each of which
+# fails SILENTLY rather than loudly if it does not.
+# --------------------------------------------------------------------------
+
+
+class _FakeGraphRegistry:
+    """Models the one semantic that matters: capture BAKES the layer set.
+
+    A CUDA graph records actual kernel launches, and the decode graph captures
+    the model's own forward (decode_cuda_graph_runner.py:1770), which iterates
+    range(start_layer, end_layer). So the executed set is fixed at capture
+    time and a replay ignores any later change to _start_layer/_end_layer.
+    """
+
+    def __init__(self, captured_range):
+        self.captured_range = captured_range
+        self.recaptures = []
+
+    def replay_would_run(self):
+        lo, hi = self.captured_range
+        return list(range(lo, hi))
+
+    def recapture(self, rng):
+        self.captured_range = tuple(rng)
+        self.recaptures.append(tuple(rng))
+
+
+def test_a_stale_graph_would_replay_the_old_layer_set():
+    """The hazard, demonstrated before the guard that prevents it.
+
+    Without this the guard below could pass vacuously -- it must be true that a
+    graph captured at rung A really does keep running rung A's layers.
+    """
+    from sglang.srt.model_executor.layout_boundary import cuda_graph_observer
+
+    _, act, _ = _rank0()
+    graphs = _FakeGraphRegistry(captured_range=(0, 28))
+    assert graphs.replay_would_run() == list(range(28))
+
+    # Flip WITHOUT telling the graphs: the model range moves, the graph does not.
+    act.flip("[29,19,16]", quiescent=True)
+    assert act.model.start_layer == 0 and act.model.end_layer == 29
+    assert graphs.replay_would_run() == list(range(28)), (
+        "a replayed graph must still run the OLD set -- that is the hazard"
+    )
+    assert graphs.captured_range != (0, 29)
+
+    # With the observer registered, the graphs are brought along.
+    _, act2, _ = _rank0()
+    graphs2 = _FakeGraphRegistry(captured_range=(0, 28))
+    act2.add_observer(cuda_graph_observer(graphs2))
+    act2.flip("[29,19,16]", quiescent=True)
+    assert graphs2.recaptures == [(0, 29)]
+    assert graphs2.replay_would_run() == list(range(29))
+
+
+def test_graphs_without_a_recapture_hook_refuse_the_flip():
+    """No recapture available means the flip must not happen at all."""
+    from sglang.srt.model_executor.layout_boundary import cuda_graph_observer
+
+    model, act, _ = _rank0()
+
+    class _NoRecapture:
+        captured_range = (0, 28)
+
+    act.add_observer(cuda_graph_observer(_NoRecapture()))
+    with pytest.raises(LayoutBoundaryError, match="rolled back"):
+        act.flip("[29,19,16]", quiescent=True)
+    assert (model.start_layer, model.end_layer) == (0, 28), "must roll back"
+
+
+def test_a_range_escaping_the_pools_built_span_is_refused():
+    """KV and mamba pools are built for a fixed span and indexed off its base.
+
+    The pools index by `layer_id - pool.start_layer` (memory_pool.py:1576,
+    :2889) and their layer id lists are filtered to the owned range at build
+    time (model_runner_kv_cache_mixin.py:2460-2470). A range that escapes the
+    span the pools were BUILT for has layers with no rows at all -- so the
+    pools must be built over the UNION, exactly like the weights.
+    """
+    from sglang.srt.model_executor.layout_boundary import pool_coverage_observer
+
+    model, act, _ = _rank0()
+    # Pools built for the narrow rung only -- the boot-time mistake this catches.
+    act.add_observer(pool_coverage_observer(0, 28, name="kv"))
+    with pytest.raises(LayoutBoundaryError, match="rolled back"):
+        act.flip("[29,19,16]", quiescent=True)
+    assert (model.start_layer, model.end_layer) == (0, 28)
+
+
+def test_pools_built_over_the_union_accept_every_rung():
+    from sglang.srt.model_executor.layout_boundary import pool_coverage_observer
+
+    model, act, _ = _rank0()
+    act.add_observer(pool_coverage_observer(0, 29, name="kv"))
+    act.add_observer(pool_coverage_observer(0, 29, name="mamba"))
+    act.flip("[29,19,16]", quiescent=True)
+    assert (model.start_layer, model.end_layer) == (0, 29)
+    act.flip("[28,20,16]", quiescent=True)
+    assert (model.start_layer, model.end_layer) == (0, 28)
+
+
+def test_the_indexing_base_is_what_makes_union_pools_necessary():
+    """Why coverage alone is not the whole story, recorded as arithmetic.
+
+    Pools index by `layer_id - pool.start_layer`. If a downstream rank's pool
+    were rebuilt with the NEW start (rank1: 28 -> 29), every cached row would
+    shift by one layer and be silently misattributed. Building over the union
+    keeps the base fixed, so the mapping is stable across a flip.
+    """
+    union_start = 28
+    # rank1 owns 28..47 at rung A and 29..47 at rung B.
+    for layer_id in range(29, 48):
+        assert layer_id - union_start == layer_id - 28  # base unchanged
+    # Had the pool been rebuilt with the new start, the same layer would land
+    # on a different row -- the silent corruption this design avoids.
+    assert (29 - 29) != (29 - union_start)

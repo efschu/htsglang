@@ -252,3 +252,90 @@ class LayoutBoundaryActuator:
         for rung, (a, b) in self.rung_ranges.items():
             out[rung] = (hi - lo) - (b - a)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Dependent-structure observers.
+#
+# A boundary change is not finished when the range changes. Two structures
+# follow the owned layer range, and BOTH fail silently rather than loudly if
+# they do not follow it -- which is why they are guards rather than notes.
+# ---------------------------------------------------------------------------
+
+
+def cuda_graph_observer(registry) -> Callable[[BoundaryFlipReport], None]:
+    """Require captured CUDA graphs to be recaptured for the new range.
+
+    A CUDA graph records actual kernel launches, and the decode graph captures
+    the model's own forward (``decode_cuda_graph_runner.py:1770``), which
+    iterates ``range(self.start_layer, self.end_layer)``. **The executed layer
+    set is therefore baked at capture time**, and a replay ignores any later
+    change to ``_start_layer``/``_end_layer``: after an unguarded flip the
+    model would report the new range while every graph replay still ran the
+    old one.
+
+    That is the worst shape of bug available here -- the layer count silently
+    reverts on exactly the fast path, and only under graph replay, so an eager
+    smoke test would show the flip working.
+
+    ``registry`` must expose ``captured_range`` and a ``recapture(range)``. If
+    it cannot recapture, the flip is refused and rolled back: a boundary whose
+    graphs disagree with it is worse than no boundary change.
+    """
+
+    def _observe(report: BoundaryFlipReport) -> None:
+        captured = getattr(registry, "captured_range", None)
+        if captured is None or tuple(captured) == tuple(report.to_range):
+            return
+        recapture = getattr(registry, "recapture", None)
+        if not callable(recapture):
+            raise LayoutBoundaryError(
+                f"CUDA graphs are captured for range {tuple(captured)} but the "
+                f"boundary moved to {tuple(report.to_range)}, and the registry "
+                "offers no recapture(). The captured graphs bake the executed "
+                "layer set, so replays would keep running the old range while "
+                "the model reports the new one -- visible only under graph "
+                "replay, which is exactly where an eager smoke test would miss "
+                "it."
+            )
+        recapture(report.to_range)
+
+    return _observe
+
+
+def pool_coverage_observer(
+    built_start: int, built_end: int, name: str = "pool"
+) -> Callable[[BoundaryFlipReport], None]:
+    """Require the new range to stay inside the span the pools were BUILT for.
+
+    The KV and mamba pools are constructed from layer id lists filtered to the
+    owned range (``model_runner_kv_cache_mixin.py:2460-2470``) and are indexed
+    by ``layer_id - pool.start_layer`` (``memory_pool.py:1576``, ``:2889``).
+    Two consequences, and the union answers both:
+
+    * a layer newly activated outside the built span has **no rows at all** --
+      for a full-attention layer no KV, for a linear layer no mamba slot;
+    * the indexing BASE must not move. If a downstream rank's pool were rebuilt
+      with the new start (rank1: 28 -> 29), every cached row would shift by one
+      layer and be silently misattributed.
+
+    So the pools are built over the UNION for exactly the reason the weights
+    are -- "load wide, run narrow" applies to the caches too, at a cost of one
+    extra layer's rows per boundary that moves.
+    """
+
+    def _observe(report: BoundaryFlipReport) -> None:
+        lo, hi = int(report.to_range[0]), int(report.to_range[1])
+        if lo < int(built_start) or hi > int(built_end):
+            raise LayoutBoundaryError(
+                f"the {name} pool was built for layers "
+                f"[{int(built_start)},{int(built_end)}) but rung "
+                f"{report.to_rung!r} needs [{lo},{hi}). Layers outside the built "
+                "span have no rows -- no KV for a full-attention layer, no "
+                "mamba slot for a linear one -- and rebuilding the pool with a "
+                "new start would move the `layer_id - start_layer` indexing base "
+                "and silently misattribute every cached row. Build the pools "
+                "over the UNION of the rungs, as the weights are."
+            )
+
+    return _observe
