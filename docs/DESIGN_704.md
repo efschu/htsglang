@@ -443,6 +443,29 @@ survive a layout change mid-sequence — is strictly better and strictly harder,
 and is not in scope for Slice 1. It is the right answer if the admission hold's
 throughput cost measures badly.
 
+> **HARD PRECONDITION, from the live system (2026-08-16).** The admission hold
+> above must **not** be armed until the #701/#698 chunked-prefill admission
+> deadlock is fixed. That deadlock is currently the dominant live defect —
+> `#running-req: 0` on **90.6% of prefill rounds** with zero completions — and
+> it is the same wedge D6 describes, already happening for another reason. An
+> admission hold dropped into an admitter that is already starving would
+> deepen the deadlock rather than bound a drain, and would then be
+> indistinguishable from it in a log.
+>
+> So the hold ships **gated**: it may only fire when admission is demonstrably
+> live (non-zero running requests), and it is disabled outright until #701
+> lands. This is a case where my mechanism and an existing bug share a failure
+> mode, and the ordering between them is not optional.
+
+**Instrumentation warning for any acceptance work built on this design:** the
+`cache_hit_rate` metric reports **0.0 despite real hits** (separate bug, filed).
+Count hits from log lines and token counts instead. Any gate written against
+that counter would pass or fail for reasons unrelated to what it measures.
+Relatedly, acceptance of the "real cache hit across flip **and** reboot" kind is
+**unfalsifiable until #701 is fixed**, because the cache is starved rather than
+broken — such a test would fail for the wrong reason and must not consume a
+boot window.
+
 **Not built:** per-request layout selection. One layout is regime-wide, per the
 `phasen-layoutwechsel` law. A rung is a property of the instance, not a request.
 
