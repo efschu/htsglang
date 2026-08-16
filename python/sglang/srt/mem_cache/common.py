@@ -76,9 +76,9 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert req.cache_protected_len % page_size == 0, (
-        "cache_protected_len must be page aligned"
-    )
+    assert (
+        req.cache_protected_len % page_size == 0
+    ), "cache_protected_len must be page aligned"
     evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
@@ -435,6 +435,35 @@ def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
     )
 
 
+def _flush_deferred_frees(allocator) -> int:
+    """Apply frees the allocator has staged in an open batching group.
+
+    #681 third root. Returns tokens applied, 0 when there is nothing staged or
+    the allocator has no group protocol.
+
+    A CAPABILITY PROBE, NOT A DEFENSIVE DEFAULT. ``flush_free_group`` is
+    defined on ``BaseTokenToKVPoolAllocator``, so every allocator in the tree
+    has it; the check is here because this module is also driven by test
+    stand-ins and by allocators that stub the group protocol out entirely
+    (``allocator/hisparse.py`` makes begin/end no-ops). A missing method means
+    "this allocator never stages", which is a real answer -- unlike a missing
+    MEASUREMENT, which is the case #606 says must never be defaulted.
+    """
+    flush = getattr(allocator, "flush_free_group", None)
+    if flush is None:
+        return 0
+    try:
+        return int(flush() or 0)
+    except Exception as exc:  # noqa: BLE001 - a relief step must not mask the OOM
+        logger.warning(
+            "#681: flushing the allocator's staged frees raised (%s); the "
+            "allocation continues to the relief ladder and, failing that, to "
+            "the original error.",
+            exc,
+        )
+        return 0
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
@@ -466,6 +495,42 @@ def alloc_token_slots(
         # register_extend_relief_provider -- and a failure still raises, so
         # fail-loud remains the last word rather than being softened into a
         # silent stall.
+        # #681 THIRD ROOT, AND IT IS TRIED FIRST BECAUSE IT IS NOT RELIEF.
+        #
+        # The rungs below give something up -- host bandwidth, a victim's
+        # decode progress. This gives up nothing: it applies frees the tree has
+        # ALREADY performed and already counted, which are sitting in
+        # ``allocator.free_group`` because a batching window was open when the
+        # eviction ran (batch_result_processor.py:92 and :741 open one inside
+        # the event loop). Measured 2026-08-16 13:58:37 on all three ranks:
+        # eviction reported its full 512 tokens, ``available_size`` stayed at
+        # 392, and no under-delivery note printed -- because by the tree's
+        # books the eviction HAD delivered. The pages were payable the whole
+        # time; nothing had asked for them.
+        #
+        # Cold path only: this runs after an allocation has already failed, so
+        # a healthy alloc pays one list check less than nothing.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            if backup_state:
+                # The snapshot above predates the flush, so rolling back to it
+                # would drop the pages the flush just applied. No caller passes
+                # backup_state on this path today; re-taking it keeps that a
+                # fact about the callers rather than a dependency of this fix.
+                state = allocator.backup_state()
+            out_cache_loc = allocator.alloc(num_tokens)
+            logger.warning(
+                "extend allocation of %d tokens failed with %d tokens already "
+                "freed but still staged in the allocator's batching group; "
+                "applying them %s. This is #681's third root: an eviction "
+                "inside a free-group window counts tokens the pool cannot yet "
+                "hand out.",
+                num_tokens,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
+
+    if out_cache_loc is None:
         freed = _attempt_extend_relief(num_tokens)
         if freed > 0:
             out_cache_loc = allocator.alloc(num_tokens)
@@ -1375,9 +1440,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert tree_cache.supports_mamba(), (
-            "Only MambaRadixCache allow freeing before alloc"
-        )
+        assert (
+            tree_cache.supports_mamba()
+        ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -1426,9 +1491,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert start_p == end_p, (
-            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
-        )
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -1442,9 +1507,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert req.mamba_pool_idx is not None, (
-            "mamba state is freed while the tree cache does not manage mamba states"
-        )
+        assert (
+            req.mamba_pool_idx is not None
+        ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
