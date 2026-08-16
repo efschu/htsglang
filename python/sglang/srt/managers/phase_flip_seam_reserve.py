@@ -1027,6 +1027,18 @@ def seam_adjusted_budget_bytes(
     if floor_allowed is None:
         # No free column on record (cold, no cell, or a pre-#678 record): fall
         # back to the subtrahend, which is the previous arithmetic exactly.
+        #
+        # SAID OUT LOUD, because "which path sized this pool" is the first
+        # question any acceptance of #678 has to answer and reconstructing it
+        # from the pool number alone is an investigation. One line, one grep.
+        logger.info(
+            "%s ARMING FLOOR APPROXIMATED (no at-rest free column on record: "
+            "%s): the pool is sized by the budget subtrahend, the pre-#678 "
+            "arithmetic. A boot that WROTE a column at rest makes the next one "
+            "solve instead.",
+            LOG_PREFIX,
+            reserve.provenance,
+        )
         charge = arming_floor_subtrahend_bytes(
             arming_floor_bytes, seam_solve_reserved_free_bytes(reserve)
         )
@@ -1045,6 +1057,19 @@ def seam_adjusted_budget_bytes(
         cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
     )
     allowed = min(int(seam_allowed), int(floor_allowed))
+    logger.info(
+        "%s ARMING FLOOR SOLVED from the at-rest free column: %d MiB free at "
+        "an id space of %d -> this rank permits %d tokens; the seam solve "
+        "permits %d; the binding one is %s at %d tokens. No budget subtrahend "
+        "was applied -- the constraint is an equality, not an adjustment.",
+        LOG_PREFIX,
+        int(reserve.free_at_measure_bytes) >> 20,
+        int(reserve.id_space),
+        int(floor_allowed),
+        int(seam_allowed),
+        "the FLOOR" if floor_allowed <= seam_allowed else "the SEAM",
+        allowed,
+    )
     return min(budget, allowed * int(cell_bytes)), allowed
 
 
