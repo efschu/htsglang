@@ -2499,3 +2499,77 @@ def tp_phase_pool(total_attn_layers: int, n_ranks: int, model: PhasePoolModel) -
         / float(n_ranks)
     )
     return sum(float(f) / per_token for f in model.free_mib)
+
+
+# --- Converged from feat/704-prefill-ladder (Slot-3), verbatim, so the KV
+# --- cell has ONE implementation rather than two that must agree.
+# ---------------------------------------------------------------------------
+
+_KV_DTYPE_WIDTH_BYTES = {
+    "fp8_e4m3": 1,
+    "fp8_e5m2": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "int8": 1,
+    "bf16": 2,
+    "bfloat16": 2,
+    "fp16": 2,
+    "float16": 2,
+    "half": 2,
+    "fp32": 4,
+    "float32": 4,
+    "auto": None,  # resolved from the model dtype by the caller, never guessed
+}
+
+
+def kv_dtype_width_bytes(kv_cache_dtype: str) -> int:
+    """Byte width of one KV element. Unknown names are refused, not defaulted.
+
+    A wrong default here is a silent 2x on every pool number, so there is no
+    fallback: an unrecognised dtype raises.
+    """
+    key = str(kv_cache_dtype).strip().lower().removeprefix("torch.")
+    width = _KV_DTYPE_WIDTH_BYTES.get(key)
+    if width is None:
+        if key == "auto":
+            raise ValueError(
+                "kv_cache_dtype='auto' does not name a width: resolve it to the "
+                "model's own dtype before pricing a pool."
+            )
+        raise ValueError(
+            f"unknown kv_cache_dtype {kv_cache_dtype!r}; refusing to guess a "
+            f"width. Known: {sorted(k for k in _KV_DTYPE_WIDTH_BYTES if k != 'auto')}"
+        )
+    return int(width)
+
+
+def kv_mib_per_token_per_attn_layer_from_config(
+    config: Dict,
+    kv_cache_dtype: str,
+    num_hidden_layers: Optional[int] = None,
+) -> float:
+    """The per-token KV cell for ONE full-attention layer, from config alone.
+
+    ``2 x num_key_value_heads x head_dim x dtype_width``. ``head_dim`` falls
+    back to ``hidden_size / num_attention_heads`` only when the checkpoint does
+    not state it, which is the same resolution order the model itself uses.
+    """
+    cfg = config.get("text_config") or config
+    kv_heads = cfg.get("num_key_value_heads") or cfg.get("num_attention_heads")
+    if not kv_heads:
+        raise ValueError(
+            "config states neither num_key_value_heads nor num_attention_heads; "
+            "the KV cell cannot be derived and must not be fitted."
+        )
+    head_dim = cfg.get("head_dim")
+    if not head_dim:
+        hidden = cfg.get("hidden_size")
+        heads = cfg.get("num_attention_heads")
+        if not hidden or not heads:
+            raise ValueError(
+                "config states no head_dim and no hidden_size/num_attention_heads "
+                "to derive one from; refusing to fit the KV cell."
+            )
+        head_dim = float(hidden) / float(heads)
+    width = kv_dtype_width_bytes(kv_cache_dtype)
+    return 2.0 * float(kv_heads) * float(head_dim) * float(width) / (1024.0 * 1024.0)

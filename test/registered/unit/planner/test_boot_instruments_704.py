@@ -50,9 +50,9 @@ INCUMBENT = (
         mamba_allocated_mib=1.05 * 1024,
         gguf_scratch_mib=0.0,
         rest_mib=14.472 * 1024,
-        available_bytes=436766 * 7 * 2048,
+        available_bytes=8526565376,
         cell_size_bytes=7 * 2048,
-        max_total_num_tokens=436766,
+        max_total_num_tokens=594766,
         arming_floor_mib=1728.0,
         attn_layers=7,
         gdn_layers=21,
@@ -65,9 +65,9 @@ INCUMBENT = (
         mamba_allocated_mib=0.75 * 1024,
         gguf_scratch_mib=0.0,
         rest_mib=7.894 * 1024,
-        available_bytes=436766 * 5 * 2048,
+        available_bytes=4741928960,
         cell_size_bytes=5 * 2048,
-        max_total_num_tokens=436766,
+        max_total_num_tokens=463079,
         arming_floor_mib=1825.0,
         attn_layers=5,
         gdn_layers=15,
@@ -80,9 +80,9 @@ INCUMBENT = (
         mamba_allocated_mib=0.60 * 1024,
         gguf_scratch_mib=0.0,
         rest_mib=8.375 * 1024,
-        available_bytes=436766 * 4 * 2048,
+        available_bytes=3575365632,
         cell_size_bytes=4 * 2048,
-        max_total_num_tokens=436766,
+        max_total_num_tokens=436446,
         arming_floor_mib=2467.0,
         attn_layers=4,
         gdn_layers=12,
@@ -108,20 +108,28 @@ def test_tokens_equal_available_bytes_over_cell_size():
 
 
 def test_the_reserve_is_recovered_not_modelled():
-    """The term no config can predict: 2.3x spread across three stages."""
+    """The term no config can predict: 1.88x spread across three stages."""
     reserves = [recover_reserve_mib(i) for i in INCUMBENT]
-    assert reserves[0] == pytest.approx(8848.0, rel=0.02)
-    assert reserves[1] == pytest.approx(3818.0, rel=0.02)
-    assert reserves[2] == pytest.approx(5164.0, rel=0.02)
-    assert max(reserves) / min(reserves) > 2.0
+    assert reserves[0] == pytest.approx(6.531 * 1024, rel=0.02)
+    assert reserves[1] == pytest.approx(3.478 * 1024, rel=0.02)
+    assert reserves[2] == pytest.approx(5.045 * 1024, rel=0.02)
+    assert max(reserves) / min(reserves) == pytest.approx(1.88, abs=0.05)
 
 
-def test_the_mamba_post_is_not_the_allocation():
-    """Feeding the solve from the post would bake in ~150 MiB/rank optimism."""
+def test_the_post_measures_less_than_a_subset_of_what_it_covers():
+    """The gap is real; its DECOMPOSITION is not established.
+
+    The post is "mamba state pool + speculative intermediate state + prefill
+    activation reserve"; the allocated line sums conv + ssm + intermediate_ssm
+    + intermediate_conv. The post nominally covers a SUPERSET and is
+    nevertheless smaller -- which cannot be legitimate -- but the 0.852 ratio
+    is a ratio of non-identical quantities and must NOT be published as "the
+    mamba post under-charges mamba by 14.8 percent".
+    """
     for inst in INCUMBENT:
         assert inst.mamba_post_mib < inst.mamba_allocated_mib
-        ratio = inst.mamba_post_mib / inst.mamba_allocated_mib
-        assert ratio == pytest.approx(0.852, abs=0.01)
+        gap = inst.mamba_allocated_mib - inst.mamba_post_mib
+        assert gap > 80.0  # MiB, on every stage
 
 
 def test_the_allocation_is_the_term_the_solver_uses():
@@ -132,8 +140,8 @@ def test_the_allocation_is_the_term_the_solver_uses():
 def test_world_pool_is_the_min_over_ranks_and_reproduces_the_boot():
     """Retro-prediction of the incumbent, from instruments alone."""
     pool, binder = world_pool_tokens(INCUMBENT)
-    assert pool == 436766
-    assert binder in (0, 1, 2)
+    assert pool == 436446
+    assert binder == 2  # PP2, as the boot reports
 
 
 def test_predicting_an_unbooted_cut_without_its_reserve_is_refused():
@@ -149,9 +157,9 @@ def test_predicting_with_a_supplied_reserve_is_arithmetic_only():
 
     # The measured PP2 stage, so it must land back on the boot.
     tokens = predict_tokens_for_cut(
-        attn_layers=4, rest_mib=8.375 * 1024, reserve_mib=5163.8
+        attn_layers=4, rest_mib=8.375 * 1024, reserve_mib=5.045 * 1024
     )
-    assert tokens == pytest.approx(436766, rel=5e-3)
+    assert tokens == pytest.approx(436446, rel=5e-3)
 
 
 def test_the_arming_floor_is_inside_the_reserve_not_a_second_subtraction():

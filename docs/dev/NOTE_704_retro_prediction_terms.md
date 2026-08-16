@@ -160,3 +160,40 @@ approximations, but naming it needs a read of that function rather than more
 arithmetic from outside — the same discipline that produced this resolution.
 Recorded as the open sub-item; it does not block the gate, because the gate
 now consumes the allocation.
+
+---
+
+## 8 — CORRECTION to §7: the 0.852 is not a "mamba under-charge"
+
+F4-r4 challenged the §7 framing and he is right. The two quantities I divided
+are **not the same thing**:
+
+* the budget POST is labelled *"mamba state pool + speculative intermediate
+  state + prefill activation reserve"* -- THREE terms;
+* the `"Mamba Cache is allocated"` line sums `conv + ssm + intermediate_ssm +
+  intermediate_conv` -- the mamba pool and the speculative intermediate, but no
+  activation reserve.
+
+So `post / allocated = 0.852` is a ratio of non-identical quantities, and §7's
+conclusion "the mamba post under-charges the mamba allocation by 14.8 %" is
+**not established**. Withdrawn as stated.
+
+What survives, and is if anything stronger: the post nominally covers a
+SUPERSET of the allocated line (it adds the prefill activation reserve) and is
+nevertheless **smaller** than it, by 0.155 / 0.111 / 0.089 GiB on PP0/PP1/PP2.
+A term that covers more cannot legitimately measure less, so a real accounting
+gap exists and is **at least** that size -- larger by whatever the activation
+reserve is worth. What is not established is which of the three sub-terms
+carries it.
+
+Consequences, unchanged in direction:
+
+* the solver must still charge the ALLOCATION, not the post. Feeding it the
+  post under-funds by at least 89-155 MiB/rank, whatever the decomposition.
+* resolving the decomposition needs the post's three sub-terms emitted
+  separately, exactly as the budget posts themselves had to be. That is the
+  same fix a third time, and it is the honest next instrument rather than more
+  arithmetic on lumped numbers.
+
+§3's derivation is untouched by this: 50.85 MiB/GDN-layer was validated against
+the ALLOCATED line (51.20 measured), not against the post.

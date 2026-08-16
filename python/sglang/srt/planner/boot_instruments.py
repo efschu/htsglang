@@ -11,9 +11,10 @@ The four instrumented terms:
    profiler's success path. Before this existed the sizer named every term of
    its own budget only when it FAILED.
 2. **mamba ALLOCATED** -- ``"Mamba Cache is allocated. ..."``, which already
-   existed and is the truth. The mamba budget POST under-charges it by a
-   constant 0.852 on every rank, so the two are kept as separate fields and the
-   solver is explicit about which it uses and why.
+   existed and is what the allocator actually took. The budget POST covers a
+   nominal SUPERSET of it (it adds a prefill activation reserve) yet measures
+   0.089-0.155 GiB LESS, which cannot be legitimate; the two are kept as
+   separate fields and the solver is explicit about which it uses and why.
 3. **available_bytes / cell_size / tokens** -- ``"KV pool sizing: ..."``, the
    last link.
 4. **per-layout arming floor** -- the #676 solver. Note it is NOT a separate
@@ -59,8 +60,16 @@ class RankInstruments:
     def mamba_charge_mib(self) -> float:
         """What the solver charges for mamba: the ALLOCATION, not the post.
 
-        The post under-charges by a constant 0.852 across every rank, so a
-        solve fed from posts carries ~150 MiB/rank of systematic optimism.
+        The post is labelled "mamba state pool + speculative intermediate state
+        + prefill activation reserve" while the allocated line sums conv + ssm +
+        intermediate_ssm + intermediate_conv -- so the post nominally covers a
+        SUPERSET and is nevertheless SMALLER, by 0.155 / 0.111 / 0.089 GiB on
+        the three stages. A term covering more cannot legitimately measure less,
+        so the gap is real and at least that size; which sub-term carries it is
+        unresolved until the post's three components are emitted separately.
+
+        Charging the allocation is correct whatever the decomposition turns out
+        to be, because it is the number the allocator actually took.
         """
         return float(self.mamba_allocated_mib)
 
@@ -98,7 +107,7 @@ def recover_reserve_mib(inst: RankInstruments) -> float:
     """The per-rank reserve, recovered from two emitted numbers.
 
     ``rest - available_bytes``. This is the term no config predicts: on the
-    live [28,20,16] boot it is 8,848 / 3,818 / 5,164 MiB, a 2.3x spread,
+    live [28,20,16] boot it is 6,688 / 3,561 / 5,166 MiB, a 1.88x spread,
     because it tracks per-rank CUDA-graph capture. It CONTAINS the arming
     floor.
     """
@@ -139,7 +148,7 @@ def predict_tokens_for_cut(
         raise ValueError(
             "no reserve supplied for this layout. The per-rank reserve tracks "
             "CUDA-graph capture and does not transfer between cuts (measured "
-            "spread 3,818-8,848 MiB on one boot), so it cannot be defaulted or "
+            "spread 3,561-6,688 MiB on one boot), so it cannot be defaulted or "
             "carried over. Supply the reserve emitted by a boot of THIS layout, "
             "or label the result an extrapolation."
         )
