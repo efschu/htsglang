@@ -2956,28 +2956,70 @@ class Scheduler(
             tree = getattr(self, "tree_cache", None)
             if tree is None:
                 return
-            from sglang.srt.mem_cache.common import evict_from_tree_cache
+            from sglang.srt.mem_cache.common import (
+                evict_from_tree_cache,
+                uniform_avail_for_evict,
+            )
 
             want = int(
                 getattr(self.server_args, "chunked_prefill_size", 0) or 0
             ) or 512
+
+            # ZERO IS AMBIGUOUS, AND THE FIRST VERSION OF THIS LOG READ IT
+            # WRONG. `evict_from_tree_cache` returns 0 in TWO different states:
+            # it ran and could not reach anything, or it was SKIPPED because
+            # `avail >= num_tokens` already (see its `return 0` tail). Reporting
+            # the alarming reading unconditionally sends the next reader hunting
+            # a phantom locked chain -- which is the counter-vs-actuator mistake
+            # this whole routine exists to catch, committed by the instrument
+            # itself. Measure `avail` on the SAME side of the call the actuator
+            # decides from, so the two zeros are told apart by evidence.
+            avail_before = None
+            try:
+                allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+                if allocator is not None:
+                    avail_before = int(uniform_avail_for_evict(tree, allocator))
+            except Exception:  # noqa: BLE001 - diagnosis must not break relief
+                avail_before = None
+
             freed = int(evict_from_tree_cache(tree, want) or 0)
             rows = self._post_evict_rows()
+
+            if freed > 0:
+                verdict = "The remedy the receipt names has now actually run."
+            elif avail_before is not None and avail_before >= want:
+                # Benign. KV was NOT the binding resource at this instant, so
+                # whatever blocks admission is something else -- mamba/GDN state
+                # slots are the standing candidate on this model, since a
+                # request needs a slot even when KV is plentiful.
+                verdict = (
+                    f"Eviction was SKIPPED, not defeated: {avail_before} rows "
+                    f"were already available against {want} wanted, so the "
+                    f"actuator had nothing to do. KV is therefore NOT the "
+                    f"binding resource here -- look at the state-slot bound "
+                    f"(mamba/GDN slots) before blaming the pool."
+                )
+            else:
+                verdict = (
+                    "Eviction RAN and delivered nothing"
+                    + (
+                        f" ({avail_before} rows available, {want} wanted)"
+                        if avail_before is not None
+                        else ""
+                    )
+                    + " -- the pool is held by something the frontier cannot "
+                    "reach (an in-flight chunked request's protected prefix is "
+                    "the known case). This is the state to escalate, not to "
+                    "retry."
+                )
+
             logger.warning(
                 "PHASE-POLICY BOTH-BLOCKED RELIEF: asked the tree cache for "
                 "%d rows, it freed %d; %d rows now reachable. %s",
                 want,
                 freed,
                 rows,
-                (
-                    "Eviction delivered NOTHING while both layouts are blocked "
-                    "-- the pool is held by something the frontier cannot "
-                    "reach (an in-flight chunked request's protected prefix is "
-                    "the known case). This is the state to escalate, not to "
-                    "retry."
-                    if freed <= 0
-                    else "The remedy the receipt names has now actually run."
-                ),
+                verdict,
             )
         except Exception as exc:  # noqa: BLE001 - relief must never break a round
             logger.warning(
