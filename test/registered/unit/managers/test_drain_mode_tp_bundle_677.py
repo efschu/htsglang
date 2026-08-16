@@ -440,3 +440,71 @@ class TheValveOutranksDrainModeSuppression(unittest.TestCase):
             phase_purity, "_active_phase", lambda s: pp.PHASE_TP
         ):
             self.assertTrue(phase_purity.prefill_blocked_here(sched))
+
+
+class SuppressionNeedsABundleToProtect(unittest.TestCase):
+    """LIVE WEDGE #4, 2026-08-16 08:03, and again my own fix caused it.
+
+    An 18-token request hung for two minutes with GPU at 0% while the policy
+    logged, every ten seconds:
+
+        holding in tp: pending prefill 18 tok <= N=7004, running it in tp
+        (pending prefill 18 tok, running bs 0)
+
+    THE POLICY WAS RIGHT AND THE SUPPRESSION OVERRODE IT. Below the break-even
+    N a flip costs more than it saves, so the policy deliberately keeps the
+    work in TP and arms no flip. The purity valve cannot rescue that: the flip
+    is not FAILING, it was never asked for, so `flip_unavailable` is false and
+    suppression held a request that nothing was ever going to run.
+
+    THE 4-CARRIER PROOFS HID IT. A 25625-token prompt sits far above N=7004,
+    so it goes to PP and prefills there; every metal run so far used long
+    prompts. Short requests -- the common case on this box -- could not be
+    served at all.
+
+    THE RULE. Drain mode exists to stop a TP window admitting the work it was
+    entered to escape, and that window is defined by a decode bundle in
+    flight. With `running_bs == 0` the bundle is finished, there is nothing to
+    drain, and the only thing suppression can still do is idle the instance.
+    """
+
+    def test_a_running_bundle_is_still_protected(self):
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=4)
+        )
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=1)
+        )
+
+    def test_an_empty_bundle_suppresses_nothing(self):
+        """THE WEDGE."""
+        self.assertFalse(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=0)
+        )
+
+    def test_an_unmeasured_bundle_is_not_read_as_empty(self):
+        """-1 means the caller did not measure it. An unmeasured input must
+        never become a licence -- that is how the drain contract would quietly
+        stop applying wherever a call site forgot to pass the count."""
+        self.assertTrue(
+            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=-1)
+        )
+
+    def test_the_scheduler_passes_the_count(self):
+        """THE CALL SITE, for the fourth time in this file. A condition the
+        hook is never told about is a condition that never fires."""
+        import inspect as _inspect
+
+        from sglang.srt.managers import scheduler as _sched
+
+        src = _inspect.getsource(_sched.Scheduler.get_next_batch_to_run)
+        self.assertIn("phase_prefill_blocked_here(", src)
+        self.assertIn("running_bs=", src)
+
+    def test_the_hook_forwards_it(self):
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_purity
+
+        src = _inspect.getsource(phase_purity.prefill_blocked_here)
+        self.assertIn("running_bs=running_bs", src)

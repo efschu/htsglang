@@ -528,7 +528,10 @@ def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
 
 
 def prefill_suppressed_in_tp(
-    cfg: "PhasePolicyConfig", phase: str, flip_unavailable: bool = False
+    cfg: "PhasePolicyConfig",
+    phase: str,
+    flip_unavailable: bool = False,
+    running_bs: int = -1,
 ) -> bool:
     """#677 hot fix 2: may prefill be admitted while the TP layout is up?
 
@@ -586,6 +589,27 @@ def prefill_suppressed_in_tp(
     if not bool(cfg.drain_mode) or phase != PHASE_TP:
         return False
     if flip_unavailable:
+        return False
+    # AND THERE MUST BE A BUNDLE TO PROTECT. Measured 2026-08-16 08:03 on my
+    # own fix: an 18-token request hung for two minutes with `running bs 0`
+    # and GPU at 0%, while the policy logged "pending prefill 18 tok <= N=7004,
+    # running it in tp".
+    #
+    # THE POLICY WAS RIGHT AND THE SUPPRESSION OVERRODE IT. Below the
+    # break-even N a flip costs more than it saves, so the policy deliberately
+    # keeps the work in TP and arms nothing. The valve cannot help: the flip
+    # is not FAILING, it simply was not asked for -- so `flip_unavailable` is
+    # false and suppression held a request that nothing was ever going to run.
+    # Long prompts hid it, because 25625 tokens sit above N and go to PP.
+    #
+    # Drain mode exists to stop a TP window admitting the work it was entered
+    # to escape -- that window is defined by a decode bundle in flight. With
+    # `running_bs == 0` the bundle is finished, there is nothing to drain, and
+    # the only thing suppression can still do is idle the instance.
+    #
+    # -1 means the caller did not measure it, which must not be read as "no
+    # bundle": an unmeasured input never becomes a licence.
+    if int(running_bs) == 0:
         return False
     return True
 
