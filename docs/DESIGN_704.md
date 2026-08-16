@@ -953,11 +953,15 @@ same 385.5 MiB against a 320 ms serial chunk is:
 | 6,000 MiB/s | 64.2 ms | +20.1% |
 | **3,000 MiB/s** (rank0 PCIe x4 class) | **128.5 ms** | **+40.2%** |
 
-So on this rig it is **+40% raw**, not +10-20%. The overlap argument is
-unchanged — there are 48 GDN layers of compute to hide behind — but the
-quantity to hide is twice what the plan assumed, and whether it actually hides
-depends on real stream concurrency. Slice 3 measures the pair matrix before
-this is priced as acceptable.
+So on this rig it is **+40% raw**, not +10-20%.
+
+> **Corrected (§4.2e).** This paragraph originally continued "the overlap
+> argument is unchanged — there are 48 GDN layers of compute to hide behind".
+> That is **wrong**, and it was wrong in the canonical plan's phrasing too. The
+> GDN layers that follow an attention layer are *sequentially downstream of the
+> very collective they were supposed to hide*: layer L+1 consumes layer L's
+> attention output, so it cannot start until L's gather completes. See §4.2e
+> for what actually hides and what does not.
 
 **A third term, which the plan omits and which the coupled layout does not
 pay: KV placement.** Under decoupling the two ownership axes are orthogonal — a
@@ -983,6 +987,56 @@ receives a full Q block and returns a full-size partial output plus LSE,
 aggressively to save bandwidth" does not work. The only levers are the number
 of remote participants and chunk size relative to compute. Pinned by
 `test_collective_traffic_is_independent_of_how_much_kv_is_remote`.
+
+### 4.2e The overlap schedule — what hides, what does not, and what the fix is worth
+
+Landed as `planner/overlap_schedule.py`, 10 hermetic tests. This is the
+mitigation priced before a window, per *Machbarkeit vor Messung*.
+
+"Overlappable behind GDN/FFN compute" is two claims, and they have opposite
+answers:
+
+| term | per attention layer | on the critical path? | hides behind the 3 following GDN layers? |
+|---|---|---|---|
+| Q-broadcast + partial gather + LSE merge | 24.09 MiB | **yes** | **no** |
+| KV placement write | 1.00 MiB (× `1 − share`) | no | **yes, entirely** |
+
+**Placement hides completely and stays hidden at every rung.** It is a write no
+later layer in the chunk reads, so the ~37 ms of GDN compute following each
+attention layer on rank0 absorbs its ~0.3 ms without effort.
+
+**The gather does not hide at all within a chunk.** Layer L+1 consumes layer
+L's attention output, so the compute that was supposed to hide L's gather
+cannot begin until that gather has finished. With today's machinery the exposed
+time *is* the gather time — not a fraction of it, all of it.
+
+The only thing that hides the dominant term is **cross-chunk pipelining**:
+overlapping chunk *c*'s gather with chunk *c+1*'s compute inside the same
+stage, bounded by that stage's own per-chunk compute. It does not exist today.
+What building it would buy, worst-rank exposed collective time per chunk:
+
+| cut | link (rank0) | exposed today | exposed with pipelining |
+|---|---|---|---|
+| `[28,20,16]` | x4 class (3,000 MiB/s) | **56.2 ms** | **7.0 ms** |
+| `[28,20,16]` | x8 class (6,000) | 28.1 ms | 0.0 ms |
+| `[44,10,10]` | x4 class | **88.3 ms** | **11.0 ms** |
+| `[44,10,10]` | x8 class | 44.2 ms | 0.0 ms |
+
+So the mitigation is worth roughly **8x** on the worst rank, and a link one
+class faster removes the exposure outright — the problem is bandwidth *and*
+scheduling, and either lever alone suffices at the incumbent.
+
+**rank0 is the worst stage under triple jeopardy**, and the three disadvantages
+coincide rather than cancel: it carries the most attention layers, it has the
+least compute to hide behind (it is the fast card), and it sits on the slowest
+link. Deepening the cut worsens both sides at once — more attention layers onto
+exactly that rank.
+
+Self-labelled: the link figures are **placeholders** pending the pair-matrix
+probe, and stage compute away from the incumbent is **extrapolated** with
+`fixed_ms = 0`, which is the optimistic end for hiding (a real fixed per-stage
+cost would mean less compute at deep cuts, hence less to hide behind). Every
+"hidden" verdict above is therefore an upper bound on how much hides.
 
 ### 4.2b The prize and the purpose contradict — quantified
 
