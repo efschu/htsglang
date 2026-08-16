@@ -5258,7 +5258,16 @@ class PhaseFlipRuntime:
             f"allocator cache {q(lambda: cached)} (reclaimable)",
             f"staging reserve kept free {q(lambda: self._staging_reserve_bytes)}",
             f"seam fixed {q(lambda: res.fixed_bytes)}",
-            f"INACTIVE-LAYOUT ARENA {q(lambda: res.arena_fixed_bytes)}",
+            # NOT "the inactive layout's weights held on this card". This is
+            # reserve.arena_fixed_bytes: the tp_to_pp leg's FUTURE commit cost,
+            # priced into staging, and ZERO on pp_to_tp. Measured per rank:
+            # rank1 arena_fixed 815 with pp_to_tp tail 0 / tp_to_pp tail 815;
+            # rank2 1456 with 0 / 1456; rank0 0 / 0 / 0. The old label read as
+            # reclaimable memory and sent a design note down a dead end -- rung
+            # 3 has already released the real tail by then (receipts: "rung 3
+            # released 1410.0 MiB ... TP layout needs 8977.8 of 10434.0").
+            f"tp_to_pp ARENA COMMIT DUE (0 on this leg if pp_to_tp) "
+            f"{q(lambda: res.arena_fixed_bytes)}",
             f"reserve active={getattr(res, 'active', '?')}",
             f"corridor floor {q(lambda: guard.floor_bytes)}",
         ]
@@ -5279,10 +5288,11 @@ class PhaseFlipRuntime:
         except Exception:  # noqa: BLE001
             parts.append("headroom over corridor floor ?")
         return (
-            "STAGING BUDGET CENSUS (MiB) -- " + ", ".join(parts) + ". The arena "
-            "term is the inactive layout's weights held on THIS card; it is "
-            "fixed-size and payload-invariant, so it is the one occupant that "
-            "does not shrink when the live set does."
+            "STAGING BUDGET CENSUS (MiB) -- " + ", ".join(parts) + ". The "
+            "arena term is a SCHEDULED COMMIT for the tp_to_pp leg, not memory "
+            "held idle now and not reclaimable here: rung 3 releases the real "
+            "tail immediately after each refill, so at a pp_to_tp gate the "
+            "arena is already committed exactly to the active PP layout."
         )
 
     def _kv_rung_verdict(self) -> str:
