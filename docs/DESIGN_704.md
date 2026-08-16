@@ -1084,6 +1084,89 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #701 — THE CHUNKED-PREFILL SELF-DEADLOCK
+
+A chunked request's own committed prefix fills the pool its own next chunk must
+allocate from, and it cannot evict itself to make room. Modelled by
+`planner/chunked_deadlock.py`, 12 hermetic tests. **No build without GO — the
+recommended fix touches admission policy.**
+
+### (a) Reachability, at file:line
+
+1. **Each committed chunk LOCKS its prefix.** `mem_cache/radix_cache.py:546` —
+   `cache_unfinished_req` ends with `self.inc_lock_ref(new_last_node)`. The
+   prefix moves from *evictable* to *protected*.
+2. **The admission budget EXCLUDES protected space.**
+   `managers/schedule_policy.py:809-825` — `rem_total_tokens` is
+   `available_size() + <tree>_evictable_size()`. Nothing protected counts.
+3. **So every chunk shrinks the budget its own successor is checked against.**
+   The request eats its own runway, one locked chunk at a time.
+4. **Eviction cannot recover it.** `radix_cache.py:569-575` — `evict` walks
+   `self.evictable_leaves` only, and the request's own prefix is locked. *The
+   request cannot evict itself to fund itself.*
+
+**The tree already knows.** `schedule_policy.py:993-995` names the behaviour:
+*"the prefill input must transiently fit the device. If not, this is the DEEP
+case (PS2) → reject, today's wedge/wait behaviour"*, and the born-spill
+admission logs that it is admitting a request whose *"full lifetime would
+wedge"*. What was missing is the arithmetic saying exactly when.
+
+**The condition.** With budget `A` at admission and chunk `C`, a request of
+length `L` commits chunks until `A − k·C < C`. So a single request deadlocks
+**iff `L > A`** — and the sharp edge is that **admission is per-chunk while the
+failure is per-total**. Concurrently the condition is on the *sum*: several
+requests each individually admissible deadlock collectively once their locked
+prefixes plus one chunk exceed the pool. No per-request check catches that.
+
+It presents as a hang rather than a reject precisely because the request gets
+*most of the way* first — the falsifier shows it committing ≥ `pool − C` before
+stalling.
+
+### (b) Falsifier
+
+Hermetic, no GPU. Pins: a fitting request completes; `L > pool` self-deadlocks
+after near-complete progress; the threshold is the **pool, not the chunk** (a
+bigger chunk changes granularity, not outcome); and two individually-admissible
+requests deadlock **collectively**.
+
+### (c) Options, priced
+
+| option | stops the wedge | can serve `L > pool` | needs | cost |
+|---|---|---|---|---|
+| **A — admission gate** (refuse unless full `L` fits, and *reserve* it) | yes | **no** | nothing | refuses long prompts; the reservation is held for the request's lifetime, so long-prompt concurrency drops sharply |
+| **B — self-evictable prefix to host** (#703 composes) | yes | **yes** | the host tier | host traffic per spilled token; **useless without host budget** — the falsifier shows it still deadlocking at zero budget, so #703 is a genuine dependency, not a nicety |
+| C — preempt/retract another request | partially | no | existing retract path | victim's work is lost; does not help the single-request case, where the only holder *is* the victim |
+
+A subtlety the model makes explicit: the gate must **reserve** the full length,
+not merely check it. Checking without reserving lets two requests both pass and
+then collide — which is the concurrent shape it exists to stop.
+
+### Recommendation
+
+**Ship A first as a safety property, then B as a capability. They are
+complementary, not alternatives.**
+
+The reasoning is about failure *shape*, not throughput. A wedge is the worst
+available outcome because it is **silent** — #699 established that `/health`
+reports 200 through it and the watchdog is disarmed by the very condition
+(`is_active` = "a batch exists") that defines it. A refusal is loud,
+diagnosable, and attributable to a request. **Converting a silent wedge into a
+noisy refusal is a strict improvement even when the refusal is unwelcome**, and
+option A does that with no new subsystem.
+
+Option A alone is *not* sufficient as an end state: it makes prompts longer than
+the device pool permanently unservable, and on this rig a 327,680-token context
+against a 436,278-token pool leaves no room for a second concurrent long prompt.
+That is why B follows — it is the only option that keeps serving the request,
+and it is exactly what #703's host tier is for.
+
+Option C is named to be dismissed: in the single-request case the only prefix
+holding the pool belongs to the request that needs it, so there is no victim to
+preempt.
+
+**Held for GO.** Option A changes admission policy, so nothing is built until
+the coordinator releases it.
+
 ## #699 — LIVENESS FROM PROGRESS, BECAUSE HEALTH 200 IS BLIND
 
 On 2026-08-16 the server sat wedged for 52+ minutes while `/health` returned
