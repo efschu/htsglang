@@ -528,6 +528,18 @@ class StageCost:
     #: supplied and the gate cannot say which state it describes -- which is
     #: exactly the ambiguity law 31 was written about.
     transient_load_state: Optional[str] = None
+    #: #602: the cut-invariant residency that is ALWAYS resident -- CUDA
+    #: context, NCCL, workspace, graph capture, boot tail. Split out of
+    #: ``transient_mib``, which used to carry their SUM.
+    #:
+    #: WHY THE SPLIT EXISTS. The two are charged by different questions. This
+    #: one is occupied at rest, so the live pool sizer charges it and any
+    #: sizer-equivalent prediction must too. ``transient_mib`` is a PEAK the
+    #: sizer never sees, because in this regime the worst load state is a SEAM
+    #: and the pool is sized before any seam has run. Summed into one field,
+    #: no consumer could charge one without the other, and the pool prediction
+    #: came out 23 % under a measured boot.
+    fixed_overhead_mib: float = 0.0
     #: #602: the draft runner's NET residency on this rank, its own post so a
     #: future mismatch names the term that moved rather than hiding inside
     #: ``transient_mib``. Cut-INVARIANT on this deployment: the draft model's
@@ -546,6 +558,7 @@ class StageCost:
             + self.state_mib
             + self.kv_mib
             + self.transient_mib
+            + self.fixed_overhead_mib
             + self.draft_mib
         )
 
@@ -809,7 +822,10 @@ def _price_stage(
         # alongside weights and KV, so they are charged together here. The
         # transient charged is the WORST measured load state (law 31): a cut
         # that only fits in the gentlest state it will serve does not fit.
-        transient_mib=rank.worst_transient_mib + rank.fixed_overhead_mib,
+        # #602: NOT summed any more. The peak and the at-rest overhead are
+        # charged by different questions; see StageCost.fixed_overhead_mib.
+        transient_mib=rank.worst_transient_mib,
+        fixed_overhead_mib=rank.fixed_overhead_mib,
         transient_load_state=rank.governing_load_state,
         seam_staging_mib=rank.seam_staging_mib,
         draft_mib=float(rank.draft_residency_mib or 0.0),
@@ -2018,3 +2034,151 @@ def seam_slope_bytes_per_token(
         n_attention_total,
         baseline_bytes_per_token,
     )
+
+
+# ---------------------------------------------------------------------------
+# #602: the SIZER-equivalent pool, kept apart from the corridor-safe floor
+# ---------------------------------------------------------------------------
+#
+# TWO QUESTIONS, ~29 % APART ON THIS RIG, AND THEY WERE ONE NUMBER.
+#
+#   world_kv_floor        "the largest pool that stays corridor-safe while a
+#                          cutover is in flight" -- funds the WORST measured
+#                          load transient (law 31).
+#   world_predicted_pool  "the pool the live sizer will actually produce" --
+#                          funds no load transient at all, because the sizer
+#                          runs BEFORE any seam has ever run and therefore
+#                          never sees one.
+#
+# In F4-r4's census regime the worst load state is a SEAM on every rank
+# (SEAM_TP_TO_PP 2168 MiB on rank 0; SEAM_PP_TO_TP 700 / 932 on ranks 1 / 2),
+# two to three times the prefill-triggered scalars. Holding the corridor-safe
+# floor to a measured pool therefore read -23.3 % and a metal arm was correctly
+# refused on it. The defect was the comparison, not a constant.
+#
+# EVERYTHING ELSE STAYS CHARGED BY BOTH. The corridor, the weights, the draft
+# residency, the cut-invariant overhead and the seam RESERVE (which is held at
+# rest, so the sizer does charge it) bind both numbers. Only the load-transient
+# PEAK separates them.
+
+
+def stage_costs(counts: Sequence[int], inputs: PPCutInputs) -> Tuple[StageCost, ...]:
+    """Priced stages for an arbitrary cut -- the incumbent included."""
+    if len(counts) != inputs.pp_size:
+        raise ValueError(
+            f"stage_costs: {len(counts)} counts for {inputs.pp_size} stages."
+        )
+    if sum(int(c) for c in counts) != inputs.n_layers:
+        raise ValueError(
+            f"stage_costs: counts {list(counts)} cover "
+            f"{sum(int(c) for c in counts)} layers, model has {inputs.n_layers}."
+        )
+    pref_attn = _prefix_attention(inputs.layer_families)
+    bounds = _bounds_from_counts(counts)
+    starts = [0] + bounds[:-1]
+    return tuple(
+        _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        for i in range(inputs.pp_size)
+    )
+
+
+def stage_pool_capacity(inputs: PPCutInputs, cost: StageCost) -> Optional[float]:
+    """Tokens the SIZER would give this stage: the corridor-safe capacity with
+    the worst-load transient added back.
+
+    ``stage_kv_capacity`` subtracts that peak; the sizer never does. Adding it
+    back here -- rather than re-deriving the whole spendable pot -- keeps the
+    two functions provably one term apart, which is the property the tests
+    pin.
+    """
+    safe = stage_kv_capacity(inputs, cost)
+    if safe is None:
+        return None
+    arena = float(inputs.arena_tokens)
+    if arena <= 0.0 or cost.kv_mib <= 0.0:
+        return None
+    return safe + float(cost.transient_mib) * arena / cost.kv_mib
+
+
+def stage_pool_capacities(
+    counts: Sequence[int], inputs: PPCutInputs
+) -> Tuple[Optional[float], ...]:
+    return tuple(
+        stage_pool_capacity(inputs, cost) for cost in stage_costs(counts, inputs)
+    )
+
+
+def world_predicted_pool(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r`` of the sizer-equivalent capacity -- the number a MEASURED pool
+    may be compared against.
+
+    This is the only output of this module that belongs in a gate against a
+    boot's ``max_total_num_tokens``. ``world_kv_floor`` answers a corridor
+    question and will read far below a measured pool wherever the worst load
+    state is a seam; that is not an error in either number.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    best = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_pool_capacity(inputs, cost)
+        if cap is None:
+            return None
+        best = min(best, cap)
+    return None if best is math.inf else best
+
+
+def world_corridor_safe_floor(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r`` of the corridor-safe capacity -- the SCORING counterpart of
+    :func:`world_predicted_pool`, gated identically so the two can be compared.
+
+    NOT the same function as :func:`world_kv_floor`, and the difference is the
+    reason this exists. ``world_kv_floor`` additionally refuses a stage whose
+    ``runnable_headroom_mib`` is negative AT THE INPUT ARENA, which is correct
+    for the solver -- a cut that does not fit the arena being searched is not a
+    candidate -- and wrong for scoring an incumbent: a MEASURED arena is
+    already full by construction, so headroom sits at ~0 and any model error
+    of either sign flips it to "infeasible" and the capacity, which is
+    perfectly well defined and smaller, cannot be reported at all.
+
+    So the solver keeps its gate and scoring gets a function without it. The
+    only term separating this from ``world_predicted_pool`` is then the
+    worst-load transient, which is exactly the property the tests pin.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    best = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_kv_capacity(inputs, cost)
+        if cap is None:
+            return None
+        best = min(best, cap)
+    return None if best is math.inf else best
