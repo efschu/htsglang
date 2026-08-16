@@ -35,8 +35,18 @@ could not be replaced.
 
 WHAT THIS MODULE DOES, AND WHAT IT DELIBERATELY DOES NOT
 --------------------------------------------------------
-It moves such a request out of ``running_batch`` and into a parked set that
-``running_bs`` does not include. That is the entire change: ARITHMETIC.
+It NAMES such a request as parked and subtracts it from the number the
+concurrency cap is compared against. That is the entire change: ARITHMETIC.
+
+The carrier does not leave ``running_batch``. An earlier draft of this
+module said it did, and moving it would have been the whole risk: every
+consumer that enumerates resident requests -- ``_live_reqs`` (whose omission
+leaves a carrier's freshest KV behind at the reshard, silently wrong
+context), ``orphan_resident_reqs``, the draft bootstrap's
+``_reachable_batches``, ``idle_blockers``, ``abort_request`` -- would each
+have needed teaching, and each is a separate chance to be silently wrong.
+Leaving the request exactly where every one of them already looks is what
+makes this change a counting change and nothing else.
 
 Nothing moves. The carrier keeps its GDN slot and its KV -- which is exactly
 the KV that would have been resident anyway -- and its ``req_to_token`` row.
@@ -59,12 +69,36 @@ Neither of these is a tunable, and phase 1 RAISES NOTHING:
     tasks making survivable. An early named refusal is the same verdict
     delivered where it can still be scheduled around.
 
-``running_bs <= max_running``
-    At all times, TP included. At TP entry the parked set re-admits in
-    capture-set-sized batches and the remainder stays parked, re-admitting as
-    decodes complete. Every pool therefore stays inside the dimensioning it
-    was built for; this module never lets more decode run at once than the
-    capture set and the pools were sized for.
+CORRECTED WHEN WIRED (2026-08-16). The unwired core claimed a second bound,
+``running_bs <= max_running`` at all times including TP, to be held by
+re-admitting in capture-set-sized batches. THE SHIPPED WIRING DOES NOT HOLD
+THAT BOUND, and says so rather than leaving the claim standing:
+
+    At TP entry every carrier decodes, so the decode batch is the whole
+    parked bundle -- up to ``slot_pool`` requests, not ``max_running``.
+
+Holding the tighter bound would have required SPLITTING a resident batch,
+and no split primitive exists: ``filter_batch`` drops requests and
+``merge_batch`` joins them. Building one means surgery in the
+``running_batch = last_batch`` aliasing path that already produced #631
+defects J.1 and J.3, defect M, and the 2026-08-09 self-merge that doubled a
+batch 2^23 -> 2^25 and killed all three ranks. Phase 1 exists precisely to
+avoid new movement surface, so it declines to open that one for a bound the
+pools do not actually need:
+
+  * the mamba/GDN pool IS ``slot_pool`` (12 here) and is the bound this
+    module enforces, so the decode batch can never exceed the state pool;
+  * the decode CUDA graph is captured for batch sizes up to 24 on this
+    recipe, so a 12-wide bundle is inside the capture set, not outside it;
+  * a parked carrier already holds its KV whether or not it is stepping,
+    so widening concurrency from 4 to 12 adds only the OUTPUT tokens --
+    on the measured 4x25625 shape roughly 1300 KV rows, not a bundle's.
+
+``max_running`` therefore survives here only as what it always was, the
+CONCURRENCY CAP that :meth:`carrier_discount` stops charging to carriers
+that cannot decode. If a future recipe puts ``slot_pool`` above the decode
+capture set, THIS is the paragraph that is falsified and the split has to
+be built.
 
 THE ONE BOOKKEEPING EDGE, stated because it is the thing to get wrong: a
 parked request is still RESIDENT. It holds KV and a ``req_to_token`` row, so
@@ -86,7 +120,7 @@ arithmetic over ids, testable on CPU with no CUDA present.
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -159,21 +193,104 @@ class ParkedDecodeSet:
         ``max_running`` and it governs re-admission, not admission. What
         governs admission is the slot pool, because every admitted request
         will eventually need a slot and a parked one is already holding its.
+
+        ``running_bs`` IS THE WHOLE RESIDENT SET, PARKED INCLUDED. A parked
+        carrier never leaves ``running_batch`` (see the module header's
+        "nothing moves"), so it is already inside the number the scheduler
+        passes here. Subtracting :attr:`_ids` as well would charge every
+        parked carrier to the pool TWICE and refuse admission at half the
+        real capacity -- which is the same class of miscount this module
+        exists to remove, only pointing the other way.
         """
         if not self.enabled:
-            # Byte-identical to the pre-change gate: the caller's own
-            # `limit - running_bs` still decides, and this adds nothing.
-            return max(0, min(int(requested), self.max_running - int(running_bs)))
-        free_slots = self.slot_pool - len(self._ids) - int(running_bs)
+            # INERT, and it must be the identity rather than "the same bound
+            # by another route". The scheduler applies this as ONE MORE min()
+            # on top of the gate it already had, so anything but `requested`
+            # here would TIGHTEN the disabled path -- the one path whose whole
+            # purpose is to be the pre-change behaviour byte for byte.
+            return int(requested)
+        free_slots = self.slot_pool - int(running_bs)
         head = max(0, min(int(requested), free_slots))
         if head <= 0:
             self.last_refusal = (
-                f"{LOG_PREFIX} refused early: {len(self._ids)} parked + "
-                f"{int(running_bs)} running fills the GDN slot pool of "
+                f"{LOG_PREFIX} refused early: {len(self._ids)} parked of "
+                f"{int(running_bs)} resident fills the GDN slot pool of "
                 f"{self.slot_pool}; admitting would only be refused later by "
                 f"alloc_req_slots. Binding bound: slot pool"
             )
         return head
+
+    def carrier_discount(self) -> int:
+        """Resident requests the CONCURRENCY CAP must stop counting.
+
+        This is the whole of phase 1. ``max_running_requests`` bounds how
+        much decode may run AT ONCE; a carrier the phase forbids to decode
+        is not running anything, so charging it to that cap reserves
+        concurrency nobody can spend. At 2026-08-16 06:04 four such
+        carriers held the entire cap of four and 403779 tokens of prefill
+        could not be admitted behind them.
+
+        Zero when parking is disabled, which is what makes the disabled
+        path byte-identical to the gate this replaces.
+        """
+        return len(self._ids) if self.enabled else 0
+
+    def sync_carriers(self, rids: Sequence[str], running_bs: int) -> None:
+        """Reconcile the parked set with what the phase currently forbids.
+
+        LEVEL-TRIGGERED, NOT EDGE-TRIGGERED, and that is a durability
+        argument rather than a style choice. The scheduler evaluates the
+        purity predicate once per round and only on rounds that reach the
+        decode branch; an edge-triggered park would have to observe every
+        arrival and every completion to stay true, and any missed edge
+        leaves the discount permanently wrong in one direction. Restating
+        the whole set from the resident ids cannot drift: a carrier that
+        finished, aborted or was retracted is simply absent from ``rids``
+        on the next reconcile and leaves the set with it.
+
+        Passing an empty ``rids`` is how the caller says "this phase
+        decodes" -- every carrier is released and the cap counts the full
+        resident set again, exactly as it did before this module existed.
+        """
+        if not self.enabled:
+            return
+        want = [str(r) for r in rids]
+        seen = set()
+        deduped: List[str] = []
+        for rid in want:
+            if rid in seen:
+                continue
+            seen.add(rid)
+            deduped.append(rid)
+        current = list(self._ids)
+        if deduped == current:
+            return
+        gone = [rid for rid in current if rid not in seen]
+        self._ids = [rid for rid in current if rid in seen]
+        added: List[str] = []
+        for rid in deduped:
+            if rid in self._ids:
+                continue
+            # The slot-pool bound is checked against the RESIDENT set, which
+            # already contains this carrier -- it is not being admitted here,
+            # only re-labelled. A refusal would therefore be meaningless, so
+            # the bound is asserted rather than enforced: exceeding it means
+            # alloc_req_slots handed out more slots than the pool has, which
+            # is a defect upstream of this module and must not be hidden here.
+            self._ids.append(rid)
+            self.parked_total += 1
+            added.append(rid)
+        if gone:
+            self.readmitted_total += len(gone)
+        if added or gone:
+            self.last_receipt = (
+                f"{LOG_PREFIX} carriers {len(self._ids)} parked "
+                f"(+{len(added)} -{len(gone)}) of {int(running_bs)} resident; "
+                f"the concurrency cap of {self.max_running} now counts "
+                f"{max(0, int(running_bs) - len(self._ids))}, and the binding "
+                f"bound on new prefill is the GDN slot pool {self.slot_pool}"
+            )
+            logger.info("%s", self.last_receipt)
 
     def park(self, req_id: str, running_bs: int) -> bool:
         """Move a finished-prefill carrier out of the counted set.

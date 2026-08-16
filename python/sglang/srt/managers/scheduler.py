@@ -1417,6 +1417,7 @@ class Scheduler(
         # it further for KV capacity). The limit that admission honours
         # floats below it and lives in the limiter.
         self.init_admission_limiter()
+        self.init_parked_decode_set()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2814,6 +2815,111 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
+
+    def init_parked_decode_set(self) -> None:
+        """#677 phase 1: stop charging undecodable carriers to the cap.
+
+        ARMED ONLY WHERE THE DEFECT EXISTS. The wedge needs a phase that
+        forbids decode while prefill keeps arriving, which is the phase
+        flip under an enforcing purity mode. Without the flip there is no
+        phase that forbids decode, every resident request is decodable,
+        the discount would be zero on every round, and arming would only
+        add a branch to the hottest gate in the scheduler.
+
+        THE SLOT POOL IS READ FROM THE ALLOCATOR, NEVER FROM A FLAG. It is
+        the mamba/GDN state pool -- the bound that actually refuses, late,
+        inside alloc_req_slots -- and on a non-hybrid model there is no
+        such pool and no such bound, so parking stays off there too rather
+        than inventing a ceiling out of max_running_requests.
+        """
+        from sglang.srt.managers.parked_decode_set import (
+            LOG_PREFIX as PARKED_DECODE_LOG_PREFIX,
+        )
+        from sglang.srt.managers.parked_decode_set import ParkedDecodeSet
+
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        # Plain os.environ, matching its siblings (SGLANG_FLIP_SEAM_CHUNK_MIB,
+        # SGLANG_PHASE_POLICY_DRAIN_MODE) rather than the envs registry, so
+        # every phase-flip knob is set and read the same way.
+        want = bool(
+            int(os.environ.get("SGLANG_PHASE_PARK_CARRIERS", "1") or 0)
+            and getattr(self.server_args, "enable_phase_flip", False)
+            and mamba_allocator is not None
+        )
+        slot_pool = int(getattr(mamba_allocator, "size", 0) or 0)
+        if want and slot_pool <= 0:
+            # A pool that reports no slots cannot bound anything, and a
+            # zero ceiling would refuse ALL admission. Refuse the feature,
+            # not the traffic.
+            logger.warning(
+                "%s parking disarmed: the mamba allocator reports %d slots, "
+                "so there is no state-pool ceiling to admit against.",
+                PARKED_DECODE_LOG_PREFIX,
+                slot_pool,
+            )
+            want = False
+        self.parked_decode_set = ParkedDecodeSet(
+            slot_pool=slot_pool,
+            max_running=int(self.max_running_requests or 0),
+            enabled=want,
+        )
+        #: The purity verdict the decode branch last reached, with the phase
+        #: it was reached in. The gate cannot re-evaluate it: the predicate
+        #: (`decode_blocked_here`) advances the starvation clock, so asking
+        #: twice per round would double-tick it. Recording the phase is what
+        #: makes a stale verdict safe -- a verdict from the other layout is
+        #: discarded rather than trusted.
+        self._parked_decode_verdict: Tuple[Optional[str], bool] = (None, False)
+        logger.info(
+            "%s parking %s: GDN slot pool %d, concurrency cap %d, phase flip "
+            "%s. Armed, a carrier this phase forbids to decode stops counting "
+            "against the cap and the slot pool becomes the admission ceiling.",
+            PARKED_DECODE_LOG_PREFIX,
+            "ARMED" if want else "off",
+            slot_pool,
+            int(self.max_running_requests or 0),
+            "on" if getattr(self.server_args, "enable_phase_flip", False) else "off",
+        )
+
+    def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
+        """Record this round's purity verdict and reconcile the parked set.
+
+        Called from the ONE site that already evaluates the verdict, so the
+        starvation clock still ticks exactly once per round.
+        """
+        if not self.parked_decode_set.enabled:
+            return
+        phase = getattr(self, "phase_flip_active_stack", None)
+        self._parked_decode_verdict = (phase, bool(decode_blocked))
+        reqs = list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        self.parked_decode_set.sync_carriers(
+            [getattr(r, "rid", "") for r in reqs],
+            len(getattr(running_batch, "reqs", None) or []),
+        )
+
+    def _parked_carrier_discount(self, running_bs: int) -> int:
+        """Carriers the concurrency cap must not count, this round.
+
+        TWO CLAMPS, EACH FOR A DIFFERENT WAY THE RECORD CAN BE STALE.
+
+        The verdict is recorded by the decode branch, which does not run on
+        every round -- a round that selects a prefill batch never reaches
+        it. So the record can outlive the layout it was made in, and a
+        verdict from the OTHER phase is discarded outright: PP forbids
+        decode and TP does not, so trusting a PP verdict inside TP would
+        discount carriers that are actively decoding.
+
+        The id set can also outlive the requests in it, for the same
+        reason -- a carrier that finished on a round the decode branch did
+        not reach is still listed. Clamping the discount to the resident
+        count means a stale id can never credit more than is there, so the
+        worst case degrades to the pre-change gate rather than to
+        over-admission.
+        """
+        phase, blocked = getattr(self, "_parked_decode_verdict", (None, False))
+        if not blocked or phase != getattr(self, "phase_flip_active_stack", None):
+            return 0
+        return min(self.parked_decode_set.carrier_discount(), max(0, int(running_bs)))
 
     def init_admission_limiter(self) -> None:
         """Build this group's floating admission limit (#287).
@@ -5228,7 +5334,17 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                if phase_decode_blocked_here(self, running_batch.batch_size()):
+                # #677 PHASE 1: the ONE evaluation of the purity verdict per
+                # round happens on the next line, and the admission gate reads
+                # what it records. It cannot ask the predicate itself --
+                # decode_blocked_here advances the decode starvation clock, so
+                # a second call per round would double-tick it and relax
+                # purity early.
+                _decode_blocked = phase_decode_blocked_here(
+                    self, running_batch.batch_size()
+                )
+                self._note_parked_carriers(running_batch, _decode_blocked)
+                if _decode_blocked:
                     # #631 STRICT PHASE PURITY: no decode step executes in
                     # the PP layout. The requests stay RESIDENT and are
                     # carried across the next cutover by the resident-carry
@@ -5275,8 +5391,27 @@ class Scheduler(
             get_server_args().pp_max_micro_batch_size,
             self.admission_limiter.current,
         )
-        res = limit - running_bs
+        # #677 PHASE 1: a carrier the phase FORBIDS to decode stops being
+        # charged to the concurrency cap. `limit` bounds how much decode may
+        # run at once; a request PP may not decode is running nothing, so
+        # counting it there reserves concurrency nobody can spend. Measured
+        # 2026-08-16 06:04: four such carriers held the whole cap of four and
+        # 403779 tokens of prefill could not be admitted behind them.
+        #
+        # ZERO UNLESS PARKING IS ARMED AND THE PHASE FORBIDS DECODE, so the
+        # default path below is the pre-change expression unchanged.
+        parked = self._parked_carrier_discount(running_bs)
+        res = limit - max(0, running_bs - parked)
         res = min(res, self.req_to_token_pool.available_size())
+        # THE SECOND BOUND EXISTS BECAUSE THE FIRST ONE STOPPED BINDING.
+        # available_size() above is the REQUEST-slot count -- HybridReqToToken
+        # Pool does not override it -- so nothing in this expression has ever
+        # seen the mamba/GDN state pool; alloc_req_slots consults it later and
+        # refuses there. While the concurrency cap bound admission that late
+        # refusal was unreachable. Discounting carriers removes that cap, so
+        # the state pool becomes the real ceiling and is asserted HERE, early
+        # and by name, instead of as a late refusal in the allocator.
+        res = min(res, self.parked_decode_set.admission_headroom(running_bs, res))
         return res
 
     def dynamic_chunked_prefill_size(self) -> int:

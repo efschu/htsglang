@@ -94,22 +94,30 @@ class TheWedgeCannotForm(unittest.TestCase):
 
 
 class TheSlotPoolIsTheHonestCapacityLimit(unittest.TestCase):
-    def test_parked_plus_running_never_exceeds_the_slot_pool(self):
+    def test_the_resident_set_never_exceeds_the_slot_pool(self):
+        """``running_bs`` IS the resident set, parked included.
+
+        A parked carrier never leaves ``running_batch``, so admitting
+        against ``slot_pool - parked - running`` would charge it twice and
+        refuse at half the real capacity. The walk below is the one the
+        scheduler actually performs: resident grows by what was admitted,
+        and the headroom closes exactly at the pool.
+        """
         s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
-        for i in range(SLOT_POOL):
-            running = min(MAX_RUNNING, SLOT_POOL - len(s))
-            head = s.admission_headroom(running_bs=running, requested=SLOT_POOL)
-            self.assertLessEqual(len(s) + running + head, SLOT_POOL)
+        resident = 0
+        for _ in range(SLOT_POOL + 4):
+            head = s.admission_headroom(running_bs=resident, requested=MAX_RUNNING)
+            self.assertLessEqual(resident + head, SLOT_POOL)
             if head <= 0:
                 break
-            s.park(f"r{i}", running_bs=running)
-        self.assertLessEqual(len(s), SLOT_POOL)
+            resident += head
+        self.assertEqual(SLOT_POOL, resident)
+        self.assertEqual(0, s.admission_headroom(running_bs=resident, requested=1))
 
     def test_a_full_slot_pool_refuses_EARLY_and_by_name(self):
         s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
-        for i in range(SLOT_POOL - MAX_RUNNING):
-            s.park(f"r{i}", running_bs=MAX_RUNNING)
-        self.assertEqual(0, s.admission_headroom(running_bs=MAX_RUNNING, requested=1))
+        s.sync_carriers([f"r{i}" for i in range(SLOT_POOL)], running_bs=SLOT_POOL)
+        self.assertEqual(0, s.admission_headroom(running_bs=SLOT_POOL, requested=1))
         self.assertIn("slot pool", s.last_refusal.lower())
         self.assertIn(str(SLOT_POOL), s.last_refusal)
 
@@ -118,6 +126,91 @@ class TheSlotPoolIsTheHonestCapacityLimit(unittest.TestCase):
         self.assertTrue(s.park("a", running_bs=1))
         with self.assertRaises(pds.ParkedSetFull):
             s.park("b", running_bs=1)
+
+
+class TheDiscountIsTheWholeFix(unittest.TestCase):
+    """The 06:04 wedge, reproduced as arithmetic and then relieved.
+
+    Four carriers PP was forbidden to decode held the entire concurrency
+    cap of four, so the gate returned 0 and 403779 tokens of prefill could
+    not be admitted behind them.
+    """
+
+    def _gate(self, s, limit, running_bs, req_slots=1_000_000):
+        """The scheduler's expression, with this module's two terms in it."""
+        res = limit - max(0, running_bs - s.carrier_discount())
+        res = min(res, req_slots)
+        return min(res, s.admission_headroom(running_bs, res))
+
+    def test_the_wedge_reproduces_without_the_discount(self):
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING,
+                                enabled=False)
+        self.assertEqual(0, self._gate(s, MAX_RUNNING, running_bs=MAX_RUNNING))
+
+    def test_the_discount_relieves_it(self):
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        s.sync_carriers([f"c{i}" for i in range(MAX_RUNNING)],
+                        running_bs=MAX_RUNNING)
+        self.assertEqual(MAX_RUNNING, s.carrier_discount())
+        self.assertEqual(MAX_RUNNING,
+                         self._gate(s, MAX_RUNNING, running_bs=MAX_RUNNING))
+
+    def test_relief_stops_at_the_state_pool_not_at_the_cap(self):
+        """The cap stops binding; the GDN pool must start.
+
+        Without the second bound the gate would keep admitting past the
+        slot pool and be refused late inside alloc_req_slots -- the late
+        refusal #679/#681/#684 spent three tasks making survivable.
+        """
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        resident = 0
+        for _ in range(SLOT_POOL + 4):
+            s.sync_carriers([f"c{i}" for i in range(resident)], running_bs=resident)
+            head = self._gate(s, MAX_RUNNING, running_bs=resident)
+            if head <= 0:
+                break
+            resident += head
+        self.assertEqual(SLOT_POOL, resident)
+
+
+class TheReconcileIsLevelTriggered(unittest.TestCase):
+    """Restating the set from the resident ids cannot drift; an
+    edge-triggered park that misses one arrival or completion stays wrong
+    in one direction forever."""
+
+    def test_a_vanished_carrier_leaves_the_set(self):
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        s.sync_carriers(["a", "b", "c"], running_bs=3)
+        self.assertEqual(3, s.carrier_discount())
+        s.sync_carriers(["a", "c"], running_bs=2)
+        self.assertEqual(["a", "c"], s.ids)
+
+    def test_an_empty_reconcile_releases_everything(self):
+        """How the caller says "this phase decodes"."""
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        s.sync_carriers(["a", "b"], running_bs=2)
+        s.sync_carriers([], running_bs=2)
+        self.assertEqual(0, s.carrier_discount())
+        self.assertEqual(2, s.readmitted_total)
+
+    def test_restating_the_same_set_is_idempotent(self):
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        for _ in range(50):
+            s.sync_carriers(["a", "b"], running_bs=2)
+        self.assertEqual(2, s.carrier_discount())
+        self.assertEqual(2, s.parked_total)
+
+    def test_duplicate_ids_are_collapsed_not_double_counted(self):
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        s.sync_carriers(["a", "a", "b"], running_bs=2)
+        self.assertEqual(2, s.carrier_discount())
+
+    def test_parked_requests_stay_resident_by_name(self):
+        """The bookkeeping edge: out of the counted set, never invisible."""
+        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
+        s.sync_carriers(["a", "b"], running_bs=2)
+        self.assertEqual(["a", "b"], s.resident_ids)
+        self.assertEqual(2, s.resident_count)
 
 
 class TpReadmissionRespectsTheCap(unittest.TestCase):
@@ -175,7 +268,17 @@ class TheSafetyNetIsUnderneath(unittest.TestCase):
                                 enabled=False)
         self.assertFalse(s.park("a", running_bs=MAX_RUNNING))
         self.assertEqual(0, len(s))
-        self.assertEqual(0, s.admission_headroom(running_bs=MAX_RUNNING, requested=4))
+        # THE IDENTITY, not "the same bound by another route". The scheduler
+        # applies this as one more min() on top of the gate it already had,
+        # so a disabled set that returned anything smaller than `requested`
+        # would TIGHTEN the very path whose purpose is to be unchanged.
+        self.assertEqual(4, s.admission_headroom(running_bs=MAX_RUNNING, requested=4))
+        self.assertEqual(
+            99, s.admission_headroom(running_bs=SLOT_POOL * 10, requested=99)
+        )
+        # And it discounts nothing, so `limit - running_bs` still decides.
+        s.sync_carriers(["a", "b"], running_bs=2)
+        self.assertEqual(0, s.carrier_discount())
 
     def test_a_refused_park_leaves_the_request_countable(self):
         """The caller must be able to tell that the request stays a carrier,
