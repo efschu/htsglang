@@ -2257,7 +2257,7 @@ class TestQwen3CoderDetector(unittest.TestCase):
         Specimen: "Tool 'None' is not defined in the tools list." followed
         by a dropped argument fragment.
         """
-        calls, _ = self._stream(
+        calls, text = self._stream(
             [
                 "<tool_call>",
                 "<parameter=command>",
@@ -2271,6 +2271,50 @@ class TestQwen3CoderDetector(unittest.TestCase):
             calls,
             [],
             f"a <parameter=> with no open function must emit nothing: {calls}",
+        )
+        self.assertIn(
+            "ls -la",
+            text,
+            "the malformed block must surface as text, not vanish",
+        )
+
+    def test_tool_name_written_as_a_parameter(self):
+        """Specimen 2026-08-16 20:57:11, the dominant production shape.
+
+        The model wrote <parameter=Bash> where <function=Bash> belongs, so
+        the tool_call carried parameters but never opened a function. The
+        server logged "Tool 'None' is not defined in the tools list." and
+        dropped every fragment -- ', \"Bash\": \"\"', then the real
+        ', \"command\": ...' and ', \"description\": ...' -- leaving the
+        client a Bash tool_use with input={}. Because the malformed turn
+        stays in the conversation it conditions the next one, which is why
+        this failed 12 times in a row rather than once.
+        """
+        calls, text = self._stream(
+            [
+                "<tool_call>",
+                "<parameter=Bash>",
+                "</parameter>",
+                "<parameter=command>",
+                "wc -l /spinning/x.py",
+                "</parameter>",
+                "<parameter=description>",
+                "Line counts",
+                "</parameter>",
+                "</function>",
+                "</tool_call>",
+            ]
+        )
+
+        self.assertEqual(
+            calls,
+            [],
+            f"a function-less tool_call must not produce a call: {calls}",
+        )
+        self.assertIn(
+            "wc -l /spinning/x.py",
+            text,
+            "the command the model actually asked for must not be lost",
         )
 
     def test_no_call_ever_carries_a_negative_tool_index(self):
