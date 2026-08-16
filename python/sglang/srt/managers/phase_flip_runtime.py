@@ -1224,6 +1224,17 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         from sglang.srt.layers.dcp.owner import refresh_all_owner_bounds
         from sglang.srt.runtime_context import get_server_args
 
+        # #690 capture A: cutover SUB-STEP timing. The aggregate cutover cost
+        # spans 43.5 to 1041.5 ms -- a 24x spread, which is the signature of a
+        # WAIT or a serialization, not of a fixed cost. The DONE line reports
+        # only the total, so the spread cannot be attributed from it; the 43.5
+        # ms minimum is the honest target. These marks cost one perf_counter
+        # call per step and change no control flow.
+        _marks = [("enter", time.perf_counter())]
+
+        def _mark(label: str) -> None:
+            _marks.append((label, time.perf_counter()))
+
         stacks = scheduler.phase_flip_stacks
         tp_phase = direction == PP_TO_TP
         n = len(stacks.vector)
@@ -1267,6 +1278,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         set_cp_token_ratios(list(stacks.token_vector))
         refresh_all_owner_bounds()
 
+        _mark("routing+owner")
         # 3. Scheduler topology snapshot (frozen dataclass -> new instance).
         if tp_phase:
             scheduler.ps = _dc.replace(
@@ -1290,6 +1302,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # dp-attention is a flip arming guard; the dp routing group is tp.
         scheduler.dp_tp_group = scheduler.tp_group
 
+        _mark("topology+groups")
         # 4b. Scheduler COMPONENTS holding ps / group snapshots (found on
         # the first post-flip serving attempt, 2026-08-08): the request
         # receiver kept the boot ps and relayed requests PP-chain-style
@@ -1345,6 +1358,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 draft_worker=want_draft,
                 model_worker=want_model_worker,
             )
+        _mark("components")
         # 4c. Census round realign: the detector's cadence counter drifted
         # per-rank under the pp loop; the cutover is group-aligned, so
         # re-zero here or the post-flip detector fires its gloo
@@ -1363,6 +1377,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             ),
         )
 
+        _mark("census+microbatch")
         # 6. PP loop arrays: re-initialized for the new topology (reads the
         # NEW ps.pp_size).
         #
@@ -1434,6 +1449,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 f"mamba slot lock and its answer is simply never finished."
             )
 
+        _mark("pp_loop_arrays")
         # 7. Active stack swap: the forward path follows model_worker.
         #
         # Speculation belongs to the TP DECODE phase (#631). The draft
@@ -1449,6 +1465,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         scheduler.model_worker = want_model_worker
         scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
 
+        _mark("stack_swap")
         # 7b. DRAFT STATE for the requests step 6 just carried in.
         #
         # AFTER the swap, deliberately: the pool that gets scrubbed is the
@@ -1600,6 +1617,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     drained,
                 )
 
+        _mark("draft_state")
         # 9. Completeness self-check: every snapshot the rebuild list names
         # is verified against the routed source of truth, HERE, before the
         # first post-flip round can touch a stale handle. A missed rebuild
@@ -1620,6 +1638,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         from sglang.srt.managers.phase_flip_output_trace import trace_cutover
 
         trace_cutover(scheduler, direction)
+        _mark("verify+publish+trace")
+        # #690 capture A: one line, sorted by cost, so the 24x spread can be
+        # ATTRIBUTED instead of guessed at. Emitted after the completeness
+        # check so a cutover that failed verification never reports timings as
+        # if it had succeeded.
+        try:
+            steps = [
+                (_marks[i + 1][0], (_marks[i + 1][1] - _marks[i][1]) * 1000.0)
+                for i in range(len(_marks) - 1)
+            ]
+            total_ms = (_marks[-1][1] - _marks[0][1]) * 1000.0
+            worst = sorted(steps, key=lambda kv: kv[1], reverse=True)
+            logger.warning(
+                "%s CUTOVER SUB-STEPS %s total=%.1f ms | %s",
+                LOG_PREFIX,
+                direction,
+                total_ms,
+                ", ".join(f"{k}={v:.1f}" for k, v in worst),
+            )
+        except Exception:  # noqa: BLE001 - timing must never break a cutover
+            pass
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
             LOG_PREFIX,
