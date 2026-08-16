@@ -2932,23 +2932,54 @@ class Scheduler(
             else:
                 watch["rounds"] += 1
                 if watch["rounds"] == self.ARM_VERDICT_ROUNDS:
-                    logger.warning(
-                        "PHASE-POLICY ARM-VERDICT-WRONG: armed %s (%s) but the "
-                        "target layout built no batch in %d rounds. The "
-                        "admissibility inputs that produced this arm were "
-                        "running_bs=%d pending=%d nothing_can_run=%s "
-                        "target_can_admit=%s ready_carriers=%d. If this repeats "
-                        "in alternating directions it is the 2026-08-16 10:24 "
-                        "ping-pong and the target term is lying again.",
-                        watch["direction"],
-                        watch["reason"],
-                        watch["rounds"],
-                        watch["running_bs"],
-                        watch["pending"],
-                        watch["nothing_can_run"],
-                        watch["target_can_admit"],
-                        watch["ready_carriers"],
+                    committed = (
+                        getattr(self, "phase_flip_active_stack", None)
+                        != watch["phase_at_arm"]
                     )
+                    if not committed:
+                        # ARM-UNFUNDED, NOT ARM-VERDICT-WRONG, and the split
+                        # matters because the first version accused the wrong
+                        # component. Measured 2026-08-16 11:05: three
+                        # ARM-VERDICT-WRONG against twelve
+                        # "FLIP ABANDONED (pool too small for the live set)",
+                        # eight of them "This rank: fits (a peer did not)".
+                        # The target layout never became active, so the
+                        # admissibility verdict was never tested -- the SEAM
+                        # could not pay. A falsifier that fires on funding
+                        # failures stops being a falsifier for verdicts.
+                        logger.warning(
+                            "PHASE-POLICY ARM-UNFUNDED: armed %s (%s) and the "
+                            "cutover has not committed after %d rounds -- the "
+                            "instance is still in the %s layout. This is a "
+                            "SEAM FUNDING failure, not a wrong admissibility "
+                            "verdict: the target was never entered, so the "
+                            "verdict was never tested. Look for FLIP ABANDONED "
+                            "on the binding rank, not at the arm.",
+                            watch["direction"],
+                            watch["reason"],
+                            watch["rounds"],
+                            watch["phase_at_arm"],
+                        )
+                    else:
+                        logger.warning(
+                            "PHASE-POLICY ARM-VERDICT-WRONG: armed %s (%s), the "
+                            "cutover COMMITTED into the target layout, and it "
+                            "still built no batch in %d rounds. The "
+                            "admissibility inputs that produced this arm were "
+                            "running_bs=%d pending=%d nothing_can_run=%s "
+                            "target_can_admit=%s ready_carriers=%d. The verdict "
+                            "was tested and was wrong; if this repeats in "
+                            "alternating directions it is the 2026-08-16 10:24 "
+                            "ping-pong and the target term is lying again.",
+                            watch["direction"],
+                            watch["reason"],
+                            watch["rounds"],
+                            watch["running_bs"],
+                            watch["pending"],
+                            watch["nothing_can_run"],
+                            watch["target_can_admit"],
+                            watch["ready_carriers"],
+                        )
         if ret is not None:
             self._round_built_nothing = False
             return
@@ -8457,6 +8488,11 @@ class Scheduler(
             "target_can_admit": bool(getattr(inp, "target_can_admit", False)),
             "ready_carriers": int(getattr(inp, "ready_carriers", 0) or 0),
             "rounds": 0,
+            # THE DISCRIMINATOR. An arm can only be judged once the layout it
+            # asked for actually arrived; until the phase changes, the cutover
+            # has not committed and any silence belongs to the FUNDING, not to
+            # the verdict.
+            "phase_at_arm": getattr(self, "phase_flip_active_stack", None),
         }
         note_flip_armed(state, decision, inp.now)
         logger.warning(

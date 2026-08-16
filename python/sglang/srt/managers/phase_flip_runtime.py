@@ -5125,6 +5125,72 @@ class PhaseFlipRuntime:
         except Exception:  # noqa: BLE001 - a damper must not raise
             return False
 
+    def staging_budget_census(self, staging_bytes: int = 0) -> str:
+        """WHO IS HOLDING THIS RANK'S SEAM STAGING BUDGET, in MiB.
+
+        The ABANDONED receipt says the pool is too small and, on eight of the
+        twelve abandons measured 2026-08-16 11:05, that "This rank: fits (a
+        peer did not)" -- which names a BINDING RANK and nothing about what is
+        binding it. Three remedies were then plausible (arena tail, inactive
+        layout arena, draft weights) with no way to choose between them, so
+        this prints the occupants instead of leaving the next reader to guess.
+
+        A CENSUS, NEVER A GATE: every term is read defensively and a failure
+        prints as "?" rather than raising, because a refusal path is the worst
+        possible place to add a new exception.
+        """
+        mib = 1024 * 1024
+
+        def q(fn, default="?"):
+            try:
+                v = fn()
+                return f"{v / mib:.0f}" if isinstance(v, (int, float)) else str(v)
+            except Exception:  # noqa: BLE001 - a census must not raise
+                return default
+
+        probe = self._mem_probe
+        driver_free = cached = None
+        try:
+            if probe is not None:
+                driver_free, cached = probe()
+            elif torch.cuda.is_available():
+                driver_free, _t = torch.cuda.mem_get_info()
+                cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        except Exception:  # noqa: BLE001
+            pass
+        # The REAL accessors, not invented attribute names: the runtime keeps
+        # the scheduler as ``_census_scheduler`` and both the guard and the
+        # measured reserve are fetched through their own modules, exactly as
+        # the prearm-relief path above does.
+        sched = getattr(self, "_census_scheduler", None)
+        res = guard = None
+        try:
+            from sglang.srt.managers.phase_flip_seam_reserve import read_seam_reserve
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            if sched is not None:
+                guard = get_corridor_guard(sched)
+                res = read_seam_reserve(
+                    sched.server_args, int(getattr(self, "_rank", 0) or 0)
+                )
+        except Exception:  # noqa: BLE001 - a census must not raise
+            pass
+        parts = [
+            f"staging needs {staging_bytes / mib:.0f}",
+            f"driver free {q(lambda: driver_free)}",
+            f"allocator cache {q(lambda: cached)} (reclaimable)",
+            f"staging reserve kept free {q(lambda: self._staging_reserve_bytes)}",
+            f"seam fixed {q(lambda: res.fixed_bytes)}",
+            f"INACTIVE-LAYOUT ARENA {q(lambda: res.arena_fixed_bytes)}",
+            f"corridor floor {q(lambda: guard.floor_bytes)}",
+        ]
+        return (
+            "STAGING BUDGET CENSUS (MiB) -- " + ", ".join(parts) + ". The arena "
+            "term is the inactive layout's weights held on THIS card; it is "
+            "fixed-size and payload-invariant, so it is the one occupant that "
+            "does not shrink when the live set does."
+        )
+
     def _kv_rung_verdict(self) -> str:
         """What the KV rung decided this round, for a REFUSAL message.
 
@@ -6244,6 +6310,13 @@ class PhaseFlipRuntime:
                     "; ".join(too_small) if too_small else "fits (a peer did not)",
                     self._phase,
                 )
+                # #689: NAME THE OCCUPANT, not just the shortfall. Which rank
+                # binds is already in the line above; what is holding that
+                # rank's budget was not, and without it the remedy is a guess.
+                try:
+                    logger.error("%s %s", LOG_PREFIX, self.staging_budget_census())
+                except Exception:  # noqa: BLE001 - never break the refusal path
+                    pass
             # #485: BOUND THE RETRY, AND END IT IF IT CANNOT WIN.
             #
             # Only real abandons are bounded. A margin DELAY is a by-design
