@@ -156,6 +156,32 @@ MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
 
+#: The names :func:`decompose_mamba_budget_post` emits, in order. Anything that
+#: sums "the mamba post" must accept BOTH shapes -- the lump and these parts --
+#: or it silently reads zero on exactly the boots that carry the instrument.
+MAMBA_POST_PART_NAMES = (
+    "mamba state pool",
+    "speculative intermediate state",
+    "prefill activation reserve",
+)
+
+
+def mamba_post_total_gb(posts) -> float:
+    """The mamba post total, whether it was emitted lumped or decomposed.
+
+    Exists because the decomposition broke the ceiling hint in
+    ``budget_exhausted_message``: that summed posts named ``MAMBA_BUDGET_POST``,
+    which matches nothing once the post is emitted as three parts, so the
+    ``--max-running-requests-ceiling`` advice disappeared from the refusal
+    message precisely on the boots that have the new instrument. Callers should
+    use this rather than matching a name.
+    """
+    return sum(
+        gb
+        for name, gb in posts
+        if name == MAMBA_BUDGET_POST or name in MAMBA_POST_PART_NAMES
+    )
+
 
 def _note_mamba_component(runner, name: str, gb: float) -> None:
     """Record one NAMED sub-term of the lumped mamba budget post (#704).
@@ -224,7 +250,7 @@ def decompose_mamba_budget_post(total_gb: float, components: dict):
     if not components:
         return [(MAMBA_BUDGET_POST, float(total_gb))]
     named = sum(float(v) for v in components.values())
-    out = [("mamba state pool", float(total_gb) - named)]
+    out = [(MAMBA_POST_PART_NAMES[0], float(total_gb) - named)]
     out.extend((str(k), float(v)) for k, v in components.items())
     return out
 
@@ -644,7 +670,7 @@ class ModelRunnerKVCacheMixin:
         short_mib = math.ceil(-rest_memory_gb * 1024)
         total_gb, outside_gb = occupancy
         ceiling_note = ""
-        mamba_post_gb = sum(gb for name, gb in posts if name == MAMBA_BUDGET_POST)
+        mamba_post_gb = mamba_post_total_gb(posts)
         if ceiling and mamba_post_gb > 0.005:
             # The post is (slots + admitted*D) * per_req + a constant reserve,
             # and both slot terms are proportional to the ceiling -- so the
