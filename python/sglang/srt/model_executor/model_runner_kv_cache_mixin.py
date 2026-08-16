@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import os
@@ -2259,9 +2260,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert kv_lora_rank % quant_block_size == 0, (
-                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
-            )
+            assert (
+                kv_lora_rank % quant_block_size == 0
+            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
             return (
                 kv_lora_rank
@@ -2285,9 +2286,9 @@ class ModelRunnerKVCacheMixin:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert not self.server_args.enable_mamba_extra_buffer_lazy(), (
-                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                )
+                assert (
+                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -2442,9 +2443,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert not self.use_mla_backend, (
-            "unified memory pool does not support MLA-hybrid-Mamba yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -2518,9 +2519,9 @@ class ModelRunnerKVCacheMixin:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "unified memory pool does not support MLA-SWA hybrid yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:
@@ -3952,9 +3953,9 @@ class ModelRunnerKVCacheMixin:
                     self._kv_sess_attach_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert not enable_page_major, (
-                        "page-major KV layout is not supported with fp4 KV cache"
-                    )
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
@@ -5638,12 +5639,128 @@ class ModelRunnerKVCacheMixin:
         self._seam_reserve_cached = cached
         return cached
 
+    def _maybe_price_cold_seam(self: ModelRunner, reserve, configurator):
+        """On a COLD record only, derive the per-token seam slope (#685).
+
+        THE DEFECT THIS CLOSES. A cold ``SeamReserve`` has every measured
+        field at zero, ``per_row_bytes`` included, so ``solve_pool_tokens``
+        evaluates ``staging(T) = A + max(F, a*T)`` with ``a = 0`` and the
+        per-token term vanishes. A first boot is then sized floor-only and
+        grants a pool whose cutover it cannot fund. The arming FLOOR has been
+        charged on a cold record since #662-F4/A0; the SLOPE never was.
+
+        WHY IT CAN BE DERIVED HERE. #685: a rank's per-row seam cost is the
+        full-attention layers it must RECEIVE at the cutover,
+        ``max(0, share*n_total - held)``, and every term is rank-LOCAL and
+        known at boot -- the share from the flip vector, ``held`` from the
+        attention modules this runner actually built, the total from the model
+        config, and the per-layer cell from the configurator's own cell
+        divided by this rank's attention count. No collective, no measurement,
+        nothing transferred from another rig.
+
+        A FALLBACK, NEVER AN OVERRIDE. Any non-cold provenance is returned
+        untouched: a stored record is a measurement of THIS rig and outranks a
+        model of it.
+
+        ABSTAIN RATHER THAN APPROXIMATE. Every input is checked and a missing
+        one leaves the reserve at zero -- the same refusal the cell read below
+        already makes for a configurator with no single cell. A rank that
+        receives NOTHING (it sheds, or breaks even) is also left at zero:
+        charging it a per-token seam would reserve against a transfer that
+        does not happen, which is the over-reservation #685 named.
+
+        WHAT THIS DOES NOT YET DO, AND WHY IT STOPS HERE. The slope is derived
+        and carried, but the reserve stays INACTIVE: ``SeamReserve.active``
+        requires ``id_space > 0``, and the downstream solve anchors on that
+        measurement point together with ``have_bytes``
+        (``t_floor = t_m + (have_m - A - F) // cell``). A derived slope has no
+        measurement point, so setting those to make it active would fabricate
+        the anchor. The budget path therefore still returns floor-only on a
+        cold boot; what has changed is that the number now EXISTS and is
+        announced, instead of being silently zero.
+
+        Consuming it needs an anchor-free branch. ``solve_pool_tokens`` is
+        exactly that form and takes no anchor -- but it currently has no live
+        caller, so which budget it is solved against (``budget_bytes`` net of
+        the floor charge, or something the sizer has not yet subtracted) is a
+        design decision on the boot path rather than a wiring detail. Left to
+        be decided rather than picked here.
+        """
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        if reserve.provenance != seam.PROVENANCE_COLD or reserve.per_row_bytes:
+            return reserve
+
+        def _abstain(why: str):
+            logger.debug(
+                "%s: cold seam slope NOT derived (%s); the per-token term "
+                "stays 0 and the pool is sized floor-only.",
+                seam.LOG_PREFIX,
+                why,
+            )
+            return reserve
+
+        raw = getattr(self.server_args, "phase_flip_tp_vector", None)
+        if not raw:
+            return _abstain("no --phase-flip-tp-vector")
+        try:
+            vector = [int(x) for x in str(raw).split(",")]
+        except (TypeError, ValueError):
+            return _abstain(f"unparsable flip vector {raw!r}")
+        rank = int(self._seam_world_rank())
+        if not 0 <= rank < len(vector):
+            return _abstain(f"rank {rank} outside the {len(vector)}-stage vector")
+        held = int(self._lane_kv_bearing_layer_count() or 0)
+        if held <= 0:
+            return _abstain("this runner holds no full-attention layer")
+        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+        if cell <= 0:
+            return _abstain("the configurator has no single per-token cell")
+        n_layers = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
+        interval = getattr(self.model_config, "full_attention_interval", None)
+        total = n_layers // int(interval) if interval else n_layers
+        if total <= 0:
+            return _abstain("the model config reports no full-attention layer")
+
+        from sglang.srt.managers.seam_slope import derive_seam_slope_for_rank
+
+        slope = derive_seam_slope_for_rank(
+            flip_tp_vector=vector,
+            rank=rank,
+            attention_held=held,
+            kv_bytes_per_token_per_attn_layer=float(cell) / float(held),
+            n_attention_total=total,
+        )
+        if slope <= 0.0:
+            return _abstain(
+                f"rank {rank} receives no layer at the cutover (holds {held} "
+                f"of {total}, flip share {vector[rank]}/{sum(vector)})"
+            )
+        logger.info(
+            "%s (rank %d): COLD record -- per-token seam DERIVED, not "
+            "measured: %.1f B/row. This rank holds %d of %d full-attention "
+            "layers and the flip hands it %d/%d of the token axis, so it must "
+            "RECEIVE %.2f layer(s) of KV per row at a pp->tp cutover. Without "
+            "this the cold pool is sized floor-only and grants a pool whose "
+            "cutover it cannot fund (#685). A measured record from any later "
+            "boot supersedes this.",
+            seam.LOG_PREFIX,
+            rank,
+            slope,
+            held,
+            total,
+            vector[rank],
+            sum(vector),
+            slope / (float(cell) / float(held)),
+        )
+        return dataclasses.replace(reserve, per_row_bytes=float(slope))
+
     def _seam_adjusted_budget(
         self: ModelRunner, budget_bytes: int, configurator
     ) -> int:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
-        reserve = self._seam_reserve()
+        reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
 
         # #662-F4 / A0: THE ARMING FLOOR IS CHARGED EVEN ON A COLD RECORD.
@@ -6012,9 +6129,9 @@ class ModelRunnerKVCacheMixin:
             # caller-supplied pool config it is supposed to RESOLVE, and
             # every rank died here with "Draft worker requires
             # memory_pool_config" (measured, boot 15, 2026-08-08).
-            assert self.memory_pool_config is not None, (
-                "Draft worker requires memory_pool_config"
-            )
+            assert (
+                self.memory_pool_config is not None
+            ), "Draft worker requires memory_pool_config"
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
