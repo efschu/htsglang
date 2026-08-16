@@ -256,3 +256,94 @@ def test_malformed_policies_are_refused():
         LivenessPolicy(min_samples=1)
     with pytest.raises(ProgressLivenessError, match="confirmations"):
         LivenessPolicy(confirmations=0)
+
+
+# --------------------------------------------------------------------------
+# Binding to the deploy tree's real attributes, verified by code reading
+# (/spinning/wt-678-deploy). Pinned against a synthetic scheduler so a rename
+# in the tree shows up here as a failure rather than as a silently dead signal.
+# --------------------------------------------------------------------------
+
+
+class _Req:
+    def __init__(self, seqlen):
+        self.seqlen = seqlen
+
+
+class _FakeScheduler:
+    """Carries exactly the attributes the deploy tree exposes."""
+
+    def __init__(self, forward_ct=0, waiting=(), pending_tokens=None):
+        self.forward_ct = forward_ct
+        self.waiting_queue = list(waiting)
+        self.running_batch = type("B", (), {"reqs": []})()
+        if pending_tokens is not None:
+            self.load_inquirer = type(
+                "L", (), {"_get_num_pending_tokens": lambda _s: pending_tokens}
+            )()
+
+
+def test_the_binding_reads_the_real_attribute_names():
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    s = _FakeScheduler(forward_ct=42, waiting=[_Req(100), _Req(200)])
+    got = sample_from_scheduler(s, t_s=1.0)
+    # forward_ct is the ONLY monotone forward counter the tree exposes
+    # (scheduler.py:6933, `+= 1` at the top of run_batch).
+    assert got.prefill_chunks == 42
+    assert got.pending_requests == 2
+    # No load_inquirer here, so it falls back to summing seqlen -- which is what
+    # load_inquirer.py:68 itself does.
+    assert got.pending_tokens == 300
+
+
+def test_the_binding_prefers_the_load_inquirer_when_present():
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    s = _FakeScheduler(forward_ct=1, waiting=[_Req(100)], pending_tokens=77_777)
+    assert sample_from_scheduler(s, t_s=0.0).pending_tokens == 77_777
+
+
+def test_a_stale_binding_is_refused_not_silently_frozen():
+    """A renamed attribute must fail loudly.
+
+    A binding that quietly returns a frozen counter reads as a PERMANENT wedge,
+    which is the worst possible failure for a wedge detector.
+    """
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    class _Renamed:
+        waiting_queue = ()
+
+    with pytest.raises(ProgressLivenessError, match="stale"):
+        sample_from_scheduler(_Renamed(), t_s=0.0)
+
+
+def test_the_bound_signal_still_catches_the_specimen():
+    """End to end on real attribute names: frozen attempts + pending = alarm."""
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    s = _FakeScheduler(forward_ct=9_000, waiting=[_Req(90_000)] * 7)
+    trace = [sample_from_scheduler(s, t_s=float(i * 10)) for i in range(6)]
+    r = assess(trace, LivenessPolicy(confirmations=1))
+    assert r.verdict == WEDGED and r.action == ACTION_ALARM
+    assert r.pending_requests == 7
+
+
+def test_advancing_attempts_alone_reads_as_healthy_and_that_is_the_known_limit():
+    """forward_ct counts ATTEMPTS, not commits.
+
+    A batch that re-runs without committing anything advances this counter
+    while nothing progresses -- the #701 self-deadlock silhouette. The binding
+    does not pretend otherwise; distinguishing that shape needs a committed-
+    chunk counter, which the tree does not have.
+    """
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    trace = []
+    for i in range(6):
+        s = _FakeScheduler(forward_ct=100 + i * 5, waiting=[_Req(500)] * 3)
+        trace.append(sample_from_scheduler(s, t_s=float(i * 10)))
+    r = assess(trace, LivenessPolicy(confirmations=1))
+    assert r.verdict == HEALTHY, "attempts advancing reads as progress"
+    assert r.deltas["completions"] == 0 and r.deltas["decode_steps"] == 0

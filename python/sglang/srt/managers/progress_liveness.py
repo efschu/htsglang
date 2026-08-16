@@ -301,3 +301,108 @@ def build_liveness_is_active(scheduler) -> callable:
         return bool(getattr(scheduler, "waiting_queue", ()) or ())
 
     return _active
+
+
+# ---------------------------------------------------------------------------
+# Binding to the deploy tree's real attributes (/spinning/wt-678-deploy).
+#
+# Verified by reading, not by running. What actually exists:
+#
+#   scheduler.forward_ct                      monotone; `+= 1` at the TOP of
+#                                             run_batch (scheduler.py:6933), so
+#                                             it counts batch ATTEMPTS
+#   len(scheduler.waiting_queue)              pending requests (:7538, :7725)
+#   len(scheduler.running_batch.reqs)         running requests (:7539, :7726)
+#   load_inquirer._get_num_pending_tokens()   pending tokens
+#                                             (load_inquirer.py:54-72: sums
+#                                             req.seqlen over the waiting queue
+#                                             plus the chunked remainder)
+#
+# WHAT DOES NOT EXIST, stated because it changes what the signal can promise:
+# there is **no monotone completion, decode-step or committed-chunk counter**.
+# `metrics_reporter.num_generated_tokens` is reset every reporting interval
+# (metrics_reporter.py:849, :1080), so it cannot carry a delta across a window.
+#
+# CONSEQUENCE, and it corrects an overstatement of mine. `forward_ct` alone IS
+# sufficient to catch the 16:23 wedge: no batch forms, so it never increments,
+# and the defect was purely the `is_active` gate. Where it is NOT sufficient is
+# the retry-loop shape -- a batch that re-runs without committing anything
+# advances ATTEMPTS while nothing progresses, which is exactly the #701
+# self-deadlock silhouette. Distinguishing those needs a committed-chunk
+# counter, and that is a one-line instrumentation ask rather than a redesign.
+#
+# So the binding below is honest about its reach: it fills the attempt signal
+# from a real monotone attribute and leaves the commit signals at zero rather
+# than inventing motion they cannot observe.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SchedulerBinding:
+    """Attribute paths on the deploy tree's Scheduler, kept as data.
+
+    Held as names rather than lambdas so a binding can be asserted against a
+    synthetic object in a hermetic test, and so a rename shows up as a refusal
+    instead of a silently dead signal.
+    """
+
+    attempts: str = "forward_ct"
+    waiting_queue: str = "waiting_queue"
+    running_batch_reqs: str = "running_batch.reqs"
+    #: Optional; when absent the pending-token term falls back to summing
+    #: ``seqlen`` over the waiting queue, which is what load_inquirer does.
+    pending_tokens_fn: str = "load_inquirer._get_num_pending_tokens"
+
+
+def _resolve(obj, dotted: str):
+    cur = obj
+    for part in dotted.split("."):
+        if not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+
+
+def sample_from_scheduler(
+    scheduler,
+    t_s: float,
+    binding: SchedulerBinding | None = None,
+    inhibited: bool = False,
+    inhibit_reason: str = "",
+) -> ProgressSample:
+    """Read one :class:`ProgressSample` from a live scheduler object.
+
+    ``attempts`` lands in ``prefill_chunks`` because it is the only monotone
+    forward counter the tree exposes and it advances in every regime that runs
+    a batch. ``completions`` and ``decode_steps`` stay at zero: no monotone
+    source exists for them, and reporting a fabricated value would make the
+    disjunction look richer than it is.
+    """
+    binding = binding or SchedulerBinding()
+    attempts = _resolve(scheduler, binding.attempts)
+    if attempts is None:
+        raise ProgressLivenessError(
+            f"no attribute {binding.attempts!r} on the scheduler: the binding is "
+            "stale. Refusing to sample rather than reporting a frozen counter, "
+            "which would read as a permanent wedge."
+        )
+
+    waiting = _resolve(scheduler, binding.waiting_queue) or ()
+    pending_requests = len(waiting)
+
+    fn = _resolve(scheduler, binding.pending_tokens_fn)
+    if callable(fn):
+        pending_tokens = int(fn())
+    else:
+        pending_tokens = int(sum(getattr(r, "seqlen", 0) for r in waiting))
+
+    return ProgressSample(
+        t_s=t_s,
+        completions=0,
+        decode_steps=0,
+        prefill_chunks=int(attempts),
+        pending_requests=pending_requests,
+        pending_tokens=pending_tokens,
+        inhibited=inhibited,
+        inhibit_reason=inhibit_reason,
+    )
