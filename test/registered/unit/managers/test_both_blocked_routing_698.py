@@ -41,14 +41,16 @@ class TheDeclineMustRouteToTheRemedy(unittest.TestCase):
             n for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "maybe_arm_phase_policy"
         )
-        called = {
-            sub.func.attr
-            for sub in ast.walk(fn)
-            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
-        }
+        # MATCH THE NAME, NOT THE CALL FORM. The routing is invoked through
+        # getattr(self, "...", noop) so scheduler STAND-INS in the policy tests
+        # do not raise; that is not an attribute call and an AST walk keyed on
+        # ast.Attribute misses it. Keying on the identifier anywhere in the
+        # function survives either spelling and still fails if the routing is
+        # deleted -- which is the only thing this pin is for.
+        body = ast.get_source_segment(src, fn) or ""
         self.assertIn(
             "_apply_both_blocked_relief",
-            called,
+            body,
             "maybe_arm_phase_policy no longer routes the decline to the evict "
             "rung. That is exactly the 2026-08-16 16:23 wedge: the diagnosis "
             "loops forever and the named remedy never runs.",

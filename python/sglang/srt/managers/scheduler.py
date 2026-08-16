@@ -8587,7 +8587,14 @@ class Scheduler(
                     inp.pending_prefill_tokens,
                     inp.running_bs,
                 )
-            self._apply_both_blocked_relief(decision, inp)
+            # getattr, for the third time in this file and for the same
+            # reason: the policy gate is driven in tests by scheduler
+            # STAND-INS carrying only the fields the policy reads. A stand-in
+            # without the relief hook must decline exactly as before, not raise
+            # AttributeError inside the arming path.
+            getattr(self, "_apply_both_blocked_relief", lambda *_: None)(
+                decision, inp
+            )
             return None
         # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
         # its seam has moved the zero-GPU window one stage right instead of
