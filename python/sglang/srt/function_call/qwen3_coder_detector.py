@@ -54,8 +54,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
+        # Name of a <function=...> whose name matches no supplied tool. The
+        # block is streamed back as plain text instead of being emitted as
+        # an invocation, and cleared at </tool_call>.
+        self.rejected_func_name: Optional[str] = None
+
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _is_known_tool(self, func_name: str, tools: Optional[List[Tool]]) -> bool:
+        """Whether ``func_name`` matches a tool the caller actually offered.
+
+        Callers that supply no tool list cannot be checked against, so
+        every name is accepted there — the check is a guard against the
+        model inventing a name, not a requirement that tools be declared.
+        """
+        if not tools:
+            return True
+        for config in tools:
+            try:
+                if config.type == "function" and config.function.name == func_name:
+                    return True
+            except AttributeError:
+                continue
+        return False
+
+    def _emits_text(self) -> bool:
+        """Whether plain text at the cursor should reach the caller.
+
+        Text inside a well-formed tool call is structural noise and is
+        dropped. Text inside a REJECTED call is the model's actual output
+        with no other way out, so it is passed through rather than silently
+        swallowed.
+        """
+        return not self.is_inside_tool_call or self.rejected_func_name is not None
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -271,10 +303,37 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 2. Function Name: <function=name>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_prefix):
+            # Only inside an open <tool_call> block, matching what
+            # ``detect_and_parse`` accepts. Outside one the literal is prose
+            # about tool syntax, and the two paths must not disagree on what
+            # counts as an invocation.
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.tool_call_prefix
+            ):
                 end_angle = current_slice.find(">")
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
+
+                    if not self._is_known_tool(func_name, tools):
+                        # Committing to the name here is what let a
+                        # parameter name written as <function=command> reach
+                        # the client as a real tool call: the name delta
+                        # goes out before the first parameter reveals the
+                        # mismatch, and by then the client has already
+                        # opened a tool_use block for a tool that does not
+                        # exist. Reject before anything is emitted, and hand
+                        # the block back as text so the model's output is
+                        # visible rather than silently discarded.
+                        logger.warning(
+                            "Tool '%s' is not defined in the tools list; "
+                            "streaming the block as text instead of opening "
+                            "a tool call.",
+                            func_name,
+                        )
+                        self.rejected_func_name = func_name
+                        normal_text_chunks.append(current_slice[: end_angle + 1])
+                        self.parsed_pos += end_angle + 1
+                        continue
 
                     self.current_tool_id += 1
                     self.current_tool_name_sent = True
@@ -299,7 +358,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 3. Parameter: <parameter=name>value...
             # -------------------------------------------------------
-            if current_slice.startswith(self.parameter_prefix):
+            # A parameter belongs to a function. Without one open there is
+            # no tool_index to attach it to, and emitting anyway produced
+            # fragments at the uninitialised index -1 that no downstream
+            # consumer could bind to a call.
+            if current_slice.startswith(self.parameter_prefix) and (
+                self.current_func_name is not None
+                or self.rejected_func_name is not None
+            ):
                 name_end = current_slice.find(">")
                 if name_end != -1:
                     value_start_idx = name_end + 1
@@ -328,6 +394,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         best_cand = min(candidates, key=lambda x: x[0])
                         end_pos = best_cand[0]
                         end_token_len = best_cand[1]
+
+                        total_len = (name_end + 1) + end_pos + end_token_len
+
+                        if self.rejected_func_name is not None:
+                            # Belongs to a call that was never opened; pass
+                            # the raw text through rather than drop it.
+                            normal_text_chunks.append(current_slice[:total_len])
+                            self.parsed_pos += total_len
+                            continue
 
                         param_name = current_slice[
                             len(self.parameter_prefix) : name_end
@@ -373,7 +448,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         self.current_tool_param_count += 1
 
                         # Advance cursor
-                        total_len = (name_end + 1) + end_pos + end_token_len
                         self.parsed_pos += total_len
                         continue
 
@@ -384,6 +458,24 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 4. Function End: </function>
             # -------------------------------------------------------
             if current_slice.startswith(self.function_end_token):
+                if self.rejected_func_name is not None:
+                    normal_text_chunks.append(self.function_end_token)
+                    self.parsed_pos += len(self.function_end_token)
+                    self.rejected_func_name = None
+                    continue
+
+                # Closing a function that was never opened used to emit a
+                # bare '{' and '}' pair at tool_index -1: a complete,
+                # nameless, argument-only tool call that no consumer could
+                # route. Nothing is open, so there is nothing to close.
+                if self.current_func_name is None:
+                    logger.warning(
+                        "Ignoring %s with no open function in the stream.",
+                        self.function_end_token,
+                    )
+                    self.parsed_pos += len(self.function_end_token)
+                    continue
+
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -403,6 +495,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.tool_call_end_token):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
+                self.rejected_func_name = None
                 continue
 
             # -------------------------------------------------------
@@ -416,7 +509,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
             if next_open_angle == -1:
                 # This entire segment is plain text
-                if not self.is_inside_tool_call:
+                if self._emits_text():
                     normal_text_chunks.append(current_slice)
                 # [FIX] If inside tool call, discard this text (usually \n), don't append
                 self.parsed_pos += len(current_slice)
@@ -452,7 +545,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             else:
                 # '<' is in the middle
                 text_segment = current_slice[:next_open_angle]
-                if not self.is_inside_tool_call:
+                if self._emits_text():
                     normal_text_chunks.append(text_segment)
                 # [FIX] If inside tool call, discard whitespace/text before Tag
                 self.parsed_pos += next_open_angle
