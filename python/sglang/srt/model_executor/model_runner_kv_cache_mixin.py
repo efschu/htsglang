@@ -5704,6 +5704,113 @@ class ModelRunnerKVCacheMixin:
                 max(already_reserved, seam._corridor_law_bytes()) >> 20,
                 floor_charge >> 20,
             )
+        # #685: HOW MANY ATTENTION LAYERS DOES THIS RANK ACTUALLY RECEIVE at
+        # the flip? A rank that receives none pays no per-token seam -- its
+        # measured per_row_bytes is BASELINE (checksums, the one-layer
+        # streaming window, allocator grain), not transfer, and reserving it
+        # per token holds back memory for bytes that never move. Measured
+        # 2026-08-16: the binding rank was 192 MiB short on a 1059 MiB need
+        # whose per-token term was ~190 MiB.
+        #
+        # DERIVED, NEVER FROZEN, and LOUD ABOUT ITS SOURCE. The frozen triple
+        # in phase_flip_seam_reserve is a drift watchdog, not an input; the
+        # live value is per-boot measured. The map comes from
+        # derive_pp_full_attn_layer_map, whose own docstring warns that the
+        # layer-id list must be the UNMUTATED global one (the PP stack's
+        # model_config is rewritten by adjust_hybrid_swa_layers_for_pp), so
+        # the source is logged and any doubt falls back to the previous
+        # arithmetic rather than guessing.
+        # ALL THREE NAMES ARE DEFINED BEFORE ANY BRANCH CAN READ THEM. The
+        # first version assigned attn_counts and rank only inside the success
+        # path of the try below, and defined received_layers only after the
+        # cold branch that consumes it -- which sigquit every rank at startup
+        # with "UnboundLocalError: cannot access local variable
+        # 'received_layers'" (12:37, 30030 down). Same shape as the silent
+        # guard before it: a branch that skips the derivation must also define
+        # what the consumer reads, not merely skip the assignment.
+        received_layers = None
+        attn_counts = None
+        rank = 0
+        try:
+            from sglang.srt.managers.phase_flip_runtime import (
+                derive_pp_full_attn_layer_map,
+            )
+            from sglang.srt.managers.seam_slope import received_attention_layers
+
+            vec = getattr(self.server_args, "phase_flip_tp_vector", None)
+            if isinstance(vec, str):
+                vec = [float(x) for x in vec.split(",") if x.strip()]
+            # THE LIST LIVES ON hf_text_config, NOT ON model_config. The flip
+            # runtime reads exactly this path
+            # (tp_model_config.hf_text_config.full_attention_layer_ids) and its
+            # own comment explains why: the attention registry reads it via
+            # runner.mambaish_config. Reading model_config directly returned an
+            # EMPTY list here and silently disarmed the whole derivation --
+            # measured, tp_vector and num_hidden=64 and pp_size=3 all present,
+            # full_attention_layer_ids=0 entries. model_config is kept as a
+            # fallback because the PP stack's copy is the mutated one and an
+            # empty list from either source must not look like "no attention".
+            ids = list(
+                getattr(
+                    getattr(self.model_config, "hf_text_config", None),
+                    "full_attention_layer_ids",
+                    None,
+                )
+                or getattr(self.model_config, "full_attention_layer_ids", None)
+                or []
+            )
+            n_hidden = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
+            pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
+            rank = int(getattr(self, "pp_rank", getattr(self, "tp_rank", 0)) or 0)
+            if vec and ids and n_hidden > 0 and pp_size > 1:
+                layer_map = derive_pp_full_attn_layer_map(ids, n_hidden, pp_size)
+                attn_counts = [len(stage) for stage in layer_map]
+                n_attn_total = sum(attn_counts)
+                received = received_attention_layers(vec, attn_counts, n_attn_total)
+                received_layers = int(received[rank])
+                logger.info(
+                    "%s (rank %d): received-layer derivation -- attention map "
+                    "%s over %d total, tp vector %s -> this rank RECEIVES %d "
+                    "layer(s) at the flip. %s",
+                    seam.LOG_PREFIX,
+                    rank,
+                    attn_counts,
+                    n_attn_total,
+                    vec,
+                    received_layers,
+                    (
+                        "Zero received: its measured per_row_bytes is baseline, "
+                        "not seam, so no per-token seam is reserved."
+                        if received_layers <= 0
+                        else "Nonzero: the measured per-token slope stands."
+                    ),
+                )
+            else:
+                # THE GUARD MUST SPEAK WHEN IT REFUSES. The first version
+                # logged only on the success branch, so a falsy input left
+                # received_layers=None with NO line anywhere and the fix sat
+                # inert through two boots looking like it had simply not been
+                # reached. A silent precondition is indistinguishable from
+                # dead code.
+                logger.info(
+                    "%s: received-layer derivation SKIPPED -- tp_vector=%s "
+                    "full_attention_layer_ids=%d entr(y/ies) num_hidden=%s "
+                    "pp_size=%s. The falsy one is the missing input; the "
+                    "per-token seam charge stays at its measured value.",
+                    seam.LOG_PREFIX,
+                    vec,
+                    len(ids),
+                    n_hidden,
+                    pp_size,
+                )
+        except Exception as exc:  # noqa: BLE001 - sizing must not fail on a probe
+            logger.info(
+                "%s: received-layer derivation unavailable (%r); the per-token "
+                "seam charge stays at its measured value.",
+                seam.LOG_PREFIX,
+                exc,
+            )
+
         if not reserve.active:
             # #685 COLD BOOT: PRICE THE SEAM FROM THE LAYOUT, do not skip it.
             #
@@ -5818,102 +5925,6 @@ class ModelRunnerKVCacheMixin:
             )
         except Exception:
             survivable = False
-        # #685: HOW MANY ATTENTION LAYERS DOES THIS RANK ACTUALLY RECEIVE at
-        # the flip? A rank that receives none pays no per-token seam -- its
-        # measured per_row_bytes is BASELINE (checksums, the one-layer
-        # streaming window, allocator grain), not transfer, and reserving it
-        # per token holds back memory for bytes that never move. Measured
-        # 2026-08-16: the binding rank was 192 MiB short on a 1059 MiB need
-        # whose per-token term was ~190 MiB.
-        #
-        # DERIVED, NEVER FROZEN, and LOUD ABOUT ITS SOURCE. The frozen triple
-        # in phase_flip_seam_reserve is a drift watchdog, not an input; the
-        # live value is per-boot measured. The map comes from
-        # derive_pp_full_attn_layer_map, whose own docstring warns that the
-        # layer-id list must be the UNMUTATED global one (the PP stack's
-        # model_config is rewritten by adjust_hybrid_swa_layers_for_pp), so
-        # the source is logged and any doubt falls back to the previous
-        # arithmetic rather than guessing.
-        received_layers = None
-        try:
-            from sglang.srt.managers.phase_flip_runtime import (
-                derive_pp_full_attn_layer_map,
-            )
-            from sglang.srt.managers.seam_slope import received_attention_layers
-
-            vec = getattr(self.server_args, "phase_flip_tp_vector", None)
-            if isinstance(vec, str):
-                vec = [float(x) for x in vec.split(",") if x.strip()]
-            # THE LIST LIVES ON hf_text_config, NOT ON model_config. The flip
-            # runtime reads exactly this path
-            # (tp_model_config.hf_text_config.full_attention_layer_ids) and its
-            # own comment explains why: the attention registry reads it via
-            # runner.mambaish_config. Reading model_config directly returned an
-            # EMPTY list here and silently disarmed the whole derivation --
-            # measured, tp_vector and num_hidden=64 and pp_size=3 all present,
-            # full_attention_layer_ids=0 entries. model_config is kept as a
-            # fallback because the PP stack's copy is the mutated one and an
-            # empty list from either source must not look like "no attention".
-            ids = list(
-                getattr(
-                    getattr(self.model_config, "hf_text_config", None),
-                    "full_attention_layer_ids",
-                    None,
-                )
-                or getattr(self.model_config, "full_attention_layer_ids", None)
-                or []
-            )
-            n_hidden = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
-            pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
-            rank = int(getattr(self, "pp_rank", getattr(self, "tp_rank", 0)) or 0)
-            if vec and ids and n_hidden > 0 and pp_size > 1:
-                layer_map = derive_pp_full_attn_layer_map(ids, n_hidden, pp_size)
-                attn_counts = [len(stage) for stage in layer_map]
-                n_attn_total = sum(attn_counts)
-                received = received_attention_layers(vec, attn_counts, n_attn_total)
-                received_layers = int(received[rank])
-                logger.info(
-                    "%s (rank %d): received-layer derivation -- attention map "
-                    "%s over %d total, tp vector %s -> this rank RECEIVES %d "
-                    "layer(s) at the flip. %s",
-                    seam.LOG_PREFIX,
-                    rank,
-                    attn_counts,
-                    n_attn_total,
-                    vec,
-                    received_layers,
-                    (
-                        "Zero received: its measured per_row_bytes is baseline, "
-                        "not seam, so no per-token seam is reserved."
-                        if received_layers <= 0
-                        else "Nonzero: the measured per-token slope stands."
-                    ),
-                )
-            else:
-                # THE GUARD MUST SPEAK WHEN IT REFUSES. The first version
-                # logged only on the success branch, so a falsy input left
-                # received_layers=None with NO line anywhere and the fix sat
-                # inert through two boots looking like it had simply not been
-                # reached. A silent precondition is indistinguishable from
-                # dead code.
-                logger.info(
-                    "%s: received-layer derivation SKIPPED -- tp_vector=%s "
-                    "full_attention_layer_ids=%d entr(y/ies) num_hidden=%s "
-                    "pp_size=%s. The falsy one is the missing input; the "
-                    "per-token seam charge stays at its measured value.",
-                    seam.LOG_PREFIX,
-                    vec,
-                    len(ids),
-                    n_hidden,
-                    pp_size,
-                )
-        except Exception as exc:  # noqa: BLE001 - sizing must not fail on a probe
-            logger.info(
-                "%s: received-layer derivation unavailable (%r); the per-token "
-                "seam charge stays at its measured value.",
-                seam.LOG_PREFIX,
-                exc,
-            )
         new_bytes, allowed = seam.seam_adjusted_budget_bytes(
             budget_bytes,
             cell,
