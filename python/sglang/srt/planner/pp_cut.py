@@ -594,9 +594,11 @@ def layer_families_from_config(
                 f"{len(explicit)} entries but num_hidden_layers is {n}."
             )
         return tuple(
-            LAYER_FAMILY_ATTENTION
-            if str(t) == LAYER_FAMILY_ATTENTION
-            else LAYER_FAMILY_LINEAR
+            (
+                LAYER_FAMILY_ATTENTION
+                if str(t) == LAYER_FAMILY_ATTENTION
+                else LAYER_FAMILY_LINEAR
+            )
             for t in explicit
         )
 
@@ -1139,3 +1141,270 @@ def validate_pp_cut(
         candidates_considered=k,
     )
     return solution, tuple(violations)
+
+
+# ---------------------------------------------------------------------------
+# #602 term 2: solve the cut for the KV FLOOR
+# ---------------------------------------------------------------------------
+#
+# Under a pipeline the KV token count is necessarily UNIFORM across stages: a
+# request's tokens occupy KV on every stage, each in its own layers. So
+# `model_runner_kv_cache_mixin.py` min-reduces the per-stage capacities into one
+# world value, and every stage above that minimum strands its surplus. Measured
+# on the 2026-08-16 boot: 78362 tokens stranded on PP0 and 55255 on PP2, about
+# 1.4 GiB that no post holds and no rank can spend.
+#
+# THAT SURPLUS IS NOT RECLAIMABLE WHERE IT SITS. It can only be converted by
+# moving LAYERS: give the roomy stage more of them and the binding stage's
+# per-token cost falls, so the world minimum rises. Hence a second objective
+# over the same contiguous search space.
+#
+# WHY NOT REUSE solve_pp_cut's SECOND PASS. That pass maximizes the tightest
+# `runnable_headroom_mib`. Headroom is not capacity: each stage converts MiB
+# into tokens at a rate set by its OWN attention-layer count, so the cut that
+# leaves the most MiB on the tightest card is not the cut that lets the pipeline
+# address the most tokens. The two objectives genuinely differ and this one is
+# the fill-side question.
+
+
+@dataclasses.dataclass(frozen=True)
+class KvFloorSolution:
+    """The cut that maximizes the world KV floor, with its justification."""
+
+    counts: Tuple[int, ...]
+    bounds: Tuple[int, ...]
+    attention_counts: Tuple[int, ...]
+    stages: Tuple[StageCost, ...]
+    #: min_r(capacity_r) -- the token count the pipeline can actually address.
+    floor_tokens: float
+    #: Per-stage capacity, same order as ``stages``.
+    stage_tokens: Tuple[float, ...]
+    feasible: bool
+    refusals: Tuple[str, ...] = ()
+    candidates_considered: int = 0
+
+    def as_layer_ratio(self) -> List[int]:
+        return list(self.counts)
+
+    def summary(self) -> str:
+        if not self.feasible:
+            return "KV-floor cut: INFEASIBLE\n  " + "\n  ".join(self.refusals)
+        rows = "\n".join(
+            f"  stage {i} {c.rank}: layers {c.n_layers} (attn {c.n_attention}), "
+            f"capacity {t:.0f} tokens, runnable headroom "
+            f"{c.runnable_headroom_mib:.0f} MiB"
+            for i, (c, t) in enumerate(zip(self.stages, self.stage_tokens))
+        )
+        return (
+            f"KV-floor cut {list(self.counts)}: world floor "
+            f"{self.floor_tokens:.0f} tokens\n{rows}"
+        )
+
+
+def _bounds_from_counts(counts: Sequence[int]) -> List[int]:
+    out, acc = [], 0
+    for c in counts:
+        acc += int(c)
+        out.append(acc)
+    return out
+
+
+def stage_kv_capacity(inputs: PPCutInputs, cost: StageCost) -> Optional[float]:
+    """Tokens this stage could hold, or ``None`` when it holds none.
+
+    Inverts the pricing rather than re-deriving it: ``kv_mib`` was priced at
+    ``inputs.arena_tokens``, so the per-token cost is exact and any future
+    change to the arena model (the TP-share ``max()``, a new family) is picked
+    up here for free instead of drifting in a second copy.
+
+    ``runnable_headroom_mib + kv_mib`` is what the stage could spend on KV once
+    the corridor, the transient, the fixed overhead and the seam staging are all
+    funded -- the hard constraints stay hard and are simply not part of the
+    spendable pot.
+
+    ``None`` for a stage with no full-attention layer: its KV pool is empty, so
+    its capacity is unbounded and it would win every maximin while contributing
+    no KV at all. That is the same refusal ``solve_pp_cut`` already makes.
+    """
+    arena = float(inputs.arena_tokens)
+    if arena <= 0.0 or cost.kv_mib <= 0.0:
+        return None
+    spendable = cost.runnable_headroom_mib + cost.kv_mib
+    if spendable <= 0.0:
+        return None
+    return spendable * arena / cost.kv_mib
+
+
+def stage_kv_capacities(
+    counts: Sequence[int], inputs: PPCutInputs
+) -> Tuple[Optional[float], ...]:
+    """Per-stage capacity for an ARBITRARY cut -- the incumbent included.
+
+    An optimiser that cannot score the cut it proposes to replace cannot be
+    shown to beat it, so this is public and takes plain layer counts.
+    """
+    if len(counts) != inputs.pp_size:
+        raise ValueError(
+            f"stage_kv_capacities: {len(counts)} counts for "
+            f"{inputs.pp_size} stages."
+        )
+    if sum(int(c) for c in counts) != inputs.n_layers:
+        raise ValueError(
+            f"stage_kv_capacities: counts {list(counts)} cover "
+            f"{sum(int(c) for c in counts)} layers, model has "
+            f"{inputs.n_layers}."
+        )
+    pref_attn = _prefix_attention(inputs.layer_families)
+    bounds = _bounds_from_counts(counts)
+    starts = [0] + bounds[:-1]
+    out: List[Optional[float]] = []
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        out.append(stage_kv_capacity(inputs, cost))
+    return tuple(out)
+
+
+def world_kv_floor(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r(capacity_r)`` for a given cut, or ``None`` if inadmissible.
+
+    ``None`` rather than 0.0 or -inf: a cut that cannot fund the corridor and
+    the seam has no capacity to report, and returning a number would let a
+    caller rank it against cuts that can.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    floor = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if not cost.feasible:
+            return None
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_kv_capacity(inputs, cost)
+        if cap is None:
+            return None
+        floor = min(floor, cap)
+    return None if floor is math.inf else floor
+
+
+def solve_pp_cut_for_kv_floor(
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> KvFloorSolution:
+    """Exactly maximize ``min_r(capacity_r)`` over contiguous cuts.
+
+    One maximin dynamic program over stage boundaries, the same shape as
+    ``solve_pp_cut``'s second pass and exactly solvable for the same reason:
+    the objective is a single aggregate (a minimum) over per-stage values that
+    depend only on ``(stage, start, end)``.
+
+    Infeasible input does not fall back to an even split (the #202 lesson): it
+    returns ``feasible=False`` with a named reason per rank.
+
+    TWO MODELLING LIMITS, NAMED RATHER THAN GUESSED:
+
+    * The NEXTN / draft head is not modelled anywhere in this module, so a
+      deployment that places a draft head on one stage pays bytes this solve
+      does not see. On the flip-target layout that placement is a real term.
+    * ``seam_staging_mib`` is a per-rank SCALAR here, but the live seam reserve
+      is ``fixed + per-token`` (measured 227 MiB + 2360.1 B/token on rank 0),
+      and the per-token part scales with the very arena this function solves
+      for. Feeding a scalar measured at one arena size makes this a solve at
+      that operating point, not a fixed point. Solving the fixed point needs a
+      seam model this module does not have; until then, re-measure the scalar
+      at the arena the solve proposes and re-run.
+    """
+    n = inputs.n_layers
+    k = inputs.pp_size
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < n
+
+    cache: Dict[Tuple[int, int, int], StageCost] = {}
+
+    def price(stage: int, start: int, end: int) -> StageCost:
+        key = (stage, start, end)
+        got = cache.get(key)
+        if got is None:
+            got = _price_stage(inputs, stage, start, end, pref_attn)
+            cache[key] = got
+        return got
+
+    def value(stage: int, start: int, end: int) -> Optional[float]:
+        cost = price(stage, start, end)
+        if not cost.feasible:
+            return None
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        return stage_kv_capacity(inputs, cost)
+
+    considered = 0
+    best: List[List[float]] = [[-math.inf] * (n + 1) for _ in range(k + 1)]
+    choice: List[List[int]] = [[-1] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = math.inf
+    for s in range(1, k + 1):
+        hi = n - (k - s)
+        for b in range(s, hi + 1):
+            row = best[s - 1]
+            acc, arg = -math.inf, -1
+            for prev in range(s - 1, b):
+                base = row[prev]
+                if base == -math.inf:
+                    continue
+                considered += 1
+                cand = value(s - 1, prev, b)
+                if cand is None:
+                    continue
+                val = base if base < cand else cand
+                # Deterministic tie-break: the earliest boundary wins, so the
+                # same inputs always yield the same cut.
+                if val > acc:
+                    acc, arg = val, prev
+            best[s][b] = acc
+            choice[s][b] = arg
+
+    if best[k][n] == -math.inf:
+        fallback = _infeasible(inputs, pref_attn, hybrid, considered)
+        return KvFloorSolution(
+            counts=fallback.counts,
+            bounds=fallback.bounds,
+            attention_counts=fallback.attention_counts,
+            stages=fallback.stages,
+            floor_tokens=0.0,
+            stage_tokens=(),
+            feasible=False,
+            refusals=fallback.refusals,
+            candidates_considered=considered,
+        )
+
+    bounds_rev: List[int] = []
+    b = n
+    for s in range(k, 0, -1):
+        bounds_rev.append(b)
+        b = choice[s][b]
+    bounds = tuple(reversed(bounds_rev))
+    starts = (0,) + bounds[:-1]
+    stages = tuple(price(i, starts[i], bounds[i]) for i in range(k))
+    caps = tuple(float(stage_kv_capacity(inputs, c) or 0.0) for c in stages)
+    return KvFloorSolution(
+        counts=tuple(s.n_layers for s in stages),
+        bounds=bounds,
+        attention_counts=tuple(s.n_attention for s in stages),
+        stages=stages,
+        floor_tokens=min(caps),
+        stage_tokens=caps,
+        feasible=True,
+        refusals=(),
+        candidates_considered=considered,
+    )
