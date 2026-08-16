@@ -13,10 +13,18 @@ step back toward pool-max rungs as fill rises.
 Everything here is SOLVED, never tabulated. Rungs, admission thresholds,
 hysteresis bands and move costs are functions of measured inputs:
 
-  * ``FamilyPoolModel``   -- NVML free bytes, checkpoint weight bytes, the KV
-                             geometry, and the checkpoint's own layer_types
-                             vector (so a 0-GDN pure-attention model is just
-                             the degenerate family split, not a special case);
+  * ``PhasePoolModel``    -- Slot-2's canonical pool model (rev5): NVML free
+                             bytes, checkpoint weight bytes, the KV cell taken
+                             FROM CONFIG, the per-layout arming floor and the
+                             GDN residency. This module does not reimplement
+                             it; an earlier duplicate of mine was deleted when
+                             the attention-only divisor was adjudicated;
+  * ``layer_families``    -- the checkpoint's own layer_types vector, so a
+                             0-GDN pure-attention model is the degenerate
+                             family split rather than a special case;
+  * ``arming_floor_for``  -- the per-LAYOUT arming floor. Required, because a
+                             constant floor is the error that over-predicted an
+                             unchanged rank's measured capacity by 4.8%;
   * ``ms_per_layer``      -- the per-rank per-layer prefill self-probe;
   * ``link_mib_per_s``    -- the measured pair-matrix link reach per rank;
   * ``min_pool_tokens``   -- the corridor floor the deployment must serve;
@@ -32,15 +40,15 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from sglang.srt.planner.pp_cut import (
-    FamilyPoolModel,
+    PhasePoolModel,
     PrefillTiming,
     _enumerate_cuts,
     attention_counts,
-    family_phase_pool,
     pipelined_prefill_ms,
+    pp_phase_pool,
     serial_prefill_ms,
 )
 
@@ -49,21 +57,60 @@ from sglang.srt.planner.pp_cut import (
 class LadderInputs:
     """Measured inputs. Every field is probed; none is a policy constant."""
 
-    pool: FamilyPoolModel
+    pool: PhasePoolModel
+    layer_families: tuple[str, ...]
     ms_per_layer: tuple[float, ...]
     fixed_ms: tuple[float, ...]
     link_mib_per_s: tuple[float, ...]
     min_pool_tokens: float
     prefill_tokens_per_s: float
+    # Per-rank arming floor FOR A GIVEN CUT. The floor moves with the layout
+    # (measured 2255/1728/2467 MiB on [32,16,16] against 1728/1825/2467 on
+    # [28,20,16]), and treating it as a constant carried ~84% of the +9.6%
+    # common-mode over-prediction that sank three boots. So the ladder cannot
+    # hold one floor: it asks per rung.
+    #
+    # KNOWN GAP, inherited from the #676 machinery: that solver derives the
+    # floor from a MEASURED seam draw, so a cut that has never booted has no
+    # solved floor. Every unbooted rung therefore carries its proxy's floor
+    # uncertainty -- about +-500 MiB, which at 8 attention layers is +-32,000
+    # tokens (~7%). A ladder is mostly unbooted rungs, so this is the dominant
+    # error term in every pool number below, and it is the reason a rung's
+    # predicted pool is not a boot gate on its own.
+    arming_floor_for: Callable[[Sequence[int]], Sequence[float]] = None  # type: ignore[assignment]
     # Fraction of a rung's pool held back as the admission ceiling. It is a
     # deployment input (the corridor's own safety statement), not a tuning
     # constant invented here.
     admit_fraction: float = 0.95
 
+    def __post_init__(self) -> None:
+        if self.arming_floor_for is None:
+            raise ValueError(
+                "arming_floor_for is required: the arming floor is per-layout, "
+                "and pricing a ladder with one constant floor is the error that "
+                "produced a 4.8% over-prediction of an UNCHANGED rank's measured "
+                "capacity. Pass the #676 solver "
+                "(phase_flip_seam_reserve.arming_floor_target_bytes), or an "
+                "explicit proxy whose uncertainty you are willing to carry."
+            )
+
     def timing(self) -> PrefillTiming:
         return PrefillTiming(
             ms_per_layer=tuple(self.ms_per_layer), fixed_ms=tuple(self.fixed_ms)
         )
+
+    def pool_model_for(self, counts: Sequence[int]) -> PhasePoolModel:
+        """The pool model with THIS layout's arming floor substituted in."""
+        return dataclasses.replace(
+            self.pool,
+            arming_floor_mib=tuple(float(x) for x in self.arming_floor_for(counts)),
+        )
+
+
+def _pool_for(counts: Sequence[int], inputs: LadderInputs) -> float:
+    """PP-phase pool for one cut, priced with that cut's own arming floor."""
+    attn = attention_counts(inputs.layer_families, counts)
+    return pp_phase_pool(counts, attn, inputs.pool_model_for(counts))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,7 +178,7 @@ def solve_layout_ladder(inputs: LadderInputs) -> Ladder:
     is beaten on both axes is not a rung.
     """
     model = inputs.pool
-    families = model.layer_families
+    families = inputs.layer_families
     depth = len(families)
     n_ranks = len(model.free_mib)
     if len(inputs.ms_per_layer) != n_ranks:
@@ -152,7 +199,7 @@ def solve_layout_ladder(inputs: LadderInputs) -> Ladder:
     priced: list[tuple[tuple[int, ...], float, float, float]] = []
     for counts in _enumerate_cuts(depth, n_ranks, 1):
         try:
-            pool = family_phase_pool(counts, model)
+            pool = _pool_for(counts, inputs)
         except ValueError:
             # Infeasible on weights, or a stage with no attention layer at all.
             # Both are refusals, not candidates. The rank0 depth cap lives here
@@ -233,7 +280,7 @@ def _solve_transitions(
     pair is dropped, and a link slow enough collapses the ladder to nothing --
     which is the honest answer, not a ladder that thrashes.
     """
-    families = inputs.pool.layer_families
+    families = inputs.layer_families
     out: list[Transition] = []
     fill_rate = float(inputs.prefill_tokens_per_s)
     for a, b in itertools.pairwise(rungs):
@@ -340,7 +387,7 @@ def rung_family(
     family is fixed first, then the arena it implies prices every member.
     """
     model = inputs.pool
-    depth = len(model.layer_families)
+    depth = len(inputs.layer_families)
     n_ranks = len(model.free_mib)
     timing = inputs.timing()
     lo, hi = int(shallowest_rank0_layers), int(deepest_rank0_layers)
@@ -382,7 +429,7 @@ def solve_arena_ladder(
     the caller must see rather than a detail to hide.
     """
     model = inputs.pool
-    families = model.layer_families
+    families = inputs.layer_families
     n_ranks = len(model.free_mib)
     timing = inputs.timing()
 
@@ -411,12 +458,18 @@ def solve_arena_ladder(
         attn = attention_counts(families, counts)
         if any(a <= 0 for a in attn):
             continue
-        # GDN state is token-independent and follows the layers actually held.
+        # GDN state and the arming floor are token-independent but BOTH follow
+        # the layout, so they are charged per rung even though the arena is not.
+        floor = tuple(float(x) for x in inputs.arming_floor_for(counts))
         caps = []
         for r in range(n_ranks):
             linear = counts[r] - attn[r]
             free = (
-                free_after_arena[r] - float(model.mamba_mib_per_linear_layer) * linear
+                free_after_arena[r]
+                - float(model.mamba_mib_per_linear_layer_per_slot)
+                * linear
+                * int(model.mamba_slots)
+                - floor[r]
             )
             if free < 0.0:
                 break

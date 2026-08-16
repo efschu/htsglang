@@ -15,6 +15,9 @@ vector is never transferred across regimes.
 Hermetic: pure arithmetic, no CUDA.
 """
 
+import dataclasses
+import itertools
+
 import pytest
 from sglang.srt.planner.layout_ladder import (
     LadderInputs,
@@ -23,7 +26,11 @@ from sglang.srt.planner.layout_ladder import (
     solve_arena_ladder,
     solve_layout_ladder,
 )
-from sglang.srt.planner.pp_cut import FamilyPoolModel, layer_families_from_config
+from sglang.srt.planner.pp_cut import (
+    PhasePoolModel,
+    kv_mib_per_token_per_attn_layer_from_config,
+    layer_families_from_config,
+)
 
 # --------------------------------------------------------------------------
 # Profile A: this rig, as calibration data only.
@@ -32,15 +39,47 @@ RIG_FAMILIES = layer_families_from_config(
     {"num_hidden_layers": 64, "full_attention_interval": 4}
 )
 
+# Qwen3.8-27B INT8: fp8_e4m3 KV, 4 kv-heads, head_dim 256 -> 2048 B/token/attn
+# layer (K alone 1024 B), byte-exact against the [28,20,16] boot log.
+RIG_KV_CELL = kv_mib_per_token_per_attn_layer_from_config(
+    {"num_key_value_heads": 4, "head_dim": 256}, "fp8_e4m3"
+)
+# Full per-GDN-layer residency, measured (Slot-2 5edfd83978): temporal_state
+# 19.5 + speculative intermediate_ssm_state_cache 30.0 + conv_state 0.762 +
+# intermediate_conv_window 0.586. Charging only the 19.5 temporal term
+# under-charges a GDN layer move by 2.6x.
+RIG_GDN_MIB_PER_LAYER = 50.85
+
+
+# STRUCTURAL FIXTURE, NOT A CALIBRATED PREDICTOR. The review gate established
+# that this free-bytes vector does not reproduce the measured boots: it was
+# fitted against the incumbent and therefore absorbed the layout-varying terms
+# (arming floors, GDN residency) that a new layout exposes. The tests below
+# assert STRUCTURE -- monotonicity, domination, hysteresis, arena residency --
+# which is invariant to the free vector. No pool VALUE here is bootable, and
+# the canonical calibrated model is Slot-2's.
+def _rig_pool() -> PhasePoolModel:
+    return PhasePoolModel(
+        free_mib=(26721.2, 16051.3, 13984.3),
+        weight_mib_per_layer=450.7,
+        kv_mib_per_token_per_attn_layer=RIG_KV_CELL,
+        arming_floor_mib=(1728.0, 1825.0, 2467.0),
+        mamba_mib_per_linear_layer_per_slot=RIG_GDN_MIB_PER_LAYER,
+        mamba_slots=1,
+    )
+
+
+def _flat_floor(counts):
+    """Proxy floor. A CONSTANT floor is exactly the D3 error, so it is only
+    admissible in structural tests and is never a boot input."""
+    return (1728.0, 1825.0, 2467.0)
+
 
 def _rig_inputs(**over) -> LadderInputs:
     base = {
-        "pool": FamilyPoolModel(
-            free_mib=(26721.2, 16051.3, 13984.3),
-            weight_mib_per_layer=450.7,
-            kv_mib_per_token_per_attn_layer=2 * 4 * 256 * 2 / (1024.0 * 1024.0),
-            layer_families=RIG_FAMILIES,
-        ),
+        "pool": _rig_pool(),
+        "layer_families": RIG_FAMILIES,
+        "arming_floor_for": _flat_floor,
         "ms_per_layer": (1.7571, 7.740, 7.275),
         "fixed_ms": (0.0, 0.0, 0.0),
         # Measured PCIe reach per rank, MiB/s. Rank0 sits on x4 here.
@@ -58,12 +97,16 @@ def _foreign_4card() -> LadderInputs:
         {"num_hidden_layers": 48, "full_attention_interval": 2}
     )
     return LadderInputs(
-        pool=FamilyPoolModel(
+        pool=PhasePoolModel(
             free_mib=(40000.0, 24000.0, 24000.0, 16000.0),
             weight_mib_per_layer=300.0,
-            kv_mib_per_token_per_attn_layer=2 * 8 * 128 * 2 / (1024.0 * 1024.0),
-            layer_families=fam,
+            kv_mib_per_token_per_attn_layer=kv_mib_per_token_per_attn_layer_from_config(
+                {"num_key_value_heads": 8, "head_dim": 128}, "bf16"
+            ),
+            arming_floor_mib=(0.0, 0.0, 0.0, 0.0),
         ),
+        layer_families=fam,
+        arming_floor_for=lambda c: (0.0, 0.0, 0.0, 0.0),
         ms_per_layer=(2.0, 5.0, 5.0, 9.0),
         fixed_ms=(0.0, 0.0, 0.0, 0.0),
         link_mib_per_s=(20000.0, 20000.0, 20000.0, 20000.0),
@@ -78,12 +121,16 @@ def _uniform_rig() -> LadderInputs:
         {"num_hidden_layers": 48, "full_attention_interval": 2}
     )
     return LadderInputs(
-        pool=FamilyPoolModel(
+        pool=PhasePoolModel(
             free_mib=(40000.0, 40000.0, 40000.0, 40000.0),
             weight_mib_per_layer=300.0,
-            kv_mib_per_token_per_attn_layer=2 * 8 * 128 * 2 / (1024.0 * 1024.0),
-            layer_families=fam,
+            kv_mib_per_token_per_attn_layer=kv_mib_per_token_per_attn_layer_from_config(
+                {"num_key_value_heads": 8, "head_dim": 128}, "bf16"
+            ),
+            arming_floor_mib=(0.0, 0.0, 0.0, 0.0),
         ),
+        layer_families=fam,
+        arming_floor_for=lambda c: (0.0, 0.0, 0.0, 0.0),
         ms_per_layer=(4.0, 4.0, 4.0, 4.0),
         fixed_ms=(0.0, 0.0, 0.0, 0.0),
         link_mib_per_s=(20000.0, 20000.0, 20000.0, 20000.0),
@@ -97,12 +144,16 @@ def _foreign_pure_attention() -> LadderInputs:
     fam = layer_families_from_config({"num_hidden_layers": 32})
     assert set(fam) == {"full_attention"}
     return LadderInputs(
-        pool=FamilyPoolModel(
+        pool=PhasePoolModel(
             free_mib=(24000.0, 12000.0),
             weight_mib_per_layer=500.0,
-            kv_mib_per_token_per_attn_layer=2 * 8 * 128 * 2 / (1024.0 * 1024.0),
-            layer_families=fam,
+            kv_mib_per_token_per_attn_layer=kv_mib_per_token_per_attn_layer_from_config(
+                {"num_key_value_heads": 8, "head_dim": 128}, "bf16"
+            ),
+            arming_floor_mib=(0.0, 0.0),
         ),
+        layer_families=fam,
+        arming_floor_for=lambda c: (0.0, 0.0),
         ms_per_layer=(2.0, 9.0),
         fixed_ms=(0.0, 0.0),
         link_mib_per_s=(5000.0, 5000.0),
@@ -156,7 +207,7 @@ def test_no_constants_leak_the_rig_layout(name):
     """Every rung sums to the profile's own depth, on any card count."""
     inputs = ALL_PROFILES[name]()
     ladder = solve_layout_ladder(inputs)
-    depth = len(inputs.pool.layer_families)
+    depth = len(inputs.layer_families)
     n_ranks = len(inputs.pool.free_mib)
     for r in ladder.rungs:
         assert sum(r.counts) == depth
@@ -219,12 +270,7 @@ def test_rank0_cap_is_derived_not_typed():
     small = solve_layout_ladder(_rig_inputs())
     big = solve_layout_ladder(
         _rig_inputs(
-            pool=FamilyPoolModel(
-                free_mib=(90000.0, 16051.3, 13984.3),
-                weight_mib_per_layer=450.7,
-                kv_mib_per_token_per_attn_layer=2 * 4 * 256 * 2 / (1024.0 * 1024.0),
-                layer_families=RIG_FAMILIES,
-            )
+            pool=dataclasses.replace(_rig_pool(), free_mib=(90000.0, 16051.3, 13984.3))
         )
     )
     assert max(r.counts[0] for r in big.rungs) > max(r.counts[0] for r in small.rungs)
@@ -281,23 +327,46 @@ def test_arena_is_the_per_rank_max_over_the_family():
         assert arena[r] == max(c[r] for c in fam)
 
 
-def test_under_an_arena_equal_attention_profiles_have_equal_pool():
-    """The structural consequence that reshapes the ladder.
+def test_under_an_arena_same_attention_profile_differs_only_by_gdn_residency():
+    """The structural consequence that reshapes the ladder -- corrected.
 
-    With free memory pinned by the arena, a rung's pool depends only on its
-    attention count. Two rungs sharing an attention profile therefore price
-    identically, so the faster one strictly dominates and they are NOT a ladder
-    pair. The ladder's real axis under an arena is the attention vector, not
-    the raw layer cut.
+    With free memory pinned by the arena, a rung's pool is set by its ATTENTION
+    count plus its GDN residency. So two rungs sharing an attention profile are
+    near-equal in pool, and the deeper one buys real pipeline speed for only
+    the GDN residency of the linear layers it gained.
+
+    An earlier version of this test asserted they were EXACTLY equal, hence the
+    deeper strictly dominated. That was an artifact of under-charging GDN: the
+    full per-layer residency is 50.85 MiB (temporal_state 19.5 + speculative
+    intermediate_ssm_state_cache 30.0 + conv_state 0.762 + intermediate_conv
+    0.586), not the 19.5 temporal term alone. At 8 attention layers, 50.85 MiB
+    is ~3,250 tokens -- small beside an attention layer's ~20k, but not zero,
+    and charging 19.5 would understate a GDN move by 2.6x.
     """
     ladder = solve_arena_ladder(_rig_inputs(), 38, 31)
-    seen = {}
+    by_profile: dict = {}
     for r in ladder.rungs:
-        assert r.attn_counts not in seen, (
-            f"rungs {seen.get(r.attn_counts)} and {r.counts} share attention "
-            f"profile {r.attn_counts}; one of them is dominated"
-        )
-        seen[r.attn_counts] = r.counts
+        by_profile.setdefault(r.attn_counts, []).append(r)
+    cell = RIG_KV_CELL
+    for profile, group in by_profile.items():
+        if len(group) < 2:
+            continue
+        for a, b in itertools.pairwise(group):
+            linear_a = sum(a.counts) - sum(a.attn_counts)
+            linear_b = sum(b.counts) - sum(b.attn_counts)
+            # The whole gap must be explained by GDN residency on the binding
+            # rank, never by the attention term -- the profile is identical.
+            gap_tokens = abs(a.pool_tokens - b.pool_tokens)
+            max_gdn_tokens = (
+                (abs(linear_a - linear_b) + 1)
+                * RIG_GDN_MIB_PER_LAYER
+                / (min(profile) * cell)
+            )
+            assert gap_tokens <= max_gdn_tokens, (
+                f"rungs {a.counts} and {b.counts} share attention profile "
+                f"{profile} but differ by {gap_tokens:,.0f} tokens, more than "
+                f"the {max_gdn_tokens:,.0f} that GDN residency can explain"
+            )
 
 
 def test_a_deeper_ladder_costs_the_shallow_rungs_pool():

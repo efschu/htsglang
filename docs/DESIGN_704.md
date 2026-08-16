@@ -1,8 +1,89 @@
 # DESIGN 704 — prefill layout ladder + PP-KV decoupling
 
-Status: design settled, Slice 0 landed green, Slices 1-2 specified.
-Worktree: `/spinning/wt-704-ladder`, branch `feat/704-prefill-ladder`,
-based on `0f9e9993c4` (Slot-2's corrected phase-separated solver).
+Status: design settled; Slice 0 landed green; converged onto Slot-2's canonical
+solver (rev5). Worktree: `/spinning/wt-704-ladder`, branch
+`feat/704-prefill-ladder`, merged with `c5afff7a8d` (Slot-2 rev5).
+
+---
+
+## ERRATA — review gate, 2026-08-16. These supersede the body below.
+
+The pre-boot review gate adjudicated the functional-form dispute **in this
+document's favour** (the pool's token term lives on attention layers only,
+proven white-box at the allocator and byte-exact against the boot log's K
+sizes). It also found **four defects of mine**. Where the body still shows an
+old number, this section wins.
+
+**E1 — the KV cell was wrong, because it was FITTED.** §2.2 read the cell as
+"4096 B (bf16)". The shipped config is `kv_cache_dtype='fp8_e4m3'`; the true
+cell is **2048 B** for K+V (1024 B for K), byte-exact against the `[28,20,16]`
+boot log. I derived 4096 by fitting against an observed pool, which also
+produced the bogus "0.83 of observed" fudge factor. **Every pool number in the
+body that predates this correction is wrong by up to 2x.** Fixed in code: the
+cell is now consumed from config via
+`pp_cut.kv_mib_per_token_per_attn_layer_from_config()`, unknown dtypes are
+refused rather than defaulted, and `test_kv_cell_from_config_704.py`
+reproduces the logged K sizes with zero free parameters.
+
+**E2 — the binding rank was wrong.** I claimed the incumbent "binds on rank1".
+The boot log shows **PP2 binds at 436,766** (PP1 463,406; PP0 clipped at
+550,000). The functional form was right; my free-bytes vector was not — and
+that error is the direct cause of E3.
+
+**E3 — `[33,15,16]` is RETRACTED as a boot arm.** My claimed pool of 457,604
+was **impossible**: `[33,15,16]` leaves rank2 byte-identical to the incumbent's
+(layers 48-63), whose measured cap is 436,766, so no cut keeping that rank2 can
+exceed it. I over-predicted an *unchanged* rank's measured capacity by 4.8%.
+Expected actual is ~387k, about **-11% vs incumbent**. Metal confirmed the
+class of error independently: `[32,16,16]` failed its pool gate at 416,796.
+The "discriminating experiment" justification is also void — the white-box
+adjudication settled the rule without a boot, so spending a window to re-prove
+it was waste.
+
+**E4 — GDN residency was under-charged 2.6x.** The full per-GDN-layer figure is
+**50.85 MiB**, not 19.5: temporal_state 19.5 + **speculative
+intermediate_ssm_state_cache 30.0** (5 spec slots x 4 draft tokens) +
+conv_state 0.762 + intermediate_conv_window 0.586. This is material to every
+rung that moves GDN layers, and it **falsified a structural claim of mine** —
+see §3.7, where "same attention profile ⇒ identical pool ⇒ the deeper rung
+strictly dominates" was an artifact of the missing 30 MiB term. Corrected, such
+rungs differ by their GDN residency (~3,250 tokens at 8 attention layers): a
+small real trade, not domination.
+
+**The structural consequence for the ladder** (this is the load-bearing
+finding, and it survives all four corrections): **no cut that keeps rank2 =
+layers 48-63 can beat the incumbent pool.** Rank2's 436,766 is a hard ceiling
+under the min-rule. Pool-positive rungs must *shrink rank2's attention count*
+(e.g. a 12-layer rank2 = 3 attention layers), or wait for Part B. A
+prefill-speed arm at pool-parity-or-below is a user trade decision, not a
+pool-gate pass.
+
+**The gate's binding lesson, which bit all three strands in one day:** a model
+calibrated against the incumbent silently absorbs exactly the layout-varying
+terms (attention counts, arming floors, GDN residency) that a new layout then
+exposes. Consume every term from config or instruments; fit nothing.
+
+### Convergence and ownership
+
+Slot-2's rev5 (`c5afff7a8d`) is now the **single canonical pool solver** and is
+merged into this branch. My duplicate `FamilyPoolModel` is **deleted**; rev5's
+`PhasePoolModel` (with its per-layout `arming_floor_mib` and mamba terms) is
+the only pool model. Division of ownership: **Slot-2 leads the solver; I own
+`layout_ladder.py`, `ladder_controller.py` and the arena model**, which now
+consume rev5 rather than reimplementing it. My two additions to `pp_cut.py` are
+the config-derived KV cell (E1) and `decoupled_phase_pool()` (Part B's
+projection), neither of which duplicates rev5.
+
+### Consequence for every pool number below
+
+Rev5's arming floor is **per layout**, and its own docstring records the gap:
+the #676 solver derives the floor from a *measured seam draw*, so **a cut that
+has never booted has no solved floor**. A ladder is mostly unbooted rungs, so
+every rung's predicted pool carries roughly **±500 MiB → ±32,000 tokens (~7%)**
+of floor uncertainty. `LadderInputs` therefore *requires* an
+`arming_floor_for(counts)` provider and refuses to be constructed without one —
+a constant floor is precisely the E3 error. **No rung's predicted pool in this
+document is a boot gate on its own.**
 
 ---
 
@@ -20,14 +101,31 @@ ranks, the pool stops depending on the cut at all, and the deepest rung becomes
 permanently affordable. **Part A is the near-term, metal-provable win and the
 control surface; Part B is what removes Part A's ceiling.**
 
-Measured consequence on this rig, from the solver in this branch:
+> **WITHDRAWN TABLE (E1/E3).** A table stood here giving pool figures for
+> `[31,17,16]` (518,433), `[41,11,12]` (254,687) and a decoupled `[44,10,10]`
+> (539,017, "+23.9%"). Every one of those pool values was computed with the
+> **fitted bf16 cell** and without per-layout arming floors or the correct GDN
+> residency. They are wrong by up to 2x and are withdrawn rather than
+> patched — re-deriving them is Slot-2's canonical solver's job, gated on the
+> retro-prediction check in §6, and quoting a corrected-looking number here
+> before that gate passes would repeat the exact mistake.
+>
+> The only pool figures in this document that are *evidence* are the measured
+> ones: **436,766 / 435,822 / 434,878** for `[28,20,16]` (PP2 binding) and
+> **416,796** for `[32,16,16]`.
 
-| layout | pipelined prefill | pool (live-equiv) |
-|---|---|---|
-| incumbent `[28,20,16]` | 1.000x | 434,878 (observed) |
-| best coupled rung `[31,17,16]` | 1.000x | 518,433 |
-| deepest coupled rung `[41,11,12]` | 1.507x | 254,687 |
-| **decoupled `[44,10,10]`** | **2.000x** | **539,017 (+23.9%)** |
+What survives the withdrawal is the **shape**, which is what the design rests
+on and which no pool constant changes:
+
+| layout | pipelined prefill | pool, coupled | pool, decoupled |
+|---|---|---|---|
+| shallow rung | 1.00x | highest | *cut-independent* |
+| deep rung | up to ~2x | collapses (÷ own attention count) | *cut-independent* |
+
+Coupled, speed and capacity oppose along the cut because the deepest rank's
+capacity is divided by its own attention count. Decoupled, the pool does not
+depend on the cut at all, because total weight bytes are constant however the
+layers are split. That asymmetry is the entire argument, and it is structural.
 
 Decoupling is not a marginal improvement to the ladder. It is the difference
 between a controller that must retreat under load and one that never does.
@@ -125,17 +223,27 @@ checkpoint has `num_key_value_heads=4`, `head_dim=256`, so one token of K+V for
 one attention layer is `2·4·256 = 2048` elements. The flat rule's calibrated
 cost is 960 bytes per token per layer — **0.47 bytes per element**, and no
 dtype has a fractional byte width. Priced on attention layers only, the same
-census yields **4096 B (bf16)** and lands at 0.83 of the observed pool, binding
-on rank1 — squarely inside the census's own known ~14-17% pessimism.
+census yields the cell **from config**: `2 x 4 x 256 x 1 B = 2048 B` under the
+shipped `fp8_e4m3`.
+
+> **Corrected (E1/E2).** This paragraph originally read "4096 B (bf16) … lands
+> at 0.83 of the observed pool, binding on rank1". Both halves were wrong and
+> for the same reason: I *fitted* the cell against an observed pool instead of
+> reading it from config, so the 2x dtype error and a bogus 0.83 fudge factor
+> cancelled into something that looked calibrated. The boot log settles it with
+> zero free parameters — at 436,766 tokens it logs K sizes 2.92 / 2.08 / 1.67
+> GB against attention counts 7 / 5 / 4, i.e. exactly `attn_i x 1024 B` per
+> token. **PP2 binds at 436,766**, not rank1.
 
 Both forms agree on *total* bytes per token, because both were fitted to the
 same observed pool. They disagree on the **distribution across ranks**, which
-is the only thing a cut solver produces. The flat form is a fit artifact.
+is the only thing a cut solver produces. The flat form is a fit artifact — and
+so, in its own smaller way, was mine.
 
 Consequence, and it is not academic: the two forms diverge exactly in the
-region the ladder operates in. Under the corrected rule `[33,15,16]` scores
-**1.330x pipelined at pool 457,604** — better than `[32,16,16]` on *both* axes.
-See §6 for the boot-arm implication.
+region the ladder operates in, which is why the divisor had to be settled. What
+does *not* follow is any specific boot arm — see §6, where my `[33,15,16]`
+recommendation is retracted.
 
 ### 2.3 Actuator survey — result
 
@@ -288,6 +396,38 @@ keep the layout they started under. This is deliberately the same discipline
 the flip controller already uses for seam waves, so the two share one
 quiescence notion rather than inventing a second.
 
+**D6 CORRECTION — as written, that rule can starve, and starves in exactly the
+case that matters.** With a 327,680-token context at a 512 chunk size a single
+prompt is 640 chunks, and with overlapping chunked admissions the "no chunked
+prefill mid-sequence" boundary can be arbitrarily far away — possibly never.
+**Ascent is needed precisely while fill is rising, i.e. while chunked prefills
+are active**, so the pending ascent that can never commit is the ladder's own
+#701-shaped wedge: the controller correctly decides to move and is structurally
+prevented from doing so, right up until the pool it was trying to escape
+overflows.
+
+The quiescence rule is therefore paired with an **admission hold with a bounded
+drain**:
+
+1. When a rung change goes pending, **stop admitting new chunked prefills**.
+   Already-admitted requests continue.
+2. The in-flight set then drains monotonically, so the boundary is reached in
+   bounded time — at most the longest in-flight remainder, which is a known
+   quantity, not an open-ended wait.
+3. The hold has a **deadline derived from the ascent's own urgency**: the
+   headroom at the moment the ascent was raised, divided by the measured fill
+   rate. If the drain would exceed it, the ascent is escalated ahead of
+   throughput rather than missed.
+4. Because the hold costs admission throughput, it is asymmetric: a **descent**
+   (speed-seeking, taken at low fill) never holds admission — it simply waits
+   for a natural boundary or is dropped. Only an **ascent** (safety-seeking)
+   may hold.
+
+The alternative — chunk-boundary-safe relocation, letting an in-flight request
+survive a layout change mid-sequence — is strictly better and strictly harder,
+and is not in scope for Slice 1. It is the right answer if the admission hold's
+throughput cost measures badly.
+
 **Not built:** per-request layout selection. One layout is regime-wide, per the
 `phasen-layoutwechsel` law. A rung is a property of the instance, not a request.
 
@@ -310,21 +450,37 @@ for the *deepest* rung and is resident at *every* rung — a rank does not get
 its weight bytes back when the ladder sits shallow. Modelled by
 `solve_arena_ladder()`, and the consequences are:
 
-1. **The shallow rungs get poorer.** For a rank0 span of [31, 38] the top
-   rung's pool falls from 518,433 to **390,700** live-equivalent — *below* the
-   incumbent's observed 434,878. Enabling the ladder costs ~10% pool at the top.
-2. **Two rungs with the same attention profile become identical in pool.** With
-   free memory pinned by the arena, a rung's pool depends only on its attention
-   count. So `[33,15,16]` and `[35,14,15]` — both (8,4,4) — price *exactly the
-   same*, and the faster one strictly dominates. **Under an arena the ladder's
-   real axis is the attention-count vector, not the raw layer cut.**
+1. **The shallow rungs get poorer.** A rank0 span that reaches deeper makes the
+   top rung poorer, because the arena it implies is resident even when the
+   ladder sits shallow. (The absolute figures previously quoted here — 518,433
+   and 390,700 — were computed with the fitted bf16 cell and are withdrawn per
+   E1; the *direction and mechanism* are unaffected, and are pinned by
+   `test_a_deeper_ladder_costs_the_shallow_rungs_pool`.)
+2. **Two rungs with the same attention profile differ only by GDN residency.**
+   With free memory pinned by the arena, a rung's pool is set by its attention
+   count plus its GDN state. So `[33,15,16]` and `[35,14,15]` — both (8,4,4) —
+   price *nearly* the same, differing by the residency of the linear layers
+   rank0 gained. **Under an arena the ladder's real axis is the attention-count
+   vector, not the raw layer cut.**
 
-Point 2 invalidates my own earlier Slice 1 proposal. I had picked
-`[33,15,16] ↔ [35,14,15]` precisely because it moves zero attention layers —
-which is exactly what makes it worthless *as a ladder pair*: the controller
-would simply sit on the faster rung forever. It remains a fine pair for proving
-the **mover** mechanically (weights move, no KV moves), and that is now its only
-stated purpose. A pair that actually trades must cross an attention boundary,
+> **Corrected (E4).** Point 2 originally claimed such rungs price *exactly* the
+> same, so the deeper one **strictly dominates**. That was an artifact of
+> charging GDN at 19.5 MiB/layer (temporal_state alone) instead of the true
+> **50.85** — the missing 30.0 MiB is the *speculative*
+> `intermediate_ssm_state_cache`. At 8 attention layers, 50.85 MiB is ~3,250
+> tokens, so a same-profile deeper rung buys pipeline speed for a small but
+> real pool cost. It is a weak trade, not a domination. The test that asserted
+> exact equality now asserts the gap is explicable by GDN residency and nothing
+> else — it failed the moment the correct constant landed, which is how the
+> error surfaced.
+
+Point 2 still invalidates my own earlier Slice 1 proposal, for the same reason
+in weakened form. I had picked `[33,15,16] ↔ [35,14,15]` precisely because it
+moves zero attention layers — which is what makes it nearly worthless *as a
+ladder pair*: the pool gap is ~3k tokens, far too small for a controller to
+trade against. It remains a fine pair for proving the **mover** mechanically
+(weights move, no KV moves), and that is now its only stated purpose. A pair
+that actually trades must cross an attention boundary,
 e.g. `[35,14,15]` (attn0=8) ↔ `[38,13,13]` (attn0=9).
 
 Solved arena ladder, rank0 span [31, 38], arena (38,16,17):
@@ -468,9 +624,38 @@ Three consequences, in descending order of value:
 
 Prize 3 is why the token vector must be chosen to match the TP phase and not
 merely "by free bytes". Free-byte proportionality and TP-vector identity
-coincide only if the TP vector is itself free-proportional; where they diverge,
-**TP identity wins**, because a phase-uniform layout is worth more than a
-locally optimal shard.
+coincide only if the TP vector is itself free-proportional.
+
+**D5 CORRECTION — "TP identity wins" was stated unconditionally, and it cannot
+be.** The measured TP vector puts ~43.8% of KV rows on rank0 (row counts
+190,681 / 136,201 / 108,961 in the boot log), and rank0 is the rank with the
+**least** free bytes at exactly the deep rungs Part B exists to unlock (e.g.
+`[44,10,10]`, where rank0 carries 44 layers of weights). So prize 1
+(cut-independent pool) and prize 3 (phase-uniform vector) can **contradict each
+other**: forcing the TP vector at a deep rung can make that rung infeasible.
+
+TP identity therefore carries a per-rung feasibility bound, checked before it
+is adopted:
+
+```
+vector_share_i x total_rows x kv_cell x total_attn_layers  <=  free_i
+```
+
+Resolution where the bound fails, stated so the choice is not made ad hoc at
+implementation time:
+
+- The **rung** yields first, not the vector. Phase-uniformity is worth more
+  than one extra rung of depth, because it is what deletes the seam move for
+  *every* flip; so the ladder's reachable depth is clipped to the deepest rung
+  at which the TP vector is feasible.
+- If **no** rung admits the TP vector, phase-uniformity is unavailable on this
+  hardware and Part B falls back to a free-proportional vector, keeping prizes
+  1 and 2 and losing prize 3. The design must not pretend prize 3 is
+  unconditional.
+- Re-deriving the TP vector to be more rank0-friendly is a *third* option that
+  trades decode balance for prefill depth. It is out of scope here and belongs
+  to whoever owns the TP vector, but it is named so it is not rediscovered as
+  novel.
 
 ### 4.3 Cost
 
@@ -482,10 +667,28 @@ the first thing Slice 3 measures.
 
 ### 4.4 Correctness gate — mandatory
 
-**Byte-identity A-vs-A for the decoupled attention path.** Same prompt, same
-seed, decoupled vs coupled, byte-identical output. Test inputs sampled on
-**CPU** and moved to device — `torch.randn` on-GPU is not architecture-identical
-across the 3080s and the 5090, and this rig has already been bitten by that.
+**D4 CORRECTION — the gate as originally written could never pass.** I demanded
+byte-identity "decoupled vs coupled". That is A-vs-**B**, not A-vs-A: an LSE
+merge sums partial results in a different floating-point order than monolithic
+attention, so bit-exact agreement is not a property correct code has. As
+written the gate would fail forever on a correct implementation, and the
+predictable outcome is that someone eventually waives it — which is worse than
+having no gate. Respecified as two gates:
+
+1. **Determinism (byte-identity, A-vs-A):** decoupled vs decoupled, identical
+   output across repeated runs *and* across boots, with inputs sampled on
+   **CPU** and moved to device — `torch.randn` on-GPU is not
+   architecture-identical across the 3080s and the 5090, and this rig has been
+   bitten by that before. This is the gate that catches a genuine
+   non-determinism, e.g. an arrival-ordered merge.
+2. **Agreement with the coupled reference, within a stated tolerance:**
+   max-abs and max-rel bounds fixed *before* the run, plus an end-to-end
+   greedy-decode token-sequence match over a fixed prompt set. Byte-identity is
+   required here **only** against a coupled reference forced to the identical
+   split schedule, which makes the summation orders match by construction; that
+   variant is the stronger check and should be built if it is cheap.
+
+Gate 1 is the one that must never be waived.
 
 An LSE merge is not associative in floating point, so merge order must be
 **fixed and rank-order-deterministic**, not arrival-order-dependent. This is
@@ -518,34 +721,47 @@ Named explicitly, so scope creep has to argue for itself:
 
 ---
 
-## 6. Boot-arm implication — for F4-r4, before the next window
+## 6. Boot-arm implication — RETRACTED, and what replaces it
 
-`[32,16,16]` was selected under the flat all-layer rule. Under the corrected
-family rule, **`[33,15,16]` dominates it on both axes** — 1.330x pipelined
-versus 1.250x, at pool 457,604 versus 475,012 model-equivalent, with an
-identical (8,4,4) attention profile. `[34,15,15]` is the same attention profile
-again at 1.333x.
+**I recommended `[33,15,16]` at pool 457,604. That number was impossible and
+the arm is withdrawn.**
 
-Two honest caveats, both of which argue for booting rather than re-deriving:
+The arithmetic I failed to do: `[33,15,16]` leaves rank2 holding layers 48-63 —
+**byte-identical to the incumbent's rank2**, whose measured capacity is 436,766
+(436,766 / 435,822 / 434,878 across three boots, ~1.9k noise). Under the
+min-rule the world pool cannot exceed the binding rank, so *no* cut keeping
+that rank2 can exceed 436,766. My 457,604 overshot an **unchanged rank's
+measured cap** by 4.8%. Expected actual is ~387k, about **-11% versus the
+incumbent** — a pool regression, not an improvement. `[32,16,16]` had already
+failed its gate on metal at 416,796, which is the same error class.
 
-1. The corrected rule is verified from allocator code and dimensional analysis,
-   **not yet on metal**. Both rules agree the arm-B class fails; they diverge in
-   the plateau.
-2. `PrefillTiming.fixed_ms` defaults to zero (`pp_cut.py:2206-2213`), the
-   optimistic end of the family. **Every speedup in this document is an upper
-   bound**, not a prediction, until a second measured cut pins the intercept.
+My "discriminating experiment" justification was also void. The divisor dispute
+was settled **white-box** — allocator source plus byte-exact K-size log lines —
+so a boot window spent re-proving it would have bought nothing.
 
-Which makes the recommendation a single arm that does double duty: **boot
-`[33,15,16]`**. It tests the corrected rule where it disagrees with the flat
-one, and it supplies the second calibration point that converts every speedup
-here from an upper bound into a measurement. A cut of `[32,15,17]` would
-discriminate the two rules even more sharply (the rules disagree by ~15% and in
-*opposite directions* there), but it is a worse operating point; `[33,15,16]`
-is the better arm because it is worth running on its own merits.
+**What actually follows, and it is a stronger result than the arm I lost:**
 
-This recommendation is **independent of everything in §3.7**: it is a single
-static cut, no ladder, no arena, no mover. Nothing in the actuator survey
-touches it. It is ready for a boot window now.
+> **No cut that keeps rank2 = layers 48-63 can beat the incumbent pool.**
+> Rank2's 436,766 is a hard ceiling. A pool-positive rung must **shrink rank2's
+> attention count** — e.g. a 12-layer rank2 holds 3 attention layers instead of
+> 4, lifting its cap by ~4/3 — or wait for Part B, which removes the per-rank
+> attention divisor entirely.
+
+That is the search direction for the next arm, and it is a *structural*
+constraint, not a number that needs re-measuring. It also reinforces §0's
+amended conclusion: the coupled ladder is boxed in by whichever rank owns the
+tail, and decoupling is the way out.
+
+**Before any further pool-gated boot**, the corrected model must clear a
+retro-prediction gate that can fail: reproduce all four measured points —
+434,878 / 435,822 / 436,766 (`[28,20,16]`) and 416,796 (`[32,16,16]`) — within
+boot noise, **with the correct binding rank each time**. Slot-2 owns that gate
+along with the canonical solver. Until it passes, no rung's predicted pool
+gates a window, including mine.
+
+Standing caveat, unchanged and now more relevant: `PrefillTiming.fixed_ms`
+defaults to zero, the optimistic end of the family, so **every speedup in this
+document is an upper bound** until a second measured cut pins the intercept.
 
 ---
 

@@ -16,22 +16,45 @@ Hermetic: pure arithmetic, no CUDA, no server.
 import pytest
 from sglang.srt.planner.ladder_controller import LadderController
 from sglang.srt.planner.layout_ladder import LadderInputs, solve_layout_ladder
-from sglang.srt.planner.pp_cut import FamilyPoolModel, layer_families_from_config
+from sglang.srt.planner.pp_cut import (
+    PhasePoolModel,
+    kv_mib_per_token_per_attn_layer_from_config,
+    layer_families_from_config,
+)
 
 RIG_FAMILIES = layer_families_from_config(
     {"num_hidden_layers": 64, "full_attention_interval": 4}
 )
 
+# Structural fixture only; see test_layout_ladder_704 for why no pool VALUE
+# here is bootable. The controller tests assert control behaviour, which is
+# invariant to the free-bytes vector.
+RIG_KV_CELL = kv_mib_per_token_per_attn_layer_from_config(
+    {"num_key_value_heads": 4, "head_dim": 256}, "fp8_e4m3"
+)
+
+
+def _rig_pool() -> PhasePoolModel:
+    return PhasePoolModel(
+        free_mib=(26721.2, 16051.3, 13984.3),
+        weight_mib_per_layer=450.7,
+        kv_mib_per_token_per_attn_layer=RIG_KV_CELL,
+        arming_floor_mib=(1728.0, 1825.0, 2467.0),
+        mamba_mib_per_linear_layer_per_slot=50.85,
+        mamba_slots=1,
+    )
+
+
+def _flat_floor(counts):
+    return (1728.0, 1825.0, 2467.0)
+
 
 def _rig_ladder():
     return solve_layout_ladder(
         LadderInputs(
-            pool=FamilyPoolModel(
-                free_mib=(26721.2, 16051.3, 13984.3),
-                weight_mib_per_layer=450.7,
-                kv_mib_per_token_per_attn_layer=2 * 4 * 256 * 2 / (1024.0 * 1024.0),
-                layer_families=RIG_FAMILIES,
-            ),
+            pool=_rig_pool(),
+            layer_families=RIG_FAMILIES,
+            arming_floor_for=_flat_floor,
             ms_per_layer=(1.7571, 7.740, 7.275),
             fixed_ms=(0.0, 0.0, 0.0),
             link_mib_per_s=(3000.0, 6000.0, 6000.0),
@@ -147,12 +170,26 @@ def test_no_move_is_committed_while_not_quiescent():
 
 
 def test_descend_only_happens_at_low_fill():
-    """Descending is bounded to the regime where KV movement is cheap."""
+    """Descending is bounded to the regime where KV movement is cheap.
+
+    Stated RELATIVE to the ladder's own solved threshold. An earlier version
+    used absolute token counts, which silently encoded the KV dtype: when the
+    cell was corrected from bf16 to the shipped fp8_e4m3 every pool doubled and
+    those constants became meaningless. A control test must not carry a
+    hardware constant.
+    """
     ladder = _rig_ladder()
     c = LadderController(ladder)
     c.force_rung(0)
-    for fill in [400_000.0, 380_000.0, 360_000.0]:
-        assert c.observe(fill, quiescent=True) is None
+    edge = c.active_descend_threshold()
+    assert edge is not None
+    for above in (1.30, 1.15, 1.001):
+        c.force_rung(0)
+        assert c.observe(edge * above, quiescent=True) is None
+    # And it DOES descend just below the same boundary -- otherwise the test
+    # above would pass on a controller that never descends at all.
+    c.force_rung(0)
+    assert c.observe(edge * 0.999, quiescent=True) is not None
 
 
 def test_a_single_ladder_step_per_observation():
@@ -181,12 +218,9 @@ def test_an_empty_transition_set_pins_the_controller():
     """
     ladder = solve_layout_ladder(
         LadderInputs(
-            pool=FamilyPoolModel(
-                free_mib=(26721.2, 16051.3, 13984.3),
-                weight_mib_per_layer=450.7,
-                kv_mib_per_token_per_attn_layer=2 * 4 * 256 * 2 / (1024.0 * 1024.0),
-                layer_families=RIG_FAMILIES,
-            ),
+            pool=_rig_pool(),
+            layer_families=RIG_FAMILIES,
+            arming_floor_for=_flat_floor,
             ms_per_layer=(1.7571, 7.740, 7.275),
             fixed_ms=(0.0, 0.0, 0.0),
             link_mib_per_s=(0.5, 0.5, 0.5),
