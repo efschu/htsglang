@@ -1981,3 +1981,80 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
         replicated_weight_bytes=sum(replicated.values()),
         replicated_breakdown=dict(replicated),
     )
+
+
+# ---------------------------------------------------------------------------
+# #685 desk half: where the rank-0 seam slope's 5.6x comes from
+# ---------------------------------------------------------------------------
+
+
+def seam_slope_bytes_per_token(
+    flip_tp_vector: Sequence[float],
+    attention_counts: Sequence[int],
+    kv_bytes_per_token_per_attn_layer: float,
+    n_attention_total: int,
+    baseline_bytes_per_token: Sequence[float] = (),
+) -> Tuple[float, ...]:
+    """Predict each rank's per-token seam slope from the CUT and the flip vector.
+
+    #685. The measured slopes on the reference rig are 2360.1 / 424.1 / 547.6
+    B/token -- rank 0 is 5.6x its peers, and nothing in the seam code explains
+    it because ``phase_flip_seam_reserve.py`` carries the triple as a frozen
+    measured constant (``basis_per_row_bytes``) rather than deriving it.
+
+    IT IS THE INCOMING LEG, AND ONLY THE INCOMING LEG.
+    ``phase_flip_runtime._staging_bytes`` peaks at
+    ``incoming + max(outgoing, local)``, and the incoming term is
+    ``dst.row_nbytes(layer) * rows`` summed over ``tr.recv_layers[peer]``. So a
+    rank's per-ROW slope is exactly the number of full-attention layers it must
+    RECEIVE at the cutover.
+
+    HOW MANY THAT IS, is decided by the mismatch between the two layouts:
+
+        received_r = max(0, tp_share_r * n_attention_total - attention_held_r)
+
+    On the reference rig, with ``--phase-flip-tp-vector 32,16,16`` and the cut
+    ``28,20,16`` (attention ``[7,5,4]``):
+
+        rank 0:  0.500 * 16 - 7 = +1 layer   -> 1 * 2326.7 = 2326.7 B/token
+        rank 1:  0.250 * 16 - 5 = -1 layer   -> sheds, receives nothing
+        rank 2:  0.250 * 16 - 4 =  0 layers  -> neutral, receives nothing
+
+    against measured 2360.1 / 424.1 / 547.6. Rank 0's prediction lands within
+    1.4 %; the other two are pure baseline, which is what the ~424-548 B/token
+    residual is. Rank 0 is not anomalous -- it is the ONLY rank the flip asks to
+    acquire KV, because the flip gives it half the token axis while the PP cut
+    gave it only 7 of 16 attention layers.
+
+    WHY THIS MATTERS TO ANY SOLVE THAT MOVES LAYERS. The slope is a FUNCTION OF
+    THE CUT. ``basis_per_row_bytes`` is valid only for the cut and flip vector
+    it was measured at; re-cutting the attention split changes ``received_r``
+    in whole-layer steps, so a solver that carries the frozen triple across
+    cuts is pricing the seam of a layout it is not proposing. A cut that moves
+    one attention layer onto rank 0 would RAISE its slope by another
+    ~2327 B/token, and one that moves an attention layer off rank 1 would start
+    charging rank 1 a slope it currently does not pay.
+
+    ``baseline_bytes_per_token`` is the residual every rank pays regardless
+    (checksums, the one-layer streaming window, allocator grain); supply the
+    measured values, default zero.
+    """
+    n = len(attention_counts)
+    if len(flip_tp_vector) != n:
+        raise ValueError(
+            f"seam_slope_bytes_per_token: {len(flip_tp_vector)} flip weights "
+            f"for {n} stages."
+        )
+    total = float(sum(float(w) for w in flip_tp_vector))
+    if total <= 0.0:
+        raise ValueError("seam_slope_bytes_per_token: flip vector sums to zero.")
+    base = list(baseline_bytes_per_token) + [0.0] * (n - len(baseline_bytes_per_token))
+    out: List[float] = []
+    for r in range(n):
+        share = float(flip_tp_vector[r]) / total
+        received = share * float(n_attention_total) - float(attention_counts[r])
+        out.append(
+            max(0.0, received) * float(kv_bytes_per_token_per_attn_layer)
+            + float(base[r])
+        )
+    return tuple(out)

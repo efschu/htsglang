@@ -320,3 +320,53 @@ class TheFloorBecomesAGate(unittest.TestCase):
             "the reclaim is back above 15 %, which on this rig meant the "
             "weight model had gone uncalibrated again",
         )
+
+
+class TheRank0SeamSlopeIsTheIncomingLeg(unittest.TestCase):
+    """#685 desk half: the 5.6x is not an anomaly, it is one received layer.
+
+    Measured on the reference rig: 2360.1 / 424.1 / 547.6 B/token.
+    """
+
+    MEASURED = (2360.1, 424.1, 547.6)
+    KVB = 2326.7
+    FLIP_VECTOR = (32, 16, 16)
+    ATTN = (7, 5, 4)
+    N_ATTN = 16
+
+    def test_rank0_is_predicted_within_two_percent(self):
+        got = pp_cut.seam_slope_bytes_per_token(
+            self.FLIP_VECTOR, self.ATTN, self.KVB, self.N_ATTN
+        )
+        self.assertAlmostEqual(got[0] / self.MEASURED[0], 1.0, delta=0.02)
+
+    def test_the_other_two_ranks_receive_nothing(self):
+        """Rank 1 sheds a layer and rank 2 is neutral, so their whole measured
+        slope is baseline -- which is why they are 5.6x smaller."""
+        got = pp_cut.seam_slope_bytes_per_token(
+            self.FLIP_VECTOR, self.ATTN, self.KVB, self.N_ATTN
+        )
+        self.assertEqual(got[1], 0.0)
+        self.assertEqual(got[2], 0.0)
+
+    def test_the_baseline_is_added_where_supplied(self):
+        got = pp_cut.seam_slope_bytes_per_token(
+            self.FLIP_VECTOR, self.ATTN, self.KVB, self.N_ATTN, (33.4, 424.1, 547.6)
+        )
+        for pred, meas in zip(got, self.MEASURED):
+            self.assertAlmostEqual(pred, meas, delta=1.0)
+
+    def test_the_slope_moves_when_the_cut_moves(self):
+        """The property that makes the frozen constant unsafe across cuts:
+        moving one attention layer onto rank 0 raises its slope by a layer."""
+        base = pp_cut.seam_slope_bytes_per_token(
+            self.FLIP_VECTOR, (7, 5, 4), self.KVB, self.N_ATTN
+        )
+        moved = pp_cut.seam_slope_bytes_per_token(
+            self.FLIP_VECTOR, (6, 6, 4), self.KVB, self.N_ATTN
+        )
+        self.assertAlmostEqual(moved[0] - base[0], self.KVB, delta=1.0)
+
+    def test_a_mis_sized_flip_vector_is_refused(self):
+        with self.assertRaises(ValueError):
+            pp_cut.seam_slope_bytes_per_token((32, 16), self.ATTN, self.KVB, 16)
