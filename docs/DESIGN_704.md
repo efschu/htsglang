@@ -1084,6 +1084,74 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## #690 — WHAT THE FIXED FLIP COST IS MADE OF
+
+The flip has been carried as a scalar (~2.0-4.2 s) with an unexplained
+residual. It is not a scalar: the runtime already reports a five-way split on
+every completed flip. Reading **765 unique `PHASE-FLIP DONE` lines** from the
+boot captures decomposes it, with no boot required.
+
+| component | median | share | what it is |
+|---|---|---|---|
+| read | 30.6 ms | 0.9% | seam read |
+| exchange | 847.8 ms | 25.3% | rank-to-rank KV |
+| write | 302.6 ms | 9.0% | seam write |
+| **movers** | **1458.4 ms** | **43.4%** | GDN state + **weights arena refill** (`phase_flip_runtime.py:1843-1846`) |
+| **cutover** | **670.7 ms** | **20.0%** | group routing, owner-rule refresh, component rebuild, scheduler swap (`:1147`) |
+| residual | 99.2 ms | 3.0% | unattributed |
+
+Totals: median 3357 ms, min 2401, max 4874 — the reported band. Both directions
+agree (pp_to_tp 3298 ms, tp_to_pp 3417 ms).
+
+**The premise is confirmed and then some.** `read + exchange + write` — the KV
+seam move, the part everyone reaches for — is **35.3%**. Sixty-plus percent sits
+outside it, and the **single largest component is `movers` at 43.4%**, which is
+the H2D copy of the target layout's weight image. The residual is only ~3%, so
+the "unexplained" part is small and the named parts are the story.
+
+*(Medians do not sum, so the composite used by the solver adds to slightly more
+than the median total; the per-event median of `(movers+cutover)/total` is
+61.6%, against 63.4% for the composite. Both are honest and both are labelled.)*
+
+### Ranked levers, priced in load rather than milliseconds
+
+Per #677, flip cost sets the stability floor and the latency ceiling in
+*opposite* directions, so a reduction **reopens refused configurations**. The
+right unit for a lever is therefore the maximum feasible load, not the saving.
+At a 10 s TTFT budget with an even phase split:
+
+| lever | F after | max feasible ρ | reopens | price |
+|---|---|---|---|---|
+| baseline (measured) | 3.36 s | 0.66 | — | — |
+| **L1 overlap movers behind the seam** (upper bound) | 2.21 s | **0.77** | **+0.11** | scheduling only |
+| L1 (lower bound, fully contending) | 3.36 s | 0.66 | +0.00 | — |
+| L2 phase-uniform vector (#704b) | 2.21 s | 0.77 | +0.11 | **costs ladder depth, n0 ≤ 37** |
+| L3 cutover to its observed minimum | 2.73 s | 0.72 | +0.06 | mechanism unknown |
+| **L1 + L3 (best realistic)** | **1.58 s** | **0.84** | **+0.18** | scheduling only |
+
+**Three things fall out, and the first is the one to act on.**
+
+1. **L1 and L2 deliver identical flip savings — 1150 ms, ρ 0.66 → 0.77 — but L1
+   is free and L2 costs ladder depth.** For flip cost specifically, #704b's
+   phase-uniform vector buys nothing that a pure scheduling change does not.
+   (It still earns its keep on #703's cache-key problem, which L1 does not
+   touch — so they are substitutes for *this* purpose only.) **Do L1 first.**
+2. **L1's saving is bounded `[0, 1150] ms`, and the bound is not yet measured.**
+   `movers` is H2D, and on this no-P2P rig the rank-to-rank `exchange` stages
+   *through host* — so both legs traverse the same PCIe direction and may
+   contend. If they fully contend the overlap saves nothing. Which end of the
+   bound holds is a measurement, and it is the single highest-value thing the
+   confirming window can capture.
+3. **L1 + L3 makes ρ = 0.8 feasible.** #677 refuses ρ = 0.8 at *every* measured
+   flip cost; at F = 1.58 s the ceiling rises to ρ = 0.84. That is the concrete
+   form of the repricing: not "save 1.8 s" but "the load the rig currently
+   refuses becomes servable".
+
+**`cutover` deserves instrumentation before optimisation.** Its 24x spread
+(43.5 to 1041.5 ms) is not the signature of a fixed cost — it looks like a wait
+or a serialisation. Sub-step timestamps would say which, and the observed
+minimum is the honest target rather than zero.
+
 ## #677 — PHASE WINDOW ECONOMICS: length solved, not set
 
 A static window is wrong in both directions — too short at high load (the
