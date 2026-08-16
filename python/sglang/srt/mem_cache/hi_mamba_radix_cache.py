@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_collective import HiCacheCollectiveDesyncError
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -72,6 +73,14 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+#: Self-identifying head of the #580 prefetch participation vote. Carried as
+#: (tag, -tag) so a MIN reduce over a group that is NOT all inside this
+#: collective produces slot0 != -slot1 and is caught instead of silently
+#: consumed. Same value as the unified cache's, deliberately: the two votes are
+#: the same mechanism on different trees, and a divergent tag would make a
+#: genuine cross-cache mixup look like a foreign payload.
+_MAMBA_PREFETCH_VOTE_TAG = 580
 
 
 class HostLRUList(LRUList):
@@ -2077,6 +2086,75 @@ class HiMambaRadixCache(MambaRadixCache):
         self.ongoing_backup[operation_id] = (node, mamba_host_protected)
         self._protect_host_node(node, protect_mamba=mamba_host_protected)
 
+    def _all_reduce_prefetch_vote(
+        self, tensor: torch.Tensor, op, label: str = "mamba-hicache"
+    ) -> None:
+        """Reduce on exactly the group the protected collectives use.
+
+        #580. ``can_terminate_prefetch`` and ``check_prefetch_progress`` both
+        reduce on ``self.tp_group`` under ``self.tp_world_size > 1``. The vote
+        exists to make participation in THOSE ops rank-uniform, so it is posted
+        on the same group rather than through the sibling caches'
+        attn-group helper: a vote on a different group would symmetrize entry
+        into a collective nobody is running.
+        """
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _hicache_prefetch_symmetric(self) -> bool:
+        """True when prefetch participation must be decided by the GROUP.
+
+        #580 residual. The symmetrization reached ``UnifiedRadixCache`` first
+        and was ported to ``HiRadixCache`` under #610; this class sits on
+        ``MambaRadixCache`` rather than ``HiRadixCache`` and was missed by both,
+        while running the same two collectives in its prefetch control path.
+
+        Same predicate as its two siblings -- storage on, a real controller,
+        multi-rank, non-uniform token vector -- so stock even-TP HiCache, where
+        the host pools and therefore the alloc/rate-limit histories agree,
+        never trips it and that path stays byte-identical.
+        """
+        from sglang.srt.distributed.utils import uneven_dcp_active
+
+        return (
+            self.enable_storage
+            and getattr(self, "cache_controller", None) is not None
+            and self.tp_world_size > 1
+            and uneven_dcp_active()
+        )
+
+    def prefetch_participation_is_collective(self) -> bool:
+        """Tell ``Scheduler._prefetch_kvcache`` to stop applying its own gate.
+
+        Without this predicate the scheduler keeps its rank-local
+        ``locally_eligible`` early return, so an ineligible rank never reaches
+        ``prefetch_from_storage`` at all and the vote below is never entered --
+        the vote would symmetrize a decision the caller already made
+        asymmetrically.
+        """
+        return self._hicache_prefetch_symmetric()
+
+    def _release_prefetch_attempt(
+        self,
+        last_host_node: TreeNode,
+        host_indices,
+        extra_pools,
+        protected: bool,
+    ) -> None:
+        """Undo a prefetch attempt this rank made but the group refused.
+
+        Both pools must be given back, not just the KV one: a negative vote can
+        land on a rank that allocated a host mamba slot as well, and that slot
+        is the scarcer of the two.
+        """
+        if host_indices is not None:
+            self.cache_controller.mem_pool_host.free(host_indices)
+        for transfer in extra_pools or []:
+            if transfer.name == PoolName.MAMBA and transfer.host_indices is not None:
+                self.mamba_pool_host.free(transfer.host_indices)
+        if protected:
+            self._release_host_node(last_host_node, release_mamba=False)
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -2084,45 +2162,106 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        locally_eligible: bool = True,
     ):
+        # #580 residual: under uneven host pools every rank-local verdict below
+        # only LOWERS this rank's ballot; none of them may skip the vote, or the
+        # peers enter check_prefetch_progress's two reduces without this rank.
+        symmetric = self._hicache_prefetch_symmetric()
+
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
-            return
-
-        self._protect_host_node(last_host_node, protect_mamba=False)
-
-        # Allocate host KV memory
-        host_indices = self._alloc_with_evict(
-            self.cache_controller.mem_pool_host,
-            prefetch_length,
-            self.evict_host,
+        eligible = (
+            locally_eligible
+            and self.enable_storage
+            and prefetch_length >= self.prefetch_threshold
+            and not self.cache_controller.prefetch_rate_limited()
         )
-        if host_indices is None:
-            # truncate the prefetch length to the page-aligned available host size
-            available_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = available_size - (available_size % self.page_size)
-            if prefetch_length < self.prefetch_threshold:
-                self._release_host_node(last_host_node, release_mamba=False)
-                return
-            new_input_tokens = new_input_tokens[:prefetch_length]
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-
-        if host_indices is None:
-            self._release_host_node(last_host_node, release_mamba=False)
+        if not eligible and not symmetric:
             return
 
-        # Allocate host mamba slot
-        extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
-        if extra_pools is None:
-            self.cache_controller.mem_pool_host.free(host_indices)
-            self._release_host_node(last_host_node, release_mamba=False)
+        host_indices = None
+        extra_pools = None
+        protected = False
+        if eligible:
+            self._protect_host_node(last_host_node, protect_mamba=False)
+            protected = True
+
+            # Allocate host KV memory
+            host_indices = self._alloc_with_evict(
+                self.cache_controller.mem_pool_host,
+                prefetch_length,
+                self.evict_host,
+            )
+            if host_indices is None and not symmetric:
+                # Truncate to the page-aligned available host size.
+                #
+                # DELIBERATELY SKIPPED under `symmetric`: the retry re-sizes
+                # from THIS rank's `available_size()`, so it would register a
+                # prefetch of a rank-dependent LENGTH. That keeps participation
+                # symmetric but makes `prefetch_tokens_occupied` and the
+                # min_completed_tokens reduce disagree instead -- the same
+                # defect moved one field along. A short rank votes no.
+                available_size = self.cache_controller.mem_pool_host.available_size()
+                prefetch_length = available_size - (available_size % self.page_size)
+                if prefetch_length < self.prefetch_threshold:
+                    self._release_host_node(last_host_node, release_mamba=False)
+                    return
+                new_input_tokens = new_input_tokens[:prefetch_length]
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    prefetch_length
+                )
+
+            # Allocate host mamba slot
+            if host_indices is not None:
+                extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
+
+        alloc_failed = host_indices is None or extra_pools is None
+
+        if symmetric:
+            # The (tag, -tag) head makes the payload SELF-IDENTIFYING: after a
+            # MIN reduce slot 0 is min(tag) and slot 1 is -max(tag), so
+            # slot0 != -slot1 proves the ranks were not all in this collective.
+            # Same-width traffic from another site then becomes a named error
+            # rather than a short read some ranks silently accept.
+            vote = torch.tensor(
+                [
+                    _MAMBA_PREFETCH_VOTE_TAG,
+                    -_MAMBA_PREFETCH_VOTE_TAG,
+                    1 if (eligible and not alloc_failed) else 0,
+                ],
+                dtype=torch.int,
+            )
+            self._all_reduce_prefetch_vote(
+                vote,
+                torch.distributed.ReduceOp.MIN,
+                label="prefetch_participation_vote",
+            )
+            tag_lo, tag_hi = int(vote[0].item()), -int(vote[1].item())
+            if tag_lo != tag_hi or tag_lo != _MAMBA_PREFETCH_VOTE_TAG:
+                raise HiCacheCollectiveDesyncError(
+                    "prefetch_participation_vote returned a foreign payload "
+                    f"(tag min={tag_lo} max={tag_hi}, expected "
+                    f"{_MAMBA_PREFETCH_VOTE_TAG} on every rank): the TP ranks "
+                    "were not all inside this collective. Some rank issued a "
+                    "different collective on the same group -- the #580 "
+                    "failure -- and continuing would corrupt the vote."
+                )
+            if int(vote[2].item()) == 0:
+                # MIN over "eligible AND fully allocated" is a logical AND:
+                # every rank registers iff all could, otherwise none do. No
+                # async op exists yet, so this is a clean local release.
+                self._release_prefetch_attempt(
+                    last_host_node, host_indices, extra_pools, protected
+                )
+                return
+            # Positive consensus: every rank allocated -> all fall through.
+        elif alloc_failed:
+            self._release_prefetch_attempt(
+                last_host_node, host_indices, extra_pools, protected
+            )
             return
 
         # mamba is also being loaded, protect host mamba as well
