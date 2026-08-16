@@ -87,6 +87,43 @@ Finally, ``--policy-file`` re-reads the arm from a small JSON file whenever its
 mtime changes. This process is the endpoint every Claude Code session points
 at, so restarting it drops live turns; the policy file is how the arm gets
 retuned without that.
+
+While the LOCAL backend is rebooting, the router HOLDS its requests instead of
+answering 502. Every serving restart used to kill every in-flight agent turn
+with "router could not reach the local endpoint". So a request routed to the
+local backend that fails at the CONNECT level -- connection refused or reset,
+NOT an HTTP error code from a live backend, which still passes through
+untouched -- is held: the router waits about 2 s, probes the backend's
+``/health`` endpoint (a tiny GET, never a hammer of full message requests),
+and retries the real request the moment the backend accepts, up to
+``--local-wait-s`` seconds (default 300, ``$ROUTER_LOCAL_WAIT_S``, ``0``
+disables and restores the immediate-502 behaviour). No response bytes -- not
+even SSE headers -- reach the client before the backend connection is
+confirmed, so a held request is invisible to it. At most
+``--local-max-buffered`` (default 64) requests are held at once; the overflow
+answers 502 immediately, because a queue that grew without bound through a
+long outage would OOM the router, which is the one process no turn may lose.
+A request that outlives the cap still gets the 502 of today, with the waited
+duration noted in the message.
+
+The wait cap, the queue cap and the poll interval are all configurable
+(``--local-wait-s``/``$ROUTER_LOCAL_WAIT_S``, ``--local-max-buffered``,
+``--local-poll-interval-s``); the poll interval also carries a small random
+jitter so many held requests do not all probe ``/health`` in lockstep. Two
+counters distinguish a hold that worked from one that did not:
+``buffer_succeeded`` (held, then the backend accepted) and ``buffer_gave_up``
+(wait cap hit, or the queue was already full). The stats endpoint also
+reports the LIVE queue depth and the longest currently-held wait, not just
+the lifetime totals.
+
+The hold only ever happens BEFORE the first byte of the backend's response:
+retries are limited to the CONNECT-level failure, and once headers have been
+received the response is forwarded byte-for-byte with no further retry. A
+backend that dies mid-stream, after it has already sent a partial response,
+is NOT re-buffered or replayed -- the client has already received bytes that
+a retry could not un-send. That failure still surfaces as a broken stream to
+the client. This is a deliberate limit, not an oversight: only the connection
+phase is idempotent enough to retry safely.
 """
 
 from __future__ import annotations
@@ -96,6 +133,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from typing import Iterable, Optional
 
 import aiohttp
@@ -148,6 +186,28 @@ MAX_FRAMED_HEAD_BYTES = 262144
 MAX_FRAMED_EVENTS = 8
 SSE_FRAME_SEPARATOR = b"\n\n"
 
+# Local-backend wait buffer (see module docstring, "WHILE THE LOCAL BACKEND
+# IS REBOOTING"). The cap is a DURATION in seconds, not a count: the router
+# holds a refused request until the backend accepts the connection or the
+# clock runs out, whichever first.
+DEFAULT_LOCAL_WAIT_S = 300.0
+LOCAL_WAIT_ENV = "ROUTER_LOCAL_WAIT_S"
+# Pacing of the recovery loop. The FULL request is only retried after a
+# healthy /health probe; while the backend is down the router sees one tiny
+# GET per interval, never a stream of message requests.
+LOCAL_WAIT_POLL_INTERVAL_S = 2.0
+# Random jitter applied to the poll interval, as a fraction of it, so a
+# reboot that stacks up many held requests does not have all of them probe
+# /health in the same instant.
+LOCAL_WAIT_POLL_JITTER_FRAC = 0.2
+# A probe that does not answer within this long counts as "down".
+HEALTH_PROBE_TIMEOUT_S = 2.0
+# How many requests may be HELD at once. Overflow is rejected with 502
+# immediately: memory is the resource this cap protects.
+MAX_BUFFERED_REQUESTS = 64
+# The sglang front's own readiness signal: 200 when healthy, 503 otherwise.
+LOCAL_HEALTH_PATH = "/health"
+
 # Model-id suffix that selects the thinking arm of a local model.
 THINKING_ALIAS_SUFFIX = "-think"
 # Mirror suffix that selects the NO-thinking arm. It exists because the
@@ -197,6 +257,15 @@ LOCAL_BASE = web.AppKey("local_base", str)
 APPLY_SHIM = web.AppKey("apply_shim", bool)
 STATS = web.AppKey("stats", dict)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
+# Local-backend wait buffer: the configured cap in seconds (0 = disabled),
+# the queue-size cap, the poll interval, and the LIVE registry of requests
+# currently held (token -> loop.time() they started waiting at). The
+# registry -- not just a counter -- is what lets /__router/stats report the
+# longest current wait, not only the lifetime totals.
+LOCAL_WAIT_S = web.AppKey("local_wait_s", float)
+MAX_BUFFERED = web.AppKey("max_buffered", int)
+LOCAL_POLL_INTERVAL_S = web.AppKey("local_poll_interval_s", float)
+HELD_STARTS = web.AppKey("held_starts", dict)
 
 
 def _filter_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
@@ -533,6 +602,214 @@ class _PolicyFile:
         return self._overrides
 
 
+def _default_local_wait_s() -> float:
+    """The wait cap when no flag was given: ``$ROUTER_LOCAL_WAIT_S``, else 300 s.
+
+    An invalid env value warns and falls back to the default instead of
+    refusing to boot: the router is the lifeline process, and a typo in one
+    env var must not take down the fleet's only HTTP path.
+    """
+    raw = os.environ.get(LOCAL_WAIT_ENV)
+    if raw is None:
+        return DEFAULT_LOCAL_WAIT_S
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; using %.0f", LOCAL_WAIT_ENV, raw, DEFAULT_LOCAL_WAIT_S
+        )
+        return DEFAULT_LOCAL_WAIT_S
+
+
+class _LocalBackendDownTimeout(Exception):
+    """The local backend stayed unreachable until the wait cap was hit."""
+
+    def __init__(self, waited_s: float, limit_s: float, last_error: Exception):
+        super().__init__(
+            f"local backend down for {waited_s:.0f}s (limit {limit_s:.0f}s): {last_error}"
+        )
+        self.waited_s = waited_s
+        self.limit_s = limit_s
+        self.last_error = last_error
+
+
+class _LocalBackendQueueFull(Exception):
+    """The hold queue was already at capacity when this request needed it.
+
+    Distinct from ``_LocalBackendDownTimeout``: this request never waited at
+    all, it was rejected on arrival because the bounded queue -- the memory
+    safeguard for a long outage -- was already full.
+    """
+
+    def __init__(self, queued: int, limit: int, last_error: Exception):
+        super().__init__(
+            f"local-backend buffer queue full ({queued}/{limit} requests "
+            f"already held): {last_error}"
+        )
+        self.queued = queued
+        self.limit = limit
+        self.last_error = last_error
+
+
+async def _connect_once(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    data: Optional[bytes],
+) -> aiohttp.ClientResponse:
+    """One connect-and-read-headers attempt against a backend.
+
+    Returns the OPEN ClientResponse on success; the caller owns releasing it.
+    Raises aiohttp's transport-level errors when the backend refuses or
+    resets the connection. HTTP error CODES from a live backend are not
+    exceptions and come back as the response, untouched -- which is exactly
+    why only this function's failure signature may be retried.
+    """
+    cm = session.request(method, url, headers=headers, data=data)
+    # If __aenter__ raises, no response exists and nothing must be cleaned
+    # up: the TCPConnector discards a failed connection attempt itself, and
+    # the context manager's __aexit__ is never due (async-with semantics).
+    return await cm.__aenter__()
+
+
+async def _probe_local_health(
+    session: aiohttp.ClientSession, health_url: str
+) -> bool:
+    """Cheap liveness probe: True only for HTTP 200, never raises.
+
+    200 from ``/health`` is the sglang front's own readiness signal;
+    refused, reset, 503 or timed-out all count as down. The probe carries
+    its own short total timeout so a half-dead backend cannot stall the
+    recovery loop past one interval.
+    """
+    try:
+        async with session.get(
+            health_url,
+            headers={"Accept-Encoding": "identity"},
+            timeout=aiohttp.ClientTimeout(total=HEALTH_PROBE_TIMEOUT_S),
+        ) as response:
+            await response.read()
+            return response.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return False
+
+
+async def _wait_for_local_backend(
+    session: aiohttp.ClientSession,
+    health_url: str,
+    deadline: float,
+    poll_interval_s: float,
+) -> None:
+    """Sleep, waking early once ``/health`` answers 200; otherwise at the deadline.
+
+    Pacing: sleep first (up to one jittered interval, never past the
+    deadline), THEN probe. So a down backend sees roughly one tiny GET per
+    ``poll_interval_s`` and the full request is retried at most about once
+    per interval -- right when the probe says ready -- instead of being
+    hammered while the backend is refused or half-booted. The jitter
+    (``LOCAL_WAIT_POLL_JITTER_FRAC``) keeps many requests held on the same
+    outage from all probing in lockstep.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        jitter = poll_interval_s * random.uniform(
+            -LOCAL_WAIT_POLL_JITTER_FRAC, LOCAL_WAIT_POLL_JITTER_FRAC
+        )
+        sleep_for = max(0.0, min(poll_interval_s + jitter, remaining))
+        await asyncio.sleep(sleep_for)
+        if loop.time() >= deadline:
+            return
+        if await _probe_local_health(session, health_url):
+            return
+
+
+async def _open_local_backend(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    data: Optional[bytes],
+    wait_s: float,
+    health_url: str,
+    stats: dict,
+    held: dict,
+    max_buffered: int,
+    poll_interval_s: float,
+) -> aiohttp.ClientResponse:
+    """Connect to the local backend, HOLDING the client while it is down.
+
+    ``wait_s <= 0`` is the pre-buffer behaviour: a single attempt, and the
+    transport error propagates untouched so the caller answers the exact 502
+    of today. ``wait_s > 0`` retries on connection failure until the backend
+    accepts (see the module docstring), or raises ``_LocalBackendDownTimeout``
+    with the waited duration, or -- if ``held`` is already at ``max_buffered``
+    when this request first needs to wait -- ``_LocalBackendQueueFull``
+    without waiting at all.
+
+    ``held`` is the app-wide LIVE registry of in-flight holds (a dict this
+    call inserts a unique token into for exactly as long as it is waiting);
+    it is what makes the queue depth and the current wait observable from
+    ``/__router/stats`` and enforceable as a cap.
+    """
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    deadline = start + wait_s
+    if wait_s <= 0:
+        return await _connect_once(session, method, url, headers, data)
+
+    token: Optional[object] = None
+    # A bare `except ... as e:` unbinds `e` the moment its block ends (a
+    # Python quirk, not a bug), so the deadline check below -- which needs
+    # the SAME error for its own raise -- keeps its own copy here instead of
+    # relying on the except clause's now-dead name.
+    last_error: Optional[Exception] = None
+    try:
+        while True:
+            try:
+                result = await _connect_once(session, method, url, headers, data)
+                if token is not None:
+                    stats["buffer_succeeded"] += 1
+                return result
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                # Transport failure, not an HTTP code: the backend is down or
+                # rebooting. Hold the request.
+                last_error = e
+                if token is None:
+                    if len(held) >= max_buffered:
+                        stats["buffer_gave_up"] += 1
+                        logger.warning(
+                            "local backend %s refused and the hold queue is "
+                            "full (%d/%d); refusing immediately: %s",
+                            health_url.rsplit("/", 1)[0],
+                            len(held),
+                            max_buffered,
+                            e,
+                        )
+                        raise _LocalBackendQueueFull(len(held), max_buffered, e) from e
+                    token = object()
+                    held[token] = start
+                    logger.info(
+                        "local backend %s refused; holding the request up to "
+                        "%.0fs while it reboots: %s",
+                        health_url.rsplit("/", 1)[0],
+                        wait_s,
+                        e,
+                    )
+            if loop.time() >= deadline:
+                stats["buffer_gave_up"] += 1
+                raise _LocalBackendDownTimeout(
+                    loop.time() - start, wait_s, last_error
+                ) from last_error
+            await _wait_for_local_backend(session, health_url, deadline, poll_interval_s)
+    finally:
+        if token is not None:
+            held.pop(token, None)
+
+
 def create_app(
     local_models: Iterable[str],
     upstream_base: str = DEFAULT_UPSTREAM,
@@ -541,6 +818,9 @@ def create_app(
     thinking_enabled: bool = False,
     effort: str = EFFORT_XHIGH,
     policy_file: Optional[str] = None,
+    local_wait_s: Optional[float] = None,
+    max_buffered: int = MAX_BUFFERED_REQUESTS,
+    local_poll_interval_s: float = LOCAL_WAIT_POLL_INTERVAL_S,
 ) -> web.Application:
     """Build the proxy application.
 
@@ -549,7 +829,22 @@ def create_app(
     a ``<id>-nothink`` alias (thinking forced off), so both arms stay reachable
     from a client whose only lever is the model string, whichever way
     ``thinking_enabled`` sets the default for the plain id.
+
+    ``local_wait_s`` is the local-backend wait cap in seconds; ``None`` means
+    "no flag given", which resolves through ``$ROUTER_LOCAL_WAIT_S`` to the
+    300 s default. ``0`` disables the buffer and restores the immediate 502
+    (this is also what every pre-buffer caller, including the test suite's
+    default backend-unreachable test, gets unless it opts in). ``max_buffered``
+    and ``local_poll_interval_s`` are the queue-size cap and the health-probe
+    pacing described in the module docstring.
     """
+    if local_wait_s is None:
+        local_wait_s = _default_local_wait_s()
+    if local_wait_s < 0:
+        logger.warning(
+            "local wait cap %s is negative; using 0 (immediate 502)", local_wait_s
+        )
+        local_wait_s = 0.0
     app = web.Application(client_max_size=1024**3)
     app[LOCAL_MODELS] = set(local_models)
     app[THINKING_ALIASES] = {m + THINKING_ALIAS_SUFFIX: m for m in app[LOCAL_MODELS]}
@@ -559,7 +854,21 @@ def create_app(
     app[APPLY_SHIM] = apply_shim
     app[POLICY] = {"thinking_enabled": thinking_enabled, "effort": effort}
     app[POLICY_FILE] = _PolicyFile(policy_file)
-    app[STATS] = {"local": 0, "upstream": 0, "errors": 0}
+    app[STATS] = {
+        "local": 0,
+        "upstream": 0,
+        "errors": 0,
+        # Lifetime totals for the local-backend hold buffer: a request that
+        # was held and then got through, versus one that gave up (wait cap
+        # hit, or the queue was already full). See /__router/stats for the
+        # LIVE queue depth and current wait, which are not lifetime totals.
+        "buffer_succeeded": 0,
+        "buffer_gave_up": 0,
+    }
+    app[LOCAL_WAIT_S] = local_wait_s
+    app[MAX_BUFFERED] = max_buffered
+    app[LOCAL_POLL_INTERVAL_S] = local_poll_interval_s
+    app[HELD_STARTS] = {}
 
     async def _session(app: web.Application):
         # auto_decompress=False keeps the response body byte-identical, so a
@@ -581,6 +890,17 @@ def create_app(
         body["thinking_aliases"] = sorted(request.app[THINKING_ALIASES])
         body["nothink_aliases"] = sorted(request.app[NOTHINK_ALIASES])
         body["policy"] = _effective_policy(request.app)
+        # Live local-backend hold-buffer state, not lifetime totals: how many
+        # requests are held RIGHT NOW, and the longest any of them has been
+        # waiting. Zero when the backend is healthy or the buffer is disabled.
+        held = request.app[HELD_STARTS]
+        now = asyncio.get_running_loop().time()
+        body["buffer_queued"] = len(held)
+        body["buffer_current_wait_s"] = round(
+            max((now - t for t in held.values()), default=0.0), 1
+        )
+        body["buffer_max_wait_s"] = request.app[LOCAL_WAIT_S]
+        body["buffer_max_queued"] = request.app[MAX_BUFFERED]
         return web.json_response(body)
 
     async def proxy(request: web.Request) -> web.StreamResponse:
@@ -652,58 +972,120 @@ def create_app(
                     _count_input_tokens(request.app[SESSION], base, count_body)
                 )
 
-        try:
-            async with request.app[SESSION].request(
+        # Opening the connection is the one step that differs between the two
+        # routes. Upstream (Anthropic) is never buffered -- this codebase runs
+        # ON Anthropic infrastructure, so that side is not the outage this
+        # buffer exists for -- and a single _connect_once there is exactly the
+        # `async with session.request(...)` this replaced: zero added latency,
+        # zero behaviour change. Local gets the hold buffer, gated on
+        # LOCAL_WAIT_S: 0 (the default absent a boot in progress reproduces
+        # the old immediate-attempt behaviour too, since wait_s<=0 short-
+        # circuits straight to a single _connect_once inside the helper.
+        if to_local:
+            opener = _open_local_backend(
+                request.app[SESSION],
                 request.method,
                 url,
-                headers=headers,
-                data=body if body else None,
-            ) as upstream_response:
-                out = web.StreamResponse(
-                    status=upstream_response.status,
-                    headers=_filter_headers(upstream_response.headers.items()),
-                )
-                await out.prepare(request)
+                headers,
+                body if body else None,
+                request.app[LOCAL_WAIT_S],
+                request.app[LOCAL_BASE] + LOCAL_HEALTH_PATH,
+                request.app[STATS],
+                request.app[HELD_STARTS],
+                request.app[MAX_BUFFERED],
+                request.app[LOCAL_POLL_INTERVAL_S],
+            )
+        else:
+            opener = _connect_once(
+                request.app[SESSION], request.method, url, headers, body if body else None
+            )
 
-                # Repair the head of the stream only, and only when there is
-                # a count to repair it with. Every other response -- upstream,
-                # non-streaming, errors -- goes through the untouched byte
-                # pipe below, exactly as before.
-                if count_task is not None and upstream_response.status == 200:
-                    tokens = await _resolve_count(count_task)
-                    pending = b""
-                    events_seen = 0
-                    framing = True
+        upstream_response: Optional[aiohttp.ClientResponse] = None
+        try:
+            upstream_response = await opener
+            out = web.StreamResponse(
+                status=upstream_response.status,
+                headers=_filter_headers(upstream_response.headers.items()),
+            )
+            await out.prepare(request)
+
+            # Repair the head of the stream only, and only when there is
+            # a count to repair it with. Every other response -- upstream,
+            # non-streaming, errors -- goes through the untouched byte
+            # pipe below, exactly as before.
+            if count_task is not None and upstream_response.status == 200:
+                tokens = await _resolve_count(count_task)
+                pending = b""
+                events_seen = 0
+                framing = True
+                while framing:
+                    # readany() is the primitive behind iter_any(); an
+                    # empty read means the upstream body is finished.
+                    chunk = await upstream_response.content.readany()
+                    if not chunk:
+                        break
+                    pending += chunk
+                    # Drain whole SSE frames out of the head buffer.
                     while framing:
-                        # readany() is the primitive behind iter_any(); an
-                        # empty read means the upstream body is finished.
-                        chunk = await upstream_response.content.readany()
-                        if not chunk:
+                        cut = pending.find(SSE_FRAME_SEPARATOR)
+                        if cut == -1:
                             break
-                        pending += chunk
-                        # Drain whole SSE frames out of the head buffer.
-                        while framing:
-                            cut = pending.find(SSE_FRAME_SEPARATOR)
-                            if cut == -1:
-                                break
-                            frame = pending[: cut + len(SSE_FRAME_SEPARATOR)]
-                            pending = pending[cut + len(SSE_FRAME_SEPARATOR) :]
-                            events_seen += 1
-                            frame, is_start = _repair_message_start(frame, tokens)
-                            await out.write(frame)
-                            # message_start is the only frame this touches, so
-                            # stop re-framing the moment it is past.
-                            if is_start or events_seen >= MAX_FRAMED_EVENTS:
-                                framing = False
-                        if len(pending) > MAX_FRAMED_HEAD_BYTES:
-                            break
-                    if pending:
-                        await out.write(pending)
+                        frame = pending[: cut + len(SSE_FRAME_SEPARATOR)]
+                        pending = pending[cut + len(SSE_FRAME_SEPARATOR) :]
+                        events_seen += 1
+                        frame, is_start = _repair_message_start(frame, tokens)
+                        await out.write(frame)
+                        # message_start is the only frame this touches, so
+                        # stop re-framing the moment it is past.
+                        if is_start or events_seen >= MAX_FRAMED_EVENTS:
+                            framing = False
+                    if len(pending) > MAX_FRAMED_HEAD_BYTES:
+                        break
+                if pending:
+                    await out.write(pending)
 
-                async for chunk in upstream_response.content.iter_any():
-                    await out.write(chunk)
-                await out.write_eof()
-                return out
+            # From here on, no failure can retry: the client has already
+            # received response headers (and possibly body bytes) that a
+            # re-buffered attempt could not un-send (see module docstring).
+            async for chunk in upstream_response.content.iter_any():
+                await out.write(chunk)
+            await out.write_eof()
+            return out
+        except _LocalBackendDownTimeout as e:
+            request.app[STATS]["errors"] += 1
+            logger.warning("local backend still down after holding: %s", e)
+            return web.json_response(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": (
+                            f"router held the request for {e.waited_s:.0f}s while "
+                            f"the local backend was down (limit {e.limit_s:.0f}s), "
+                            f"then gave up: {e.last_error}"
+                        ),
+                    },
+                },
+                status=502,
+            )
+        except _LocalBackendQueueFull as e:
+            request.app[STATS]["errors"] += 1
+            logger.warning("local backend hold queue full: %s", e)
+            return web.json_response(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": (
+                            f"router's local-backend hold queue is full "
+                            f"({e.queued}/{e.limit} requests already waiting for "
+                            f"it to come back); refusing immediately, waited 0s: "
+                            f"{e.last_error}"
+                        ),
+                    },
+                },
+                status=502,
+            )
         except aiohttp.ClientError as e:
             request.app[STATS]["errors"] += 1
             # Anthropic-shaped envelope so the client's error handling works.
@@ -726,6 +1108,11 @@ def create_app(
             # pending on the event loop.
             if count_task is not None and not count_task.done():
                 count_task.cancel()
+            # We opened this connection by hand (not `async with`), so we own
+            # returning it to the pool. Mirrors what the context manager's
+            # __aexit__ used to do unconditionally, success or failure.
+            if upstream_response is not None:
+                await upstream_response.release()
 
     app.router.add_get(STATS_PATH, stats)
     app.router.add_route("*", "/{tail:.*}", proxy)
@@ -790,6 +1177,35 @@ def main(argv: list[str] | None = None) -> None:
         "retuned without restarting this process, which is the endpoint "
         "live client sessions are pointed at.",
     )
+    parser.add_argument(
+        "--local-wait-s",
+        type=float,
+        default=None,
+        help="how long (seconds) to HOLD a request whose connection to the "
+        "local backend was refused or reset, retrying once it accepts, "
+        "instead of answering 502 immediately. Boots on this rig take "
+        "roughly 4-10 minutes, hence the generous default. 0 disables the "
+        "buffer and restores the immediate-502 behaviour. Defaults to "
+        f"${LOCAL_WAIT_ENV} if set, else {DEFAULT_LOCAL_WAIT_S:.0f}s. Does "
+        "NOT apply to --upstream-base (api.anthropic.com): only a CONNECT- "
+        "level failure to the local backend is held, an HTTP error code "
+        "from a live backend still passes straight through.",
+    )
+    parser.add_argument(
+        "--local-max-buffered",
+        type=int,
+        default=MAX_BUFFERED_REQUESTS,
+        help="max number of requests HELD at once waiting for the local "
+        "backend. Overflow is refused with 502 immediately -- an unbounded "
+        f"queue through a long outage would OOM the router. Default {MAX_BUFFERED_REQUESTS}.",
+    )
+    parser.add_argument(
+        "--local-poll-interval-s",
+        type=float,
+        default=LOCAL_WAIT_POLL_INTERVAL_S,
+        help="how often (seconds, plus jitter) a held request probes the "
+        f"local backend's /health while waiting. Default {LOCAL_WAIT_POLL_INTERVAL_S:.0f}s.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -806,10 +1222,14 @@ def main(argv: list[str] | None = None) -> None:
         thinking_enabled=args.local_thinking == "on",
         effort=args.local_effort,
         policy_file=args.policy_file,
+        local_wait_s=args.local_wait_s,
+        max_buffered=args.local_max_buffered,
+        local_poll_interval_s=args.local_poll_interval_s,
     )
     logger.info(
         "listening on %s:%d, local models %s (aliases %s) -> %s, "
-        "everything else -> %s; default arm thinking=%s effort=%s%s",
+        "everything else -> %s; default arm thinking=%s effort=%s%s; "
+        "local-backend hold buffer: wait_s=%.0f max_buffered=%d poll_interval_s=%.1f",
         args.host,
         args.port,
         sorted(args.local_model),
@@ -819,6 +1239,9 @@ def main(argv: list[str] | None = None) -> None:
         args.local_thinking,
         args.local_effort,
         f" (policy file {args.policy_file})" if args.policy_file else "",
+        app[LOCAL_WAIT_S],
+        app[MAX_BUFFERED],
+        app[LOCAL_POLL_INTERVAL_S],
     )
     web.run_app(app, host=args.host, port=args.port, print=None)
 

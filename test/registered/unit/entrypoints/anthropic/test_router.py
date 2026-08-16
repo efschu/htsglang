@@ -4,15 +4,25 @@ Two mock servers stand in for api.anthropic.com and the local htsglang front,
 so the whole routing decision is exercised without a GPU, a network, or a
 credential. Each mock records what it received; the assertions are about which
 one got the request and what the body looked like when it arrived.
+
+``RouterTestCase`` and ``ThinkingOnDefaultTestCase`` build their app with
+``local_wait_s=0``, i.e. the hold buffer explicitly OFF: they are exercising
+routing/shim/policy behaviour, not the buffer, and a backend-unreachable
+scenario there must fail immediately, not hang for the 300s production
+default. The buffer itself is ``LocalBackendBufferTestCase`` below, which
+picks small wait/poll values so it stays fast.
 """
 
+import asyncio
+import contextlib
 import json
 import os
 import tempfile
+import time
 import unittest
 
 from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase, TestServer
+from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer, unused_port
 
 from sglang.srt.entrypoints.anthropic.router import (
     NOTHINK_ALIAS_SUFFIX,
@@ -82,6 +92,11 @@ class RouterTestCase(AioHTTPTestCase):
             local_models=[LOCAL_MODEL],
             upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
             local_base=str(self.local_server.make_url("")).rstrip("/"),
+            # Off: this suite is about routing/shim behaviour, not the hold
+            # buffer (see LocalBackendBufferTestCase). With the buffer's
+            # generous 300s production default, a closed local_server would
+            # hang the unreachable-backend test instead of failing fast.
+            local_wait_s=0,
         )
 
     async def tearDownAsync(self):
@@ -396,6 +411,7 @@ class ThinkingOnDefaultTestCase(AioHTTPTestCase):
             local_models=[LOCAL_MODEL],
             upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
             local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,  # this suite is about policy, not the hold buffer
             thinking_enabled=True,
             effort=self.EFFORT,
             policy_file=self.policy_path,
@@ -541,6 +557,223 @@ class ThinkingOnDefaultTestCase(AioHTTPTestCase):
         self.assertEqual(stats["policy"]["thinking_enabled"], True)
         self.assertEqual(stats["policy"]["effort"], self.EFFORT)
         self.assertEqual(stats["nothink_aliases"], [NOTHINK_ALIAS])
+
+
+class LocalBackendBufferTestCase(unittest.IsolatedAsyncioTestCase):
+    """The local-backend hold buffer (task #675).
+
+    Unlike the suites above, these tests bring the local backend up and down
+    MID-TEST, so they manage TestServer/TestClient lifecycles by hand instead
+    of AioHTTPTestCase's single fixed get_application(). The local backend's
+    listen port is fixed via unused_port() up front so it can be "absent"
+    (nothing listening -> connection refused, simulating a backend that is
+    still booting) and then started later on that same port (simulating the
+    boot completing), without the router's local_base ever changing.
+    """
+
+    async def asyncSetUp(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        self.upstream_server = TestServer(upstream_app)
+        await self.upstream_server.start_server()
+        self.local_port = unused_port()
+        self.local_server = None
+        self.local = None
+        self._extra_clients = []
+        self._extra_servers = []
+
+    async def asyncTearDown(self):
+        for client in self._extra_clients:
+            await client.close()
+        for server in self._extra_servers:
+            await server.close()
+        await self.upstream_server.close()
+        if self.local_server is not None:
+            await self.local_server.close()
+
+    def _local_base(self):
+        return f"http://127.0.0.1:{self.local_port}"
+
+    async def _start_local_backend(self):
+        """Bring the local backend "up" on the port the router already targets."""
+        local_app, self.local = _make_backend("local")
+        self.local_server = TestServer(local_app, port=self.local_port)
+        await self.local_server.start_server()
+
+    def _body(self, model=LOCAL_MODEL, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    async def _make_router(self, **kwargs):
+        app = create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=self._local_base(),
+            **kwargs,
+        )
+        server = TestServer(app)
+        await server.start_server()
+        client = TestClient(server)
+        await client.start_server()
+        self._extra_servers.append(server)
+        self._extra_clients.append(client)
+        return app, server, client
+
+    # ---------- held, then succeeds ----------
+
+    async def test_request_is_held_and_then_succeeds_once_backend_comes_up(self):
+        _, _, client = await self._make_router(
+            local_wait_s=5.0, local_poll_interval_s=0.15
+        )
+
+        async def _send():
+            return await client.post("/v1/messages", json=self._body())
+
+        task = asyncio.create_task(_send())
+        # Give the first connect attempt time to fail (backend not started
+        # yet) and register itself in the held queue.
+        await asyncio.sleep(0.4)
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_queued"], 1)
+        self.assertGreater(stats["buffer_current_wait_s"], 0)
+        self.assertEqual(len(self.upstream["requests"]), 0)  # never fell to upstream
+
+        await self._start_local_backend()
+        resp = await asyncio.wait_for(task, timeout=5.0)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "local")
+
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_queued"], 0)
+        self.assertEqual(stats["buffer_succeeded"], 1)
+        self.assertEqual(stats["buffer_gave_up"], 0)
+
+    async def test_streaming_request_is_held_and_completes_once_backend_is_up(self):
+        """Requirement: a streaming request must not be half-started.
+
+        No SSE bytes -- not even headers -- can have reached the client while
+        the backend was down, so the response, once it does arrive, must be
+        the complete, uncorrupted stream.
+        """
+        _, _, client = await self._make_router(
+            local_wait_s=5.0, local_poll_interval_s=0.15
+        )
+
+        async def _send():
+            return await client.post("/v1/messages", json=self._body(stream=True))
+
+        task = asyncio.create_task(_send())
+        await asyncio.sleep(0.4)
+        await self._start_local_backend()
+        resp = await asyncio.wait_for(task, timeout=5.0)
+        self.assertEqual(resp.status, 200)
+        text = await resp.text()
+        self.assertIn("event: message_start", text)
+        self.assertIn("event: message_stop", text)
+        self.assertIn('"backend":"local"', text)
+
+    # ---------- gives up honestly ----------
+
+    async def test_timeout_returns_honest_502_with_waited_seconds(self):
+        _, _, client = await self._make_router(
+            local_wait_s=0.6, local_poll_interval_s=0.15
+        )
+        start = time.monotonic()
+        resp = await client.post("/v1/messages", json=self._body())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(resp.status, 502)
+        payload = await resp.json()
+        message = payload["error"]["message"]
+        self.assertRegex(message, r"held the request for \d+s")
+        self.assertIn("local backend was down", message)
+        # It actually waited roughly the configured cap, not an instant 502.
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertLess(elapsed, 3.0)
+
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_gave_up"], 1)
+        self.assertEqual(stats["buffer_succeeded"], 0)
+        self.assertEqual(stats["buffer_queued"], 0)
+
+    async def test_queue_full_gives_up_immediately_without_waiting(self):
+        _, _, client = await self._make_router(
+            local_wait_s=5.0, local_poll_interval_s=0.15, max_buffered=1
+        )
+
+        async def _send():
+            return await client.post("/v1/messages", json=self._body())
+
+        first = asyncio.create_task(_send())
+        await asyncio.sleep(0.3)
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_queued"], 1)
+
+        start = time.monotonic()
+        second = await client.post("/v1/messages", json=self._body())
+        elapsed = time.monotonic() - start
+        self.assertEqual(second.status, 502)
+        payload = await second.json()
+        self.assertIn("queue is full", payload["error"]["message"])
+        # Rejected on arrival, not held for anywhere near the 5s wait cap.
+        self.assertLess(elapsed, 0.3)
+
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_gave_up"], 1)
+
+    async def test_disabled_buffer_fails_immediately_like_before(self):
+        """``local_wait_s=0`` is the pre-buffer behaviour, byte for byte."""
+        _, _, client = await self._make_router(local_wait_s=0)
+        start = time.monotonic()
+        resp = await client.post("/v1/messages", json=self._body())
+        elapsed = time.monotonic() - start
+        self.assertEqual(resp.status, 502)
+        self.assertLess(elapsed, 0.3)
+        stats = await (await client.get(STATS_PATH)).json()
+        self.assertEqual(stats["buffer_queued"], 0)
+        self.assertEqual(stats["buffer_gave_up"], 0)  # never entered the hold path
+
+    # ---------- healthy path is untouched ----------
+
+    async def test_healthy_path_has_no_added_latency(self):
+        """Requirement: zero added latency when upstream/local is healthy.
+
+        Trivial check, not a benchmark: with the backend up throughout, the
+        buffer-enabled app (wait_s=300, the production default magnitude)
+        must not be meaningfully slower than the buffer-disabled app, because
+        a healthy first connect attempt takes the exact same code path
+        (``_connect_once``) either way.
+        """
+        await self._start_local_backend()
+        _, _, client_off = await self._make_router(local_wait_s=0)
+        _, _, client_on = await self._make_router(
+            local_wait_s=300.0, local_poll_interval_s=2.0
+        )
+
+        async def _avg_latency(client, n=20):
+            # One warm-up call, excluded, so connection setup cost is equal.
+            await client.post("/v1/messages", json=self._body())
+            total = 0.0
+            for _ in range(n):
+                start = time.monotonic()
+                resp = await client.post("/v1/messages", json=self._body())
+                total += time.monotonic() - start
+                self.assertEqual(resp.status, 200)
+            return total / n
+
+        off_avg = await _avg_latency(client_off)
+        on_avg = await _avg_latency(client_on)
+        # Generous bound: this asserts "no meaningful regression", not tight
+        # equality -- CI noise on a shared box should never flake this.
+        self.assertLess(on_avg, off_avg + 0.05)
 
 
 if __name__ == "__main__":
