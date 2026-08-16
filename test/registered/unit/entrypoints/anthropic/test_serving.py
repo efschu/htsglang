@@ -13,7 +13,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+    AnthropicServing,
+    ToolCallAssemblyError,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1440,6 +1443,286 @@ class TestAnthropicServing(unittest.TestCase):
             any("content_filter" in rec for rec in log.output),
             f"expected a warning mentioning the unmapped finish_reason: {log.output}",
         )
+
+
+def _tool_chunk(index, arguments=None, name=None, call_id=None, finish_reason=None):
+    """Build one OpenAI streaming chunk carrying a single tool_call delta.
+
+    ``name``/``call_id``/``arguments`` are each omitted when None so the
+    fixture can reproduce the exact shapes the qwen detector emits: a
+    name-less argument fragment, a name-only opener, or both together.
+    """
+    function: dict = {}
+    if name is not None:
+        function["name"] = name
+    if arguments is not None:
+        function["arguments"] = arguments
+    tool_call: dict = {"index": index, "type": "function", "function": function}
+    if call_id is not None:
+        tool_call["id"] = call_id
+    return _chunk([_choice({"tool_calls": [tool_call]}, finish_reason=finish_reason)])
+
+
+class TestAnthropicToolCallAssembly(unittest.TestCase):
+    """Tool-call argument assembly against real malformed upstream streams.
+
+    Every sequence below is replayed from a specimen recorded in the live
+    server log while serving Claude Code agents through the Anthropic
+    front-end. Before the assembly fix these produced a plausible-looking
+    ``tool_use`` block whose ``input`` was ``{}`` — the client executed, or
+    refused, a tool call whose arguments the adapter had silently thrown
+    away. Silent falseness is the defect under test here; a loud error is
+    the required behaviour whenever the arguments cannot be delivered
+    intact.
+    """
+
+    def _serving(self, stream_lines):
+        return AnthropicServing(_FakeOpenAIServingChat(stream_lines))
+
+    def _anthropic_request(self, **overrides):
+        data = {
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        }
+        data.update(overrides)
+        return AnthropicMessagesRequest.model_validate(data)
+
+    def _run(self, stream_lines):
+        return asyncio.run(
+            _collect_anthropic_events(
+                self._serving(stream_lines), self._anthropic_request()
+            )
+        )
+
+    @staticmethod
+    def _tool_blocks(events):
+        """Return ``[(index, name, assembled_json_str)]`` per tool_use block."""
+        blocks: dict[int, list] = {}
+        order: list[int] = []
+        for event in events:
+            if (
+                event["type"] == "content_block_start"
+                and event["content_block"]["type"] == "tool_use"
+            ):
+                blocks[event["index"]] = [event["content_block"]["name"], []]
+                order.append(event["index"])
+            elif (
+                event["type"] == "content_block_delta"
+                and event["delta"].get("type") == "input_json_delta"
+                and event["index"] in blocks
+            ):
+                blocks[event["index"]][1].append(event["delta"]["partial_json"])
+        return [(i, blocks[i][0], "".join(blocks[i][1])) for i in order]
+
+    @staticmethod
+    def _errors(events):
+        return [e for e in events if e["type"] == "error"]
+
+    def test_args_after_interleaved_text_are_not_dropped(self):
+        """Specimen 2026-08-16 20:32:47 / 20:45:27.
+
+        The detector opens the call with a name-only delta, emits a stray
+        content token, then streams the arguments. The adapter used to close
+        the tool_use block on the text delta and drop every later fragment,
+        logging "Dropping tool_call argument delta with no open tool_use
+        block: '{'" and "... '}'".
+        """
+        events = self._run(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _tool_chunk(0, name="Bash", call_id="call_1", arguments=""),
+                _chunk([_choice({"content": "\n"})]),
+                _tool_chunk(0, arguments="{"),
+                _tool_chunk(0, arguments='"command": "ls -la"'),
+                _tool_chunk(0, arguments="}"),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertEqual(self._errors(events), [])
+        blocks = self._tool_blocks(events)
+        self.assertEqual(
+            len(blocks), 1, f"expected exactly one tool_use block: {blocks}"
+        )
+        _, name, assembled = blocks[0]
+        self.assertEqual(name, "Bash")
+        self.assertEqual(json.loads(assembled), {"command": "ls -la"})
+
+    def test_args_after_interleaved_thinking_are_not_dropped(self):
+        """Same defect via a reasoning_content delta (thinking-on serving)."""
+        events = self._run(
+            [
+                _tool_chunk(0, name="Bash", call_id="call_1"),
+                _chunk([_choice({"reasoning_content": "checking"})]),
+                _tool_chunk(0, arguments='{"command": "pwd"}'),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertEqual(self._errors(events), [])
+        blocks = self._tool_blocks(events)
+        self.assertEqual(
+            len(blocks), 1, f"expected exactly one tool_use block: {blocks}"
+        )
+        self.assertEqual(json.loads(blocks[0][2]), {"command": "pwd"})
+
+    def test_args_arriving_before_the_name_are_buffered(self):
+        """Specimen 2026-08-16 20:57:11: leading delta carries name=None.
+
+        Upstream logged "Tool 'None' is not defined in the tools list." and
+        the adapter dropped the fragment because no block was open yet. The
+        name arrives on a later delta and must retroactively adopt the
+        buffered arguments.
+        """
+        events = self._run(
+            [
+                _tool_chunk(0, call_id="call_1", arguments="{"),
+                _tool_chunk(0, name="Bash", arguments='"command": "wc -l x"'),
+                _tool_chunk(0, arguments=', "description": "count"'),
+                _tool_chunk(0, arguments="}"),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertEqual(self._errors(events), [])
+        blocks = self._tool_blocks(events)
+        self.assertEqual(
+            len(blocks), 1, f"expected exactly one tool_use block: {blocks}"
+        )
+        self.assertEqual(blocks[0][1], "Bash")
+        self.assertEqual(
+            json.loads(blocks[0][2]),
+            {"command": "wc -l x", "description": "count"},
+        )
+
+    def test_args_never_claimed_by_a_name_emit_an_error(self):
+        """Arguments with no name anywhere in the stream must fail loudly."""
+        events = self._run(
+            [
+                _tool_chunk(0, arguments='{"command": "ls"}'),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertTrue(
+            self._errors(events),
+            "orphaned tool arguments must surface as an error event",
+        )
+        self.assertEqual(
+            self._tool_blocks(events),
+            [],
+            "an unnamed tool call must not reach the client as a tool_use block",
+        )
+
+    def test_incomplete_tool_json_at_stream_end_emits_an_error(self):
+        """Truncated arguments must not be delivered as a valid tool call."""
+        events = self._run(
+            [
+                _tool_chunk(
+                    0, name="Bash", call_id="call_1", arguments='{"command": "l'
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertTrue(
+            self._errors(events),
+            "truncated tool arguments must surface as an error event",
+        )
+
+    def test_args_for_a_later_index_do_not_leak_into_the_open_block(self):
+        """Index churn must not append one call's arguments to another's.
+
+        A name-less fragment carrying a DIFFERENT tool index than the open
+        block used to be appended to the open block regardless, corrupting
+        both calls' JSON.
+        """
+        events = self._run(
+            [
+                _tool_chunk(0, name="alpha", call_id="call_a", arguments='{"x": 1}'),
+                _tool_chunk(1, arguments='{"y": 2}'),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        alpha = [b for b in self._tool_blocks(events) if b[1] == "alpha"]
+        self.assertEqual(len(alpha), 1)
+        self.assertEqual(
+            json.loads(alpha[0][2]),
+            {"x": 1},
+            "index-1 arguments must not be appended to the index-0 block",
+        )
+        self.assertTrue(
+            self._errors(events),
+            "the unnamed index-1 call must surface as an error event",
+        )
+
+    def test_well_formed_stream_is_unchanged(self):
+        """The default path keeps emitting fragments as they arrive."""
+        events = self._run(
+            [
+                _tool_chunk(0, name="Bash", call_id="call_1", arguments='{"command"'),
+                _tool_chunk(0, arguments=': "ls"}'),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        self.assertEqual(self._errors(events), [])
+        deltas = [
+            e["delta"]["partial_json"]
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e["delta"].get("type") == "input_json_delta"
+        ]
+        self.assertEqual(deltas, ['{"command"', ': "ls"}'])
+
+    def test_non_streaming_invalid_tool_arguments_emit_an_error(self):
+        """The non-streaming path must not substitute ``input={}`` either."""
+        serving = AnthropicServing(_FakeOpenAIServingChat())
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "created": 0,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": '{"command": "l',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+        with self.assertRaises(ToolCallAssemblyError):
+            serving._convert_response(response)
 
 
 class TestDetectInlineSystemSupport(unittest.TestCase):

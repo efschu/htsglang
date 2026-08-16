@@ -83,6 +83,22 @@ STOP_REASON_MAP = {
 # Module-level so tests can shorten it; read at runtime, never captured.
 PING_INTERVAL_SECONDS = 5.0
 
+
+class ToolCallAssemblyError(Exception):
+    """A tool call could not be reassembled from the backend's deltas.
+
+    Raised (non-streaming) or converted into an SSE ``error`` event
+    (streaming) whenever the arguments of a tool call are missing,
+    truncated, or unclaimed by any function name. The alternative — the
+    behaviour this replaces — was to hand the client a well-formed
+    ``tool_use`` block with ``input={}``, which is indistinguishable from a
+    genuine zero-argument call. Agents acted on those: a ``Bash`` call with
+    no ``command`` is not a no-op, it is a lost instruction that the client
+    then rejects as an invalid tool input, burning the whole turn. An error
+    the caller can see is always preferable to a plausible fabrication.
+    """
+
+
 ERROR_TYPE_MAP = {
     400: "invalid_request_error",
     401: "authentication_error",
@@ -880,10 +896,20 @@ class AnthropicServing:
             # It's an error response (ORJSONResponse)
             return self._convert_openai_error_response(response)
 
-        # Convert to Anthropic response
-        anthropic_response = self._convert_response(
-            response, stop_sequences=anthropic_request.stop_sequences
-        )
+        # Convert to Anthropic response. A tool call that cannot be
+        # assembled is reported as an error the caller can see rather than
+        # being smoothed into a tool_use block with an empty input.
+        try:
+            anthropic_response = self._convert_response(
+                response, stop_sequences=anthropic_request.stop_sequences
+            )
+        except ToolCallAssemblyError as e:
+            return self._error_response(
+                status_code=502,
+                error_type="api_error",
+                message=f"Tool call arguments were lost in transport: {e}",
+                exception_name=type(e).__name__,
+            )
         payload = anthropic_response.model_dump(exclude_none=True)
         # ``exclude_none`` is kept: it drops the optional cache/usage fields
         # the local backend never populates, which would otherwise be pure
@@ -970,6 +996,30 @@ class AnthropicServing:
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
         stop_sequences = anthropic_request.stop_sequences
+
+        # --- tool-call assembly state -------------------------------------
+        # The backend's incremental function-call detector does not
+        # guarantee that a call's function name arrives on the first delta,
+        # nor that its argument fragments arrive contiguously. Observed on
+        # a thinking-on qwen deployment: a leading delta with ``name=None``,
+        # argument fragments separated by a stray content token, and
+        # fragments carrying a tool index other than the open block's.
+        # Every one of those used to end as a dropped fragment and a
+        # ``tool_use`` block with ``input={}`` on the client. The state
+        # below makes the adapter robust regardless of what the detector
+        # does: fragments are keyed by the backend's tool index and are
+        # buffered until a name claims them, never discarded.
+        open_tool_index: Optional[int] = None
+        tool_names: dict[int, str] = {}
+        tool_ids: dict[int, Optional[str]] = {}
+        # Every fragment seen per index, delivered or not — the basis for
+        # the completeness check at end of stream.
+        tool_args: dict[int, list[str]] = {}
+        # Fragments not yet attached to a content block (no name yet).
+        pending_tool_args: dict[int, list[str]] = {}
+        # Text/thinking held back while an open tool_use block still has
+        # incomplete arguments, replayed once the block can be closed.
+        deferred_content: list[tuple[str, str]] = []
 
         def _message_start_event(usage) -> MessageStartEvent:
             return MessageStartEvent(
@@ -1066,6 +1116,110 @@ class AnthropicServing:
                 content_block_open = True
                 content_block_type = block_type
             return events
+
+        def _tool_args_parse_state(index: int) -> str:
+            """Classify the arguments accumulated for one tool index.
+
+            Returns ``"empty"`` (nothing received yet — either a genuine
+            zero-argument call or a call whose fragments are still in
+            flight), ``"partial"`` (received but not valid JSON yet), or
+            ``"complete"``.
+            """
+            joined = "".join(tool_args.get(index, []))
+            if not joined.strip():
+                return "empty"
+            try:
+                json.loads(joined)
+            except (json.JSONDecodeError, ValueError):
+                return "partial"
+            return "complete"
+
+        def _tool_block_awaits_arguments() -> bool:
+            """True while the open tool_use block cannot safely be closed.
+
+            Closing it would strand every argument fragment still to come:
+            once the block is gone the fragments have nowhere to go. So
+            interleaved text/thinking is held back instead of closing the
+            block — the exact case that produced "Dropping tool_call
+            argument delta with no open tool_use block" in production.
+            """
+            if not (content_block_open and content_block_type == "tool_use"):
+                return False
+            if open_tool_index is None:
+                return False
+            return _tool_args_parse_state(open_tool_index) != "complete"
+
+        def _release_deferred_content_events() -> list[AnthropicStreamEvent]:
+            """Replay text/thinking held back during an incomplete tool call.
+
+            Ordering note: this emits the held content AFTER the tool_use
+            block it was interleaved with, rather than splitting the tool
+            call in two. The content is preserved in its original relative
+            order; only its position against the one tool block moves.
+            """
+            nonlocal deferred_content
+
+            events: list[AnthropicStreamEvent] = []
+            if not deferred_content:
+                return events
+            held, deferred_content = deferred_content, []
+            for kind, text in held:
+                if kind == "thinking":
+                    events.extend(
+                        _ensure_content_block_events(
+                            "thinking", ThinkingBlock(thinking="")
+                        )
+                    )
+                    events.append(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=ThinkingDelta(thinking=text),
+                        )
+                    )
+                else:
+                    events.extend(
+                        _ensure_content_block_events("text", TextBlock(text=""))
+                    )
+                    events.append(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=TextDelta(text=text),
+                        )
+                    )
+            return events
+
+        def _tool_assembly_failure() -> Optional[str]:
+            """Describe the first tool call that could not be delivered intact.
+
+            Called once at end of stream. Anything it reports is a fragment
+            the client would otherwise never see, so the caller turns it
+            into a visible error rather than shipping a ``tool_use`` block
+            whose ``input`` silently lost its contents.
+            """
+            indices = set(tool_args) | set(tool_names) | set(pending_tool_args)
+            for index in sorted(indices):
+                name = tool_names.get(index)
+                joined = "".join(tool_args.get(index, []))
+                if name is None:
+                    return (
+                        f"tool call #{index} streamed {len(joined)} characters "
+                        "of arguments but the backend never sent a function "
+                        "name, so the call has no addressable tool"
+                    )
+                if pending_tool_args.get(index):
+                    undelivered = "".join(pending_tool_args[index])
+                    return (
+                        f"tool call #{index} ({name}) has "
+                        f"{len(undelivered)} characters of arguments that "
+                        "were never attached to a content block"
+                    )
+                state = _tool_args_parse_state(index)
+                if state == "partial":
+                    return (
+                        f"tool call #{index} ({name}) arguments are "
+                        f"not valid JSON after {len(joined)} characters"
+                    )
+            return None
 
         def _ensure_message_started(usage) -> list[str]:
             """Emit message_start exactly once. Returns SSE frames to yield."""
@@ -1249,16 +1403,40 @@ class AnthropicServing:
                     yield _emit(MessageStopEvent())
                     continue
 
+                # Replay anything held back while a tool call was still
+                # assembling, THEN close the last open block.
+                for event in _release_deferred_content_events():
+                    yield _emit(event)
+
                 # Close any open content block
                 for event in _close_content_block_events():
                     yield _emit(event)
+
+                # A tool call whose arguments never arrived intact must not
+                # be handed to the client as a normal completion: an empty
+                # or truncated ``input`` is indistinguishable from a real
+                # call, and the client acts on it. Fail visibly instead.
+                assembly_failure = _tool_assembly_failure()
+                if assembly_failure is not None:
+                    logger.warning(
+                        "Tool call could not be assembled from the backend stream: %s",
+                        assembly_failure,
+                    )
+                    yield _emit(
+                        _build_error_event(
+                            "api_error",
+                            "Tool call arguments were lost in transport: "
+                            f"{assembly_failure}",
+                        )
+                    )
+                    yield _emit(MessageStopEvent())
+                    continue
 
                 # Emit message_delta with stop_reason and usage
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
@@ -1371,89 +1549,121 @@ class AnthropicServing:
 
             # Handle reasoning content deltas
             if delta.reasoning_content:
-                for event in _ensure_content_block_events(
-                    "thinking",
-                    ThinkingBlock(thinking=""),
-                ):
-                    yield _emit(event)
+                if _tool_block_awaits_arguments():
+                    deferred_content.append(("thinking", delta.reasoning_content))
+                else:
+                    for event in _release_deferred_content_events():
+                        yield _emit(event)
+                    for event in _ensure_content_block_events(
+                        "thinking",
+                        ThinkingBlock(thinking=""),
+                    ):
+                        yield _emit(event)
 
-                yield _emit(
-                    ContentBlockDeltaEvent(
-                        index=content_block_index,
-                        delta=ThinkingDelta(thinking=delta.reasoning_content),
+                    yield _emit(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=ThinkingDelta(thinking=delta.reasoning_content),
+                        )
                     )
-                )
                 had_content_delta = True
 
             # Handle tool call deltas
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    tc_id = tc.id
                     tc_func = tc.function
+                    tc_name = (tc_func.name or None) if tc_func else None
+                    tc_args = (tc_func.arguments or "") if tc_func else ""
 
-                    # New tool call: always close the previous block (even if
-                    # it was also tool_use — each tool needs its own index)
-                    # and start a fresh one.
-                    if tc_func and tc_func.name:
+                    # The backend index is the only reliable identity for a
+                    # call across deltas: ``id`` and ``name`` may be absent
+                    # on continuations. When it is absent too, continue the
+                    # call currently open rather than guessing a new one.
+                    tc_index = tc.index
+                    if tc_index is None:
+                        tc_index = open_tool_index if open_tool_index is not None else 0
+
+                    if tc.id is not None:
+                        tool_ids.setdefault(tc_index, tc.id)
+
+                    # A name is what makes a call addressable, so the block
+                    # opens on the FIRST name for this index — not on the
+                    # first delta, which may well be name-less. Deltas that
+                    # merely repeat a known name are continuations.
+                    if tc_name is not None and tool_names.get(tc_index) is None:
+                        tool_names[tc_index] = tc_name
                         for event in _ensure_content_block_events(
                             "tool_use",
                             ToolUseBlock(
-                                id=_anthropic_tool_use_id(tc_id),
-                                name=tc_func.name,
+                                id=_anthropic_tool_use_id(tool_ids.get(tc_index)),
+                                name=tc_name,
                                 input={},
                             ),
                             force_new=True,
                         ):
                             yield _emit(event)
+                        open_tool_index = tc_index
                         # A zero-argument tool call may never emit an
                         # input_json_delta; the tool_use start block itself is
                         # still meaningful content because it carries id/name.
                         had_content_delta = True
 
-                        if tc_func.arguments:
+                        # Fragments that arrived before the name are flushed
+                        # now, in arrival order, ahead of this delta's own.
+                        for fragment in pending_tool_args.pop(tc_index, []):
                             yield _emit(
                                 ContentBlockDeltaEvent(
                                     index=content_block_index,
-                                    delta=InputJsonDelta(
-                                        partial_json=tc_func.arguments,
-                                    ),
+                                    delta=InputJsonDelta(partial_json=fragment),
                                 )
                             )
                             had_content_delta = True
 
-                    elif tc_func and tc_func.arguments:
-                        # Continuing arguments for current tool call
-                        if content_block_type != "tool_use":
-                            logger.warning(
-                                "Dropping tool_call argument delta with no "
-                                "open tool_use block: %r",
-                                (tc_func.arguments or "")[:100],
-                            )
-                            continue
-                        yield _emit(
-                            ContentBlockDeltaEvent(
-                                index=content_block_index,
-                                delta=InputJsonDelta(
-                                    partial_json=tc_func.arguments,
-                                ),
-                            )
+                    if tc_args:
+                        tool_args.setdefault(tc_index, []).append(tc_args)
+                        owns_open_block = (
+                            content_block_open
+                            and content_block_type == "tool_use"
+                            and open_tool_index == tc_index
+                            and tool_names.get(tc_index) is not None
                         )
-                        had_content_delta = True
+                        if owns_open_block:
+                            yield _emit(
+                                ContentBlockDeltaEvent(
+                                    index=content_block_index,
+                                    delta=InputJsonDelta(partial_json=tc_args),
+                                )
+                            )
+                            had_content_delta = True
+                        else:
+                            # No live block owns this index — the name has
+                            # not arrived, or the fragment belongs to a
+                            # different call than the open one. Buffering is
+                            # the only non-lossy option: appending it to
+                            # whatever block happens to be open would
+                            # corrupt that call's JSON with another call's
+                            # arguments.
+                            pending_tool_args.setdefault(tc_index, []).append(tc_args)
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
-                for event in _ensure_content_block_events(
-                    "text",
-                    TextBlock(text=""),
-                ):
-                    yield _emit(event)
+                if _tool_block_awaits_arguments():
+                    deferred_content.append(("text", delta.content))
+                else:
+                    for event in _release_deferred_content_events():
+                        yield _emit(event)
+                    for event in _ensure_content_block_events(
+                        "text",
+                        TextBlock(text=""),
+                    ):
+                        yield _emit(event)
 
-                yield _emit(
-                    ContentBlockDeltaEvent(
-                        index=content_block_index,
-                        delta=TextDelta(text=delta.content),
+                    yield _emit(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=TextDelta(text=delta.content),
+                        )
                     )
-                )
                 had_content_delta = True
                 # Kept only to feed the stop-sequence suffix fallback in
                 # ``_resolve_stop_sequence``; never re-emitted.
@@ -1491,19 +1701,35 @@ class AnthropicServing:
         if choice.message.tool_calls:
             for tool_call in choice.message.tool_calls:
                 raw_args = tool_call.function.arguments
-                try:
-                    tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
+                if not tool_call.function.name:
+                    raise ToolCallAssemblyError(
+                        "backend returned a tool call with no function name "
+                        f"({len(raw_args or '')} characters of arguments)"
                     )
-                    tool_input = {}
+                if raw_args is None or not str(raw_args).strip():
+                    # A tool with no parameters legitimately serialises to
+                    # nothing at all; that is not a failure.
+                    tool_input: dict = {}
+                else:
+                    try:
+                        tool_input = json.loads(raw_args)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        # Substituting ``{}`` here used to make a mangled
+                        # tool call look exactly like a valid zero-argument
+                        # one. The caller cannot tell the difference, so the
+                        # arguments have to fail loudly instead.
+                        raise ToolCallAssemblyError(
+                            f"tool {tool_call.function.name!r} returned "
+                            f"arguments that are not valid JSON "
+                            f"({type(e).__name__}): "
+                            f"{str(raw_args)[:200]!r}"
+                        ) from e
+                if not isinstance(tool_input, dict):
+                    raise ToolCallAssemblyError(
+                        f"tool {tool_call.function.name!r} returned "
+                        f"non-object arguments of type "
+                        f"{type(tool_input).__name__}"
+                    )
 
                 content.append(
                     ToolUseBlock(
