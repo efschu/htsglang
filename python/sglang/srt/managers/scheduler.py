@@ -3024,17 +3024,38 @@ class Scheduler(
             if freed > 0:
                 verdict = "The remedy the receipt names has now actually run."
             elif avail_before is not None and avail_before >= want:
-                # Benign. KV was NOT the binding resource at this instant, so
-                # whatever blocks admission is something else -- mamba/GDN state
-                # slots are the standing candidate on this model, since a
-                # request needs a slot even when KV is plentiful.
-                verdict = (
-                    f"Eviction was SKIPPED, not defeated: {avail_before} rows "
-                    f"were already available against {want} wanted, so the "
-                    f"actuator had nothing to do. KV is therefore NOT the "
-                    f"binding resource here -- look at the state-slot bound "
-                    f"(mamba/GDN slots) before blaming the pool."
-                )
+                # Eviction was skipped: `want` was already available. But `want`
+                # is chunked_prefill_size, an arbitrary chunk, NOT what the
+                # blocked work actually needs -- so "avail >= 512" does NOT
+                # license "KV is not binding". The 22:22:33 specimen made that
+                # concrete: 19004 rows available, 512 wanted, and 97922 tokens
+                # of prefill pending. The first version of this branch concluded
+                # KV was not the binding resource from the 512 test alone, which
+                # is the same over-claim from a partial instrument that this
+                # routine exists to stop. Compare against the real demand.
+                pending = None
+                try:
+                    pending = int(getattr(inp, "pending_prefill_tokens", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    pending = None
+                if pending and avail_before < pending:
+                    verdict = (
+                        f"Eviction was SKIPPED, not defeated: {avail_before} "
+                        f"rows were already available against the {want} asked "
+                        f"for. But {pending} tokens of prefill are pending, so "
+                        f"KV may well be binding for the REAL demand -- this "
+                        f"asked for a chunk, not for what the blocked work "
+                        f"needs. Do not read this as 'KV is fine'."
+                    )
+                else:
+                    verdict = (
+                        f"Eviction was SKIPPED, not defeated: {avail_before} "
+                        f"rows were already available against {want} wanted"
+                        + (f" and {pending} pending" if pending else "")
+                        + ", so the actuator had nothing to do. KV is not the "
+                        "binding resource here -- look at the state-slot bound "
+                        "(mamba/GDN slots) before blaming the pool."
+                    )
             else:
                 verdict = (
                     "Eviction RAN and delivered nothing"

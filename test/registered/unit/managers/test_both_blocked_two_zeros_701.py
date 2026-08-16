@@ -48,7 +48,7 @@ def _both_blocked_decision():
     return SimpleNamespace(reason=f"{BOTH_BLOCKED}: nothing can run")
 
 
-def _run(stub, avail, freed):
+def _run(stub, avail, freed, pending=0):
     """Drive the relief with a stubbed actuator + availability."""
     from sglang.srt.managers import scheduler as scheduler_mod
 
@@ -62,7 +62,9 @@ def _run(stub, avail, freed):
     ):
         with mock.patch.object(scheduler_mod.logger, "warning") as warn:
             scheduler_mod.Scheduler._apply_both_blocked_relief(
-                stub, _both_blocked_decision(), SimpleNamespace(now=1000.0)
+                stub,
+                _both_blocked_decision(),
+                SimpleNamespace(now=1000.0, pending_prefill_tokens=pending),
             )
     if not warn.call_args_list:
         return ""
@@ -78,11 +80,11 @@ class TestBothBlockedTwoZeros701(CustomTestCase):
     def test_zero_with_sufficient_avail_is_reported_as_SKIPPED(self):
         """The live 21:44:37 case. 139507 rows reachable, 512 wanted, freed 0 --
         because eviction was never needed, not because it failed."""
-        msg = _run(_stub_scheduler(), avail=139507, freed=0)
+        msg = _run(_stub_scheduler(), avail=139507, freed=0, pending=0)
         self.assertIn("SKIPPED", msg, msg)
         self.assertNotIn("frontier cannot reach", msg, msg)
         self.assertIn(
-            "NOT the binding resource",
+            "not the binding resource",
             msg,
             "the benign case must say KV is not what is blocking admission",
         )
@@ -133,3 +135,27 @@ class TestBothBlockedTwoZeros701(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPendingDemandGuardsTheClaim701(CustomTestCase):
+    """The 22:22:33 specimen: 19004 rows available, 512 wanted, 97922 pending.
+
+    `want` is chunked_prefill_size -- an arbitrary chunk, not what the blocked
+    work needs. Concluding "KV is not the binding resource" from `avail >= 512`
+    is an over-claim from a partial instrument, which is precisely what this
+    routine exists to stop it doing to someone else.
+    """
+
+    def test_pending_above_avail_withholds_the_not_binding_claim(self):
+        msg = _run(_stub_scheduler(), avail=19004, freed=0, pending=97922)
+        self.assertIn("SKIPPED", msg, msg)
+        self.assertIn("97922", msg, msg)
+        self.assertIn("may well be binding", msg, msg)
+        self.assertNotIn("KV is not the binding resource", msg, msg)
+
+    def test_pending_below_avail_still_makes_the_claim(self):
+        """CAN-FAIL: the strong claim must survive where it IS warranted. A fix
+        that always hedged would pass the test above and fail this one."""
+        msg = _run(_stub_scheduler(), avail=139507, freed=0, pending=4096)
+        self.assertIn("KV is not the binding resource", msg, msg)
+        self.assertNotIn("may well be binding", msg, msg)
