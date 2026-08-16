@@ -310,3 +310,88 @@ def test_an_impossible_ladder_is_refused():
         fixed_vector_for_ladder([], POOL_TOKENS, GEO)
     with pytest.raises(DecoupledKvError, match="disagree"):
         fixed_vector_for_ladder([(1.0, 2.0, 3.0), (1.0, 2.0)], POOL_TOKENS, GEO)
+
+
+# --------------------------------------------------------------------------
+# The bridge to the EXISTING owner rule. distributed/utils.py:407 defines the
+# token-axis split as INTEGER ratios: slot L belongs to rank r iff (L % S) is
+# in [lo_r, hi_r) with S = sum(ratios), so the realized share is exactly
+# ratio_r / S. Our solver produces FRACTIONS, so they must be quantised -- and
+# rounding is not neutral, because rounding a tight rank UP can make it
+# infeasible.
+# --------------------------------------------------------------------------
+
+
+def test_quantised_ratios_sum_to_the_period_and_realize_the_shares():
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    target = (0.135, 0.483, 0.382)
+    q = quantize_shares(
+        target,
+        period=32,
+        free_gib=_free_for((44, 10, 10)),
+        total_tokens=POOL_TOKENS,
+        geometry=GEO,
+    )
+    assert sum(q.ratios) == 32
+    assert all(r >= 1 for r in q.ratios)
+    for got, want in zip(q.realized_shares, target):
+        assert abs(got - want) < 0.05
+
+
+def test_a_finer_period_tracks_the_target_more_closely():
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    target = (0.135, 0.483, 0.382)
+    free = _free_for((44, 10, 10))
+    coarse = quantize_shares(target, 8, free, POOL_TOKENS, GEO)
+    fine = quantize_shares(target, 128, free, POOL_TOKENS, GEO)
+    assert fine.max_share_error <= coarse.max_share_error
+
+
+def test_rounding_may_not_push_a_tight_rank_over_its_free_memory():
+    """THE hazard the quantiser exists for.
+
+    At [44,10,10] rank0 has only 2.97 GiB free and a 13.5% target share.
+    Rounding that share UP buys rows rank0 cannot hold, and the resulting OOM
+    would look like a decoupling bug rather than a rounding bug.
+    """
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    free = _free_for((44, 10, 10))
+    q = quantize_shares((0.135, 0.483, 0.382), 32, free, POOL_TOKENS, GEO)
+    fit = vector_feasibility(q.ratios, free, POOL_TOKENS, GEO)
+    assert all(fit.fits), "the quantised vector must itself be feasible"
+
+
+def test_an_infeasible_target_is_refused_rather_than_rounded_into_place():
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    # Demand almost everything on rank0, which has the least free memory.
+    with pytest.raises(DecoupledKvError, match="feasible"):
+        quantize_shares(
+            (0.90, 0.05, 0.05), 32, _free_for((44, 10, 10)), POOL_TOKENS, GEO
+        )
+
+
+def test_a_rank_quantising_to_zero_slots_is_refused_not_silently_dropped():
+    """A zero-slot rank holds no rows but would still be asked for Q and a
+    partial output, paying full collective cost for nothing. If a rank is meant
+    to be out of the shard set, the caller must say so explicitly."""
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    with pytest.raises(DecoupledKvError, match="zero slots"):
+        quantize_shares((0.98, 0.01, 0.01), 4, (100.0, 100.0, 100.0), POOL_TOKENS, GEO)
+
+
+def test_the_even_split_round_trips_exactly():
+    """All-equal ratios are the classic even-DCP fast path, which
+    distributed/utils.py keeps bit-identical. Quantising an even target must
+    not perturb it."""
+    from sglang.srt.planner.decoupled_kv import quantize_shares
+
+    q = quantize_shares(
+        (1 / 3, 1 / 3, 1 / 3), 3, (100.0, 100.0, 100.0), POOL_TOKENS, GEO
+    )
+    assert q.ratios == (1, 1, 1)
+    assert q.max_share_error == pytest.approx(0.0, abs=1e-12)

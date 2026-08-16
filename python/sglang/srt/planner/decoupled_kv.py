@@ -246,3 +246,101 @@ def fixed_vector_for_ladder(
             "exists and the ladder cannot be served decoupled."
         )
     return tuple(_normalise(worst))
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantisedShares:
+    """Integer token-axis ratios for the EXISTING uneven-DCP owner rule."""
+
+    ratios: tuple[int, ...]
+    period: int
+    realized_shares: tuple[float, ...]
+    max_share_error: float
+
+
+def quantize_shares(
+    target: Sequence[float],
+    period: int,
+    free_gib: Sequence[float],
+    total_tokens: int,
+    geometry: KvGeometry,
+) -> QuantisedShares:
+    """Round a FEASIBLE fractional target onto the integer owner rule.
+
+    ``distributed/utils.py:407`` defines the token axis as integer ratios: slot
+    ``L`` belongs to rank ``r`` iff ``(L % S)`` is in ``[lo_r, hi_r)`` with
+    ``S = sum(ratios)``. So the realized share is exactly ``ratio_r / S`` and
+    the solver's fractions have to be quantised before they can drive it.
+
+    This is a ROUNDING step, not a re-optimisation. An infeasible target is
+    refused rather than repaired into something feasible but unrelated -- the
+    caller is expected to have obtained a feasible target from
+    :func:`vector_feasibility` or :func:`fixed_vector_for_ladder`, and silently
+    substituting a different vector would hide that it did not.
+
+    Rounding itself is not neutral: rounding a tight rank UP buys rows it
+    cannot hold, and the resulting OOM would read as a decoupling bug rather
+    than a rounding bug. So the rounded vector is re-checked and repaired by
+    moving slots from any over-committed rank to the rank with the most slack.
+    """
+    if period < len(target):
+        raise DecoupledKvError(
+            f"period {period} cannot give {len(target)} ranks a slot each."
+        )
+    norm = _normalise(target, len(free_gib))
+
+    # The target itself must be feasible; quantisation does not rescue it.
+    base = vector_feasibility(norm, free_gib, total_tokens, geometry)
+    if not all(base.fits):
+        bad = [i for i, ok in enumerate(base.fits) if not ok]
+        raise DecoupledKvError(
+            f"the target share vector is not feasible on rank(s) {bad}: "
+            f"needs {[round(base.need_gib[i], 2) for i in bad]} GiB against "
+            f"{[round(base.free_gib[i], 2) for i in bad]} GiB free. Quantisation "
+            "rounds a feasible target; it does not repair an infeasible one, "
+            "because substituting a different vector would hide that the "
+            "target was wrong."
+        )
+
+    # Largest-remainder apportionment: exact sum, minimal rounding drift.
+    raw = [s * period for s in norm]
+    ratios = [int(x) for x in raw]
+    rem = period - sum(ratios)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - ratios[i], reverse=True)
+    for i in range(rem):
+        ratios[order[i % len(order)]] += 1
+
+    if any(r <= 0 for r in ratios):
+        zero = [i for i, r in enumerate(ratios) if r <= 0]
+        raise DecoupledKvError(
+            f"rank(s) {zero} quantise to zero slots at period {period}. A "
+            "zero-slot rank holds no rows but is still asked for Q and a "
+            "partial output, paying the full collective cost for nothing. Use "
+            "a finer period, or drop those ranks from the shard set explicitly "
+            "so the cost model sees fewer participants."
+        )
+
+    # Repair rounding-induced infeasibility only.
+    for _ in range(period):
+        fit = vector_feasibility(ratios, free_gib, total_tokens, geometry)
+        over = [i for i, ok in enumerate(fit.fits) if not ok]
+        if not over:
+            break
+        donor = max(over, key=lambda i: fit.need_gib[i] - fit.free_gib[i])
+        slack = [fit.free_gib[i] - fit.need_gib[i] for i in range(len(ratios))]
+        taker = max(range(len(ratios)), key=lambda i: slack[i])
+        if ratios[donor] <= 1 or taker == donor:
+            raise DecoupledKvError(
+                f"no feasible integer split exists at period {period}: rank "
+                f"{donor} is over budget even at its smallest non-zero share."
+            )
+        ratios[donor] -= 1
+        ratios[taker] += 1
+
+    realized = tuple(r / period for r in ratios)
+    return QuantisedShares(
+        ratios=tuple(ratios),
+        period=int(period),
+        realized_shares=realized,
+        max_share_error=max(abs(a - b) for a, b in zip(realized, norm)),
+    )

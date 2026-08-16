@@ -249,6 +249,12 @@ same observed pool. They disagree on the **distribution across ranks**, which
 is the only thing a cut solver produces. The flat form is a fit artifact — and
 so, in its own smaller way, was mine.
 
+> **Confirmed on absolute grounds (2026-08-16, restored boot `bdd777a8cd`).**
+> The running system's `cell_size` is `attn_layers × 2048` **exactly**, per rank
+> — 7 / 5 / 4 × 2048. This is no longer a fit that reproduces a pool, nor an
+> inference from allocator source: it is the live sizer agreeing with the rule
+> term for term. The attention-layers divisor is settled.
+
 Consequence, and it is not academic: the two forms diverge exactly in the
 region the ladder operates in, which is why the divisor had to be settled. What
 does *not* follow is any specific boot arm — see §6, where my `[33,15,16]`
@@ -975,12 +981,13 @@ binding constraint comes from a different rung. That candidate is then verified
 per rung — it is the natural construction, not a theorem, and the solver says
 so.
 
-### 4.2c Shared layout contract with #706 (PROPOSED — awaiting F4-r4)
+### 4.2c Shared layout contract with #706 — **AGREED**
 
 The same-key world must hold on **both** the host format (#706) and the device
-layout (#704b), so this paragraph is proposed for verbatim inclusion in both
-design docs. **Status: sent for agreement; not yet confirmed. The device-side
-layout code is held until it is.**
+layout (#704b), so the text below is carried **verbatim in both design docs**.
+**Status: AGREED with the #706 strand.** He frames it as the stronger form of
+his #241 invariant — canonical bytes depend on no geometry, therefore the key
+carries none. The device-side layout code is unblocked on this basis.
 
 > A cache key identifies CONTENT, never placement. The key is a function of the
 > model identity, the token sequence, and semantic modifiers that change the
@@ -998,18 +1005,60 @@ layout code is held until it is.**
 >
 > Consequence: bytes written by PP-prefill are readable by TP-decode and vice
 > versa, at the same key, with no re-keying and no second geometry.
+>
+> **(a) Draft pages are excluded, by name.** `{hash}.draft` pages cannot be
+> made geometry-neutral by any suffix rule: draft KV is the exact MIRROR of
+> target KV — head-SHARDED and token-COMPLETE — and the draft worker exists
+> only in the TP decode phase. Draft pages therefore stay phase- and
+> rank-specific, and the draft pool starts **cold** after a flip or reboot. A
+> partial `#cached-token` share is the DESIGNED shape, not a defect. Named and
+> accepted rather than silently inherited.
+>
+> **(b) The mamba/GDN canonical form is DEFINED BY the #706 mamba spec, and is
+> not restated here.** 48 of 64 layers are GDN, so the attention ordering above
+> is silent on most of the model and must not be read as covering it. The
+> definition is `MambaPool.get_conv_subblock_spec` (`memory_pool.py:1226`,
+> returning `(sub_block_full_sizes, units, conv_dim)`) together with
+> `layer_extents()` / `MambaBlobSpec.for_layers()` (#706, `e77a1e35a2`). Any
+> implementation MUST call that spec rather than compute offsets locally.
+>
+> **The trap it exists to prevent:** a mamba layer range is **TWO DISJOINT byte
+> ranges** — a temporal region and a conv region — and the conv region is three
+> independently head-sharded `[query_key | query_key | value]` sub-blocks, so a
+> rank's conv shard is three concatenated ranges, not one contiguous slice.
+> **Cutting it as one flat range returns the right NUMBER of bytes and the
+> wrong channels**, which is a silent-corruption class, not a crash.
 
 If the key encoded the share vector we would lose structural uniformity for
-free and gain nothing — hence "descriptor, not key". Sizing for the host side:
-a full 436,766-token pool is `16 × 2048 × 436,766` = **13.3 GiB** of canonical
-bytes world-wide, independent of sharding; one page of P tokens is
-`P × 16 × 2048` B.
+free and gain nothing — hence "descriptor, not key".
 
-**Open question put to F4-r4:** does a #706 page carry all 16 attention layers
-for its token range (layer-major within the page, as above), or one page per
-(layer, token-range)? The former is assumed here. The latter also satisfies the
-contract but changes his page count 16× and moves who pays the gather, so it is
-being matched rather than guessed.
+**Page shape: OPTION A**, settled by #706. A page carries **all 16 attention
+layers for its token range, layer-major within the page**. Grounds, all his:
+`page_size == 1` is mandatory (required by `dcp_owner_mode`, since a
+multi-token page would span owner ranks), so a page is ONE token — Option A is
+a 32,768 B object where the per-(layer,token) alternative would be 2,048 B;
+that alternative implies ~7.0M sub-4-KiB objects, below the filesystem block
+size, giving ~2x space amplification and IOPS that would make disk-L3 slower
+than re-prefilling; and `memory_pool_host.py:793` already allocates
+`(num_host_pages, layer_num, item_bytes)`, so Option A only widens `layer_num`
+to 16 and globalises `start_layer`.
+
+Cost of Option A, stated honestly because **the writer pays**: each PP stage
+partial-writes its own layer slots at byte offsets within a shared page, so a
+per-page **completeness marker** (slot bitmap header, or rename-on-complete) is
+required and **does not exist yet** — it must be built.
+
+Sizing: a full 436,766-token pool is `16 × 2048 × 436,766` = **13.3 GiB** of
+canonical attention bytes world-wide, independent of sharding.
+
+**Known gap inherited from (b), and it is large.** The existing mamba spec cuts
+by **heads**, for TP mismatch. The PP phase shards **layers**, so a stage's
+`.mamba` blob is layer-partial rather than head-partial, and
+`get_conv_subblock_spec` does not address that axis at all. A **layer** cut for
+mamba that composes with the head cut is new work, and #706 records it as the
+single largest piece in his design. #704b depends on it for any prefix that
+must survive a phase change, because 48 of 64 layers are GDN and a prefix
+cannot be resumed from attention KV alone.
 
 ### 4.3 Cost
 
