@@ -981,6 +981,12 @@ class PhasePolicyState:
     #: The runtime's own words for a direction that has been refused past
     #: ``refusal_degrade_after``. Truthy = degraded; cleared by a success.
     arm_degraded: dict = field(default_factory=dict)
+    #: The reason the LAST arm of each direction was abandoned, kept whether
+    #: or not the degrade threshold was reached. The purity valve prints it
+    #: when it stands down, so the receipt names the SHORTFALL that idled the
+    #: instance ("staging 1614 MiB needed but only 1595 MiB is spendable")
+    #: instead of only the streak count, which says nothing about the cause.
+    arm_last_detail: dict = field(default_factory=dict)
     #: What ``note_flip_armed`` overwrote, so a refusal can put it back.
     #: A tuple (direction, previous_last_flip_at, previous_idle_since); None
     #: when no arm is outstanding.
@@ -1020,6 +1026,31 @@ class PhasePolicyInputs:
     pending_prefill_tokens: int
     running_bs: int
     now: float
+
+    #: THE ROUND JUST FAILED TO BUILD A BATCH OF EITHER WORK CLASS.
+    #:
+    #: Not "the queue is empty" and not "the box looks quiet": both classes
+    #: had work and neither could be scheduled in the layout that is running.
+    #: Measured 2026-08-16 09:42:39-45, six seconds of total silence with
+    #: 572715 tok of prefill queued and four carriers ready to decode --
+    #: decode forbidden in PP, and prefill unadmittable because those same
+    #: four carriers' KV held ~352k of the 472k-row pool. Nothing could run,
+    #: and the only rule that armed the flip out of it was the 180 s
+    #: decode-stall cap.
+    #:
+    #: REPLICATED like every other field here: it is derived from the round's
+    #: own build outcome, which every rank reaches by running the same
+    #: scheduler over the same replicated queue.
+    nothing_can_run: bool = False
+
+    #: The OTHER layout can build at least one of those classes.
+    #:
+    #: This is what makes the arm ONE-SIDED and therefore non-oscillating by
+    #: construction, with no timer floor: the flip is armed only when the
+    #: current layout provably cannot run anything AND the target provably
+    #: can, so after the flip the target runs by premise and the same
+    #: condition cannot immediately hold again in the new layout.
+    target_can_admit: bool = False
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1215,44 @@ def _decide_from_load(
         return _no("policy disabled")
 
     idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
+
+    # NOTHING CAN RUN HERE -- CHECKED BEFORE THE DWELL, AND THAT IS THE POINT.
+    #
+    # Every other rule below asks "is flipping WORTH it", and a dwell floor is
+    # the right damper for that question: it bounds thrash between two layouts
+    # that can both do work. This rule asks a different question -- "can this
+    # layout do ANY work at all" -- and when the answer is no, waiting is not
+    # a trade-off, it is dead time. Measured on metal 2026-08-16 09:42:39-45:
+    # six seconds of zero GPU, zero PCIe, py-spy showing all three ranks
+    # spinning get_next_batch_to_run and building nothing, released only by
+    # the 180 s decode-stall cap. DRAINED could not fire (it needs pending
+    # <= one chunk; there were 572715 tok) and the #677(a) progress exit could
+    # not fire either (it needs pending FROZEN, and pending was still creeping
+    # 572792 -> 572715, which reads as progress).
+    #
+    # A TIMER IS THE WRONG INSTRUMENT FOR A FACT THAT IS ALREADY KNOWN. The
+    # round has just finished failing to build a batch of either class; that
+    # is not a prediction to be confirmed by waiting, it is a completed
+    # observation. So the arm is event-driven off that failure and carries no
+    # interval of its own.
+    #
+    # IT CANNOT OSCILLATE, and not because a damper stops it. The condition is
+    # ONE-SIDED: it requires that the current layout can build nothing AND
+    # that the target can build something. After the flip the target runs by
+    # premise, so the same condition is false there. Bypassing the dwell is
+    # therefore safe in exactly this branch and nowhere else -- which is why
+    # it is written here, above the dwell, rather than as an exception inside
+    # it.
+    if inp.nothing_can_run and inp.target_can_admit:
+        direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
+        return PhasePolicyDecision(
+            direction,
+            f"IDLE-LOCKED: no batch of either work class can be built in the "
+            f"{inp.phase} layout ({inp.running_bs} req resident, "
+            f"{inp.pending_prefill_tokens} tok prefill pending) and the "
+            f"target layout can run one -- arming immediately rather than "
+            f"waiting for a stall timer to notice",
+        )
 
     # The minimum dwell is checked FIRST and applies to every flip, so no
     # branch below can bypass the thrash bound. It is the only guarantee
@@ -1577,6 +1646,10 @@ def note_flip_outcome(
     # instant rather than from the end of a backoff it is going to ignore.
     state.arm_hold_last_span[direction] = hold
     detail = (message or "no reason given").strip()
+    # Kept unconditionally, so the purity valve can name the shortfall that
+    # idled the box even on the FIRST abandon -- which, since the stand-down
+    # bound became 1, is the abandon that opens it.
+    state.arm_last_detail[direction] = detail
 
     if k >= cfg.refusal_degrade_after and not state.arm_degraded.get(direction):
         state.arm_degraded[direction] = detail

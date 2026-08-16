@@ -2896,6 +2896,59 @@ class Scheduler(
             "on" if getattr(self.server_args, "enable_phase_flip", False) else "off",
         )
 
+    def _note_round_build_outcome(self, ret, running_batch) -> None:
+        """Record that this round built nothing while both classes had work.
+
+        AN OBSERVATION, NOT A PREDICTION, and that distinction is the whole
+        fix. ``get_next_batch_to_run`` has just finished trying to build a
+        batch and produced none; whether this layout can run anything is
+        therefore already ANSWERED at this line. The old escape from that
+        state was the 180 s decode-stall cap -- a timer re-deriving by
+        waiting what the round already knew (metal 2026-08-16 09:42:39-45:
+        six seconds of zero GPU, zero PCIe, 572715 tok queued, four carriers
+        ready, py-spy showing all three ranks spinning this very function).
+
+        BOTH CLASSES MUST HAVE WORK AND BOTH MUST HAVE FAILED. An empty
+        instance also builds no batch, and flipping an idle server is thrash
+        with no benefit -- so "no batch" alone is deliberately not the
+        trigger.
+        """
+        if ret is not None:
+            self._round_built_nothing = False
+            return
+        resident = len(getattr(running_batch, "reqs", None) or [])
+        try:
+            pending = int(self._pending_prefill_tokens() or 0)
+        except Exception:  # noqa: BLE001 - an observation must not break a round
+            pending = 0
+        self._round_built_nothing = bool(resident > 0 or pending > 0)
+
+    def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
+        """``(nothing_can_run, target_can_admit)`` for the policy.
+
+        ONE-SIDED BY CONSTRUCTION, which is what makes the arm safe without a
+        dwell floor underneath it. ``target_can_admit`` asks whether the OTHER
+        layout can run one of the classes this one cannot:
+
+        * in PP, decode is forbidden, so a resident carrier is work only TP
+          can do -- the target admits iff something is resident;
+        * in TP, prefill is forbidden under drain purity, so queued tokens are
+          work only PP can do -- the target admits iff prefill is pending.
+
+        After the flip the target therefore runs BY PREMISE, so the condition
+        cannot immediately hold again on the other side and the pair cannot
+        ping-pong. No interval, no counter, no floor.
+        """
+        if not bool(getattr(self, "_round_built_nothing", False)):
+            return False, False
+        phase = getattr(self, "phase_flip_active_stack", None)
+        if phase == "pp":
+            return True, int(running_bs) > 0
+        if phase == "tp":
+            return True, int(pending_tokens) > 0
+        # No flip enabled, or a phase this rule says nothing about: never arm.
+        return False, False
+
     def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
         """Record this round's purity verdict and reconcile the parked set.
 
@@ -5394,6 +5447,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        self._note_round_build_outcome(ret, running_batch)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -8159,6 +8213,19 @@ class Scheduler(
             pending_prefill_tokens=self._pending_prefill_tokens(),
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
+            # getattr, because this gate is driven in tests by scheduler
+            # STAND-INS that carry only the fields the policy reads. A
+            # stand-in without the observation has not observed anything, and
+            # "not observed" must mean "do not arm on it" -- the pre-change
+            # behaviour -- rather than an AttributeError in the arming path.
+            **dict(
+                zip(
+                    ("nothing_can_run", "target_can_admit"),
+                    getattr(self, "_idle_locked_inputs", lambda *_: (False, False))(
+                        int(running_bs or 0), self._pending_prefill_tokens()
+                    ),
+                )
+            ),
         )
         state = self.phase_policy_state
         observe_idle(state, inp)

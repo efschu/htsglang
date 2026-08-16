@@ -118,6 +118,7 @@ DISCIPLINE
 from __future__ import annotations
 
 import logging
+import time
 from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -196,6 +197,21 @@ class SeamCensus:
         #: and the 1.5 s plateau this was built for.
         self.below_law: List[Tuple[str, int]] = []
         self._law_announced = False
+        #: (label, monotonic seconds) per stage, parallel to ``stages``.
+        #:
+        #: TIME, BECAUSE THE MEMORY WALK ALREADY PROVED IT IS NOT THE PAYLOAD.
+        #: Measured 2026-08-16 across five flips spanning 123 -> 102538 live
+        #: slots (834x), the FLIP DONE receipt's own read+exchange+write
+        #: accounted for only 458-953 ms of a 2459-3186 ms flip. The
+        #: remaining 2001-2233 ms was UNNAMED, and it barely moved (231 ms
+        #: spread) while the payload grew 834x -- so it is a fixed per-flip
+        #: cost, and a fixed cost cannot be found by looking at transfer
+        #: sizes. It has to be timed where it is spent, which is here: the
+        #: census already stops at every stage boundary that matters.
+        #:
+        #: Kept PARALLEL to ``stages`` rather than widening that tuple, whose
+        #: shape ``format_line`` and the #485 excursion analysis both read.
+        self.times: List[Tuple[str, float]] = []
 
     def mark(self, label: str) -> None:
         """Record one stage boundary.
@@ -208,6 +224,11 @@ class SeamCensus:
         no-return path that is an instance, not a missing log line.
         (Caught by test_a_probe_that_raises_does_not_escape.)
         """
+        # BEFORE the probe: the probe itself calls into the driver
+        # (mem_get_info), so stamping after it would charge the driver call to
+        # the segment that just ended and make every segment look slower than
+        # it is.
+        self.times.append((str(label), time.monotonic()))
         try:
             sample = self._probe()
         except Exception:
@@ -292,6 +313,45 @@ class SeamCensus:
         if base is None or low is None:
             return None
         return max(0, base - low[1])
+
+    def format_timing_line(self) -> str:
+        """One line per flip per rank: per-segment WALL MILLISECONDS.
+
+        THE COMPANION TO format_line, AND THE REASON IT WAS NOT ENOUGH. That
+        line answers "which stage spent the MEMORY". This one answers "which
+        stage spent the TIME", and until it existed the answer was simply not
+        in the log: the FLIP DONE receipt times read, exchange and write --
+        the three phases of the wave transfer -- and nothing else, so
+        everything between the arm and the cutover was one unnamed block.
+
+        Measured 2026-08-16, five flips, 123 -> 102538 live slots (834x):
+        read+exchange+write accounted 458-953 ms of a 2459-3186 ms flip. The
+        unnamed remainder was 2001-2233 ms and moved by only 231 ms across the
+        whole 834x range. That is a FIXED per-flip cost roughly 4x the size of
+        the transfer it surrounds, and it is what an idle window is made of.
+
+        Sorted by cost DESCENDING, because a decomposition is read to find the
+        dominating segment and that segment should not have to be hunted for.
+        """
+        if len(self.times) < 2:
+            return (
+                f"{LOG_PREFIX} timing {self.direction} rank {self.rank}: "
+                f"only {len(self.times)} stage mark(s), no segment to time"
+            )
+        segs = []
+        for (a_label, a_t), (b_label, b_t) in zip(self.times, self.times[1:]):
+            segs.append((f"{a_label}->{b_label}", (b_t - a_t) * 1000.0))
+        total_ms = (self.times[-1][1] - self.times[0][1]) * 1000.0
+        ranked = sorted(segs, key=lambda kv: kv[1], reverse=True)
+        body = " | ".join(f"{name} {ms:.1f}" for name, ms in ranked)
+        top_name, top_ms = ranked[0]
+        share = (100.0 * top_ms / total_ms) if total_ms > 0 else 0.0
+        return (
+            f"{LOG_PREFIX} timing {self.direction} rank {self.rank}: "
+            f"{total_ms:.1f} ms across {len(segs)} segment(s), worst "
+            f"'{top_name}' {top_ms:.1f} ms ({share:.0f}% of the walk). "
+            f"ms by segment, descending -- {body}"
+        )
 
     def format_line(self) -> str:
         """One line per flip per rank: per-stage DELTAS against baseline.
@@ -428,6 +488,7 @@ def end() -> Optional[SeamCensus]:
     try:
         census.mark("done")
         logger.info("%s", census.format_line())
+        logger.info("%s", census.format_timing_line())
     except Exception:  # pragma: no cover
         pass
     return census

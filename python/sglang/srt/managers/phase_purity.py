@@ -329,6 +329,17 @@ def _active_phase(scheduler) -> Optional[str]:
 #: purpose: ``/health`` times out at 20 s and a refused round costs about 3 s
 #: on this rig, so a larger bound would open the valve after the instance has
 #: already stopped answering -- which is the state this exists to prevent.
+#:
+#: LEFT AT 4 DELIBERATELY, 2026-08-16. Lowering it to 1 was tried as a way to
+#: close the sub-10 s idle windows and is the WRONG FIX, which the suite says
+#: out loud: it reds
+#:   test_purity_stand_down_656 :: test_a_short_abandon_streak_is_not_a_stand_down
+#:   test_decode_slo_starvation_662 :: test_it_holds_with_NO_count_REACHING_ITS_BOUND
+#: Those are deliberate invariants -- a SHORT streak must not stand purity
+#: down -- and an idle window is not a licence to delete them. The valve is
+#: for a PERSISTENTLY unreachable layout; a single abandoned flip is a
+#: latency defect in the seam, and it is fixed where it is caused. See the
+#: gap decomposition before reaching for this constant again.
 ENV_STAND_DOWN_AFTER = "SGLANG_PHASE_PURITY_STAND_DOWN_AFTER"
 DEFAULT_STAND_DOWN_AFTER = 4
 
@@ -537,8 +548,25 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
         return (
             f"{direction} arm refused {refused} times consecutively (bound "
             f"{bound}); the layout {work} needs is not reachable"
+            f"{_last_abandon_detail(state, direction)}"
         )
     return None
+
+
+def _last_abandon_detail(state, direction: str) -> str:
+    """The shortfall that caused the stand-down, for the receipt.
+
+    NAMED, NOT COUNTED. "abandoned 1 time consecutively" tells an operator
+    that the valve opened and nothing about WHY, and the why is the number
+    that gets acted on: the 2026-08-16 idle windows were a 19 MiB shortfall
+    (staging 1614 MiB needed, 1595 MiB spendable), which is small enough that
+    the evict rung could have funded it outright. A receipt that carries the
+    figure is what makes that follow-up obvious instead of archaeological.
+    """
+    detail = (getattr(state, "arm_last_detail", None) or {}).get(direction)
+    if not detail:
+        return ""
+    return f". Last abandon: {detail}"
 
 
 def _relaxed(scheduler, work: str) -> bool:
