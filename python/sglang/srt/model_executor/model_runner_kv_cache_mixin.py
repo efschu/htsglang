@@ -5720,6 +5720,21 @@ class ModelRunnerKVCacheMixin:
         # below what the corridor law already pays for would hold VRAM free
         # ABOVE the law for the life of the instance instead. Read from the
         # purity mode, never configured on its own.
+        # #685 DIAGNOSTIC: the received-layer derivation below did not appear
+        # in the 12:04 boot's log although the pool WAS seam-adjusted, so the
+        # function is returning before it on the live path. One unconditional
+        # line at the point of no return, naming the terms every early exit
+        # keys on, decides which branch without another bisect.
+        logger.info(
+            "%s: seam-adjusted budget reached the survivability step -- "
+            "reserve.active=%s per_row=%.1f fixed=%d arena=%d id_space=%s",
+            seam.LOG_PREFIX,
+            getattr(reserve, "active", "?"),
+            float(getattr(reserve, "per_row_bytes", 0.0) or 0.0),
+            int(getattr(reserve, "fixed_bytes", 0) or 0),
+            int(getattr(reserve, "arena_fixed_bytes", 0) or 0),
+            getattr(reserve, "id_space", "?"),
+        )
         from sglang.srt.managers.phase_purity import purity_from_server_args
 
         try:
