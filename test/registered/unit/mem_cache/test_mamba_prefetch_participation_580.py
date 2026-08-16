@@ -35,6 +35,23 @@ then meet on one gloo group: the crash class this ticket is named for.
 THE ASSERTION THAT MATTERS is not "a vote exists" but "every rank issues the
 same collectives". A test that only checked for the presence of a vote would
 pass against a vote posted on the wrong group, or posted after an early return.
+
+REACHABILITY, CORRECTED (#609). This class is UNREACHABLE in the default
+factory: ``registry.py`` routes hierarchical + hybrid-SSM configs to
+``UnifiedRadixCache``, and ``registry.py:107`` states that HiMambaRadixCache
+has no construction site anywhere. The commit that added this file claimed it
+was "the tree this rig actually runs"; that was WRONG. The rig does run
+mamba/GDN, which is what misled the claim, but that configuration lands in
+UnifiedRadixCache.
+
+So this file and its fix are LATENT hardening, not a live-defect repair, and
+they are kept on the same terms as the three hardening commits the module
+docstring of ``hi_mamba_radix_cache.py`` already records (2915f6de4f,
+1d379c56ee, 8bca9d3db1) -- under #609's explicit decision to retain the class
+rather than delete it. THE LIVE PATHS ARE ALREADY COVERED: both reachable
+trees carry the vote, UnifiedRadixCache from #580 and HiRadixCache from #610.
+A reader looking for a production behaviour fix wants unified_radix_cache.py;
+this file exists so that a future construction site does not inherit the gap.
 """
 
 import types
