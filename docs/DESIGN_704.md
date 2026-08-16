@@ -1084,6 +1084,126 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
+## L1 OVERLAP SPEC (#690) — design only; the flip runtime is F4-r4's to build
+
+**Headline, and it revises my own lever table: L1 is NOT "scheduling only".**
+It deepens a VRAM trough that **already breaks the corridor law in the serial
+ordering**. Any build must treat that as the binding constraint, not the
+bandwidth question.
+
+### What runs where today
+
+`phase_flip_runtime.py:6552-6563`, in order and strictly serial:
+
+```
+wave loop  (read -> exchange -> write, per seam wave)
+t_movers0 -> for fn in _pre_cutover_fns:  gdn_state, weights_refill
+t_cutover0 -> _cutover_fn(direction)
+```
+
+The movers are **occupancy-independent by construction** — the arena refill
+moves the same bytes whatever the KV live set is — which the runtime names as
+the leading explanation for the residual being *flat* at 2.0-2.1 s across a
+3600x range of live slots (123 → 440,095). The exchange, by contrast, scales
+with live slots. That asymmetry is exactly why overlapping them is attractive:
+a fixed cost hidden behind a variable one.
+
+### The constraint that dominates the design
+
+`phase_flip_runtime.py:4546-4548` states it: `stacks.refill` is a **pre-cutover**
+function and therefore **commits while the wave state is still outstanding**.
+The measured stage walk (tp_to_pp rank 1,
+`/spinning/evidence-631/remediation-656/boot_m1.log`):
+
+```
+baseline free 2464 MiB
+backing_restore free=1250 | gdn_state free=1250
+weights_refill  free=1012  step -238   *** CORRIDOR LAW BROKEN: deepest 1012 ***
+cutover         free=1290  step +278
+```
+
+The wave walk leaves 1214 MiB outstanding; the refill's 238 MiB commit lands on
+top and ends **12 MiB under the law** — in today's *serial* ordering. Moving the
+refill **earlier**, to overlap the exchange, lengthens the window in which both
+are outstanding and makes the trough deeper, not shallower.
+
+**So L1 trades a VRAM peak for wall time.** On a card with 12 MiB of margin that
+is not a free win, and the spec must be built with a guard rather than as a pure
+reordering.
+
+### Stream and ordering
+
+* The refill is `dst.copy_(payload)` followed by a device-side
+  `uint8_checksum(dst)` (`weights_arena.py:539+`). Both run on the **current**
+  stream; nothing today puts them on a side stream. Overlap therefore requires
+  an explicit non-default stream plus an event, not merely moving the call.
+* **Ordering that must hold:** refill completes → checksum verifies → cutover
+  rebinds parameters. The cutover is the consumer; an event recorded after the
+  checksum and waited on at cutover entry is the minimal correct fence.
+* **Ordering that must NOT be assumed:** the refill and the seam waves touch
+  different *logical* memory (weights vs KV) but compete for the same
+  **physical page pool** under the #631 VA-backed backing swap
+  (`pre_write_fns` → `WavedBackingSwap`). Independence in bytes is not
+  independence in pages. This is the correctness edge to verify before any
+  build, and it is why "they touch different tensors" is not sufficient
+  argument.
+
+### Abort semantics — the arena must never be half-new
+
+`arena_refill` already has the right shape and it must be preserved, not
+reinvented: the copy is **one contiguous `dst.copy_`**, the checksum runs
+**after** the copy on the arena's device, and a mismatch with a `restore=`
+image rewrites the current layout's bytes so every live view is byte-identical
+again before raising. Requirements for the overlapped version:
+
+1. **No cutover may begin while a refill is in flight or failed.** The event
+   fence above is the mechanism; the abort path must wait on the same event
+   rather than racing it.
+2. **A half-written arena is never observable.** Because the copy is one
+   operation into a fixed-address arena, the only observable states are
+   old-complete and new-complete — provided the checksum gates the transition.
+   An overlapped build must not split the copy into per-layer pieces to get
+   finer overlap; that would introduce exactly the half-new state the current
+   design excludes.
+3. **On abort mid-refill, restore is mandatory, not optional.** Without a
+   `restore` image the arena is marked FATAL. Overlap increases the abort
+   window, so the restore image must be resident for the whole overlapped
+   region rather than constructed lazily.
+4. **The abort gate must see it.** `barlink_abort_gate.check_aborts` is where
+   collective-abort classes are policed; a refill on a side stream must
+   register there or an abort can be declared while the copy is still running.
+
+### A/B measurement plan — resolving the [0, 1150] ms bound
+
+The saving is bounded `[0, 1150] ms` and unmeasured, because `movers` is H2D
+while the rank-to-rank `exchange` stages **through host** on this no-P2P rig,
+so both traverse the same PCIe direction and may fully contend.
+
+Two arms on one boot, decided by the sub-step timestamps already being
+captured:
+
+* **Arm A (serial, today):** record `movers_ms` and `exchange_ms` separately —
+  already emitted on the DONE line.
+* **Arm B (overlapped):** same flip with the refill issued on a side stream at
+  wave-loop entry, event-fenced before cutover.
+
+**The discriminating quantity is not the wall time — it is the sum.** If the
+legs are independent, `total_B ≈ total_A − min(movers, exchange)`. If they
+fully contend, `total_B ≈ total_A` and the *individual* legs both stretch:
+`movers_B > movers_A` and `exchange_B > exchange_A` with their sum roughly
+conserved. Reporting only the total cannot tell "no saving" from "saving offset
+by a slower exchange", so **both legs must be reported per arm**.
+
+Mandatory alongside: the **VRAM trough** per arm, from the same stage walk that
+produced the 1012 MiB reading. A wall-time win that deepens the trough below the
+corridor law is not a win, and on the measured margin (12 MiB) that outcome is
+likely enough to gate on.
+
+Suggested order: run Arm B **only** if Arm A's trough shows margin above the
+law. If the serial ordering is already at the limit, the correct next step is
+to shrink the refill (partial residency of tensors common to both layouts), not
+to overlap it.
+
 ## #701 WIRING — landed (defect b only), plus the flip spec for F4-r4
 
 ### What is wired
@@ -1330,16 +1450,21 @@ At a 10 s TTFT budget with an even phase split:
 | lever | F after | max feasible ρ | reopens | price |
 |---|---|---|---|---|
 | baseline (measured) | 3.36 s | 0.66 | — | — |
-| **L1 overlap movers behind the seam** (upper bound) | 2.21 s | **0.77** | **+0.11** | scheduling only |
+| **L1 overlap movers behind the seam** (upper bound) | 2.21 s | **0.77** | **+0.11** | **NOT free — deepens a VRAM trough already 12 MiB under the corridor law** |
 | L1 (lower bound, fully contending) | 3.36 s | 0.66 | +0.00 | — |
 | L2 phase-uniform vector (#704b) | 2.21 s | 0.77 | +0.11 | **costs ladder depth, n0 ≤ 37** |
 | L3 cutover to its observed minimum | 2.73 s | 0.72 | +0.06 | mechanism unknown |
-| **L1 + L3 (best realistic)** | **1.58 s** | **0.84** | **+0.18** | scheduling only |
+| **L1 + L3 (best realistic)** | **1.58 s** | **0.84** | **+0.18** | carries L1's VRAM-peak cost |
 
 **Three things fall out, and the first is the one to act on.**
 
-1. **L1 and L2 deliver identical flip savings — 1150 ms, ρ 0.66 → 0.77 — but L1
-   is free and L2 costs ladder depth.** For flip cost specifically, #704b's
+1. **L1 and L2 deliver identical flip savings — 1150 ms, ρ 0.66 → 0.77.** I
+   first called L1 "free" and L2 "costs ladder depth". **That was wrong about
+   L1**: the arena refill already commits while wave state is outstanding
+   (`phase_flip_runtime.py:4546-4548`) and the measured stage walk lands 12 MiB
+   *under* the corridor law in the serial ordering. Overlapping lengthens that
+   window and deepens the trough, so L1 buys wall time with VRAM headroom the
+   rig may not have. See the L1 spec above. For flip cost specifically, #704b's
    phase-uniform vector buys nothing that a pure scheduling change does not.
    (It still earns its keep on #703's cache-key problem, which L1 does not
    touch — so they are substitutes for *this* purpose only.) **Do L1 first.**
