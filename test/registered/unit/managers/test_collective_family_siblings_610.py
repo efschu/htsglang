@@ -508,6 +508,75 @@ class BudgetHarness:
         self.server_args = SimpleNamespace(dcp_size=dcp_size)
 
 
+def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
+    """A ``PrefillAdder`` built past ``__init__``, carrying exactly the state
+    ``budget_state`` reads on the non-SWA, non-DLLM path.
+
+    ``__new__`` is deliberate -- constructing a real adder needs a scheduler --
+    but it means every field the predicate reads has to be set BY HAND here,
+    and a field added to the production class is silently absent until it is.
+    ``TheAdderStubTracksTheBudgetPredicate`` below is what makes that absence
+    loud; see #624 for why this harness class keeps earning one.
+    """
+    from sglang.srt.managers.schedule_policy import PrefillAdder
+
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.prefill_spill_deep_taken = False
+    adder.is_hybrid_swa = False
+    adder.is_all_swa = False
+    adder.is_hybrid_ssm_cache = False
+    adder.rem_mamba_slots = None
+    adder.rem_input_tokens = 1 << 20
+    adder.rem_chunk_tokens = None
+    adder.dllm_config = None
+    adder.rem_total_token_offset = 1000
+    adder.cur_rem_token_offset = 1000
+    #: #681 added a group-uniform ceiling to ``rem_total_tokens``. Absent here
+    #: the predicate raised AttributeError on both ranks -- the same drift
+    #: shape, this time introduced by the fix rather than by a reduce.
+    adder.fundable_extend_floor = None
+    adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
+    adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
+    adder.dcp_avail_deficit = deficit
+    return adder
+
+
+class TheAdderStubTracksTheBudgetPredicate(unittest.TestCase):
+    """#624 again, on the adder stub this time.
+
+    Scope is ``rem_total_tokens`` and not the whole ``budget_state`` surface,
+    deliberately: the stub pins ``is_hybrid_swa``/``is_all_swa`` False, so the
+    SWA members are never reached and demanding them would fail this guard on
+    state the harness legitimately does not need. ``rem_total_tokens`` is the
+    term the uneven-DCP budget is actually about, and it is where the #681
+    ceiling landed.
+    """
+
+    def test_the_stub_carries_everything_the_budget_term_reads(self):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
+        needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget)
+        missing = sorted(n for n in needed if not hasattr(stub, n))
+        self.assertEqual(
+            missing,
+            [],
+            "the PrefillAdder stub has drifted behind rem_total_tokens: "
+            f"{missing}. Set them in _budget_state_stub so budget_state keeps "
+            "exercising the real predicate instead of raising AttributeError.",
+        )
+
+    def test_the_guard_can_fail(self):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
+        needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget) | {
+            "_a_field_added_next_quarter"
+        }
+        missing = sorted(n for n in needed if not hasattr(stub, n))
+        self.assertEqual(missing, ["_a_field_added_next_quarter"])
+
+
 class PrefillAdmissionBudgetTest(unittest.TestCase):
     """S3. Two ranks with different pool ownership (the weighted-DCP split) must
     admit against the same budget, or `budget_state` returns NO_TOKEN on one and
@@ -562,32 +631,17 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
         """The symptom itself, through the real PrefillAdder predicate: with a
         per-request demand between the two ranks' local budgets, the unpinned
         code makes them disagree on NO_TOKEN."""
-        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.managers.schedule_policy import AddReqResult
 
         budgets, errors = self._budgets()
         self.assertEqual(errors, [], f"a rank broke the budget reduce: {errors}")
 
         verdicts = []
         for rank in (0, 1):
-            adder = PrefillAdder.__new__(PrefillAdder)
-            adder.prefill_spill_deep_taken = False
-            adder.is_hybrid_swa = False
-            adder.is_all_swa = False
-            adder.is_hybrid_ssm_cache = False
-            adder.rem_mamba_slots = None
-            adder.rem_input_tokens = 1 << 20
-            adder.rem_chunk_tokens = None
-            adder.dllm_config = None
-            adder.rem_total_token_offset = 1000
-            adder.cur_rem_token_offset = 1000
-            adder.token_to_kv_pool_allocator = SimpleNamespace(
-                available_size=lambda r=rank: self.AVAIL[r]
-            )
-            adder.tree_cache = SimpleNamespace(
-                evictable_size=lambda r=rank: self.EVICT[r]
-            )
-            adder.dcp_avail_deficit = (
-                self.AVAIL[rank] + self.EVICT[rank] - budgets[rank]
+            adder = _budget_state_stub(
+                avail=self.AVAIL[rank],
+                evictable=self.EVICT[rank],
+                deficit=self.AVAIL[rank] + self.EVICT[rank] - budgets[rank],
             )
             verdicts.append(adder.budget_state())
 
