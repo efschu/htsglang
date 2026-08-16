@@ -653,11 +653,20 @@ class TheHarnessTracksTheProductionSurface(unittest.TestCase):
     """
 
     def _required(self) -> set:
+        """One level down, and ONLY through helpers the harness inherits.
+
+        A stand-in that supplies its OWN implementation of a callee never
+        reaches the production version's state, so demanding it would fail this
+        guard on bindings the harness legitimately does not need. Every helper
+        this harness uses IS bound off ``Scheduler``, so the rule changes
+        nothing here -- it is written this way so the idiom is the same one the
+        sibling guard in ``test_first_chunk_dynamic_chunking`` needs, where the
+        harness DOES override a callee.
+        """
         needed = _self_attributes_read_by(Scheduler._update_uniform_pool_budget)
-        # One level down, through the helpers the reduce itself calls.
         for name in sorted(needed):
             member = getattr(Scheduler, name, None)
-            if callable(member):
+            if callable(member) and getattr(BudgetHarness, name, None) is member:
                 needed = needed | _self_attributes_read_by(member)
         return needed
 
