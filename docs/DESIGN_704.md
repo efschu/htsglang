@@ -868,6 +868,149 @@ implementation time:
   to whoever owns the TP vector, but it is named so it is not rediscovered as
   novel.
 
+### 4.2a COST MODEL — census numbers, replacing the plan's estimates
+
+Landed as `planner/decoupled_kv.py`, 12 hermetic tests. Done before any
+measurement (*Machbarkeit vor Messung*), and it moves two of the plan's numbers.
+
+**Confirmed:** ~25 MiB per attention layer per 512-token chunk. From geometry:
+Q 6.00 MiB + partial out 6.00 MiB + LSE 0.047 MiB, times 2 remote ranks =
+**24.09 MiB/layer**, so **385.5 MiB per chunk** across the 16 layers.
+
+**Corrected:** "+10-20% chunk cost" assumes a link rank0 does not have. The
+same 385.5 MiB against a 320 ms serial chunk is:
+
+| link | chunk cost | overhead |
+|---|---|---|
+| 12,000 MiB/s | 32.1 ms | +10.0% |
+| 6,000 MiB/s | 64.2 ms | +20.1% |
+| **3,000 MiB/s** (rank0 PCIe x4 class) | **128.5 ms** | **+40.2%** |
+
+So on this rig it is **+40% raw**, not +10-20%. The overlap argument is
+unchanged — there are 48 GDN layers of compute to hide behind — but the
+quantity to hide is twice what the plan assumed, and whether it actually hides
+depends on real stream concurrency. Slice 3 measures the pair matrix before
+this is priced as acceptable.
+
+**Structural fact the estimate does not capture: traffic is driven by Q and the
+partial OUTPUT, not by how much KV is remote.** Each remote participant
+receives a full Q block and returns a full-size partial output plus LSE,
+*regardless of whether it holds 1% or 99% of the shard*. So "shard less
+aggressively to save bandwidth" does not work. The only levers are the number
+of remote participants and chunk size relative to compute. Pinned by
+`test_collective_traffic_is_independent_of_how_much_kv_is_remote`.
+
+### 4.2b The prize and the purpose contradict — quantified
+
+The phase-uniform vector is the TP vector `[14,10,8]`, i.e. shares
+0.4375 / 0.3125 / 0.25. That puts **43.75% of all KV rows on rank0** — and
+rank0 is exactly the rank a deep PP cut loads with weights. Against
+free-for-KV measured at the `[28,20,16]` boot (`2 × K_size + available_gpu_mem`
+= 10.01 / 6.19 / 5.74 GiB):
+
+| cut | rank0 free | rank0 needs | verdict |
+|---|---|---|---|
+| `[28,20,16]` | 10.01 GiB | 5.83 GiB | fits |
+| `[35,14,15]` | 6.93 | 5.83 | fits |
+| `[38,13,13]` | 5.61 | 5.83 | **infeasible** |
+| `[42,11,11]` | 3.85 | 5.83 | **infeasible** |
+| `[44,10,10]` | 2.97 | 5.83 | **infeasible** |
+
+**Depth ceiling under the phase-uniform vector: n0 ≤ 37**, solved by
+`deepest_feasible_rank0_layers()`. So `[42,11,11]` and `[44,10,10]` — the cuts
+decoupling exists to unlock — are precisely where the phase-uniform vector
+fails. At `[44,10,10]` the free-proportional vector is `[0.135, 0.483, 0.382]`,
+nearly the **inverse** of the TP vector on rank0, because rank0 is weight-rich
+under a deep PP cut and weight-light under TP width-sharding. The two phases
+genuinely want opposite vectors; this is not a tuning accident.
+
+**Resolution: split the prize, because the halves have different prices.**
+
+* **Structural uniformity** — both phases token-shard the same 16 layers, so
+  the layout *kind* matches. This is what a content-addressed cache key needs,
+  so it solves #703. It is **free**, and is taken unconditionally.
+* **Vector identity** — both phases use the same *shares*, so no rows move at
+  the seam. This additionally deletes #690's fixed flip cost. It **costs
+  depth**, capping the ladder at n0 ≤ 37 (~1.5x pipelined instead of 2.0x).
+
+Conflating the two would pay for both or get neither, which is why
+`seam_rebalance_bytes()` reports them separately: identical shares return zero
+(the #690 prize), differing shares return a rebalance rather than a re-layout
+(the #703 prize retained regardless).
+
+**OPERATOR DECISION (adopted).** Structural uniformity is taken
+unconditionally. Vector identity stays **open** until slice 1a-i's timing
+intercept gives the flip-frequency break-even — it is an empirical resolution,
+not a values call, so it is not escalated yet; if the break-even lands
+ambiguous it becomes a user-level fork (seam-free flips vs ladder depth).
+
+**Consequence, and it inverts the default:** because vector identity may lose,
+the mechanism is designed **free-proportional-primary**, with vector identity
+as the special case — not the other way round. The structural half holds either
+way.
+
+### 4.2d Under free-proportional, the vector does NOT follow the cut
+
+Free-proportional raises a question vector identity did not: the free vector
+changes with the cut, so does the share vector follow it? If it did, every rung
+change would rebalance KV rows — reintroducing exactly the cost decoupling was
+meant to remove.
+
+It does not have to. Solved by `fixed_vector_for_ladder()`:
+
+| approach | rung-change cost | feasible at every rung? | pool range |
+|---|---|---|---|
+| vector follows each rung | **0.80–1.07 GiB per step**, 3.48 GiB across the ladder | yes | 492k–719k |
+| **vector fixed once** | **zero rows moved** | **yes, all rungs** | 492k–719k |
+
+Fixing it strictly dominates: identical pools, no rebalancing, and **every rung
+exceeds the coupled incumbent's 436,766** — 492,393 at the shallowest rung,
+718,930 at `[44,10,10]`. So a rung change moves no weights (§3.8) *and* no KV
+rows, under the primary case as well as the special one.
+
+The vector is built from the **per-rank minimum of free memory across rungs**,
+not from any single rung's free vector, because there is no single tightest
+rung: deepening starves rank0 while *freeing* rank1 and rank2, so each rank's
+binding constraint comes from a different rung. That candidate is then verified
+per rung — it is the natural construction, not a theorem, and the solver says
+so.
+
+### 4.2c Shared layout contract with #706 (PROPOSED — awaiting F4-r4)
+
+The same-key world must hold on **both** the host format (#706) and the device
+layout (#704b), so this paragraph is proposed for verbatim inclusion in both
+design docs. **Status: sent for agreement; not yet confirmed. The device-side
+layout code is held until it is.**
+
+> A cache key identifies CONTENT, never placement. The key is a function of the
+> model identity, the token sequence, and semantic modifiers that change the
+> values (RoPE scaling, quantisation of the stored KV). It MUST NOT encode any
+> layout fact: not the PP cut, not the token-shard vector, not the page
+> geometry, not which phase produced the bytes. Placement is carried separately
+> as a LayoutDescriptor alongside the entry, used only to scatter and gather.
+>
+> The stored (host) form is CANONICAL and layout-neutral: one defined byte
+> order — layer-major, then token, then kv-head, then head_dim — that any
+> device layout can scatter from and gather into. A writer converts from its
+> device layout into canonical form on store; a reader converts from canonical
+> into its own device layout on load. Neither side stores its private device
+> order.
+>
+> Consequence: bytes written by PP-prefill are readable by TP-decode and vice
+> versa, at the same key, with no re-keying and no second geometry.
+
+If the key encoded the share vector we would lose structural uniformity for
+free and gain nothing — hence "descriptor, not key". Sizing for the host side:
+a full 436,766-token pool is `16 × 2048 × 436,766` = **13.3 GiB** of canonical
+bytes world-wide, independent of sharding; one page of P tokens is
+`P × 16 × 2048` B.
+
+**Open question put to F4-r4:** does a #706 page carry all 16 attention layers
+for its token range (layer-major within the page, as above), or one page per
+(layer, token-range)? The former is assumed here. The latter also satisfies the
+contract but changes his page count 16× and moves who pays the gather, so it is
+being matched rather than guessed.
+
 ### 4.3 Cost
 
 ~25 MiB of collective traffic per attention layer per 512-token chunk,
