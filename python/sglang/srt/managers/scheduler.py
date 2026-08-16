@@ -386,6 +386,38 @@ def derive_enable_hicache_storage(server_args: ServerArgs) -> bool:
     )
 
 
+def default_pp_micro_batch_size(
+    *, max_running_requests: int, pp_size: int, enable_phase_flip: bool
+) -> int:
+    """The auto-computed ``pp_max_micro_batch_size``.
+
+    Classic PP divides the concurrency cap by ``pp_size`` because the stages
+    run micro-batches of one batch, so each stage may only hold its share.
+
+    UNDER THE PHASE FLIP THAT DIVISION IS WRONG, and it is the binding cap on
+    this deployment. Decode does not run in the PP layout at all -- it runs in
+    the TP layout, which has no pipeline to divide by. Dividing anyway throttles
+    the DECODE phase with a bound belonging to the PREFILL phase.
+
+    Measured 2026-08-16 on max_running_requests=4, pp_size=3: the default was
+    max(4 // 3, 1) = 1, and under a sustained depth-5 load decode concurrency
+    never exceeded 2 -- 973 prefill rounds with 0 requests running, 792 with 1,
+    48 with 2, against a configured ceiling of 4. Nothing was deadlocked; the
+    scheduler was obeying a cap of one.
+
+    The flip branch returns the full ``max_running_requests``. It is not
+    unbounded: ``get_num_allocatable_reqs`` still mins this against the
+    admission limiter, the request-slot pool, and the mamba/GDN state headroom,
+    so the state pool remains the real ceiling -- this only stops a
+    prefill-layout divisor from pre-empting all three.
+    """
+    if max_running_requests <= 0:
+        return 1
+    if enable_phase_flip:
+        return max(int(max_running_requests), 1)
+    return max(int(max_running_requests) // max(int(pp_size), 1), 1)
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1452,8 +1484,12 @@ class Scheduler(
         if not get_server_args().pp_max_micro_batch_size:
             get_server_args().override(
                 "scheduler.pp_max_micro_batch_size_default",
-                pp_max_micro_batch_size=max(
-                    self.max_running_requests // self.ps.pp_size, 1
+                pp_max_micro_batch_size=default_pp_micro_batch_size(
+                    max_running_requests=self.max_running_requests,
+                    pp_size=self.ps.pp_size,
+                    enable_phase_flip=bool(
+                        getattr(get_server_args(), "enable_phase_flip", False)
+                    ),
                 ),
             )
 
