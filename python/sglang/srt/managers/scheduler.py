@@ -4255,6 +4255,59 @@ class Scheduler(
     #: reading it sooner.
     _CORRIDOR_BREACH_CHECK_S = 10.0
 
+    def _flight_serving_tick(self) -> None:
+        """One paced VRAM flight sample while serving (#684).
+
+        WHY, MEASURED. The recorder's last boot post is ``first_forward``. On
+        2026-08-16 an instance died 36 minutes later with ``76.38 MiB is free
+        ... Process 1920108 has 4.29 GiB memory in use``, and naming that
+        process took hours -- log archaeology plus a pid-clock interpolation
+        across two boots' ``boot_id`` fields. Every fact needed to answer it in
+        one line was already computed by the recorder's own NVML view, which
+        includes the full pid->bytes map of everyone on the card. Nothing was
+        marking after boot.
+
+        NOT A DUPLICATE OF ``_corridor_trace_tick``. That one arms a 100 ms
+        sampler for the corridor LAW, keeping a fixed-size RAM ring -- which
+        dies with the process that crashes, and whose ``Sample`` discards the
+        per-pid map it reads. This appends to a FILE, so it survives the
+        crash; the surviving boot marks are what made that pid clock
+        calibratable at all.
+
+        HERE, AND ONCE PER ITERATION, for the reason the two lines above this
+        call site give: every rank reaches it exactly once per round, so the
+        cadence is replicated and the per-rank files line up round for round,
+        which is what makes them comparable across ranks. Unlike its
+        neighbours this needs no collective and takes no branch -- it is
+        write-only -- so it cannot make two ranks disagree about anything.
+
+        The pacing lives in the recorder (default 30 s), so the cost here is
+        one monotonic clock read per iteration, and exactly zero when the
+        recorder is not armed.
+
+        THE IMPORT IS OUTSIDE THE GUARD, DELIBERATELY. ``flight_recorder`` is
+        imported inside ``run_scheduler_process``, not at module scope, so a
+        module-level reference here is a ``NameError`` -- and the first version
+        of this method had one, inside a bare ``except Exception`` that turned
+        it into an instrument which silently never ran. That is the exact
+        failure this task exists to prevent, so the import may fail loudly and
+        only the CALL is guarded.
+        """
+        from sglang.srt.mem_ledger import flight_recorder
+
+        try:
+            flight_recorder.mark_serving(rank=self.ps.tp_rank)
+        except Exception as e:  # noqa: BLE001 - a probe never breaks serving
+            if not getattr(self, "_flight_serving_warned", False):
+                # ONCE, at WARNING: a probe must not spam a serving loop, and
+                # it must not be silent either. Silence is what cost the hours.
+                self._flight_serving_warned = True
+                logger.warning(
+                    "VRAM flight serving mark failed and will be retried "
+                    "quietly from here on: %s",
+                    e,
+                )
+
     def _corridor_trace_tick(self) -> None:
         """Arm the continuous corridor sampler, then AUDIT it on a cadence.
 
@@ -4789,6 +4842,11 @@ class Scheduler(
         # returns immediately on every later iteration; no-op unless
         # SGLANG_CORRIDOR_TRACE_MS is set.
         self._corridor_trace_tick()
+
+        # #684: the DURABLE serving series, beside the sampler above and for a
+        # different job -- the ring dies with the process, this survives it.
+        # Paced in the recorder; no-op unless SGLANG_VRAM_FLIGHT_DIR is set.
+        self._flight_serving_tick()
 
         # #297 phase-boundary KV resharding: same lazy-build and cadence
         # discipline as the #287 block below. Built FIRST so the pressure
