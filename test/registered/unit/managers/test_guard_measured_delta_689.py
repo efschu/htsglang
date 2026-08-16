@@ -98,6 +98,50 @@ class AnAskThatFreedNothingIsNotASuccess(unittest.TestCase):
         self.assertFalse(res.ok)
 
 
+class SmallAskLargeFreeIsStillARefusal(unittest.TestCase):
+    """The 13:03:25 receipt, pinned as CORRECT rather than fixed.
+
+        CORRIDOR-GUARD REFUSED: want 6 MiB, free 2518 -> 2518 MiB,
+        reclaimed 0 MiB from [nothing], arming floor 1536, corridor law 1024
+
+    Read cold this looks like the mirror image of the false success: free
+    exceeds want plus both floors by nearly a gibibyte, and the ask is refused
+    anyway. It is not an inversion, and the reason is what ``want`` MEANS to
+    this caller.
+
+    The seam computes ``spendable = driver_free - staging_reserve`` and asks
+    only for the SHORTFALL above that. At 13:03:25 free was 2518, spendable
+    1699, the need 1705 -- so the ask was 6. Satisfying it from "free minus
+    the arming floor" would have authorised spending the seam's own 819 MiB
+    staging reserve: the memory it holds free FOR the staging it is about to
+    do. That is a false success again, one layer down.
+
+    So an incremental ask stays refused when nothing moved, however much free
+    memory happens to be lying around -- and the refusal message says only
+    what it judged.
+    """
+
+    def test_a_tiny_ask_against_huge_free_still_refuses_when_nothing_moved(self):
+        g, _ = _guard(2518)
+        res = g.ensure_headroom(6 * MIB, reason="seam staging", must_reclaim=True)
+        self.assertFalse(res.ok)
+        self.assertEqual(0, res.reclaimed)
+
+    def test_the_refusal_does_not_quote_the_free_column_as_a_reason(self):
+        """It was reported as an inversion because the message recited terms
+        the verdict never weighed."""
+        g, _ = _guard(2518)
+        res = g.ensure_headroom(6 * MIB, reason="seam staging", must_reclaim=True)
+        self.assertIn("INCREMENTAL", res.detail)
+        self.assertIn("not weighed", res.detail)
+        self.assertNotIn("arming floor", res.detail)
+
+    def test_it_succeeds_as_soon_as_a_provider_actually_pays(self):
+        g, _ = _guard(2518, providers=[("arena", 30, 64)])
+        res = g.ensure_headroom(6 * MIB, reason="seam staging", must_reclaim=True)
+        self.assertTrue(res.ok)
+
+
 class TheDefaultContractIsUnCHANGED(unittest.TestCase):
     """Every existing caller is an allocator about to allocate ``want``.
 

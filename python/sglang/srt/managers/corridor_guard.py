@@ -734,13 +734,23 @@ class CorridorGuard:
         # cannot carry and moves the failure later, into an abandon.
         if must_reclaim and ok and reclaimed < want:
             ok = False
+            # THE MESSAGE MUST NOT QUOTE TERMS IT DID NOT JUDGE. The default
+            # verdict weighs free against the floor; this one does not weigh
+            # them at all, and a refusal that recites "free 2518, arming floor
+            # 1536, corridor law 1024" next to "want 6" reads as an inversion
+            # -- it was reported as one. Under must_reclaim the ONLY quantities
+            # in the verdict are asked-vs-reclaimed, so those are the only ones
+            # stated, with the reason the free column is irrelevant here.
             detail = (
-                f"{detail} -- REFUSED under must_reclaim: the ladder reclaimed "
-                f"{reclaimed / _MIB:.0f} MiB of the {want / _MIB:.0f} MiB "
-                f"asked. {free_now / _MIB:.0f} MiB was already free before "
-                f"this call and the caller has already accounted it, so free "
-                f"memory it did not release cannot fund the ask. Providers "
-                f"available: {', '.join(self.providers) or 'none'}"
+                f"want {want / _MIB:.0f} MiB INCREMENTAL, reclaimed "
+                f"{reclaimed / _MIB:.0f} MiB from "
+                f"[{', '.join(used) if used else 'nothing'}] "
+                f"({reason}). REFUSED under must_reclaim, which judges the "
+                f"DELTA and nothing else: the caller has already accounted the "
+                f"free column and is asking this ladder to RELEASE more, so "
+                f"free memory it did not release cannot fund the ask and is "
+                f"not weighed. Providers available: "
+                f"{', '.join(self.providers) or 'none'}"
             )
         if host_forced and used_host:
             detail += (
