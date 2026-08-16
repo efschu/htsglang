@@ -5328,6 +5328,45 @@ class PhaseFlipRuntime:
                 kv_freed / (1024 * 1024),
                 direction,
             )
+        else:
+            # A RUNG THAT RETURNS NOTHING MUST STILL SAY SO.
+            #
+            # This branch used to be absent, and the silence cost a whole
+            # morning of misdiagnosis on 2026-08-16. At 06:47:48 the seam was
+            # refused 76 times with no relief line anywhere in the log, so
+            # "the rung returned 0" and "the rung never ran" looked identical
+            # -- and the guard's own "reclaimed 0 MiB from [nothing]" was then
+            # read as the rung being exhausted. It never said that: that
+            # string is the GUARD LADDER's provider list, which contains only
+            # allocator-cache and draft-weights. No KV provider is registered
+            # with the guard at all, by design (the cap is a group decision
+            # and the ladder is rank-local), so the rung's bytes arrive as
+            # `kv_freed` BEFORE the probe and can never appear in that list.
+            #
+            # Logged at the same level as the success so a seam's funding
+            # story is one grep, and carrying the rung's own view of why it
+            # could not pay -- the three causes are not interchangeable:
+            # the floor is a healthy limit, an empty evictable set means the
+            # pool is genuinely live, and a disqualified rung is a defect.
+            from sglang.srt.managers.phase_flip_spill import (
+                KV_BACKING_RELIEF_ATTR as _RUNG_ATTR,
+            )
+
+            rung = getattr(scheduler, _RUNG_ATTR, None) if scheduler else None
+            logger.info(
+                "%s KV backing relief returned NOTHING before the gate (%s): "
+                "rung=%s, evicted %s rows over %s shrinks so far. This is not "
+                "the guard's '[nothing]' -- no KV provider is registered with "
+                "the guard, so the rung never appears in its provider list. "
+                "Check in order: the admission floor (healthy), an empty "
+                "evictable set (the pool is genuinely live), a disqualified "
+                "rung (a defect).",
+                LOG_PREFIX,
+                direction,
+                "absent" if rung is None else "present",
+                getattr(rung, "evicted_rows_total", "?"),
+                getattr(rung, "evict_count", "?"),
+            )
         if guard is None:
             return ""
         try:

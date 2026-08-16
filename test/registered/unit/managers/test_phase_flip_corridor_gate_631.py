@@ -558,5 +558,47 @@ class TheGuardDoesNotCarryTheKvRungInItsLadderTest(unittest.TestCase):
         self.assertIn("collective_kv_backing_relief", src)
 
 
+class TheRungReportsAZeroTest(unittest.TestCase):
+    """A rung that returns nothing must still say so.
+
+    THE MORNING THIS COST. On 2026-08-16 the seam was refused 76 times from
+    06:47:48 with no KV relief line anywhere in the log, because the relief
+    was logged only under `if kv_freed > 0`. "The rung returned 0" and "the
+    rung never ran" were therefore indistinguishable, and the guard's own
+    "reclaimed 0 MiB from [nothing]" got read as the rung being exhausted.
+
+    IT NEVER SAID THAT. That string is the GUARD LADDER's provider list, and
+    the ladder has exactly two providers -- allocator-cache and draft-weights.
+    No KV provider is registered with the guard at all, deliberately: the cap
+    is a group decision and the ladder is rank-local. The rung's bytes arrive
+    as `kv_freed` BEFORE the guard probes, so they can never appear in that
+    list no matter how much the rung paid.
+
+    Pinned by source assertion, the same way this file already pins the rung's
+    wiring, because the branch is a log inside a long collective method that
+    cannot be reached without a live group.
+    """
+
+    def test_the_gate_logs_the_rung_even_when_it_pays_nothing(self):
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_flip_runtime
+
+        src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
+        self.assertIn("returned NOTHING before the gate", src)
+        # And it must not be reachable only through the success branch.
+        self.assertIn("if kv_freed > 0:", src)
+        self.assertIn("else:", src)
+
+    def test_the_zero_line_names_the_guard_confusion_it_exists_to_end(self):
+        """Without this clause the next reader repeats the misdiagnosis."""
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_flip_runtime
+
+        src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
+        self.assertIn("no KV provider is registered with", src)
+
+
 if __name__ == "__main__":
     unittest.main()
