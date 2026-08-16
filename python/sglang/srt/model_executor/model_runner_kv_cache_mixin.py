@@ -5720,6 +5720,14 @@ class ModelRunnerKVCacheMixin:
         # model_config is rewritten by adjust_hybrid_swa_layers_for_pp), so
         # the source is logged and any doubt falls back to the previous
         # arithmetic rather than guessing.
+        # HOISTED ABOVE THE COLD BRANCH THAT READS IT. `cell` used to be
+        # computed after the reserve.active check; the cold seam pricing needs
+        # it, and taking it later cost a second startup crash
+        # ("UnboundLocalError: cannot access local variable 'cell'", 12:54).
+        # It depends only on the configurator, never on the reserve, so there
+        # is nothing to compute later.
+        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+
         # ALL THREE NAMES ARE DEFINED BEFORE ANY BRANCH CAN READ THEM. The
         # first version assigned attn_counts and rank only inside the success
         # path of the try below, and defined received_layers only after the
@@ -5893,7 +5901,6 @@ class ModelRunnerKVCacheMixin:
         # A configurator with no single cell (hybrid SWA, MiniMax sparse)
         # gets no invented one: abstaining is a smaller error than charging
         # a slope against a cell that does not exist.
-        cell = int(getattr(configurator, "_cell_size", 0) or 0)
         # WHAT A REFUSED SEAM COSTS decides whether the pool pays for the
         # guarantee. Under strict purity a refused tp_to_pp means prefill
         # never runs -- boot E held the corridor and served nothing -- so the
