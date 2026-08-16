@@ -5728,12 +5728,75 @@ class ModelRunnerKVCacheMixin:
             )
         except Exception:
             survivable = False
+        # #685: HOW MANY ATTENTION LAYERS DOES THIS RANK ACTUALLY RECEIVE at
+        # the flip? A rank that receives none pays no per-token seam -- its
+        # measured per_row_bytes is BASELINE (checksums, the one-layer
+        # streaming window, allocator grain), not transfer, and reserving it
+        # per token holds back memory for bytes that never move. Measured
+        # 2026-08-16: the binding rank was 192 MiB short on a 1059 MiB need
+        # whose per-token term was ~190 MiB.
+        #
+        # DERIVED, NEVER FROZEN, and LOUD ABOUT ITS SOURCE. The frozen triple
+        # in phase_flip_seam_reserve is a drift watchdog, not an input; the
+        # live value is per-boot measured. The map comes from
+        # derive_pp_full_attn_layer_map, whose own docstring warns that the
+        # layer-id list must be the UNMUTATED global one (the PP stack's
+        # model_config is rewritten by adjust_hybrid_swa_layers_for_pp), so
+        # the source is logged and any doubt falls back to the previous
+        # arithmetic rather than guessing.
+        received_layers = None
+        try:
+            from sglang.srt.managers.phase_flip_runtime import (
+                derive_pp_full_attn_layer_map,
+            )
+            from sglang.srt.managers.seam_slope import received_attention_layers
+
+            vec = getattr(self.server_args, "phase_flip_tp_vector", None)
+            if isinstance(vec, str):
+                vec = [float(x) for x in vec.split(",") if x.strip()]
+            ids = list(
+                getattr(self.model_config, "full_attention_layer_ids", None) or []
+            )
+            n_hidden = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
+            pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
+            rank = int(getattr(self, "pp_rank", getattr(self, "tp_rank", 0)) or 0)
+            if vec and ids and n_hidden > 0 and pp_size > 1:
+                layer_map = derive_pp_full_attn_layer_map(ids, n_hidden, pp_size)
+                attn_counts = [len(stage) for stage in layer_map]
+                n_attn_total = sum(attn_counts)
+                received = received_attention_layers(vec, attn_counts, n_attn_total)
+                received_layers = int(received[rank])
+                logger.info(
+                    "%s (rank %d): received-layer derivation -- attention map "
+                    "%s over %d total, tp vector %s -> this rank RECEIVES %d "
+                    "layer(s) at the flip. %s",
+                    seam.LOG_PREFIX,
+                    rank,
+                    attn_counts,
+                    n_attn_total,
+                    vec,
+                    received_layers,
+                    (
+                        "Zero received: its measured per_row_bytes is baseline, "
+                        "not seam, so no per-token seam is reserved."
+                        if received_layers <= 0
+                        else "Nonzero: the measured per-token slope stands."
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - sizing must not fail on a probe
+            logger.info(
+                "%s: received-layer derivation unavailable (%r); the per-token "
+                "seam charge stays at its measured value.",
+                seam.LOG_PREFIX,
+                exc,
+            )
         new_bytes, allowed = seam.seam_adjusted_budget_bytes(
             budget_bytes,
             cell,
             reserve,
             abandon_is_survivable=survivable,
             arming_floor_bytes=arming_floor,
+            received_layers=received_layers,
         )
         logger.info(
             "%s (rank %d): seam floor %d MiB + %.1f B/token, measured with "

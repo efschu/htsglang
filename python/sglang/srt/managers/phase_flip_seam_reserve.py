@@ -882,6 +882,7 @@ def solve_pool_tokens(
     fixed_bytes: int,
     per_row_bytes: float,
     arena_fixed_bytes: int = 0,
+    received_layers: Optional[int] = None,
 ) -> int:
     """The largest T with ``T*cell + staging(T) <= R'``.
 
@@ -925,6 +926,25 @@ def solve_pool_tokens(
     F = max(0, int(fixed_bytes))
     A = max(0, int(arena_fixed_bytes))
     a = max(0.0, float(per_row_bytes))
+    # #685 THE ZERO-RECEIVE RANK PAYS NO PER-TOKEN SEAM.
+    #
+    # ``per_row_bytes`` is a MEASURED per-boot record, and on a rank that
+    # receives no attention layers at the flip it measures BASELINE cost --
+    # checksums, the one-layer streaming window, allocator grain -- not
+    # transfer. Charging it as a per-token seam reserve makes that rank hold
+    # back memory for bytes that never move, which shrinks its pool and its
+    # spendable headroom at exactly the moment the seam needs them.
+    #
+    # Measured 2026-08-16: the binding rank was short 192 MiB on a 1059 MiB
+    # need whose per-token term was ~190 MiB, i.e. essentially the whole
+    # shortfall was a charge for a transfer it does not perform. received_r
+    # comes from seam_slope.received_attention_layers; rank 0 (received 1)
+    # keeps its measured slope, which matches the derivation to 1.4%.
+    #
+    # None means "not supplied" and is NOT zero: callers that cannot derive
+    # the layout keep the previous arithmetic exactly.
+    if received_layers is not None and int(received_layers) <= 0:
+        a = 0.0
 
     t_floor = max(0, (R - A - F) // cell)
     if a * t_floor <= F:
@@ -953,6 +973,7 @@ def seam_allowed_tokens(
     reserve: "SeamReserve",
     *,
     abandon_is_survivable: bool = False,
+    received_layers: Optional[int] = None,
 ) -> int:
     """The largest id space whose seam this rank can still fund.
 
@@ -1006,6 +1027,10 @@ def seam_allowed_tokens(
     F = max(0, int(reserve.fixed_bytes))
     A = max(0, int(reserve.arena_fixed_bytes))
     a = max(0.0, float(reserve.per_row_bytes))
+    # See the note in solve_pool_tokens: a zero-receive rank's measured
+    # per_row_bytes is baseline, not seam, and must not be reserved per token.
+    if received_layers is not None and int(received_layers) <= 0:
+        a = 0.0
 
     t_floor = t_m + (have_m - A - F) // cell
     if a * max(0, t_floor) <= F:
@@ -1150,6 +1175,7 @@ def seam_adjusted_budget_bytes(
     *,
     abandon_is_survivable: bool = False,
     arming_floor_bytes: int = 0,
+    received_layers: Optional[int] = None,
 ) -> Tuple[int, int]:
     """(new_budget_bytes, allowed_tokens). Never GROWS the budget.
 
@@ -1212,7 +1238,10 @@ def seam_adjusted_budget_bytes(
         if not reserve.active or int(cell_bytes) <= 0:
             return max(0, budget - charge), 0
         allowed = seam_allowed_tokens(
-            cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
+            cell_bytes,
+            reserve,
+            abandon_is_survivable=abandon_is_survivable,
+            received_layers=received_layers,
         )
         return max(0, min(budget, allowed * int(cell_bytes)) - charge), allowed
 
@@ -1221,7 +1250,10 @@ def seam_adjusted_budget_bytes(
     # they bind on different ranks at different vectors, so the pool is the
     # smaller of the two id spaces rather than one adjusted by the other.
     seam_allowed = seam_allowed_tokens(
-        cell_bytes, reserve, abandon_is_survivable=abandon_is_survivable
+        cell_bytes,
+        reserve,
+        abandon_is_survivable=abandon_is_survivable,
+        received_layers=received_layers,
     )
     allowed = min(int(seam_allowed), int(floor_allowed))
     logger.info(
