@@ -60,6 +60,7 @@ for the arming half. No CUDA, no model, no collectives.
 from __future__ import annotations
 
 import os
+import tempfile
 import types
 import unittest
 
@@ -884,11 +885,26 @@ class TheFloorIsSOLVEDNotApproximatedTest(unittest.TestCase):
             "exactly the two ranks measured below their floor must reject it",
         )
 
-    def test_the_solved_pool_clears_the_operators_bar(self):
-        """THE NUMBER THIS CHANGE EXISTS TO PRODUCE.
+    def test_the_floor_solve_alone_clears_the_bar_with_the_seam_NEUTRALISED(self):
+        """RENAMED, BECAUSE THE OLD NAME CLAIMED A PROPERTY IT DID NOT TEST.
 
-        The pool is the smallest id space any rank permits. The bar is 495000,
-        i.e. within 10% of the 550000 the hand-pin encodes.
+        This was ``test_the_solved_pool_clears_the_operators_bar``, asserting
+        that "the solved pool" reaches 495000 -- within 10% of the 550000
+        hand-pin. It is computed from ``_reserve_for``, which sets
+        ``per_row_bytes=1.0`` and ``have_bytes=8 GiB`` ("deliberately
+        non-binding"). The rig's own records carry 424.1 / 550.7 / 2360.3
+        B/row. So the number this asserted was the FLOOR solve in isolation
+        with the seam term switched off, and it could not fail against the
+        thing its name promised -- #380 class.
+
+        On metal the same regime solves 435319, and the seam binds rank 0 at
+        530237. A green bar at 495000 coexisted with that for a whole task.
+
+        The isolation is still worth testing -- it is what proves the floor
+        arithmetic itself is not the conservative term -- so the test stays
+        with an honest name. The SHIP bar moved to
+        ``TheShipPinIsDerivedFromThisRegime``, which uses the records the boot
+        actually writes.
         """
         per_rank = {}
         for rank in self.RANKS:
@@ -1051,3 +1067,135 @@ class TheSolveDegradesToTheOldPathTest(unittest.TestCase):
             400 * GIB, cell, r, arming_floor_bytes=1825 * MIB
         )
         self.assertEqual(new_bytes, allowed * cell)
+
+
+class TheShipPinIsDerivedFromThisRegime(unittest.TestCase):
+    """#678: the ship bar, computed from the records the boot actually writes.
+
+    WHAT THIS REPLACES. The old ship bar was 495000, "within 10% of the 550000
+    the hand-pin encodes", asserted with the seam slope set to 1.0 B/row. Two
+    things were wrong with it and they compound: the bar descended from a
+    pin taken under a DIFFERENT REGIME (before 48ba9fe72a folded the arming
+    floor into sizing), and the assertion neutralised the very term that binds
+    on metal. A test that cannot fail against the property it names is worse
+    than no test, because the next reader takes it as coverage.
+
+    THE BRACKET THE RIG MEASURED, and it is why the withdrawn pin was not
+    merely stale: 482490 tokens flipped both ways under load with every rank
+    above its floor; 537076 could not hold the floors on two of three ranks.
+    537076 is 13k BELOW the 550000 that was being chased.
+
+    FIXTURES COME FROM THE REAL FORMAT. Each rank's record is written by
+    ``write_seam_reserve`` and read back by ``read_seam_reserve`` -- the same
+    pair the boot uses -- so a change to the record schema breaks this file
+    instead of silently leaving it testing a shape nothing writes.
+    """
+
+    MIB = 1 << 20
+
+    #: This rig's records of 2026-08-16T03:56Z, the basis SHIP_PIN stands on.
+    RECORDS = {
+        0: dict(fixed_bytes=238763008, per_row_bytes=2360.3031340235552,
+                have_bytes=3880139776, id_space=435319, arena_fixed_bytes=0,
+                worst_leg_fixed_bytes=238763008, free_at_measure_bytes=4500160512,
+                rung_fund_bytes=238763008, floor_mib=1728),
+        1: dict(fixed_bytes=145652736, per_row_bytes=424.1172657292698,
+                have_bytes=2337502976, id_space=435319, arena_fixed_bytes=854522624,
+                worst_leg_fixed_bytes=854522624, free_at_measure_bytes=2196111360,
+                rung_fund_bytes=1000175360, floor_mib=1825),
+        2: dict(fixed_bytes=145652736, per_row_bytes=550.6682501797533,
+                have_bytes=3408306688, id_space=435319, arena_fixed_bytes=1526867456,
+                worst_leg_fixed_bytes=1526867456, free_at_measure_bytes=2594570240,
+                rung_fund_bytes=1672520192, floor_mib=2467),
+    }
+
+    #: What the recorded inputs support TODAY, with a little tolerance. The
+    #: sizer must not slip below this without the change being seen.
+    REGRESSION_FLOOR = 430000
+    CELL_BYTES = 20480
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._real_record_path = sr.record_path
+
+    def tearDown(self):
+        sr.record_path = self._real_record_path
+        self._dir.cleanup()
+
+    def _round_trip(self, rank):
+        """Write this rank's record the way the boot does, then read it back."""
+        r = dict(self.RECORDS[rank])
+        floor = r.pop("floor_mib") * self.MIB
+        path = os.path.join(self._dir.name, f"seam-rank{rank}.json")
+        sr.record_path = lambda server_args, world_rank, _p=path: _p
+        sr.write_seam_reserve(None, rank, detail="regime basis", **r)
+        return sr.read_seam_reserve(None, rank), floor
+
+    def _solved_pool(self):
+        per_rank = {}
+        for rank in self.RECORDS:
+            reserve, floor = self._round_trip(rank)
+            self.assertEqual(sr.PROVENANCE_STORED, reserve.provenance)
+            floor_allowed = sr.floor_allowed_tokens(self.CELL_BYTES, reserve, floor)
+            seam_allowed = sr.seam_allowed_tokens(self.CELL_BYTES, reserve)
+            per_rank[rank] = min(
+                x for x in (floor_allowed, seam_allowed) if x is not None
+            )
+        return min(per_rank.values()), per_rank
+
+    def test_nothing_ships_at_or_above_a_pool_measured_UNSAFE(self):
+        """The property the old bar inverted: it pushed UP toward 550000.
+
+        537076 was measured unable to hold its floors on two of three ranks.
+        A sizer that reaches it has regressed however good the token count
+        looks.
+        """
+        pool, per_rank = self._solved_pool()
+        self.assertLess(
+            pool,
+            sr.SHIP_PIN.demonstrated_unsafe_tokens,
+            f"solved {pool} at or above the measured-unsafe "
+            f"{sr.SHIP_PIN.demonstrated_unsafe_tokens}: {per_rank}",
+        )
+
+    def test_the_sizer_does_not_regress_below_what_these_records_support(self):
+        pool, per_rank = self._solved_pool()
+        self.assertGreaterEqual(
+            pool, self.REGRESSION_FLOOR, f"sizer regressed: {per_rank}"
+        )
+
+    def test_the_withdrawn_pin_is_recorded_as_withdrawn(self):
+        """So a re-introduction is recognisable on sight rather than arriving
+        as a fresh 'empirical bound'."""
+        self.assertEqual(550000, sr.SHIP_PIN.withdrawn_pin)
+        self.assertIn("cross-regime", sr.SHIP_PIN.withdrawn_reason)
+        self.assertLess(
+            sr.SHIP_PIN.demonstrated_unsafe_tokens,
+            sr.SHIP_PIN.withdrawn_pin,
+            "the withdrawn pin must be recorded as ABOVE a measured-unsafe pool",
+        )
+
+    def test_the_pin_basis_matches_the_records_it_was_derived_from(self):
+        """THE INVALIDATION MECHANISM. 550000 outlived its regime silently
+        because nothing compared it to its inputs. When a change moves a seam
+        slope or an arming floor, this goes red and the pin is re-derived
+        instead of quietly surviving."""
+        slopes = tuple(self.RECORDS[r]["per_row_bytes"] for r in sorted(self.RECORDS))
+        floors = tuple(self.RECORDS[r]["floor_mib"] for r in sorted(self.RECORDS))
+        self.assertEqual(sr.SHIP_PIN.basis_per_row_bytes, slopes)
+        self.assertEqual(sr.SHIP_PIN.basis_arming_floor_mib, floors)
+
+    def test_the_remaining_gap_to_the_safe_bracket_is_named_not_hidden(self):
+        """HONEST ABOUT WHAT IS STILL OPEN.
+
+        The sizer lands ~47k below the pool this rig demonstrated safe. That
+        is real and it is follow-up work, not something this bar should paper
+        over by lowering the safe number to meet it.
+        """
+        pool, _ = self._solved_pool()
+        self.assertLess(
+            pool,
+            sr.SHIP_PIN.demonstrated_safe_tokens,
+            "if the sizer now reaches the demonstrated-safe pool, this test "
+            "has done its job and the follow-up investigation can close",
+        )
