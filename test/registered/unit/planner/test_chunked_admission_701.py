@@ -31,8 +31,8 @@ Hermetic: pure arithmetic, no CUDA, no scheduler import.
 """
 
 import pytest
-
 from sglang.srt.planner.chunked_admission import (
+    ChunkedCommitmentLedger,
     PoolState,
     decide_chunked_admission,
     effective_running_bs,
@@ -70,7 +70,7 @@ def test_the_chunk_is_unrepresentable():
     pool = _pool(free=20_000.0, recoverable=1_000.0)
     assert decide_chunked_admission(327_680, pool).verdict == "defer"
     with pytest.raises(TypeError):
-        decide_chunked_admission(327_680, pool, chunk_tokens=512)  # noqa
+        decide_chunked_admission(327_680, pool, chunk_tokens=512)
 
 
 def test_above_the_achievable_ceiling_is_refused_loudly():
@@ -99,7 +99,7 @@ def test_paper_evictable_is_not_representable_as_fundable():
     with pytest.raises(TypeError):
         PoolState(
             free_tokens=1.0,
-            evictable_unlocked_tokens=2.0,  # noqa - removed on purpose
+            evictable_unlocked_tokens=2.0,
             locked_tokens=0.0,
             total_capacity_tokens=3.0,
         )
@@ -131,3 +131,37 @@ def test_effective_running_bs_counts_resident_chunked_requests():
     """#631 defect O: resident-but-batchless is RUNNING."""
     assert effective_running_bs(running_bs=0, resident_chunked=1) == 1
     assert effective_running_bs(running_bs=3, resident_chunked=2) == 5
+
+
+# #699 ride-along: separate a retry loop from real progress.
+#
+# forward_ct counts batch ATTEMPTS (scheduler.py:6933, `+= 1` at the top of
+# run_batch), so a batch that re-runs without committing advances it while
+# nothing progresses. The liveness detector cannot tell that from health
+# without a COMMIT counter, and spend() is already the single commit path.
+
+
+def test_committed_chunks_counts_only_actual_commits():
+    led = ChunkedCommitmentLedger()
+    led.commit("a", 1000)
+    assert led.committed_chunks == 0, "admission is not a commit"
+    led.spend("a", 512)
+    led.spend("a", 488)
+    assert led.committed_chunks == 2
+
+
+def test_committed_chunks_is_not_rewound_by_release():
+    """A progress counter that goes backwards reads as a restart to a watcher."""
+    led = ChunkedCommitmentLedger()
+    led.commit("a", 100)
+    led.spend("a", 100)
+    led.release("a")
+    assert led.committed_chunks == 1
+
+
+def test_a_refused_spend_does_not_count_as_a_commit():
+    led = ChunkedCommitmentLedger()
+    led.commit("a", 100)
+    with pytest.raises(ValueError):
+        led.spend("a", 200)
+    assert led.committed_chunks == 0

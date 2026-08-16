@@ -58,6 +58,10 @@ class FrontierPoint:
     #: True when no shallower candidate is worse without pipelining, i.e. this
     #: cut is only reachable once the lever is built.
     needs_pipelining: bool
+    #: True when the predicted gain is smaller than the measured A-vs-A noise
+    #: floor. Such a rung is NOT A FINDING: it cannot be told from the
+    #: incumbent by measurement, whatever the arithmetic says.
+    below_noise_floor: bool = False
     #: Provenance of THIS cut's pool, per layout. A booted layout's
     #: available_bytes are read from its own sizing lines and are exact; every
     #: other cut is extrapolated and says so. One global flag would let a
@@ -96,12 +100,18 @@ def solve_prefill_frontier(
     link_mib_per_s: Sequence[float],
     max_rank0_layers: int | None = None,
     measured_for: Callable[[Sequence[int]], bool] | None = None,
+    noise_floor: float = 0.0,
 ) -> PrefillFrontier:
     """Enumerate cuts and price each on speed, pool and overhead.
 
     ``available_bytes_for(counts, attn_counts)`` returns the per-rank bytes
     left for KV under that cut. It is injected because it depends on the
     boot's own budget instruments, which no arithmetic here can invent.
+
+    ``noise_floor`` is the measured A-vs-A spread (0.141 on this rig). A rung
+    whose predicted gain falls under it is flagged: the arithmetic may prefer
+    it, but no measurement could tell it from the incumbent, so presenting it
+    as a win would be presenting noise.
 
     ``measured_for(counts)`` says whether THAT cut's bytes came from its own
     boot. Provenance is per layout rather than per frontier: a booted cut is
@@ -190,6 +200,7 @@ def solve_prefill_frontier(
                 net_pipelined=base / best_ms,
                 needs_pipelining=False,
                 pool_measured=bool(measured_for(best)) if measured_for else False,
+                below_noise_floor=(base / best_ms - 1.0) < float(noise_floor),
             )
         )
 

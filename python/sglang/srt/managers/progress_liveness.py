@@ -73,6 +73,11 @@ class ProgressSample:
     prefill_chunks: int
     pending_requests: int
     pending_tokens: int
+    #: Batch ATTEMPTS (scheduler.forward_ct). Distinct from the commit counters
+    #: above: a batch that re-runs without committing advances this and nothing
+    #: else, which is the #701 retry-loop silhouette. Kept separate so that
+    #: shape can be named rather than read as health.
+    attempts: int = 0
     #: Deliberate pause: a phase flip, a maintenance hold, a GPU-arb claim.
     #: Progress legitimately stops, so an alarm here would be a false positive.
     inhibited: bool = False
@@ -92,6 +97,9 @@ class LivenessPolicy:
     #: Consecutive wedged assessments before the alarm is raised. Guards against
     #: a single slow window (a flip is 2-4.2 s; a long chunk is ~0.3 s).
     confirmations: int = 2
+    #: Treat "attempts advancing with zero commits and work pending" as a
+    #: wedge. Off restores the plain disjunctive rule.
+    retry_loop_detection: bool = True
     #: Alarms before the restart policy fires. None disables restart entirely.
     restart_after_alarms: int | None = 3
     #: Minimum seconds between restarts, so a wedge that survives a restart
@@ -211,7 +219,45 @@ def assess(
             "one; the window will refill.",
         )
 
-    if any(v > 0 for v in deltas.values()):
+    attempts_delta = last.attempts - first.attempts
+    committed = any(v > 0 for v in deltas.values())
+
+    if (
+        policy.retry_loop_detection
+        and not committed
+        and attempts_delta > 0
+        and last.has_work
+    ):
+        wedges = consecutive_wedges + 1
+        detail = (
+            f"RETRY LOOP: {attempts_delta} batch attempt(s) over {span:,.1f}s "
+            "committed nothing, with "
+            f"{last.pending_requests} request(s) and {last.pending_tokens} "
+            "token(s) pending. Work is being re-attempted rather than "
+            "advanced -- the #701 self-deadlock silhouette. An attempts-only "
+            "watchdog reads this as healthy."
+        )
+        if wedges < policy.confirmations:
+            return LivenessReport(
+                WEDGED,
+                ACTION_NONE,
+                deltas,
+                last.pending_requests,
+                last.pending_tokens,
+                span,
+                detail + f" Confirmation {wedges}/{policy.confirmations}.",
+            )
+        return LivenessReport(
+            WEDGED,
+            ACTION_ALARM,
+            deltas,
+            last.pending_requests,
+            last.pending_tokens,
+            span,
+            detail,
+        )
+
+    if committed:
         return LivenessReport(
             HEALTHY,
             ACTION_NONE,
@@ -347,6 +393,9 @@ class SchedulerBinding:
     """
 
     attempts: str = "forward_ct"
+    #: Monotone committed-chunk counter (#701 ledger ride-along). When absent
+    #: the commit signal stays at zero rather than borrowing the attempt count.
+    committed_chunks: str = "chunked_admission_ledger.committed_chunks"
     waiting_queue: str = "waiting_queue"
     running_batch_reqs: str = "running_batch.reqs"
     #: Optional; when absent the pending-token term falls back to summing
@@ -372,11 +421,14 @@ def sample_from_scheduler(
 ) -> ProgressSample:
     """Read one :class:`ProgressSample` from a live scheduler object.
 
-    ``attempts`` lands in ``prefill_chunks`` because it is the only monotone
-    forward counter the tree exposes and it advances in every regime that runs
-    a batch. ``completions`` and ``decode_steps`` stay at zero: no monotone
-    source exists for them, and reporting a fabricated value would make the
-    disjunction look richer than it is.
+    ``forward_ct`` lands in ``attempts``, and the #701 ledger's monotone
+    ``committed_chunks`` lands in ``prefill_chunks``. Keeping them apart is what
+    lets the retry-loop shape be named: attempts advancing with commits flat is
+    a wedge, not health. When the ledger is absent the commit signal stays at
+    ZERO rather than borrowing the attempt count -- an invented commit would
+    make a retry loop look like progress, which is the failure being hunted.
+    ``completions`` and ``decode_steps`` stay at zero for the same reason: no
+    monotone source exists for them.
     """
     binding = binding or SchedulerBinding()
     attempts = _resolve(scheduler, binding.attempts)
@@ -396,11 +448,13 @@ def sample_from_scheduler(
     else:
         pending_tokens = int(sum(getattr(r, "seqlen", 0) for r in waiting))
 
+    commits = _resolve(scheduler, binding.committed_chunks)
     return ProgressSample(
         t_s=t_s,
         completions=0,
         decode_steps=0,
-        prefill_chunks=int(attempts),
+        prefill_chunks=int(commits) if commits is not None else 0,
+        attempts=int(attempts),
         pending_requests=pending_requests,
         pending_tokens=pending_tokens,
         inhibited=inhibited,

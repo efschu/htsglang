@@ -29,7 +29,6 @@ chunk is what the original code substituted for the commitment.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, Optional
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,10 +153,15 @@ class ChunkedCommitmentLedger:
     while still holding its prefix.
     """
 
+    #: Monotone across the ledger's life; never rewound by release(), because a
+    #: progress counter that goes backwards reads as a restart to any watcher.
+    committed_chunks: int
+
     def __init__(self) -> None:
-        self._outstanding: Dict[str, int] = {}
-        self._first_deferred_pass: Dict[str, int] = {}
-        self._last_deferred_pass: Dict[str, int] = {}
+        self.committed_chunks = 0
+        self._outstanding: dict[str, int] = {}
+        self._first_deferred_pass: dict[str, int] = {}
+        self._last_deferred_pass: dict[str, int] = {}
 
     def commit(self, request_id: str, remaining_tokens: int) -> None:
         if request_id in self._outstanding:
@@ -182,6 +186,12 @@ class ChunkedCommitmentLedger:
                 "left; this means the commitment was mis-sized at admission."
             )
         self._outstanding[request_id] = held - int(chunk_tokens)
+        # #699 ride-along: a MONOTONE count of chunks that actually committed.
+        # The liveness detector needs this to separate a retry loop (batch
+        # attempts advancing, nothing committing) from real progress. forward_ct
+        # counts attempts and cannot tell those apart; this can, and it is one
+        # line because spend() is already the single commit path.
+        self.committed_chunks += 1
 
     def release(self, request_id: str) -> None:
         """On finish, abort or retract. Idempotent: a double release is not an
@@ -211,7 +221,7 @@ class ChunkedCommitmentLedger:
 
 
 def effective_rem_total_tokens(
-    rem_total_tokens: float, ledger: Optional[ChunkedCommitmentLedger]
+    rem_total_tokens: float, ledger: ChunkedCommitmentLedger | None
 ) -> float:
     """The budget a later pass may actually spend.
 

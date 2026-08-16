@@ -1084,88 +1084,71 @@ PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
 ones, so it is low-stakes but must still be answered by identity, not by
 ordinal.
 
-## #701 — THE CHUNKED-PREFILL SELF-DEADLOCK
+## #701 — RETRACTED. My analysis re-derived a story the tree had already refuted.
 
-A chunked request's own committed prefix fills the pool its own next chunk must
-allocate from, and it cannot evict itself to make room. Modelled by
-`planner/chunked_deadlock.py`, 12 hermetic tests. **No build without GO — the
-recommended fix touches admission policy.**
+**This section previously carried a reachability analysis concluding
+"admission is per-chunk, the failure is per-total". That premise is FALSE and
+is withdrawn.**
 
-### (a) Reachability, at file:line
+`managers/schedule_policy.py:1464` gates the **full lifetime** at first
+admission:
 
-1. **Each committed chunk LOCKS its prefix.** `mem_cache/radix_cache.py:546` —
-   `cache_unfinished_req` ends with `self.inc_lock_ref(new_last_node)`. The
-   prefix moves from *evictable* to *protected*.
-2. **The admission budget EXCLUDES protected space.**
-   `managers/schedule_policy.py:809-825` — `rem_total_tokens` is
-   `available_size() + <tree>_evictable_size()`. Nothing protected counts.
-3. **So every chunk shrinks the budget its own successor is checked against.**
-   The request eats its own runway, one locked chunk at a time.
-4. **Eviction cannot recover it.** `radix_cache.py:569-575` — `evict` walks
-   `self.evictable_leaves` only, and the request's own prefix is locked. *The
-   request cannot evict itself to fund itself.*
+```
+if total_tokens >= self.rem_total_tokens:
+    ...
+    return AddReqResult.NO_TOKEN
+```
 
-**The tree already knows.** `schedule_policy.py:993-995` names the behaviour:
-*"the prefill input must transiently fit the device. If not, this is the DEEP
-case (PS2) → reject, today's wedge/wait behaviour"*, and the born-spill
-admission logs that it is admitting a request whose *"full lifetime would
-wedge"*. What was missing is the arithmetic saying exactly when.
+So there is no missing full-length gate, and a single request longer than the
+pool is **refused, not admitted-then-wedged**. My falsifier's headline case
+modelled a defect the shipped code already prevents.
 
-**The condition.** With budget `A` at admission and chunk `C`, a request of
-length `L` commits chunks until `A − k·C < C`. So a single request deadlocks
-**iff `L > A`** — and the sharp edge is that **admission is per-chunk while the
-failure is per-total**. Concurrently the condition is on the *sum*: several
-requests each individually admissible deadlock collectively once their locked
-prefixes plus one chunk exceed the pool. No per-request check catches that.
+**Worse, the retraction already existed on this very branch.** Commit
+`845ac92bc4` ("[#701] Slice-3 rework: retract the mechanism story, close the
+real holes") had verified `:1464`, retracted exactly this story in its design
+doc, module docstring and both test files, and closed the real defect. I
+re-derived the refuted version without reading it. The failure was mine: I
+searched the deploy tree for the mechanism but never checked whether #701 was
+already owned and answered.
 
-It presents as a hang rather than a reject precisely because the request gets
-*most of the way* first — the falsifier shows it committing ≥ `pool − C` before
-stalling.
+### What the real defect is, per the work that already exists
 
-### (b) Falsifier
+1. **Paper-evictable funds an admission the evictor cannot honour.**
+   `schedule_policy.py:734-737` documents it in-code: `rem_total_tokens`
+   includes `full_evictable_size()` while the allocator can only recover
+   MAMBA-recoverable bytes. The gate passes; the later relief frees 0.
+2. **The missing reservation is CROSS-PASS, not per-request.** `PrefillAdder`
+   is rebuilt each pass and reserves only remaining *decode*, so a resident
+   chunked request's remaining *prefill* is represented nowhere in later
+   passes. Later admissions then spend its committed future, and the deadlock
+   needs **two actors** — which is why a single-request analysis could never
+   find it.
 
-Hermetic, no GPU. Pins: a fitting request completes; `L > pool` self-deadlocks
-after near-complete progress; the threshold is the **pool, not the chunk** (a
-bigger chunk changes granularity, not outcome); and two individually-admissible
-requests deadlock **collectively**.
+### What already exists, and what I added
 
-### (c) Options, priced
+`planner/chunked_admission.py` (`ChunkedCommitmentLedger`,
+`decide_chunked_admission`, `effective_rem_total_tokens`, defer-age tracking,
+idle-flip blocking) with `test/registered/unit/planner/test_chunked_admission_701.py`
+and `test/registered/unit/managers/test_chunked_commitment_701.py` — the latter
+running against the **real** `PrefillAdder`, which is strictly better evidence
+than the toy model I had written. `DESIGN_701_chunked_admission.md` is its
+design doc.
 
-| option | stops the wedge | can serve `L > pool` | needs | cost |
-|---|---|---|---|---|
-| **A — admission gate** (refuse unless full `L` fits, and *reserve* it) | yes | **no** | nothing | refuses long prompts; the reservation is held for the request's lifetime, so long-prompt concurrency drops sharply |
-| **B — self-evictable prefix to host** (#703 composes) | yes | **yes** | the host tier | host traffic per spilled token; **useless without host budget** — the falsifier shows it still deadlocking at zero budget, so #703 is a genuine dependency, not a nicety |
-| C — preempt/retract another request | partially | no | existing retract path | victim's work is lost; does not help the single-request case, where the only holder *is* the victim |
+I **deleted my duplicate** `managers/chunked_admission.py` and my
+`planner/chunked_deadlock.py` falsifier rather than keep a second, weaker
+account of the same defect.
 
-A subtlety the model makes explicit: the gate must **reserve** the full length,
-not merely check it. Checking without reserving lets two requests both pass and
-then collide — which is the concurrent shape it exists to stop.
+**My one genuinely additive contribution** is the #699 ride-along: a monotone
+`committed_chunks` counter on the existing ledger's `spend()` — the single
+commit path — so the liveness detector can separate a retry loop (attempts
+advancing, nothing committing) from real progress. One line, serving both
+strands, and it is not rewound by `release()` because a progress counter that
+goes backwards reads as a restart to any watcher.
 
-### Recommendation
-
-**Ship A first as a safety property, then B as a capability. They are
-complementary, not alternatives.**
-
-The reasoning is about failure *shape*, not throughput. A wedge is the worst
-available outcome because it is **silent** — #699 established that `/health`
-reports 200 through it and the watchdog is disarmed by the very condition
-(`is_active` = "a batch exists") that defines it. A refusal is loud,
-diagnosable, and attributable to a request. **Converting a silent wedge into a
-noisy refusal is a strict improvement even when the refusal is unwelcome**, and
-option A does that with no new subsystem.
-
-Option A alone is *not* sufficient as an end state: it makes prompts longer than
-the device pool permanently unservable, and on this rig a 327,680-token context
-against a 436,278-token pool leaves no room for a second concurrent long prompt.
-That is why B follows — it is the only option that keeps serving the request,
-and it is exactly what #703's host tier is for.
-
-Option C is named to be dismissed: in the single-request case the only prefix
-holding the pool belongs to the request that needs it, so there is no victim to
-preempt.
-
-**Held for GO.** Option A changes admission policy, so nothing is built until
-the coordinator releases it.
+**Still not wired into `schedule_policy.py`** — that is the behaviour change,
+it needs F4-r4 coordination, and its sibling inventory is `:1569-1610` (main),
+`:1388-1407` (ignore_eos), `:1230-1276` (chunk continuation, commitment-blind)
+and `:1124-1141` (dLLM analog).
 
 ## #699 — LIVENESS FROM PROGRESS, BECAUSE HEALTH 200 IS BLIND
 
@@ -1459,6 +1442,19 @@ which is why they carry `needs_pipelining`.
   incumbent**, because at incumbent depth the collective buys nothing and still
   costs its overhead. Decoupling does not pay for itself until roughly
   `[29,17,18]`.
+
+**MEASURED NOISE FLOOR (window 0b6c7db891): A-vs-A spread is 14.1%, clean
+single-stream prefill ~1,820 tok/s.** Any rung predicting less than +14.1%
+is **not a finding** — no measurement could tell it from the incumbent, so
+`[28,17,19]` (+12.0%) is disqualified outright and flagged
+`below_noise_floor`. The recommended picks are unaffected: `[42,11,11]` at
++81.8% and `[44,10,10]` at +100% clear the floor by a wide margin.
+
+Worth noting against the model: 1,820 tok/s measured single-stream against
+3,307 tok/s implied by the pipelined stage times. That is consistent with a
+single stream not filling a 3-stage pipeline rather than with a modelling
+error, but it means **stage times measured under single-stream load are not
+the pipelined figures** and should not be substituted for them.
 
 **Caveats, all self-labelled and none folded into the numbers.** Every speedup
 is an **upper bound** until slice 1a-i lands the timing intercept (`fixed_ms`

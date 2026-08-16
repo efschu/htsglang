@@ -272,3 +272,36 @@ def test_malformed_inputs_are_refused():
         _solve(incumbent=(28, 20, 15))
     with pytest.raises(PrefillFrontierError, match="every stage"):
         _solve(link_mib_per_s=(X8, X8))
+
+
+# The measured A-vs-A noise floor on this rig is 14.1% (clean single-stream
+# prefill ~1,820 tok/s). A predicted gain under that is not a finding.
+NOISE_FLOOR = 0.141
+
+
+def test_rungs_under_the_noise_floor_are_flagged_as_not_findings():
+    """Arithmetic can prefer a rung that no measurement could confirm.
+
+    [28,17,19] predicts +12.0%, under the 14.1% A-vs-A floor, so it cannot be
+    told from the incumbent by measurement. Presenting it as a win would be
+    presenting noise.
+    """
+    f = _solve(noise_floor=NOISE_FLOOR)
+    by_cut = {p.counts: p for p in f.points}
+    assert by_cut[(28, 17, 19)].below_noise_floor is True
+    assert by_cut[(28, 17, 19)].compute_speedup - 1.0 < NOISE_FLOOR
+    # A real gain is not flagged.
+    assert by_cut[(42, 11, 11)].below_noise_floor is False
+
+
+def test_the_floor_defaults_to_zero_so_it_must_be_supplied_deliberately():
+    f = _solve()
+    assert all(not p.below_noise_floor for p in f.points if p.compute_speedup > 1.0)
+
+
+def test_a_larger_floor_disqualifies_more_rungs():
+    lo = _solve(noise_floor=0.10)
+    hi = _solve(noise_floor=0.40)
+    assert sum(p.below_noise_floor for p in hi.points) > sum(
+        p.below_noise_floor for p in lo.points
+    )

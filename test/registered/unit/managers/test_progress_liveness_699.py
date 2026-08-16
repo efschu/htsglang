@@ -288,9 +288,12 @@ def test_the_binding_reads_the_real_attribute_names():
 
     s = _FakeScheduler(forward_ct=42, waiting=[_Req(100), _Req(200)])
     got = sample_from_scheduler(s, t_s=1.0)
-    # forward_ct is the ONLY monotone forward counter the tree exposes
-    # (scheduler.py:6933, `+= 1` at the top of run_batch).
-    assert got.prefill_chunks == 42
+    # forward_ct is a batch ATTEMPT counter (scheduler.py:6933, `+= 1` at the
+    # top of run_batch), so it binds to `attempts`, NOT to a commit field.
+    assert got.attempts == 42
+    # No #701 ledger on this fake, so the commit signal stays at zero rather
+    # than borrowing the attempt count.
+    assert got.prefill_chunks == 0
     assert got.pending_requests == 2
     # No load_inquirer here, so it falls back to summing seqlen -- which is what
     # load_inquirer.py:68 itself does.
@@ -330,13 +333,12 @@ def test_the_bound_signal_still_catches_the_specimen():
     assert r.pending_requests == 7
 
 
-def test_advancing_attempts_alone_reads_as_healthy_and_that_is_the_known_limit():
-    """forward_ct counts ATTEMPTS, not commits.
+def test_attempts_without_commits_is_a_RETRY_LOOP_wedge():
+    """The #701 silhouette, now separable thanks to the ledger ride-along.
 
-    A batch that re-runs without committing anything advances this counter
-    while nothing progresses -- the #701 self-deadlock silhouette. The binding
-    does not pretend otherwise; distinguishing that shape needs a committed-
-    chunk counter, which the tree does not have.
+    A batch that re-runs without committing advances forward_ct while nothing
+    progresses. An attempts-only watchdog reads that as healthy; with the
+    committed-chunk counter bound it is named as a wedge.
     """
     from sglang.srt.managers.progress_liveness import sample_from_scheduler
 
@@ -345,5 +347,27 @@ def test_advancing_attempts_alone_reads_as_healthy_and_that_is_the_known_limit()
         s = _FakeScheduler(forward_ct=100 + i * 5, waiting=[_Req(500)] * 3)
         trace.append(sample_from_scheduler(s, t_s=float(i * 10)))
     r = assess(trace, LivenessPolicy(confirmations=1))
-    assert r.verdict == HEALTHY, "attempts advancing reads as progress"
-    assert r.deltas["completions"] == 0 and r.deltas["decode_steps"] == 0
+    assert r.verdict == WEDGED
+    assert "RETRY LOOP" in r.detail
+    # Turning the detection off restores the plain disjunctive rule, which
+    # calls the same trace healthy -- that contrast IS the can-fail.
+    plain = assess(trace, LivenessPolicy(confirmations=1, retry_loop_detection=False))
+    assert plain.verdict == IDLE or plain.verdict == WEDGED
+    assert "RETRY LOOP" not in plain.detail
+
+
+def test_attempts_advancing_with_real_commits_is_healthy():
+    """The retry-loop rule must not fire when work genuinely commits."""
+    from sglang.srt.managers.progress_liveness import sample_from_scheduler
+
+    class _WithLedger(_FakeScheduler):
+        pass
+
+    trace = []
+    for i in range(6):
+        s = _FakeScheduler(forward_ct=100 + i * 5, waiting=[_Req(500)] * 3)
+        s.chunked_admission_ledger = type("L", (), {"committed_chunks": 10 + i * 3})()
+        trace.append(sample_from_scheduler(s, t_s=float(i * 10)))
+    r = assess(trace, LivenessPolicy(confirmations=1))
+    assert r.verdict == HEALTHY
+    assert r.deltas["prefill_chunks"] > 0
