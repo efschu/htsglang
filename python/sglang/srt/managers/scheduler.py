@@ -3006,10 +3006,45 @@ class Scheduler(
             avail = int(alloc.available_size()) if alloc is not None else 0
         except Exception:  # noqa: BLE001 - a probe must not break the round
             avail = 0
-        try:
-            evictable = int(tree.evictable_size()) if tree is not None else 0
-        except Exception:  # noqa: BLE001
-            evictable = 0
+        # #698: ASK FOR THE FULL-ATTENTION COUNT FIRST, and fall back to the
+        # flat accessor only for the classes that have one.
+        #
+        # MambaRadixCache.evictable_size() RAISES NotImplementedError -- it
+        # splits the count in two and says so ("use full_evictable_size() and
+        # mamba_evictable_size() instead"). This swallowed that exception and
+        # used 0, so on the class this rig actually runs the probe returned
+        # `available` ALONE -- exactly the error the docstring above warns
+        # about, committed three lines below it.
+        #
+        # At usage 1.00 that reads ~0, so every admissibility question answered
+        # "no": pp could not admit, tp had nothing resident to decode, and the
+        # #688 BOTH BLOCKED branch declined the flip. That branch returns
+        # BEFORE alloc_token_slots, so the allocator was never reached, so
+        # eviction never ran, so a pool that was 100% UNLOCKED CACHE with zero
+        # resident requests was never freed. Serving stopped for 54 minutes on
+        # 2026-08-16 with health returning 200 throughout, three GPUs at 0%,
+        # and 10.5M tokens queued behind a cache nothing would evict.
+        #
+        # The identical trap is documented at mem_cache/common.py:411-425 for
+        # the same two classes. Resolution order is copied from there rather
+        # than re-derived, because two spellings of one rule is how this
+        # returns.
+        #
+        # A SWALLOWED EXCEPTION THAT YIELDS A PLAUSIBLE NUMBER is the shape to
+        # avoid: zero is a legal row count, so nothing downstream could
+        # distinguish "the cache holds nothing" from "the cache was never
+        # asked". Each accessor is tried in turn and only a genuine absence of
+        # all of them yields zero.
+        evictable = 0
+        for name in ("full_evictable_size", "evictable_size"):
+            getter = getattr(tree, name, None) if tree is not None else None
+            if getter is None:
+                continue
+            try:
+                evictable = int(getter())
+                break
+            except Exception:  # noqa: BLE001 - try the next accessor
+                continue
         return max(0, avail) + max(0, evictable)
 
     def _layout_admits(self, phase: str, running_bs: int, pending_tokens: int) -> bool:
