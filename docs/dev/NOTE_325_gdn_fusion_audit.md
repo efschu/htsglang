@@ -9,17 +9,20 @@ every code claim is a file:line in this tree.
 
 ## 0 — Verdict
 
-**Refused, on a counted threshold.** The stated gate was: build the top fusion
-only if it saves **>10 % of the chain's bytes**. The best remaining adjacency
-saves **0.31 %**, and a *perfect* fusion of the entire remaining chain — every
-intermediate materialization removed — saves **0.99 %**.
+**Fusion: refused, on a counted threshold.** The stated gate was: build the top
+fusion only if it saves **>10 % of the chain's bytes**. The best remaining
+adjacency saves **0.31 %**, and a *perfect* fusion of the entire remaining
+chain — every intermediate materialization removed — saves **0.99 %**.
 
-The reason is not that the code is clever. It is that **95.22 % of the chain's
-bytes are the recurrent state, read once and written once per token**, which
-is the GDN recurrence itself. No fusion can remove it: the algorithm is
-defined as "load S, update S, store S". The premise of the ticket — "cut
-memory round-trips" — is correct as a lever in general and simply has almost
-no material left to cut here.
+That is because **95.22 % of the chain's bytes are the recurrent state, read
+once and written once per token**. No *fusion* can remove it: fusing adjacent
+kernels does not change how often S is loaded and stored.
+
+**But the ticket's real premise — cut memory round-trips — does have a live
+answer, and it is already in this tree.** See §7. Revision 1 of this note
+called the state traffic "irreducible"; that was **wrong**, and the mechanism
+that refutes it is referenced in the very function this audit enumerated.
+The fusion verdict stands; the "nothing left to cut" framing does not.
 
 The premise that *no weight format can help* is also confirmed, and for the
 same reason: on this chain the weights are 1.24 % of traffic.
@@ -131,23 +134,76 @@ kernel.
   everything fusion can touch. The verdict does not depend on that config
   value.
 
-## 6 — The falsifier, and the arm nobody needs to run
+## 6 — The falsifier I named, and the one I missed
 
-This refusal rests on an algorithmic invariant, not on an inventory of
-kernels, so it cannot be overturned by finding more fused kernels upstream.
-What *would* overturn it:
+Revision 1 named the correct falsifier and then failed to check whether it was
+already satisfied. It said: the verdict would be overturned by "a formulation
+that does not read and write the full state per token — e.g. a low-rank or
+blocked state update where the touched slice is a fraction of S", and dismissed
+it as "an algorithm change, not a fusion, and it would not be lossless."
 
-* a formulation that does **not** read and write the full state per token —
-  e.g. a low-rank or blocked state update where the touched slice is a
-  fraction of S. That is an algorithm change, not a fusion, and it would not
-  be lossless. Out of scope for a lossless-perf ticket.
-* a measurement showing the chain is **launch-bound rather than byte-bound**
-  at bs=1 — 192 memory-bound launches per round is not nothing. That is a
-  different lever (fewer launches, e.g. CUDA-graph coverage or layer-batching)
-  and a different ticket; this audit prices bytes, which is what #325 asked
-  for. Flagging it as the one adjacent question worth its own count.
+The first half is right and the second half was asserted without checking.
+That formulation exists, it is in this tree, and §7 is it.
 
-No A/B arm is defined, because nothing is being built. If a future arm is
-wanted it must be gated on the launch-bound hypothesis above, and measured as
-ms/round split compute vs wait — not as a byte-saving claim, which §2 has
-already priced at under 1 %.
+The other adjacent question stands and is still unpriced: at bs=1 the chain is
+**192 memory-bound launches per round**, so it may be launch-bound rather than
+byte-bound. This audit prices bytes, which is what #325 asked for. Note that
+ReplaySSM's own headline is quoted at "batch >= 64", which is consistent with
+bytes not being the binding constraint at bs=1.
+
+## 7 — ReplaySSM: the lever that does clear the gate, already in the tree
+
+`--enable-linear-replayssm` (`server_args.py:4145`, **default `False`**), with
+`--linear-replayssm-cache-len` (`:4156`, default **16**).
+
+**Mechanism**, from the kernel's own header
+(`layers/attention/fla/fused_recurrent_linear_replayssm.py:14-23`): the plain
+packed decode reads the full state S and writes it back *every* step.
+ReplaySSM keeps a per-slot ring buffer of the last L steps' `(d, k, g)` and
+only WRITES the full state every L steps; on non-flush steps it appends a tiny
+record and reconstructs the readout from the checkpoint `S0` plus the buffer.
+`S0` is still read every step, so per-step state traffic goes from read+write
+to **read-only — "roughly halved"** in the header's own words.
+
+Against §2's table that attacks the 47.61 % write term directly, i.e. the
+single largest line in the chain — five times the >10 % gate that the fusion
+candidates failed. The net is not the full 47.61 %: the ring buffer must be
+appended each step and re-read on reconstruction, which is the offsetting term
+that makes the header say "roughly halved" rather than "write eliminated". A
+precise net is a count this audit has **not** done.
+
+**Claimed benefit** (`server_args.py:4147-4149`): "~1.2-1.5x at batch >= 64",
+GDN scalar-gate only. Explicitly **not recommended for KDA** — the per-K
+`g_cache` is K times larger and the reconstruction refolds the per-K decay
+every step, making KDA decode *slower* than the packed baseline.
+
+**Preconditions**: the Triton linear-attn decode backend and
+`--mamba-scheduler-strategy no_buffer` (the default).
+
+**The open gate, and why it belongs to this queue.** The flag text claims the
+kernel is "numerically correct". It does **not** claim byte-identity, and the
+reconstruction sums buffered rank-1 updates in a different order than the
+sequential update, so byte-identity should be assumed absent until measured.
+#325 sits on the **lossless**-perf queue, and the standing rule is that lossy
+features come last, after byte-identical wins. So the next step is not a new
+kernel — it is:
+
+1. establish byte-identity status of ReplaySSM on the GDN path (A-vs-A on
+   CPU-sampled inputs, per the cuda-randn rule);
+2. determine how far the wiring actually goes. `gdn_backend.py:497-507` passes
+   `replayssm_d/k/g`, `replayssm_write_pos` and `replayssm_force_flush` into
+   `packed_decode`, while the kernel header still says it is "NOT yet wired
+   into the memory pool / radix cache / scheduler / backend dispatch". One of
+   the two is stale. That contradiction must be resolved before any arm.
+
+**Provenance**: upstream RFC `sgl-project/sglang#28511` covers the same
+mechanism and reports only **~2.3 % end-to-end TPOT** on Qwen3.5-35B-A3B,
+because a MoE-heavy model dilutes a GDN-kernel win. Our production checkpoint
+is also MoE, so the end-to-end expectation here should be set from that number
+and not from the 1.2-1.5x kernel figure.
+
+**Arm, if and only if the byte-identity gate passes**: control
+`--enable-linear-replayssm` off vs on at default L=16, GDN path, batch >= 64
+(the regime where its own help text places the win), measured as ms/round
+split compute vs wait. `layers/attention/fla/bench_gdn_replayssm_decode.py`
+already exists and should be read before any harness is written.
