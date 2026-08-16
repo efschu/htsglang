@@ -85,7 +85,10 @@ builds those numbers from ``PerfCostModel`` lives in ``pp_cut_adapter.py``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
+import os
+import re
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
@@ -1792,9 +1795,16 @@ def residency_terms_from_flight(
         kv_target = sums.get(("kv_pool_sized", False), 0.0)
         weights_draft = sums.get(_DRAFT_WEIGHT_KEY, 0.0)
         gap = sums.get(_INTER_RUNNER_GAP_KEY, 0.0)
-        kv_draft = sums.get(("kv_pool_sized", True), 0.0)
         net_draft = weights_draft + gap
-        overhead = at_rest - weights_target - kv_target - net_draft - kv_draft
+        # The draft runner's own KV motion (``kv_pool_sized`` with draft=True,
+        # -740 MiB on rank 1 of the reference boot) is deliberately NOT
+        # subtracted: the cost model prices only the TARGET KV arena, so a term
+        # removed here would be represented nowhere and the reconstruction
+        # would sit 740 MiB high on that rank. Letting the overhead absorb it
+        # keeps the identity
+        #     at_rest = weights + kv + net_draft + overhead
+        # exact against what the model can actually price.
+        overhead = at_rest - weights_target - kv_target - net_draft
 
         serving = serving_by_pid.get(pid) or []
         if not serving:
@@ -1825,3 +1835,149 @@ def residency_terms_from_flight(
             covers_worst_load_state=False,
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# #602: the weight terms, measured from the checkpoint
+# ---------------------------------------------------------------------------
+
+#: Bytes per element, by safetensors dtype tag.
+_SAFETENSORS_DTYPE_BYTES: Dict[str, int] = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckpointWeightTerms:
+    """Per-family layer weights and the non-layer payloads, from the headers.
+
+    Read from the safetensors HEADERS only -- no payload is touched, so this is
+    instant and needs no accelerator. `PPCutInputs` already instructs callers to
+    measure these rather than derive them from the config's parameter formulas,
+    because the formula-derived attention layer was 30 MiB per layer wrong on
+    the reference checkpoint and the error is CUT-SHAPED.
+
+    ``replicated_weight_bytes`` is the payload every stage carries: on the
+    reference checkpoint a vision tower and an MTP head. Adding those two is
+    what closes the per-stage weight identity against the recorder to 0.1 %;
+    modelling them as first-stage-only leaves stages 1 and 2 short by exactly
+    their size, which is how they were found.
+    """
+
+    source: str
+    n_layers: int
+    attention_layer_indices: Tuple[int, ...]
+    attn_layer_weight_bytes: float
+    linear_layer_weight_bytes: float
+    embedding_weight_bytes: float
+    lm_head_weight_bytes: float
+    replicated_weight_bytes: float
+    replicated_breakdown: Dict[str, float]
+
+
+def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
+    """Measure the weight terms `PPCutInputs` needs from a safetensors dir.
+
+    Raises :class:`DraftResidencyUnavailable` when the directory holds no
+    safetensors shards or no transformer layers -- never a zero-filled result,
+    for the same reason the residency readers refuse: zero non-layer weight is
+    a real value (tied embeddings, no vision tower) and must not stand in for
+    "not measured".
+    """
+    import glob as _glob
+    import struct as _struct
+
+    shards = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not shards:
+        raise DraftResidencyUnavailable(
+            f"no *.safetensors under {model_path!r}; the weight terms cannot "
+            "be defaulted."
+        )
+
+    sizes: Dict[str, float] = {}
+    for shard in shards:
+        try:
+            with open(shard, "rb") as fh:
+                (header_len,) = _struct.unpack("<Q", fh.read(8))
+                header = json.loads(fh.read(header_len))
+        except Exception as exc:
+            raise DraftResidencyUnavailable(
+                f"could not read the safetensors header of {shard!r}: {exc}"
+            ) from exc
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            elements = 1
+            for dim in meta.get("shape", []):
+                elements *= int(dim)
+            sizes[name] = float(elements) * _SAFETENSORS_DTYPE_BYTES.get(
+                str(meta.get("dtype")), 2
+            )
+
+    layer_bytes: Dict[int, float] = {}
+    layer_family: Dict[int, str] = {}
+    embedding = lm_head = 0.0
+    replicated: Dict[str, float] = {}
+    layer_re = re.compile(r"layers\.(\d+)\.")
+    for name, size in sizes.items():
+        if name.startswith("mtp"):
+            replicated["mtp"] = replicated.get("mtp", 0.0) + size
+            continue
+        if ".visual." in name or name.startswith("model.visual"):
+            replicated["visual"] = replicated.get("visual", 0.0) + size
+            continue
+        if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+            lm_head += size
+            continue
+        if "embed_tokens" in name:
+            embedding += size
+            continue
+        found = layer_re.search(name)
+        if found is None:
+            continue
+        index = int(found.group(1))
+        layer_bytes[index] = layer_bytes.get(index, 0.0) + size
+        if ".self_attn." in name:
+            layer_family[index] = LAYER_FAMILY_ATTENTION
+        elif index not in layer_family:
+            layer_family[index] = LAYER_FAMILY_LINEAR
+
+    if not layer_bytes:
+        raise DraftResidencyUnavailable(
+            f"{model_path!r} holds safetensors but no transformer layers; the "
+            "per-family weights cannot be measured from it."
+        )
+
+    attn_idx = tuple(
+        sorted(i for i in layer_bytes if layer_family.get(i) == LAYER_FAMILY_ATTENTION)
+    )
+    lin_idx = [i for i in layer_bytes if layer_family.get(i) != LAYER_FAMILY_ATTENTION]
+    attn_mean = (
+        sum(layer_bytes[i] for i in attn_idx) / len(attn_idx) if attn_idx else 0.0
+    )
+    lin_mean = sum(layer_bytes[i] for i in lin_idx) / len(lin_idx) if lin_idx else 0.0
+    return CheckpointWeightTerms(
+        source=str(model_path),
+        n_layers=len(layer_bytes),
+        attention_layer_indices=attn_idx,
+        attn_layer_weight_bytes=attn_mean,
+        linear_layer_weight_bytes=lin_mean,
+        embedding_weight_bytes=embedding,
+        lm_head_weight_bytes=lm_head,
+        replicated_weight_bytes=sum(replicated.values()),
+        replicated_breakdown=dict(replicated),
+    )
