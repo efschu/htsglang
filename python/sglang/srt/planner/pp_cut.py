@@ -202,6 +202,17 @@ class RankResources:
     #: and says nothing about runnability.
     seam_staging_mib: float = 0.0
 
+    #: #602: what the NEXTN / draft runner actually costs this rank, NET of
+    #: the measured inter-runner overlap credit. See
+    #: :func:`draft_residency_from_flight`, which is where this should come
+    #: from -- the raw ``weights_draft`` post is the WRONG number and charging
+    #: it prices the running configuration as infeasible.
+    #:
+    #: ``None`` means NOT MEASURED, which is not the same as zero and is
+    #: refused by ``PPCutInputs`` whenever a draft runner is declared present.
+    #: Zero is reserved for "this deployment has no draft runner".
+    draft_residency_mib: Optional[float] = None
+
     def __post_init__(self) -> None:
         if self.attn_bw_gbs <= 0.0:
             raise ValueError(
@@ -394,10 +405,34 @@ class PPCutInputs:
     #: Free VRAM that must remain on every card. The rig's standing corridor.
     corridor_mib: float = 1024.0
 
+    #: #602: does this deployment run a NEXTN / draft runner? Declaring it
+    #: makes ``RankResources.draft_residency_mib`` MANDATORY on every rank.
+    #:
+    #: THE FLAG EXISTS SO ABSENCE CANNOT BE MISTAKEN FOR ZERO (#606). Both
+    #: readings are legitimate -- a deployment may genuinely have no draft
+    #: runner -- and they are numerically identical, so only the caller can
+    #: separate them. Leaving the term unset while a draft runner is in fact
+    #: resident is what produced a solver that priced 18 GiB of weights at
+    #: nothing; requiring the declaration turns that into a refusal at
+    #: construction instead of a confident wrong answer at the end.
+    draft_runner_present: bool = False
+
     def __post_init__(self) -> None:
         n = len(self.layer_families)
         if n == 0:
             raise ValueError("PPCutInputs: layer_families is empty.")
+        if self.draft_runner_present:
+            missing = [r.label for r in self.ranks if r.draft_residency_mib is None]
+            if missing:
+                raise ValueError(
+                    "PPCutInputs: draft_runner_present=True but "
+                    f"draft_residency_mib is not measured on rank(s) {missing}. "
+                    "Supply it from draft_residency_from_flight() -- the NET "
+                    "figure, weights_draft minus the inter-runner overlap "
+                    "credit. Defaulting it to zero here would price a resident "
+                    "draft runner at nothing, which is the calibration defect "
+                    "this flag exists to prevent."
+                )
         bad = sorted(
             set(self.layer_families) - {LAYER_FAMILY_ATTENTION, LAYER_FAMILY_LINEAR}
         )
@@ -490,6 +525,11 @@ class StageCost:
     #: supplied and the gate cannot say which state it describes -- which is
     #: exactly the ambiguity law 31 was written about.
     transient_load_state: Optional[str] = None
+    #: #602: the draft runner's NET residency on this rank, its own post so a
+    #: future mismatch names the term that moved rather than hiding inside
+    #: ``transient_mib``. Cut-INVARIANT on this deployment: the draft model's
+    #: placement follows its own vector, not ``pp_layer_ratio``.
+    draft_mib: float = 0.0
 
     @property
     def total_seconds(self) -> float:
@@ -503,6 +543,7 @@ class StageCost:
             + self.state_mib
             + self.kv_mib
             + self.transient_mib
+            + self.draft_mib
         )
 
     @property
@@ -768,6 +809,7 @@ def _price_stage(
         transient_mib=rank.worst_transient_mib + rank.fixed_overhead_mib,
         transient_load_state=rank.governing_load_state,
         seam_staging_mib=rank.seam_staging_mib,
+        draft_mib=float(rank.draft_residency_mib or 0.0),
         # The corridor is subtracted here, once, so every downstream
         # comparison is against usable bytes.
         budget_mib=rank.budget_mib - inputs.corridor_mib,
@@ -1408,3 +1450,249 @@ def solve_pp_cut_for_kv_floor(
         refusals=(),
         candidates_considered=considered,
     )
+
+
+# ---------------------------------------------------------------------------
+# #602: the draft runner's residency, measured from the flight recorder
+# ---------------------------------------------------------------------------
+
+
+class DraftResidencyUnavailable(RuntimeError):
+    """The recorder holds no draft posts for this boot.
+
+    Raised instead of returning zero. Zero is a REAL value in this model --
+    it means the deployment has no draft runner -- so substituting it for "not
+    measured" would let an uncalibrated solve present itself as calibrated.
+    That is the #606 getattr lesson applied to a number instead of an
+    attribute: a defensive default that hides its own trigger.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class DraftResidency:
+    """What the NEXTN / draft runner costs one rank, and where that was read.
+
+    ``weights_draft_mib`` is what the draft runner ALLOCATED.
+    ``overlap_credit_mib`` is what the process RELEASED between the two
+    runners (the recorder's ``inter_runner_gap``, sign-flipped to a credit).
+
+    THE NET IS THE ONLY FIGURE THE SOLVER MAY USE. Charging the gross weights
+    prices the reference rig's RUNNING configuration as infeasible -- 10796
+    MiB of draft weights against an 18800 MiB budget that also carries the
+    target model -- because the two runners do not both occupy the card at
+    once. The gross number is kept beside the net one so a reader can see the
+    size of the correction rather than being handed a small number to trust.
+    """
+
+    pid: int
+    card_uuid: str
+    boot_id: str
+    source: str
+    weights_draft_mib: float
+    overlap_credit_mib: float
+
+    @property
+    def net_mib(self) -> float:
+        return self.weights_draft_mib - self.overlap_credit_mib
+
+
+#: Recorder transitions this term is differenced from, keyed as
+#: ``(closing phase, draft_worker)`` exactly as the fill-side report names
+#: posts. Kept next to the reader so the two cannot drift into naming the same
+#: bytes differently.
+_DRAFT_WEIGHT_KEY = ("weights_loaded", True)
+_INTER_RUNNER_GAP_KEY = ("pre_weight_load", True)
+
+
+def draft_residency_from_flight(
+    directory: str, *, boot: Optional[str] = None
+) -> Dict[int, DraftResidency]:
+    """Measure each process's draft-runner residency from the flight recorder.
+
+    Returns ``{pid: DraftResidency}`` for ONE boot (the latest by default),
+    grouped by pid rather than by rank for the reason
+    ``flight_recorder.read_marks`` documents: under ``--tp-size 1 --pp-size 3``
+    all three processes file their marks under TP rank 0, so keying on the rank
+    field merges three cards into one timeline.
+
+    Raises :class:`DraftResidencyUnavailable` when the directory holds no marks
+    or the boot has no draft posts at all -- never a zero-filled result.
+    """
+    try:
+        from sglang.srt.mem_ledger import flight_recorder
+    except ImportError as exc:  # pragma: no cover - packaging accident
+        raise DraftResidencyUnavailable(
+            f"flight recorder module is not importable: {exc}"
+        ) from exc
+
+    try:
+        by_pid = flight_recorder.read_marks(directory, boot=boot)
+    except Exception as exc:
+        raise DraftResidencyUnavailable(
+            f"could not read flight marks from {directory!r}: {exc}"
+        ) from exc
+
+    if not by_pid:
+        raise DraftResidencyUnavailable(
+            f"no flight marks under {directory!r}"
+            + (f" for boot {boot!r}" if boot else "")
+            + ". The draft residency cannot be defaulted; arm the recorder on "
+            "a boot of this configuration and re-read."
+        )
+
+    out: Dict[int, DraftResidency] = {}
+    for pid, marks in by_pid.items():
+        ordered = sorted(marks, key=lambda m: m.get("monotonic") or 0.0)
+        weights = 0.0
+        gap = 0.0
+        seen_draft = False
+        for prev, cur in zip(ordered, ordered[1:]):
+            flag = (cur.get("extra") or {}).get("draft_worker")
+            flag = None if flag is None else bool(flag)
+            key = (str(cur.get("phase")), flag)
+            delta = (
+                int(cur.get("nvml_self_bytes") or 0)
+                - int(prev.get("nvml_self_bytes") or 0)
+            ) / MIB
+            if key == _DRAFT_WEIGHT_KEY:
+                weights += delta
+                seen_draft = True
+            elif key == _INTER_RUNNER_GAP_KEY:
+                gap += delta
+                seen_draft = True
+        if not seen_draft:
+            continue
+        uuids = [m.get("card_uuid") for m in ordered if m.get("card_uuid")]
+        boots = [m.get("boot_id") for m in ordered if m.get("boot_id")]
+        out[int(pid)] = DraftResidency(
+            pid=int(pid),
+            card_uuid=str(sorted(uuids)[0]) if uuids else "?",
+            boot_id=str(boots[0]) if boots else "?",
+            source=str(directory),
+            weights_draft_mib=weights,
+            # Sign-flipped: the recorder writes the release as negative, and a
+            # credit that reads positive is the one a caller can subtract
+            # without having to remember which way the sign ran.
+            overlap_credit_mib=-gap,
+        )
+
+    if not out:
+        raise DraftResidencyUnavailable(
+            f"the boot under {directory!r} has no draft-runner posts. If this "
+            "deployment genuinely runs no draft runner, say so with "
+            "draft_runner_present=False rather than reading a zero out of a "
+            "recorder that never saw one."
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# #602: the seam is a FIXED POINT, because it flips the cut
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class KvFloorFixedPoint:
+    """A KV-floor solve whose seam demand is consistent with its own arena."""
+
+    solution: KvFloorSolution
+    seam_staging_mib: Tuple[float, ...]
+    iterations: int
+    converged: bool
+
+
+def solve_pp_cut_for_kv_floor_at_seam_fixed_point(
+    inputs: PPCutInputs,
+    *,
+    seam_fixed_mib: Sequence[float],
+    seam_slope_bytes_per_token: Sequence[float],
+    tolerance_tokens: float = 50.0,
+    max_iterations: int = 40,
+) -> KvFloorFixedPoint:
+    """Solve the cut with the seam priced at the arena the solve itself implies.
+
+    WHY THIS IS NOT OPTIONAL, MEASURED RATHER THAN ASSUMED. The seam reserve is
+    ``fixed + slope * tokens`` (rank 0: 227 MiB + 2360.1 B/token), so pricing it
+    at the CURRENT arena while solving for a LARGER one understates it on
+    exactly the stage the solve wants to load. On the reference rig that is not
+    a rounding difference, it changes the ANSWER:
+
+        seam priced at the live arena (471638)   ->  cut [31, 16, 17]
+        seam priced at its own fixed point       ->  cut [30, 17, 17]
+
+    A one-shot solve therefore returns a cut that is optimal for a seam demand
+    the cut itself invalidates. The iteration below re-prices the seam at each
+    candidate arena until the arena stops moving, which is the only operating
+    point at which the answer is self-consistent.
+
+    NON-CONVERGENCE IS REPORTED, NOT SMOOTHED. ``converged=False`` comes back
+    with the last iterate rather than an exception so a caller can see what it
+    was oscillating between, but the flag must be checked: an unconverged fixed
+    point is a cut whose seam demand does not match its own arena, which is the
+    defect this function exists to remove.
+    """
+    if (
+        len(seam_fixed_mib) != inputs.pp_size
+        or len(seam_slope_bytes_per_token) != inputs.pp_size
+    ):
+        raise ValueError(
+            "solve_pp_cut_for_kv_floor_at_seam_fixed_point: seam terms must "
+            f"cover all {inputs.pp_size} stages."
+        )
+
+    def _with_seam(tokens: float) -> PPCutInputs:
+        seam = tuple(
+            float(f) + float(s) * float(tokens) / MIB
+            for f, s in zip(seam_fixed_mib, seam_slope_bytes_per_token)
+        )
+        ranks = tuple(
+            dataclasses.replace(r, seam_staging_mib=seam[i])
+            for i, r in enumerate(inputs.ranks)
+        )
+        return dataclasses.replace(inputs, ranks=ranks)
+
+    tokens = float(inputs.arena_tokens)
+    solution = None
+    seam_used: Tuple[float, ...] = ()
+    for it in range(1, max_iterations + 1):
+        scoped = _with_seam(tokens)
+        seam_used = tuple(r.seam_staging_mib for r in scoped.ranks)
+        solution = solve_pp_cut_for_kv_floor(scoped)
+        if not solution.feasible:
+            return KvFloorFixedPoint(solution, seam_used, it, False)
+        if abs(solution.floor_tokens - tokens) <= tolerance_tokens:
+            return KvFloorFixedPoint(solution, seam_used, it, True)
+        tokens = solution.floor_tokens
+    return KvFloorFixedPoint(solution, seam_used, max_iterations, False)
+
+
+def world_kv_floor_at_seam_fixed_point(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    seam_fixed_mib: Sequence[float],
+    seam_slope_bytes_per_token: Sequence[float],
+    tolerance_tokens: float = 50.0,
+    max_iterations: int = 40,
+) -> Optional[float]:
+    """The same fixed point for a GIVEN cut, so the incumbent is scored on the
+    same terms as the candidate. Comparing a fixed-point solve against a
+    one-shot incumbent would credit the new cut with the correction."""
+    tokens = float(inputs.arena_tokens)
+    floor: Optional[float] = None
+    for _ in range(max_iterations):
+        seam = tuple(
+            float(f) + float(s) * tokens / MIB
+            for f, s in zip(seam_fixed_mib, seam_slope_bytes_per_token)
+        )
+        ranks = tuple(
+            dataclasses.replace(r, seam_staging_mib=seam[i])
+            for i, r in enumerate(inputs.ranks)
+        )
+        floor = world_kv_floor(counts, dataclasses.replace(inputs, ranks=ranks))
+        if floor is None:
+            return None
+        if abs(floor - tokens) <= tolerance_tokens:
+            return floor
+        tokens = floor
+    return floor
