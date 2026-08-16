@@ -898,6 +898,23 @@ quantity to hide is twice what the plan assumed, and whether it actually hides
 depends on real stream concurrency. Slice 3 measures the pair matrix before
 this is priced as acceptable.
 
+**A third term, which the plan omits and which the coupled layout does not
+pay: KV placement.** Under decoupling the two ownership axes are orthogonal — a
+PP stage computes the layers it owns, but each token's rows are stored on the
+rank owning that *token*. Every row a stage produces for a token it does not
+own must therefore be shipped. Per attention layer a chunk produces
+`512 × 2048` = 1.00 MiB, of which `1 − share_of_computing_stage` leaves; summed
+over the 7/5/4 attention-layer split that is **11.1 MiB per chunk, ~2.9% on top
+of the 385.5 MiB collective**. Small, but charged rather than waved away —
+it is exactly the kind of term that is invisible in a design and obvious in a
+profile. Solved by `kv_placement_bytes_per_chunk()`.
+
+This also confirms #706's writer-side finding from my side: a canonical page
+holds all 16 attention layers for one token, but those 16 slots are produced by
+**three different PP stages** (7 + 5 + 4), so every page takes partial writes
+from three writers regardless of which rank stores it. Decoupling does **not**
+remove the need for his per-page completeness marker.
+
 **Structural fact the estimate does not capture: traffic is driven by Q and the
 partial OUTPUT, not by how much KV is remote.** Each remote participant
 receives a full Q block and returns a full-size partial output plus LSE,

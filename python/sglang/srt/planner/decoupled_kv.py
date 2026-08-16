@@ -344,3 +344,40 @@ def quantize_shares(
         realized_shares=realized,
         max_share_error=max(abs(a - b) for a, b in zip(realized, norm)),
     )
+
+
+def kv_placement_bytes_per_chunk(
+    geometry: KvGeometry,
+    attn_layers_per_stage: Sequence[int],
+    shares: Sequence[float],
+    chunk_tokens: int,
+) -> int:
+    """KV rows that must travel from the COMPUTING stage to the STORING rank.
+
+    A cost the coupled layout does not have, and one the plan's estimate omits.
+    Under decoupling the two ownership axes are orthogonal: a PP stage computes
+    the layers it owns, but each token's rows are stored on the rank that owns
+    that TOKEN. So every row a stage produces for a token it does not own has
+    to be shipped.
+
+    Per attention layer a chunk produces ``chunk_tokens x kv_cell`` bytes, of
+    which the fraction ``1 - share_of_the_computing_stage`` leaves that stage.
+
+    On this rig it is small beside the Q/output collective -- 11.1 MiB against
+    385.5 MiB per chunk, about 3% on top -- but it is charged here rather than
+    waved away, because it is exactly the kind of term that is invisible in a
+    design and obvious in a profile.
+    """
+    if len(attn_layers_per_stage) != len(shares):
+        raise DecoupledKvError(
+            f"{len(attn_layers_per_stage)} stages of attention layers against "
+            f"{len(shares)} shares."
+        )
+    norm = _normalise(shares)
+    per_layer = int(chunk_tokens) * geometry.kv_bytes_per_token_per_attn_layer
+    return int(
+        sum(
+            int(n) * per_layer * (1.0 - norm[i])
+            for i, n in enumerate(attn_layers_per_stage)
+        )
+    )

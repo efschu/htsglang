@@ -395,3 +395,43 @@ def test_the_even_split_round_trips_exactly():
     )
     assert q.ratios == (1, 1, 1)
     assert q.max_share_error == pytest.approx(0.0, abs=1e-12)
+
+
+def test_kv_placement_is_a_real_cost_the_coupled_layout_does_not_pay():
+    """The orthogonal-ownership term the plan's estimate omits.
+
+    A PP stage computes the layers it owns, but each token's rows are stored on
+    the rank owning that TOKEN. Those axes are independent, so every row
+    produced for a token the computing stage does not own must be shipped --
+    traffic that simply does not exist when KV stays with its layer.
+    """
+    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+
+    shares = (0.135, 0.483, 0.382)
+    attn_per_stage = (7, 5, 4)  # interval-4 split of [44,10,10]-class cuts
+    placement = kv_placement_bytes_per_chunk(GEO, attn_per_stage, shares, 512)
+    collective = collective_bytes_per_chunk(GEO, 2, 512)
+
+    # Real, but an order of magnitude below the Q/output collective.
+    assert 0.02 < placement / collective < 0.05
+    assert 10.0 < placement / MiB < 12.0
+
+    # A stage that owned every token would ship nothing: the term is entirely
+    # about ownership mismatch, not about volume.
+    none_remote = kv_placement_bytes_per_chunk(GEO, (16, 0, 0), (1.0, 0.0, 0.0), 512)
+    assert none_remote == 0
+
+
+def test_placement_traffic_scales_with_the_chunk():
+    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+
+    a = kv_placement_bytes_per_chunk(GEO, (7, 5, 4), (0.135, 0.483, 0.382), 512)
+    b = kv_placement_bytes_per_chunk(GEO, (7, 5, 4), (0.135, 0.483, 0.382), 1024)
+    assert b == pytest.approx(2 * a)
+
+
+def test_placement_refuses_a_stage_share_mismatch():
+    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+
+    with pytest.raises(DecoupledKvError, match="stages"):
+        kv_placement_bytes_per_chunk(GEO, (7, 5), (0.1, 0.5, 0.4), 512)
