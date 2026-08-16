@@ -138,11 +138,27 @@ class RankPrefillLog:
     line is emitted immediately, without the gpu-ms field.
     """
 
+    #: #691. How far the two queues may legitimately drift apart before the
+    #: pairing is declared broken.
+    #:
+    #: A LEAD IS NORMAL IN BOTH DIRECTIONS and must not trip this. Under the
+    #: overlap schedule a forward's events routinely complete before the
+    #: result that records them (durations lead), and several forwards can be
+    #: in flight before any of their events complete (records lead). What is
+    #: NOT normal is one stream persistently outrunning the other, which is
+    #: the shape a stage that times forwards it never records would produce.
+    MAX_PAIR_SKEW: int = 8
+
     def __init__(self) -> None:
         # Installed by SchedulerMetricsReporter when CUDA-event timing is
         # applicable; stays None otherwise.
         self.timer: Optional[DeviceTimer] = None
         self.clock: Optional[CollectiveClock] = None
+        # #691. Set once, never cleared: the streams have been observed not to
+        # pair, so no further duration may be attached to any record on this
+        # rank. Reporting resumes in the untimed form rather than stopping,
+        # because the token counts are still true.
+        self.pairing_refused: bool = False
         # (new_tokens, cached_tokens, graphed)
         self._pending: deque = deque()
         # (total_seconds, collective_seconds | None), completion order
@@ -192,7 +208,7 @@ class RankPrefillLog:
         timed: bool,
         graphed: bool = False,
     ) -> None:
-        if timed and self.timer is not None:
+        if timed and self.timer is not None and not self.pairing_refused:
             self._pending.append((new_tokens, cached_tokens, graphed))
         else:
             logger.info(
@@ -201,11 +217,64 @@ class RankPrefillLog:
                 cached_tokens,
             )
 
+    def _drain_untimed(self) -> None:
+        """Emit the queued records without a duration, and drop the durations.
+
+        #691. Used once the pairing has been refused: the token counts are
+        still true and worth reporting, only their association with a
+        particular forward's timing is not.
+        """
+        self._durations.clear()
+        while self._pending:
+            new_tokens, cached_tokens, _graphed = self._pending.popleft()
+            logger.info(
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
+                new_tokens,
+                cached_tokens,
+            )
+
+    def _refuse_pairing(self, skew: int) -> None:
+        """Announce once, then stop attaching durations on this rank.
+
+        Named rather than silently degraded: a rank that stops reporting
+        gpu-ms while its peers keep reporting it looks like a quiet rank, and
+        the whole point of the per-rank line is that a missing number is
+        indistinguishable from a fast one.
+        """
+        self.pairing_refused = True
+        logger.warning(
+            "Prefill rank timing DISABLED on this rank: the record and "
+            "duration queues drifted %d apart (limit %d), so they are no "
+            "longer fed by the same forwards and any pairing would attach "
+            "one forward's timing to another forward's tokens. The line "
+            "continues without gpu-ms. This is the #691 guard; under a "
+            "pipeline it means this stage times forwards it does not record, "
+            "which the per-stage install assumed it did not.",
+            skew,
+            self.MAX_PAIR_SKEW,
+        )
+        self._drain_untimed()
+
     def flush(self) -> None:
         """Harvest completed CUDA events (query-only, no sync) and emit one
         line for every record whose duration has arrived."""
         if self.timer is not None:
             self.timer._report()
+        # #691. PAIR OR REFUSE, NEVER MISPAIR. The pairing below is
+        # POSITIONAL: index i of one queue is taken to be index i of the
+        # other. That holds only while both queues are fed by the same
+        # forwards. A stage that times a forward it never records (or the
+        # reverse) shifts the correspondence, and every subsequent line would
+        # attach one forward's duration to another forward's token counts --
+        # a wrong number carrying the same authority as a right one. Checked
+        # BEFORE any pop, so the diverged pass emits nothing timed.
+        if self.pairing_refused:
+            self._drain_untimed()
+            return
+        skew = len(self._durations) - len(self._pending)
+        if abs(skew) > self.MAX_PAIR_SKEW:
+            self._refuse_pairing(skew)
+            return
         k = min(len(self._pending), len(self._durations))
         if k == 0:
             return
@@ -390,13 +459,29 @@ class SchedulerMetricsReporter:
         """Wire the per-rank prefill log's CUDA-event timer onto the TARGET
         runner only (see RankPrefillLog). Deliberately NOT the draft runners:
         their extend forwards are not 1:1 with prefill batch reports. GPU
-        timing needs a CUDA(-alike) device; PP pipelines process prefill
-        results on the last stage only, which breaks the FIFO pairing, so
-        they keep the untimed line."""
-        if (
-            getattr(self.scheduler, "device", "") != "cuda"
-            or self.scheduler.server_args.pp_size != 1
-        ):
+        timing needs a CUDA(-alike) device.
+
+        #691: PIPELINES ARE NOW ADMITTED, per stage. This gate used to also
+        require ``pp_size == 1``, on the reading that a pipeline processes
+        prefill results on the last stage only and so breaks the FIFO
+        pairing. Measured on the reference PP=3 boot, that is not what
+        happens: all three stages emit the per-rank prefill line in
+        near-equal counts (1020 / 1020 / 1018 across one log rotation),
+        because every stage runs its own scheduling pass and records its own
+        prefill batches. Each stage's two queues are therefore fed by that
+        stage's own forwards, which is what positional pairing needs.
+
+        Per-stage local pairing rather than last-stage-only reporting is also
+        the only variant that answers the question the instrument exists for:
+        last-stage-only measures one card, and the compute-vs-wait SPREAD
+        across stages is the signal.
+
+        The assumption is not taken on trust. ``RankPrefillLog.flush``
+        watches the two queues for persistent drift and refuses the pairing
+        loudly if a stage turns out to time forwards it does not record --
+        see ``_refuse_pairing``. A stage that cannot pair reports the untimed
+        line; it never reports a mispaired one."""
+        if getattr(self.scheduler, "device", "") != "cuda":
             return
         self.rank_prefill_log.clock = collective_clock()
         self.rank_prefill_log.timer = SplitDeviceTimer(
