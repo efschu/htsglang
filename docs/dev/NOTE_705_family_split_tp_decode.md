@@ -148,3 +148,72 @@ way §2 models it and the pricing is void.
 already there; it is a decode-phase member of the #485 matrix, so it must not be
 co-armed with a prefill-cut change (#702) — one phase at a time or neither
 result is attributable.
+
+---
+
+## 8 — VERDICT (desk, measured): REFUSE the A/B. Do uneven TP instead.
+
+The gate is no longer a threshold to guess at. The on-rig collective cost is
+**measured**: `ar_10kb_us` = **31.0-33.7 us** for the 10 KB bs=1 payload
+(`INTEGRATION_R3_VALIDATION`, `__group__` rows; ANALYSE_321 uses 32.4). The 44.92
+us figure in the tier tables is **UCX to a remote rig over 40G RoCE** and does
+not apply here. Total decode collective cost is ~4.1 ms/round at 128
+collectives/token, of which this proposal removes 48.
+
+### The three baselines, and why the answer hinges on which one is honest
+
+| GDN attention family, per decode round | ms |
+|---|---:|
+| solo on the 5090 | 3.192 |
+| **EQUAL 1/3 shard** — what the rig runs today (`rank_tp_ratio=None`) | 2.506 |
+| **PROPORTIONAL shard** — uneven TP, `--rank-tp-ratio`, already shipped | **1.726** |
+
+Collective saving from removing 48: **1.488 - 1.618 ms** across the measured
+range.
+
+| net per round | vs EQUAL (today) | vs PROPORTIONAL (uneven TP) |
+|---|---:|---:|
+| at 31.0 us | +0.802 ms | +0.022 ms |
+| at 32.4 us | +0.869 ms | +0.090 ms |
+| at 33.7 us | +0.932 ms | +0.152 ms |
+
+### The finding
+
+**Uneven TP alone is worth +0.780 ms/round, at zero capacity cost and no
+structural change.** It is already shipped and simply not enabled here
+(`rank_tp_ratio=None`).
+
+**The family split beyond uneven TP is worth +0.090 ms/round** — about **0.3 %
+of a ~30 ms bs=1 round** — in exchange for concentrating a family on one rank,
+moving 4,688 MiB of residency, and taking on the #115 zero-shard machinery.
+
+That is not a trade worth a window. **Refused**, and the A/B is not requested.
+
+### Capacity ledger (not the blocker, but it was asked for)
+
+Priced against the measured TP-stack sizing pass (holdback 0.000 % there, so
+these are the real KV budgets):
+
+| | rank0 | rank1 | rank2 | world |
+|---|---:|---:|---:|---:|
+| current KV, MiB | 20,118.6 | 12,566.3 | 12,072.3 | |
+| tokens | 643,795 | 402,122 | 386,314 | **1,432,230** |
+| after split, MiB | 15,430.4 | 14,910.4 | 14,416.4 | |
+| tokens | 493,773 | 477,133 | 461,325 | **1,432,230** |
+
+**World delta: exactly 0 tokens.** The split is capacity-neutral under the TP
+sum rule and every budget stays positive, so it *fits* — rank0's share simply
+falls from 45.0 % to 34.5 %. Capacity was never the obstacle; the win was.
+
+Note the premise correction from section 1 still stands and is load-bearing
+here: only **5,304 MiB** of GDN *attention* relocates, not "20 GB". The MoE
+block is 77.7 % of weights and stays sharded on every layer, which is also why
+no layer becomes sync-free and only 48 of 128 collectives are removable.
+
+### If it is ever revisited
+
+The order is fixed by the numbers: enable uneven TP first and re-measure. The
+family split's remaining value is whatever survives *after* the proportional
+shard, and today that is 0.09 ms. It becomes interesting only if the collective
+cost rises materially (a slower interconnect, or many more ranks) or if the
+GDN attention family grows relative to MoE — neither is true on this rig.
