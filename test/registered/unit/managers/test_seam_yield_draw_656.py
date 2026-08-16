@@ -163,21 +163,29 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
             with _Patched(_Guard(ENTRY_FREE)):
                 return r, r._corridor_gate(STAGED, "tp_to_pp")
 
-    def test_the_metal_instant_is_no_longer_yielded_through(self):
-        r, detail = self._gate(measured_draw_mib=1452)
-        self.assertNotEqual(detail, "", "the yield entered a measured breach")
-        self.assertEqual(r.seam_margin_yields, 0)
+    def test_the_metal_instant_now_PROCEEDS_with_a_warning(self):
+        """SUPERSEDED BY THE USER DECISION 2026-08-16.
 
-    def test_it_objects_as_a_DELAY_so_the_flip_is_not_stood_down(self):
-        """The margin-delay tag is exempt from the seam-abandon cap.
+        This case used to withhold the yield because the measured draw
+        predicted a sub-law trough. The withhold emitted a margin-delay tag,
+        which is exempt from the stand-down cap -- so when the condition did
+        not clear, nothing bounded it. That is exactly what happened at
+        07:02:15: the delay streak climbed 15/16/17 while the box sat at bs 0
+        with 794179 tok pending.
 
-        That exemption is what keeps this a delay rather than a permanent
-        stand-down: the condition is transient (the memory comes back once
-        decode drains), so ending the flip for good would be the wrong
-        verdict for a wait that can win.
+        The law is a fill-quality target, not a gate. The prediction still
+        runs and still speaks -- it sizes the warning and aims the pre-flip
+        spill -- but the seam proceeds.
         """
+        r, detail = self._gate(measured_draw_mib=1452)
+        self.assertEqual(detail, "", "a margin prediction may no longer stop the seam")
+        self.assertEqual(r.seam_law_warned, 1)
+
+    def test_it_no_longer_objects_at_all(self):
+        """THE WEDGE CLASS, deleted. No delay tag, so nothing can accumulate
+        an unbounded streak out of a prediction."""
         _r, detail = self._gate(measured_draw_mib=1452)
-        self.assertIn(SEAM_MARGIN_DELAY_TAG, detail)
+        self.assertNotIn(SEAM_MARGIN_DELAY_TAG, detail)
 
     def test_a_rank_with_no_measurement_still_yields(self):
         """Zero measured draw is not a licence to invent one.
@@ -195,11 +203,13 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
         self.assertEqual(detail, "")
         self.assertEqual(r.seam_margin_yields, 1)
 
-    def test_the_law_check_itself_is_unchanged(self):
-        """A seam below the LAW is still refused, however exhausted the budget.
+    def test_a_verdict_that_does_not_hold_is_still_refused(self):
+        """The boundary the 2026-08-16 decision did NOT move.
 
-        The falsifier for the whole item: this must not turn into a path that
-        proceeds because the measured draw happened to be small.
+        Reworded, not reaimed: this drives a guard whose verdict is not ok,
+        which since that decision means the allocation does not FIT -- an OOM,
+        not a corridor dip. The seam must still decline it, and must decline
+        it as an abort rather than a margin delay.
         """
         r = _runtime(direction="tp_to_pp", abandons=8, measured_draw_mib=0)
         with _Env(SGLANG_SEAM_ENTRY_MARGIN_MIB=512, SGLANG_SEAM_ENTRY_DELAY_BUDGET=2):
@@ -210,14 +220,19 @@ class TheYieldIsWithheldWhenTheDrawPredictsABreachTest(unittest.TestCase):
         self.assertEqual(r.corridor_aborts, 1)
 
 
-class TheWithholdingIsCountedApartTest(unittest.TestCase):
+class TheLawWarningIsCountedApartTest(unittest.TestCase):
     def test_it_has_its_own_counter(self):
         r = _runtime(direction="tp_to_pp", abandons=8, measured_draw_mib=1452)
         with _Env(SGLANG_SEAM_ENTRY_MARGIN_MIB=512, SGLANG_SEAM_ENTRY_DELAY_BUDGET=2):
             with _Patched(_Guard(ENTRY_FREE)):
                 r._corridor_gate(STAGED, "tp_to_pp")
-        self.assertEqual(r.seam_yields_withheld, 1)
-        self.assertEqual(r.seam_margin_yields, 0)
+        self.assertEqual(r.seam_law_warned, 1)
+        # The warning ACCOMPANIES the yield, it does not replace it: the seam
+        # enters on the law and says that it could not hold the floor. Two
+        # separate facts, counted separately, because a run whose warnings
+        # dominate is evidence about the spill rung rather than about the
+        # yield.
+        self.assertEqual(r.seam_margin_yields, 1)
 
 
 if __name__ == "__main__":

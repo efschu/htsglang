@@ -527,16 +527,8 @@ def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
     return max(PROGRESS_STALL_CHUNKS * (chunk / rate), floor)
 
 
-#: #677: after how many consecutive REFUSED tp_to_pp arms drain mode stops
-#: suppressing prefill in the TP layout. Not a new number -- the seam entry
-#: margin already yields after two consecutive abandoned attempts, and an
-#: instance should not wait longer to stop IDLING than it waits to lower its
-#: own guard.
-DRAIN_SUPPRESSION_YIELD_AFTER = 2
-
-
 def prefill_suppressed_in_tp(
-    cfg: "PhasePolicyConfig", phase: str, tp_arm_refusals: int = 0
+    cfg: "PhasePolicyConfig", phase: str, flip_unavailable: bool = False
 ) -> bool:
     """#677 hot fix 2: may prefill be admitted while the TP layout is up?
 
@@ -550,8 +542,8 @@ def prefill_suppressed_in_tp(
     never finishes costs a whole extra round trip and returns the same
     carriers.
 
-    IT YIELDS WHEN THE FLIP CANNOT BE FUNDED, and that clause is the whole
-    lesson of 2026-08-16 06:47:48. CorridorGuard refused the seam staging on
+    IT DEFERS TO THE PURITY VALVE, and that clause is the whole lesson of two
+    live wedges. 2026-08-16 06:47:48: CorridorGuard refused the seam staging on
     two ranks with static numbers -- PP1 want 2163 MiB against 2456 free with
     an arming floor of 1536, PP2 want 2858 against 3560 -- because the staging
     a 4-carrier bundle needs EXCEEDS the floor that was supposed to guarantee
@@ -564,9 +556,24 @@ def prefill_suppressed_in_tp(
     the backlog drained slowly instead of not at all. An idle server with
     727004 tokens waiting is strictly worse than a slow one.
 
-    So the rule that hot fix 1 was built on applies here too -- a failure must
-    degrade to the fallback, never to a wedge. Once the seam has PROVED it
-    cannot be funded, the TP layout goes back to prefilling.
+    Then 07:02 said it again in a shape the first fix could not see. tp_to_pp
+    was not REFUSED, it was DELAYED: one rank withheld its entry-margin yield
+    on a predicted sub-law trough, and the withhold is deliberately exempt
+    from the stand-down cap, so "consecutive delayed attempts" climbed 15, 16,
+    17 with no exit while my fix watched a refusal counter that never moved.
+    A different counter, the same wedge.
+
+    SO THE QUESTION IS NOT "WAS IT REFUSED" BUT "IS PP REACHABLE". Drain
+    mode's premise is that prefill belongs in PP and should wait for PP; that
+    premise holds only while PP can be reached. ``flip_unavailable_reason``
+    already answers exactly this, over BOTH books -- the seam's own
+    ``_seam_abandons_in_a_row``, which delays DO advance, and the policy's
+    ``arm_refusals`` -- so both wedge shapes leave through one door.
+
+    ONE BOUND, NOT TWO. This replaces the threshold of my own that the first
+    fix introduced. Keying on the valve inherits its bound and its two books;
+    a second number would have been one more thing to tell the wrong state,
+    which is the entire failure mode of this chain.
 
     NOT A LATCH. ``arm_refusals`` is reset by the first successful arm, so an
     instance that recovers returns to the user's semantics by itself. This
@@ -578,7 +585,7 @@ def prefill_suppressed_in_tp(
     """
     if not bool(cfg.drain_mode) or phase != PHASE_TP:
         return False
-    if int(tp_arm_refusals) >= DRAIN_SUPPRESSION_YIELD_AFTER:
+    if flip_unavailable:
         return False
     return True
 
@@ -1757,7 +1764,6 @@ __all__ = [
     "PP_TO_TP",
     "TP_TO_PP",
     "prefill_suppressed_in_tp",
-    "DRAIN_SUPPRESSION_YIELD_AFTER",
     "REST_PREFILL",
     "REST_DECODE",
     "REST_STATES",
