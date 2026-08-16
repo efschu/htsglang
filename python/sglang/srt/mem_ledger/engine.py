@@ -1230,14 +1230,69 @@ def build_card_ledgers(
                     fingerprint=inputs.phase_footprint_fingerprint,
                 )
             )
+        elif "capture_mib" in measured:
+            # #605(c): MEASURED FROM THE NVML FREE DELTA, not the allocator's.
+            #
+            # The reserved-bytes delta across the same two marks is
+            # structurally blind to the private-pool component CUDA graphs
+            # take -- 184/182/182 MiB booked against an NVML free drop of
+            # 282/324/324 on this rig, so 98-142 MiB per card invisible to
+            # torch's books. An OOM here named that component directly ("71.21
+            # MiB allocated in private pools"). Both numbers are carried so
+            # the blindness stays visible.
+            #
+            # CONTAMINATION IS A PRECISION CAVEAT, NOT A SAFETY ONE: NVML free
+            # is card-wide, so a foreign process allocating during the capture
+            # window INFLATES this. That is an over-charge, which costs KV
+            # pool and never a boot -- the same direction that justifies the
+            # activation upper bound.
+            est = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks) * (
+                GRAPH_MIB_PER_CAPTURED_TOKEN
+            )
+            terms.append(
+                LedgerTerm(
+                    name=TERM_GRAPH_CAPTURE,
+                    mib=int(measured["capture_mib"]),
+                    provenance=Provenance.MEASURED,
+                    derivation=(
+                        "NVML free delta across this boot's own capture_begin "
+                        f"-> capture_end marks ({int(measured['capture_mib'])} "
+                        "MiB). The allocator's reserved delta over the same "
+                        f"window reads {int(measured.get('capture_reserved_mib', 0))} "
+                        "MiB and is blind to the graph private pools, which is "
+                        "why the driver's number is the one priced. The "
+                        f"captured-tokens x {GRAPH_MIB_PER_CAPTURED_TOKEN} MiB "
+                        f"estimate (~{est} MiB here) stays REJECTED, and the "
+                        "inherited '3.3-3.8x low' factor is WITHDRAWN as a "
+                        "cross-regime carry from the 2026-08-05 window: "
+                        "re-derived on this boot's own marks it is 1.5-1.7x"
+                    ),
+                    inputs=("flight_recorder marks",),
+                )
+            )
+        elif "capture_fault_mib" in measured:
+            # The driver cannot hand back less than the allocator took, so a
+            # NVML delta BELOW the reserved delta is an instrument fault, not
+            # a small capture. Refuse loudly rather than feed a number already
+            # known to be wrong.
+            unbounded.append(
+                f"{TERM_GRAPH_CAPTURE} on {card.name}: MEASUREMENT FAULT -- "
+                f"the NVML free delta across capture "
+                f"({int(measured['capture_fault_mib'])} MiB) reads BELOW the "
+                f"allocator's reserved delta "
+                f"({int(measured.get('capture_reserved_mib', 0))} MiB) on the "
+                "same window, which is physically impossible: the driver "
+                "cannot release less than the allocator took. The post is "
+                "refused for this boot rather than priced from a reading that "
+                "is already known to be wrong"
+            )
         else:
-            # REFUSAL, not the token estimate. The 2026-08-05 window measured
-            # that estimate 3.3-3.8x LOW (192 MiB booked against 633-730 MiB
-            # actually taken per rank), and an under-charge is the direction
-            # that OOMs a boot rather than merely costing KV. Keeping it as a
-            # fallback would mean the ledger's most dangerous term is also its
-            # least trustworthy one, silently, on any rig that has not been
-            # probed.
+            # REFUSAL, not the token estimate. An under-charge is the
+            # direction that OOMs a boot rather than merely costing KV, so the
+            # estimate is never a fallback. The factor quoted is re-derived
+            # per boot from the marks where they exist; the inherited
+            # "3.3-3.8x low" from the 2026-08-05 window is withdrawn as a
+            # cross-regime carry rather than repeated.
             est = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks) * (
                 GRAPH_MIB_PER_CAPTURED_TOKEN
             )
@@ -1249,8 +1304,13 @@ def build_card_ledgers(
                 "`ingest-boot-log` against a boot log that contains the "
                 "'Capture ... begin' lines. This term does NOT fall back to "
                 f"the captured-tokens x {GRAPH_MIB_PER_CAPTURED_TOKEN} MiB "
-                f"estimate (~{est} MiB here), which that window measured "
-                "3.3-3.8x low -- an under-charge is the direction that OOMs"
+                f"estimate (~{est} MiB here). That estimate is rejected "
+                "because it under-charges, and an under-charge is the "
+                "direction that OOMs; the size of the error is NOT quoted "
+                "from the 2026-08-05 window, whose 3.3-3.8x does not "
+                "reproduce on this configuration and is withdrawn as a "
+                "cross-regime carry. Arm the recorder "
+                "(SGLANG_VRAM_FLIGHT_DIR) and the post is measured instead"
             )
 
         # -- adaptive ladder, charged to exactly one GPU ---------------------

@@ -775,8 +775,9 @@ def measured_card_posts(
     as the model. The other layout's bytes are the seam's arena post and are
     not this term.
 
-    ``capture_mib`` is the first ``capture_begin -> capture_end`` reserved
-    delta. RECORDED, DELIBERATELY NOT FED, AND NOW KNOWN TO BE INCOMPLETE.
+    ``capture_mib`` is the CUDA-graph capture cost, taken as the NVML FREE
+    delta across the first ``capture_begin -> capture_end`` pair -- not the
+    reserved-bytes delta, which is structurally blind to part of it.
 
     Measured on this rig 2026-08-16, across the same two marks:
 
@@ -785,22 +786,30 @@ def measured_card_posts(
         3080                182 MiB           324 MiB       142 MiB
         3080                182 MiB           324 MiB       142 MiB
 
-    So the reserved-bytes delta IS structurally blind to part of the capture
-    cost -- the private-pool/driver-side component CUDA graphs take, which an
-    OOM on this rig named directly ("71.21 MiB allocated in private pools").
-    Feeding ``capture_mib`` would under-charge by ~100-140 MiB per card, and
-    an under-charge is the direction that OOMs.
+    The blindness is the private-pool component CUDA graphs take, which an OOM
+    on this rig named directly ("71.21 MiB allocated in private pools"). Both
+    numbers are kept -- ``capture_reserved_mib`` beside ``capture_mib`` -- so
+    that blindness stays visible to a future reader instead of becoming folk
+    knowledge.
 
-    THE PROBE DOES NOT NEED REPLACING; THE FIELD DOES. The honest quantity is
-    the NVML free delta across the same boundaries, which these marks already
-    record. It is not exposed here yet because the ledger's refusal also
-    carries an inherited "3.3-3.8x low" falsification that does NOT reproduce
-    on this configuration (estimate ~192 MiB against a measured 282-324, i.e.
-    1.5-1.7x low), so that figure has to be re-derived on this regime rather
-    than carried into a new term -- the same cross-regime transfer that cost
-    #678 a whole task. One caveat travels with the NVML reading: it is
+    THE STALE "3.3-3.8x LOW" IS WITHDRAWN, NOT SILENTLY REPLACED. That factor
+    belongs to the 2026-08-05 window and does not reproduce on this
+    configuration: the captured-tokens estimate reads ~192 MiB here against a
+    measured 282-324, i.e. 1.5-1.7x low. The estimate stays rejected -- an
+    under-charge is the direction that OOMs -- but the FACTOR is re-derived
+    from this boot's own marks rather than carried across a regime, which is
+    the transfer that cost #678 an entire task.
+
+    CONTAMINATION IS A PRECISION CAVEAT, NOT A SAFETY ONE. NVML free is
     card-wide, so a foreign process allocating during the capture window
-    inflates it.
+    inflates this reading. That is an OVER-charge, the same safe direction
+    that justifies the activation upper bound; it costs KV pool, never a boot.
+
+    ``capture_fault_mib`` appears INSTEAD of ``capture_mib`` when the NVML
+    delta reads BELOW the reserved delta on the same window. That is
+    physically impossible -- the driver cannot hand back less than the
+    allocator took -- so it is a measurement fault, and the caller must refuse
+    the post for that boot rather than feed a number known to be wrong.
 
     ``activation_upper_mib`` is an UPPER BOUND and never a point estimate:
     ``max(allocated_peak) over the serving samples - allocated at
@@ -854,14 +863,46 @@ def measured_card_posts(
                 opened = None
         return None
 
+    def _first_capture(marks):
+        """(reserved delta, NVML free drop) across the first real capture.
+
+        BOTH, because they measure different things and their difference is
+        the finding: the allocator's books versus what the driver actually
+        stopped being able to hand out. A capture that moved neither is the
+        no-op second round and is skipped.
+        """
+        opened = None
+        for m in marks:
+            phase = m.get("phase")
+            if phase == "capture_begin":
+                opened = m
+            elif phase == "capture_end" and opened is not None:
+                resv = int(m.get("reserved_bytes", 0)) - int(
+                    opened.get("reserved_bytes", 0)
+                )
+                nvml = int(opened.get("nvml_free_bytes", 0)) - int(
+                    m.get("nvml_free_bytes", 0)
+                )
+                if resv > 0 or nvml > 0:
+                    return resv, nvml
+                opened = None
+        return None
+
     for uuid, marks in boot_rows.items():
         card: Dict[str, int] = {}
         weights = _first_delta(marks, "pre_weight_load", "weights_loaded")
         if weights is not None:
             card["weights_mib"] = weights // MIB
-        capture = _first_delta(marks, "capture_begin", "capture_end")
-        if capture is not None:
-            card["capture_mib"] = capture // MIB
+        cap = _first_capture(marks)
+        if cap is not None:
+            resv_delta, nvml_delta = cap
+            card["capture_reserved_mib"] = resv_delta // MIB
+            if nvml_delta >= resv_delta:
+                card["capture_mib"] = nvml_delta // MIB
+            else:
+                # Physically impossible, so it is an instrument fault and not
+                # a small capture. Recorded so the refusal can quote it.
+                card["capture_fault_mib"] = nvml_delta // MIB
         resting = None
         for m in marks:
             if m.get("phase") == "boot_complete":

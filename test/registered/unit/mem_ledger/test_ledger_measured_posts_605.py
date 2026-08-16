@@ -53,7 +53,10 @@ MIB = 1 << 20
 CARD = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
 
 
-def _mark(phase, resv_mib, *, card=CARD, alloc_mib=None, peak_mib=None, wall=0.0):
+def _mark(
+    phase, resv_mib, *, card=CARD, alloc_mib=None, peak_mib=None, wall=0.0,
+    free_mib=0,
+):
     return {
         "phase": phase,
         "boot_id": "boot-1",
@@ -62,6 +65,7 @@ def _mark(phase, resv_mib, *, card=CARD, alloc_mib=None, peak_mib=None, wall=0.0
         "card_uuid": card,
         "reserved_bytes": resv_mib * MIB,
         "allocated_bytes": (alloc_mib if alloc_mib is not None else resv_mib) * MIB,
+        "nvml_free_bytes": free_mib * MIB,
         "reserved_peak_bytes": (peak_mib if peak_mib is not None else resv_mib) * MIB,
         "allocated_peak_bytes": (peak_mib if peak_mib is not None else resv_mib) * MIB,
     }
@@ -143,16 +147,57 @@ class TheWeightsPostIsReadFromTheMarks(_OnDisk):
 
 
 class TheCaptureAndActivationPosts(_OnDisk):
-    def test_the_capture_delta_is_reported_for_the_GATED_investigation(self):
-        """Recorded, but #605(c) keeps it OUT of the calibration store until
-        the 182-vs-'3.3-3.8x low' discrepancy is explained."""
+    def test_capture_is_priced_from_the_NVML_delta_not_the_allocators(self):
+        """#605(c): the reserved delta is blind to the graph private pools.
+
+        The running boot's 5090 numbers: reserved rose 184 MiB across the
+        capture while the driver's free column fell 282 MiB. The 98 MiB
+        difference is the component torch's books never saw, and an OOM on
+        this rig named it directly ("71.21 MiB allocated in private pools").
+        Both are kept so that blindness stays visible.
+        """
         self._write(
             [
-                _mark("capture_begin", 32006, wall=1.0),
-                _mark("capture_end", 32190, wall=2.0),
+                _mark("capture_begin", 32006, free_mib=5045, wall=1.0),
+                _mark("capture_end", 32190, free_mib=4763, wall=2.0),
             ]
         )
-        self.assertEqual(184, fr.measured_card_posts(self.dir)[CARD]["capture_mib"])
+        posts = fr.measured_card_posts(self.dir)[CARD]
+        self.assertEqual(282, posts["capture_mib"], "the fed number is the driver's")
+        self.assertEqual(184, posts["capture_reserved_mib"], "and the blind one stays")
+
+    def test_an_impossible_reading_is_a_FAULT_and_is_not_fed(self):
+        """The driver cannot release less than the allocator took, so a NVML
+        delta below the reserved delta is an instrument fault -- refused
+        loudly for that boot rather than priced from a known-wrong number."""
+        self._write(
+            [
+                _mark("capture_begin", 32006, free_mib=5045, wall=1.0),
+                _mark("capture_end", 32190, free_mib=5000, wall=2.0),
+            ]
+        )
+        posts = fr.measured_card_posts(self.dir)[CARD]
+        self.assertNotIn("capture_mib", posts)
+        self.assertEqual(45, posts["capture_fault_mib"])
+        self.assertEqual(184, posts["capture_reserved_mib"])
+
+    def test_a_boot_without_the_capture_pair_prices_nothing(self):
+        """No pair, no number -- the engine must post UNBOUNDED loudly."""
+        self._write([_mark("capture_begin", 32006, free_mib=5045, wall=1.0)])
+        self.assertNotIn("capture_mib", fr.measured_card_posts(self.dir).get(CARD, {}))
+
+    def test_the_no_op_second_capture_round_is_skipped(self):
+        """A flip boot captures twice; the second moves neither number and
+        must not be taken as a zero-cost capture."""
+        self._write(
+            [
+                _mark("capture_begin", 32006, free_mib=5045, wall=1.0),
+                _mark("capture_end", 32190, free_mib=4763, wall=2.0),
+                _mark("capture_begin", 32190, free_mib=4763, wall=3.0),
+                _mark("capture_end", 32190, free_mib=4763, wall=4.0),
+            ]
+        )
+        self.assertEqual(282, fr.measured_card_posts(self.dir)[CARD]["capture_mib"])
 
     def test_the_activation_envelope_needs_serving_marks(self):
         """Boot marks stop at first_forward, so they cannot bound activation
