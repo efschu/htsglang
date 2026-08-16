@@ -2527,3 +2527,155 @@ def solve_prefill_cut_tradeoff(
         )
     out.sort(key=lambda c: -c.pipelined_speedup)
     return out if top is None else out[: int(top)]
+
+
+# ---------------------------------------------------------------------------
+# #704 -- the token-scaling term lives on ATTENTION layers only.
+#
+# `PhasePoolModel` above prices a rank's capacity as
+# `free_i / (layers_i * flat_cost)` over the rank's TOTAL layer count. That
+# form is calibrated -- it reproduces the incumbent and backtests the
+# [42,11,11] OOM -- but it is dimensionally wrong, and a contiguous cut hides
+# the error by correlating attention count with layer count.
+#
+# The allocator settles it. `HybridLinearKVPool` builds its token-indexed pool
+# with `layer_num=self.full_layer_nums`, i.e. only the full-attention layers
+# (`mem_cache/memory_pool.py:3609` sets `full_layer_nums`, consumed at `:3687`).
+# The linear (GDN) layers are served by `MambaPool`, sized by the SEQUENCE
+# count. So a rank's token-scaling footprint is
+#
+#     max_total_tokens * attn_layers_i * kv_per_token_per_attn_layer
+#
+# and its linear layers contribute a token-INDEPENDENT term that subtracts,
+# never divides.
+#
+# The arithmetic that makes this a proof rather than a preference: with
+# num_key_value_heads=4 and head_dim=256, one token of K+V for one attention
+# layer is 2*4*256 = 2048 elements. The flat rule's calibrated cost is 960
+# bytes per token per layer -- 0.47 bytes per element, and no dtype has a
+# fractional byte width. Priced on attention layers the same census yields
+# 4096 B (bf16) to within its own known pessimism.
+#
+# Both forms agree on total bytes per token, since both are fitted to the same
+# observed pool. They disagree on the DISTRIBUTION across ranks, which is the
+# only thing a cut solver produces.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyPoolModel:
+    """Per-rank memory facts with the hybrid layer families kept apart.
+
+    ``free_mib`` is free memory BEFORE layer weights are placed.
+    ``mamba_mib_per_linear_layer`` is the GDN state cost for the configured
+    max sequence count -- token-INDEPENDENT, so it subtracts from free memory
+    rather than entering the denominator.
+    """
+
+    free_mib: Tuple[float, ...]
+    weight_mib_per_layer: float
+    kv_mib_per_token_per_attn_layer: float
+    layer_families: Tuple[str, ...]
+    mamba_mib_per_linear_layer: float = 0.0
+
+    def attn_per_stage(self, counts: Sequence[int]) -> Tuple[int, ...]:
+        return attention_counts(self.layer_families, counts)
+
+
+def stage_family_capacities(
+    counts: Sequence[int], model: FamilyPoolModel
+) -> Tuple[float, ...]:
+    """Per-rank PP-phase token capacity, priced on attention layers only."""
+    if int(sum(counts)) != len(model.layer_families):
+        raise ValueError(
+            f"cut {tuple(counts)} sums to {int(sum(counts))} layers but the "
+            f"family table describes {len(model.layer_families)}."
+        )
+    attn = model.attn_per_stage(counts)
+    caps: List[float] = []
+    for r, n in enumerate(counts):
+        n = int(n)
+        if n <= 0:
+            raise ValueError(f"rank{r} holds {n} layers; a PP stage needs at least 1.")
+        if attn[r] <= 0:
+            # Refused rather than priced as infinite: a stage with no attention
+            # layer has no token-scaling term, and reporting unbounded capacity
+            # for it is how a cut that cannot run gets armed.
+            raise ValueError(
+                f"cut {tuple(counts)} gives rank{r} {n} layers but ZERO "
+                "full-attention layers, so it has no token capacity to price. "
+                "The world pool would be reported as bounded by the other "
+                "ranks alone, which is not a pool this stage can serve."
+            )
+        linear = n - attn[r]
+        free = (
+            float(model.free_mib[r])
+            - float(model.weight_mib_per_layer) * n
+            - float(model.mamba_mib_per_linear_layer) * linear
+        )
+        if free < 0.0:
+            raise ValueError(
+                f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers need "
+                f"{float(model.weight_mib_per_layer) * n:,.1f} MiB of weights "
+                f"plus {float(model.mamba_mib_per_linear_layer) * linear:,.1f} "
+                f"MiB of GDN state against "
+                f"{float(model.free_mib[r]):,.1f} MiB free, i.e. "
+                f"{-free:,.1f} MiB short."
+            )
+        caps.append(free / (attn[r] * float(model.kv_mib_per_token_per_attn_layer)))
+    return tuple(caps)
+
+
+def family_phase_pool(
+    counts: Sequence[int], model: FamilyPoolModel, **forbidden
+) -> float:
+    """PP-phase pool bound under the family split: the MIN over ranks.
+
+    Takes no KV-token-vector argument, for the same reason ``pp_phase_pool``
+    does not: under PP the pool is layer-sharded and the vector cannot relieve
+    a tight rank (#702, proven on metal).
+    """
+    if forbidden:
+        raise TypeError(
+            "family_phase_pool takes no KV-token-vector argument. Under PP "
+            "prefill the pool is LAYER-sharded, so rank r stores KV for all "
+            "tokens for its own attention layers and the token vector does not "
+            f"enter. Refused: {sorted(forbidden)}"
+        )
+    return min(stage_family_capacities(counts, model))
+
+
+def decoupled_phase_pool(counts: Sequence[int], model: FamilyPoolModel) -> float:
+    """#704 part B: the pool once attention KV is token-sharded across ranks.
+
+    With the attention layers' KV distributed by free bytes instead of pinned
+    to the layer owner, a rank's token-scaling footprint stops depending on
+    which layers it holds. Every rank then carries a share of ALL attention
+    layers, so the bound is the SUM of per-rank capacities priced over the
+    world's attention layers -- and it is independent of the cut.
+
+    This is the quantity that makes the layout ladder walkable: under
+    ``family_phase_pool`` the pool collapses as the cut deepens, so speed and
+    capacity oppose; here it does not move, so the cut axis is free.
+    """
+    total_attn = sum(1 for f in model.layer_families if f == LAYER_FAMILY_ATTENTION)
+    if total_attn <= 0:
+        raise ValueError("no full-attention layers: there is no KV pool to shard.")
+    attn = model.attn_per_stage(counts)
+    per_token = total_attn * float(model.kv_mib_per_token_per_attn_layer)
+    total = 0.0
+    for r, n in enumerate(counts):
+        n = int(n)
+        linear = n - attn[r]
+        free = (
+            float(model.free_mib[r])
+            - float(model.weight_mib_per_layer) * n
+            - float(model.mamba_mib_per_linear_layer) * linear
+        )
+        if free < 0.0:
+            raise ValueError(
+                f"cut {tuple(counts)} is infeasible on rank{r} before any KV is "
+                f"placed: {-free:,.1f} MiB short on weights and GDN state."
+            )
+        total += free / per_token
+    return total
