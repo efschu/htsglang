@@ -527,6 +527,25 @@ def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
     return max(PROGRESS_STALL_CHUNKS * (chunk / rate), floor)
 
 
+def prefill_suppressed_in_tp(cfg: "PhasePolicyConfig", phase: str) -> bool:
+    """#677 hot fix 2: may prefill be admitted while the TP layout is up?
+
+    Under drain mode, no. The TP window exists to finish a decode bundle, and
+    prefill admitted into it competes with exactly the work the window was
+    entered for -- measured as visible "Prefill batch" lines inside TP while
+    carriers went unfinished across repeated flips.
+
+    CARDS PARTIALLY IDLE DURING TP IS ACCEPTED, deliberately, and is the
+    user's stated model: the alternative measured worse, because a bundle that
+    never finishes costs a whole extra round trip and returns the same
+    carriers.
+
+    False for every phase but TP, and False everywhere when drain mode is off,
+    so a deployment that has not opted in is byte-identical.
+    """
+    return bool(cfg.drain_mode) and phase == PHASE_TP
+
+
 def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
     """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
 
@@ -771,6 +790,11 @@ class PhasePolicyConfig:
     #: Drained threshold for the PP phase, in tokens. Set from the scheduler's
     #: real chunked_prefill_size at boot; see ENV_PP_EXIT_TOKENS for why this
     #: is emphatically not flip_tokens.
+    #: #677 hot fix 2: the user's target semantics -- prefill until empty,
+    #: decode the bundle TO COMPLETION, then prefill again. Off by default, and
+    #: every rule it gates is byte-identical to the previous behaviour until it
+    #: is set, so no existing deployment moves.
+    drain_mode: bool = False
     pp_exit_tokens: int = DEFAULT_PP_EXIT_TOKENS
     #: The scheduler's chunked_prefill_size, filled in at boot. Drives the
     #: seam staging estimate below.
@@ -909,6 +933,10 @@ class PhasePolicyState:
     #: What pending was at the previous observation, so a DECREASE can be
     #: recognised. Compared, never trusted as a level.
     last_pending_prefill_tokens: Optional[int] = None
+    #: #677 hot fix 2: how many requests were decoding when this TP window
+    #: opened, so the exit receipt can name the BUNDLE it finished rather than
+    #: only the instant it ended. Set by ``observe_idle`` at the phase change.
+    bundle_at_phase_entry: int = 0
     #: Cutovers that actually MOVED BYTES. Distinct from ``flips_armed`` on
     #: purpose: boot E armed 179 flips and completed none, and every summary
     #: that read the arm count called that instance healthy.
@@ -1130,6 +1158,40 @@ def _decide_from_load(
                 f"{inp.running_bs} req decoding: flipping would strand them "
                 f"in pp for a {cfg.pp_window_s:g}s window"
             )
+        if cfg.drain_mode and inp.pending_prefill_tokens > cfg.pp_exit_tokens:
+            # #677 HOT FIX 2: THE BUNDLE IS FINISHED BEFORE THE LAYOUT MOVES.
+            #
+            # Measured live: `arming tp_to_pp: pending > N=7004` fired with
+            # running bs 2-3, cutting a decode bundle in half -- and under
+            # purity the backlog is ALWAYS above N, so that rule cannot be a
+            # reason to leave without meaning "never finish anything". Five
+            # blocked-admission exits in one boot were the same carriers
+            # coming back unfinished, window after window.
+            #
+            # The user's semantics: prefill until empty, decode the bundle to
+            # completion, prefill again. So the backlog stops being an exit
+            # condition here and BS==0 becomes one. The min-dwell, the decode
+            # floor, the 180s cap and the #677a progress exit are all
+            # untouched underneath -- this changes what ends a HEALTHY window,
+            # never what rescues a broken one.
+            if inp.running_bs > 0:
+                return _no(
+                    f"decode bundle running: {inp.running_bs} of "
+                    f"{max(state.bundle_at_phase_entry, inp.running_bs)} req "
+                    f"still decoding, {inp.pending_prefill_tokens} tok prefill "
+                    f"waiting -- drain mode finishes the bundle before flipping"
+                )
+            in_phase = (
+                None if state.phase_since is None else inp.now - state.phase_since
+            )
+            bundle = max(state.bundle_at_phase_entry, 0)
+            return PhasePolicyDecision(
+                TP_TO_PP,
+                f"decode bundle complete: {bundle} reqs decoded in "
+                f"{0.0 if in_phase is None else in_phase:.1f} s "
+                f"({inp.pending_prefill_tokens} tok prefill waiting) -- exit "
+                f"condition: decode drained",
+            )
         if inp.pending_prefill_tokens > tp_threshold:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
@@ -1341,6 +1403,9 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
         # last one.
         state.last_prefill_progress_at = inp.now
         state.last_pending_prefill_tokens = None
+        # #677 hot fix 2: the bundle this window inherits. Recorded at the
+        # boundary because by the time it drains there is nothing left to count.
+        state.bundle_at_phase_entry = int(inp.running_bs)
     # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
     # frozen at a value while every slot is held by a carried decode, so the
     # observable that separates it from a slow drain is whether the backlog
@@ -1512,6 +1577,15 @@ def _env_float(name: str, default: float) -> float:
         raise PhasePolicyError(f"{name}={raw!r} is not a number") from exc
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """A boolean knob. Unset keeps the default, which for every flag added
+    after a deployment exists must be the deployment's current behaviour."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -1520,6 +1594,12 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise PhasePolicyError(f"{name}={raw!r} is not an integer") from exc
+
+
+#: #677 hot fix 2: opt in to "prefill until empty, decode the bundle to
+#: completion, prefill again". Off unless set, so no deployment moves without
+#: asking for it.
+ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
 
 
 def config_from_env(
@@ -1573,6 +1653,7 @@ def config_from_env(
 
     cfg = PhasePolicyConfig(
         enabled=enabled,
+        drain_mode=_env_flag(ENV_DRAIN_MODE, False),
         flip_tokens=flip_tokens,
         min_dwell_s=min_dwell,
         idle_dwell_s=idle_dwell,
@@ -1638,6 +1719,7 @@ __all__ = [
     "PHASE_TP",
     "PP_TO_TP",
     "TP_TO_PP",
+    "prefill_suppressed_in_tp",
     "REST_PREFILL",
     "REST_DECODE",
     "REST_STATES",
