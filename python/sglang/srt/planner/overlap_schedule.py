@@ -161,3 +161,77 @@ def solve_overlap(
         worst_pipelined_ms=worst_p,
         worst_stage_no_pipeline=worst_i,
     )
+
+
+# ---------------------------------------------------------------------------
+# Link bandwidth binds to CARD IDENTITY, never to a rank index.
+#
+# This exists because getting it wrong cost a whole analysis. An earlier
+# revision assumed "rank0 is on the x4 link" and concluded a triple jeopardy:
+# rank0 carries the most attention layers, has the least compute to hide behind,
+# AND sits on the slowest link. The authoritative mapping is the opposite -- the
+# 5090 is on x8, one 3080 is on x8, the other 3080 is on x4 -- and with it the
+# worst-rank exposure falls roughly fourfold and the "triple jeopardy" dissolves.
+#
+# Torch device order and NVML order diverge on this rig, so a rank index is not
+# a card. The canon is registry/nvml.py's IdentityMap / CardIdentity (uuid,
+# pci_bus_id, name, total_mib). A caller must therefore hand over a rank->UUID
+# mapping explicitly; there is no positional shortcut, because the positional
+# shortcut is the bug.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class CardLink:
+    """Measured host-link reach of ONE physical card, keyed by identity."""
+
+    uuid: str
+    pci_bus_id: str
+    name: str
+    total_mib: int
+    lanes: int
+    host_mib_per_s: float
+    #: Provenance. False means estimated, and every number derived from it
+    #: inherits that label rather than quietly becoming a measurement.
+    measured: bool
+
+    def __post_init__(self) -> None:
+        if not self.uuid:
+            raise OverlapScheduleError(
+                "a CardLink without a UUID cannot be bound to a card; a rank "
+                "index is not an identity (torch and NVML order diverge here)."
+            )
+        if self.host_mib_per_s <= 0.0:
+            raise OverlapScheduleError(f"{self.uuid}: non-positive link reach.")
+
+
+def links_for_stages(
+    stage_card_uuids: Sequence[str], profile: Sequence[CardLink]
+) -> tuple[float, ...]:
+    """Resolve per-stage link reach through card identity.
+
+    ``stage_card_uuids[i]`` is the NVML UUID of the card stage ``i`` runs on.
+    Refuses an unknown UUID rather than falling back to a positional guess:
+    a wrong card-to-link binding does not fail loudly, it just produces a
+    confident and wrong schedule -- which is exactly what happened once.
+    """
+    by_uuid = {c.uuid: c for c in profile}
+    if len(by_uuid) != len(profile):
+        raise OverlapScheduleError("the link profile lists a UUID twice.")
+    out: list[float] = []
+    for i, uuid in enumerate(stage_card_uuids):
+        card = by_uuid.get(uuid)
+        if card is None:
+            raise OverlapScheduleError(
+                f"stage {i} runs on card {uuid!r}, which is not in the link "
+                f"profile {sorted(by_uuid)}. Refusing to guess its link: "
+                "binding link data by position is how a 4x-too-pessimistic "
+                "schedule got published."
+            )
+        out.append(float(card.host_mib_per_s))
+    return tuple(out)
+
+
+def all_measured(profile: Sequence[CardLink]) -> bool:
+    """True only if EVERY card's reach is measured; else results are estimates."""
+    return all(c.measured for c in profile)

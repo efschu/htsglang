@@ -720,19 +720,29 @@ window. This is the same discipline already applied to the arming floor
 (§3.3's ±32,000-token uncertainty on unbooted rungs) — one more term with the
 same provenance problem.
 
-**The consequence that is not yet modelled, and it connects to §3.11.** If the
-reserve tracks CUDA-graph capture, and a rung change forces recapture (§3.11a),
-then **a rung change changes the reserve**, and therefore changes the pool — by
-a quantity my ladder currently treats as constant across rungs. At 3.48–6.53 GiB
-per rank the reserve is far too large to assume away. This does not affect the
-weights or KV movement results (both remain zero), but it does mean a rung's
-pool is not simply its free-memory arithmetic.
+**The consequence, and the premise behind it has since been refuted.** I
+reasoned: *if* the reserve tracks CUDA-graph capture, and a rung change forces
+recapture (§3.11a), *then* a rung change changes the reserve and therefore the
+pool — a term my ladder treats as constant across rungs, and at 3.48–6.53 GiB
+per rank far too large to assume away.
 
-Needed, in order: a reserve-versus-layout model (does it scale with layers per
-rank, with captured graph count, or with neither?), and until one exists, every
-extrapolated rung pool in this document carries an unquantified reserve term on
-top of its arming-floor uncertainty. Raised with Slot-2 as the natural owner of
-the pool model; it is his refusal message that identifies the term.
+> **Refuted (Slot-2, `f55c1a8adf`).** The per-rank holdback is **not** a
+> CUDA-graph-capture reserve. It is the delta across `_seam_adjusted_budget` —
+> a **seam adjustment**. The "reserve tracks graph capture" premise came from
+> the refusal message itself, and it is wrong; that is why every scaling
+> hypothesis against it misfit.
+>
+> This is good news twice over. The graph-recapture coupling I feared does not
+> exist, so §3.11a's recapture requirement does **not** drag a pool change
+> behind it. And because seam funding is deterministic machinery (#676 arming
+> floors, seam projection) rather than an empirical property of graph capture,
+> the term is likely **computable per layout rather than needing a fitted
+> model** — which would make ladder rung pools *exact* instead of extrapolated.
+
+Until the confirming boot lands, every extrapolated rung pool in this document
+keeps its **unquantified reserve term** on top of its arming-floor uncertainty,
+self-labelled, with **no interim value folded into any number**. Slot-2 owns the
+formula and a follow-up is expected once the boot confirms the form.
 
 ### 3.10 Slice 1a-i — what the timing pair can and cannot pin
 
@@ -951,9 +961,22 @@ same 385.5 MiB against a 320 ms serial chunk is:
 |---|---|---|
 | 12,000 MiB/s | 32.1 ms | +10.0% |
 | 6,000 MiB/s | 64.2 ms | +20.1% |
-| **3,000 MiB/s** (rank0 PCIe x4 class) | **128.5 ms** | **+40.2%** |
+| **3,000 MiB/s** (assumed rank0 PCIe x4 class) | **128.5 ms** | **+40.2%** |
 
-So on this rig it is **+40% raw**, not +10-20%.
+> **WITHDRAWN (E5). The +40% row assumed the wrong card on the x4 link.**
+> The authoritative mapping (user, 2026-08-17) is: **the 5090 is on x8, one
+> 3080 on x8, the other 3080 on x4.** rank0 is the 5090 — it is the card
+> measuring 1.757 ms/layer against the 3080s' 7.74/7.28 — so **rank0 is on
+> x8**, and the 3,000 MiB/s row never applied to it. On measured links
+> (x8 = 13 GB/s, x4 = 6.4 GB/s) the real overhead is **+6.3% to +27.5%**
+> across the ladder (§4.2e), which makes the canonical plan's original
+> "+10-20%" approximately right in mid-ladder and my "+40%" an artifact of a
+> placeholder bound to a **rank index instead of a card identity**.
+>
+> The lesson generalises past this number: link data attached to a rank is not
+> attached to anything, because torch device order and NVML order diverge on
+> this rig. `overlap_schedule.CardLink` now keys reach by NVML UUID and PCI
+> BDF and **refuses an unknown card rather than guessing positionally**.
 
 > **Corrected (§4.2e).** This paragraph originally continued "the overlap
 > argument is unchanged — there are 48 GDN layers of compute to hide behind".
@@ -1013,30 +1036,132 @@ time *is* the gather time — not a fraction of it, all of it.
 The only thing that hides the dominant term is **cross-chunk pipelining**:
 overlapping chunk *c*'s gather with chunk *c+1*'s compute inside the same
 stage, bounded by that stage's own per-chunk compute. It does not exist today.
-What building it would buy, worst-rank exposed collective time per chunk:
+**On MEASURED links and the authoritative card mapping** (x8 = 13 GB/s,
+x4 = 6.4 GB/s; 5090 on x8, one 3080 on x8, the other 3080 on x4), overhead on
+the pipelined chunk cost — `max_i(compute_i + exposed_i)` against
+`max_i(compute_i)`:
 
-| cut | link (rank0) | exposed today | exposed with pipelining |
-|---|---|---|---|
-| `[28,20,16]` | x4 class (3,000 MiB/s) | **56.2 ms** | **7.0 ms** |
-| `[28,20,16]` | x8 class (6,000) | 28.1 ms | 0.0 ms |
-| `[44,10,10]` | x4 class | **88.3 ms** | **11.0 ms** |
-| `[44,10,10]` | x8 class | 44.2 ms | 0.0 ms |
+| cut | compute only | with gather | overhead | with pipelining |
+|---|---|---|---|---|
+| `[28,20,16]` | 154.8 ms | 164.5 | **+6.3%** | +0.0% |
+| `[32,16,16]` | 123.8 | 132.2 | +6.7% | +0.0% |
+| `[35,14,15]` | 109.1 | 124.9 | +14.5% | +0.0% |
+| `[38,13,13]` | 100.6 | 110.4 | +9.7% | +0.0% |
+| `[41,11,12]` | 87.3 | 99.1 | +13.6% | +0.0% |
+| `[44,10,10]` | 77.4 | 98.7 | **+27.5%** | +0.0% |
 
-So the mitigation is worth roughly **8x** on the worst rank, and a link one
-class faster removes the exposure outright — the problem is bandwidth *and*
-scheduling, and either lever alone suffices at the incumbent.
+**Cross-chunk pipelining removes the exposure entirely at every rung**, because
+each stage's own per-chunk compute (49–155 ms shallow, 72–77 ms deep) far
+exceeds its gather (4–21 ms). But the quantity removed is **15.8–21.4 ms**, not
+the 56–88 ms the refuted mapping implied — so it is a **deep-cut enabler, not
+an incumbent necessity**: worth +27.5% at `[44,10,10]` and only +6.3% at the
+incumbent.
 
-**rank0 is the worst stage under triple jeopardy**, and the three disadvantages
-coincide rather than cancel: it carries the most attention layers, it has the
-least compute to hide behind (it is the fast card), and it sits on the slowest
-link. Deepening the cut worsens both sides at once — more attention layers onto
-exactly that rank.
+> **Correction (E5): the "triple jeopardy" framing was wrong.** An earlier
+> revision here read: *"rank0 is the worst stage under triple jeopardy — most
+> attention layers, least compute to hide behind, and the slowest link."* The
+> third disadvantage does not exist. rank0 is the 5090 and the 5090 is on x8,
+> so the worst-rank exposure falls roughly fourfold and the deep cut stops
+> looking unaffordable. Kept as `test_the_triple_jeopardy_framing_was_wrong`
+> so it cannot be re-derived. The real lesson is not about links: **link data
+> bound to a rank index rather than a card identity produced a confident,
+> wrong analysis**, and torch/NVML order diverge on this rig.
 
-Self-labelled: the link figures are **placeholders** pending the pair-matrix
-probe, and stage compute away from the incumbent is **extrapolated** with
-`fixed_ms = 0`, which is the optimistic end for hiding (a real fixed per-stage
-cost would mean less compute at deep cuts, hence less to hide behind). Every
-"hidden" verdict above is therefore an upper bound on how much hides.
+**The placement rule, and its limit.** Putting the x4 card under the stage with
+the *fewest attention layers* is worth a few ms **only while that stage binds**
+— at the incumbent, 15.8 ms versus 19.7 ms for the wrong choice. By
+`[38,13,13]` and deeper the **5090 binds on its own attention concentration**
+(11 of 16 layers at `[44,10,10]`) whichever 3080 is slow, and the placement
+choice stops mattering: both assignments give an identical 21.4 ms. So the rule
+is real but shallow-rung-only, and it cannot be satisfied at both ends at once
+— the fewest-attention stage is rank2 at the incumbent and rank1 at the deep
+cut, while cards cannot be re-slotted at runtime.
+
+Still self-labelled: stage compute away from the incumbent is **extrapolated**
+with `fixed_ms = 0`, the optimistic end for hiding, so every "hidden" verdict is
+an upper bound. Which *physical* 3080 sits on x4 remains to be resolved by
+PCI-BDF/NVML identity — it is worth ~4 ms at shallow rungs and nothing at deep
+ones, so it is low-stakes but must still be answered by identity, not by
+ordinal.
+
+### 4.2g CROSS-CHUNK PIPELINING DESK SPEC — the exposure lever
+
+Written against the code, no changes made. Removes 15.8–21.4 ms of exposure per
+chunk (§4.2e), i.e. +27.5% at `[44,10,10]` and +6.3% at the incumbent — a
+**deep-cut enabler, not an incumbent necessity**, which is how it should be
+ranked against other work.
+
+**Why it is the only lever left.** Within one chunk the gather cannot hide:
+layer L+1 consumes layer L's attention output. The only independent work
+available is the *next chunk*, whose layers 0…L−1 do not depend on chunk N at
+all once the previous PP stage has delivered its activations.
+
+**Schedule.** Interleave two chunks at attention-layer granularity. When chunk N
+reaches attention layer L it issues its Q-broadcast and posts the gather on a
+side stream; the stage then advances chunk N+1 until *it* reaches an attention
+layer; then it returns to collect chunk N's merge. Steady state keeps exactly
+two chunks resident and one gather in flight, which is sufficient — the gather
+(4–21 ms) is smaller than a stage's per-chunk compute (49–155 ms shallow,
+72–77 ms deep), so one chunk of lookahead already covers it. Deeper lookahead
+buys nothing and costs buffers.
+
+**Buffers and staging** (per stage, small): two hidden-state buffers and two
+residual buffers at `512 × 5120 × 2 B` = 5 MiB each, plus per-in-flight-gather
+Q/output staging at 6 MiB each — roughly **32 MiB total**, negligible against a
+GiB-scale pool. This is a scheduling change, not a memory one.
+
+**Interaction with the captured-graph route.** §3.11a established that a CUDA
+graph bakes the executed layer *set*; a graph also bakes the launch *sequence*,
+and an interleaved two-chunk schedule is a different sequence than a
+single-chunk pass. So a graph captured for the single-chunk pass **cannot
+replay** an interleaved one. Prefill already runs the **breakable** route
+(`model_executor/runner_backend/breakable_cuda_graph_backend.py`), which exists
+to be interrupted, and its replays already register with the abort gate
+(`:462`, `barlink_abort_gate.note_replay("breakable", shape_key)`). The
+attention layers are the natural break points, so the breakable route is the
+host for this and the full-graph decode route is untouched.
+
+**The 512-token chunk boundary.** Pipelining needs a successor chunk, so it
+covers every chunk of a prompt except the last. A max-length prompt is 640
+chunks, so 639 hide and one is exposed — immaterial. A **single-chunk prompt
+gets no benefit at all**, which is worth stating because short-prompt latency is
+exactly where an overhead is most visible.
+
+**Failure and abort semantics — the sharpest constraint.** The existing
+contract (`managers/scheduler.py:3821-3834`) is that `abort_request` only
+*records* the target in `_pending_chunked_abort_req` because tearing down
+mid-iteration is unsafe; `process_pending_chunked_abort` then clears
+`chunked_req` at the top of the step so the **next** chunk does not launch,
+while the **already-launched** chunk drains as its result resolves. The
+docstring notes that under overlap the result lands a step later and
+`inflight_middle_chunks` accounting keeps it straight. Cross-chunk pipelining
+widens that window from one launched item to two, with three consequences:
+
+1. **A collective cannot be aborted unilaterally.** The gather spans ranks, so a
+   rank that skips it leaves its peers blocked in the collective — an abort
+   becomes a hang. Abort must therefore be *collective-safe*: either every rank
+   aborts at the same chunk boundary, or the in-flight gather is allowed to
+   complete before teardown. The second is simpler and bounded by one gather
+   (≤21 ms). `barlink_abort_gate.check_aborts` is the existing place that
+   polices exactly this class.
+2. **KV and metadata must not be freed under an in-flight gather.** Chunk N's
+   rows may still be read by a peer computing its partial; releasing them
+   (`release_kv_cache`, `maybe_release_metadata_buffer`) before the gather
+   resolves is a use-after-free that would surface as wrong numbers, not a
+   crash.
+3. **`inflight_middle_chunks` accounting must count the deeper window**, or the
+   drain bookkeeping under-counts by one and the aborted chunk is either double
+   -dropped or never dropped.
+
+**It invalidates the stage-1 timing calibration, and that ordering matters.**
+§3.10 solves the per-layer slope and fixed per-stage intercept from measured
+per-chunk stage times, which assumes a chunk's wall time *is*
+`fixed + slope × layers`. Under pipelining a chunk's wall time includes
+overlapped work from its neighbour and becomes a steady-state throughput
+figure instead. **So slice 1a-i must be measured with pipelining OFF**, or the
+solve is fitting a different quantity — and since 1a-i is the boot that converts
+every speedup in this document from an upper bound into a prediction, that
+ordering is not negotiable: calibrate first, pipeline second.
 
 ### 4.2f B1 DESK SPEC — the cross-PP-stage group
 
