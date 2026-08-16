@@ -2536,7 +2536,10 @@ class PhaseFlipRuntime:
         #: costs nothing. Flip latency at 16 is +4% against the floor arm,
         #: inside the spread between ranks.
         #:
-        #: INERT WITHOUT A COMMIT CHUNK, which is still off by default:
+        #: LIVE SINCE #688: the commit chunk now defaults to 8 MiB, so these
+        #: blocks are reached in a default boot. Priced under load at
+        #: 216-377 MiB per rank saved (memory_pool._alloc_post_capture_buffers
+        #: carries the table). Formerly inert:
         #: ``_effective_row_blocks`` mirrors ``_execute``'s gate and returns
         #: 1 when the arena cannot do span ops, so a default boot is
         #: unchanged. Pair this with ``SGLANG_FLIP_SEAM_CHUNK_MIB=16``; that

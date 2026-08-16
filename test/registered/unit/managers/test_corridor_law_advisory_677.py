@@ -97,3 +97,43 @@ class OomIsStillHard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheSeamCommitChunkDefaultIsArmed(unittest.TestCase):
+    """#688: the row-blocking machinery must be reachable in a default boot.
+
+    IT WAS NOT. `SGLANG_FLIP_SEAM_CHUNK_MIB` defaulted to 0, and
+    `_effective_row_blocks` returns 1 when the arena cannot do span ops -- so
+    the shipped 16-block default was unreachable in every fresh deployment.
+    This rig only ever exercised row-blocking because its operator env carried
+    `SGLANG_FLIP_SEAM_CHUNK_MIB=8` by hand, which is also what made the first
+    attempt to price it come out as "no effect": that A/B was 8 against 16,
+    both above the arena chunk floor, and it measured nothing because there
+    was nothing between them to measure.
+
+    Priced properly at 0 against 16 on 7b706e8b89, same argv, same load, at
+    matched live-slot counts: 216-377 MiB per rank saved, as a CONSTANT offset
+    rather than a slope, with corridor law warnings falling 6 -> 3 over the
+    same work. That is the same order as the margin the 06:47:48 wedge was
+    short by.
+    """
+
+    def test_the_default_is_no_longer_zero(self):
+        import inspect as _inspect
+
+        from sglang.srt.mem_cache import memory_pool
+
+        src = _inspect.getsource(memory_pool.MHATokenToKVPool._alloc_post_capture_buffers)
+        self.assertIn('"SGLANG_FLIP_SEAM_CHUNK_MIB", "8"', src)
+        self.assertNotIn('"SGLANG_FLIP_SEAM_CHUNK_MIB", "0"', src)
+
+    def test_the_measurement_travels_with_the_default(self):
+        """A default whose provenance is not written down gets reverted by the
+        next person who reads the old 'defaults to 0' comment."""
+        import inspect as _inspect
+
+        from sglang.srt.mem_cache import memory_pool
+
+        src = _inspect.getsource(memory_pool.MHATokenToKVPool._alloc_post_capture_buffers)
+        self.assertIn("MEASURED UNDER LOAD", src)
+        self.assertIn("1438.25", src)
