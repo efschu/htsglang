@@ -4983,6 +4983,9 @@ class PhaseFlipRuntime:
                 return int(free_dev), int(max(0, cached_free))
 
         reserve = self._staging_reserve_bytes
+        # Remembered for the ABANDONED census, which runs later and otherwise
+        # has no way to quote the figure the refusal was about.
+        self._last_staging_bytes = int(staging_bytes)
         driver_free, cached_free = probe()
         from_driver = max(0, driver_free - reserve)
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
@@ -5182,8 +5185,25 @@ class PhaseFlipRuntime:
             f"staging reserve kept free {q(lambda: self._staging_reserve_bytes)}",
             f"seam fixed {q(lambda: res.fixed_bytes)}",
             f"INACTIVE-LAYOUT ARENA {q(lambda: res.arena_fixed_bytes)}",
+            f"reserve active={getattr(res, 'active', '?')}",
             f"corridor floor {q(lambda: guard.floor_bytes)}",
         ]
+        # THE TWO DERIVED NUMBERS THAT ACTUALLY DECIDE IT. Absolutes make the
+        # reader do the arithmetic; the question "could this rank have paid"
+        # is driver_free minus what must stay free, and that is what a
+        # binding-rank diagnosis turns on.
+        try:
+            spendable = int(driver_free) - int(self._staging_reserve_bytes)
+            parts.append(f"=> SPENDABLE {spendable / mib:.0f}")
+        except Exception:  # noqa: BLE001
+            parts.append("=> SPENDABLE ?")
+        try:
+            parts.append(
+                f"headroom over corridor floor "
+                f"{(int(driver_free) - int(guard.floor_bytes)) / mib:.0f}"
+            )
+        except Exception:  # noqa: BLE001
+            parts.append("headroom over corridor floor ?")
         return (
             "STAGING BUDGET CENSUS (MiB) -- " + ", ".join(parts) + ". The arena "
             "term is the inactive layout's weights held on THIS card; it is "
@@ -6314,7 +6334,13 @@ class PhaseFlipRuntime:
                 # binds is already in the line above; what is holding that
                 # rank's budget was not, and without it the remedy is a guess.
                 try:
-                    logger.error("%s %s", LOG_PREFIX, self.staging_budget_census())
+                    logger.error(
+                        "%s %s",
+                        LOG_PREFIX,
+                        self.staging_budget_census(
+                            int(getattr(self, "_last_staging_bytes", 0) or 0)
+                        ),
+                    )
                 except Exception:  # noqa: BLE001 - never break the refusal path
                     pass
             # #485: BOUND THE RETRY, AND END IT IF IT CANNOT WIN.
