@@ -514,6 +514,49 @@ hysteresis-damped, this is not obviously the wrong trade, and the two solvers in
 this branch price both. Choosing between them needs the measured recapture cost,
 which Slice 2 should collect while it is measuring the link.
 
+### 3.8 The union arena — a rung change copies ZERO weight bytes
+
+Slice 1a's implementation found that §3.7's H2D refill is more work than the
+existing primitives require. Landed as
+`model_executor/weights_arena_union.py`, 13 hermetic tests.
+
+`plan_arena_layout` fixes slot offsets by **sorted tensor name**, and
+`bind_arena_views` rebinds parameters to arena views **without copying any
+bytes** (`weights_arena.py:495-519`). Plan the arena over the **union** of the
+rungs' tensors instead of per rung, and:
+
+* every tensor shared by two rungs sits at the **same offset** in both, so
+  changing rung cannot require moving it;
+* a rung change becomes a rebind plus a PP-boundary change — **zero weight
+  bytes on the wire**, replacing the 451-901 MiB per step I had specified.
+
+**The union is not a restatement of a coincidence, and there is a can-fail
+proof that it is doing real work.** With *per-rung* layouts, 14 of 56 shared
+tensors land at **different offsets** — because `model.layers.28.*` sorts
+lexically between `...27.*` and `...3.*`, displacing every slot after it. So a
+per-rung arena would have to relocate weights that are already resident and
+unchanged, purely because a name sorted differently. Under the union, zero move.
+
+The cost moves from bandwidth to **residency**: a layer that changes hands must
+be resident on *both* ranks, so the world holds `64 + (layers that move)`
+layer-images. For the slice-1a pair that is one extra layer, ~451 MiB. This is
+the same trade §3.7 already prices — pay in resident VRAM, not per-change link
+time — and on this rig it strictly dominates the refill, because with no P2P a
+rank-to-rank transfer would stage through host anyway.
+
+`arena_refill` is **not** replaced. It remains correct for the *phase flip*,
+where the two layouts are genuinely different tensor sets (PP weights vs TP
+width-shards) with no useful union. The union is for the *ladder*, where
+consecutive rungs differ by one or two whole layers.
+
+**Scope limit, carried in the data structure rather than in a reader's
+memory.** "Zero bytes" must not be read as "nothing to do". A GDN layer also
+carries per-sequence recurrent state — temporal_state ~19.5 MiB/layer plus
+conv_state ~0.762 — which lives with the layer. Slice 1a therefore flips **only
+at quiescence**, where no live state exists to preserve; every `FlipDelta`
+carries `requires_quiescence=True` and an `out_of_scope` string saying so, and
+a test asserts both. Live-state transfer is slice 1b.
+
 ### 3.6 Interaction with the flip controller's seam funding
 
 The ladder and the phase flip both move bytes over the same links, and they
@@ -814,7 +857,8 @@ document is an upper bound** until a second measured cut pins the intercept.
 |---|---|---|---|
 | **0 — landed** | Family-split pool rule + ladder solver, hermetic, 3 hardware profiles | done | 26 tests green |
 | **0b — landed** | Rung controller (decision function) + oscillation falsifiers | done | 10 tests green, can-fail verified |
-| **1a** | Multi-layout arena refill: extend `weights_arena.py`'s image/refill to N boot-baked layouts, `[33,15,16]` ↔ `[35,14,15]` (same (8,4,4), **zero KV moved**) — proves the MOVER only, not the ladder | 1 window | refill completes, checksum green, graphs survive, output byte-identical across a refill |
+| **1a-i — ticket ready** | Two STATIC boots, `[28,20,16]` ↔ `[29,19,16]`, one variable (`--pp-layer-ratio`). **Zero new code.** Both are (7,5,4), layer 28 is linear, so no attention layer and no KV row moves | 1 short window | A1 pool within 2.5k of 436,766; A2 PP2 binds; A3 K sizes unchanged. Plus **T1: the second timing cut** |
+| **1a-ii — machinery landed** | Union arena (`weights_arena_union.py`, 13 tests) + runtime wiring: load the union per rank, size the arena for the union, flip `start_layer`/`end_layer` and the PP send/recv boundary at quiescence | 1-2 windows | flip completes, output byte-identical across a flip and back, graphs survive |
 | **1b** | Wire the controller to 1a on a pair that actually trades: `[35,14,15]` ↔ `[38,13,13]` (attn0 8→9) | 1 window | hysteresis proven on metal, no oscillation under load |
 | **2** | Measure real move cost on the pair matrix **and the CUDA-graph recapture cost**, to decide arena vs realloc (§3.7); re-solve | 0.5 window | move time within 20% of solved; the arena/realloc fork closed on numbers |
 | **3a** | **B1**: build a cross-PP-stage process group at boot, using the manifest-verify-then-create pattern from `parallel_state.py:3422-3517` | 1-2 windows | group forms and survives a boot; collective round-trips |
