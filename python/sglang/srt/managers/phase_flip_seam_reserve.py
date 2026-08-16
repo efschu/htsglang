@@ -98,6 +98,7 @@ something this can express, which is the point.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -138,6 +139,90 @@ ENV_FIXED_MIB = "SGLANG_PHASE_FLIP_SEAM_RESERVE_MIB"
 #: deviation.
 ENV_MARGIN_MIB = "SGLANG_PHASE_FLIP_SEAM_MARGIN_MIB"
 DEFAULT_MARGIN_MIB = 192
+
+#: #678: how a measured corridor breach EXPIRES. It is monotonic-max while it
+#: is being observed (a shallower breach later does not retire a deeper one)
+#: and halved by every flip boot that measures its seam without seeing it. A
+#: breach that recurs is re-raised on the spot; one that cannot be reproduced
+#: is gone in a bounded number of boots instead of taxing the arming floor for
+#: the life of the configuration.
+SHORTFALL_DECAY_DEN = 2
+
+#: Below this the residue is written off to exactly 0, so the decay terminates
+#: instead of leaving a long tail that still moves the floor.
+SHORTFALL_FORGET_BYTES = 16 << 20
+
+@dataclasses.dataclass(frozen=True)
+class SizingPin:
+    """A shipped pool size WITH the regime it was derived under (#678).
+
+    WHY THE PROVENANCE IS IN THE ARTIFACT AND NOT IN A COMMIT MESSAGE. The
+    number this replaces -- a hand-pinned 550000 -- was an empirical bound
+    from a boot that armed and flipped 219+ times, and it was correct when it
+    was taken. It then survived a regime change silently: `48ba9fe72a`
+    ("the pool must reserve for the floor the GATE arms at") folded the arming
+    floor into sizing, every seam record written after it came back smaller,
+    and the pin kept being quoted as the target the sizer was failing to
+    reach. A whole task was opened to find "the missing 115k" that had never
+    existed as a recoverable quantity -- it was the distance between two
+    regimes.
+
+    THE RIG'S OWN METAL ALREADY BRACKETED THE HONEST ANSWER, and both ends are
+    recorded here because the upper one is what makes the pin falsifiable:
+
+      * 482490 tokens -- SAFE. Every rank above its arming floor
+        (2167/3056/3233 free against 1536/1772/2414) and a full round trip
+        under load.
+      * 537076 tokens -- UNSAFE. 987/2286/1475 free, below the floor on two of
+        three ranks, with the pre-arm ladder finding 40-46 MiB against a
+        650-726 MiB gap.
+
+    537076 is 13k BELOW the withdrawn 550000 pin. So the pin did not merely
+    drift out of regime; it named a pool larger than one this rig has measured
+    as unable to hold its own floor.
+
+    HOW THE NEXT REGIME CHANGE INVALIDATES THIS. `basis_per_row_bytes` and
+    `basis_arming_floor_mib` are what the rig's own records and gate said when
+    the pin was derived. A registered test compares them against the live
+    values; when a change moves either, the test goes red and the pin has to
+    be re-derived instead of quietly outliving its inputs, which is exactly
+    what 550000 did.
+    """
+
+    #: The largest pool this rig has DEMONSTRATED safe under the current
+    #: regime -- not a target the sizer is asserted to reach today.
+    demonstrated_safe_tokens: int
+    #: The smallest pool measured UNABLE to hold its floors. Nothing may ship
+    #: at or above this.
+    demonstrated_unsafe_tokens: int
+    #: The commit that defines the regime these numbers belong to.
+    regime_commit: str
+    #: Per-rank seam slope and arming floor the derivation stood on.
+    basis_per_row_bytes: Tuple[float, ...]
+    basis_arming_floor_mib: Tuple[int, ...]
+    derived_at: str
+    #: What was replaced, so a re-introduction is recognisable on sight.
+    withdrawn_pin: int = 0
+    withdrawn_reason: str = ""
+
+
+#: #678: the re-derived pin, from the current regime's six solves (three ranks
+#: x floor and seam), anchored on the measured bracket above. The slopes are
+#: this rig's own records of 2026-08-16T03:56Z; the floors are the levels the
+#: gate solved on the same boot.
+SHIP_PIN = SizingPin(
+    demonstrated_safe_tokens=482490,
+    demonstrated_unsafe_tokens=537076,
+    regime_commit="48ba9fe72a",
+    basis_per_row_bytes=(2360.3031340235552, 424.1172657292698, 550.6682501797533),
+    basis_arming_floor_mib=(1728, 1825, 2467),
+    derived_at="2026-08-16",
+    withdrawn_pin=550000,
+    withdrawn_reason=(
+        "cross-regime transfer: derived before 48ba9fe72a folded the arming "
+        "floor into sizing, and 13k above the measured-unsafe 537076"
+    ),
+)
 
 PROVENANCE_COLD = "cold"
 PROVENANCE_STORED = "stored"
@@ -591,16 +676,50 @@ def write_seam_reserve(
     predicted.
     """
     path = record_path(server_args, world_rank)
-    # PRESERVED, NOT OVERWRITTEN. The shortfall is written by a different
-    # event (the runtime's corridor audit, mid-run) than this measurement
-    # (end of the flip boot), so a boot that re-measures its seam must not
-    # silently discard a breach an earlier boot paid to learn about.
+    # PRESERVED WHEN THIS BOOT SAW IT, DECAYED WHEN IT DID NOT (#678).
+    #
+    # The shortfall is written by a different event (the runtime's corridor
+    # audit, mid-run) than this measurement (end of the flip boot), so a boot
+    # that re-measures its seam must not silently discard a breach an earlier
+    # boot paid to learn about. It must also not RENEW one indefinitely: the
+    # term is added straight to the arming floor's load margin, and the floor
+    # binds the pool on two of three ranks, so a value nobody can reproduce
+    # sizes the instance forever.
+    #
+    # Measured 2026-08-16: the rank-0 record carried 1004 MiB while every
+    # record from the day before carried 0, and the boot reading it logged no
+    # breach of its own. The event it descends from is a foreign process that
+    # held 4.29 GiB on that card for a few seconds.
+    #
+    # SAME PID MEANS THIS BOOT SAW IT. Both writers live in the same process,
+    # so the pid the audit stamped is the exact discriminator between "this
+    # boot observed a breach" and "this value was inherited". A boot that
+    # completed a seam measurement without its audit firing is evidence
+    # against the inherited value, and evidence is what retires it.
     prior_shortfall = 0
+    prior_pid = None
     try:
         with open(path) as fh:
-            prior_shortfall = int(json.load(fh).get("corridor_shortfall_bytes", 0))
+            _prior = json.load(fh)
+        prior_shortfall = int(_prior.get("corridor_shortfall_bytes", 0))
+        prior_pid = _prior.get("corridor_shortfall_pid")
     except Exception:
         prior_shortfall = 0
+        prior_pid = None
+    if prior_shortfall > 0 and prior_pid != os.getpid():
+        decayed = int(prior_shortfall) // SHORTFALL_DECAY_DEN
+        if decayed < SHORTFALL_FORGET_BYTES:
+            decayed = 0
+        logger.info(
+            "%s corridor shortfall %d MiB was inherited, not observed by this "
+            "boot: decaying to %d MiB. A breach that recurs is re-observed and "
+            "re-raised to its worst on the spot; one that does not is retired "
+            "rather than charged to the arming floor forever (#678).",
+            LOG_PREFIX,
+            int(prior_shortfall) >> 20,
+            decayed >> 20,
+        )
+        prior_shortfall = decayed
     payload = {
         "fixed_bytes": int(fixed_bytes),
         "arena_fixed_bytes": int(arena_fixed_bytes),
@@ -611,6 +730,7 @@ def write_seam_reserve(
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),
         "corridor_shortfall_bytes": max(0, prior_shortfall),
+        "corridor_shortfall_pid": prior_pid if prior_shortfall > 0 else None,
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "detail": detail,
     }
@@ -661,6 +781,10 @@ def record_corridor_shortfall(
         return prior
     rec["corridor_shortfall_bytes"] = want
     rec["corridor_shortfall_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    #: #678: WHICH PROCESS SAW IT. `write_seam_reserve` decays a shortfall it
+    #: did not observe itself, and both writers run in this process, so the pid
+    #: is the discriminator between a live measurement and an inherited one.
+    rec["corridor_shortfall_pid"] = os.getpid()
     try:
         tmp = f"{path}.tmp{os.getpid()}"
         with open(tmp, "w") as fh:
