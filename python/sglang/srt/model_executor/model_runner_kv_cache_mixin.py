@@ -173,6 +173,34 @@ def _note_mamba_component(runner, name: str, gb: float) -> None:
     acc[name] = acc.get(name, 0.0) + float(gb)
 
 
+def budget_holdback_mib(profiled_bytes: int, adjusted_bytes: int) -> float:
+    """The TRUE per-rank holdback, in MiB (#704, fourth instrument).
+
+    The quantity between the profiler's ``rest`` and what the configurator
+    actually receives. On metal it lands at 6,688 / 3,561 / 5,166 MiB while
+    ``derived_rank_auto_reserve_mib`` returns 4,160 UNIFORMLY for the same
+    boot's arguments -- so the holdback is not that function's output, and with
+    three exactly-collinear data points its form cannot be fitted (single-factor
+    layer models are already falsified by non-monotonicity; see
+    DESIGN_704_reserve_vs_layout.md). Emitting it settles the form in one boot
+    instead of a regression that cannot separate collinear regressors.
+
+    Reports rather than sanitises. A NEGATIVE holdback means the seam handed
+    budget back, which is a real and loud state; clamping it to zero would hide
+    exactly the accounting-error class this ticket has spent four instruments
+    chasing.
+    """
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(1 << 20)
+
+
+def budget_holdback_fraction(profiled_bytes: int, adjusted_bytes: int):
+    """Holdback as a fraction of the profiled budget, or ``None`` if there was
+    no budget to hold back from -- a division nobody should have to guard."""
+    if not profiled_bytes:
+        return None
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(profiled_bytes)
+
+
 def decompose_mamba_budget_post(total_gb: float, components: dict):
     """Split the lumped mamba budget post into its three NAMED components.
 
@@ -5976,7 +6004,23 @@ class ModelRunnerKVCacheMixin:
         # #656: charge the flip seam HERE, the one funnel every sizing path
         # reaches. Keyed to the post-capture path instead, it never fired at
         # all on the ship config, whose pool is decided pre-capture (boot H).
+        _profiled_bytes = budget_bytes
         budget_bytes = self._seam_adjusted_budget(budget_bytes, configurator)
+        # #704: EMIT the true per-rank holdback at the one funnel every sizing
+        # path reaches. This is the term that lands at 6,688 / 3,561 / 5,166 MiB
+        # on metal while derived_rank_auto_reserve_mib reports 4,160 uniformly,
+        # and the term no external re-derivation reproduced (+20 %, -3.8 %,
+        # -12 % on three attempts). With it emitted, one boot identifies the
+        # form that three collinear points could not.
+        _frac = budget_holdback_fraction(_profiled_bytes, budget_bytes)
+        logger.info(
+            "KV budget holdback: profiled=%.1f MiB, adjusted=%.1f MiB, "
+            "holdback=%.1f MiB (%s of profiled)",
+            _profiled_bytes / (1 << 20),
+            budget_bytes / (1 << 20),
+            budget_holdback_mib(_profiled_bytes, budget_bytes),
+            "n/a" if _frac is None else f"{_frac:.3%}",
+        )
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
