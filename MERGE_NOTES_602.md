@@ -31,15 +31,29 @@ no boot, no live flag changed, nothing deployed.
 Neither depends on the #602 solver files. `5a1e087c37` is the only commit that
 couples the two areas and a cherry-pick does not need it.
 
-## 3. Retracted, on the record
+## 3. Retracted, on the record — TWICE
 
-An earlier revision of `TICKET_602_METAL.md` recommended `31,16,17` and
-predicted **+227095 tokens (+36.3 %)**. Both are **withdrawn**. They came from
-the #485 reference-bench weights; the real linear layer is 476 MiB, so moving
-layers onto a stage costs far more than the model believed.
+**Revision 1** recommended `31,16,17` at **+227095 tokens (+36.3 %)**.
+Withdrawn: it came from #485 reference-bench weights, and the real linear layer
+is 476 MiB, so moving layers costs far more than the model believed.
 
-Calibrated: solved cut **`29,19,16`** (stage 2 **keeps** 16 layers), incumbent
-480010 → 497245, **+17235 tokens, +3.6 %**.
+**Revision 2** recommended `29,19,16` at **+17235 tokens (+3.6 %)**.
+**Also withdrawn**, after F4-r4's census boots. Two separate defects:
+
+* The ±5 % gate compared a **corridor-safe floor** (worst load transient
+  funded) against a **measured pool** (sizer, no transient funded). In his
+  regime the worst load state is a SEAM on every rank, so the two are ~29 %
+  apart and the comparison read -23.3 %. He refused the arm; he was right.
+  Fixed in `90e37f0510` by separating `world_predicted_pool` from
+  `world_corridor_safe_floor` — validated at **-0.5 %** against his measured
+  471303.
+* Re-solved on his terms, the **incumbent `28,20,16` is the global optimum**
+  over all 1953 contiguous cuts; `29,19,16` is 6.3 % *worse*. There is no cut
+  to arm on that regime. The +3.6 % was a property of my boot's terms, not a
+  portable result.
+
+**Standing rule now in the ticket: re-solve on the regime being booted, and
+check `world_predicted_pool` against its measured pool, before any arm.**
 
 ## 4. Open decision points — two, both outside my lane
 
@@ -57,9 +71,10 @@ form **but has no live caller anywhere in the tree**, so which budget it is
 solved against is a boot-path design decision, not wiring.
 **Owner: F4-r4.** One decision; the slope is already there and tested.
 
-### 4b. #602 metal arm — DEFERRED by operator
+### 4b. #602 metal arm — NO ARM on the censused regime
 
-Prize is +3.6 %, too small to spend a boot while F4-r4 iterates.
+Not merely deferred: its premise is absent there (§3). The incumbent cut is
+already optimal, so there is nothing to measure.
 `TICKET_602_METAL.md` stays on file with its verdict; it carries a hard ±5 %
 floor gate (earned from the 1.8 % demonstrated error) and a **non-concurrency
 constraint against F4-r4's #689 window** — re-cutting moves per-stage arena and
