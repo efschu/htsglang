@@ -76,9 +76,9 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
+    assert req.cache_protected_len % page_size == 0, (
+        "cache_protected_len must be page aligned"
+    )
     evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
@@ -556,6 +556,13 @@ def alloc_token_slots(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    # #694: charge this draw against the published floor. Reached only on
+    # success, so a failed allocation never inflates the ledger. Without this
+    # the floor stays at its publish-time value all iteration, the evict
+    # trigger reads it, skips, and the NEXT allocation raises on a tree full of
+    # evictable tokens -- the two 2026-08-16 specimens.
+    note_uniform_admitted(tree_cache, num_tokens)
+
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
@@ -756,10 +763,36 @@ def uniform_avail_for_evict(tree_cache, allocator) -> int:
     identical. When it is None -- single rank, or pools that agree -- this is
     the live local value and the caller behaves exactly as it did before.
     """
+    #: #694: CHARGE ALLOCATIONS AGAINST THE FLOOR, exactly as the HOST sibling
+    #: below already does for backups. The floor is published ONCE per
+    #: iteration (scheduler.py:4142-4144) as the group MIN at that instant;
+    #: allocations made later in the same iteration are not reflected in it, so
+    #: late in an iteration it is stale-OPTIMISTIC. With ``floor >= num_tokens``
+    #: the eviction is SKIPPED entirely, the alloc then fails against the live
+    #: pool, and the raise reports a tree full of evictable tokens nothing ever
+    #: asked for -- the two 2026-08-16 specimens, 512 refused at ~167k
+    #: evictable, both scheduler deaths.
+    #:
+    #: SUFFICIENT, by the same argument #645 makes for the host: this rank's
+    #: live availability is at least ``avail_at_publish - admitted``, and
+    #: ``avail_at_publish >= floor``, so a request clearing ``floor - admitted``
+    #: fits the real pool too. RANK-UNIFORM by construction: ``num_tokens``
+    #: comes from the replicated batch, so every rank charges the same amount at
+    #: the same allocation and the predicate stays identical across ranks --
+    #: which is the #616g invariant this must not break.
     floor = getattr(tree_cache, "uniform_avail_floor", None)
     if floor is None:
         return int(allocator.available_size())
-    return int(floor)
+    admitted = getattr(tree_cache, "uniform_admitted_since_floor", 0)
+    # A stand-in without the attribute yields a Mock, and ``int(Mock())`` is
+    # **1**, not 0 -- so an unconfigured double silently shaved a token off the
+    # floor. Caught by test_a_published_floor_is_returned (499 != 500). Real
+    # caches declare the field on BasePrefixCache, so this only ever guards
+    # doubles; treating a non-int as zero keeps production behaviour exact and
+    # stops the #624 stub-drift class biting a third time.
+    if not isinstance(admitted, int) or isinstance(admitted, bool):
+        admitted = 0
+    return max(0, int(floor) - admitted)
 
 
 def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
@@ -846,6 +879,21 @@ def uniform_host_floor_active(tree_cache) -> bool:
     ``test/registered/unit/distributed/test_uniform_host_evict_floor_645.py``.
     """
     return getattr(tree_cache, "uniform_host_avail_floor", None) is not None
+
+
+def note_uniform_admitted(tree_cache, tokens: int) -> None:
+    """Charge an admitted DEVICE allocation against the published floor (#694).
+
+    The device twin of :func:`note_uniform_host_admitted`. Only meaningful while
+    a floor is active -- with no floor the attribute is never read, so charging
+    is a no-op and the no-floor path stays byte-identical. Reset once per
+    iteration by the scheduler when it publishes the next floor, so the ledger
+    never outlives the number it corrects.
+    """
+    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+        return
+    current = getattr(tree_cache, "uniform_admitted_since_floor", 0)
+    tree_cache.uniform_admitted_since_floor = current + int(tokens)
 
 
 def note_uniform_host_admitted(tree_cache, tokens: int) -> None:
@@ -1440,9 +1488,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -1491,9 +1539,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -1507,9 +1555,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.mamba_pool_idx is not None, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
