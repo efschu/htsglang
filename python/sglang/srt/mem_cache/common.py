@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import numpy as np
@@ -75,9 +76,9 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
+    assert req.cache_protected_len % page_size == 0, (
+        "cache_protected_len must be page aligned"
+    )
     evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
@@ -485,6 +486,43 @@ def fundable_extend_tokens(tree_cache) -> int:
     except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
         evictable = 0
     return max(0, avail) + max(0, evictable)
+
+
+#: #679 rung 1-3: may an admission spend RELIEF before it parks?
+#:
+#: OFF BY DEFAULT, and the default is the whole compatibility argument: with
+#: this unset the ladder returns 0 immediately and admission behaves exactly as
+#: c4b88e1923 did, which is the boot currently serving. The ladder changes how
+#: much the pool can fund; it never admits or refuses anything itself.
+ENV_ADMISSION_RELIEF_LADDER = "SGLANG_ADMISSION_RELIEF_LADDER"
+
+#: #679 rung 3 SEPARATELY, because it is the only rung that destroys progress.
+#: A victim loses its whole decode and re-prefills, so an operator may want
+#: rungs 1-2 (spill and throttle, which cost bandwidth and latency) without
+#: rung 3. Requires the ladder itself to be on.
+ENV_ADMISSION_RETRACTION = "SGLANG_ADMISSION_RELIEF_RETRACT"
+
+
+def admission_relief_ladder_enabled() -> bool:
+    return os.environ.get(ENV_ADMISSION_RELIEF_LADDER, "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def admission_retraction_enabled() -> bool:
+    """Rung 3 needs BOTH flags. A retraction rung reachable while the ladder
+    is off would be a second admission-side actuator nobody asked for."""
+    if not admission_relief_ladder_enabled():
+        return False
+    return os.environ.get(ENV_ADMISSION_RETRACTION, "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
 
 
 def chunk_tokens_the_pool_can_fund(
@@ -1222,9 +1260,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -1273,9 +1311,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -1289,9 +1327,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.mamba_pool_idx is not None, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
