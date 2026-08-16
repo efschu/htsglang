@@ -766,6 +766,13 @@ class TestRadixCache(unittest.TestCase):
             # Should have 1 page (split at page_size=2)
             self.assertEqual(len(node.hash_value), 1)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "measures torch.cuda.memory_allocated() directly, so it needs a real "
+        'CUDA device; the hermetic run (CUDA_VISIBLE_DEVICES="") has none. '
+        "Marked individually rather than via the directory conftest because "
+        "this one reaches CUDA without going through get_device().",
+    )
     def test_memory_allocated(self):
         keys, values = [], []
 

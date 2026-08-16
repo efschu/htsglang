@@ -40,7 +40,7 @@ from sglang.srt.planner.chunked_admission import (
 )
 
 
-def _tree_cache(*, evictable: int = 0, recoverable=None) -> MagicMock:
+def _tree_cache(*, evictable: int = 0) -> MagicMock:
     tc = MagicMock()
     tc.supports_mamba.return_value = False
     tc.evictable_size.return_value = evictable
@@ -48,10 +48,14 @@ def _tree_cache(*, evictable: int = 0, recoverable=None) -> MagicMock:
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    # The mamba-recoverable figure, which may be far below paper-evictable.
-    tc.mamba_recoverable_size = MagicMock(
-        return_value=evictable if recoverable is None else recoverable
-    )
+    # NOTE: no `mamba_recoverable_size` is mocked here. An earlier version of
+    # this harness did, and NO SUCH ACCESSOR EXISTS -- the real one is
+    # ``mamba_evictable_size`` (mamba_radix_cache.py:1177,
+    # unified_radix_cache.py:3189). Nothing read the phantom, so it never
+    # produced a false green, but a mock of a non-existent API is exactly the
+    # #380/#624 shape: it teaches the next reader an interface the tree does
+    # not have. If a future test needs the recoverable figure, mock the real
+    # name.
     return tc
 
 
