@@ -266,3 +266,81 @@ class TheGateIsReachableFromABoot(unittest.TestCase):
             )
         ):
             self.assertFalse(phase_purity.prefill_blocked_here(stub))
+
+
+class SuppressionYieldsWhenTheFlipCannotBeFunded(unittest.TestCase):
+    """LIVE INCIDENT 2026-08-16 06:47:48, and the defect is in hot fix 2.
+
+    The policy armed tp_to_pp every ~3 s and CorridorGuard refused the seam
+    staging on two ranks with static numbers:
+
+        PP1  want 2163 MiB, free 2456, arming floor 1536  -> 293 short
+        PP2  want 2858 MiB, free 3560, arming floor 1536  -> 702 short
+
+    The want (2163-2858) EXCEEDS the arming floor (1536): the floor guarantees
+    less than a 4-carrier bundle's seam actually needs, because staging scales
+    with live KV cells. Every degradation already stood down -- abandon cap,
+    backoff, entry margin -- and it still could not fund. 76 refusals in a row.
+
+    THAT ALONE WOULD HAVE BEEN A SLOW BOOT. What made it a TOTAL wedge is hot
+    fix 2: before it, a refused tp_to_pp still degraded to prefilling in the TP
+    layout, so the backlog drained slowly instead of not at all. Suppressing
+    prefill in TP removed the fallback, so an unfundable seam became an idle
+    server with 727004 tokens waiting.
+
+    The rule hot fix 1 was built on applies to hot fix 2 and I did not apply
+    it: a failure must degrade to the fallback, never to a wedge. So the
+    suppression YIELDS once the flip has proved it cannot be funded -- the same
+    shape, and the same threshold, as the seam entry margin's own
+    "YIELDED after 2 consecutive abandoned attempts".
+    """
+
+    def test_suppression_holds_while_the_flip_is_still_viable(self):
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 0))
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 1))
+
+    def test_it_yields_once_the_seam_has_proved_unfundable(self):
+        """THE INCIDENT. At 76 refusals the layout must prefill again."""
+        self.assertFalse(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 76))
+        self.assertFalse(
+            pp.prefill_suppressed_in_tp(
+                _cfg(), pp.PHASE_TP, pp.DRAIN_SUPPRESSION_YIELD_AFTER
+            )
+        )
+
+    def test_the_yield_threshold_matches_the_seam_margins_own(self):
+        """Not a new number: the codebase already yields its entry margin
+        after two consecutive abandons, and one instance should not wait
+        longer to stop idling than the other waits to lower its guard."""
+        self.assertEqual(2, pp.DRAIN_SUPPRESSION_YIELD_AFTER)
+
+    def test_a_funded_flip_restores_suppression(self):
+        """The yield is not a latch. `arm_refusals` is reset by the first
+        success, so a rig that recovers goes straight back to the user's
+        semantics -- the fifth latch of this chain is not being added here."""
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, 0))
+
+    def test_the_purity_hook_passes_the_refusal_count(self):
+        """THE CALL SITE. A yield the hook never learns about is a yield that
+        never happens -- twice now this file has caught that shape."""
+        import types
+
+        from sglang.srt.managers import phase_purity
+
+        stub = types.SimpleNamespace(
+            phase_policy_cfg=_cfg(),
+            phase_policy_state=pp.PhasePolicyState(
+                arm_refusals={pp.TP_TO_PP: 76}
+            ),
+        )
+        with unittest.mock.patch.object(
+            phase_purity, "_active_phase", lambda s: pp.PHASE_TP
+        ), unittest.mock.patch.object(
+            phase_purity, "purity_of", lambda s: types.SimpleNamespace(
+                prefill_allowed_in_tp=lambda: True
+            )
+        ):
+            self.assertFalse(
+                phase_purity.prefill_blocked_here(stub),
+                "an unfundable seam must let the TP layout prefill again",
+            )

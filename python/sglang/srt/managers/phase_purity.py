@@ -601,6 +601,7 @@ def prefill_blocked_here(scheduler) -> bool:
     """
     from sglang.srt.managers.phase_policy import (
         PHASE_TP,
+        TP_TO_PP,
         prefill_suppressed_in_tp,
     )
 
@@ -623,7 +624,19 @@ def prefill_blocked_here(scheduler) -> bool:
     # fires -- the same shape as the #684 serving tick's NameError. Pinned by
     # `test_the_purity_hook_reads_the_real_scheduler_attribute`.
     policy = getattr(scheduler, "phase_policy_cfg", None)
-    if policy is not None and prefill_suppressed_in_tp(policy, PHASE_TP):
+    # THE REFUSAL COUNT IS PART OF THE QUESTION, not context for it. A seam
+    # that cannot be funded makes suppression a wedge rather than a policy --
+    # measured 2026-08-16 06:47:48, 76 refused arms with 727004 tok waiting --
+    # so the hook has to pass what it knows about the flip's viability.
+    # Rank-uniform: `arm_refusals` advances off the group's own arm outcomes.
+    pstate = getattr(scheduler, "phase_policy_state", None)
+    refusals = 0
+    if pstate is not None:
+        try:
+            refusals = int(getattr(pstate, "arm_refusals", {}).get(TP_TO_PP, 0))
+        except Exception:  # noqa: BLE001 - a guard never breaks the loop
+            refusals = 0
+    if policy is not None and prefill_suppressed_in_tp(policy, PHASE_TP, refusals):
         return True
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
