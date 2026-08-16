@@ -21,19 +21,32 @@ surrounding code itself knows may not apply. That is how the corridor guard's
 only escalation rung above ``allocator-cache`` stayed dead for the whole boot
 while its diagnostic pointed at the arena.
 
-THE DEFECT IS A MISSING CLAMP. ``recover`` bounds its target two ways -- by
+THE DEFECT WAS A MISSING CLAMP. ``recover`` bounded its target two ways -- by
 ``_rows_at_boot`` and by what the free column can afford above the corridor law
--- and by nothing else. The pool's own reservation is never consulted; the
-string ``reserved`` does not appear against a pool anywhere in the module. So
-when the reservation is smaller than the boot row count the target is
-unsatisfiable BY CONSTRUCTION and every attempt fails identically, forever.
+-- and by nothing else. The pool's reservation was never consulted.
+
+WHY THE REMEMBERED NUMBER COULD EXCEED IT, ROOT-CAUSED. The reservation is
+IMMUTABLE: ``KvVmmBufferOwner`` takes ``reserved_num_tokens=self.size`` at
+construction (memory_pool.py:2458) and assigns ``_reserved_num_tokens`` exactly
+once (kv_vmm_backing.py:979). ``size`` is NOT immutable -- the #330 dial writes
+it on every step, as #662-F4 already noted one layer up. So a target derived
+from a remembered or configured row count can sit above a ceiling that never
+moves, and ``_check_final`` then refuses it identically, forever. The candidate
+this task was opened on -- the flip's "released 1410.0 MiB of weights-arena
+tail" -- is REFUTED twice over: it is the weights arena, not the KV pool, and
+an immutable reservation cannot be what moved.
+
+THE REPAIR IS TO ASK THE BOUND RATHER THAN TRUST THE DERIVATION, the same
+correction as #681 (count vs leaf frontier) and #682 (guard ceiling vs the
+bound the scheduler holds). ``recover`` now clamps to the arena's ceiling AND
+corrects the remembered number, because a clamp alone would only convert a
+loud failure into a quiet one that re-clamps to the same place forever.
 
 WHAT THIS FILE IS. A hermetic reproduction, no GPU: the pool is a fake whose
-``runtime_set_backing_rows`` refuses exactly as the production one does. It
-pins the defect as it stands today. When the clamp lands,
-``test_recovery_is_refused_forever_because_nothing_clamps_it`` INVERTS -- the
-recovery returns bytes and the cap lifts -- and that inversion is the fix's
-acceptance test, already written.
+``runtime_set_backing_rows`` refuses exactly as the production one does.
+``test_recovery_is_refused_forever_because_nothing_clamps_it`` keeps its name
+because it is the acceptance pin the fix was required to invert -- it asserted
+the defect before the clamp and asserts the repair after it.
 
 NOT WHAT THE TASK WAS ORIGINALLY FRAMED AS. The suspected mechanism was extent
 fragmentation ("191k rows of slack, zero releasable extents"). It is not:
@@ -65,6 +78,9 @@ class _FakeVmmPool:
     def __init__(self, backed_rows: int, reserved_rows: int, page_size: int = 1):
         self.full_pool_backed_rows = int(backed_rows)
         self.reserved = int(reserved_rows)
+        #: What the clamp reads: the arena's IMMUTABLE reservation, pinned to
+        #: the pool's size at construction (kv_vmm_backing.py:2458/979).
+        self.reserved_backing_rows = int(reserved_rows)
         self.page_size = int(page_size)
         self.attempts = []
 
@@ -101,11 +117,16 @@ class TheRecoveryTargetIgnoresTheReservation(unittest.TestCase):
     """The 02:15-02:35 loop, reproduced from injected state alone."""
 
     def test_recovery_is_refused_forever_because_nothing_clamps_it(self):
-        """PINS THE DEFECT. Inverts when #684's clamp lands.
+        """THE ACCEPTANCE PIN, INVERTED BY THE FIX (#684).
 
-        Production numbers: boot row count 270646, reservation 190596, and a
-        free column with room to spare so affordability is not what bounds
-        the target.
+        It used to assert the defect: target 270646 against reservation
+        190596, refused, 0 returned, 59 times. It now asserts the repair --
+        the target is clamped to what the pool can actually accept, and the
+        recovery that was impossible becomes the largest one that is possible.
+
+        Production numbers throughout: boot row count 270646, reservation
+        190596, and a free column with room to spare so affordability is not
+        what bounds the target.
         """
         pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
         relief = _relief(pool, free_mib=8192, rows_at_boot=270646)
@@ -115,28 +136,74 @@ class TheRecoveryTargetIgnoresTheReservation(unittest.TestCase):
             pool.reserved,
             "test setup: the boot row count must exceed the reservation",
         )
-        recovered = relief.recover()
+        relief.recover()
 
-        self.assertEqual(0, recovered, "recovery returned bytes it did not get")
         self.assertEqual(
-            110592,
+            190596,
             pool.full_pool_backed_rows,
-            "a failed grow must leave the watermark exactly where it was",
+            "recovery must reach the reservation, not stop at the old level",
         )
         self.assertTrue(pool.attempts, "recovery must at least have tried")
         self.assertTrue(
-            all(a > pool.reserved for a in pool.attempts),
-            f"every attempt aimed above the reservation: {pool.attempts}",
+            all(a <= pool.reserved for a in pool.attempts),
+            f"no attempt may aim above the reservation: {pool.attempts}",
         )
 
-    def test_it_fails_identically_however_many_times_it_runs(self):
-        """59 of 59 in production: no attempt teaches the next one anything."""
+    def test_the_stale_boot_row_count_is_corrected_not_retried(self):
+        """59 of 59 in production: no attempt taught the next one anything.
+
+        Clamping alone would stop the exception and keep aiming at 270646 for
+        the rest of the process. The remembered number is now corrected to
+        what the pool proved it can hold, so the second call has nothing left
+        to do instead of failing again.
+        """
         pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
         relief = _relief(pool, free_mib=8192, rows_at_boot=270646)
-        for _ in range(5):
-            self.assertEqual(0, relief.recover())
-        self.assertEqual(5, len(pool.attempts))
-        self.assertEqual({270646}, set(pool.attempts), "the target never moves")
+        relief.recover()
+        # Either cleared (fully recovered, nothing left to remember) or at
+        # most the ceiling. What must NEVER survive is the impossible number.
+        self.assertTrue(
+            relief._rows_at_boot is None or relief._rows_at_boot <= pool.reserved,
+            f"the unsatisfiable target survived the call that proved it: "
+            f"{relief._rows_at_boot}",
+        )
+        before = len(pool.attempts)
+        for _ in range(4):
+            relief.recover()
+        self.assertEqual(
+            before,
+            len(pool.attempts),
+            "a pool already at its reservation must not be asked again",
+        )
+
+    def test_a_pool_without_a_reservation_keeps_its_previous_behaviour(self):
+        """The clamp must not change pools that expose no arena at all.
+
+        A non-VMM pool has no ceiling to read, so the guard stays inert and
+        the path behaves exactly as it did before #684 -- which for this
+        (impossible) target still means a refusal.
+        """
+        pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
+        del pool.reserved_backing_rows
+        relief = _relief(pool, free_mib=8192, rows_at_boot=270646)
+        relief.recover()
+        self.assertEqual([270646], pool.attempts, "the target must be unclamped")
+        self.assertEqual(110592, pool.full_pool_backed_rows)
+
+    def test_a_zero_reservation_reads_as_absent_not_as_a_ceiling_of_zero(self):
+        """0 means 'no arena', never 'a reservation of zero'.
+
+        Clamping to 0 would ask the pool to unback itself completely from
+        inside recovery -- a shrink wearing a grow's name.
+        """
+        pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
+        pool.reserved_backing_rows = 0
+        relief = _relief(pool, free_mib=8192, rows_at_boot=270646)
+        relief.recover()
+        self.assertTrue(
+            all(a > 0 for a in pool.attempts),
+            f"a zero ceiling must never become the target: {pool.attempts}",
+        )
 
     def test_a_reservation_above_the_boot_rows_recovers_normally(self):
         """The control: the same code path works when the clamp is not needed.
@@ -151,6 +218,33 @@ class TheRecoveryTargetIgnoresTheReservation(unittest.TestCase):
             270646,
             pool.full_pool_backed_rows,
             "with room in the reservation the pool must reach the boot rows",
+        )
+
+    def test_the_clamp_can_only_lower_the_target_never_raise_it(self):
+        """The safety property that makes this shippable without a window.
+
+        The clamp runs AFTER the corridor-affordability bound, so when both
+        bite the target is the smaller of the two. If it could raise the
+        target it would commit pages the corridor law had already refused --
+        the failure that drove rank 1 to 6 MiB free and OOMed inside relief.
+
+        Affordability here allows 39408 rows above the current 110592; the
+        reservation would allow 190596. The target must be the former.
+        """
+        pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
+        affordable_rows = 39408
+        free_mib = LAW_FLOOR // (1 << 20) + (affordable_rows * BYTES_PER_ROW) // (1 << 20)
+        relief = _relief(pool, free_mib=free_mib, rows_at_boot=270646)
+        relief.recover()
+        self.assertTrue(pool.attempts, "recovery must have been attempted")
+        self.assertLessEqual(
+            max(pool.attempts),
+            110592 + affordable_rows,
+            f"the clamp raised the target past what the corridor allowed: "
+            f"{pool.attempts}",
+        )
+        self.assertLess(
+            max(pool.attempts), pool.reserved, "affordability must be the binding bound"
         )
 
     def test_affordability_still_bounds_the_target(self):

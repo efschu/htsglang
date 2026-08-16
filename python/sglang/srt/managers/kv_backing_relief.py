@@ -954,6 +954,36 @@ class KvBackingRelief:
             return None
         return backed // self._bytes_per_row
 
+    def _reserved_rows(self) -> Optional[int]:
+        """The arena's immutable row ceiling, or None when unreadable (#684).
+
+        None -- never 0 -- when the pool exposes no reservation, so a pool
+        without an arena keeps exactly its previous behaviour and the clamp
+        simply does not engage. 0 from the pool means the same thing: no
+        arena, hence nothing to clamp against, NOT a ceiling of zero.
+
+        NOT :meth:`_reservation_rows`, and the two must not be conflated. That
+        one is the ALLOCATOR's id space, read from the id-space owner, and it
+        feeds ``exposed_rows`` and the collective cap agreement. This one is
+        the ARENA's VA span on whichever layout the backing calls currently
+        point at -- the bound ``_check_final`` enforces on a grow.
+
+        RANK-LOCAL BY NATURE, and that is why reading it needs no collective.
+        A reservation is one card's VA span; under uneven TP the ranks hold
+        different ones (190596 / 136140 / 108912 on the 2026-08-16 boot), so
+        there is no group number here to agree on. What recovery changes is
+        this rank's own physical backing, and the module's collective -- the
+        cap agreement -- is on the SHRINK target, which is unchanged.
+        """
+        raw = getattr(self._pool, "reserved_backing_rows", None)
+        if raw is None:
+            return None
+        try:
+            rows = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return rows if rows > 0 else None
+
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
 
@@ -1663,6 +1693,46 @@ class KvBackingRelief:
                 rows = min(boot_rows, was + max(0, affordable))
                 page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
                 rows = int(rows // page * page)
+            # #684: CLAMP TO WHAT THE ACTUATOR CAN ACCEPT, NOT TO WHAT WE
+            # REMEMBER. The reservation is fixed at construction from the
+            # pool's size AT THAT MOMENT and never moves again, while `size`
+            # itself is mutable -- the #330 dial writes it on every step. So a
+            # target derived from a remembered row count can sit above the
+            # ceiling, and `_check_final` refuses it identically every time:
+            # measured 59 times in 20 minutes on three ranks, 02:15:24 to
+            # 02:35:26, `recovery to 270646 rows failed: ... reserved=190596`.
+            #
+            # Recovery is what LIFTS the cap, so those 59 refusals meant the
+            # cap never lifted, the pool stayed shrunk, and every later
+            # `free_up_to` found the backing already at its target and claimed
+            # 0 MiB -- which the shrink path then reported as an exhausted
+            # ARENA. One unsatisfiable number, and the corridor guard's only
+            # rung above the allocator cache was dead for the whole boot.
+            #
+            # DERIVATION IS NOT TRUSTED; THE BOUND IS ASKED. This is the same
+            # correction as #681 and #682: validate against what the actuator
+            # can pay rather than against the count that proposed it. The
+            # clamp is therefore deliberately not conditional on knowing WHY
+            # the remembered number is stale.
+            ceiling = self._reserved_rows()
+            if ceiling is not None and rows > ceiling:
+                logger.warning(
+                    "%s recovery target %d rows exceeds the pool's immutable "
+                    "reservation of %d; clamping and correcting the remembered "
+                    "boot row count, which was stale (#684).",
+                    LOG_PREFIX,
+                    rows,
+                    ceiling,
+                )
+                rows = int(ceiling // page * page) if page > 0 else int(ceiling)
+                # AND CORRECT THE MEMORY, or the clamp only converts a loud
+                # failure into a quiet one: `_rows_at_boot` would still name an
+                # impossible level and every later recovery would re-clamp to
+                # the same place while believing it had further to go. The
+                # pool's ceiling is what it can hold, so that is what "fully
+                # recovered" means for this arena.
+                self._rows_at_boot = max(int(rows), int(was))
+                boot_rows = self._rows_at_boot
             if rows <= was:
                 logger.warning(
                     "%s recovery deferred: %d MiB free leaves nothing above "

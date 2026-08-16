@@ -1240,6 +1240,26 @@ class KvVmmBufferOwner:
         return self._arena.backed_bytes if self._arena is not None else 0
 
     @property
+    def reserved_rows(self) -> int:
+        """The VA reservation in rows -- the CEILING a grow can ever reach.
+
+        IMMUTABLE, and that is why it has to be readable (#684). It is fixed
+        at construction from the pool's size at that moment
+        (``reserved_num_tokens=self.size``) and never assigned again, while
+        ``size`` itself is mutable at runtime -- the #330 dial writes it on
+        every step. So a caller that derives a grow target from a remembered
+        or configured row count can aim ABOVE this number, and
+        ``_check_final`` will refuse it every single time.
+
+        Measured 2026-08-16, 02:15:24 to 02:35:26, 59 times on three ranks:
+        ``recovery to 270646 rows failed: ... <= reserved=190596``. Recovery
+        is what LIFTS the backing cap, so 59 refusals meant the cap never
+        lifted and the corridor guard's only rung above the allocator cache
+        stayed dead for the whole boot.
+        """
+        return int(self._reserved_num_tokens)
+
+    @property
     def uniform_backed_tokens(self) -> int:
         """Tokens backed in EVERY buffer -- the depth a shrink can act on.
 

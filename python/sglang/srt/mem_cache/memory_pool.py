@@ -2709,6 +2709,18 @@ class MHATokenToKVPool(KVCache):
         return int(owner.uniform_backed_tokens) if owner is not None else 0
 
     @property
+    def reserved_backing_rows(self) -> int:
+        """The arena's IMMUTABLE row ceiling, or 0 when there is no arena.
+
+        0 means "no reservation to clamp against", never "a reservation of
+        zero": a pool with no VMM owner is not backed by an arena at all, so a
+        caller must treat 0 as absent. See KvVmmBufferOwner.reserved_rows for
+        why this has to be readable (#684).
+        """
+        owner = self._post_capture_owner
+        return int(owner.reserved_rows) if owner is not None else 0
+
+    @property
     def store_bound_rows(self) -> int:
         """Rows the K/V buffers physically address = the largest
         ``size + page_size`` this pool can ever reach (#352).
@@ -3735,6 +3747,15 @@ class HybridLinearKVPool(KVCache):
     @property
     def uniform_backed_rows(self) -> int:
         return int(getattr(self.full_kv_pool, "uniform_backed_rows", 0))
+
+    @property
+    def reserved_backing_rows(self) -> int:
+        """#684: the full-attention arena's immutable row ceiling, or 0.
+
+        Forwarded for the same reason ``uniform_backed_rows`` is: the relief
+        holds THIS pool, and the number lives one layer down.
+        """
+        return int(getattr(self.full_kv_pool, "reserved_backing_rows", 0))
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
