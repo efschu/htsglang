@@ -89,7 +89,7 @@ import json
 import math
 import os
 import re
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "LAYER_FAMILY_ATTENTION",
@@ -1306,8 +1306,7 @@ def stage_kv_capacities(
     """
     if len(counts) != inputs.pp_size:
         raise ValueError(
-            f"stage_kv_capacities: {len(counts)} counts for "
-            f"{inputs.pp_size} stages."
+            f"stage_kv_capacities: {len(counts)} counts for {inputs.pp_size} stages."
         )
     if sum(int(c) for c in counts) != inputs.n_layers:
         raise ValueError(
@@ -2182,3 +2181,308 @@ def world_corridor_safe_floor(
             return None
         best = min(best, cap)
     return None if best is math.inf else best
+
+
+# ---------------------------------------------------------------------------
+# #702 -- the PREFILL-SPEED objective.
+#
+# The #602 solve above answers "which cut maximises the KV pool". That is a
+# capacity question, and on the censused regime it correctly withdrew the cut.
+# The question the user actually asked -- "more prefill on the 5090" -- is a
+# TIME question, and these two objectives do not agree. Both are exported so
+# the trade is decided on numbers rather than on which solver was run.
+#
+# Two time objectives, also not equivalent to each other:
+#   SERIAL     sum_r  stage_ms_r   -- today's non-pipelined prefill cost.
+#   PIPELINED  max_r  stage_ms_r   -- once stages overlap, the slowest stage
+#                                     is the throughput bound.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefillTiming:
+    """Per-stage prefill cost model: ``fixed_ms[r] + ms_per_layer[r] * n_r``.
+
+    CALIBRATION LIMIT, stated because it is load-bearing: a single measured cut
+    gives ONE (layer-count, time) point per rank. That cannot separate the
+    per-layer slope from a fixed per-stage cost -- both fit the point exactly.
+    ``fixed_ms`` therefore defaults to all-zero, which is the OPTIMISTIC end of
+    the family: it credits a reallocation with the full per-layer saving. A
+    second measured cut per rank would pin the intercept; until one exists,
+    every speedup produced here is an upper bound, not a prediction.
+    """
+
+    ms_per_layer: Tuple[float, ...]
+    fixed_ms: Tuple[float, ...]
+
+    def stage_ms(self, counts: Sequence[int]) -> Tuple[float, ...]:
+        if len(counts) != len(self.ms_per_layer):
+            raise ValueError(
+                f"counts has {len(counts)} stages but the timing model has "
+                f"{len(self.ms_per_layer)}."
+            )
+        return tuple(
+            f + m * float(n)
+            for f, m, n in zip(self.fixed_ms, self.ms_per_layer, counts)
+        )
+
+
+def prefill_timing_from_measurement(
+    counts: Sequence[int],
+    stage_ms: Sequence[float],
+    fixed_fraction: float = 0.0,
+) -> PrefillTiming:
+    """Calibrate from one measured cut.
+
+    ``fixed_fraction`` is the share of each measured stage time attributed to
+    fixed per-stage cost rather than to layers. It is a SENSITIVITY DIAL, not a
+    measurement: any value in [0, 1) reproduces the calibration point exactly
+    (see ``PrefillTiming``), and larger values shrink the modelled benefit of
+    moving layers between ranks.
+    """
+    if len(counts) != len(stage_ms):
+        raise ValueError(
+            f"counts ({len(counts)}) and stage_ms ({len(stage_ms)}) disagree "
+            "on the number of stages."
+        )
+    if not 0.0 <= fixed_fraction < 1.0:
+        raise ValueError(f"fixed_fraction must be in [0, 1), got {fixed_fraction}.")
+    slopes: List[float] = []
+    fixed: List[float] = []
+    for r, (n, ms) in enumerate(zip(counts, stage_ms)):
+        if int(n) <= 0:
+            raise ValueError(
+                f"stage {r} holds zero layers in the calibration cut, so its "
+                "measured time cannot be turned into a per-layer cost "
+                "(division by zero)."
+            )
+        f = fixed_fraction * float(ms)
+        fixed.append(f)
+        slopes.append((float(ms) - f) / float(n))
+    return PrefillTiming(ms_per_layer=tuple(slopes), fixed_ms=tuple(fixed))
+
+
+def _check_total(counts: Sequence[int], total_layers: Optional[int]) -> None:
+    if total_layers is not None and int(sum(counts)) != int(total_layers):
+        raise ValueError(
+            f"stage counts {tuple(counts)} sum to {int(sum(counts))}, not the "
+            f"declared total of {int(total_layers)} layers."
+        )
+
+
+def serial_prefill_ms(
+    counts: Sequence[int],
+    timing: PrefillTiming,
+    total_layers: Optional[int] = None,
+) -> float:
+    """Non-pipelined prefill cost: the SUM over stages."""
+    _check_total(counts, total_layers)
+    return float(sum(timing.stage_ms(counts)))
+
+
+def pipelined_prefill_ms(
+    counts: Sequence[int],
+    timing: PrefillTiming,
+    total_layers: Optional[int] = None,
+) -> float:
+    """Pipelined prefill bound: the MAX over stages (the slowest stage)."""
+    _check_total(counts, total_layers)
+    return float(max(timing.stage_ms(counts)))
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefillCutCandidate:
+    counts: Tuple[int, ...]
+    serial_ms: float
+    pipelined_ms: float
+    serial_speedup: float
+    pipelined_speedup: float
+    pool_tokens: Optional[float]
+
+
+def _enumerate_cuts(
+    total_layers: int, stages: int, min_per_stage: int
+) -> List[Tuple[int, ...]]:
+    out: List[Tuple[int, ...]] = []
+
+    def rec(remaining: int, left: int, acc: Tuple[int, ...]) -> None:
+        if left == 1:
+            if remaining >= min_per_stage:
+                out.append(acc + (remaining,))
+            return
+        # Leave at least min_per_stage for each of the remaining stages.
+        hi = remaining - min_per_stage * (left - 1)
+        for n in range(min_per_stage, hi + 1):
+            rec(remaining - n, left - 1, acc + (n,))
+
+    rec(int(total_layers), int(stages), ())
+    return out
+
+
+def solve_pp_cut_for_prefill_speed(
+    total_layers: int,
+    timing: PrefillTiming,
+    incumbent: Sequence[int],
+    max_rank0_layers: int,
+    min_layers_per_stage: int = 1,
+    pool_fn: Optional[Callable[[Sequence[int]], Optional[float]]] = None,
+    top: Optional[int] = None,
+) -> List[PrefillCutCandidate]:
+    """Enumerate feasible cuts and price each on BOTH time objectives.
+
+    ``max_rank0_layers`` is a hard VRAM constraint, not a preference: rank0's
+    weights plus arena must fit its budget, and a cut above the cap is
+    arithmetic that ignores it.
+
+    ``pool_fn`` supplies the capacity cost of a cut, in tokens. It is injected
+    rather than computed here so this solver stays free of ``PPCutInputs``; when
+    it is absent, ``pool_tokens`` is ``None`` and NO pool number is invented.
+    Every candidate carries both speedups and the pool cost so the trade is
+    decided on numbers.
+    """
+    stages = len(incumbent)
+    _check_total(incumbent, total_layers)
+    base_serial = serial_prefill_ms(incumbent, timing)
+    base_pipelined = pipelined_prefill_ms(incumbent, timing)
+    cands: List[PrefillCutCandidate] = []
+    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage):
+        if counts[0] > int(max_rank0_layers):
+            continue
+        s = serial_prefill_ms(counts, timing)
+        p = pipelined_prefill_ms(counts, timing)
+        cands.append(
+            PrefillCutCandidate(
+                counts=counts,
+                serial_ms=s,
+                pipelined_ms=p,
+                serial_speedup=base_serial / s,
+                pipelined_speedup=base_pipelined / p,
+                pool_tokens=(None if pool_fn is None else pool_fn(counts)),
+            )
+        )
+    cands.sort(key=lambda c: c.serial_ms)
+    return cands if top is None else cands[: int(top)]
+
+
+# ---------------------------------------------------------------------------
+# #702 revision -- CO-SOLVING the KV/mamba token vector with the layer cut.
+#
+# Revision 1 of this objective reported a "pool cost" per candidate while
+# holding the KV token vector PINNED. That is single-family optimization and
+# the #485 phase-matrix doctrine forbids it: the vector is not a constant of
+# the problem, it is a second free variable that moves WITH the cut.
+#
+# The mechanics that make it move: a layer relocated to rank0 frees exactly its
+# weight bytes on the rank it left. Those bytes are immediately available to the
+# uneven-DCP / rank-kv-ratio machinery, which relocates the displaced KV share
+# onto them (the #320 capacity-matched pattern -- prefill 10,1,1 against a kv
+# vector 2,11,10). Rank0's VRAM cap therefore bounds rank0's SHARE of the token
+# split; it does not bound the world pool.
+#
+# Consequence, and it is exact rather than approximate: total VRAM is fixed and
+# the same 64 layers of weights exist wherever they sit, so total free bytes are
+# invariant under the cut. Under DCP the KV is token-sharded -- a rank holds the
+# full layer stack for its share of tokens -- so a token of world capacity costs
+# the same total bytes on any cut. The world pool is CONSERVED, and the only
+# honest residual is second-order: seam/staging in both directions and the
+# TP-phase vector redistribution, which are itemized rather than lumped.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldMemory:
+    """Per-rank memory facts needed to co-solve the token vector."""
+
+    vram_mib: Tuple[float, ...]
+    nonlayer_weight_mib: Tuple[float, ...]
+    weight_mib_per_layer: float
+    kv_mib_per_token_per_layer: float
+
+
+@dataclasses.dataclass(frozen=True)
+class CoSolvedCut:
+    counts: Tuple[int, ...]
+    serial_ms: float
+    pipelined_ms: float
+    serial_speedup: float
+    pipelined_speedup: float
+    kv_token_vector: Tuple[float, ...]
+    world_pool_tokens: float
+    world_pool_delta: float
+    second_order: Dict[str, float]
+
+
+def _free_mib(counts: Sequence[int], world: WorldMemory) -> List[float]:
+    free: List[float] = []
+    for r, n in enumerate(counts):
+        f = (
+            float(world.vram_mib[r])
+            - float(world.nonlayer_weight_mib[r])
+            - float(world.weight_mib_per_layer) * float(n)
+        )
+        if f < 0.0:
+            raise ValueError(
+                f"cut {tuple(counts)} is infeasible on rank{r}: "
+                f"{n} layers need "
+                f"{float(world.weight_mib_per_layer) * float(n):,.1f} MiB of "
+                f"weights plus {float(world.nonlayer_weight_mib[r]):,.1f} MiB "
+                f"non-layer against {float(world.vram_mib[r]):,.1f} MiB of "
+                f"VRAM, i.e. {-f:,.1f} MiB short. This is a weight overflow, "
+                "not a small pool."
+            )
+        free.append(f)
+    return free
+
+
+def _world_pool(
+    counts: Sequence[int],
+    world: WorldMemory,
+    overhead: Mapping[str, float],
+) -> Tuple[float, Tuple[float, ...]]:
+    """Return (world_pool_tokens, per-rank token vector).
+
+    Token-sharded (DCP): a rank holds the full layer stack for its SHARE of the
+    tokens, so one token costs ``kv_mib_per_token_per_layer * total_layers``
+    wherever it lands. That is what makes the world pool cut-invariant.
+    """
+    total_layers = int(sum(counts))
+    per_token = float(world.kv_mib_per_token_per_layer) * float(total_layers)
+    free = _free_mib(counts, world)
+    raw = [f / per_token for f in free]
+    pool = (sum(free) - float(sum(overhead.values()))) / per_token
+    scale = 1.0 if sum(raw) == 0 else pool / sum(raw)
+    return pool, tuple(x * scale for x in raw)
+
+
+def cosolve_prefill_cut(
+    counts: Sequence[int],
+    world: WorldMemory,
+    timing: PrefillTiming,
+    incumbent: Sequence[int] = (28, 20, 16),
+    overhead_fn: Optional[Callable[[Sequence[int]], Mapping[str, float]]] = None,
+) -> CoSolvedCut:
+    """Price one cut on time AND on a co-solved KV/mamba token vector.
+
+    ``overhead_fn`` returns the itemized second-order MiB terms for a cut
+    (seam/staging both directions, TP-phase redistribution). It is injected so
+    this solver invents no memory number it has not been given; absent it, the
+    residual is zero and the conservation result stands unqualified.
+    """
+    counts = tuple(int(n) for n in counts)
+    ov = dict(overhead_fn(counts)) if overhead_fn is not None else {}
+    base_ov = dict(overhead_fn(incumbent)) if overhead_fn is not None else {}
+    pool, vector = _world_pool(counts, world, ov)
+    base_pool, _ = _world_pool(incumbent, world, base_ov)
+    s = serial_prefill_ms(counts, timing)
+    p = pipelined_prefill_ms(counts, timing)
+    return CoSolvedCut(
+        counts=counts,
+        serial_ms=s,
+        pipelined_ms=p,
+        serial_speedup=serial_prefill_ms(incumbent, timing) / s,
+        pipelined_speedup=pipelined_prefill_ms(incumbent, timing) / p,
+        kv_token_vector=vector,
+        world_pool_tokens=pool,
+        world_pool_delta=pool - base_pool,
+        second_order=ov,
+    )
