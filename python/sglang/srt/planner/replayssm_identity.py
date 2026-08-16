@@ -1,6 +1,29 @@
-"""#700: the ReplaySSM byte-identity gate.
+"""#700: ReplaySSM divergence classifier. NOT the enable gate -- see below.
 
-``--enable-linear-replayssm`` stays off until BOTH halves are settled:
+**RETIRED AS A GATE (2026-08-16).** The byte-identity criterion is structurally
+unpassable and has been withdrawn as the enable condition. The kernel's own
+registered test, ``test_linear_replayssm_decode.py``, settles it: its docstring
+states the kernel is "algebraically equivalent but floating-point REORDERED",
+and the suite contains ZERO exact-equality assertions -- every check is
+tolerance-based (atol 2e-6 at L=1, 1e-4/1e-3 at L>=4). It passes 6/36 subtests
+on GPU. ReplaySSM produces a nonzero delta BY DESIGN; the reordering IS the
+optimization, so no probe at any level can show byte-identity.
+
+``--enable-linear-replayssm`` therefore stays OFF and its enable path is
+Quality-Last: lossy features go to the back of the queue and need quality-suite
+evidence. A criterion nothing can pass is not a gate.
+
+**What this module is still for:** regression-pinning the tolerance band. If a
+future kernel change widens divergence beyond the envelope the registered test
+encodes, that is a real regression, and the classifier's distinction between
+"same tokens, nonzero delta" and "tokens changed" is the right shape to catch
+it. Do not cite it as the enable gate.
+
+Historical context below; the wiring half remains correct and useful.
+
+---
+
+The wiring contradiction, resolved:
 
 1. **Wiring** -- resolved. The kernel header's "NOT yet wired into the memory
    pool / radix cache / scheduler / backend dispatch" was stale and false in all

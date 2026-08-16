@@ -156,3 +156,52 @@ changes emitted tokens.
 identity result decides whether the perf arm is even worth running. If the
 divergence changes emitted tokens, ReplaySSM is a lossy feature and goes last
 by standing policy, whatever the 1.68x says.
+
+---
+
+## 8 — VERDICT: byte-identity is structurally unpassable. Gate retired.
+
+Decided without a boot, from the kernel's OWN registered test
+(`test_linear_replayssm_decode.py`), run on GPU2 alongside live serving: **6
+passed / 36 subtests**.
+
+The test settles it by construction:
+
+* its docstring states the kernel is *"algebraically equivalent but
+  floating-point REORDERED"*;
+* the suite contains **zero exact-equality assertions**. Every check is
+  tolerance-based — `atol 2e-6` at L=1, `1e-4`/`1e-3` at L>=4.
+
+So ReplaySSM produces a nonzero delta **by design**: the reordering *is* the
+optimization. Under the acceptance rule it is **not byte-identical and cannot
+be**, at any L, on any rig.
+
+**Verdict: `--enable-linear-replayssm` STAYS OFF.** The enable path is now
+**Quality-Last** per standing doctrine — lossy features go to the back of the
+queue and require quality-suite evidence, not a byte gate. The byte-identity
+gate is **retired as the criterion**, because a criterion nothing can pass is
+not a gate, it is a permanent refusal wearing a gate's clothes.
+
+### What this means for the harness I built
+
+`planner/replayssm_identity.py` and `scripts/replayssm/identity_probe.py`
+(fc74a3e03b) were built to answer a question the kernel's own registered test
+had already answered. At serving level they can only confirm the same result
+**more noisily**, with end-to-end variance layered on top of a delta that is
+deliberate.
+
+Their remaining value is narrower and worth keeping: **regression-pinning the
+tolerance band**. If a future kernel change widens the divergence beyond the
+2e-6 / 1e-4 / 1e-3 envelope the registered test encodes, that is a real
+regression, and the classifier distinguishing "same tokens, nonzero delta" from
+"tokens changed" is the right shape for catching it. They are **not** the enable
+gate and must not be cited as one.
+
+### The miss, recorded
+
+I built a measurement harness without first checking whether a registered test
+already covered the question. It did, definitively, and it was cheaper and
+sharper than an end-to-end probe. This is the same lesson as the mamba
+allocation instrument, which also already existed
+(`"Mamba Cache is allocated"`): **look for the existing instrument before
+building one.** Twice now the answer was already in the tree.
