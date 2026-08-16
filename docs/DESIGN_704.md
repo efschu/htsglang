@@ -578,9 +578,6 @@ reallocation, no bytes. Combined with §3.8's union arena, a rung change moves
 nothing at all; a test pins that every parameter keeps its `data_ptr()` across
 a flip while the executed set changes.
 
-Note `models/qwen3_next.py` is **not** the PP model — it asserts
-`is_first_rank and is_last_rank` at `:1165`. `qwen3_5.py` is the PP-capable one.
-
 **Load wide, run narrow.** At boot a rank builds and loads real modules for the
 UNION of the ranges it may occupy, then runs whichever sub-range the ladder
 selects. The union must be in force during *loading* too, because weight
@@ -597,16 +594,81 @@ Two failure modes are enforced rather than documented:
    by the owned range. Observers run inside the flip; if one raises, the range
    is **rolled back** and the flip fails.
 
-A third came out of a test failure rather than foresight: the actuator
-originally *assumed* the model already sat at its current rung. Under load-wide
-it does not — it arrives wide — so the constructor now performs the narrowing
-step explicitly. Left as it was, the actuator's belief and the model's actual
-range would have disagreed from the first forward, silently executing a layer
-the rank did not own.
+3. **CONTRACT — the actuator owns the active range; it never infers it.**
+   Constructing a `LayoutBoundaryActuator` *applies* the declared current
+   rung's range to the model. It does not read the model's range and assume
+   agreement, and it does not accept the model's range as authoritative. There
+   is exactly one writer of `_start_layer`/`_end_layer` once an actuator
+   exists, and any other writer is a defect.
+
+   The contract is stated positively because the alternative is not a warning
+   but a silent split brain: under "load wide, run narrow" the model *arrives*
+   at the union range, so an actuator that merely recorded a declared rung
+   would disagree with the model from the very first forward, and the rank
+   would execute a layer it does not own — producing plausible output, not an
+   error. (This was found by test failure rather than foresight; it is written
+   as a contract because the next reader needs the rule, not the anecdote.)
+   Pinned by `test_construction_performs_the_narrowing_step`.
+
+**Model-class correction, carried here because it misled me once:**
+`models/qwen3_next.py` is **not** the pipeline-parallel model — it asserts
+`is_first_rank and is_last_rank` at `qwen3_next.py:1165`, i.e. PP=1 only.
+`models/qwen3_5.py` is the PP-capable class and is the one every citation in
+this section refers to. Any note pointing at `qwen3_next` for PP layer handling
+is wrong.
 
 World-level tiling is validated separately (`validate_world_tiling`), because
 it cannot be checked locally: a gap silently drops layers and an overlap
 computes them twice, while every individual rank's range looks sensible.
+
+### 3.10 Slice 1a-i — what the timing pair can and cannot pin
+
+Landed as `planner/timing_calibration.py`, 9 hermetic tests.
+
+`PrefillTiming` models a stage as `fixed_ms[r] + ms_per_layer[r] * n_r`, and
+one measured cut cannot separate the two — both fit the single point exactly.
+`prefill_timing_from_measurement` therefore defaults `fixed_ms` to zero, the
+**optimistic** end of the family, which is exactly why every speedup in this
+document is an upper bound. Two cuts resolve it per rank by elimination.
+
+Doing the arithmetic before the window rather than after changed what the boot
+should ask for. The slice-1a pair is **three different calibrators at once**:
+
+| rank | layers | dn | expected Δt | verdict |
+|---|---|---|---|---|
+| rank0 | 28 → 29 | +1 | ~1.76 ms | weak — the binding cost |
+| rank1 | 20 → 19 | −1 | ~7.74 ms | strong |
+| rank2 | 16 → 16 | 0 | — | **not calibrated at all** |
+
+**rank2 is not calibrated by this pair**, and the solver refuses to report an
+intercept for it rather than emitting the `fixed_ms=0` fallback, which at a
+call site is indistinguishable from a measurement.
+
+**Sample count is a precondition, not an afterthought.** The slope is a
+difference of two means over the layer delta, so `stderr(s) = √2·σ/|dn|`, and
+`dn = 1` puts the entire per-stage noise onto the slope. Because rank0's slope
+is small, it is far more expensive to pin than rank1's:
+
+| per-chunk SD | chunks for 10% on rank0 (1.757) | on rank1 (7.740) |
+|---|---|---|
+| 1 ms | 65 | 4 |
+| 2 ms | 260 | 14 |
+| 3 ms | 584 | 31 |
+| 5 ms | 1620 | 84 |
+
+Useful arithmetic: one max-length prompt is `327680 / 512 = 640` chunks, which
+clears the 584 needed at SD = 3 ms — so **one full-length prefill per arm
+suffices for rank0 at 10%**, provided the per-chunk SD is actually measured and
+reported rather than assumed. `samples_needed()` answers this before the
+window; discovering afterwards that the samples could never have supported the
+claim is the expensive way to learn it.
+
+Two further refusals, both because a confident-looking wrong number is worse
+than none: a **negative intercept** is reported rather than clamped (it means
+the linear model does not hold across the pair, most likely a non-constant
+per-layer cost), and a **structural** refusal — this pair cannot calibrate that
+rank — is raised before any data-dependent one, so the reader is not sent to
+inspect timings when the pair was never capable of the answer.
 
 ### 3.6 Interaction with the flip controller's seam funding
 
@@ -908,7 +970,7 @@ document is an upper bound** until a second measured cut pins the intercept.
 |---|---|---|---|
 | **0 — landed** | Family-split pool rule + ladder solver, hermetic, 3 hardware profiles | done | 26 tests green |
 | **0b — landed** | Rung controller (decision function) + oscillation falsifiers | done | 10 tests green, can-fail verified |
-| **1a-i — ticket ready** | Two STATIC boots, `[28,20,16]` ↔ `[29,19,16]`, one variable (`--pp-layer-ratio`). **Zero new code.** Both are (7,5,4), layer 28 is linear, so no attention layer and no KV row moves | 1 short window | A1 pool within 2.5k of 436,766; A2 PP2 binds; A3 K sizes unchanged. Plus **T1: the second timing cut** |
+| **1a-i — ticket + calibration harness ready** | Two STATIC boots, `[28,20,16]` ↔ `[29,19,16]`, one variable (`--pp-layer-ratio`). **Zero new code.** Both are (7,5,4), layer 28 is linear, so no attention layer and no KV row moves | 1 short window | A1 pool within 2.5k of 436,766; A2 PP2 binds; A3 K sizes unchanged. Plus **T1: the second timing cut** |
 | **1a-ii — desk-complete** | Union arena (`weights_arena_union.py`, 13 tests) + boundary actuator (`layout_boundary.py`, 14 tests): load the union per rank, size the arena for the union, mutate `_start_layer`/`_end_layer` at quiescence with observer rollback. Remaining for a window: boot-time union load + the dependent-structure observers | 1 window | flip completes, output byte-identical across a flip and back, graphs survive |
 | **1b** | Wire the controller to 1a on a pair that actually trades: `[35,14,15]` ↔ `[38,13,13]` (attn0 8→9) | 1 window | hysteresis proven on metal, no oscillation under load |
 | **2** | Measure real move cost on the pair matrix **and the CUDA-graph recapture cost**, to decide arena vs realloc (§3.7); re-solve | 0.5 window | move time within 20% of solved; the arena/realloc fork closed on numbers |

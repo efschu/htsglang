@@ -189,9 +189,43 @@ cat <<MSG
   ALSO CAPTURE (the independent prize -- the timing intercept):
     T1  the three per-stage prefill times at $RATIO_NEW, against the
         incumbent's 49.2 / 154.8 / 116.4 ms. Two measured cuts pin the
-        per-layer slope against the fixed per-stage cost for the first time
-        and convert every speedup in DESIGN_704 from an upper bound into a
-        prediction. Worth the window on its own.
+        per-layer slope against the fixed per-stage cost, which converts every
+        speedup in DESIGN_704 from an UPPER BOUND into a prediction.
+
+        WHAT THIS PAIR CAN AND CANNOT PIN -- read before planning the run.
+        Solved by planner/timing_calibration.py, not by hand:
+
+          rank0: 28 -> 29  (dn=+1)   expected dt ~ 1.76 ms
+          rank1: 20 -> 19  (dn=-1)   expected dt ~ 7.74 ms
+          rank2: 16 -> 16  UNCHANGED -- NOT CALIBRATED BY THIS PAIR
+
+        rank2 keeps 16 layers in both cuts, so the pair carries no information
+        about its intercept. Do NOT report one for it; the solver refuses by
+        default rather than emitting the optimistic fixed_ms=0 fallback, which
+        would be indistinguishable from a measurement.
+
+        SAMPLE COUNT IS A PRECONDITION, NOT AN AFTERTHOUGHT. The slope is a
+        difference of two means over the layer delta, so its standard error is
+        sqrt(2)*sigma/|dn|, and dn=1 puts the entire per-stage noise onto the
+        slope. That bites unevenly, because rank0's slope is small:
+
+          per-chunk SD | chunks needed for 10% slope precision
+                       |   rank0 (1.757)      rank1 (7.740)
+                  1 ms |        65                  4
+                  2 ms |       260                 14
+                  3 ms |       584                 31
+                  5 ms |      1620                 84
+
+        So rank1 is cheap to calibrate and rank0 is the binding cost. Convenient
+        arithmetic: one max-length prompt is 327680/512 = 640 chunks, which
+        clears the 584 needed at SD=3 ms. ONE full-length prefill per arm is
+        therefore sufficient for rank0 at 10% -- but MEASURE the per-chunk SD
+        and report it, do not assume 3 ms.
+
+        Report per stage: mean, per-chunk SD, N, and the standard error of the
+        mean. Without the SE the intercept cannot be gated and must not be
+        published.
+
     T2  the per-rank arming floors at this layout (rev5 consumes them per
         layout; an unbooted cut has no solved floor).
 
