@@ -194,6 +194,19 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   `link_disjointness()` expose PATH identity for #423's striping gate, with
   `DISJOINT` requiring complete paths on both sides and `UNKNOWN` being a
   refusal. Design: `docs/dev/DESIGN_407_memtier_registry.md`.
+  TWO #407 DESIGNS, deliberately: `DESIGN_407_memory_tier_registry.md` is
+  the design of record (node layer, consumer survey, tier interface,
+  measurement plan, cut plan); `DESIGN_407_memtier_registry.md` is the
+  #434 amendment and WINS on its three enumerated overrides. Both now
+  cross-reference; see `VERDICT_407_two_designs.md`.
+  CUT 6 SHIPPED: `--hibernate-dir` resolves through the registry and
+  refuses a provably volatile medium by name
+  (`memtier/hibernate_tier.py`, called from `ServerArgs`), closing the
+  tmpfs-hibernate silent-correctness hole -- a park that reported success
+  and lost the backup at the next reboot. An UNRESOLVABLE mount warns
+  rather than refuses: a gate that cannot see must not veto a working
+  container. Cut 2 was already delivered (the launcher-published rank ->
+  card-UUID vector, `registry/rank_cards.py`).
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream

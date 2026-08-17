@@ -5,6 +5,27 @@ Charter (user directive, verbatim): *every memory you have access to must be a
 disk / RAM / VRAM, local as well as remote.* #224 is consumer number one, #305
 is the policy layer above.
 
+> **READ THIS FIRST — there is a second #407 design document, and it wins where
+> the two disagree.** `DESIGN_407_memtier_registry.md` (2026-08-02, slice 1b,
+> directive #434) is scoped to what #434 changed and to slice 1. **This document
+> remains the design of record** for the node layer, the consumer survey (§2),
+> the tier interface (§3), the measurement plan (§4) and the cut plan (§5) --
+> the newer one cites those rather than restating them. But it overrides this
+> document on exactly three points, enumerated in its §2: the profile default
+> (`profiles/rig1.json` is a *candidate* matched against hardware, not a
+> normal-path default), the empty `cards` list in that profile (functional, not
+> a TODO -- it can only match at MODEL scope and asserts nothing about a
+> reader's host or disks), and `TierCaps` provenance (values may now enter from
+> an artifact adapter, though `apply_outcome` is still the only writer and its
+> refusals are unchanged). Everything else here stands, including all four
+> exclusions (X1 HiCache ladder, X2 GDN state, X3 cross-rig GPU-to-GPU, X4
+> compute placement) and the C1/C2 contradictions.
+>
+> This pointer was added on 2026-08-17. The forward reference already existed;
+> the back reference did not, so a reader who opened this document first had no
+> way to learn it had been partially superseded. See
+> `VERDICT_407_two_designs.md`.
+
 Desk work, no cards (`CUDA_VISIBLE_DEVICES=99`). Branch
 `docs/407-tier-registry-design`, base `1421d20dce`
 (`integration/r3-probe-next2`). This document designs; it changes no code.

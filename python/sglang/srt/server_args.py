@@ -13182,9 +13182,17 @@ class ServerArgs:
                 raise ValueError(
                     "--hibernate-dir requires --enable-weights-disk-backup."
                 )
+            from sglang.srt.memtier.hibernate_tier import (
+                refuse_volatile_hibernate_dir,
+            )
             from sglang.srt.model_loader.hibernate import (
                 hibernate_manifest_matches,
             )
+
+            # #407 cut 6: the park is only a backup if the medium survives a
+            # reboot. Checked here, before any weight is written, because the
+            # failure it prevents is silent -- every write to a tmpfs succeeds.
+            refuse_volatile_hibernate_dir(self.hibernate_dir)
 
             if self.load_format != "gguf":
                 raise ValueError(
