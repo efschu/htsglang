@@ -25,6 +25,8 @@ visible rather than buried.
 Hermetic: pure arithmetic, no CUDA, no pool construction.
 """
 
+import unittest
+
 import pytest
 
 from sglang.srt.planner.pp_cut import (
@@ -173,3 +175,108 @@ def test_timing_rejects_a_zero_layer_calibration_stage():
     """Dividing a stage time by zero layers is not a per-layer cost."""
     with pytest.raises(ValueError, match="zero"):
         prefill_timing_from_measurement((28, 0, 36), (49.2, 154.8, 116.4))
+
+
+# ---------------------------------------------------------------------------
+# RECONCILIATION (Cluster B, 2026-08-17): what became of the co-solve tests.
+#
+# The serving line carried six tests here that pinned the WorldMemory /
+# cosolve_prefill_cut model:
+#
+#   test_world_pool_is_conserved_when_overheads_do_not_move_with_the_cut
+#   test_the_residual_is_exactly_the_itemized_second_order_terms
+#   test_kv_vector_shifts_onto_the_freed_3080_bytes
+#   test_rank0_cap_bounds_only_its_own_share_not_the_world_pool
+#   test_a_cut_that_overflows_rank0_is_refused_by_name
+#   test_speedups_survive_the_cosolve_unchanged
+#
+# #701/#704a replaced that model with PhasePoolModel + pp_phase_pool /
+# tp_phase_pool and deleted those tests along with the API they exercised.
+# They are NOT restored as-is: four of them assert properties of a "world
+# pool" that no longer exists as a concept, and restoring them would pin a
+# model this tree deliberately left behind.
+#
+# The supersession is decided on the standing rule -- measured beats designed,
+# newer beats older. The phase-pool model reproduces BOTH metal calibration
+# points with solved per-layout floors (test_pp_cut_phase_pool_702.py); the
+# co-solve model is the older design and had no metal backing of its own.
+#
+# What survives is re-pinned below against the new model, so no claim is
+# dropped silently -- only re-expressed.
+# ---------------------------------------------------------------------------
+
+
+class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
+    """The surviving half of the six, against PhasePoolModel."""
+
+    def _model(self):
+        from sglang.srt.planner.pp_cut import PhasePoolModel
+
+        return PhasePoolModel(
+            free_mib=(20000.0, 12000.0, 12000.0),
+            weight_mib_per_layer=450.7,
+            kv_mib_per_token_per_attn_layer=0.002,
+            arming_floor_mib=(2255.0, 1728.0, 2467.0),
+        )
+
+    def test_the_pp_pool_is_the_binding_rank_not_a_world_sum(self):
+        """SUPERSEDES test_world_pool_is_conserved... and
+        test_rank0_cap_bounds_only_its_own_share_not_the_world_pool.
+
+        There is no world pool to conserve, nor one that a per-rank cap could
+        fail to bound: the PP-phase pool IS the min over ranks, so the binding
+        rank is the pool and a per-rank cap CAN bind it -- the opposite of the
+        old claim, which is why that test could not be carried over.
+        """
+        from sglang.srt.planner.pp_cut import pp_phase_pool, stage_pp_capacities
+
+        model = self._model()
+        counts, attn = (32, 16, 16), (8, 4, 4)
+        caps = stage_pp_capacities(counts, attn, model)
+        pool = pp_phase_pool(counts, attn, model)
+        self.assertAlmostEqual(pool, min(caps), places=6)
+        self.assertLessEqual(pool, max(caps))
+
+    def test_the_tp_pool_is_a_sum_and_ignores_the_cut(self):
+        """SUPERSEDES test_kv_vector_shifts_onto_the_freed_3080_bytes.
+
+        That intuition belongs to the TP column, which is a SUM over ranks and
+        independent of any PP cut, so it is pinned as cut-independence rather
+        than as a vector shift.
+        """
+        from sglang.srt.planner.pp_cut import tp_phase_pool
+
+        model = self._model()
+        self.assertEqual(tp_phase_pool(16, 3, model), tp_phase_pool(16, 3, model))
+        self.assertGreater(tp_phase_pool(16, 3, model), 0.0)
+
+    def test_overflow_is_still_refused_by_name(self):
+        """SUPERSEDES test_a_cut_that_overflows_rank0_is_refused_by_name.
+
+        This claim survived the model change intact; the new model's own suite
+        pins it as test_weight_overflow_is_refused_by_name. Cross-checked here
+        so this file records that it was carried, not dropped.
+        """
+        from sglang.srt.planner.pp_cut import stage_pp_capacities
+
+        with self.assertRaises(ValueError):
+            stage_pp_capacities((64, 0, 0), (16, 0, 0), self._model())
+
+    def test_the_speedup_objectives_are_untouched_by_the_pool_model(self):
+        """SUPERSEDES test_speedups_survive_the_cosolve_unchanged.
+
+        The original point -- co-solving for capacity must not perturb the
+        timing objectives -- now reduces to the observation that the timing
+        half does not consult the pool model at all.
+        """
+        timing = _timing()
+        self.assertAlmostEqual(
+            serial_prefill_ms((32, 16, 16), timing),
+            sum(c * m for c, m in zip((32, 16, 16), timing.ms_per_layer)),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pipelined_prefill_ms((32, 16, 16), timing),
+            max(c * m for c, m in zip((32, 16, 16), timing.ms_per_layer)),
+            places=6,
+        )
