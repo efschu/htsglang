@@ -353,6 +353,163 @@ class LoopbackLink(KvLink):
         self._open = False
 
 
+def order_blocks(blocks: Sequence[TransferBlock]) -> List[TransferBlock]:
+    """The order both sides walk, derived rather than coordinated.
+
+    NCCL send/recv pair up POSITIONALLY: the n-th send on the sender must meet
+    the n-th recv on the receiver. The two instances build their block lists
+    independently from their own page tables, so relying on "the order the
+    planner happened to emit" makes correctness depend on two code paths
+    staying in step -- and a mismatch does not fail, it lands the right bytes
+    at the wrong offset (#345's class, one layer down).
+
+    Sorting both sides by a key each can compute alone removes the need to
+    agree at all. Region first, then the offsets, so the order is total.
+    """
+    return sorted(
+        blocks,
+        key=lambda b: (b.region_index, b.src_offset_bytes, b.dst_offset_bytes),
+    )
+
+
+def _validate_blocks(
+    blocks: Sequence[TransferBlock],
+    regions: Sequence[MemoryRegion],
+    *,
+    link: str,
+) -> None:
+    """Bounds-check a plan against the registered regions.
+
+    The messages deliberately mirror LoopbackLink's, because the KvLink
+    contract says a caller must not be able to tell the members apart by which
+    errors they raise. Loopback keeps its own inline copy: rewriting it would
+    put a refactor of a validated member inside an unvalidated member's cut.
+    """
+    if not regions:
+        raise LinkError(
+            f"{link} link has no registered regions; register() must run "
+            f"before transfer()"
+        )
+    for b in blocks:
+        if b.region_index >= len(regions):
+            raise LinkError(
+                f"block references region {b.region_index}, but only "
+                f"{len(regions)} region(s) exist"
+            )
+        region = regions[b.region_index]
+        for offset, side in (
+            (b.src_offset_bytes, "source"),
+            (b.dst_offset_bytes, "destination"),
+        ):
+            if offset + b.length_bytes > region.length:
+                raise LinkError(
+                    f"block runs past the {side} region {region.what!r}: "
+                    f"{offset}+{b.length_bytes} > {region.length}"
+                )
+
+
+class LinkOps:
+    """The two wire calls, isolated so the contract above is testable.
+
+    Production is :class:`TorchDistributedOps`. A test supplies a double and
+    then owns every property this module claims -- ordering, bounds, partial
+    failure, accounting -- without a peer, which is the only way any of it can
+    be checked before the GPU ticket runs.
+    """
+
+    def send(self, view: Any, *, group: Any, timeout_s: float) -> None:
+        raise NotImplementedError
+
+    def recv(self, view: Any, *, group: Any, timeout_s: float) -> None:
+        raise NotImplementedError
+
+
+class TorchDistributedOps(LinkOps):
+    """torch.distributed point-to-point, bounded by the #312 helpers.
+
+    NOT VALIDATED ON HARDWARE -- this is the half the GPU ticket exists to
+    prove. It is written against the same bounded-wait helpers the rest of the
+    fork uses rather than raw ``dist.send``/``dist.recv``, so a dead peer ends
+    the wait with a named error instead of hanging a scheduler thread.
+    """
+
+    def _peer_rank(self, group: Any) -> int:
+        import torch.distributed as dist
+
+        rank = dist.get_rank(group=group)
+        # A cross-instance link is a two-member group by construction (#259's
+        # fixed universe), so the peer is simply the other rank.
+        return 1 - rank
+
+    def send(self, view: Any, *, group: Any, timeout_s: float) -> None:
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            bounded_collective,
+        )
+
+        bounded_collective(
+            lambda: dist.send(view, dst=self._peer_rank(group), group=group),
+            timeout_s=timeout_s,
+            what="nccl kv send",
+        )
+
+    def recv(self, view: Any, *, group: Any, timeout_s: float) -> None:
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            bounded_collective,
+        )
+
+        bounded_collective(
+            lambda: dist.recv(view, src=self._peer_rank(group), group=group),
+            timeout_s=timeout_s,
+            what="nccl kv recv",
+        )
+
+
+class _ArrayInterfaceView:
+    """Describes a raw device range to torch, per weak_ref_tensor.py's pattern."""
+
+    __slots__ = ("__cuda_array_interface__",)
+
+    def __init__(self, interface: dict):
+        self.__cuda_array_interface__ = interface
+
+
+def default_region_view(region: MemoryRegion, offset: int, length: int) -> Any:
+    """A byte range of a registered region, as a tensor torch can send.
+
+    THE ONE PRIMITIVE THAT COULD NOT BE WRITTEN BLIND, and it is isolated here
+    for that reason. Device memory goes through ``__cuda_array_interface__``
+    (the same route ``compilation/weak_ref_tensor.py`` already uses to build a
+    non-owning tensor over a pointer); host memory goes through ctypes. The
+    region carries only a pointer, so which one applies cannot be read off the
+    type -- the CUDA route is tried first and the host route is the fallback.
+
+    The GPU ticket owns confirming this against a real KV buffer. Until then
+    the wire path is opt-in, and a caller that wants a different materialisation
+    passes ``region_view=`` rather than editing this.
+    """
+    import torch
+
+    base = region.ptr + offset
+    try:
+        interface = {
+            "shape": (length,),
+            "typestr": "|u1",
+            "data": (base, False),
+            "version": 3,
+            "strides": None,
+        }
+        return torch.as_tensor(_ArrayInterfaceView(interface))
+    except Exception:  # noqa: BLE001 - host memory, or no CUDA at all
+        import ctypes
+
+        buffer = (ctypes.c_char * length).from_address(base)
+        return torch.frombuffer(memoryview(buffer), dtype=torch.uint8)
+
+
 class NcclLink(KvLink):
     """Cross-instance KV movement over an NCCL process group.
 
@@ -387,10 +544,31 @@ class NcclLink(KvLink):
         group_factory: Optional[Callable[..., Any]] = None,
         timeout_s: float = DEFAULT_LINK_TIMEOUT_S,
         world_size_fn: Optional[Callable[[Any], int]] = None,
+        wire_enabled: bool = False,
+        ops: Optional["LinkOps"] = None,
+        region_view: Optional[Callable[[MemoryRegion, int, int], Any]] = None,
     ) -> None:
         self._group = None
         self._group_factory = group_factory
         self._timeout_s = timeout_s
+        #: OPT-IN. False keeps transfer() raising the pre-wire NotImplementedError
+        #: verbatim. The two-instance GPU ticket is what flips this default; a
+        #: transport nobody has run must not become reachable by upgrading.
+        self._wire_enabled = bool(wire_enabled)
+        #: The two seams the wire path is built on, both injectable so the
+        #: CONTRACT (ordering, bounds, partial failure, accounting) is
+        #: exercisable without a peer -- and so the one primitive that cannot
+        #: be written blind, materialising a region as a tensor, is replaceable
+        #: by whatever the GPU ticket proves correct.
+        self._ops = ops if ops is not None else TorchDistributedOps()
+        self._region_view = (
+            region_view if region_view is not None else default_region_view
+        )
+        self.is_sender: bool = False
+        #: Observability parity with LoopbackLink, so a harness can read the
+        #: same fields off either member.
+        self.bytes_moved: int = 0
+        self.transfers: List[Dict[str, Any]] = []
         #: Injectable so the fixed-universe check is exercisable without a
         #: real process group; production leaves it None -> torch.distributed.
         self._world_size_fn = world_size_fn
@@ -453,13 +631,67 @@ class NcclLink(KvLink):
             raise LinkError("NcclLink.transfer() before setup()")
         if not blocks:
             return 0
-        raise NotImplementedError(
-            "NcclLink.transfer is the GPU slice of #111: it needs a "
-            "cross-instance NCCL group to run against and has therefore not "
-            "been written blind. The seam, the contract, the route policy and "
-            "the block planner are complete and tested; see "
-            "docs/dev/TASK_111_PD_KV_NCCL.md for the ticket that lands this."
+        if not self._wire_enabled:
+            # The pre-wire refusal, PRESERVED VERBATIM. The wire path below is
+            # opt-in until the two-instance GPU ticket passes, so a deployment
+            # that has not asked for it gets exactly the message it got before
+            # the path existed -- an unproven transport must not become
+            # reachable by upgrading.
+            raise NotImplementedError(
+                "NcclLink.transfer is the GPU slice of #111: it needs a "
+                "cross-instance NCCL group to run against and has therefore not "
+                "been written blind. The seam, the contract, the route policy and "
+                "the block planner are complete and tested; see "
+                "docs/dev/TASK_111_PD_KV_NCCL.md for the ticket that lands this."
+            )
+
+        from sglang.srt.disaggregation.nccl.contract import MessageClass
+
+        # Validated, not just carried: an unknown class here means the caller
+        # and the route policy disagree, and the route policy is what decided
+        # this link should carry the payload at all.
+        message = MessageClass(message_class)
+        timeout = self._timeout_s if timeout_s is None else float(timeout_s)
+        ordered = order_blocks(blocks)
+        _validate_blocks(ordered, self._regions, link=self.name)
+
+        moved = 0
+        for position, block in enumerate(ordered):
+            region = self._regions[block.region_index]
+            offset = (
+                block.src_offset_bytes if self.is_sender else block.dst_offset_bytes
+            )
+            try:
+                view = self._region_view(region, offset, block.length_bytes)
+                if self.is_sender:
+                    self._ops.send(view, group=self._group, timeout_s=timeout)
+                else:
+                    self._ops.recv(view, group=self._group, timeout_s=timeout)
+            except LinkTimeoutError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - re-raised as a link error
+                # NEVER a partial success. The count of bytes already on the
+                # wire is named because a caller that retries needs to know the
+                # stream is dirty -- #221's all-or-nothing, one layer down.
+                raise LinkError(
+                    f"{self.name} link to peer {self.peer!r}: block "
+                    f"{position + 1}/{len(ordered)} (region "
+                    f"{block.region_index}, {block.length_bytes} B) failed "
+                    f"after {moved} B had already moved: {exc!r}. The transfer "
+                    f"is incomplete and the peer's stream is out of step; this "
+                    f"session cannot be retried on the same link."
+                ) from exc
+            moved += block.length_bytes
+
+        self.bytes_moved += moved
+        self.transfers.append(
+            {
+                "message_class": message.value,
+                "blocks": len(ordered),
+                "bytes": moved,
+            }
         )
+        return moved
 
     def close(self) -> None:
         self._group = None
