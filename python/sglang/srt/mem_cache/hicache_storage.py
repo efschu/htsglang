@@ -14,8 +14,13 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.canonical_page_store import (
+        CanonicalExtentWindow,
+        CanonicalPageWindow,
+    )
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -117,6 +122,24 @@ class HiCacheStorageConfig:
     # readable by every rank), while component pools (mamba/SWA: genuinely
     # per-rank shards) keep the rank suffix.
     dcp_owner_mode: bool = False
+    # #706 whole-page protocol: this rank's slot window in the canonical page
+    # (mem_cache/canonical_page_store.py). Set only when the geometry-neutral
+    # format is active; None keeps every key and every byte exactly as before.
+    #
+    # When set, a KV page is full width (every attention layer of one token) and
+    # each stage deposits its own slots at their GLOBAL offset, so the bytes stop
+    # depending on the PP cut and the key drops the _{pp_size}_{pp_rank} suffix
+    # as well -- the same argument dcp_owner_mode above already made on the token
+    # axis. The key then carries content alone: model identity and token hash.
+    canonical_kv_page: Optional[CanonicalPageWindow] = None
+    # #706 slice 2: this rank's window in the canonical {hash}.mamba blob, on
+    # the same protocol. Required whenever the model HAS GDN/mamba layers and
+    # the canonical page is active, because a KV-only prefix is worth nothing:
+    # batch_exists_v2 takes the MINIMUM across pools and the mamba pool is
+    # registered TRAILING_PAGES, so a missing blob truncates the whole KV
+    # prefix to zero (test_mamba_gates_the_hit_706.py), and the device-side
+    # MambaRadixCache match advances only at nodes that carry mamba state.
+    canonical_mamba_blob: Optional[CanonicalExtentWindow] = None
 
 
 @dataclass
@@ -482,6 +505,43 @@ def page_shard(stem: str) -> str:
     return _SHARD_FALLBACK
 
 
+class MixedLayoutError(RuntimeError):
+    """The same page stem exists in BOTH the flat and the sharded layout."""
+
+
+def audit_layout(root_dir: str, *, limit: int = 8) -> list:
+    """Stems present in BOTH layouts. Empty list when the store is coherent.
+
+    Sharding (#558) is a READ-THROUGH migration: new writes are sharded, old
+    flat files keep serving hits, and nothing moves. That is safe exactly while
+    a stem lives in one place or the other. If a stem exists in both,
+    ``_existing_path`` silently prefers the sharded one -- and the two files can
+    differ, because the flat one was written under whatever geometry and format
+    the store had at the time. A silent preference between two candidate pages
+    for one content-addressed key is the failure this refuses.
+
+    Only the top-level ``.bin`` files are enumerated (the legacy layout), and
+    each is checked against its shard. A store that never had a flat layout
+    costs one scandir of a directory holding only shard directories.
+    """
+    duplicates = []
+    try:
+        with os.scandir(root_dir) as it:
+            entries = list(it)
+    except FileNotFoundError:
+        return duplicates
+    for entry in entries:
+        if entry.is_dir() or not entry.name.endswith(".bin"):
+            continue
+        stem = entry.name[:-4]
+        sharded = os.path.join(root_dir, page_shard(stem), entry.name)
+        if os.path.exists(sharded):
+            duplicates.append(stem)
+            if len(duplicates) >= limit:
+                break
+    return duplicates
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -502,6 +562,33 @@ class HiCacheFile(HiCacheStorage):
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         self.dcp_owner_mode = bool(getattr(storage_config, "dcp_owner_mode", False))
+        # #706: this rank's window in the canonical (full-width) page. None on
+        # every default path, and the ONLY thing that moves a key.
+        self.canonical_kv_page = getattr(storage_config, "canonical_kv_page", None)
+        self.canonical_mamba_blob = getattr(
+            storage_config, "canonical_mamba_blob", None
+        )
+        # Precomputed once: the KV page's generic (one-extent) form, so the hot
+        # path does not rebuild and revalidate it per page.
+        self._canonical_kv_extents = (
+            self.canonical_kv_page.as_extents()
+            if self.canonical_kv_page is not None
+            else None
+        )
+        if self.canonical_mamba_blob is not None and self.canonical_kv_page is None:
+            raise NotImplementedError(
+                "The #706 canonical mamba blob was configured without the "
+                "canonical KV page. The two travel together: a neutral GDN blob "
+                "beside pp-suffixed KV pages still misses across the flip."
+            )
+        if self.canonical_kv_page is not None and attn_cp_size > 1:
+            raise NotImplementedError(
+                "The #706 canonical KV page and NSA context parallel both claim "
+                "the page: each CP rank holds a disjoint slice of every page, "
+                "which is a THIRD sharding axis the 16-slot layer format does "
+                "not describe. Refusing rather than writing pages whose key no "
+                "longer names their bytes."
+            )
         # Model identity hash keeps runs that share a served_model_name but
         # differ in weights or KV byte format (dtype/quantization/
         # kv_cache_dtype) from hitting each other's persisted pages. Old-layout
@@ -521,11 +608,21 @@ class HiCacheFile(HiCacheStorage):
             self.kv_config_suffix += f"_{identity_hash}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
-            if not self.dcp_owner_mode:
+            if not self.dcp_owner_mode and self.canonical_kv_page is None:
                 self.kv_config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
-            self.kv_config_suffix += f"_{pp_size}_{pp_rank}"
+            # #706: the pp suffix is honest ONLY while a stage's page holds just
+            # that stage's layers. Under the canonical page the stages deposit
+            # their slots into one full-width page, so the bytes stop depending
+            # on the cut and the suffix has nothing left to name. The rule is
+            # not "keys always carry geometry" but "the key carries exactly the
+            # geometry the bytes still depend on" -- dropping it is legitimate
+            # here for the same reason dcp_owner_mode may drop the tp suffix,
+            # and for no other reason, which is why it is gated on the format
+            # being active rather than applied to every PP run.
+            if self.canonical_kv_page is None:
+                self.kv_config_suffix += f"_{pp_size}_{pp_rank}"
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
@@ -535,6 +632,62 @@ class HiCacheFile(HiCacheStorage):
         # Shard directories created so far (see page_shard): keeps the write path
         # to one makedirs per shard instead of one per page.
         self._known_shards: set[str] = set()
+
+        # #410: the pin ledger, loaded before anything can evict or sweep. It
+        # is durable because a checkpoint outlives the process, so a pin that
+        # only lived in memory would silently stop protecting anything at the
+        # next restart.
+        from sglang.srt.mem_cache.pin_ledger import PinLedger
+
+        self.pins = PinLedger(
+            self.file_path,
+            budget_bytes=int(envs.SGLANG_HICACHE_PIN_BUDGET_BYTES.get() or 0),
+        )
+        self.pins.load()
+
+        # #558: a stem in BOTH layouts means two candidate pages for one
+        # content-addressed key, and the read path would silently prefer one.
+        # Checked once, at attach, and refused loudly rather than resolved.
+        duplicates = audit_layout(self.file_path)
+        if duplicates:
+            raise MixedLayoutError(
+                f"HiCacheFile store {self.file_path!r} holds the same page in "
+                f"both the flat and the sharded layout: {duplicates}. The read "
+                "path prefers the sharded copy, but the two files can differ -- "
+                "the flat one predates sharding and may predate the current key "
+                "format entirely. Resolve it deliberately (delete the legacy "
+                "copies, or run the offline migration) rather than letting a "
+                "content-addressed key resolve to whichever file the lookup "
+                "order happens to find first."
+            )
+
+        # #706: orphaned partials are invisible to readers AND untracked by the
+        # LRU evictor (it walks .bin only), so nothing else would ever reap a
+        # page whose remaining writers never arrived. One sweep at attach, by
+        # age, on the same principle as the .tmp. staging files: never reap
+        # something a live writer might still be filling.
+        self._partial_ttl_s = float(
+            envs.SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S.get() or 3600.0
+        )
+        # #558: the free-space floor the canonical protocol refuses below. The
+        # LRU evictor's watermark does not cover this: it is disabled entirely
+        # unless a cap or a min-free is configured, which is the default.
+        self._space_floor_bytes = int(
+            envs.SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES.get() or 0
+        )
+        if self.canonical_kv_page is not None or self.canonical_mamba_blob is not None:
+            from sglang.srt.mem_cache.canonical_page_store import sweep_partials
+
+            try:
+                sweep_partials(
+                    self.file_path,
+                    older_than_s=self._partial_ttl_s,
+                    is_pinned=self.pins.is_pinned,
+                )
+            except OSError as e:
+                # A store that cannot be swept is still usable; orphans only
+                # cost disk, and the free-space watchdog still sees them.
+                logger.warning("Could not sweep canonical partial files: %s", e)
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -586,6 +739,7 @@ class HiCacheFile(HiCacheStorage):
             writer_count=writer_count,
             path_for_stem=self._existing_path,
             iter_existing=self._iter_existing_files,
+            pins=self.pins,
         )
 
     # Longest filename most Linux filesystems accept, in bytes.
@@ -616,12 +770,61 @@ class HiCacheFile(HiCacheStorage):
             )
         return f"{tensor_path}.tmp.{uuid.uuid4().hex[:min(16, room)]}"
 
+    def _is_draft_key(self, key: str) -> bool:
+        """Draft pages, excluded from every neutralisation rule BY NAME.
+
+        Draft KV is the exact MIRROR of target KV: head-SHARDED and
+        token-COMPLETE, written by every rank under its own suffix. No suffix
+        rule can neutralise that, so the draft pool starts cold after a flip or
+        a reboot -- the designed shape, and the reason a cross-phase hit is
+        expected to be PARTIAL rather than total.
+        """
+        return key.endswith(f".{PoolName.DRAFT}")
+
+    def _is_shared_kv_key(self, key: str) -> bool:
+        """True for the keys whose bytes are geometry-independent.
+
+        Plain KV page keys are bare page hashes (hex, no '.'); component and
+        draft keys are '{hash}.{pool_name}'. Only the plain ones can lose a
+        geometry suffix, under either rule that earns it:
+
+        * ``dcp_owner_mode`` -- pages carry FULL replicated kv-heads and are
+          token-sharded, so a page is complete on its owner rank (token axis).
+        * ``canonical_kv_page`` (#706) -- pages carry every attention layer, so
+          a page is complete across PP stages (layer axis).
+
+        DRAFT PAGES ARE EXCLUDED BY NAME, and not as an oversight. Draft KV is
+        the exact MIRROR of target KV: head-SHARDED and token-COMPLETE, written
+        by every rank under its own suffix. No suffix rule can neutralise that,
+        so the draft pool starts cold after a flip or a reboot -- the designed
+        shape, which is why a cross-phase hit is expected to be PARTIAL.
+        Component pools (mamba/SWA) are genuinely per-rank shards for the same
+        kind of reason and keep their suffix too; their cross-geometry form is
+        the offline cut in ``hicache_migrate`` (``MambaBlobSpec.for_layers`` /
+        ``layer_extents`` for the layer axis), never a softened key.
+        """
+        return "." not in key
+
+    def _is_shared_mamba_key(self, key: str) -> bool:
+        """True when the GDN/mamba blob for this key is the canonical one.
+
+        Gated on the window existing, because only then are the blob's bytes
+        full-width in both axes (every layer, every head) instead of this
+        rank's shard. Without it the blob stays per-rank and per-stage, exactly
+        as it is today.
+        """
+        return self.canonical_mamba_blob is not None and key.endswith(
+            f".{PoolName.MAMBA}"
+        )
+
     def _get_suffixed_key(self, key: str) -> str:
-        # Plain KV page keys are bare page hashes (hex, no '.'); component /
-        # draft keys are '{hash}.{pool_name}'. In dcp_owner_mode only the KV
-        # pages are rank-shared (full replicated kv-heads, owner-written) --
-        # component and draft pools stay per-rank.
-        if self.dcp_owner_mode and "." not in key:
+        if self._is_draft_key(key):
+            return key + self.config_suffix
+        if (
+            self.dcp_owner_mode or self.canonical_kv_page is not None
+        ) and self._is_shared_kv_key(key):
+            return key + self.kv_config_suffix
+        if self._is_shared_mamba_key(key):
             return key + self.kv_config_suffix
         return key + self.config_suffix
 
@@ -706,12 +909,134 @@ class HiCacheFile(HiCacheStorage):
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         for stem, _st in self._iter_existing_files():
-            # Only files belonging to this rank/model (dcp_owner_mode: rank-shared
-            # KV files carry the rank-less kv_config_suffix instead).
+            # Only files belonging to this rank/model. Shared KV files
+            # (dcp_owner_mode on the token axis, #706 on the layer axis) carry
+            # the geometry-free kv_config_suffix instead.
             if stem.endswith(self.config_suffix) or (
-                self.dcp_owner_mode and stem.endswith(self.kv_config_suffix)
+                (
+                    self.dcp_owner_mode
+                    or self.canonical_kv_page is not None
+                    or self.canonical_mamba_blob is not None
+                )
+                and stem.endswith(self.kv_config_suffix)
             ):
                 self.metadata_cache.add(stem)
+
+    def pin_checkpoint(self, checkpoint_id: str, keys: List[str]):
+        """Pin every store object a checkpoint references (#410 slice 2).
+
+        Translates CONTENT keys -- what a manifest holds -- into the suffixed
+        stems the evictor indexes, so the manifest never has to know the
+        store's key layout and the ledger never has to guess a size.
+        """
+        from sglang.srt.mem_cache.pin_ledger import stems_with_sizes
+
+        pairs = []
+        for key in keys:
+            stem = self._get_suffixed_key(key)
+            pairs.append((stem, self._existing_path(stem)))
+        return self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+
+    def unpin_checkpoint(self, checkpoint_id: str) -> int:
+        """Release a checkpoint's pins, returning the bytes actually freed."""
+        return self.pins.unpin(checkpoint_id)
+
+    def pin_stats(self) -> dict:
+        return self.pins.ledger()
+
+    def _canonical_space_check(self, need_bytes: int) -> None:
+        """Refuse a canonical write that would take the store below the floor."""
+        from sglang.srt.mem_cache.canonical_page_store import ensure_space
+
+        ensure_space(self.file_path, need_bytes, self._space_floor_bytes)
+
+    def _canonical_window(self, key: str):
+        """The canonical window serving this key, or None for the normal path.
+
+        One dispatch for both pools: the KV page's window in its generic
+        one-extent form, or the mamba blob's extent window. Draft keys never
+        reach either (excluded by name), and any other component pool keeps its
+        per-rank key because no canonical form is defined for it.
+        """
+        if self._is_draft_key(key):
+            return None
+        if self._canonical_kv_extents is not None and self._is_shared_kv_key(key):
+            return self._canonical_kv_extents
+        if self._is_shared_mamba_key(key):
+            return self.canonical_mamba_blob
+        return None
+
+    def _get_canonical_slice(
+        self, key: str, window, target_location: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Cut this rank's extents out of the canonical blob (#706).
+
+        Both phases arrive here with the SAME key and leave with different
+        bytes: a PP stage takes the byte ranges of the layers it owns, a TP rank
+        takes its head channels across every layer. That is the read-time cut
+        the token axis already does for kv-heads, on the other two axes.
+        """
+        from sglang.srt.mem_cache.canonical_page_store import read_extents
+
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = self._existing_path(suffixed)
+        try:
+            served = read_extents(tensor_path, window, target_location)
+        except CanonicalPageError as e:
+            # A geometry that cannot cut this blob is a configuration error, not
+            # a cache miss. Loud and per-page rather than raised, because this
+            # runs on the prefetch worker and a dead worker is a wedge.
+            logger.error("Canonical read refused for %s: %s", key, e)
+            return None
+        if not served:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            return None
+        self._evictor.touch(suffixed, tensor_path)
+        if self.metadata_cache is not None:
+            self.metadata_cache.add(suffixed)
+        return target_location
+
+    def _set_canonical_slice(self, key: str, window, value: torch.Tensor) -> bool:
+        """Deposit this rank's extents into the canonical blob (#706).
+
+        The blob becomes visible only once every byte is present, so a writer
+        acting alone leaves nothing readable behind -- see
+        ``canonical_page_store`` for the marker and the rename.
+        """
+        from sglang.srt.mem_cache.canonical_page_store import write_extents
+
+        suffixed = self._get_suffixed_key(key)
+        if self.exists(key):
+            # A complete blob is content-addressed: it already holds exactly
+            # these bytes. Refresh recency, write nothing.
+            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            return True
+
+        tensor_path = self._sharded_path(suffixed)
+        reserved = False
+        try:
+            # Charged per SLICE: the writers together account for one blob, and
+            # the one that completes it has ``commit`` correct the estimate to
+            # the file's real allocation.
+            if not self._evictor.reserve(suffixed, window.payload_bytes, key=key):
+                return False
+            reserved = True
+            self._ensure_shard_dir(tensor_path)
+            result = write_extents(
+                tensor_path, window, value, space_check=self._canonical_space_check
+            )
+            self._evictor.commit(suffixed)
+            if (
+                result.completed or result.already_complete
+            ) and self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save canonical slice for {key}: {e}")
+            if reserved:
+                self._evictor.abort(suffixed)
+            return False
 
     def get(
         self,
@@ -719,6 +1044,9 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
+        window = self._canonical_window(key)
+        if window is not None:
+            return self._get_canonical_slice(key, window, target_location)
         suffixed = self._get_suffixed_key(key)
         tensor_path = self._existing_path(suffixed)
         try:
@@ -771,6 +1099,9 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        window = self._canonical_window(key)
+        if window is not None:
+            return self._set_canonical_slice(key, window, value)
         suffixed = self._get_suffixed_key(key)
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
@@ -921,13 +1252,45 @@ class HiCacheFile(HiCacheStorage):
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
 
+    def _read_buffer_pool(self, pool_name: str, host_pool):
+        """#720: the reusable read target for this pool, or None (today's path).
+
+        Built lazily, once per registered pool, because the page size is the
+        pool's and is only known here. ``0`` -- the default -- keeps the
+        per-read fresh allocation exactly as it was.
+        """
+        capacity = int(envs.SGLANG_HICACHE_READ_BUFFERS.get() or 0)
+        if capacity <= 0:
+            return None
+        pools = getattr(self, "_read_buffers", None)
+        if pools is None:
+            pools = self._read_buffers = {}
+        pool = pools.get(pool_name)
+        if pool is None:
+            from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+
+            probe = host_pool.get_dummy_flat_data_page()
+            pool = ReadBufferPool(
+                name=f"HiCache read buffers [{pool_name}]",
+                flag="SGLANG_HICACHE_READ_BUFFERS",
+                capacity=capacity,
+                page_bytes=int(probe.numel()) * int(probe.element_size()),
+                factory=host_pool.get_dummy_flat_data_page,
+            )
+            pools[pool_name] = pool
+        return pool
+
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
+        from sglang.srt.mem_cache.read_buffer_pool import borrowed
+
         storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
-        if data_page is None:
-            return False
-        host_pool.set_from_flat_data_page(page_offset, data_page)
+        buffers = self._read_buffer_pool(pool_name, host_pool)
+        with borrowed(buffers, host_pool.get_dummy_flat_data_page) as target:
+            data_page = self.get(storage_key, target)
+            if data_page is None:
+                return False
+            host_pool.set_from_flat_data_page(page_offset, data_page)
         return True
 
     def _write_page(

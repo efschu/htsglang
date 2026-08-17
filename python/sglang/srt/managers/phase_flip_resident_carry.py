@@ -119,6 +119,43 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP-CARRY"
 
+#: How far above ``max_running_requests`` the resident set may legally sit
+#: (#682). Not slack, and not a fudge factor: the scheduler MAINTAINS this
+#: bound, and the guard used to assert a tighter one than the code it was
+#: watching.
+#:
+#: ``Scheduler._get_new_batch_prefill_raw`` suspends the running-request cap
+#: for as long as a chunked prefill is in flight, and names the reason:
+#:
+#:     # Ignore the check if self.chunked_req is not None.
+#:     # In PP case, chunked requests (or dllm requests) can start in one
+#:     # microbatch and end in another microbatch, so the
+#:     # max_running_requests per microbatch should not be strict. Instead,
+#:     # we should always allow chunked requests to be added, otherwise,
+#:     # there will be a memory leak.
+#:
+#: EXACTLY ONE, because the scheduler holds exactly one: ``self.chunked_req``
+#: is a single slot, asserted empty (``assert self.chunked_req is None``)
+#: before a new one is stashed. So ``cap + 1`` is the true bound and
+#: ``cap + 2`` is still a corrupted resident set -- which is what keeps this
+#: a repair of defect M's ceiling rather than a removal of it.
+#:
+#: ADDITIVE, NOT PROPORTIONAL: ``--max-running-requests 1`` is a real
+#: single-stream configuration and its chunked prefill is precisely the case
+#: the scheduler's bypass exists for.
+#:
+#: UNCONDITIONAL, AND THAT IS THE GROUP-UNIFORMITY ARGUMENT. Gating this on
+#: ``scheduler.chunked_req is not None`` would be tighter and would be a
+#: hang: that flag is per-rank scheduler state, the PP ranks sit at
+#: different pipeline positions, and at one cutover instant a peer can hold
+#: it while this rank has just cleared it -- so the same resident set would
+#: be legal on one rank and fatal on another. Deriving the ceiling from
+#: ``max_running_requests`` alone keeps the verdict replicated:
+#: ``Scheduler.init_admission_limiter`` documents that value as "uniform
+#: across ranks by construction: every input to `ceiling` is min-reduced
+#: before it gets here". No collective is added.
+IN_FLIGHT_CHUNKED_ALLOWANCE = 1
+
 
 class ResidentCarryError(RuntimeError):
     """A resident request would have been dropped, duplicated or orphaned.
@@ -130,11 +167,11 @@ class ResidentCarryError(RuntimeError):
     """
 
 
-# No batch on this server holds more requests than max_running_requests
-# (4 on the production recipe), and no plausible configuration approaches
-# this number. It exists only to separate "a request list" from "an object
-# that is not one", cheaply, without trusting the caller to pass a
-# scheduler. The scheduler-aware, much tighter bound lives in
+# No batch on this server holds more requests than max_running_requests plus
+# IN_FLIGHT_CHUNKED_ALLOWANCE (5 on the 4-request recipe), and no plausible
+# configuration approaches this number. It exists only to separate "a request
+# list" from "an object that is not one", cheaply, without trusting the caller
+# to pass a scheduler. The scheduler-aware, much tighter bound lives in
 # ``harvest_resident_batches``.
 IMPLAUSIBLE_RESIDENT_REQS = 65536
 
@@ -224,24 +261,64 @@ def harvest_resident_batches(scheduler) -> List:
     # allowed to run concurrently is refused BY SLOT NAME. A list of the
     # right type but an impossible length is still a corrupted resident
     # set, and it reaches ``committed_slots`` just the same.
-    ceiling = getattr(scheduler, "max_running_requests", None)
+    cap = getattr(scheduler, "max_running_requests", None)
     try:
-        ceiling = int(ceiling) if ceiling else None
+        cap = int(cap) if cap else None
     except (TypeError, ValueError):
-        ceiling = None
+        cap = None
+    ceiling = None if cap is None else cap + IN_FLIGHT_CHUNKED_ALLOWANCE
+
+    reported_excursion = [False]
 
     def _take(batch, origin: str) -> None:
         if not _is_resident(batch):
             return
         if ceiling is not None:
             n = len(_reqs_of(batch))
+            if cap is not None and n > cap and not reported_excursion[0]:
+                # #682 RECEIPT, AND IT IS ONE BECAUSE THE ATTRIBUTION IS AN
+                # INFERENCE. That the fifth resident on 2026-08-16 02:07:22
+                # was the in-flight chunked prefill is established by
+                # ELIMINATION -- the scheduler's cap bypass is the only
+                # documented route past `max_running_requests`, and
+                # `AdmissionLimiter`'s ceiling "can never be exceeded" -- not
+                # by observation: no chunked request was visible in that log,
+                # and the nearest #679 park was three minutes earlier.
+                #
+                # So say what was actually true at the moment the allowance
+                # was spent. If a future excursion reports chunked_req=CLEAR,
+                # the elimination has a hole and this widening is covering
+                # something else.
+                #
+                # A LOG, NEVER A DECISION: the verdict above reads only
+                # `max_running_requests`, which is rank-uniform, so this line
+                # cannot make two ranks disagree no matter what it prints.
+                reported_excursion[0] = True
+                logger.info(
+                    "%s %s holds %d resident request(s), %d above "
+                    "max_running_requests=%d -- the in-flight chunked prefill "
+                    "allowance (#682). chunked_req=%s on this rank. Carrying.",
+                    LOG_PREFIX,
+                    origin,
+                    n,
+                    n - cap,
+                    cap,
+                    (
+                        "SET"
+                        if getattr(scheduler, "chunked_req", None) is not None
+                        else "CLEAR"
+                    ),
+                )
             if n > ceiling:
                 raise ResidentCarryError(
                     f"{LOG_PREFIX} {origin} claims {n} resident request(s), "
-                    f"above max_running_requests={ceiling}. Refusing to "
-                    f"carry it. This is defect M: a corrupted resident set "
-                    f"arms a flip that no load justifies and then makes the "
-                    f"cutover allocate one tensor per claimed request."
+                    f"above the {ceiling} this scheduler can hold "
+                    f"(max_running_requests={cap} plus "
+                    f"{IN_FLIGHT_CHUNKED_ALLOWANCE} for an in-flight chunked "
+                    f"prefill). Refusing to carry it. This is defect M: a "
+                    f"corrupted resident set arms a flip that no load "
+                    f"justifies and then makes the cutover allocate one "
+                    f"tensor per claimed request."
                 )
         if id(batch) in seen_batches:
             return

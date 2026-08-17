@@ -47,9 +47,7 @@ class _Event:
 def _manager(spills=None, copy_done=True, event_raises=False):
     return types.SimpleNamespace(
         spills=dict(spills or {}),
-        backend=types.SimpleNamespace(
-            _sess_wave_done=_Event(copy_done, event_raises)
-        ),
+        backend=types.SimpleNamespace(_sess_wave_done=_Event(copy_done, event_raises)),
     )
 
 
@@ -66,9 +64,7 @@ class TestFlipSafetyState(unittest.TestCase):
 
     def test_parked_images_of_the_live_phase_are_safe_to_carry(self):
         m = _manager({1: _Slot("pp"), 2: _Slot("pp")})
-        state, detail = flip_safety_state(
-            m, current_phase="pp", incoming_phase="tp"
-        )
+        state, detail = flip_safety_state(m, current_phase="pp", incoming_phase="tp")
         self.assertEqual(state, STATE_PARKED)
         self.assertIn("2 spilled session", detail)
 
@@ -95,9 +91,7 @@ class TestFlipSafetyState(unittest.TestCase):
         # tp-stamped image restore-eligible across a layout change it did not
         # survive.
         m = _manager({3: _Slot("tp")})
-        state, detail = flip_safety_state(
-            m, current_phase="pp", incoming_phase="tp"
-        )
+        state, detail = flip_safety_state(m, current_phase="pp", incoming_phase="tp")
         self.assertEqual(state, STATE_BUSY)
         self.assertIn("INCOMING", detail)
 

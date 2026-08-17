@@ -34,6 +34,27 @@ _applied = False
 # ---------------------------------------------------------------------------
 
 
+def arm():
+    """Arm the patches for WHEN transformers is imported, without importing it.
+
+    The package root used to call ``apply_all()`` directly, which imported
+    transformers in EVERY process -- and transformers reaches
+    ``torch._dynamo`` (``masking_utils.py``), which imports triton. Processes
+    that never run a model forward were therefore loading a graph compiler and
+    a GPU kernel compiler at ``import sglang`` (#237/#403 second-context
+    family, and host RAM on a swapless box).
+
+    Arming instead applies the patches inside transformers' own import, so the
+    ordering guarantee is unchanged and stronger than before: a user must
+    import transformers to use it, and the patches land before that import
+    returns. A process that never imports transformers never pays -- and never
+    needed the patches, since they only touch transformers internals.
+    """
+    from sglang.srt.utils import post_import_hook
+
+    post_import_hook.install("transformers", lambda _module: apply_all())
+
+
 def apply_all():
     """Apply all transformers compatibility patches (idempotent).
 

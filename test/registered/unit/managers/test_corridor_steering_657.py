@@ -327,7 +327,9 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
 
     def test_real_partition_matches_the_fake(self):
         real, fake = self._real(), _FakeAllocator(320)
-        self.assertEqual(real.set_owner_bias((32, 14, 24)), fake.set_owner_bias((32, 14, 24)))
+        self.assertEqual(
+            real.set_owner_bias((32, 14, 24)), fake.set_owner_bias((32, 14, 24))
+        )
         self.assertEqual(real.free_pages.tolist(), fake.free_pages.tolist())
 
     def test_real_bias_is_cleared_by_none(self):

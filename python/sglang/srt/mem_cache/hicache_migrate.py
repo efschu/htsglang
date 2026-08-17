@@ -122,7 +122,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # Byte ranges of one target file: (source path, source offset, length), in
@@ -375,6 +375,17 @@ class MambaBlobSpec:
     def total_bytes(self) -> int:
         return self.temporal_bytes + self.conv_bytes
 
+    def for_layers(self, layer_lo: int, layer_hi: int) -> "MambaBlobSpec":
+        """The layout of a LAYER sub-range's blob (#706): identical in every
+        sharded dimension, fewer layers. The layer axis is orthogonal to the
+        head axis, so this composes with ``shard_for_rank`` in either order."""
+        if not 0 <= layer_lo <= layer_hi <= self.num_layers:
+            raise ValueError(
+                f"layer range [{layer_lo}, {layer_hi}) is not within "
+                f"[0, {self.num_layers})."
+            )
+        return replace(self, num_layers=layer_hi - layer_lo)
+
     def shard_for_rank(self, ratios: Sequence[int], rank: int) -> "MambaBlobSpec":
         """The layout of ``rank``'s OWN blob: every sharded dimension --
         heads and each conv sub-block -- cut with the runtime's rule, so the
@@ -453,6 +464,47 @@ def conv_extents(
         for off, length in pairs:
             out.append((base + off * per_channel, length * per_channel))
     return out
+
+
+def layer_extents(
+    spec: MambaBlobSpec, layer_lo: int, layer_hi: int
+) -> List[Tuple[int, int]]:
+    """(offset, length) byte ranges of layers ``[layer_lo, layer_hi)``, full
+    heads -- the LAYER axis, for #706's whole-page format under PP.
+
+    TWO ranges, never one. The blob is two layer-major regions back to back:
+    every layer's temporal state first, then every layer's conv state (see
+    ``MambaBlobSpec``). A contiguous layer range is therefore contiguous
+    *within each region* but the two regions are far apart, separated by the
+    temporal state of the layers this stage does NOT own.
+
+    Cutting ``[layer_lo, layer_hi)`` as a single flat slice of ``total_bytes``
+    is the layer-axis form of the documented conv trap: it takes the temporal
+    state of the right layers followed by the temporal state of the WRONG ones,
+    and no conv state at all. ``test_hicache_layer_cut_706.py`` plants that
+    exact mistake as its can-fail.
+
+    Orthogonal to the head cut. ``shard_for_rank`` changes the SIZE of a
+    layer's temporal/conv block; this changes WHICH layer blocks are taken.
+    Compose them by taking the layer range of a rank-sharded spec -- the two
+    never touch the same dimension.
+    """
+    if not 0 <= layer_lo <= layer_hi <= spec.num_layers:
+        raise ValueError(
+            f"layer range [{layer_lo}, {layer_hi}) is not within "
+            f"[0, {spec.num_layers}) -- a PP stage cannot own layers the blob "
+            f"does not describe."
+        )
+    if layer_lo == layer_hi:
+        return []
+    n = layer_hi - layer_lo
+    return [
+        (layer_lo * spec.temporal_layer_bytes, n * spec.temporal_layer_bytes),
+        (
+            spec.temporal_bytes + layer_lo * spec.conv_layer_bytes,
+            n * spec.conv_layer_bytes,
+        ),
+    ]
 
 
 def reverse_extents(

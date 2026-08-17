@@ -41,6 +41,7 @@ def _load(path: str):
 def _policy(cfg) -> W.Policy:
     w = cfg.watchdog
     return W.Policy(poll_s=w.poll_s, generation_probe_s=w.generation_probe_s,
+                    generation_probe_enabled=w.generation_probe_enabled,
                     wedge_confirmations=w.wedge_confirmations,
                     backoff_s=tuple(w.backoff_s), max_restarts=w.max_restarts,
                     restart_window_s=w.restart_window_s)
@@ -123,6 +124,12 @@ def _cmd_watch(cfg, a) -> int:
     if lane is None:
         print(f"no such lane: {a.lane}")
         return 2
+    if not cfg.watchdog.enabled:
+        # This key was parsed and never read: 'enabled = false' silently did
+        # nothing. Honouring it is part of retiring the prober -- a config
+        # that says off must BE off.
+        print("watchdog disabled by config ([watchdog].enabled = false)")
+        return 0
     unit = a.unit or f"htsglang-serving@{lane.name}.service"
     pol = _policy(cfg)
     pol = W.Policy(**{**pol.__dict__, "boot_grace_s": float(lane.ready_timeout_s)})

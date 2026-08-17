@@ -33,6 +33,7 @@ from sglang.srt.managers.phase_policy import (
 )
 from sglang.srt.managers.phase_purity import (
     MODE_OFF,
+    MODE_PREFILL_IN_TP,
     MODE_STRICT,
     MODE_THRESHOLD,
     PhasePurity,
@@ -47,12 +48,30 @@ from sglang.srt.managers.phase_purity import (
 # -- parsing ------------------------------------------------------------
 
 
-def test_default_is_strict():
-    """The DEFAULT is the strict rule -- not 'off'. A default of 'off'
-    would make every deployment that does not name the flag reproduce the
-    defect."""
-    assert parse_purity(None).mode == MODE_STRICT
-    assert parse_purity("").mode == MODE_STRICT
+def test_default_forbids_decode_in_pp_but_is_not_strict():
+    """UPDATED 2026-08-14 (user): the default moved strict -> prefill_in_tp.
+
+    This test used to assert `strict`. The half it was really protecting --
+    "a default of 'off' would make every deployment that does not name the
+    flag reproduce the defect" -- is unchanged and still asserted here: the
+    default must never allow decode in the PP layout, which is the defect
+    (87 decode batches at 35.4 tok/s in the prefill layout).
+
+    What changed is the OTHER half. The blanket prefill-in-TP prohibition was
+    withdrawn as resting on wrong input data: a small prefill does not repay
+    a ~4.8 s seam round trip, and forcing it to produced 882 flips in one
+    boot, arming at 184 pending tokens against a break-even of N=7004. The
+    default now lets `phase_policy.break_even_tokens` make that call.
+    """
+    for raw in (None, ""):
+        p = parse_purity(raw)
+        assert p.mode == MODE_PREFILL_IN_TP
+        assert not p.strict
+        # the load-bearing invariant this test has always defended:
+        assert not p.decode_allowed_in_pp(0)
+        assert not p.decode_allowed_in_pp(4)
+        # and the default must never be the pre-purity interleaving
+        assert p.enforced
     assert parse_purity("strict").strict
 
 

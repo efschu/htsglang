@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
+import os
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval, is_on_interval
@@ -72,6 +73,17 @@ def _skipped_ids(params: Optional[DecLockRefParams], component: ComponentType):
     if params is None:
         return ()
     return params.skip_lock_node_ids.get(component, ())
+
+
+def _radix_debug_dump() -> bool:
+    """Per-node radix detail on the error path, off by default (#695).
+
+    Read from the environment on each call rather than cached at import: this
+    is an error path, it runs at most once per failure, and an operator who
+    sets the variable while chasing a live incident should not have to restart
+    the instance to see the detail.
+    """
+    return os.environ.get("SGLANG_RADIX_DEBUG_DUMP", "") not in ("", "0", "false", "False")
 
 
 class TreeNode:
@@ -338,25 +350,52 @@ class LRUList:
         """
         Pretty print the lru list
         """
-        msg = f"{self.mamba=} LRU list: "
+        # #695: bounded, and to the logger. This is called from the same OOM
+        # path as MambaRadixCache.pretty_print; an unbounded chain walk printed
+        # to stdout there is what buried the RuntimeError at 13:58:37.
+        LIMIT = 24
+        head = []
         x_lru = self._get_lru()
+        seen = 0
         while x_lru is not None and x_lru.id in self.cache:
-            msg += f"[{x_lru.id}] {x_lru.last_access_time:f} -> "
+            seen += 1
+            if len(head) < LIMIT:
+                head.append(f"[{x_lru.id}] {x_lru.last_access_time:f}")
             x_lru = getattr(x_lru, self.prv)
-        print(msg)
+        tail = "" if seen <= LIMIT else f" ... (+{seen - LIMIT} more)"
+        logger.error(
+            "%s LRU list: %d entries, oldest first: %s%s",
+            f"{self.mamba=}",
+            seen,
+            " -> ".join(head),
+            tail,
+        )
 
         if not tree_cache:
             return
-        msg = f"{self.mamba=} Nodes (sorted by last_access_time): "
+        # #695: the sibling of the walk above, bounded the same way. This one
+        # heapifies EVERY node and concatenates one entry per node into a
+        # single string, so on the tree that killed the 13:58:37 instance it
+        # built a multi-megabyte line at the moment of an OOM.
         if self.mamba:
             nodes = tree_cache._collect_nontombstone_nodes()
         else:
             nodes = tree_cache._collect_all_nodes()
+        total = len(nodes)
         heapq.heapify(nodes)
-        while len(nodes):
+        LIMIT = 24
+        oldest = []
+        while nodes and len(oldest) < LIMIT:
             x = heapq.heappop(nodes)
-            msg += f"[{x.id}] {x.last_access_time:f} -> "
-        print(msg)
+            oldest.append(f"[{x.id}] {x.last_access_time:f}")
+        tail = "" if total <= LIMIT else f" ... (+{total - LIMIT} more)"
+        logger.error(
+            "%s Nodes by last_access_time: %d total, oldest first: %s%s",
+            f"{self.mamba=}",
+            total,
+            " -> ".join(oldest),
+            tail,
+        )
 
     # Note: this is expensive, only use for debug
     def sanity_check_evictable_size(self):
@@ -895,9 +934,97 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:
-        self._print_helper(self.root_node, 0)
-        total_size, total_mamba_size = self._total_size_helper()
-        print(f"#full_tokens: {total_size}, #mamba_num: {total_mamba_size}")
+        """One bounded record about the tree's SHAPE, at ERROR level.
+
+        #695. This runs on the production OOM path (mem_cache/common.py's
+        alloc handlers call it between logging the error and raising it), and
+        what it used to do there was print one bare line PER NODE. At the
+        2026-08-16 13:58:37 crash that was ~370 lines of `print()` after the
+        line that mattered:
+
+            RuntimeError: Out of memory. Try to allocate 512 tokens.
+            Available full tokens: 167743 (available=392 + evictable=167351)
+
+        The first diagnosis read the visible tail, found "terminate called
+        without an active exception" with no Python frame, and filed a
+        teardown abort. The RuntimeError was 300 lines above. The dump did not
+        just add noise, it MOVED THE CAUSE OUT OF VIEW.
+
+        WHAT AN OOM READER ACTUALLY NEEDS is the shape, not the tree: how many
+        nodes, how many tokens, and HOW MUCH IS LOCKED -- because the question
+        at an allocation failure with six figures of "evictable" is whether the
+        counter was promising tokens the eviction frontier could not reach
+        (#681: correct as a count, wrong as a capability). The locked share is
+        that question in one number.
+
+        The per-node detail is not deleted, only moved behind
+        SGLANG_RADIX_DEBUG_DUMP, and it goes to the logger there too.
+        """
+        summary = self._shape_summary()
+        if _radix_debug_dump():
+            lines = []
+            self._print_helper(self.root_node, 0, sink=lines.append)
+            logger.error(
+                "%s\nper-node detail (SGLANG_RADIX_DEBUG_DUMP):\n%s",
+                summary,
+                "\n".join(lines),
+            )
+        else:
+            logger.error("%s", summary)
+
+    def _shape_summary(self) -> str:
+        """Walk once; report shape. NEVER RAISES.
+
+        A reporter on an error path that can raise will replace the error it
+        was called to explain -- and this one could: ``_print_helper`` asserts
+        the child-key invariant mid-walk, so a tree that is BOTH out of memory
+        AND structurally surprising reported the AssertionError and lost the
+        OOM. Structural surprises are counted and named here instead.
+        """
+        nodes = tokens = mamba_tokens = 0
+        locked_nodes = locked_tokens = 0
+        mismatched = 0
+        max_depth = 0
+        try:
+            stack = [(self.root_node, 0)]
+            while stack:
+                node, depth = stack.pop()
+                nodes += 1
+                max_depth = max(max_depth, depth)
+                n = len(getattr(node, "value", ()) or ())
+                tokens += n
+                mv = getattr(node, "mamba_value", None)
+                if mv is not None:
+                    mamba_tokens += len(mv)
+                if getattr(node, "full_lock_ref", 0) or getattr(
+                    node, "mamba_lock_ref", 0
+                ):
+                    locked_nodes += 1
+                    locked_tokens += n
+                for key, child in (getattr(node, "children", {}) or {}).items():
+                    try:
+                        if key != child.key.child_key(self.page_size):
+                            mismatched += 1
+                    except Exception:  # noqa: BLE001 - counted, never fatal
+                        mismatched += 1
+                    stack.append((child, depth + 1))
+        except Exception as exc:  # noqa: BLE001 - a reporter must not raise
+            return (
+                f"RADIX SHAPE: walk failed after {nodes} nodes ({exc!r}). "
+                f"Partial: tokens={tokens}, locked_nodes={locked_nodes}."
+            )
+        pct = (100.0 * locked_tokens / tokens) if tokens else 0.0
+        return (
+            f"RADIX SHAPE: {nodes} nodes, {tokens} full tokens, "
+            f"{mamba_tokens} mamba tokens, max depth {max_depth}; "
+            f"LOCKED {locked_nodes} nodes / {locked_tokens} tokens "
+            f"({pct:.1f}% of tokens). "
+            f"child-key mismatches: {mismatched}. "
+            f"At an allocation failure the locked share is the question: "
+            f"tokens counted evictable but sitting behind a locked chain are "
+            f"not reachable by the eviction frontier (#681). "
+            f"Set SGLANG_RADIX_DEBUG_DUMP=1 for per-node detail."
+        )
 
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
@@ -1041,8 +1168,41 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
-            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
-            full_num_evicted += full_num_evicted_delta
+            if x.mamba_value is None:
+                # #681: AN UNLOCKED TOMBSTONE LEAF, WHICH THE SELECTOR OFFERS
+                # AND THE OLD CONSUMER REFUSED.
+                #
+                # `get_leaf_lru_no_lock` asks for unlocked and childless;
+                # `_evict_leaf_node` additionally demands a mamba value and
+                # asserted when it was missing. That combination is reachable
+                # WITHOUT any invariant being broken:
+                # `_iteratively_delete_tombstone_leaf` breaks on
+                # `node.parent.full_lock_ref > 0`, so a tombstone that loses
+                # its last child while a request holds it survives as a LOCKED
+                # tombstone leaf -- and when that request finishes, nothing
+                # revisits it. It is then unlocked, childless, counted in
+                # `full_evictable_size_`, and first in line at the frontier.
+                #
+                # Measured 2026-08-16 01:46:10: the tree all three ranks
+                # printed held exactly one (node 5937 -- fr=0, mv=None,
+                # childless, in the full LRU list). Replaying that dumped tree
+                # through this function selects it and dies on the assert,
+                # which kills the whole group over a state the cache itself
+                # produced and can perfectly well pay.
+                #
+                # Freeing it here is not a new capability: it is the same
+                # deletion `_iteratively_delete_tombstone_leaf` would have
+                # performed one step earlier, taken now that the lock which
+                # deferred it is gone. Deliberately NOT extended past a lock --
+                # a LOCKED tombstone leaf is still refused, because reaching
+                # behind a live reference is a different repair.
+                x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
+                full_num_evicted += self._free_tombstone_leaf(x)
+                x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
+                full_num_evicted += leaf_full_num_evicted
+            else:
+                full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
+                full_num_evicted += full_num_evicted_delta
 
             # if parent has no more children, it is a leaf. It is possible that this node is lru, so
             # we need to get the first leaf node in the lru list
@@ -1645,18 +1805,35 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # if locked, means node is in use, skip
             if node.parent.full_lock_ref > 0:
                 break
-            assert (
-                node.parent.mamba_lock_ref == 0
-            ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
-            self.full_lru_list.remove_node(node.parent)
-            self._delete_tombstone_leaf(node.parent)
+            full_num_evicted += self._free_tombstone_leaf(node.parent)
             node = node.parent
 
         return node, full_num_evicted
+
+    def _free_tombstone_leaf(self, node: TreeNode) -> int:
+        """Free one UNLOCKED, childless mamba tombstone. Returns tokens freed.
+
+        The single place a tombstone leaf is paid for, shared by the cleanup
+        walk above and by the ``evict_full`` frontier (#681), so both routes
+        keep ``full_evictable_size_`` and the LRU list in step by construction.
+        """
+        assert (
+            node.mamba_value is None
+        ), f"not a tombstone, {node.id=}, {len(node.mamba_value)=}"
+        assert len(node.children) == 0, f"tombstone is not a leaf, {node.id=}"
+        assert (
+            node.full_lock_ref == 0
+        ), f"tombstone is locked, {node.id=}, {node.full_lock_ref=}"
+        assert (
+            node.mamba_lock_ref == 0
+        ), f"tombstone mamba_lock_ref should always be 0, {node.full_lock_ref=}, {node.mamba_lock_ref=}, {node.id=}"
+        self._record_remove_event(node)
+        self.token_to_kv_pool_allocator.free(node.value)
+        freed = len(node.value)
+        self.full_lru_list.remove_node(node)
+        self._delete_tombstone_leaf(node)
+        return freed
 
     def _delete_leaf(self, node: TreeNode) -> None:
         assert (
@@ -1707,27 +1884,30 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             stack.extend(cur_node.children.values())
         return ret_list
 
-    def _print_helper(self, node: TreeNode, indent: int) -> None:
-        """Prints the radix tree in a human-readable format."""
+    def _print_helper(self, node: TreeNode, indent: int, sink=None) -> None:
+        """Render the tree per node into ``sink`` (default: the logger).
+
+        #695: ``sink`` replaces the bare ``print``. The child-key invariant is
+        no longer asserted HERE -- this function is reached from the OOM path,
+        and an assertion raised while explaining an out-of-memory error
+        replaces that error with a structural one. ``_shape_summary`` counts
+        the same mismatch and reports it without raising.
+        """
+        out = sink if sink is not None else (lambda line: logger.error("%s", line))
         stack = [(node, indent)]
         while stack:
             current_node, current_indent = stack.pop()
-            print(
-                " " * current_indent,
-                f"[{current_node.id}]",
-                len(current_node.key),
-                f"fr={current_node.full_lock_ref}",
-                f"mr={current_node.mamba_lock_ref}",
-                f"fll={self.full_lru_list.in_list(current_node)}",
-                f"mll={self.mamba_lru_list.in_list(current_node)}",
-                f"mv={current_node.mamba_value}",
+            out(
+                " " * current_indent
+                + f"[{current_node.id}] {len(current_node.key)} "
+                + f"fr={current_node.full_lock_ref} "
+                + f"mr={current_node.mamba_lock_ref} "
+                + f"fll={self.full_lru_list.in_list(current_node)} "
+                + f"mll={self.mamba_lru_list.in_list(current_node)} "
+                + f"mv={current_node.mamba_value}"
             )
-            for key, child in current_node.children.items():
+            for _key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
-
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
 
     def _total_size_helper(self) -> Tuple[int, int]:
         total_size = 0

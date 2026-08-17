@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -229,6 +230,11 @@ class HiCacheController:
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
+        # #706 keeps the WRAPPER too: only the hybrid pool knows its layers by
+        # GLOBAL id (full_attention_layer_id_mapping / mamba_map). The unwrapped
+        # full_kv_pool reports start_layer 0 and a bare layer count on every
+        # stage, which cannot distinguish stage 1 from stage 0.
+        self.mem_pool_device_hybrid = mem_pool_device
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
@@ -454,6 +460,24 @@ class HiCacheController:
                     "Weighted uneven-DCP HiCache storage requires page_size == 1, "
                     f"got {self.page_size}."
                 )
+        # #706 whole-page protocol: same two conditions, for the layer axis.
+        # Only the file backend can assemble one page from several stages
+        # (partial byte-range writes), and a canonical page is ONE token's
+        # attention layers. The boot-time twin of this check lives in
+        # ServerArgs._handle_phase_flip; both exist because this one also
+        # covers a storage backend attached at RUNTIME, where no ServerArgs
+        # validation runs.
+        if self.storage_config.canonical_kv_page is not None:
+            if storage_backend != "file":
+                raise NotImplementedError(
+                    "The #706 canonical KV page currently supports only the "
+                    f"'file' backend, got '{storage_backend}'."
+                )
+            if self.page_size != 1:
+                raise NotImplementedError(
+                    "The #706 canonical KV page requires page_size == 1, got "
+                    f"{self.page_size}."
+                )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -634,6 +658,38 @@ class HiCacheController:
             else None
         )
 
+        # #706: this rank's window in the geometry-neutral page. Built only
+        # when the format is switched on, and built from the pools that KNOW
+        # their global layer ids -- never inferred from a layer count, because
+        # the host pool's own start_layer is 0 on every PP stage.
+        canonical_kv_page = None
+        canonical_mamba_blob = None
+        if server_args is not None and getattr(
+            server_args, "phase_flip_canonical_kv_page", False
+        ):
+            from sglang.srt.mem_cache.canonical_page_store import build_page_window
+
+            model_config = server_args.get_model_config()
+            attn_layer_ids = getattr(model_config, "full_attention_layer_ids", None)
+            if not attn_layer_ids:
+                # A model with no hybrid split: every layer carries KV, so the
+                # attention-layer list is the layer list.
+                attn_layer_ids = list(range(int(model_config.num_hidden_layers)))
+            canonical_kv_page = build_page_window(
+                attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
+            )
+            logger.info(
+                "#706 canonical KV page active: slots [%d, %d) of %d, %d B per "
+                "slot; KV keys carry content only (no tp/pp suffix).",
+                canonical_kv_page.first_slot,
+                canonical_kv_page.first_slot + canonical_kv_page.num_slots,
+                canonical_kv_page.spec.num_attn_layers,
+                canonical_kv_page.cell_bytes,
+            )
+            canonical_mamba_blob = self._canonical_mamba_window(
+                server_args, model_config
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -653,7 +709,74 @@ class HiCacheController:
             # Weighted uneven-DCP: KV pages are token-sharded with FULL
             # replicated kv-heads -> owner-written, rank-shared page files.
             dcp_owner_mode=self._dcp_owner_ctx() is not None,
+            # #706: full-width pages, stage-offset writes, suffix-free KV keys.
+            canonical_kv_page=canonical_kv_page,
+            canonical_mamba_blob=canonical_mamba_blob,
         )
+
+    def _canonical_mamba_window(self, server_args, model_config):
+        """This rank's window in the canonical GDN blob (#706 slice 2).
+
+        ``None`` only when the model has NO linear/GDN layers -- then there is
+        no blob and the KV page alone is the whole prefix. For a hybrid model
+        this must succeed or attach fails: a canonical KV page beside a
+        phase-local GDN blob delivers ZERO usable prefix, because
+        ``batch_exists_v2`` takes the minimum across pools and the mamba pool is
+        registered TRAILING_PAGES. Silently running KV-only would look like the
+        feature was on while every cross-phase lookup missed.
+        """
+        from sglang.srt.mem_cache.canonical_page_store import (
+            build_mamba_window,
+            derive_mamba_blob_spec,
+            local_mamba_layer_range,
+        )
+
+        cache_params = getattr(model_config, "mamba2_cache_params", None)
+        mamba_layer_ids = list(getattr(cache_params, "layers", None) or [])
+        if not mamba_layer_ids:
+            return None
+
+        hybrid = self.mem_pool_device_hybrid
+        mamba_pool = getattr(hybrid, "mamba_pool", None)
+        if mamba_pool is None:
+            raise NotImplementedError(
+                "#706: this model has GDN/linear layers but the KV pool exposes "
+                "no mamba pool, so the GDN blob cannot be made phase-uniform. "
+                "Refusing rather than serving a store whose KV pages are "
+                "geometry-free while its GDN blobs are not -- that combination "
+                "hits nothing at all."
+            )
+        spec = derive_mamba_blob_spec(
+            model_config, mamba_pool, num_linear_layers=len(mamba_layer_ids)
+        )
+        layer_lo, layer_hi = local_mamba_layer_range(hybrid, mamba_layer_ids)
+        # Head sharding: the uneven-TP vector when set, equal shares otherwise.
+        # Under the PP prefill phase tp_size is 1, so this is [1] and the window
+        # carries full heads -- exactly the layer-only cut.
+        raw_ratio = getattr(server_args, "rank_tp_ratio", None)
+        ratios = (
+            [int(x) for x in str(raw_ratio).split(",")]
+            if raw_ratio
+            else [1] * max(1, self.tp_size)
+        )
+        window = build_mamba_window(
+            spec,
+            ratios=ratios,
+            rank=self.tp_rank,
+            layer_lo=layer_lo,
+            layer_hi=layer_hi,
+        )
+        logger.info(
+            "#706 canonical GDN blob active: layers [%d, %d) of %d, %d of %d "
+            "blob bytes on this rank, %d extent(s).",
+            layer_lo,
+            layer_hi,
+            spec.num_layers,
+            window.payload_bytes,
+            window.total_bytes,
+            len(window.extents),
+        )
+        return window
 
     def reset(self):
         self.storage_stop_event.set()
@@ -693,6 +816,13 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
+        # #718: this controller is bound to the pool it was BUILT with. While
+        # the flip routes to its TP stack, that is not the pool the model
+        # writes into, so this copy would persist another row's bytes under a
+        # content-addressed key. Refuse: a prefix that is not staged is a miss
+        # later, which is the cheap failure.
+        if device_tier_disarmed("write"):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -778,6 +908,12 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
+        # #718: the mirror hazard. This copy would fill rows in the bound (PP)
+        # pool while the model reads the flip stack's, and the tree would
+        # report the prefix resident -- so attention would read rows nobody
+        # filled. Refuse: a prefetch that does not land is a miss now.
+        if device_tier_disarmed("load"):
+            return None
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None

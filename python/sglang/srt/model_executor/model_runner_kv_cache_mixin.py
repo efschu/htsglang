@@ -155,6 +155,79 @@ MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
 
+
+def _note_mamba_component(runner, name: str, gb: float) -> None:
+    """Record one NAMED sub-term of the lumped mamba budget post (#704).
+
+    Module-level and duck-typed ON PURPOSE. As a bound method it required
+    every test double to grow an attribute it had no reason to have -- the
+    #624 stub-drift class -- and it broke eleven ceiling-fit tests the moment
+    it landed. Production must not demand more of a stand-in than the
+    behaviour under test actually needs.
+    """
+    acc = getattr(runner, "_mamba_budget_components", None)
+    if acc is None:
+        acc = {}
+        setattr(runner, "_mamba_budget_components", acc)
+    acc[name] = acc.get(name, 0.0) + float(gb)
+
+
+def budget_holdback_mib(profiled_bytes: int, adjusted_bytes: int) -> float:
+    """The TRUE per-rank holdback, in MiB (#704, fourth instrument).
+
+    The quantity between the profiler's ``rest`` and what the configurator
+    actually receives. On metal it lands at 6,688 / 3,561 / 5,166 MiB while
+    ``derived_rank_auto_reserve_mib`` returns 4,160 UNIFORMLY for the same
+    boot's arguments -- so the holdback is not that function's output, and with
+    three exactly-collinear data points its form cannot be fitted (single-factor
+    layer models are already falsified by non-monotonicity; see
+    DESIGN_704_reserve_vs_layout.md). Emitting it settles the form in one boot
+    instead of a regression that cannot separate collinear regressors.
+
+    Reports rather than sanitises. A NEGATIVE holdback means the seam handed
+    budget back, which is a real and loud state; clamping it to zero would hide
+    exactly the accounting-error class this ticket has spent four instruments
+    chasing.
+    """
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(1 << 20)
+
+
+def budget_holdback_fraction(profiled_bytes: int, adjusted_bytes: int):
+    """Holdback as a fraction of the profiled budget, or ``None`` if there was
+    no budget to hold back from -- a division nobody should have to guard."""
+    if not profiled_bytes:
+        return None
+    return (float(profiled_bytes) - float(adjusted_bytes)) / float(profiled_bytes)
+
+
+def decompose_mamba_budget_post(total_gb: float, components: dict):
+    """Split the lumped mamba budget post into its three NAMED components.
+
+    The label has always named three terms; the post emitted one number. That
+    lump is why an accounting gap could not be attributed: the post nominally
+    covers MORE than the "Mamba Cache is allocated" line (it adds the prefill
+    activation reserve) yet measures 0.155 / 0.111 / 0.089 GiB LESS on the three
+    stages of the live boot. A term covering more cannot legitimately measure
+    less, and with one number there is no way to say which part carries it.
+
+    ``components`` holds the sub-terms the sizer actually measured. Whatever
+    they do not explain IS the state pool, so it is emitted under that name
+    rather than left as an anonymous remainder -- the parts always sum to the
+    lump exactly, and a NEGATIVE residual is reported rather than clamped,
+    because a negative state pool is precisely the error this instrument exists
+    to surface.
+
+    With no components (the other budget branches never populate them) the lump
+    is returned unchanged, so nothing else has to know about this.
+    """
+    if not components:
+        return [(MAMBA_BUDGET_POST, float(total_gb))]
+    named = sum(float(v) for v in components.values())
+    out = [("mamba state pool", float(total_gb) - named)]
+    out.extend((str(k), float(v)) for k, v in components.items())
+    return out
+
+
 #: State-slot count a pipeline stage WITHOUT any linear-attention layers in
 #: its layer window contributes to the world MIN-agreement on
 #: max_mamba_cache_size (#201 slice 3). Such a stage allocates zero state
@@ -392,7 +465,9 @@ class ModelRunnerKVCacheMixin:
         total_gb = total_b / (1 << 30)
         return (total_gb, max(0.0, total_gb - device_free_gb - own_b / (1 << 30)))
 
-    def _nvml_process_reach_gb(self: ModelRunner) -> Optional[Tuple[float, float, float]]:
+    def _nvml_process_reach_gb(
+        self: ModelRunner,
+    ) -> Optional[Tuple[float, float, float]]:
         """``(held by THIS process, card free, card total)`` in GiB, or None.
 
         Read through the registry identity map, never by assuming the CUDA
@@ -723,7 +798,12 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-            budget_posts.append((MAMBA_BUDGET_POST, before_mamba_gb - rest_memory))
+            budget_posts.extend(
+                decompose_mamba_budget_post(
+                    before_mamba_gb - rest_memory,
+                    getattr(self, "_mamba_budget_components", {}) or {},
+                )
+            )
 
         # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
         # a scratch buffer before the large-M cuBLAS GEMM, and targets above
@@ -873,6 +953,36 @@ class ModelRunnerKVCacheMixin:
         self._mem_ckpt_post_weights = (
             torch.cuda.memory_allocated(),
             torch.cuda.memory_reserved(),
+        )
+
+        # #704: EMIT the budget decomposition on the SUCCESS path too.
+        #
+        # Until now ``budget_posts`` was built on every boot and handed to
+        # ``budget_exhausted_message`` only when the budget RAN OUT -- so the
+        # sizer named every term of its own arithmetic exactly when it failed,
+        # and discarded the naming when it worked. The planner therefore had no
+        # instrument for the reserve it must not double-count, and re-deriving
+        # it from config missed the measured boot by +20 %, -3.8 % and -12 % on
+        # three independent attempts (NOTE_704_retro_prediction_terms.md).
+        #
+        # This line is the instrument that closes that gap: the pool solve
+        # CONSUMES these posts instead of recomputing them, which is the same
+        # discipline the #676 arming floor already follows. Two numbers that
+        # must agree and are computed twice is a shape this corpus has paid for
+        # repeatedly; here the second computation lives in a different process
+        # and could not even be compared.
+        # World rank, not tp_rank: under the flip's primary topology (tp=1,
+        # pp=N) every PP stage has tp_rank 0, so labelling with tp_rank names
+        # stage 0's card three times -- the #201 defect the budget-exhausted
+        # path already guards against a few lines below. Confirmed on metal:
+        # the first boot carrying this line emitted "[rank 0]" for PP0, PP1 and
+        # PP2 alike. _rank_vector_index() is the existing accessor and falls
+        # back to tp_rank when server_args is stubbed.
+        logger.info(
+            "[world_rank %d] KV budget posts (GiB): %s | rest=%.3f",
+            self._rank_vector_index(),
+            ", ".join(f"{name}={gb:.3f}" for name, gb in budget_posts),
+            rest_memory,
         )
 
         return int(rest_memory * (1 << 30))  # return in bytes
@@ -1678,9 +1788,7 @@ class ModelRunnerKVCacheMixin:
         n_global = len(layers)
         if self.pp_size <= 1:
             return n_global, n_global
-        n_local = sum(
-            1 for lid in layers if self.start_layer <= lid < self.end_layer
-        )
+        n_local = sum(1 for lid in layers if self.start_layer <= lid < self.end_layer)
         return n_local, n_global
 
     def _stage_local_mamba_cache_per_req(self: ModelRunner, config) -> int:
@@ -1863,6 +1971,8 @@ class ModelRunnerKVCacheMixin:
         return fitted
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
+        # #704: start a fresh component ledger for THIS sizing pass.
+        self._mamba_budget_components = {}
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
@@ -1909,7 +2019,9 @@ class ModelRunnerKVCacheMixin:
                     # secondary rung can exceed the boot shape's draft tokens.
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         elif self._auto_mamba_demand_active():
             # === Demand-driven mamba pool (uneven-DCP auto-sizing) ===========
             # Size the pool to the real serving concurrency, NOT to a fixed
@@ -1981,11 +2093,14 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             # Fold prefill-activation headroom back OUT of the KV budget so the
             # token pool does not grow to the physical ceiling and starve the
             # transient DCP-extend prefix-gather scratch (which OOMs a large
             # prefill). This lets the default --rank-auto-reserve-mib stand.
+            _note_mamba_component(self, "prefill activation reserve", reserve_gb)
             total_rest_memory = total_rest_memory - reserve_gb
         elif (
             server_args.disable_radix_cache
@@ -2044,7 +2159,9 @@ class ModelRunnerKVCacheMixin:
                     * server_args.max_mamba_cache_size
                     * server_args.max_speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
         else:
             # Use ratio-based calculation to auto-fit available memory
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
@@ -2083,7 +2200,9 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                _spec_gb = intermediate_size / (1 << 30)
+                _note_mamba_component(self, "speculative intermediate state", _spec_gb)
+                total_rest_memory = total_rest_memory - _spec_gb
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
@@ -5276,9 +5395,7 @@ class ModelRunnerKVCacheMixin:
                         solution.capacities,
                     )
                 return
-            capped = [
-                r for r in range(self.dcp_size) if q_by_rank[r] < p_by_rank[r]
-            ]
+            capped = [r for r in range(self.dcp_size) if q_by_rank[r] < p_by_rank[r]]
             c_active = _context_budget(active, solution.capacities)
             active_unit = min(
                 solution.capacities[r] // active[r] for r in range(self.dcp_size)
@@ -5646,17 +5763,301 @@ class ModelRunnerKVCacheMixin:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
         reserve = self._seam_reserve()
-        if not reserve.active:
-            return int(budget_bytes)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        # #662-F4 / A0: THE ARMING FLOOR IS CHARGED EVEN ON A COLD RECORD.
+        #
+        # ``reserve.active`` is False when every MEASURED field is zero, which
+        # is exactly a first boot -- and returning here is what sized
+        # boot_maxfill.log's rank 1 to ~875 MiB free against a 1536 MiB arming
+        # floor. Every prefill then stayed in the TP layout, in both
+        # directions, with no runtime recovery possible because the pool is
+        # fixed at boot; the operator had to hand-pin --max-total-tokens.
+        #
+        # A cold record means THE STAGING COST IS UNKNOWN. It does not mean the
+        # arming LEVEL is unknown: that one is derived from the corridor law
+        # the operator already stated, and is knowable on every rig at boot.
+        # So the two are charged separately from here on.
+        flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
+        # The floor is resolved from the SAME two inputs the guard resolves it
+        # from -- the operator's override and this rank's measured seam draw --
+        # so the pool reserves for the number the gate will actually enforce.
+        # On this rig the override is 1536 MiB against a derived 1331: sizing
+        # for the derived one would leave every rank 205 MiB short of its own
+        # arming floor, which looks like a healthy boot that never flips.
+        arming_floor = (
+            seam.arming_floor_target_bytes(
+                configured_mib=seam.configured_arming_floor_mib(self.server_args),
+                measured_draw_mib=(
+                    int(reserve.arming_draw_bytes()) >> 20 if reserve.active else 0
+                ),
+            )
+            if flips_on
+            else 0
+        )
+        # ONE CHARGE, COMPUTED ONCE, LOGGED AND APPLIED. #678 caught this line
+        # reporting the law-baseline number while
+        # ``seam_adjusted_budget_bytes`` applied the residual one -- a log that
+        # disagrees with the arithmetic it describes, which is worse than no
+        # log because it is the number an operator reads back.
+        already_reserved = seam.seam_solve_reserved_free_bytes(reserve)
+        floor_charge = seam.arming_floor_subtrahend_bytes(
+            arming_floor, already_reserved
+        )
+        if floor_charge or arming_floor:
+            logger.info(
+                "%s (rank %d): ARMING FLOOR %d MiB (corridor law + this rank's "
+                "measured one-leg seam draw + load margin) must stay free for a "
+                "flip to arm at all. Already held free by %s: %d MiB, so the "
+                "pool gives up the %d MiB difference and no more -- charging the "
+                "whole floor over a solve that already reserved it is what "
+                "returned 284181 tokens where 550000 arms and flips.",
+                seam.LOG_PREFIX,
+                self._seam_world_rank(),
+                arming_floor >> 20,
+                (
+                    "the seam solve"
+                    if already_reserved > seam._corridor_law_bytes()
+                    else "the corridor law"
+                ),
+                max(already_reserved, seam._corridor_law_bytes()) >> 20,
+                floor_charge >> 20,
+            )
+        # #685: HOW MANY ATTENTION LAYERS DOES THIS RANK ACTUALLY RECEIVE at
+        # the flip? A rank that receives none pays no per-token seam -- its
+        # measured per_row_bytes is BASELINE (checksums, the one-layer
+        # streaming window, allocator grain), not transfer, and reserving it
+        # per token holds back memory for bytes that never move. Measured
+        # 2026-08-16: the binding rank was 192 MiB short on a 1059 MiB need
+        # whose per-token term was ~190 MiB.
+        #
+        # DERIVED, NEVER FROZEN, and LOUD ABOUT ITS SOURCE. The frozen triple
+        # in phase_flip_seam_reserve is a drift watchdog, not an input; the
+        # live value is per-boot measured. The map comes from
+        # derive_pp_full_attn_layer_map, whose own docstring warns that the
+        # layer-id list must be the UNMUTATED global one (the PP stack's
+        # model_config is rewritten by adjust_hybrid_swa_layers_for_pp), so
+        # the source is logged and any doubt falls back to the previous
+        # arithmetic rather than guessing.
+        # HOISTED ABOVE THE COLD BRANCH THAT READS IT. `cell` used to be
+        # computed after the reserve.active check; the cold seam pricing needs
+        # it, and taking it later cost a second startup crash
+        # ("UnboundLocalError: cannot access local variable 'cell'", 12:54).
+        # It depends only on the configurator, never on the reserve, so there
+        # is nothing to compute later.
+        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+
+        # ALL THREE NAMES ARE DEFINED BEFORE ANY BRANCH CAN READ THEM. The
+        # first version assigned attn_counts and rank only inside the success
+        # path of the try below, and defined received_layers only after the
+        # cold branch that consumes it -- which sigquit every rank at startup
+        # with "UnboundLocalError: cannot access local variable
+        # 'received_layers'" (12:37, 30030 down). Same shape as the silent
+        # guard before it: a branch that skips the derivation must also define
+        # what the consumer reads, not merely skip the assignment.
+        received_layers = None
+        attn_counts = None
+        rank = 0
+        try:
+            from sglang.srt.managers.phase_flip_runtime import (
+                derive_pp_full_attn_layer_map,
+            )
+            from sglang.srt.managers.seam_slope import received_attention_layers
+
+            vec = getattr(self.server_args, "phase_flip_tp_vector", None)
+            if isinstance(vec, str):
+                vec = [float(x) for x in vec.split(",") if x.strip()]
+            # THE LIST LIVES ON hf_text_config, NOT ON model_config. The flip
+            # runtime reads exactly this path
+            # (tp_model_config.hf_text_config.full_attention_layer_ids) and its
+            # own comment explains why: the attention registry reads it via
+            # runner.mambaish_config. Reading model_config directly returned an
+            # EMPTY list here and silently disarmed the whole derivation --
+            # measured, tp_vector and num_hidden=64 and pp_size=3 all present,
+            # full_attention_layer_ids=0 entries. model_config is kept as a
+            # fallback because the PP stack's copy is the mutated one and an
+            # empty list from either source must not look like "no attention".
+            ids = list(
+                getattr(
+                    getattr(self.model_config, "hf_text_config", None),
+                    "full_attention_layer_ids",
+                    None,
+                )
+                or getattr(self.model_config, "full_attention_layer_ids", None)
+                or []
+            )
+            n_hidden = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
+            pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
+            rank = int(getattr(self, "pp_rank", getattr(self, "tp_rank", 0)) or 0)
+            if vec and ids and n_hidden > 0 and pp_size > 1:
+                layer_map = derive_pp_full_attn_layer_map(ids, n_hidden, pp_size)
+                attn_counts = [len(stage) for stage in layer_map]
+                n_attn_total = sum(attn_counts)
+                received = received_attention_layers(vec, attn_counts, n_attn_total)
+                received_layers = int(received[rank])
+                logger.info(
+                    "%s (rank %d): received-layer derivation -- attention map "
+                    "%s over %d total, tp vector %s -> this rank RECEIVES %d "
+                    "layer(s) at the flip. %s",
+                    seam.LOG_PREFIX,
+                    rank,
+                    attn_counts,
+                    n_attn_total,
+                    vec,
+                    received_layers,
+                    (
+                        "Zero received: its measured per_row_bytes is baseline, "
+                        "not seam, so no per-token seam is reserved."
+                        if received_layers <= 0
+                        else "Nonzero: the measured per-token slope stands."
+                    ),
+                )
+            else:
+                # THE GUARD MUST SPEAK WHEN IT REFUSES. The first version
+                # logged only on the success branch, so a falsy input left
+                # received_layers=None with NO line anywhere and the fix sat
+                # inert through two boots looking like it had simply not been
+                # reached. A silent precondition is indistinguishable from
+                # dead code.
+                logger.info(
+                    "%s: received-layer derivation SKIPPED -- tp_vector=%s "
+                    "full_attention_layer_ids=%d entr(y/ies) num_hidden=%s "
+                    "pp_size=%s. The falsy one is the missing input; the "
+                    "per-token seam charge stays at its measured value.",
+                    seam.LOG_PREFIX,
+                    vec,
+                    len(ids),
+                    n_hidden,
+                    pp_size,
+                )
+        except Exception as exc:  # noqa: BLE001 - sizing must not fail on a probe
+            logger.info(
+                "%s: received-layer derivation unavailable (%r); the per-token "
+                "seam charge stays at its measured value.",
+                seam.LOG_PREFIX,
+                exc,
+            )
+
+        if not reserve.active:
+            # #685 COLD BOOT: PRICE THE SEAM FROM THE LAYOUT, do not skip it.
+            #
+            # Reproduced live 2026-08-16 12:04, all three ranks "seam reserve
+            # is COLD ... sizes with NO flip-seam term": the pool came out at
+            # the raw 550000 pin where the warm boot minutes later solved
+            # 467708 against the same budget. A cold boot sized ~17% above
+            # what the same configuration knows to be safe, and the first flip
+            # then meets a pool that was never priced for it.
+            #
+            # There is no measured record to read, but the SLOPE does not need
+            # one: it is a property of the layout (which layers this rank
+            # receives) and the KV geometry (bytes per token per attention
+            # layer), both known at boot. The measured record adds the fixed
+            # and arena terms and the id-space anchor; without it we charge
+            # the per-token term alone, which UNDERCHARGES relative to warm and
+            # is deliberately the safe direction to be wrong in on a first
+            # boot -- strictly better than charging nothing.
+            #
+            # R' IS NET OF THE FLOOR CHARGE. The arming floor must stay free
+            # for a flip to arm at all; it is a reservation, never a spendable
+            # balance, so it cannot become KV. Solving against the
+            # pre-subtraction budget would price it as if it could, which is
+            # the same overshoot by another route. The warm branch returns
+            # this same net quantity, so both branches answer "how many bytes
+            # could become KV" with one number.
+            #
+            # AND THE FLOOR IS CHARGED ONCE. This returns min(net, allowed *
+            # cell) -- never net minus the charge a second time, which would
+            # hold a whole arming floor free for the life of the instance.
+            net = max(0, int(budget_bytes) - floor_charge)
+            cold_slope = 0.0
+            try:
+                attn_local = (
+                    attn_counts[rank]
+                    if received_layers is not None and attn_counts
+                    else 0
+                )
+                if received_layers and attn_local > 0 and int(cell) > 0:
+                    kv_per_attn_layer = float(cell) / float(attn_local)
+                    cold_slope = float(received_layers) * kv_per_attn_layer
+            except Exception:  # noqa: BLE001 - sizing must not fail on a probe
+                cold_slope = 0.0
+            if cold_slope <= 0.0 or int(cell) <= 0:
+                logger.info(
+                    "%s (rank %s): COLD and the seam slope could not be "
+                    "derived (received=%s cell=%s); sizing with NO per-token "
+                    "seam term, the pre-#685 behaviour.",
+                    seam.LOG_PREFIX,
+                    self._seam_world_rank(),
+                    received_layers,
+                    cell,
+                )
+                return net
+            allowed_cold = seam.solve_pool_tokens(
+                net, int(cell), 0, cold_slope, 0, received_layers=received_layers
+            )
+            priced = max(0, min(net, allowed_cold * int(cell)))
+            logger.info(
+                "%s (rank %s): COLD seam priced from the layout -- receives %d "
+                "layer(s), %.1f B/token/attn-layer, slope %.1f B/token; R' = "
+                "%d MiB net of the %d MiB floor charge -> %d tokens, budget "
+                "%d -> %d MiB. No measured record, so the fixed and arena "
+                "terms are NOT charged; this undercharges versus warm, which "
+                "is the safe direction on a first boot.",
+                seam.LOG_PREFIX,
+                self._seam_world_rank(),
+                int(received_layers or 0),
+                (float(cell) / float(attn_counts[rank])) if attn_counts else 0.0,
+                cold_slope,
+                net >> 20,
+                floor_charge >> 20,
+                allowed_cold,
+                net >> 20,
+                priced >> 20,
+            )
+            return priced
 
         # Per-RANK per-token bytes, which is what the record's slope means.
         # A configurator with no single cell (hybrid SWA, MiniMax sparse)
         # gets no invented one: abstaining is a smaller error than charging
         # a slope against a cell that does not exist.
-        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+        # WHAT A REFUSED SEAM COSTS decides whether the pool pays for the
+        # guarantee. Under strict purity a refused tp_to_pp means prefill
+        # never runs -- boot E held the corridor and served nothing -- so the
+        # pool must shrink until the seam is affordable. Where prefill may run
+        # in the TP layout the refusal costs one flip, and shrinking the pool
+        # below what the corridor law already pays for would hold VRAM free
+        # ABOVE the law for the life of the instance instead. Read from the
+        # purity mode, never configured on its own.
+        # #685 DIAGNOSTIC: the received-layer derivation below did not appear
+        # in the 12:04 boot's log although the pool WAS seam-adjusted, so the
+        # function is returning before it on the live path. One unconditional
+        # line at the point of no return, naming the terms every early exit
+        # keys on, decides which branch without another bisect.
+        logger.info(
+            "%s: seam-adjusted budget reached the survivability step -- "
+            "reserve.active=%s per_row=%.1f fixed=%d arena=%d id_space=%s",
+            seam.LOG_PREFIX,
+            getattr(reserve, "active", "?"),
+            float(getattr(reserve, "per_row_bytes", 0.0) or 0.0),
+            int(getattr(reserve, "fixed_bytes", 0) or 0),
+            int(getattr(reserve, "arena_fixed_bytes", 0) or 0),
+            getattr(reserve, "id_space", "?"),
+        )
+        from sglang.srt.managers.phase_purity import purity_from_server_args
+
+        try:
+            survivable = bool(
+                purity_from_server_args(self.server_args).prefill_allowed_in_tp()
+            )
+        except Exception:
+            survivable = False
         new_bytes, allowed = seam.seam_adjusted_budget_bytes(
-            budget_bytes, cell, reserve
+            budget_bytes,
+            cell,
+            reserve,
+            abandon_is_survivable=survivable,
+            arming_floor_bytes=arming_floor,
+            received_layers=received_layers,
         )
         logger.info(
             "%s (rank %d): seam floor %d MiB + %.1f B/token, measured with "
@@ -5691,7 +6092,23 @@ class ModelRunnerKVCacheMixin:
         # #656: charge the flip seam HERE, the one funnel every sizing path
         # reaches. Keyed to the post-capture path instead, it never fired at
         # all on the ship config, whose pool is decided pre-capture (boot H).
+        _profiled_bytes = budget_bytes
         budget_bytes = self._seam_adjusted_budget(budget_bytes, configurator)
+        # #704: EMIT the true per-rank holdback at the one funnel every sizing
+        # path reaches. This is the term that lands at 6,688 / 3,561 / 5,166 MiB
+        # on metal while derived_rank_auto_reserve_mib reports 4,160 uniformly,
+        # and the term no external re-derivation reproduced (+20 %, -3.8 %,
+        # -12 % on three attempts). With it emitted, one boot identifies the
+        # form that three collinear points could not.
+        _frac = budget_holdback_fraction(_profiled_bytes, budget_bytes)
+        logger.info(
+            "KV budget holdback: profiled=%.1f MiB, adjusted=%.1f MiB, "
+            "holdback=%.1f MiB (%s of profiled)",
+            _profiled_bytes / (1 << 20),
+            budget_bytes / (1 << 20),
+            budget_holdback_mib(_profiled_bytes, budget_bytes),
+            "n/a" if _frac is None else f"{_frac:.3%}",
+        )
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:

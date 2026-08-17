@@ -386,6 +386,38 @@ def derive_enable_hicache_storage(server_args: ServerArgs) -> bool:
     )
 
 
+def default_pp_micro_batch_size(
+    *, max_running_requests: int, pp_size: int, enable_phase_flip: bool
+) -> int:
+    """The auto-computed ``pp_max_micro_batch_size``.
+
+    Classic PP divides the concurrency cap by ``pp_size`` because the stages
+    run micro-batches of one batch, so each stage may only hold its share.
+
+    UNDER THE PHASE FLIP THAT DIVISION IS WRONG, and it is the binding cap on
+    this deployment. Decode does not run in the PP layout at all -- it runs in
+    the TP layout, which has no pipeline to divide by. Dividing anyway throttles
+    the DECODE phase with a bound belonging to the PREFILL phase.
+
+    Measured 2026-08-16 on max_running_requests=4, pp_size=3: the default was
+    max(4 // 3, 1) = 1, and under a sustained depth-5 load decode concurrency
+    never exceeded 2 -- 973 prefill rounds with 0 requests running, 792 with 1,
+    48 with 2, against a configured ceiling of 4. Nothing was deadlocked; the
+    scheduler was obeying a cap of one.
+
+    The flip branch returns the full ``max_running_requests``. It is not
+    unbounded: ``get_num_allocatable_reqs`` still mins this against the
+    admission limiter, the request-slot pool, and the mamba/GDN state headroom,
+    so the state pool remains the real ceiling -- this only stops a
+    prefill-layout divisor from pre-empting all three.
+    """
+    if max_running_requests <= 0:
+        return 1
+    if enable_phase_flip:
+        return max(int(max_running_requests), 1)
+    return max(int(max_running_requests) // max(int(pp_size), 1), 1)
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -461,10 +493,15 @@ class Scheduler(
         from sglang.srt.managers.phase_policy import config_from_env
 
         self.phase_policy_cfg = config_from_env(
+            chunk_tokens=int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+            # #689: a decode window should open at the width the pools were
+            # built for, not at whatever single carrier happened to finish
+            # first. max_running_requests IS that width.
+            formation_target=int(getattr(server_args, "max_running_requests", 0) or 0),
             enabled=(
                 getattr(server_args, "enable_phase_flip", False)
                 and getattr(server_args, "phase_flip_policy", "manual") == "auto"
-            )
+            ),
         )
         self.phase_policy_state = None
         if self.phase_policy_cfg.enabled:
@@ -494,6 +531,16 @@ class Scheduler(
             if not self._phase_purity.prefill_allowed_in_tp():
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg, prefill_runs_in_tp=False
+                )
+            # The PP phase is drained when less than one chunk is left, and
+            # the chunk size is a runtime fact, not a policy guess. Only fill
+            # it in when the operator has not pinned one.
+            if self.phase_policy_cfg.pp_exit_tokens <= 0:
+                self.phase_policy_cfg = dataclasses.replace(
+                    self.phase_policy_cfg,
+                    pp_exit_tokens=int(
+                        getattr(server_args, "chunked_prefill_size", 0) or 0
+                    ),
                 )
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
@@ -677,6 +724,22 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.
+        # It reads the GDN slot pool off req_to_token_pool.mamba_allocator,
+        # and that attribute is assigned four lines up -- AFTER
+        # init_model_worker() has already returned. Sitting next to the
+        # admission limiter (inside init_model_worker) put it before its own
+        # input existed and killed every rank on the first boot that got far
+        # enough to reach it:
+        #     line 1420, in init_model_worker -> self.init_parked_decode_set()
+        #     AttributeError: 'Scheduler' object has no attribute
+        #     'req_to_token_pool'                     (metal, 2026-08-16 09:00)
+        # The two earlier boots died at build_flip_draft_worker before ever
+        # reaching the call, which is exactly why a stand-in unit test could
+        # not have caught this: the ordering bug lives in the constructor, and
+        # the tests bind the methods to an object that already has the fields.
+        self.init_parked_decode_set()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -1421,8 +1484,12 @@ class Scheduler(
         if not get_server_args().pp_max_micro_batch_size:
             get_server_args().override(
                 "scheduler.pp_max_micro_batch_size_default",
-                pp_max_micro_batch_size=max(
-                    self.max_running_requests // self.ps.pp_size, 1
+                pp_max_micro_batch_size=default_pp_micro_batch_size(
+                    max_running_requests=self.max_running_requests,
+                    pp_size=self.ps.pp_size,
+                    enable_phase_flip=bool(
+                        getattr(get_server_args(), "enable_phase_flip", False)
+                    ),
                 ),
             )
 
@@ -2803,6 +2870,451 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
+
+    def init_parked_decode_set(self) -> None:
+        """#677 phase 1: stop charging undecodable carriers to the cap.
+
+        ARMED ONLY WHERE THE DEFECT EXISTS. The wedge needs a phase that
+        forbids decode while prefill keeps arriving, which is the phase
+        flip under an enforcing purity mode. Without the flip there is no
+        phase that forbids decode, every resident request is decodable,
+        the discount would be zero on every round, and arming would only
+        add a branch to the hottest gate in the scheduler.
+
+        THE SLOT POOL IS READ FROM THE ALLOCATOR, NEVER FROM A FLAG. It is
+        the mamba/GDN state pool -- the bound that actually refuses, late,
+        inside alloc_req_slots -- and on a non-hybrid model there is no
+        such pool and no such bound, so parking stays off there too rather
+        than inventing a ceiling out of max_running_requests.
+        """
+        from sglang.srt.managers.parked_decode_set import (
+            LOG_PREFIX as PARKED_DECODE_LOG_PREFIX,
+        )
+        from sglang.srt.managers.parked_decode_set import ParkedDecodeSet
+
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        # Plain os.environ, matching its siblings (SGLANG_FLIP_SEAM_CHUNK_MIB,
+        # SGLANG_PHASE_POLICY_DRAIN_MODE) rather than the envs registry, so
+        # every phase-flip knob is set and read the same way.
+        want = bool(
+            int(os.environ.get("SGLANG_PHASE_PARK_CARRIERS", "1") or 0)
+            and getattr(self.server_args, "enable_phase_flip", False)
+            and mamba_allocator is not None
+        )
+        slot_pool = int(getattr(mamba_allocator, "size", 0) or 0)
+        if want and slot_pool <= 0:
+            # A pool that reports no slots cannot bound anything, and a
+            # zero ceiling would refuse ALL admission. Refuse the feature,
+            # not the traffic.
+            logger.warning(
+                "%s parking disarmed: the mamba allocator reports %d slots, "
+                "so there is no state-pool ceiling to admit against.",
+                PARKED_DECODE_LOG_PREFIX,
+                slot_pool,
+            )
+            want = False
+        self.parked_decode_set = ParkedDecodeSet(
+            slot_pool=slot_pool,
+            max_running=int(self.max_running_requests or 0),
+            enabled=want,
+        )
+        #: The purity verdict the decode branch last reached, with the phase
+        #: it was reached in. The gate cannot re-evaluate it: the predicate
+        #: (`decode_blocked_here`) advances the starvation clock, so asking
+        #: twice per round would double-tick it. Recording the phase is what
+        #: makes a stale verdict safe -- a verdict from the other layout is
+        #: discarded rather than trusted.
+        self._parked_decode_verdict: Tuple[Optional[str], bool] = (None, False)
+        logger.info(
+            "%s parking %s: GDN slot pool %d, concurrency cap %d, phase flip "
+            "%s. Armed, a carrier this phase forbids to decode stops counting "
+            "against the cap and the slot pool becomes the admission ceiling.",
+            PARKED_DECODE_LOG_PREFIX,
+            "ARMED" if want else "off",
+            slot_pool,
+            int(self.max_running_requests or 0),
+            "on" if getattr(self.server_args, "enable_phase_flip", False) else "off",
+        )
+
+    #: Rounds the target layout may take to build its first batch after a
+    #: policy-armed flip before the arm is declared wrong. Small, because the
+    #: thing being caught is a loop that re-armed every 3-4 seconds; large
+    #: enough that one empty round during the post-cutover settle is not an
+    #: accusation.
+    ARM_VERDICT_ROUNDS = 8
+
+    #: Minimum seconds between BOTH-BLOCKED evict attempts. The decline is
+    #: evaluated every round, and an unbounded evict call there would be a
+    #: tight loop over the whole radix tree while the instance is already
+    #: wedged.
+    BOTH_BLOCKED_EVICT_INTERVAL_S = 5.0
+
+    def _apply_both_blocked_relief(self, decision, inp) -> None:
+        """Actually run the eviction the BOTH-BLOCKED receipt promises.
+
+        #698 THE INVARIANT WAS COMMENT-ONLY, and that is what a 54-minute
+        outage was made of. phase_policy's branch says:
+
+            "Declining here is what routes the caller to the evict rung
+             instead of to a cutover."
+
+        The caller did no such thing. Every decline was handled identically --
+        one throttled log line, return None -- so the system printed "this is
+        an evict trigger and NOT a flip" 350 times over 54 minutes while no
+        evict was ever attempted. Health returned 200 throughout, three GPUs
+        sat at 0%, and 10.5M tokens queued behind a pool nothing would free.
+        That is the fourth counter-vs-actuator member found in one day, and
+        the first where the actuator was described in prose and never written.
+
+        BOUNDED, AND HONEST ABOUT DELIVERING NOTHING. The decline is evaluated
+        every round, so the call is rate-limited; and it REPORTS what eviction
+        actually returned, because "the remedy ran and freed 0" and "the remedy
+        never ran" are the two states this outage could not distinguish.
+
+        A ZERO HERE IS A FINDING, NOT A FAILURE OF THIS CODE. At the 16:23
+        specimen the pool was held by an in-flight CHUNKED request's protected
+        prefix -- a chunked request is resident but sits in no batch (#631
+        defect O), which is why the scheduler read `#running-req: 0` while its
+        prefix was locked. Eviction cannot free a locked chain, so on that
+        specimen this routing would have delivered 0 and said so. Naming that
+        in one line is what turns a silent wedge into a diagnosis.
+        """
+        try:
+            from sglang.srt.managers.phase_policy import BOTH_BLOCKED
+
+            if (decision.reason or "").find(BOTH_BLOCKED) != 0:
+                return
+            now = float(inp.now)
+            last = getattr(self, "_both_blocked_evict_at", 0.0)
+            if last and (now - last) < self.BOTH_BLOCKED_EVICT_INTERVAL_S:
+                return
+            self._both_blocked_evict_at = now
+            tree = getattr(self, "tree_cache", None)
+            if tree is None:
+                return
+            from sglang.srt.mem_cache.common import (
+                evict_from_tree_cache,
+                uniform_avail_for_evict,
+            )
+
+            want = int(
+                getattr(self.server_args, "chunked_prefill_size", 0) or 0
+            ) or 512
+
+            # ZERO IS AMBIGUOUS, AND THE FIRST VERSION OF THIS LOG READ IT
+            # WRONG. `evict_from_tree_cache` returns 0 in TWO different states:
+            # it ran and could not reach anything, or it was SKIPPED because
+            # `avail >= num_tokens` already (see its `return 0` tail). Reporting
+            # the alarming reading unconditionally sends the next reader hunting
+            # a phantom locked chain -- which is the counter-vs-actuator mistake
+            # this whole routine exists to catch, committed by the instrument
+            # itself. Measure `avail` on the SAME side of the call the actuator
+            # decides from, so the two zeros are told apart by evidence.
+            avail_before = None
+            try:
+                allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+                if allocator is not None:
+                    avail_before = int(uniform_avail_for_evict(tree, allocator))
+            except Exception:  # noqa: BLE001 - diagnosis must not break relief
+                avail_before = None
+
+            freed = int(evict_from_tree_cache(tree, want) or 0)
+            rows = self._post_evict_rows()
+
+            if freed > 0:
+                verdict = "The remedy the receipt names has now actually run."
+            elif avail_before is not None and avail_before >= want:
+                # Benign. KV was NOT the binding resource at this instant, so
+                # whatever blocks admission is something else -- mamba/GDN state
+                # slots are the standing candidate on this model, since a
+                # request needs a slot even when KV is plentiful.
+                verdict = (
+                    f"Eviction was SKIPPED, not defeated: {avail_before} rows "
+                    f"were already available against {want} wanted, so the "
+                    f"actuator had nothing to do. KV is therefore NOT the "
+                    f"binding resource here -- look at the state-slot bound "
+                    f"(mamba/GDN slots) before blaming the pool."
+                )
+            else:
+                verdict = (
+                    "Eviction RAN and delivered nothing"
+                    + (
+                        f" ({avail_before} rows available, {want} wanted)"
+                        if avail_before is not None
+                        else ""
+                    )
+                    + " -- the pool is held by something the frontier cannot "
+                    "reach (an in-flight chunked request's protected prefix is "
+                    "the known case). This is the state to escalate, not to "
+                    "retry."
+                )
+
+            logger.warning(
+                "PHASE-POLICY BOTH-BLOCKED RELIEF: asked the tree cache for "
+                "%d rows, it freed %d; %d rows now reachable. %s",
+                want,
+                freed,
+                rows,
+                verdict,
+            )
+        except Exception as exc:  # noqa: BLE001 - relief must never break a round
+            logger.warning(
+                "PHASE-POLICY BOTH-BLOCKED RELIEF could not run (%r); the "
+                "decline stands and nothing was freed.",
+                exc,
+            )
+
+    def _note_round_build_outcome(self, ret, running_batch) -> None:
+        """Record that this round built nothing while both classes had work.
+
+        AN OBSERVATION, NOT A PREDICTION, and that distinction is the whole
+        fix. ``get_next_batch_to_run`` has just finished trying to build a
+        batch and produced none; whether this layout can run anything is
+        therefore already ANSWERED at this line. The old escape from that
+        state was the 180 s decode-stall cap -- a timer re-deriving by
+        waiting what the round already knew (metal 2026-08-16 09:42:39-45:
+        six seconds of zero GPU, zero PCIe, 572715 tok queued, four carriers
+        ready, py-spy showing all three ranks spinning this very function).
+
+        BOTH CLASSES MUST HAVE WORK AND BOTH MUST HAVE FAILED. An empty
+        instance also builds no batch, and flipping an idle server is thrash
+        with no benefit -- so "no batch" alone is deliberately not the
+        trigger.
+        """
+        watch = getattr(self, "_arm_watch", None)
+        if watch is not None:
+            if ret is not None:
+                # The target ran. The verdict is vindicated; stop watching.
+                self._arm_watch = None
+            else:
+                watch["rounds"] += 1
+                if watch["rounds"] == self.ARM_VERDICT_ROUNDS:
+                    committed = (
+                        getattr(self, "phase_flip_active_stack", None)
+                        != watch["phase_at_arm"]
+                    )
+                    if not committed:
+                        # ARM-UNFUNDED, NOT ARM-VERDICT-WRONG, and the split
+                        # matters because the first version accused the wrong
+                        # component. Measured 2026-08-16 11:05: three
+                        # ARM-VERDICT-WRONG against twelve
+                        # "FLIP ABANDONED (pool too small for the live set)",
+                        # eight of them "This rank: fits (a peer did not)".
+                        # The target layout never became active, so the
+                        # admissibility verdict was never tested -- the SEAM
+                        # could not pay. A falsifier that fires on funding
+                        # failures stops being a falsifier for verdicts.
+                        logger.warning(
+                            "PHASE-POLICY ARM-UNFUNDED: armed %s (%s) and the "
+                            "cutover has not committed after %d rounds -- the "
+                            "instance is still in the %s layout. This is a "
+                            "SEAM FUNDING failure, not a wrong admissibility "
+                            "verdict: the target was never entered, so the "
+                            "verdict was never tested. Look for FLIP ABANDONED "
+                            "on the binding rank, not at the arm.",
+                            watch["direction"],
+                            watch["reason"],
+                            watch["rounds"],
+                            watch["phase_at_arm"],
+                        )
+                    else:
+                        logger.warning(
+                            "PHASE-POLICY ARM-VERDICT-WRONG: armed %s (%s), the "
+                            "cutover COMMITTED into the target layout, and it "
+                            "still built no batch in %d rounds. The "
+                            "admissibility inputs that produced this arm were "
+                            "running_bs=%d pending=%d nothing_can_run=%s "
+                            "target_can_admit=%s ready_carriers=%d. The verdict "
+                            "was tested and was wrong; if this repeats in "
+                            "alternating directions it is the 2026-08-16 10:24 "
+                            "ping-pong and the target term is lying again.",
+                            watch["direction"],
+                            watch["reason"],
+                            watch["rounds"],
+                            watch["running_bs"],
+                            watch["pending"],
+                            watch["nothing_can_run"],
+                            watch["target_can_admit"],
+                            watch["ready_carriers"],
+                        )
+        if ret is not None:
+            self._round_built_nothing = False
+            return
+        resident = len(getattr(running_batch, "reqs", None) or [])
+        try:
+            pending = int(self._pending_prefill_tokens() or 0)
+        except Exception:  # noqa: BLE001 - an observation must not break a round
+            pending = 0
+        self._round_built_nothing = bool(resident > 0 or pending > 0)
+
+    def _post_evict_rows(self) -> int:
+        """KV rows this rank could hand out if the cache gave up everything.
+
+        POST-EVICT, because the cache is not a claim on the pool -- it is a
+        cache. The 10:30:50 boot died with ``full_available_size=0`` and
+        ``full_evictable_size=151040`` in the same message: an allocator that
+        looked empty while 151040 rows sat there evictable. An admissibility
+        answer computed from ``available`` alone would call that layout
+        unusable and be wrong by 151040 rows.
+        """
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        tree = getattr(self, "tree_cache", None)
+        try:
+            avail = int(alloc.available_size()) if alloc is not None else 0
+        except Exception:  # noqa: BLE001 - a probe must not break the round
+            avail = 0
+        # #698: ASK FOR THE FULL-ATTENTION COUNT FIRST, and fall back to the
+        # flat accessor only for the classes that have one.
+        #
+        # MambaRadixCache.evictable_size() RAISES NotImplementedError -- it
+        # splits the count in two and says so ("use full_evictable_size() and
+        # mamba_evictable_size() instead"). This swallowed that exception and
+        # used 0, so on the class this rig actually runs the probe returned
+        # `available` ALONE -- exactly the error the docstring above warns
+        # about, committed three lines below it.
+        #
+        # At usage 1.00 that reads ~0, so every admissibility question answered
+        # "no": pp could not admit, tp had nothing resident to decode, and the
+        # #688 BOTH BLOCKED branch declined the flip. That branch returns
+        # BEFORE alloc_token_slots, so the allocator was never reached, so
+        # eviction never ran, so a pool that was 100% UNLOCKED CACHE with zero
+        # resident requests was never freed. Serving stopped for 54 minutes on
+        # 2026-08-16 with health returning 200 throughout, three GPUs at 0%,
+        # and 10.5M tokens queued behind a cache nothing would evict.
+        #
+        # The identical trap is documented at mem_cache/common.py:411-425 for
+        # the same two classes. Resolution order is copied from there rather
+        # than re-derived, because two spellings of one rule is how this
+        # returns.
+        #
+        # A SWALLOWED EXCEPTION THAT YIELDS A PLAUSIBLE NUMBER is the shape to
+        # avoid: zero is a legal row count, so nothing downstream could
+        # distinguish "the cache holds nothing" from "the cache was never
+        # asked". Each accessor is tried in turn and only a genuine absence of
+        # all of them yields zero.
+        evictable = 0
+        for name in ("full_evictable_size", "evictable_size"):
+            getter = getattr(tree, name, None) if tree is not None else None
+            if getter is None:
+                continue
+            try:
+                evictable = int(getter())
+                break
+            except Exception:  # noqa: BLE001 - try the next accessor
+                continue
+        return max(0, avail) + max(0, evictable)
+
+    def _layout_admits(self, phase: str, running_bs: int, pending_tokens: int) -> bool:
+        """Can the layout ``phase`` build a batch of the class it is allowed?
+
+        ONE SIMULATION, USED FOR BOTH SIDES. The current layout and the target
+        layout are the same question asked of two phases, so they must not be
+        answered by two different mechanisms -- that asymmetry is exactly what
+        produced the 10:24 ping-pong (target simulated, current inferred) and
+        then the 10:47 premature arm (current inferred from a single round).
+
+        PP may only prefill: it needs a CHUNK of rows and a free GDN state
+        slot for the incoming request. TP may only decode under drain purity:
+        it needs the pool to back one decode step for the residents, which
+        under NEXTN is a draft window per carrier rather than one row for the
+        batch. Rows are counted POST-EVICT, because the cache is not a claim
+        on the pool.
+        """
+        rows = self._post_evict_rows()
+        if phase == "pp":
+            if int(pending_tokens) <= 0:
+                return False
+            chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
+            need = min(chunk, int(pending_tokens))
+            mamba = getattr(
+                getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+            )
+            try:
+                slots = int(mamba.available_size()) if mamba is not None else 1
+            except Exception:  # noqa: BLE001 - a probe must not break the round
+                slots = 0
+            return rows >= need and slots >= 1
+        if phase == "tp":
+            if int(running_bs) <= 0:
+                return False
+            per_req = max(
+                1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
+            )
+            return rows >= int(running_bs) * per_req
+        return False
+
+    def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
+        """``(nothing_can_run, target_admissible)`` for the policy.
+
+        BOTH TERMS ARE SIMULATED NOW. Each was a proxy once and each cost a
+        live defect, in the same shape:
+
+        * ``target_can_admit`` was "work of that class exists". On 2026-08-16
+          10:24 that was permanently true on both sides while NEITHER layout
+          could run, and the policy ping-ponged every 3-4 seconds.
+        * ``nothing_can_run`` was "the round happened to build nothing". On
+          2026-08-16 10:47:42 that fired on a single transient empty round
+          with the pool 5% used, 6 of 12 GDN slots free and a request still
+          queued -- PP could plainly have admitted more. The arm bypassed
+          window formation (correctly, #688 outranks #689) and the decode
+          window opened at ONE carrier, which is the bs=1 defect #689 exists
+          to remove.
+
+        A ROUND THAT BUILT NOTHING IS NECESSARY BUT NOT SUFFICIENT. It is kept
+        as the trigger -- the check is worthless if it fires while batches are
+        being built -- but the verdict is now whether the layout CAN build
+        one, not whether it just did.
+        """
+        if not bool(getattr(self, "_round_built_nothing", False)):
+            return False, False
+        phase = getattr(self, "phase_flip_active_stack", None)
+        if phase not in ("pp", "tp"):
+            # No flip enabled, or a phase this rule says nothing about.
+            return False, False
+        other = "tp" if phase == "pp" else "pp"
+        here = self._layout_admits(phase, running_bs, pending_tokens)
+        there = self._layout_admits(other, running_bs, pending_tokens)
+        return (not here), there
+
+    def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
+        """Record this round's purity verdict and reconcile the parked set.
+
+        Called from the ONE site that already evaluates the verdict, so the
+        starvation clock still ticks exactly once per round.
+        """
+        if not self.parked_decode_set.enabled:
+            return
+        phase = getattr(self, "phase_flip_active_stack", None)
+        self._parked_decode_verdict = (phase, bool(decode_blocked))
+        reqs = list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        self.parked_decode_set.sync_carriers(
+            [getattr(r, "rid", "") for r in reqs],
+            len(getattr(running_batch, "reqs", None) or []),
+        )
+
+    def _parked_carrier_discount(self, running_bs: int) -> int:
+        """Carriers the concurrency cap must not count, this round.
+
+        TWO CLAMPS, EACH FOR A DIFFERENT WAY THE RECORD CAN BE STALE.
+
+        The verdict is recorded by the decode branch, which does not run on
+        every round -- a round that selects a prefill batch never reaches
+        it. So the record can outlive the layout it was made in, and a
+        verdict from the OTHER phase is discarded outright: PP forbids
+        decode and TP does not, so trusting a PP verdict inside TP would
+        discount carriers that are actively decoding.
+
+        The id set can also outlive the requests in it, for the same
+        reason -- a carrier that finished on a round the decode branch did
+        not reach is still listed. Clamping the discount to the resident
+        count means a stale id can never credit more than is there, so the
+        worst case degrades to the pre-change gate rather than to
+        over-admission.
+        """
+        phase, blocked = getattr(self, "_parked_decode_verdict", (None, False))
+        if not blocked or phase != getattr(self, "phase_flip_active_stack", None):
+            return 0
+        return min(self.parked_decode_set.carrier_discount(), max(0, int(running_bs)))
 
     def init_admission_limiter(self) -> None:
         """Build this group's floating admission limit (#287).
@@ -4244,6 +4756,59 @@ class Scheduler(
     #: reading it sooner.
     _CORRIDOR_BREACH_CHECK_S = 10.0
 
+    def _flight_serving_tick(self) -> None:
+        """One paced VRAM flight sample while serving (#684).
+
+        WHY, MEASURED. The recorder's last boot post is ``first_forward``. On
+        2026-08-16 an instance died 36 minutes later with ``76.38 MiB is free
+        ... Process 1920108 has 4.29 GiB memory in use``, and naming that
+        process took hours -- log archaeology plus a pid-clock interpolation
+        across two boots' ``boot_id`` fields. Every fact needed to answer it in
+        one line was already computed by the recorder's own NVML view, which
+        includes the full pid->bytes map of everyone on the card. Nothing was
+        marking after boot.
+
+        NOT A DUPLICATE OF ``_corridor_trace_tick``. That one arms a 100 ms
+        sampler for the corridor LAW, keeping a fixed-size RAM ring -- which
+        dies with the process that crashes, and whose ``Sample`` discards the
+        per-pid map it reads. This appends to a FILE, so it survives the
+        crash; the surviving boot marks are what made that pid clock
+        calibratable at all.
+
+        HERE, AND ONCE PER ITERATION, for the reason the two lines above this
+        call site give: every rank reaches it exactly once per round, so the
+        cadence is replicated and the per-rank files line up round for round,
+        which is what makes them comparable across ranks. Unlike its
+        neighbours this needs no collective and takes no branch -- it is
+        write-only -- so it cannot make two ranks disagree about anything.
+
+        The pacing lives in the recorder (default 30 s), so the cost here is
+        one monotonic clock read per iteration, and exactly zero when the
+        recorder is not armed.
+
+        THE IMPORT IS OUTSIDE THE GUARD, DELIBERATELY. ``flight_recorder`` is
+        imported inside ``run_scheduler_process``, not at module scope, so a
+        module-level reference here is a ``NameError`` -- and the first version
+        of this method had one, inside a bare ``except Exception`` that turned
+        it into an instrument which silently never ran. That is the exact
+        failure this task exists to prevent, so the import may fail loudly and
+        only the CALL is guarded.
+        """
+        from sglang.srt.mem_ledger import flight_recorder
+
+        try:
+            flight_recorder.mark_serving(rank=self.ps.tp_rank)
+        except Exception as e:  # noqa: BLE001 - a probe never breaks serving
+            if not getattr(self, "_flight_serving_warned", False):
+                # ONCE, at WARNING: a probe must not spam a serving loop, and
+                # it must not be silent either. Silence is what cost the hours.
+                self._flight_serving_warned = True
+                logger.warning(
+                    "VRAM flight serving mark failed and will be retried "
+                    "quietly from here on: %s",
+                    e,
+                )
+
     def _corridor_trace_tick(self) -> None:
         """Arm the continuous corridor sampler, then AUDIT it on a cadence.
 
@@ -4779,6 +5344,11 @@ class Scheduler(
         # SGLANG_CORRIDOR_TRACE_MS is set.
         self._corridor_trace_tick()
 
+        # #684: the DURABLE serving series, beside the sampler above and for a
+        # different job -- the ring dies with the process, this survives it.
+        # Paced in the recorder; no-op unless SGLANG_VRAM_FLIGHT_DIR is set.
+        self._flight_serving_tick()
+
         # #297 phase-boundary KV resharding: same lazy-build and cadence
         # discipline as the #287 block below. Built FIRST so the pressure
         # runtime's dcp_ratio actuator can bind to it in the same iteration.
@@ -5039,11 +5609,24 @@ class Scheduler(
             and self.phase_flip_runtime.pending is not None
             and not chunk_blocks_quiescence(self.chunked_req)
         ):
+            # A round withheld for a PENDING FLIP is not a round that could
+            # not build a batch -- it is one that deliberately did not try. It
+            # must not leave the previous round's verdict standing, or the
+            # arming gate reads a stale "nothing can run" from before the flip
+            # was armed.
+            self._round_built_nothing = False
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif phase_prefill_blocked_here(self):
+        elif phase_prefill_blocked_here(
+            self,
+            running_bs=(
+                len(running_batch.reqs)
+                if running_batch is not None and running_batch.reqs is not None
+                else 0
+            ),
+        ):
             # #631 STRICT PHASE PURITY: not a single token is prefilled in
             # the TP layout. The prefill batch is not BUILT (nothing is
             # allocated and then dropped) -- the work stays queued and is
@@ -5152,7 +5735,17 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                if phase_decode_blocked_here(self, running_batch.batch_size()):
+                # #677 PHASE 1: the ONE evaluation of the purity verdict per
+                # round happens on the next line, and the admission gate reads
+                # what it records. It cannot ask the predicate itself --
+                # decode_blocked_here advances the decode starvation clock, so
+                # a second call per round would double-tick it and relax
+                # purity early.
+                _decode_blocked = phase_decode_blocked_here(
+                    self, running_batch.batch_size()
+                )
+                self._note_parked_carriers(running_batch, _decode_blocked)
+                if _decode_blocked:
                     # #631 STRICT PHASE PURITY: no decode step executes in
                     # the PP layout. The requests stay RESIDENT and are
                     # carried across the next cutover by the resident-carry
@@ -5187,6 +5780,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        self._note_round_build_outcome(ret, running_batch)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -5199,8 +5793,27 @@ class Scheduler(
             get_server_args().pp_max_micro_batch_size,
             self.admission_limiter.current,
         )
-        res = limit - running_bs
+        # #677 PHASE 1: a carrier the phase FORBIDS to decode stops being
+        # charged to the concurrency cap. `limit` bounds how much decode may
+        # run at once; a request PP may not decode is running nothing, so
+        # counting it there reserves concurrency nobody can spend. Measured
+        # 2026-08-16 06:04: four such carriers held the whole cap of four and
+        # 403779 tokens of prefill could not be admitted behind them.
+        #
+        # ZERO UNLESS PARKING IS ARMED AND THE PHASE FORBIDS DECODE, so the
+        # default path below is the pre-change expression unchanged.
+        parked = self._parked_carrier_discount(running_bs)
+        res = limit - max(0, running_bs - parked)
         res = min(res, self.req_to_token_pool.available_size())
+        # THE SECOND BOUND EXISTS BECAUSE THE FIRST ONE STOPPED BINDING.
+        # available_size() above is the REQUEST-slot count -- HybridReqToToken
+        # Pool does not override it -- so nothing in this expression has ever
+        # seen the mamba/GDN state pool; alloc_req_slots consults it later and
+        # refuses there. While the concurrency cap bound admission that late
+        # refusal was unreachable. Discounting carriers removes that cap, so
+        # the state pool becomes the real ceiling and is asserted HERE, early
+        # and by name, instead of as a late refusal in the allocator.
+        res = min(res, self.parked_decode_set.admission_headroom(running_bs, res))
         return res
 
     def dynamic_chunked_prefill_size(self) -> int:
@@ -5568,6 +6181,8 @@ class Scheduler(
             prefill_spill_regions = self.kv_session_offload.prefill_spill_free_regions()
 
         # Prefill policy
+        from sglang.srt.mem_cache.common import published_fundable_floor
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -5590,10 +6205,37 @@ class Scheduler(
             prefill_spill_regions=prefill_spill_regions,
             prefill_spill_region_tokens=prefill_spill_region_tokens,
             prefill_spill_deep=prefill_spill_deep,
+            # #681: the NEW-request half of #679's park. `add_chunked_req`
+            # already refuses to schedule a chunk the pool cannot fund, on the
+            # group-published floor; without this the sibling gate for fresh
+            # requests still branches on THIS rank's pool and admits batches
+            # `alloc_for_extend` then dies on. Read once per iteration, from
+            # the same helper the chunked gate uses, so both gates agree by
+            # construction rather than by two copies of the arithmetic.
+            #
+            # `published_fundable_floor` and not `fundable_extend_tokens`
+            # directly: as a CEILING a mis-read 0 would admit nothing forever,
+            # so the cap is applied only where a group floor was actually
+            # published. See that helper for why the two gates read the same
+            # number through different doors.
+            fundable_extend_floor=published_fundable_floor(self.tree_cache),
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # #679 rung 1-3: SPEND RELIEF BEFORE THE PARK, not instead of it.
+            #
+            # The ladder runs here and nowhere else: this is the last point at
+            # which the pool can still be topped up before add_chunked_req
+            # decides, and it is downstream of the pre-branch reduce (this
+            # iteration's uniform_min_avail is already published), so no rung
+            # takes a collective of its own.
+            #
+            # ORDER IS THE CONTRACT (DESIGN_679 §4, rule 1): the ladder changes
+            # what there is to decide from; add_chunked_req still decides. A
+            # ladder that admitted work itself would be a second admission
+            # authority, and the park guard would no longer be final.
+            self._maybe_spend_admission_relief(running_batch)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -5804,6 +6446,257 @@ class Scheduler(
                 new_lora_set
             )
 
+    #: One prefix so a boot log can be grepped for the whole ladder at once.
+    _LADDER_PREFIX = "KV-ADMISSION-LADDER"
+
+    def _maybe_spend_admission_relief(self, running_batch: ScheduleBatch) -> int:
+        """Decide, group-uniformly, whether the chunked prefill needs relief.
+
+        #679. Split from the ladder so the TRIGGER and the ACTUATORS can be
+        tested apart, and so the trigger's one job is visible: read the agreed
+        number, compare it against what the next chunk would ask for, and spend
+        nothing at all when the pool is comfortable. The comfortable case is
+        every iteration on a healthy instance, so it must cost one comparison.
+
+        THE SHORTFALL IS SIZED FROM THE REDUCED VALUE, which makes every rank
+        ask its rungs for the same number of tokens. Sizing it from this rank's
+        own availability would have the binding rank retract more victims than
+        its peers -- #583, one layer up from where #583 was found.
+        """
+        from sglang.srt.mem_cache.common import admission_relief_ladder_enabled
+
+        if not admission_relief_ladder_enabled():
+            return 0
+        req = self.chunked_req
+        if req is None:
+            return 0
+        try:
+            want = int(self.server_args.chunked_prefill_size or 0)
+            if want <= 0:
+                return 0
+            avail = int(self.uniform_min_avail())
+            if avail >= want:
+                # The common case, and it must stay cheap: one reduced read,
+                # one comparison, no rung entered.
+                return 0
+            return self._admission_relief_ladder(running_batch, want - avail)
+        except Exception as e:  # noqa: BLE001 - relief must never fail a boot
+            logger.warning(
+                "%s trigger failed (%s); admission proceeds and the park guard "
+                "decides unaided",
+                self._LADDER_PREFIX,
+                e,
+            )
+            return 0
+
+    def _admission_relief_ladder(
+        self, running_batch: ScheduleBatch, need_tokens: int
+    ) -> int:
+        """Spend relief so an admission need not PARK. Returns tokens freed.
+
+        #679 rung 1-3, built to DESIGN_679_admission_relief_ladder.md. The park
+        guard remains the floor of this ladder and the final authority: this
+        function only changes how much the pool can fund BEFORE that guard
+        decides. It never admits anything and never refuses anything.
+
+        THE ORDER, and why it is this order (see the design note for the
+        costing of each rung):
+
+          rung 0  radix eviction -- already spent by the caller, and by
+                  alloc_token_slots after it. Not repeated here.
+          rung 1  kvso.try_spill -- a BOUNDED, CHOSEN amount (the victim's
+                  block-aligned tail overhang) at the cost of host bandwidth
+                  and no request's progress. Best rung available.
+          rung 2  throttle_before_retract -- frees NOTHING now; lowers inflow
+                  so rung 3 does not repeat next round. Placed between the two
+                  for exactly the reason the decode-OOM branch places it there.
+          rung 3  retract_decode -- the most tokens per call and the loudest:
+                  the victim loses all decode progress and re-prefills.
+
+        EXHAUSTION IS A RUNG OUTCOME, NEVER AN ERROR. ``try_spill`` returns
+        False when no host region is free -- a reachable state whose bound has
+        never been measured under the 5-lane load that produced the crash -- and
+        the ladder simply falls through to the next rung. Same for a rung that
+        frees less than asked: the ladder continues, the caller re-reads the
+        pool, and the park guard has the last word. Nothing here raises.
+
+        GROUP UNIFORMITY. Every decision reads ``uniform_min_avail()``, the
+        value the pre-branch reduce published at the top of this iteration
+        (scheduler.py's _update_uniform_pool_budget, unconditional and once per
+        rank), so no rung takes a collective of its own and no rung can split
+        the group. ``need`` is sized from that same reduced value, so every
+        rank spills and retracts for the same shortfall. This is the property
+        #603 and #583 were paid for; it is not re-derived here, it is reused.
+
+        OFF BY DEFAULT. Without the env flag this returns 0 immediately and the
+        caller behaves exactly as c4b88e1923 did.
+        """
+        from sglang.srt.mem_cache.common import (
+            admission_relief_ladder_enabled,
+            admission_retraction_enabled,
+        )
+
+        if not admission_relief_ladder_enabled():
+            return 0
+        if running_batch is None or running_batch.is_empty():
+            # Nothing to spill and nothing to retract: every rung below acts on
+            # the RUNNING batch. An empty one means the pressure is not coming
+            # from resident work, so there is nothing this ladder can take.
+            return 0
+
+        need = max(0, int(need_tokens))
+        if need <= 0:
+            return 0
+
+        before = int(self.uniform_min_avail())
+        freed_by = []
+
+        # -- rung 1: spill a session's tail to host ---------------------------
+        if self.kv_session_offload is not None:
+            try:
+                if self.kv_session_offload.try_spill(running_batch, need=need):
+                    freed_by.append("kvso_spill")
+            except Exception as e:  # noqa: BLE001 - a rung must not kill a boot
+                logger.warning(
+                    "%s rung 1 (kvso spill) failed: %s", self._LADDER_PREFIX, e
+                )
+            if int(self.uniform_min_avail()) - before >= need:
+                self._log_ladder(need, before, freed_by)
+                return int(self.uniform_min_avail()) - before
+
+        # -- rung 2: lower inflow so rung 3 does not repeat -------------------
+        # Frees nothing. Deliberately spent even when rung 3 is skipped below:
+        # the pressure that got us here is inflow, and the throttle is the only
+        # rung that addresses that rather than its symptom.
+        try:
+            if throttle_before_retract(
+                self.admission_limiter, running_batch.batch_size()
+            ):
+                freed_by.append("throttle")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s rung 2 (throttle) failed: %s", self._LADDER_PREFIX, e)
+
+        # -- rung 3: retract decode victims -----------------------------------
+        # THE PRECONDITION IS NOT OPTIONAL. retract_decode's loop bound and its
+        # last-survivor test both read uniform_avail_floor; handing it a
+        # rank-local value is #583 exactly -- ranks enter together and pop
+        # DIFFERENT numbers of victims.
+        if admission_retraction_enabled():
+            try:
+                running_batch.uniform_avail_floor = self.uniform_min_avail()
+                gained = self._retract_decode_and_requeue(
+                    running_batch, kv_full_retract_flag=True
+                )
+                if gained:
+                    freed_by.append(f"retract({gained})")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s rung 3 (retract) failed: %s", self._LADDER_PREFIX, e)
+
+        freed = max(0, int(self.uniform_min_avail()) - before)
+        self._log_ladder(need, before, freed_by)
+        return freed
+
+    def _log_ladder(self, need: int, before: int, freed_by: list) -> None:
+        after = int(self.uniform_min_avail())
+        logger.warning(
+            "%s asked for %d tokens: group-uniform available %d -> %d (%+d) "
+            "via %s. The park guard still decides; this only changed what "
+            "there is to decide from.",
+            self._LADDER_PREFIX,
+            need,
+            before,
+            after,
+            after - before,
+            ", ".join(freed_by) if freed_by else "nothing (every rung was spent)",
+        )
+
+    def _retract_decode_and_requeue(
+        self, batch: ScheduleBatch, *, kv_full_retract_flag: bool
+    ) -> int:
+        """Retract decode victims and put every one of them back. Returns the
+        tokens the pool gained.
+
+        #679 rung 3: EXTRACTED VERBATIM from update_running_batch so the
+        admission ladder can reach this actuator without owning a second copy
+        of it. That matters more than it looks. The retraction itself is one
+        call; what surrounds it is the part that must not drift -- the metrics,
+        the new_token_ratio handover, the abort dispatch for requests that
+        could not be kept, and above all
+
+            for req in retracted_reqs:
+                self._add_request_to_queue(req, is_retracted=True)
+
+        A second implementation that forgot that line would LEAK every victim
+        it retracted, which is a worse failure than the crash this ladder
+        exists to prevent. One implementation, two call sites, no drift.
+
+        THE CALLER OWNS THE PRECONDITIONS, and they are not optional:
+          * ``batch.uniform_avail_floor`` must already be the reduced value --
+            it bounds the retraction loop and the last-survivor test, and #583
+            is exactly the case where the entry decision was uniform and the
+            loop bound was not, so ranks popped DIFFERENT numbers of victims;
+          * the decision to call at all must be group-uniform for the same
+            reason.
+        """
+        old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        old_ratio = self.new_token_ratio_tracker.current
+        mamba_allocator = getattr(
+            self.tree_cache.req_to_token_pool, "mamba_allocator", None
+        )
+        old_mamba_available = (
+            mamba_allocator.available_size() if mamba_allocator is not None else None
+        )
+        retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+            self.server_args
+        )
+        new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        new_token_gained = new_available_tokens - old_available_tokens
+        mamba_num_gained = (
+            mamba_allocator.available_size() - old_mamba_available
+            if mamba_allocator is not None
+            else None
+        )
+
+        self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
+        if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
+            self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                num_retracted_reqs=len(retracted_reqs),
+                num_retracted_input_tokens=sum(
+                    len(r.origin_input_ids) for r in retracted_reqs
+                ),
+                num_retracted_output_tokens=sum(
+                    len(r.output_ids) for r in retracted_reqs
+                ),
+            )
+        self.new_token_ratio_tracker.current = new_token_ratio
+        for req in reqs_to_abort:
+            abort_reason: FINISH_ABORT = req.to_finish
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason=abort_reason.to_json(),
+                    rid=req.rid,
+                ),
+                req,
+            )
+
+        msg_prefix = (
+            "KV cache pool is full. Retract requests. "
+            if kv_full_retract_flag
+            else "Testing retraction. "
+        )
+        msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+        if mamba_num_gained is not None:
+            msg_details += f", #mamba_num_gained: {mamba_num_gained}"
+        if kv_full_retract_flag:
+            msg_details += (
+                f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+            )
+        logger.warning(msg_prefix + msg_details)
+
+        for req in retracted_reqs:
+            self._add_request_to_queue(req, is_retracted=True)
+        return new_token_gained
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -5926,65 +6819,9 @@ class Scheduler(
         if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
-            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
-            old_ratio = self.new_token_ratio_tracker.current
-            mamba_allocator = getattr(
-                self.tree_cache.req_to_token_pool, "mamba_allocator", None
+            self._retract_decode_and_requeue(
+                batch, kv_full_retract_flag=kv_full_retract_flag
             )
-            old_mamba_available = (
-                mamba_allocator.available_size()
-                if mamba_allocator is not None
-                else None
-            )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
-            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
-            new_token_gained = new_available_tokens - old_available_tokens
-            mamba_num_gained = (
-                mamba_allocator.available_size() - old_mamba_available
-                if mamba_allocator is not None
-                else None
-            )
-
-            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
-            if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
-                self.metrics_reporter.metrics_collector.increment_retracted_reqs(
-                    num_retracted_reqs=len(retracted_reqs),
-                    num_retracted_input_tokens=sum(
-                        len(r.origin_input_ids) for r in retracted_reqs
-                    ),
-                    num_retracted_output_tokens=sum(
-                        len(r.output_ids) for r in retracted_reqs
-                    ),
-                )
-            self.new_token_ratio_tracker.current = new_token_ratio
-            for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                    ),
-                    req,
-                )
-
-            msg_prefix = (
-                "KV cache pool is full. Retract requests. "
-                if kv_full_retract_flag
-                else "Testing retraction. "
-            )
-            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
-            if mamba_num_gained is not None:
-                msg_details += f", #mamba_num_gained: {mamba_num_gained}"
-            if kv_full_retract_flag:
-                msg_details += (
-                    f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
-                )
-            logger.warning(msg_prefix + msg_details)
-
-            for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -7335,6 +8172,17 @@ class Scheduler(
                 # on the lane-local limiter, not a server arg -- the ceiling
                 # the pools were built for stays where it is.
                 "effective_max_running_requests",
+                # #665-F1: the measured decode-contention fraction the flip
+                # threshold is solved against. Runtime-settable for the same
+                # reason as dual_group_lane_pairing above -- it lets the
+                # one-sided and the measured threshold be compared from ONE
+                # boot, on the same memory vector, the same KV token vector
+                # and the same corridor, instead of carrying boot-to-boot
+                # variance into the comparison. It changes only how a
+                # threshold is COMPUTED; it moves no memory and reshapes no
+                # pool, which is why it is safe to move at runtime while the
+                # budgets around it are not.
+                "phase_policy_decode_contention",
             ]
         )
 
@@ -7383,6 +8231,25 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "phase_policy_decode_contention":
+                if self.phase_policy_state is None:
+                    logging.warning(
+                        "phase_policy_decode_contention requires the phase "
+                        "policy to be enabled (--phase-flip-policy auto)."
+                    )
+                    if_success = False
+                    break
+                from sglang.srt.managers.phase_policy import (
+                    PhasePolicyError,
+                    with_decode_contention,
+                )
+
+                try:
+                    with_decode_contention(self.phase_policy_cfg, v)
+                except PhasePolicyError as e:
+                    logging.warning(f"Updating {k} to {v!r} is rejected: {e}")
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -7415,6 +8282,29 @@ class Scheduler(
                     "Admission limit set to %d (ceiling %d).",
                     self.admission_limiter.current,
                     self.admission_limiter.ceiling,
+                )
+            # #665-F1: recompute the threshold, not a pool. Logged with the
+            # whole ladder because the failure this guards against is a TOP
+            # rung no prompt can reach, which is invisible if only one rung
+            # is printed.
+            if "phase_policy_decode_contention" in server_args_dict:
+                from sglang.srt.managers.phase_policy import (
+                    effective_flip_threshold,
+                    with_decode_contention,
+                )
+
+                self.phase_policy_cfg = with_decode_contention(
+                    self.phase_policy_cfg,
+                    remaining.pop("phase_policy_decode_contention"),
+                )
+                logger.warning(
+                    "PHASE-POLICY decode contention set to %g; N ladder by "
+                    "decoding reqs now %s",
+                    self.phase_policy_cfg.decode_contention,
+                    [
+                        effective_flip_threshold(self.phase_policy_cfg, b)
+                        for b in range(5)
+                    ],
                 )
             # Multi-group runtime (#274): lane job -- a command, not a server
             # arg. Only the rank carrying the addressed lane enqueues; every
@@ -7572,6 +8462,9 @@ class Scheduler(
 
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
         from sglang.srt.managers.phase_policy import (
+            IDLE_LOCKED as POLICY_IDLE_LOCKED,
+        )
+        from sglang.srt.managers.phase_policy import (
             PhasePolicyDecision,
             PhasePolicyInputs,
             decide,
@@ -7672,6 +8565,31 @@ class Scheduler(
             pending_prefill_tokens=self._pending_prefill_tokens(),
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
+            # getattr, because this gate is driven in tests by scheduler
+            # STAND-INS that carry only the fields the policy reads. A
+            # stand-in without the observation has not observed anything, and
+            # "not observed" must mean "do not arm on it" -- the pre-change
+            # behaviour -- rather than an AttributeError in the arming path.
+            # #689 FORMATION INPUTS. ready_carriers is the PARKED count, not
+            # running_bs: with #677 phase-1 parking live, carriers PP cannot
+            # decode are discounted from the admission cap, so running_bs
+            # reads 0 exactly when the window is fullest. Both terms are
+            # replicated -- the parked set is reconciled from the same
+            # resident batch on every rank, and the queue is the replicated
+            # waiting queue.
+            ready_carriers=int(
+                getattr(getattr(self, "parked_decode_set", None), "resident_count", 0)
+                or 0
+            ),
+            queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
+            **dict(
+                zip(
+                    ("nothing_can_run", "target_can_admit"),
+                    getattr(self, "_idle_locked_inputs", lambda *_: (False, False))(
+                        int(running_bs or 0), self._pending_prefill_tokens()
+                    ),
+                )
+            ),
         )
         state = self.phase_policy_state
         observe_idle(state, inp)
@@ -7747,7 +8665,51 @@ class Scheduler(
                     inp.pending_prefill_tokens,
                     inp.running_bs,
                 )
+            # getattr, for the third time in this file and for the same
+            # reason: the policy gate is driven in tests by scheduler
+            # STAND-INS carrying only the fields the policy reads. A stand-in
+            # without the relief hook must decline exactly as before, not raise
+            # AttributeError inside the arming path.
+            getattr(self, "_apply_both_blocked_relief", lambda *_: None)(
+                decision, inp
+            )
             return None
+        # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
+        # its seam has moved the zero-GPU window one stage right instead of
+        # removing it (live specimen 09:43:11Z: staging 1706 MiB needed
+        # against 1635 spendable -- 71 MiB short, with 364884 cached rows
+        # sitting there). Recorded on the runtime so the funding path can see
+        # WHY this flip was armed; cleared by the runtime once it is read.
+        rt_for_funding = getattr(self, "phase_flip_runtime", None)
+        if rt_for_funding is not None:
+            rt_for_funding.armed_idle_locked = bool(
+                (decision.reason or "").startswith(POLICY_IDLE_LOCKED)
+            )
+        # #688 ANTI-OSCILLATION AS A RUNTIME INVARIANT, not a test premise.
+        #
+        # The hermetic test asserted that the target runs after the flip by
+        # FEEDING that assumption in by hand, so it could not have caught the
+        # 10:24 ping-pong -- the assumption was the bug. The property has to
+        # be checked where it can actually be false: on metal, after the flip,
+        # against what the target layout then does. If the target does not
+        # build a batch within a few rounds, the admissibility verdict that
+        # armed this flip was WRONG, and the inputs that produced it are what
+        # a reader needs.
+        self._arm_watch = {
+            "direction": decision.direction,
+            "reason": (decision.reason or "")[:120],
+            "running_bs": int(inp.running_bs),
+            "pending": int(inp.pending_prefill_tokens),
+            "nothing_can_run": bool(getattr(inp, "nothing_can_run", False)),
+            "target_can_admit": bool(getattr(inp, "target_can_admit", False)),
+            "ready_carriers": int(getattr(inp, "ready_carriers", 0) or 0),
+            "rounds": 0,
+            # THE DISCRIMINATOR. An arm can only be judged once the layout it
+            # asked for actually arrived; until the phase changes, the cutover
+            # has not committed and any silence belongs to the FUNDING, not to
+            # the verdict.
+            "phase_at_arm": getattr(self, "phase_flip_active_stack", None),
+        }
         note_flip_armed(state, decision, inp.now)
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
@@ -8600,6 +9562,17 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+            # #673: destroy the collectives before the interpreter does. Their
+            # C++ watchdog and heartbeat threads are joined by the process
+            # group's DESTRUCTOR; with the group never destroyed those
+            # std::threads are still joinable at teardown, and destroying a
+            # joinable std::thread calls std::terminate -- "terminate called
+            # without an active exception", after a clean drain, which is the
+            # #673 signature. Graceful path only and flag-gated: the destroy
+            # path runs barlink's close(), which is #722's machinery.
+            from sglang.srt.managers.scheduler_teardown import release_distributed
+
+            release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 
 # ---------------------------------------------------------------------------

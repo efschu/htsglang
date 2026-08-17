@@ -142,7 +142,9 @@ class _SpanOpsBase(CustomTestCase):
 
     def _covered(self, arena, offset=OFF):
         """The set of chunk-aligned starts currently mapped at ``offset``."""
-        return sorted(rel for rel, _size, _h in arena._extents_by_offset.get(offset, []))
+        return sorted(
+            rel for rel, _size, _h in arena._extents_by_offset.get(offset, [])
+        )
 
 
 class TestSuffixCommit(_SpanOpsBase):

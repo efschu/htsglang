@@ -58,7 +58,6 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -105,6 +104,25 @@ from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_av
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
+
+#: FLA's chunk size, INLINED rather than imported (#673 follow-up).
+#:
+#: This used to be
+#: ``from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE``,
+#: which dragged torch, triton and the whole FLA kernel chain into EVERY
+#: process that touches ServerArgs -- launcher, tokenizer manager, detokenizer
+#: -- to learn one integer. Worse than the cost: ``fla/utils.py`` probes the
+#: device AT IMPORT TIME (``get_available_device`` -> ``torch.cuda.is_available``,
+#: plus the triton driver), so processes that must never hold a CUDA context
+#: were touching the driver during argument parsing -- the #237/#403
+#: second-context family.
+#:
+#: The upstream value is a plain literal, so there is nothing to derive. It is
+#: pinned against the authoritative definition by
+#: ``test_server_args_import_weight_673.py``, which imports FLA properly (in a
+#: test, where the cost is fine) and fails if the two ever diverge -- so drift
+#: is loud rather than silent.
+FLA_CHUNK_SIZE = 64
 
 logger = logging.getLogger(__name__)
 
@@ -5504,6 +5522,104 @@ class ServerArgs:
             "fallback SGLANG_PHASE_FLIP_SPILL_DEPTH.",
         ),
     ] = None
+    phase_flip_canonical_kv_page: A[
+        bool,
+        Arg(
+            help="#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL "
+            "whole-page format, so tokens produced by the same model do not "
+            "miss between the PP prefill phase and the TP decode phase, or "
+            "across a reboot. A stored page carries EVERY attention layer of "
+            "one token (page_size 1, layer-major, global layer order); each PP "
+            "stage deposits only its own slots at their global offset into one "
+            "shared page and a completeness marker keeps the page invisible "
+            "until the last slot arrives. Because the bytes then stop "
+            "depending on the cut, the KV key drops BOTH geometry suffixes "
+            "(_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}) and carries "
+            "content alone -- the same argument weighted uneven-DCP already "
+            "used on the token axis, and the reason this is gated on the "
+            "format rather than applied to every PP run: the key carries "
+            "exactly the geometry the bytes still depend on. Draft pages are "
+            "excluded by name (head-sharded and token-complete, so no suffix "
+            "rule can neutralise them: the draft pool starts cold after a flip "
+            "and a cross-phase hit is PARTIAL by design), and component "
+            "(mamba/SWA) pools keep their per-rank keys. Requires "
+            "--enable-phase-flip, the 'file' storage backend and page_size 1. "
+            "Default off = keys and bytes byte-identical to today.",
+        ),
+    ] = False
+    phase_flip_writeback: A[
+        bool,
+        Arg(
+            help="#703: push warm prefixes to the geometry-neutral store "
+            "BEFORE each phase flip, instead of hoping the normal write-back "
+            "policy already did. Nothing in the flip path touches HiCache "
+            "today: device rows ride through (the live row set is relocated by "
+            "row id), but the HOST tier is bound to the pool that BUILT it -- "
+            "the boot PP stack -- and in the TP phase that is not the live "
+            "pool, so the only way across the flip for a prefix is the disk "
+            "tier. Getting it there is not automatic: under "
+            "--hicache-write-policy write_back a prefix is staged only under "
+            "eviction pressure, and the host->storage stage is an asynchronous "
+            "queue that a flip neither forces nor waits for. This hook stages "
+            "the un-backed prefixes of the tree and WAITS for the storage "
+            "acknowledgements under a deadline "
+            "(--phase-flip-writeback-deadline-s), never unbounded: it runs "
+            "with requests parked, where an unbounded wait is a wedge. "
+            "REFUSES LOUDLY without --phase-flip-canonical-kv-page, because "
+            "pages keyed by the geometry of one phase cannot be read by the "
+            "other and the IO would buy nothing. Requires --enable-phase-flip. "
+            "Default off.",
+        ),
+    ] = False
+    phase_flip_writeback_deadline_s: A[
+        Optional[float],
+        Arg(
+            help="#703: hard bound on the flip-time writeback wait, in "
+            "seconds (default 2.0). Whatever is not acknowledged in time stays "
+            "in flight and is reported; the flip proceeds either way. A prefix "
+            "that misses the store costs a later cache miss, while a flip "
+            "stalled behind an unbounded drain costs the instance. Requires "
+            "--phase-flip-writeback.",
+        ),
+    ] = None
+    scheduler_distributed_teardown: A[
+        bool,
+        Arg(
+            help="#673: destroy this scheduler's process groups on the graceful "
+            "shutdown path, instead of leaving them to the interpreter. torch "
+            "already reports the omission on every boot "
+            '("destroy_process_group() was not called before program exit"), '
+            "and the cost is the #673 abort: ProcessGroupNCCL's watchdog and "
+            "heartbeat are C++ threads joined by the group's destructor, so "
+            "with the group never destroyed they are still joinable when the "
+            "process tears down -- and destroying a joinable std::thread calls "
+            'std::terminate, which is the observed "terminate called without '
+            'an active exception" after a CLEAN drain. Default off because '
+            "the destroy path also closes barlink (a POSIX shm segment and the "
+            "device-mapped abort word that spinning kernels read), which is "
+            "task #722's live machinery.",
+        ),
+    ] = False
+    phase_flip_rebind_hicache: A[
+        bool,
+        Arg(
+            help="#719: move the HiCache pool bindings to the phase-active "
+            "pools at the cutover, so the device tier is usable in BOTH "
+            "phases instead of only the one that built it. Without this the "
+            "controller, the radix cache and the scheduler all name the boot "
+            "(PP) pool permanently, and #718 disarms device-tier I/O in the TP "
+            "phase because copying against the wrong pool is silent corruption "
+            "in both directions. The rebind is ALL THREE READERS OR NONE and "
+            "is verified by generation afterwards: a rebind one subsystem sees "
+            "and another does not is worse than no rebind, because every call "
+            "still succeeds against different memory. It REFUSES unless the "
+            "incoming phase has its own host pool of matching shape -- a host "
+            "pool is allocated FROM a device pool, so reusing the other "
+            "phase's would copy matching row ids at mismatched widths. "
+            "Requires --enable-phase-flip. Default off = the #718 disarm "
+            "stands and behaviour is byte-identical.",
+        ),
+    ] = False
     enable_vram_dial: A[
         bool,
         Arg(
@@ -7620,6 +7736,26 @@ class ServerArgs:
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
                 )
+            if self.phase_flip_rebind_hicache:
+                raise ValueError(
+                    "--phase-flip-rebind-hicache requires "
+                    "--enable-phase-flip: with one layout there is only one "
+                    "set of pools, so there is nothing to rebind between."
+                )
+            if self.phase_flip_writeback:
+                raise ValueError(
+                    "--phase-flip-writeback requires --enable-phase-flip: "
+                    "with one layout there is no flip to write back before."
+                )
+            if self.phase_flip_canonical_kv_page:
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page requires "
+                    "--enable-phase-flip: the geometry-neutral page exists so "
+                    "the two phases can name the same bytes, and with one "
+                    "layout there is no second geometry to be neutral "
+                    "towards. Refused rather than ignored -- silently "
+                    "accepting it would move every KV key for nothing."
+                )
             if self.phase_flip_spill_depth is not None:
                 raise ValueError(
                     "--phase-flip-spill-depth requires --enable-phase-flip: "
@@ -7751,11 +7887,22 @@ class ServerArgs:
         blockers = []
         if self.disaggregation_mode != "null":
             blockers.append("--disaggregation-mode")
-        if self.enable_hierarchical_cache:
-            blockers.append(
-                "--enable-hierarchical-cache (#630: PP x disk HiCache "
-                "wedges at warmup)"
-            )
+        # #703: the BOOT-TIME twin of the runtime clause in
+        # phase_flip_runtime.flip_blocking_guards, narrowed identically and for
+        # the same reason. The #630 wedge was the DISK tier at warmup; its root
+        # was fixed by 9da9dfd025 (bounded collectives,
+        # mem_cache/hicache_collective.py). Refusing on the mere flag forced the
+        # serving line to run with no cache tier of any kind. Fixing only the
+        # runtime clause is not enough -- this one refuses at parse time, before
+        # a scheduler exists, so both must move together or the flag is still
+        # unusable.
+        # #703 stage 2: the #630 blocker is REMOVED, matching its runtime twin
+        # in phase_flip_runtime.flip_blocking_guards. The disk tier is the
+        # retention store the design needs (user decision: disk is plentiful,
+        # host RAM is not), and the wedge that earned this blocker was fixed by
+        # 9da9dfd025 with a green suite. See the comment at the runtime clause
+        # for why the pp-suffix decision, not the backend allowance, is the
+        # thing that stays gated on #706's whole-page format.
         if getattr(self, "dual_group_lane", False):
             blockers.append("--dual-group-lane")
         if self.dp_size > 1:
@@ -7783,6 +7930,52 @@ class ServerArgs:
                 )
         if blockers:
             raise ValueError(f"--enable-phase-flip V1 refuses: {', '.join(blockers)}.")
+        if self.phase_flip_writeback and not self.phase_flip_canonical_kv_page:
+            raise ValueError(
+                "--phase-flip-writeback requires "
+                "--phase-flip-canonical-kv-page: the writeback exists to get "
+                "a prefix into a store the OTHER phase can name, and without "
+                "the geometry-neutral format the pages it writes still carry "
+                "the tp/pp suffixes of the phase that wrote them. Refused "
+                "rather than run, because the cost -- IO at the flip seam, "
+                "with requests parked -- would be paid for a hit that cannot "
+                "happen."
+            )
+        if self.phase_flip_writeback_deadline_s is not None:
+            if not self.phase_flip_writeback:
+                raise ValueError(
+                    "--phase-flip-writeback-deadline-s requires "
+                    "--phase-flip-writeback; alone it bounds nothing."
+                )
+            if self.phase_flip_writeback_deadline_s <= 0:
+                raise ValueError(
+                    "--phase-flip-writeback-deadline-s must be > 0, got "
+                    f"{self.phase_flip_writeback_deadline_s}."
+                )
+        if self.phase_flip_canonical_kv_page:
+            # #706: the two conditions the whole-page protocol is defined on.
+            # Both are checkable here, and both are silent corruption if left
+            # to be discovered later -- a backend that cannot do a partial
+            # write has no way to assemble a page across stages, and a
+            # multi-token page would span token owners, which is why
+            # dcp_owner_mode already requires page_size 1.
+            if self.hicache_storage_backend != "file":
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page needs "
+                    "--hicache-storage-backend file, got "
+                    f"{self.hicache_storage_backend!r}. The whole-page format "
+                    "assembles one page from several stages by writing byte "
+                    "ranges into it; no other backend implements that, and the "
+                    "disk tier is where the format has to live anyway for "
+                    "context to survive a reboot."
+                )
+            if self.page_size != 1:
+                raise ValueError(
+                    "--phase-flip-canonical-kv-page requires --page-size 1, "
+                    f"got {self.page_size}. A canonical page is ONE token's "
+                    "attention layers; a multi-token page would span token "
+                    "owners, the same limit weighted uneven-DCP already sets."
+                )
 
     def _handle_regime_controller(self):
         """#363: validate the mode and, for 'act', the entry gate.

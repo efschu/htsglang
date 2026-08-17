@@ -31,18 +31,29 @@ permission to move its KV placement and VRAM budget as a side effect of
 wanting a layout change. So this policy actuates ONE axis and nothing else,
 behind its own flag. #363 remains the general answer.
 
-THE RESTING STATE IS THE PREFILL LAYOUT (PP), by design
--------------------------------------------------------
-Idle flips are free -- no request is waiting on them -- and the first thing
-any request does is prefill. Resting in PP therefore means a long prompt
-arriving at a quiet server gets PP-class prefill with ZERO flip cost inside
-its TTFT. Resting in TP would put a ~3.2 s round trip in the latency path of
-exactly the requests that are most latency-sensitive to it. The trade is
-real but one-sided for this deployment: TP-resting only wins for
-short-prompt / short-output traffic, where the prefill is too small to repay
-a flip anyway (and such traffic simply runs in whatever layout is current --
-see the threshold below). ``rest_state`` makes it configurable rather than
-assumed.
+THE RESTING STATE IS THE DECODE LAYOUT (TP) -- CHANGED 2026-08-14 (user)
+------------------------------------------------------------------------
+EVERY request decodes; only a large-prefill request benefits from PP. Since
+decode in the PP layout is forbidden, resting in PP means every request pays
+at least one ``pp_to_tp`` cutover to decode, and the server then idles back
+to PP and pays it again on the next one. That is not a corner case, it is a
+thrash cycle, and it was measured on this rig 2026-08-14: 882 flips in a
+single boot, arming at 184 pending prefill tokens, ~4.8 s of seam per
+request, TTFT ~2.9 s on a 65-CHARACTER prompt.
+
+Resting in TP costs the opposite case: a long prompt arriving at a QUIET
+server now pays ~2.7 s of ``tp_to_pp`` inside its TTFT that it previously got
+free. That cost is bounded and, above the threshold N, repaid by the prefill
+saving by construction -- N is precisely the point where it is. Below N the
+prompt never wanted PP anyway and now prefills in TP without any flip at all.
+
+The previous argument for PP-resting ("a long prompt gets PP-class prefill
+with ZERO flip cost") was written when prefill could not run in TP AT ALL, so
+every request had to reach PP regardless of size. With that prohibition
+withdrawn the argument only covers prompts above N, which are the ones that
+can afford the flip. ``rest_state`` remains configurable
+(``HTSGLANG_PHASE_IDLE_STATE``) for a deployment whose traffic is dominated
+by large prompts arriving at an idle server.
 
 THE THRESHOLD N, AND WHY IT IS A BREAK-EVEN AND NOT A GUESS
 -----------------------------------------------------------
@@ -106,7 +117,13 @@ LOG_PREFIX = "PHASE-POLICY"
 # importable (and unit-testable) without the flip runtime.
 PHASE_PP = "pp"
 PHASE_TP = "tp"
+BOTH_BLOCKED = "BOTH BLOCKED"
 PP_TO_TP = "pp_to_tp"
+#: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
+#: formation gate must recognise that decision and refuse to hold it, and a
+#: literal repeated in two modules is a rename away from silently
+#: reintroducing the idle window.
+IDLE_LOCKED = "IDLE-LOCKED"
 TP_TO_PP = "tp_to_pp"
 
 # Which layout the server returns to when it has nothing to do.
@@ -128,6 +145,81 @@ DEFAULT_PP_PREFILL_TOK_S = 7245.5
 # PROD_BRINGUP_BENCH. Overridable so a different rig can re-derive N from
 # its own ladder without editing code.
 ENV_TP_TOK_S = "SGLANG_PHASE_POLICY_TP_TOK_S"
+#: The PP-phase counterpart. It did not exist until 2026-08-15, which
+#: meant the PP rate was the ONLY input to the break-even that could not
+#: be re-measured per checkpoint -- so a rig whose PP prefill differed
+#: from this module's 7245.5 had no way to say so, and silently solved N
+#: against another rig's number.
+ENV_PP_TOK_S = "SGLANG_PHASE_POLICY_PP_TOK_S"
+#: THE DECODE-STARVATION CONSTRAINT that replaces the PP stopwatch.
+#:
+#: `pp_window_s` was a hand-set duty cycle, and it ejected the PP phase on a
+#: clock regardless of what was left to drain. Live at 12:25 on 2026-08-15:
+#:
+#:   arming pp_to_tp: pp window 15.0s >= 15s with 3 req waiting to decode
+#:                    (23313 tok prefill deferred to the next pp window)
+#:
+#: 23k of prefill still standing, ~12 s of seam burned across two round trips
+#: to defer work that one longer window would have drained, then straight back
+#: into PP as pending regrew. That is a see-saw on a timer, and a hand-set
+#: constant deciding it is the same provenance defect the ladder fix removed
+#: from arming.
+#:
+#: What actually bounds a PP residency is not a duty cycle, it is how long a
+#: carried decode may be stalled -- a LATENCY constraint. Declare that, and the
+#: residency cap is SOLVED from it and the measured seam:
+#:
+#:     pp_residency_cap = decode_stall_slo_s - 2 * flip_cost_s
+#:
+#: The 2x is not a fudge: a decode carried into PP resumes only once the
+#: instance is back in TP, so it pays the seam in BOTH directions on top of the
+#: residency itself. 0 means no cap is declared and the phase is governed
+#: purely by drain, which is the existing default (`pp_window_s` also defaults
+#: to 0).
+ENV_DECODE_STALL_SLO = "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S"
+#: Tokens at or below which the PP phase is considered DRAINED.
+#:
+#: This is NOT the entry break-even N, and conflating the two was a real
+#: defect: the instance left PP at ~10k pending and prefilled the remainder in
+#: TP at a third of the rate. N prices ENTRY -- two seams against a mountain
+#: that has not been climbed yet. Once you are already IN PP the economics are
+#: asymmetric:
+#:
+#:   finish here : R / r_pp  + the return seam, which is due anyway
+#:   leave now   : the return seam NOW + R / r_tp
+#:
+#: The seam is common to both, so it cancels, and what remains is R/r_pp
+#: against R/r_tp. Since r_pp > r_tp by construction (it is why the PP layout
+#: exists), leaving early LOSES for every R > 0. There is no crossover to
+#: find: the correct exit is "the prefill is done", and the only thing allowed
+#: to cut it short is the decode-starvation SLO.
+#:
+#: "Done" means below one chunk, not exactly zero, because a chunked prefill
+#: leaves a partial chunk in flight and an ==0 test can miss it forever. The
+#: scheduler supplies its real chunked_prefill_size at boot.
+ENV_PP_EXIT_TOKENS = "SGLANG_PHASE_POLICY_PP_EXIT_TOKENS"
+
+# -- SEAM STAGING IS EVALUATED, NOT FITTED (#665-F1 item 7) -----------------
+# An earlier version of this file carried an empirical want = base + k*chunk^2
+# fit over three measured anchors. It was falsified on a held-out point (chunk
+# 1024: predicted 1240 MiB, actual 1539-2398) and the anchors turned out to be
+# one-per-RANK, so the curve was fitting per-rank arena_tail offsets rather
+# than chunk width at all.
+#
+# There is nothing to fit. `PhaseFlipRuntime._staging_bytes` computes the want
+# exactly, from the transfer plan and the static layout:
+#
+#     want = arena_tail + max(wave_peak, draft_restore)
+#     wave_peak = incoming + max(outgoing, local) + one_layer_window
+#                 + backing_slack
+#
+# and the ONLY live-set input to the plan is the slot count. So the boot-time
+# projection lives with the runtime (see project_staging_bytes there), which
+# owns those terms and knows its own rank -- not here, where a curve could
+# only ever approximate them and would silently rot the next time the formula
+# changed.
+DEFAULT_PP_EXIT_TOKENS = 0
+DEFAULT_DECODE_STALL_SLO_S = 0.0
 # TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
 # (2026-08-08, commit 2bcc6b7d25, quiet-gated ladder with zero contended
 # draws): 2134.1 / 1681.0 / 1484.1 at 2048 / 8192 / 32768, spreads 0.25 /
@@ -143,6 +235,8 @@ DEFAULT_TP_PREFILL_TOK_S = float(os.environ.get(ENV_TP_TOK_S, "1681.0") or 1681.
 
 ENV_ENABLE = "SGLANG_PHASE_POLICY"
 ENV_FLIP_TOKENS = "SGLANG_PHASE_POLICY_FLIP_TOKENS"
+ENV_FLIP_COST_S = "SGLANG_PHASE_POLICY_FLIP_COST_S"
+ENV_DECODE_STRAND_WEIGHT = "SGLANG_PHASE_POLICY_DECODE_STRAND_WEIGHT"
 ENV_MIN_DWELL = "SGLANG_PHASE_POLICY_MIN_DWELL_S"
 ENV_IDLE_DWELL = "SGLANG_PHASE_POLICY_IDLE_DWELL_S"
 ENV_REST_STATE = "HTSGLANG_PHASE_IDLE_STATE"
@@ -150,6 +244,89 @@ ENV_PP_WINDOW = "SGLANG_PHASE_POLICY_PP_WINDOW_S"
 ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
 ENV_REFUSAL_BACKOFF_CAP = "SGLANG_PHASE_POLICY_REFUSAL_BACKOFF_CAP_S"
 ENV_REFUSAL_DEGRADE_AFTER = "SGLANG_PHASE_POLICY_REFUSAL_DEGRADE_AFTER"
+ENV_DECODE_CONTENTION = "SGLANG_PHASE_POLICY_DECODE_CONTENTION"
+
+# -- THE COUNTERFACTUAL, MEASURED (#665-F1, 2026-08-15) ----------------------
+# `effective_flip_threshold` charges every decoding request a full PP window
+# for the stranding a cutover causes, and charges the alternative -- leaving
+# the prefill in TP -- nothing at all. That one-sidedness made the gate
+# unreachable on the dev instance: the ladder ran 7004 / 39835 / 72666 /
+# 105498 / 138329 tokens for 0..4 decoding requests, so at
+# --max-running-requests 4 no prompt this model can hold could ever flip, and
+# a live 72,257-token backlog at running_bs 2 was refused by 409 tokens.
+#
+# The premise behind the zero was never measured. It is false here. Measured
+# against the live instance (2 decode streams + one 72k prompt, client-side
+# token timing, /spinning/evidence-665-f1/measure_decode_contention.py):
+#
+#   decode throughput, undisturbed            53.2 tok/s
+#   decode throughput, during a TP prefill      0.0 tok/s
+#   A-vs-A noise floor                          0.4 %
+#   TP prefill wall clock for 72k tokens       60.6 s
+#
+# Decode does not degrade beside a co-resident TP prefill -- it STOPS, for the
+# whole minute the prefill takes. So the decodes are stranded in BOTH branches
+# and the only question is for how long: ~60 s if we stay, ~16 s (two seams
+# plus a 9.9 s PP prefill) if we flip. The surcharge was protecting the
+# decodes by stalling them roughly four times longer.
+#
+# `decode_contention` is that measurement: the fraction of decode throughput
+# lost while a prefill is co-resident in TP. 1.0 = decode stops dead, which is
+# what this scheduler does unconditionally: batch selection reads `if
+# new_batch is not None: # Run prefill first if possible`, so an iteration
+# with any prefill chunk pending runs THAT batch and never reaches the decode
+# branch. That is absolute prefill priority per iteration, not a property of
+# --disable-overlap-schedule or any other flag. 0.0 means "not
+# measured here" and keeps the old surcharge byte-identically, the same
+# measurement gate `flip_cost_s` already uses.
+#
+# THE TWO ALTERNATIVES, AND WHY THEY LOST.
+#
+# CAP THE SURCHARGE at some multiple of `flip_tokens`. It would work, and the
+# multiple would be fiat: nothing in the evidence picks one, and it would need
+# re-picking whenever the seam or the window moved, because the model under it
+# would still be one-sided. Pricing the counterfactual turns out to DERIVE the
+# cap instead -- 2 x N at sigma = 1 -- so this option is not so much rejected
+# as explained.
+#
+# ADMIT-THEN-FLIP-AT-DRAIN: admit the long prefill, queue the flip, take it
+# once the decodes drain below a bar. Rejected, and the measurement is what
+# rejects it. At sigma = 1 the decodes CANNOT drain while the admitted prefill
+# runs in TP -- the prefill is precisely what is stopping them -- so the
+# trigger waits on a condition its own admission prevents. It is also the trap
+# the block comment at DEFAULT_PP_WINDOW_S documents twice already: a
+# load-triggered predicate that a sustained backlog never satisfies, one
+# threshold further out. Making it terminate needs a deadline, i.e. a forced
+# flip, and forced flips are what raised the flip rate that killed three boots
+# with an allocation failure at the cutover seam.
+#
+# WHAT THIS COSTS, STATED PLAINLY. TP->PP arms at the effective threshold while
+# PP->TP arms at plain `flip_tokens`, so the two rules form a hysteresis band.
+# Making the gate reachable NARROWS that band -- at running_bs 2 it goes from
+# [7004, 72666] to [7004, 11673] -- and a narrower band is easier to cross
+# twice. It does not raise the rate CEILING, which `min_dwell_s` and
+# `tp_decode_floor_s` already own: a cycle cannot be shorter than
+# tp_decode_floor + seam + min_dwell + seam, ~16 s with the booted 10 / 3.2 / 3,
+# i.e. at most ~7 flips/min. But before this change the load-driven direction
+# essentially never armed, so the REALISED rate was ~0 and that ceiling was
+# theoretical; now it is reachable, and 12 flips in four minutes is the rate
+# that once killed three boots.
+#
+# So the realised rate under sustained load is a number that has to be
+# MEASURED, not argued (see acceptance GATE C in
+# /spinning/evidence-665-f1/acceptance_665_f1.py, which reports flips/min
+# alongside a 100 ms NVML corridor series). If it comes out too high, the
+# remedy is `tp_decode_floor_s` -- the knob that already exists for exactly
+# this -- and not a third mechanism bolted on here.
+DEFAULT_DECODE_CONTENTION = 0.0
+
+# Returned when the differential model proves no backlog can repay a flip --
+# reachable only with the fairness window disabled (pp_window_s <= 0), where
+# nothing bounds how long a carried decode waits. Deliberately a finite,
+# recognisable number rather than sys.maxsize: it is compared against pending
+# token counts, and a value that shows up in a log should read as "the policy
+# says never", not as arithmetic that overflowed.
+UNREACHABLE_FLIP_THRESHOLD = 1 << 40
 
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
 # Both thresholds above are LOAD-TRIGGERED, and that is not enough. Under
@@ -280,6 +457,370 @@ def break_even_tokens(
     return int(round(flip_cost_s / (1.0 / tp_tok_s - 1.0 / pp_tok_s)))
 
 
+def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
+    """Pending-prefill tokens required to justify `tp_to_pp` RIGHT NOW.
+
+    ``break_even_tokens`` prices the seam and nothing else. A cutover also
+    PAUSES every request that is decoding: it is carried into the PP layout,
+    where decode is forbidden, and waits out the PP window before emitting
+    another token. Stranding is therefore a real cost of the flip, it scales
+    with how many requests are in flight, and it belongs in the same
+    comparison rather than in a separate ad-hoc guard.
+
+    The seconds go into the same C that produced N, so the threshold simply
+    scales:
+
+        C_eff = flip_cost_s + weight x running_bs x pp_window_s
+        N_eff = flip_tokens x C_eff / flip_cost_s
+
+    Degenerate cases return the unchanged threshold, so a deployment that has
+    not measured its seam behaves exactly as before:
+      * ``flip_cost_s <= 0``  -- seam not measured here;
+      * ``running_bs <= 0``   -- nothing to strand;
+      * ``weight == 0``       -- surcharge explicitly disabled.
+
+    Under ``strict`` purity (``prefill_runs_in_tp`` False) the threshold is 0
+    by construction -- a sub-N prompt could not run in TP at all -- and the
+    surcharge must not resurrect one, or short prompts would never run.
+    """
+    if not cfg.prefill_runs_in_tp:
+        return 0
+    base = int(cfg.flip_tokens)
+    if cfg.flip_cost_s <= 0 or running_bs <= 0:
+        return base
+    if cfg.decode_contention > 0.0:
+        return _differential_flip_threshold(cfg, running_bs, base)
+    if cfg.decode_strand_weight <= 0:
+        return base
+    stranded_s = cfg.decode_strand_weight * float(running_bs) * cfg.pp_window_s
+    return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
+
+
+#: How many chunk-cadences of silence make a stall a WEDGE rather than a slow
+#: tick. Small on purpose: the rule already refuses to fire while anything is
+#: moving, so its only job is to outlast ordinary jitter between chunks.
+PROGRESS_STALL_CHUNKS = 3
+
+
+def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
+    """How long prefill may make NO progress before PP is declared wedged.
+
+    SOLVED, NOT SET, and from the two quantities that already describe the
+    phase: one chunk takes ``pp_exit_tokens / pp_prefill_tok_s`` seconds at the
+    measured rate, so several of those passing with nothing admitted is not a
+    slow drain, it is a drain that has stopped.
+
+    FLOORED AT ``2 * flip_cost_s``. A cutover is the one interval in which
+    prefill legitimately makes no progress at all, so a rig fast enough to
+    solve a window shorter than its own seam would otherwise exit on the seam
+    it just paid for -- arming a flip because it was flipping.
+
+    0 disables the rule, which is what an unusable rate must produce: a
+    division by zero here would be a wedge-breaker that wedges.
+
+    WHY THIS IS NOT ANOTHER STOPWATCH, and the distinction is the whole point
+    of #677(a). The user's pure-drain decision removed the clock deliberately:
+    a real drain must never be cut short however long it takes. This rule
+    cannot cut one short, because ANY progress resets it -- one chunk per
+    window is enough to hold PP forever. It fires only when the thing the
+    drain is waiting for has stopped happening.
+    """
+    rate = float(cfg.pp_prefill_tok_s)
+    chunk = int(cfg.pp_exit_tokens)
+    floor = 2.0 * float(cfg.flip_cost_s)
+    if rate <= 0 or chunk <= 0:
+        return 0.0
+    return max(PROGRESS_STALL_CHUNKS * (chunk / rate), floor)
+
+
+def prefill_suppressed_in_tp(
+    cfg: "PhasePolicyConfig",
+    phase: str,
+    flip_unavailable: bool = False,
+    running_bs: int = -1,
+) -> bool:
+    """#677 hot fix 2: may prefill be admitted while the TP layout is up?
+
+    Under drain mode, no. The TP window exists to finish a decode bundle, and
+    prefill admitted into it competes with exactly the work the window was
+    entered for -- measured as visible "Prefill batch" lines inside TP while
+    carriers went unfinished across repeated flips.
+
+    CARDS PARTIALLY IDLE DURING TP IS ACCEPTED, deliberately, and is the
+    user's stated model: the alternative measured worse, because a bundle that
+    never finishes costs a whole extra round trip and returns the same
+    carriers.
+
+    IT DEFERS TO THE PURITY VALVE, and that clause is the whole lesson of two
+    live wedges. 2026-08-16 06:47:48: CorridorGuard refused the seam staging on
+    two ranks with static numbers -- PP1 want 2163 MiB against 2456 free with
+    an arming floor of 1536, PP2 want 2858 against 3560 -- because the staging
+    a 4-carrier bundle needs EXCEEDS the floor that was supposed to guarantee
+    it. Every degradation had already stood down; the arm refused 76 times in
+    a row.
+
+    That alone would have been a slow boot. It became a TOTAL wedge because
+    suppressing prefill in TP removed the fallback the instance used to have:
+    before drain mode, a refused tp_to_pp still prefilled in the TP layout and
+    the backlog drained slowly instead of not at all. An idle server with
+    727004 tokens waiting is strictly worse than a slow one.
+
+    Then 07:02 said it again in a shape the first fix could not see. tp_to_pp
+    was not REFUSED, it was DELAYED: one rank withheld its entry-margin yield
+    on a predicted sub-law trough, and the withhold is deliberately exempt
+    from the stand-down cap, so "consecutive delayed attempts" climbed 15, 16,
+    17 with no exit while my fix watched a refusal counter that never moved.
+    A different counter, the same wedge.
+
+    SO THE QUESTION IS NOT "WAS IT REFUSED" BUT "IS PP REACHABLE". Drain
+    mode's premise is that prefill belongs in PP and should wait for PP; that
+    premise holds only while PP can be reached. ``flip_unavailable_reason``
+    already answers exactly this, over BOTH books -- the seam's own
+    ``_seam_abandons_in_a_row``, which delays DO advance, and the policy's
+    ``arm_refusals`` -- so both wedge shapes leave through one door.
+
+    ONE BOUND, NOT TWO. This replaces the threshold of my own that the first
+    fix introduced. Keying on the valve inherits its bound and its two books;
+    a second number would have been one more thing to tell the wrong state,
+    which is the entire failure mode of this chain.
+
+    NOT A LATCH. ``arm_refusals`` is reset by the first successful arm, so an
+    instance that recovers returns to the user's semantics by itself. This
+    chain has spent four tasks removing one-way ratchets; it is not adding a
+    fifth.
+
+    False for every phase but TP, and False everywhere when drain mode is off,
+    so a deployment that has not opted in is byte-identical.
+    """
+    if not bool(cfg.drain_mode) or phase != PHASE_TP:
+        return False
+    if flip_unavailable:
+        return False
+    # AND THERE MUST BE A BUNDLE TO PROTECT. Measured 2026-08-16 08:03 on my
+    # own fix: an 18-token request hung for two minutes with `running bs 0`
+    # and GPU at 0%, while the policy logged "pending prefill 18 tok <= N=7004,
+    # running it in tp".
+    #
+    # THE POLICY WAS RIGHT AND THE SUPPRESSION OVERRODE IT. Below the
+    # break-even N a flip costs more than it saves, so the policy deliberately
+    # keeps the work in TP and arms nothing. The valve cannot help: the flip
+    # is not FAILING, it simply was not asked for -- so `flip_unavailable` is
+    # false and suppression held a request that nothing was ever going to run.
+    # Long prompts hid it, because 25625 tokens sit above N and go to PP.
+    #
+    # Drain mode exists to stop a TP window admitting the work it was entered
+    # to escape -- that window is defined by a decode bundle in flight. With
+    # `running_bs == 0` the bundle is finished, there is nothing to drain, and
+    # the only thing suppression can still do is idle the instance.
+    #
+    # -1 means the caller did not measure it, which must not be read as "no
+    # bundle": an unmeasured input never becomes a licence.
+    if int(running_bs) == 0:
+        return False
+    return True
+
+
+def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
+    """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
+
+    Returns 0 when nothing is declared, meaning drain alone governs the phase.
+    Never returns a negative cap: an SLO tighter than the round trip it must
+    contain cannot be honoured by leaving PP sooner, because the seams are
+    already inside it -- so it collapses to "leave as soon as the drain rule or
+    the dwell allows" rather than to a nonsense negative deadline.
+    """
+    if cfg.decode_stall_slo_s <= 0.0:
+        return 0.0
+    return max(0.0, cfg.decode_stall_slo_s - 2.0 * cfg.flip_cost_s)
+
+
+def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
+    """Minimum TP dwell, SOLVED: one full round trip.
+
+    A cycle that spends less time serving decode in TP than it just spent
+    entering and leaving TP has put more than half its wall clock into
+    cutovers. `2 * flip_cost_s` is therefore the floor below which the phase
+    machinery costs more than it moves -- measured, not chosen.
+    """
+    return 2.0 * cfg.flip_cost_s
+
+
+def with_decode_contention(
+    cfg: "PhasePolicyConfig", value: object
+) -> "PhasePolicyConfig":
+    """Return ``cfg`` with a new MEASURED decode-contention fraction.
+
+    Lives here rather than in the scheduler's ``set_internal_state`` chain so
+    the validation sits with the thing it validates and can be tested without
+    standing up a Scheduler. Range checking is not repeated: ``replace`` re-runs
+    ``__post_init__``, which already refuses anything outside [0, 1].
+
+    Raises ``PhasePolicyError`` for a value that is not a fraction, so the
+    caller can report it and refuse the update rather than half-applying one.
+    """
+    import dataclasses
+
+    try:
+        frac = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise PhasePolicyError(
+            f"{ENV_DECODE_CONTENTION} must be a number in [0, 1] -- it is the "
+            f"FRACTION of decode throughput lost to a co-resident TP prefill "
+            f"-- got {value!r}"
+        ) from None
+    return dataclasses.replace(cfg, decode_contention=frac)
+
+
+def _demand_outweighs_a_retry(
+    cfg: "PhasePolicyConfig",
+    inp: "PhasePolicyInputs",
+    state: "PhasePolicyState",
+) -> bool:
+    """Should a pending backlog override the staging rate limit?
+
+    THE DAMPER THIS REMOVES. A rate limit that postpones a seam the load is
+    actively demanding is a damper, not a guard. Live at 12:49-12:51: 70-90k
+    tokens sat in TP behind "next staging in 12.4s ... capped at 60s" while
+    the prefill crawled at the TP rate. Whatever the odds that the retry
+    abandons again, waiting was strictly worse than trying.
+
+    So the limiter yields whenever the flip is worth more than the wait. Both
+    sides are seconds and both are measured:
+
+        saved   = N x (1/r_tp - 1/r_pp) - 2C     what landing it is worth now
+        waited  = the limiter's current interval
+
+    At 90k on this checkpoint that is ~47 s against ~12.8 s: attempt. At the
+    break-even rung it is ~0 s against 11.8 s: let the limiter hold. And under
+    strict purity with one token pending -- the #656 storm shape -- saved is
+    ~0, which is exactly the case the guard exists for.
+
+    The guard therefore still bounds storms, and can no longer bound progress.
+    """
+    if not cfg.prefill_runs_in_tp:
+        # Purity: a sub-N prompt cannot run in TP at all, so "demand" here
+        # carries no time saving to weigh -- this is the #656 shape.
+        return False
+    tp, pp = float(cfg.tp_prefill_tok_s), float(cfg.pp_prefill_tok_s)
+    if tp <= 0 or pp <= tp:
+        return False
+    saved_s = inp.pending_prefill_tokens * (1.0 / tp - 1.0 / pp) - 2.0 * cfg.flip_cost_s
+    k = max(1, state.arm_refusals.get(TP_TO_PP, 1))
+    base_s = solved_tp_decode_floor_s(cfg) if cfg.flip_cost_s > 0 else cfg.min_dwell_s
+    waited_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+    return saved_s > waited_s
+
+
+def _differential_flip_threshold(
+    cfg: "PhasePolicyConfig", running_bs: int, base: int
+) -> int:
+    """The threshold once the counterfactual is priced too (#665-F1).
+
+    The old surcharge compares the stranding a flip causes against a
+    stay-in-TP branch assumed to cost the decodes nothing. Measured, that
+    branch costs them everything (see DEFAULT_DECODE_CONTENTION). Both
+    branches are therefore priced as aggregate delay-seconds, with
+    ``sigma = cfg.decode_contention`` the measured fraction of decode
+    throughput lost while a prefill is co-resident in TP:
+
+        stay = N/X + B x sigma x N/X
+        flip = (C + N/P) + B x (2C + min(W, N/P))
+
+    ``2C`` and not ``C`` because a stranded decode waits out the cutover in
+    BOTH directions -- it resumes only once the instance is back in TP -- while
+    the prefill only pays the way in. ``min(W, N/P)`` because the PP window
+    bounds how long the instance may sit in PP: past ``W x P`` tokens the
+    prefill no longer fits one window, the decodes are released at ``W``, and
+    the remainder waits for the next window.
+
+    Flipping is justified when ``flip < stay``. Solving for N is linear in
+    each of the two regimes ``min()`` selects, so the result is still a single
+    scalar threshold that the caller compares against pending tokens:
+
+        N/P <= W :  N > N0 (1-r)(1+2B) / [ (1+B*sigma) - (1+B) r ]
+        N/P >  W :  N > N0 (1-r)[(1+2B) + B W / C] / [ (1+B*sigma) - r ]
+
+    with ``r = X/P`` the prefill speed ratio and ``N0`` the seam break-even.
+    Both reduce to ``N0`` at ``B = 0``, as they must.
+
+    THE BOUND IS DERIVED, NOT DECREED. At the measured ``sigma = 1`` the first
+    regime collapses to ``N0 x (1 + 2B) / (1 + B)`` -- with ``N0`` the
+    UNROUNDED break-even ``C / (1/X - 1/P)``, since the solve uses the
+    measurements rather than the rounded integer ``flip_tokens`` -- whose
+    supremum is exactly ``2 x N0``: with decode stalled either way, even an infinitely busy server
+    needs at most twice the break-even backlog, and the factor two is the
+    round trip the decodes additionally pay. The threshold still RISES with
+    the number of decodes stranded -- the surcharge keeps doing its job of
+    delaying a marginal flip -- it just can no longer diverge to a number no
+    prompt can reach.
+
+    AND AT sigma = 1 THE RATIO CANCELS. ``(1-r)`` divides out of numerator and
+    denominator, so the whole threshold depends only on ``N0`` and ``B`` -- not
+    on the prefill ladder. That matters operationally: this rig re-ships
+    the serving instance on re-solved memory and KV vectors, and a calibration that
+    needed ``r`` re-measured after every such change would be stale the moment
+    it landed. sigma = 1 is not a fitted constant either; it is what this
+    scheduler does by construction. Batch selection reads ``if new_batch is
+    not None: # Run prefill first if possible``, so an iteration with any
+    prefill chunk pending runs THAT batch and never reaches the decode
+    branch -- absolute prefill priority per iteration, decode getting zero
+    steps until the backlog is chunked through. Measured 1.000 at running_bs
+    2 and 3, on both the loose and the law-fitted vector, with A-vs-A noise
+    floors of 0.4 % and 0.0 %. ``r`` is consulted only for a partial sigma,
+    where a deployment that really does interleave would need its own ladder
+    anyway.
+    """
+    tp_tok_s = float(cfg.tp_prefill_tok_s)
+    pp_tok_s = float(cfg.pp_prefill_tok_s)
+    if tp_tok_s <= 0 or pp_tok_s <= 0 or tp_tok_s >= pp_tok_s:
+        # No speedup to solve against; fall back to the seam break-even
+        # rather than invent a threshold from an unusable ratio.
+        return base
+    b = float(running_bs)
+    sigma = float(cfg.decode_contention)
+    cost = cfg.flip_cost_s * (1.0 + 2.0 * b)
+
+    # Solved from C, X and P DIRECTLY rather than by substituting
+    # N0 = C / (1/X - 1/P) and cancelling. The substitution is only valid
+    # while `flip_tokens` is exactly the break-even of THESE three numbers,
+    # and it need not be: `config_from_env` derives the default N from the
+    # module constant DEFAULT_FLIP_COST_S while `flip_cost_s` itself is
+    # overridable, and an operator may pin `flip_tokens` outright. Deriving
+    # from the measurements makes the surcharge independent of that, and
+    # `base` survives only as the floor it should always have been.
+    den_a = (1.0 + b * sigma) / tp_tok_s - (1.0 + b) / pp_tok_s
+
+    if cfg.pp_window_s <= 0.0:
+        # NO WINDOW BOUND. The PP phase is not time-limited, so a carried
+        # decode waits out the whole prefill: the stall is 2C + N/P and
+        # regime A is the ONLY regime. Regime B must not be reached here --
+        # it models the decode charge SATURATING at W, and with W = 0 that
+        # reads as "stranding is free", the opposite of what an absent
+        # window means. Falling through to it produced a threshold that
+        # spiked toward the singularity at den_a -> 0+ and then dropped by
+        # half a million tokens once den_a went negative.
+        if den_a <= 0.0:
+            # No positive N satisfies the inequality: with this little
+            # contention and this many decodes, flipping does not repay at
+            # ANY backlog. That is a real answer, not a failure, and it is
+            # reached only when the operator has disabled the fairness
+            # window that would otherwise bound the stranding.
+            return UNREACHABLE_FLIP_THRESHOLD
+        return max(base, int(round(cost / den_a)))
+
+    if den_a > 0.0:
+        n_a = cost / den_a
+        # Regime A holds only where the prefill fits inside one PP window.
+        if n_a <= cfg.pp_window_s * pp_tok_s:
+            return max(base, int(round(n_a)))
+
+    # Beyond the window the decode charge saturates at W, which makes this
+    # denominator strictly positive (sigma >= 0 and ratio < 1), so the
+    # threshold is always solvable and always finite.
+    den_b = (1.0 + b * sigma) / tp_tok_s - 1.0 / pp_tok_s
+    return max(base, int(round((cost + b * cfg.pp_window_s) / den_b)))
+
+
 @dataclass(frozen=True)
 class PhasePolicyConfig:
     """Static configuration. Built once at boot, never mutated."""
@@ -288,12 +829,68 @@ class PhasePolicyConfig:
     flip_tokens: int = 0
     min_dwell_s: float = DEFAULT_MIN_DWELL_S
     idle_dwell_s: float = DEFAULT_IDLE_DWELL_S
-    rest_state: str = REST_PREFILL
+    rest_state: str = REST_DECODE
     #: Fairness bound; 0 disables it and restores the pure load-triggered
     #: behaviour that starves under a sustained backlog. See the block
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: #689 WINDOW FORMATION. How many completed carriers a PP window should
+    #: accumulate before the tp-ward arm is allowed, normally
+    #: max_running_requests. 0 or 1 disables the gate entirely and restores
+    #: the previous behaviour exactly.
+    formation_target: int = 0
+    #: The latency bound on that accumulation. A PLAIN TIME CAP, chosen from
+    #: this rig's own receipts rather than from an economics term: one flip
+    #: EXECUTES in 2459-3186 ms (five FLIP DONE receipts, 2026-08-16), so
+    #: spending up to about one flip's worth of waiting to quadruple the
+    #: window it opens is obviously worth it, and spending much more is not
+    #: obviously anything. #677's economics replaces this number later; until
+    #: then it is a bound, not an optimum, and it is written here as such.
+    formation_cap_s: float = 3.0
+    #: The MEASURED seam round trip (s) that ``flip_tokens`` was derived from.
+    #: 0.0 means "not measured here", which disables the stranded-decode
+    #: surcharge below and reproduces the previous policy exactly. The
+    #: surcharge is gated on a MEASUREMENT rather than a flag on purpose: its
+    #: entire justification is that the seam and the window were measured.
+    flip_cost_s: float = 0.0
+    #: How much of a PP window a stranded decode is charged. 1.0 = the full
+    #: window (a paused generation really does wait it out); 0.0 disables the
+    #: surcharge while keeping ``flip_cost_s`` available for reporting.
+    #:
+    #: Consulted only while ``decode_contention`` is 0. Once the
+    #: counterfactual is measured there is nothing left for a hand-set weight
+    #: to express -- the stranding is priced against what NOT flipping costs
+    #: the same decodes.
+    decode_strand_weight: float = 1.0
+    #: MEASURED fraction of decode throughput lost while a prefill is
+    #: co-resident in the TP layout, in [0, 1]. 0.0 = "not measured here" and
+    #: the old one-sided surcharge is used unchanged. See the block comment at
+    #: DEFAULT_DECODE_CONTENTION for why the un-measured default of zero made
+    #: the gate unreachable, and _differential_flip_threshold for the model
+    #: this feeds.
+    decode_contention: float = DEFAULT_DECODE_CONTENTION
+    #: Max seconds a carried decode may be stalled by a cutover, DECLARED as a
+    #: latency constraint. The PP residency cap is solved from it; see
+    #: ENV_DECODE_STALL_SLO. 0 = not declared, drain governs alone.
+    decode_stall_slo_s: float = DEFAULT_DECODE_STALL_SLO_S
+    #: Drained threshold for the PP phase, in tokens. Set from the scheduler's
+    #: real chunked_prefill_size at boot; see ENV_PP_EXIT_TOKENS for why this
+    #: is emphatically not flip_tokens.
+    #: #677 hot fix 2: the user's target semantics -- prefill until empty,
+    #: decode the bundle TO COMPLETION, then prefill again. Off by default, and
+    #: every rule it gates is byte-identical to the previous behaviour until it
+    #: is set, so no existing deployment moves.
+    drain_mode: bool = False
+    pp_exit_tokens: int = DEFAULT_PP_EXIT_TOKENS
+    #: The scheduler's chunked_prefill_size, filled in at boot. Drives the
+    #: seam staging estimate below.
+    prefill_chunk_tokens: int = 0
+    #: The prefill ladder the threshold is solved against. Only the RATIO
+    #: matters to the differential model; ``flip_tokens`` already carries the
+    #: absolute scale.
+    tp_prefill_tok_s: float = DEFAULT_TP_PREFILL_TOK_S
+    pp_prefill_tok_s: float = DEFAULT_PP_PREFILL_TOK_S
     #: How long a REFUSED arm holds the policy off that direction, doubling
     #: per consecutive refusal from ``min_dwell_s`` and clamped here.
     #:
@@ -342,6 +939,21 @@ class PhasePolicyConfig:
                 f"{ENV_FLIP_TOKENS} or supply a measured TP prefill "
                 f"throughput via {ENV_TP_TOK_S}"
             )
+        if self.pp_window_s < 0.0:
+            # 0 means "no fairness window" and is a supported configuration;
+            # a NEGATIVE window is not a weaker version of that, it is a typo
+            # that would flow into the stranding charge as negative seconds.
+            raise PhasePolicyError(
+                f"{ENV_PP_WINDOW}={self.pp_window_s!r} is negative; use 0 to "
+                f"disable the fairness window, or a positive number of seconds"
+            )
+        if not 0.0 <= self.decode_contention <= 1.0:
+            raise PhasePolicyError(
+                f"{ENV_DECODE_CONTENTION}={self.decode_contention!r} is not a "
+                f"fraction of decode throughput; it must be in [0, 1], where "
+                f"1 means decode stops dead while a prefill shares the TP "
+                f"batch (measured on this rig) and 0 means it is unaffected"
+            )
 
     @property
     def rest_phase(self) -> str:
@@ -377,9 +989,23 @@ class PhasePolicyState:
     arm_refusals: dict = field(default_factory=dict)
     #: Clock, per direction, before which no further arm may be issued.
     arm_hold_until: dict = field(default_factory=dict)
+    #: Per direction, the length of the hold currently in force. Only used to
+    #: recover when that hold STARTED; see `_last_refusal_at`.
+    arm_hold_last_span: dict = field(default_factory=dict)
+    #: When a staging attempt last ABANDONED, per direction. The storm guard
+    #: is paced off this and nothing else -- see the rate-limiter block in
+    #: `decide`. Cleared by a completion, so a funded path never carries a
+    #: penalty from an earlier failure.
+    last_abandon_at: dict = field(default_factory=dict)
     #: The runtime's own words for a direction that has been refused past
     #: ``refusal_degrade_after``. Truthy = degraded; cleared by a success.
     arm_degraded: dict = field(default_factory=dict)
+    #: The reason the LAST arm of each direction was abandoned, kept whether
+    #: or not the degrade threshold was reached. The purity valve prints it
+    #: when it stands down, so the receipt names the SHORTFALL that idled the
+    #: instance ("staging 1614 MiB needed but only 1595 MiB is spendable")
+    #: instead of only the streak count, which says nothing about the cause.
+    arm_last_detail: dict = field(default_factory=dict)
     #: What ``note_flip_armed`` overwrote, so a refusal can put it back.
     #: A tuple (direction, previous_last_flip_at, previous_idle_since); None
     #: when no arm is outstanding.
@@ -390,10 +1016,28 @@ class PhasePolicyState:
     #: flip" rather than as a retry tally.
     arm_refusals_total: int = 0
     arm_degrade_events: int = 0
+    #: #677(a): the last tick at which prefill DEMONSTRABLY moved -- pending
+    #: strictly decreased. Maintained by ``observe_idle`` so ``decide`` stays
+    #: pure, the same split the idle clock uses. None means not yet observed,
+    #: which reads as "inapplicable" rather than "stalled since t=0": a caller
+    #: that reaches ``decide`` without observing must degrade to the previous
+    #: behaviour, never to an immediate exit.
+    last_prefill_progress_at: Optional[float] = None
+    #: What pending was at the previous observation, so a DECREASE can be
+    #: recognised. Compared, never trusted as a level.
+    last_pending_prefill_tokens: Optional[int] = None
+    #: #677 hot fix 2: how many requests were decoding when this TP window
+    #: opened, so the exit receipt can name the BUNDLE it finished rather than
+    #: only the instant it ended. Set by ``observe_idle`` at the phase change.
+    bundle_at_phase_entry: int = 0
     #: Cutovers that actually MOVED BYTES. Distinct from ``flips_armed`` on
     #: purpose: boot E armed 179 flips and completed none, and every summary
     #: that read the arm count called that instance healthy.
     flips_completed: int = 0
+    #: When the current PP window began accumulating carriers, or 0.0 when it
+    #: is not accumulating. Stamped by ``observe_idle`` (the caller), because
+    #: ``decide`` is pure and may not mutate state.
+    formation_started_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -405,6 +1049,41 @@ class PhasePolicyInputs:
     pending_prefill_tokens: int
     running_bs: int
     now: float
+
+    #: THE ROUND JUST FAILED TO BUILD A BATCH OF EITHER WORK CLASS.
+    #:
+    #: Not "the queue is empty" and not "the box looks quiet": both classes
+    #: had work and neither could be scheduled in the layout that is running.
+    #: Measured 2026-08-16 09:42:39-45, six seconds of total silence with
+    #: 572715 tok of prefill queued and four carriers ready to decode --
+    #: decode forbidden in PP, and prefill unadmittable because those same
+    #: four carriers' KV held ~352k of the 472k-row pool. Nothing could run,
+    #: and the only rule that armed the flip out of it was the 180 s
+    #: decode-stall cap.
+    #:
+    #: REPLICATED like every other field here: it is derived from the round's
+    #: own build outcome, which every rank reaches by running the same
+    #: scheduler over the same replicated queue.
+    nothing_can_run: bool = False
+
+    #: The OTHER layout can build at least one of those classes.
+    #:
+    #: This is what makes the arm ONE-SIDED and therefore non-oscillating by
+    #: construction, with no timer floor: the flip is armed only when the
+    #: current layout provably cannot run anything AND the target provably
+    #: can, so after the flip the target runs by premise and the same
+    #: condition cannot immediately hold again in the new layout.
+    target_can_admit: bool = False
+
+    #: #689: completed carriers waiting for a decode window. NOT running_bs --
+    #: with #677 phase-1 parking live, carriers PP cannot decode are
+    #: deliberately discounted from the admission cap, so the two numbers have
+    #: diverged and a formation rule keyed on running_bs would read 0 exactly
+    #: when the window is fullest.
+    ready_carriers: int = 0
+    #: Whether anything is still queued behind them. When the queue is empty
+    #: there is nothing left to accumulate and the window opens at once.
+    queue_nonempty: bool = False
 
 
 @dataclass(frozen=True)
@@ -426,6 +1105,108 @@ def decide(
     state: PhasePolicyState,
     inp: PhasePolicyInputs,
 ) -> PhasePolicyDecision:
+    """The load rules, then batch formation. Pure, mutates nothing.
+
+    #689 WINDOW FORMATION IS APPLIED HERE, AS A WRAPPER, so it sits at ONE
+    place instead of at the nine ``return PhasePolicyDecision`` sites inside
+    the rules. It only ever converts a pp_to_tp arm into a wait; it can never
+    create an arm, and it never sees the tp_to_pp direction at all.
+    """
+    d = _decide_rules(cfg, state, inp)
+    if d.direction != PP_TO_TP:
+        return d
+    if (d.reason or "").startswith(IDLE_LOCKED):
+        # #688 OUTRANKS #689, STRUCTURALLY. The idle-locked arm fires only
+        # when the current layout can build NOTHING; holding it to accumulate
+        # carriers would be waiting for a wider window inside a layout that
+        # cannot fill one, which is the exact zero-GPU window #688 removes.
+        # Caught by test_the_deadlock_escape_is_not_delayed_by_formation,
+        # which failed on the first draft of this wrapper.
+        return d
+    return _apply_formation_gate(cfg, state, inp, d)
+
+
+def _formation_target(cfg: PhasePolicyConfig, inp: PhasePolicyInputs) -> int:
+    want = int(getattr(cfg, "formation_target", 0) or 0)
+    return max(0, want)
+
+
+def _apply_formation_gate(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    inp: PhasePolicyInputs,
+    d: PhasePolicyDecision,
+) -> PhasePolicyDecision:
+    """Hold a tp-ward arm until the decode window is worth opening.
+
+    THE DEFECT, MEASURED. Decode ran bs=1 on 261 of 288 batches and bs=4 on
+    12, while 13 requests sat queued, token usage was 0.44 and the mamba pool
+    held 2 of 12 slots. Nothing was throttling ADMISSION -- what was wrong was
+    WINDOW FORMATION. Under pure drain a TP window can only decode the
+    carriers whose prefill finished in the PRECEDING PP window, and the flip
+    was fired by stall caps rather than by readiness, so a window opened with
+    one ready carrier and then served bs=1 for its whole length while the
+    other twelve waited for the next one.
+
+    So the arm waits for carriers to ACCUMULATE, bounded two ways:
+
+    * it never waits when the queue is empty -- there is nothing left to
+      accumulate, and waiting would be pure latency;
+    * it never waits longer than ``formation_cap_s``, so a single carrier
+      that no one follows still gets its window.
+
+    IT CANNOT REINTRODUCE THE IDLE WINDOW. The #688 idle-locked arm is
+    returned by ``_decide_rules`` BEFORE any of this and is not a load rule,
+    so a layout that can run nothing leaves immediately and is never held
+    here. This gate only ever fires while the PP layout is still doing work,
+    which is the whole difference between "shape the window" and "stall".
+
+    DELIBERATELY A PLAIN TIME CAP, not an economics term. #677's window
+    economics is a separate piece of work; this is the bounded first cut that
+    makes bs=4 real, and it is labelled as such rather than presented as the
+    optimum.
+    """
+    target = _formation_target(cfg, inp)
+    if target <= 1:
+        return d
+    ready = int(getattr(inp, "ready_carriers", 0) or 0)
+    if ready >= target:
+        return d
+    if not bool(getattr(inp, "queue_nonempty", False)):
+        # Nothing more can arrive to fill the window; opening it now is right.
+        return d
+    started = float(state.formation_started_at or 0.0)
+    if started <= 0.0:
+        # First round of this formation window. The caller stamps the clock;
+        # a pure function cannot, so the wait begins on the NEXT round and
+        # this one still holds -- one round, not one cap.
+        return PhasePolicyDecision(
+            None,
+            f"forming decode window: {ready} of {target} carrier(s) ready, "
+            f"queue still filling -- holding the tp-ward arm",
+        )
+    waited = float(inp.now) - started
+    cap = float(getattr(cfg, "formation_cap_s", 0.0) or 0.0)
+    if cap > 0.0 and waited >= cap:
+        return PhasePolicyDecision(
+            d.direction,
+            f"{d.reason} [formation cap: {ready} of {target} carrier(s) after "
+            f"{waited:.1f}s >= {cap:g}s -- opening the window short rather "
+            f"than making the ready carrier wait longer]",
+        )
+    return PhasePolicyDecision(
+        None,
+        f"forming decode window: {ready} of {target} carrier(s) ready after "
+        f"{waited:.1f}s of {cap:g}s -- holding the tp-ward arm so the window "
+        f"opens at width instead of at 1",
+    )
+
+
+def _decide_rules(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    inp: PhasePolicyInputs,
+) -> PhasePolicyDecision:
     """The load rules, then the refused-arm hold. Pure, mutates nothing.
 
     THE HOLD IS APPLIED LAST, not folded into the rules, because the two
@@ -439,20 +1220,118 @@ def decide(
     d = _decide_from_load(cfg, state, inp)
     if not d.wants_flip:
         return d
+
+    # THE STORM GUARD, as a RATE LIMITER rather than a latch.
+    #
+    # Two dampers were removed from this path: the doubling backoff became
+    # dwell pacing, and the guards-layer latch that blocked re-pricing after 8
+    # abandons is going. This is what remains, and it has one job -- bound the
+    # rate of EXPENSIVE failures without ever refusing a flip that could now be
+    # funded.
+    #
+    # So it paces on abandons, not on arms. An arm that never reaches staging
+    # costs a broadcast; an arm that stages and abandons costs the seam's
+    # memory peak, and 12 of those in four minutes once killed three boots.
+    # Decoupling the two is the whole point: probes stay cheap and frequent,
+    # expensive failures get a floor between them.
+    #
+    # The floor is SOLVED, not chosen: one failed staging per
+    # `solved_tp_decode_floor_s` = 2 x flip_cost_s. That is already the period
+    # below which cutover work exceeds half the wall clock, so applying it to
+    # failed work bounds waste by the same rule that bounds useful work.
+    #
+    # It is not a latch and cannot become one: it holds nothing, remembers one
+    # timestamp, never exceeds 2 x flip_cost_s, and a COMPLETION clears it
+    # outright. The instant conditions allow funding, the next arm goes.
+    last_abandon = state.last_abandon_at.get(d.direction)
+    if last_abandon is not None and not _demand_outweighs_a_retry(cfg, inp, state):
+        # Interval starts at one round trip and doubles per consecutive
+        # abandon, capped. Doubling because a second failure against the same
+        # conditions is evidence the conditions have not moved; capped because
+        # they might, and past the cap the right behaviour is to keep asking
+        # once a minute forever rather than to give up -- which is the
+        # difference between a rate limiter and a latch.
+        k = max(1, state.arm_refusals.get(d.direction, 1))
+        # The base interval is one round trip WHERE THE SEAM WAS MEASURED, and
+        # min_dwell_s where it was not. A safety limiter must not switch itself
+        # off for want of a measurement -- that is the right gate for a
+        # threshold term, and exactly the wrong one here, where the failure
+        # mode is an arm storm against an unfundable seam.
+        base_s = (
+            solved_tp_decode_floor_s(cfg)
+            if cfg.flip_cost_s > 0
+            else cfg.min_dwell_s
+        )
+        floor_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+        since = inp.now - last_abandon
+        if floor_s > 0 and since < floor_s:
+            return _no(
+                f"{d.direction} arm refused by the staging rate limit: {k} "
+                f"consecutive abandons, "
+                f"last {since:.1f}s ago, next staging in {floor_s - since:.1f}s "
+                f"(interval {floor_s:.1f}s = {base_s:.1f}s doubled {k}x, capped "
+                f"at {cfg.refusal_backoff_cap_s:g}s) "
+                f"-- a rate limit, not a latch: it never stops re-probing and "
+                f"a completion clears it outright"
+            )
     hold_until = state.arm_hold_until.get(d.direction)
     if hold_until is not None and inp.now < hold_until:
         k = state.arm_refusals.get(d.direction, 0)
         degraded = state.arm_degraded.get(d.direction)
+        # #662: WHILE THE WORK IS STILL THERE, A REFUSAL IS NOT A REASON TO
+        # WAIT -- IT IS A REASON TO PAY.
+        #
+        # Reaching here means `_decide_from_load` already said this load wants
+        # the other layout, so the arming condition PERSISTS. Backing off then
+        # is not damping, it is the defect with a timer on it: measured on
+        # this rig, tp_to_pp was refused for want of ~380 MiB while tens of
+        # thousands of tokens sat pending, the direction was declared
+        # unfundable, and the instance held in TP at 1000-1600 tok/s where the
+        # PP layout does 4000-7000. Waiting 48 s changed nothing, because
+        # nothing about waiting frees memory.
+        #
+        # What DOES free memory is the KV rung: the pool being full is what
+        # makes the flip worth taking AND what pays for it, once the rung is
+        # actually asked. So while the condition holds we re-attempt at the
+        # plain dwell cadence -- each attempt runs the gate, which asks the
+        # rung -- instead of doubling a backoff or honouring a degrade latch.
+        #
+        # The exponential backoff and the latch both survive for the case they
+        # were written for: a load that has STOPPED wanting the flip, where
+        # `wants_flip` is false and this branch is never reached.
+        paced_until = hold_until
+        if k > 0:
+            paced_until = min(
+                hold_until, _last_refusal_at(state, d.direction) + cfg.min_dwell_s
+            )
+        if inp.now >= paced_until:
+            return d
         if degraded:
             return _no(
                 f"{d.direction} refused {k} times and treated as unfundable "
-                f"({degraded}); re-probing in {hold_until - inp.now:.1f}s"
+                f"({degraded}); the load still wants this layout, so the next "
+                f"attempt is in {paced_until - inp.now:.1f}s and it will ask "
+                f"the KV rung again rather than wait out a backoff"
             )
         return _no(
-            f"{d.direction} arm refused {k} in a row, backoff holds for "
-            f"{hold_until - inp.now:.1f}s more"
+            f"{d.direction} arm refused {k} in a row; the load still wants "
+            f"this layout, so the next attempt is in "
+            f"{paced_until - inp.now:.1f}s (dwell-paced, not backed off)"
         )
+
     return d
+
+
+def _last_refusal_at(state: "PhasePolicyState", direction: str) -> float:
+    """When the current hold started, derived from the hold itself.
+
+    The state carries the hold's END, not its start, so the start is recovered
+    by subtracting the backoff that produced it. Kept as a helper so the
+    arithmetic has one home and the caller reads as intent.
+    """
+    return float(state.arm_hold_until.get(direction, 0.0)) - float(
+        state.arm_hold_last_span.get(direction, 0.0)
+    )
 
 
 def _decide_from_load(
@@ -472,14 +1351,71 @@ def _decide_from_load(
 
     idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
 
+    # NOTHING CAN RUN HERE -- CHECKED BEFORE THE DWELL, AND THAT IS THE POINT.
+    #
+    # Every other rule below asks "is flipping WORTH it", and a dwell floor is
+    # the right damper for that question: it bounds thrash between two layouts
+    # that can both do work. This rule asks a different question -- "can this
+    # layout do ANY work at all" -- and when the answer is no, waiting is not
+    # a trade-off, it is dead time. Measured on metal 2026-08-16 09:42:39-45:
+    # six seconds of zero GPU, zero PCIe, py-spy showing all three ranks
+    # spinning get_next_batch_to_run and building nothing, released only by
+    # the 180 s decode-stall cap. DRAINED could not fire (it needs pending
+    # <= one chunk; there were 572715 tok) and the #677(a) progress exit could
+    # not fire either (it needs pending FROZEN, and pending was still creeping
+    # 572792 -> 572715, which reads as progress).
+    #
+    # A TIMER IS THE WRONG INSTRUMENT FOR A FACT THAT IS ALREADY KNOWN. The
+    # round has just finished failing to build a batch of either class; that
+    # is not a prediction to be confirmed by waiting, it is a completed
+    # observation. So the arm is event-driven off that failure and carries no
+    # interval of its own.
+    #
+    # IT CANNOT OSCILLATE, and not because a damper stops it. The condition is
+    # ONE-SIDED: it requires that the current layout can build nothing AND
+    # that the target can build something. After the flip the target runs by
+    # premise, so the same condition is false there. Bypassing the dwell is
+    # therefore safe in exactly this branch and nowhere else -- which is why
+    # it is written here, above the dwell, rather than as an exception inside
+    # it.
+    if inp.nothing_can_run and not inp.target_can_admit:
+        # BOTH SIDES BLOCKED IS AN EVICT PROBLEM, NOT A LAYOUT PROBLEM.
+        #
+        # This branch exists because the first version of this rule did not
+        # have it, and shipped a flip loop: on 2026-08-16 10:24 the policy
+        # armed tp_to_pp, pp_to_tp and tp_to_pp again in seven seconds, with
+        # 2 requests resident and 910140 tokens queued, because each layout
+        # was certified as the other's escape while NEITHER could run. When
+        # the target is not admissible either, changing layout cannot help --
+        # the binding resource is KV, and the action that unblocks a side is
+        # freeing it. Declining here is what routes the caller to the evict
+        # rung instead of to a cutover.
+        return _no(
+            f"{BOTH_BLOCKED}: nothing can run in the {inp.phase} layout and the "
+            f"target cannot admit either ({inp.running_bs} req resident, "
+            f"{inp.pending_prefill_tokens} tok pending) -- the binding "
+            f"resource is KV, not the layout, so this is an evict trigger and "
+            f"NOT a flip. Flipping here is the 10:24 ping-pong."
+        )
+
+    if inp.nothing_can_run and inp.target_can_admit:
+        direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
+        return PhasePolicyDecision(
+            direction,
+            f"{IDLE_LOCKED}: no batch of either work class can be built in the "
+            f"{inp.phase} layout ({inp.running_bs} req resident, "
+            f"{inp.pending_prefill_tokens} tok prefill pending) and the "
+            f"target layout can run one -- arming immediately rather than "
+            f"waiting for a stall timer to notice",
+        )
+
     # The minimum dwell is checked FIRST and applies to every flip, so no
     # branch below can bypass the thrash bound. It is the only guarantee
     # that survives an adversarial arrival pattern.
     since_flip = inp.now - state.last_flip_at
     if state.last_flip_at > 0 and since_flip < cfg.min_dwell_s:
         return _no(
-            f"min dwell: {since_flip:.1f}s since last flip < "
-            f"{cfg.min_dwell_s:g}s"
+            f"min dwell: {since_flip:.1f}s since last flip < {cfg.min_dwell_s:g}s"
         )
 
     if inp.phase == PHASE_TP:
@@ -488,7 +1424,66 @@ def _decide_from_load(
         # the correct answer for short prompts by construction of N.
         # Under purity the break-even is meaningless (see
         # prefill_runs_in_tp): the only threshold that terminates is zero.
-        tp_threshold = cfg.flip_tokens if cfg.prefill_runs_in_tp else 0
+        tp_threshold = effective_flip_threshold(cfg, inp.running_bs)
+        if (
+            cfg.prefill_runs_in_tp
+            and inp.running_bs > 0
+            and cfg.flip_tokens < inp.pending_prefill_tokens <= tp_threshold
+        ):
+            # Repays the seam, but not the seam PLUS the generations this
+            # cutover would pause for a whole PP window. Named explicitly so
+            # the log says which term refused, not just "below threshold".
+            if cfg.decode_contention > 0.0:
+                # Under the differential model the refusal is NOT "a flip
+                # would strand them" -- they are stranded either way -- but
+                # "the backlog is not yet big enough that flipping shortens
+                # the stall". Say which, or the log invites the wrong fix.
+                return _no(
+                    f"pending prefill {inp.pending_prefill_tokens} tok > N="
+                    f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                    f"{inp.running_bs} req decoding: too short for the round "
+                    f"trip to beat prefilling it in tp"
+                )
+            return _no(
+                f"pending prefill {inp.pending_prefill_tokens} tok > N="
+                f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                f"{inp.running_bs} req decoding: flipping would strand them "
+                f"in pp for a {cfg.pp_window_s:g}s window"
+            )
+        if cfg.drain_mode and inp.pending_prefill_tokens > cfg.pp_exit_tokens:
+            # #677 HOT FIX 2: THE BUNDLE IS FINISHED BEFORE THE LAYOUT MOVES.
+            #
+            # Measured live: `arming tp_to_pp: pending > N=7004` fired with
+            # running bs 2-3, cutting a decode bundle in half -- and under
+            # purity the backlog is ALWAYS above N, so that rule cannot be a
+            # reason to leave without meaning "never finish anything". Five
+            # blocked-admission exits in one boot were the same carriers
+            # coming back unfinished, window after window.
+            #
+            # The user's semantics: prefill until empty, decode the bundle to
+            # completion, prefill again. So the backlog stops being an exit
+            # condition here and BS==0 becomes one. The min-dwell, the decode
+            # floor, the 180s cap and the #677a progress exit are all
+            # untouched underneath -- this changes what ends a HEALTHY window,
+            # never what rescues a broken one.
+            if inp.running_bs > 0:
+                return _no(
+                    f"decode bundle running: {inp.running_bs} of "
+                    f"{max(state.bundle_at_phase_entry, inp.running_bs)} req "
+                    f"still decoding, {inp.pending_prefill_tokens} tok prefill "
+                    f"waiting -- drain mode finishes the bundle before flipping"
+                )
+            in_phase = (
+                None if state.phase_since is None else inp.now - state.phase_since
+            )
+            bundle = max(state.bundle_at_phase_entry, 0)
+            return PhasePolicyDecision(
+                TP_TO_PP,
+                f"decode bundle complete: {bundle} reqs decoded in "
+                f"{0.0 if in_phase is None else in_phase:.1f} s "
+                f"({inp.pending_prefill_tokens} tok prefill waiting) -- exit "
+                f"condition: decode drained",
+            )
         if inp.pending_prefill_tokens > tp_threshold:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
@@ -499,9 +1494,7 @@ def _decide_from_load(
             # nothing decoding there is nothing to protect, and an arriving
             # long prompt should reach the PP layout inside its TTFT.
             in_phase = (
-                None
-                if state.phase_since is None
-                else inp.now - state.phase_since
+                None if state.phase_since is None else inp.now - state.phase_since
             )
             if (
                 cfg.tp_decode_floor_s > 0
@@ -531,9 +1524,7 @@ def _decide_from_load(
                     f"idle {idle_for:.1f}s >= {cfg.idle_dwell_s:g}s, "
                     f"returning to the {cfg.rest_state} resting layout",
                 )
-            return _no(
-                f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell"
-            )
+            return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
         if inp.pending_prefill_tokens:
             # Unreachable under purity: tp_threshold is 0 there, so any
             # non-zero pending already armed above. Reaching it would mean
@@ -559,12 +1550,51 @@ def _decide_from_load(
         # running in whatever layout we are about to be in anyway. That
         # makes the two rules one hysteresis band around N instead of two
         # unrelated thresholds, so no arrival pattern can satisfy both.
-        if inp.pending_prefill_tokens <= cfg.flip_tokens and inp.running_bs > 0:
+        if inp.pending_prefill_tokens <= cfg.pp_exit_tokens and inp.running_bs > 0:
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"prefill down to {inp.pending_prefill_tokens} tok "
-                f"(<= N={cfg.flip_tokens}), {inp.running_bs} req decoding",
+                f"DRAINED: {inp.pending_prefill_tokens} tok remaining "
+                f"(<= one chunk of {cfg.pp_exit_tokens}), {inp.running_bs} req "
+                f"decoding -- exit condition: drained",
             )
+        # #677(a) BLOCKED ADMISSION, CHECKED BEFORE THE RESIDENCY CAP.
+        #
+        # Measured live 2026-08-16 06:04: pending frozen at 403779 tok from
+        # 06:04:47 with running bs 4 -- every max_running_requests slot held by
+        # a carried decode. PP may not decode under strict purity, so no slot
+        # could free; admission needs a slot, so no chunk could land; and the
+        # DRAINED rule waits for pending to fall below one chunk, which it
+        # never would. The instance was not slow, it was waiting for an event
+        # that could no longer happen, and the user saw a dead server.
+        #
+        # This is not a deadline. It fires on the absence of PROGRESS, which
+        # any single admitted chunk resets, so a genuine drain is never cut
+        # short however long it takes -- the property the pure-drain decision
+        # requires. See `pp_progress_stall_window_s` for the solve.
+        stall_window = pp_progress_stall_window_s(cfg)
+        stalled_for = (
+            None
+            if state.last_prefill_progress_at is None
+            else inp.now - state.last_prefill_progress_at
+        )
+        if (
+            stall_window > 0
+            and stalled_for is not None
+            and stalled_for >= stall_window
+            and inp.pending_prefill_tokens > cfg.pp_exit_tokens
+            and inp.running_bs > 0
+        ):
+            return PhasePolicyDecision(
+                PP_TO_TP,
+                f"blocked admission: pending frozen at "
+                f"{inp.pending_prefill_tokens} tok for {stalled_for:.1f}s with "
+                f"bs {inp.running_bs} carried (no chunk admitted in "
+                f"{stall_window:.1f}s, solved as {PROGRESS_STALL_CHUNKS}x the "
+                f"{cfg.pp_exit_tokens}tok/{cfg.pp_prefill_tok_s:g}tok-s chunk "
+                f"cadence, floored at 2x{cfg.flip_cost_s:g}s seam) -- exit "
+                f"condition: blocked admission",
+            )
+
         # THE PP WINDOW. The rule above needs prefill to DRAIN below N; a
         # sustained backlog never does, and under strict purity the PP
         # phase may not decode at all, so without this bound the instance
@@ -574,18 +1604,54 @@ def _decide_from_load(
         # fit waits for the next PP window. This is also the deadlock
         # breaker for a PP phase that cannot ADMIT its pending prefill (no
         # free state slot) -- see phase_purity's deadlock section.
-        if (
-            cfg.pp_window_s > 0
-            and state.phase_since is not None
-            and inp.running_bs > 0
-            and (inp.now - state.phase_since) >= cfg.pp_window_s
-        ):
+        # THE DECODE-STARVATION CAP, solved from the declared latency
+        # constraint and the measured seam. Unlike the stopwatch it replaces,
+        # this is the only thing that may cut a drain short, and it says why in
+        # units someone can argue with: a carried decode has been stalled for
+        # its whole budget.
+        in_pp = None if state.phase_since is None else inp.now - state.phase_since
+        cap = pp_residency_cap_s(cfg)
+        if cap > 0 and in_pp is not None and inp.running_bs > 0 and in_pp >= cap:
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"pp window {inp.now - state.phase_since:.1f}s >= "
-                f"{cfg.pp_window_s:g}s with {inp.running_bs} req waiting to "
-                f"decode ({inp.pending_prefill_tokens} tok prefill deferred "
-                f"to the next pp window)",
+                f"decode stall cap: {inp.running_bs} req stalled "
+                f"{in_pp + 2 * cfg.flip_cost_s:.1f}s of the "
+                f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
+                f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
+                f"{inp.pending_prefill_tokens} tok prefill still pending -- exit "
+                f"condition: decode starvation cap",
+            )
+
+        # LEGACY STOPWATCH. Retained so a deployment that set pp_window_s keeps
+        # its behaviour, but it now has to say what the drain-based policy
+        # would have done instead -- the whole point being that the next audit
+        # can compare the two without re-deriving anything.
+        if (
+            cap <= 0
+            and cfg.pp_window_s > 0
+            and in_pp is not None
+            and inp.running_bs > 0
+            and in_pp >= cfg.pp_window_s
+        ):
+            rung = effective_flip_threshold(cfg, inp.running_bs)
+            would_drain = inp.pending_prefill_tokens <= cfg.flip_tokens
+            drain_s = (
+                inp.pending_prefill_tokens / cfg.pp_prefill_tok_s
+                if cfg.pp_prefill_tok_s > 0
+                else float("nan")
+            )
+            return PhasePolicyDecision(
+                PP_TO_TP,
+                f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
+                f"{inp.running_bs} req waiting to decode "
+                f"({inp.pending_prefill_tokens} tok prefill deferred to the "
+                f"next pp window) -- HAND-SET STOPWATCH; drain-based policy "
+                f"would {'also leave' if would_drain else 'STAY'} "
+                f"(pending {inp.pending_prefill_tokens} vs drain target "
+                f"{cfg.flip_tokens}, active rung {rung}, ~{drain_s:.1f}s more "
+                f"in pp to drain at {cfg.pp_prefill_tok_s:g} tok/s vs "
+                f"{2 * cfg.flip_cost_s:.1f}s of seam to leave and return); "
+                f"declare {ENV_DECODE_STALL_SLO} to solve this instead",
             )
         if idle and cfg.rest_phase == PHASE_TP:
             if state.idle_since is None:
@@ -597,9 +1663,7 @@ def _decide_from_load(
                     f"idle {idle_for:.1f}s >= {cfg.idle_dwell_s:g}s, "
                     f"returning to the {cfg.rest_state} resting layout",
                 )
-            return _no(
-                f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell"
-            )
+            return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
         if idle:
             return _no("idle at rest")
         return _no(f"prefilling in pp ({inp.pending_prefill_tokens} tok pending)")
@@ -619,6 +1683,23 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
             state.idle_since = inp.now
     else:
         state.idle_since = None
+
+    # #689 FORMATION CLOCK. Stamped on the first round in which a PP window
+    # holds a carrier but not yet a full one; cleared whenever the window is
+    # full, the queue drains, or the phase is not PP. Kept HERE, in the
+    # observer, for the same reason the idle clock is: ``decide`` is pure and
+    # must not mutate, and a clock driven by the policy's own verdict would
+    # restart every time the verdict changed.
+    forming = (
+        inp.phase == PHASE_PP
+        and int(getattr(inp, "ready_carriers", 0) or 0) > 0
+        and bool(getattr(inp, "queue_nonempty", False))
+    )
+    if forming:
+        if not state.formation_started_at:
+            state.formation_started_at = inp.now
+    else:
+        state.formation_started_at = 0.0
     # Phase-entry clock for the fairness bound. Driven by the OBSERVED
     # phase rather than by the policy's own verdict, so it is correct for
     # the first phase (no flip has happened yet, last_flip_at == 0) and for
@@ -626,6 +1707,24 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     if state.last_phase != inp.phase:
         state.last_phase = inp.phase
         state.phase_since = inp.now
+        # A fresh phase inherits no stall. The clock restarts here so a wedge
+        # has to be demonstrated in THIS residency, not carried in from the
+        # last one.
+        state.last_prefill_progress_at = inp.now
+        state.last_pending_prefill_tokens = None
+        # #677 hot fix 2: the bundle this window inherits. Recorded at the
+        # boundary because by the time it drains there is nothing left to count.
+        state.bundle_at_phase_entry = int(inp.running_bs)
+    # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
+    # frozen at a value while every slot is held by a carried decode, so the
+    # observable that separates it from a slow drain is whether the backlog
+    # ever goes DOWN. Recorded here rather than derived in `decide` for the
+    # same reason the idle clock is: a decision that measures its own history
+    # is not reproducible from its inputs.
+    prev = state.last_pending_prefill_tokens
+    if prev is None or inp.pending_prefill_tokens < prev:
+        state.last_prefill_progress_at = inp.now
+    state.last_pending_prefill_tokens = inp.pending_prefill_tokens
 
 
 def note_flip_armed(
@@ -705,12 +1804,24 @@ def note_flip_outcome(
         state.idle_since = pending[2]
         state.flips_armed = max(0, state.flips_armed - 1)
 
+    # An outcome of False means a staging attempt was made and ABANDONED --
+    # the expensive failure, the one with a memory peak at the seam. Arms that
+    # never reach staging do not land here, which is what lets the storm guard
+    # be paced on real cost instead of on probe count.
+    state.last_abandon_at[direction] = now
     k = state.arm_refusals.get(direction, 0) + 1
     state.arm_refusals[direction] = k
     state.arm_refusals_total += 1
     hold = min(cfg.min_dwell_s * (2**k), cfg.refusal_backoff_cap_s)
     state.arm_hold_until[direction] = now + hold
+    # The span, so a persisting arming condition can pace from the refusal
+    # instant rather than from the end of a backoff it is going to ignore.
+    state.arm_hold_last_span[direction] = hold
     detail = (message or "no reason given").strip()
+    # Kept unconditionally, so the purity valve can name the shortfall that
+    # idled the box even on the FIRST abandon -- which, since the stand-down
+    # bound became 1, is the abandon that opens it.
+    state.arm_last_detail[direction] = detail
 
     if k >= cfg.refusal_degrade_after and not state.arm_degraded.get(direction):
         state.arm_degraded[direction] = detail
@@ -759,6 +1870,7 @@ def note_flip_completed(
     state.flips_completed += 1
     state.arm_refusals.pop(direction, None)
     state.arm_hold_until.pop(direction, None)
+    state.last_abandon_at.pop(direction, None)
     if state.arm_degraded.pop(direction, None):
         logger.warning(
             "%s %s completed a cutover and is fundable again after being "
@@ -778,6 +1890,15 @@ def _env_float(name: str, default: float) -> float:
         raise PhasePolicyError(f"{name}={raw!r} is not a number") from exc
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """A boolean knob. Unset keeps the default, which for every flag added
+    after a deployment exists must be the deployment's current behaviour."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -788,7 +1909,15 @@ def _env_int(name: str, default: int) -> int:
         raise PhasePolicyError(f"{name}={raw!r} is not an integer") from exc
 
 
-def config_from_env(enabled: bool) -> PhasePolicyConfig:
+#: #677 hot fix 2: opt in to "prefill until empty, decode the bundle to
+#: completion, prefill again". Off unless set, so no deployment moves without
+#: asking for it.
+ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
+
+
+def config_from_env(
+    enabled: bool, chunk_tokens: int = 0, formation_target: int = 0
+) -> PhasePolicyConfig:
     """Build the boot configuration.
 
     ``enabled`` comes from the server arg; the tuning knobs come from the
@@ -796,23 +1925,32 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     change, and so the acceptance run can exercise a short dwell without
     shipping a short dwell as the default.
     """
-    rest_state = os.environ.get(ENV_REST_STATE) or REST_PREFILL
+    rest_state = os.environ.get(ENV_REST_STATE) or REST_DECODE
     min_dwell = _env_float(ENV_MIN_DWELL, DEFAULT_MIN_DWELL_S)
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
+
+    # THE THREE MEASUREMENTS THE WHOLE LADDER RESTS ON, resolved from the
+    # environment ONCE and then used everywhere -- for the break-even N, for
+    # the stranded-decode surcharge, and for the boot log.
+    #
+    # This used to read the module CONSTANTS here while the surcharge read the
+    # env, so the two halves of one ladder were solved against different
+    # numbers. Booting with a measured 5.918 s seam produced
+    # [7004, 19430, 21589, 22669, 23316]: rung 0 did not move at all, because
+    # the seam knob never reached it. A solved number silently replaced by a
+    # constant is exactly the provenance defect this policy exists to avoid.
+    seam_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
+    tp_tok_s = _env_float(ENV_TP_TOK_S, DEFAULT_TP_PREFILL_TOK_S)
+    pp_tok_s = _env_float(ENV_PP_TOK_S, DEFAULT_PP_PREFILL_TOK_S)
 
     explicit = _env_int(ENV_FLIP_TOKENS, 0)
     if explicit > 0:
         flip_tokens = explicit
         source = f"{ENV_FLIP_TOKENS}={explicit}"
-    elif DEFAULT_TP_PREFILL_TOK_S > 0:
-        flip_tokens = break_even_tokens(
-            DEFAULT_FLIP_COST_S,
-            DEFAULT_TP_PREFILL_TOK_S,
-            DEFAULT_PP_PREFILL_TOK_S,
-        )
+    elif tp_tok_s > 0:
+        flip_tokens = break_even_tokens(seam_s, tp_tok_s, pp_tok_s)
         source = (
-            f"break-even {DEFAULT_FLIP_COST_S:g}s / (1/"
-            f"{DEFAULT_TP_PREFILL_TOK_S:g} - 1/{DEFAULT_PP_PREFILL_TOK_S:g})"
+            f"break-even {seam_s:g}s / (1/{tp_tok_s:g} - 1/{pp_tok_s:g})"
         )
     elif enabled:
         raise PhasePolicyError(
@@ -828,12 +1966,40 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
 
     cfg = PhasePolicyConfig(
         enabled=enabled,
+        drain_mode=_env_flag(ENV_DRAIN_MODE, False),
         flip_tokens=flip_tokens,
         min_dwell_s=min_dwell,
         idle_dwell_s=idle_dwell,
         rest_state=rest_state,
         pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
         tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
+        # #689: the caller passes max_running_requests; the env can override
+        # it, and 0/1 disables the gate and restores the previous behaviour.
+        formation_target=int(
+            _env_float("SGLANG_PHASE_FORMATION_TARGET", float(formation_target))
+        ),
+        formation_cap_s=_env_float("SGLANG_PHASE_FORMATION_CAP_S", 3.0),
+        # The seam cost the threshold was derived from, carried so the
+        # stranded-decode surcharge can price a cutover against the
+        # generations it would pause. Without this the surcharge is inert.
+        flip_cost_s=seam_s,
+        decode_strand_weight=_env_float(ENV_DECODE_STRAND_WEIGHT, 1.0),
+        # The measured counterfactual. With it the surcharge prices a flip
+        # against what NOT flipping costs the same decodes; without it the
+        # old one-sided form is kept, unchanged.
+        decode_contention=_env_float(
+            ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION
+        ),
+        decode_stall_slo_s=_env_float(
+            ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
+        ),
+        pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
+        # Passed in rather than read from env: it is a runtime fact of THIS
+        # scheduler, and the armed line below prices the seam from it -- so it
+        # has to be known before that line is emitted, not filled in after.
+        prefill_chunk_tokens=int(chunk_tokens or 0),
+        tp_prefill_tok_s=tp_tok_s,
+        pp_prefill_tok_s=pp_tok_s,
         refusal_backoff_cap_s=_env_float(
             ENV_REFUSAL_BACKOFF_CAP, DEFAULT_REFUSAL_BACKOFF_CAP_S
         ),
@@ -844,7 +2010,9 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     if enabled:
         logger.warning(
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
-            "pp window %gs, tp decode floor %gs, resting layout %s (%s)",
+            "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g, "
+            "decode contention %g, N ladder by decoding reqs %s, "
+            "resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
@@ -852,6 +2020,13 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             cfg.idle_dwell_s,
             cfg.pp_window_s,
             cfg.tp_decode_floor_s,
+            cfg.flip_cost_s,
+            cfg.decode_strand_weight,
+            cfg.decode_contention,
+            # The whole ladder, not just the one-decode rung: an unreachable
+            # top rung is exactly the defect #665-F1 was, and it is invisible
+            # if only the first rung is logged.
+            [effective_flip_threshold(cfg, b) for b in range(5)],
             cfg.rest_phase,
             cfg.rest_state,
         )
@@ -863,6 +2038,7 @@ __all__ = [
     "PHASE_TP",
     "PP_TO_TP",
     "TP_TO_PP",
+    "prefill_suppressed_in_tp",
     "REST_PREFILL",
     "REST_DECODE",
     "REST_STATES",

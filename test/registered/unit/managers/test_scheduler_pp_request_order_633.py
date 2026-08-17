@@ -53,6 +53,26 @@ _LOOPS = (
 )
 
 
+def _loop_source(name: str) -> str:
+    """A loop's source, PLUS the body it delegates to.
+
+    #679 follow-up, and it repairs a pin rather than relaxing one.
+    ``event_loop_pp`` was refactored to set ``_defer_flip_round_to_pp_loop``
+    and call ``_event_loop_pp_body``; the helper call the pin looks for moved
+    one frame down with it. The property -- every PP loop routes received
+    requests through the forward-first helper, or adjacent stages deadlock --
+    was never lost, so the fix is to follow the delegation, not to drop the
+    assertion. A pin that stops reaching the code it guards is worse than no
+    pin, because it reads as protection while protecting nothing.
+    """
+    src = inspect.getsource(getattr(SchedulerPPMixin, name))
+    for delegate in re.findall(r"self\.(_event_loop_\w*body)\(", src):
+        fn = getattr(SchedulerPPMixin, delegate, None)
+        if fn is not None:
+            src += "\n" + inspect.getsource(fn)
+    return src
+
+
 def _blocking_req():
     """The request whose handler blocks on peers -- the deadlock's trigger."""
     return InitWeightsUpdateGroupReqInput(
@@ -63,11 +83,27 @@ def _blocking_req():
     )
 
 
+def _pp_stub() -> SchedulerPPMixin:
+    """A mixin instance with the flags the helper reads pinned OFF.
+
+    #679 follow-up. ``_pp_forward_and_process_input_requests`` now consults
+    ``pp_phase_flip_armed()``, which reads ``server_args.enable_phase_flip``,
+    so a bare ``SchedulerPPMixin()`` raises AttributeError before the ordering
+    this class exists to assert is ever exercised. The flip is irrelevant here
+    -- the contract under test is forward-before-process -- so it is pinned
+    off rather than simulated, which is what the sibling gate test does with
+    the same flag for the same reason.
+    """
+    scheduler = SchedulerPPMixin()
+    scheduler.server_args = SimpleNamespace(enable_phase_flip=False)
+    return scheduler
+
+
 class PpForwardBeforeProcessTest(CustomTestCase):
     """(1) The helper's ordering contract."""
 
     def test_non_last_stage_forwards_then_processes(self):
-        scheduler = SchedulerPPMixin()
+        scheduler = _pp_stub()
         scheduler.pp_group = SimpleNamespace(is_last_rank=False)
         previous_send_work = ["previous-send"]
         current_send_work = ["current-send"]
@@ -97,7 +133,7 @@ class PpForwardBeforeProcessTest(CustomTestCase):
         self.assertIs(scheduler.send_req_work, current_send_work)
 
     def test_last_stage_has_nobody_to_forward_to(self):
-        scheduler = SchedulerPPMixin()
+        scheduler = _pp_stub()
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.send_req_work = []
 
@@ -123,7 +159,7 @@ class PpLoopsUseTheHelperTest(CustomTestCase):
     def test_every_pp_loop_calls_the_helper(self):
         for name in _LOOPS:
             with self.subTest(loop=name):
-                src = inspect.getsource(getattr(SchedulerPPMixin, name))
+                src = _loop_source(name)
                 self.assertIn(
                     "_pp_forward_and_process_input_requests(recv_reqs)",
                     src,
@@ -139,7 +175,7 @@ class PpLoopsUseTheHelperTest(CustomTestCase):
         """
         for name in _LOOPS:
             with self.subTest(loop=name):
-                src = inspect.getsource(getattr(SchedulerPPMixin, name))
+                src = _loop_source(name)
                 self.assertNotRegex(
                     src,
                     r"(?<!_)\bself\.process_input_requests\(",

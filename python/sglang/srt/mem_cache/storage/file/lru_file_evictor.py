@@ -84,7 +84,12 @@ class LRUFileEvictor:
         iter_existing: Optional[
             Callable[[], Iterable[Tuple[str, os.stat_result]]]
         ] = None,
+        pins: Optional[Any] = None,
     ) -> None:
+        # #410: the pin ledger, or None. None is the default and every code
+        # path guards on it, so a store without checkpoints behaves exactly as
+        # before -- no extra lookup on the eviction hot path.
+        self._pins = pins
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
@@ -247,6 +252,16 @@ class LRUFileEvictor:
             "used_bytes": self._total_bytes,
             "num_entries": len(self._lru),
             "write_stopped": self._write_stopped,
+            # #410 + the #715 lesson: never report as deliverable what the
+            # actuator cannot deliver. Pinned bytes are held by conversation
+            # checkpoints and eviction skips them, so a capacity decision must
+            # read reclaimable_bytes rather than used_bytes.
+            "pinned_entries": self._pins.pinned_entries() if self._pins else 0,
+            "pinned_bytes": self._pins.pinned_bytes() if self._pins else 0,
+            "reclaimable_bytes": max(
+                0,
+                self._total_bytes - (self._pins.pinned_bytes() if self._pins else 0),
+            ),
         }
 
     def stats(self) -> dict:
@@ -633,6 +648,14 @@ class LRUFileEvictor:
         evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
         if evict_stem in self._pending_writes:
             # Keep in-flight reservations; their file isn't committed yet.
+            self._lru[evict_stem] = evict_size
+            return "skipped", 0
+        if self._pins is not None and self._pins.is_pinned(evict_stem):
+            # #410: a conversation checkpoint references this page. The same
+            # skip-and-repin step an in-flight write gets, deliberately: it
+            # reuses the bounded skip budget in _evict_while, so a store whose
+            # entries are ALL pinned cannot spin -- it exhausts its attempts and
+            # the caller learns the space is not there rather than looping.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
         tensor_path = self._path_for_stem(evict_stem)

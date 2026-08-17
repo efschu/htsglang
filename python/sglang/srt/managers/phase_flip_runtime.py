@@ -257,6 +257,39 @@ ENV_SEAM_ABANDON_CAP = "SGLANG_SEAM_ABANDON_CAP"
 DEFAULT_SEAM_ABANDON_BACKOFF_MAX = 16
 ENV_SEAM_ABANDON_BACKOFF_MAX = "SGLANG_SEAM_ABANDON_BACKOFF_MAX"
 
+#: #662-F4 / A0: may an arm SPILL for the arming floor before refusing for it?
+#:
+#: On by default, and a no-op whenever the card already holds the floor, which
+#: is every arm on a correctly sized instance -- the sizer charges the floor at
+#: boot. What this catches is the transient the sizer cannot: a co-tenant, a
+#: capture peak, a rank that drifted. Set to 0 to restore the plain refusal.
+ENV_PREARM_RELIEF = "SGLANG_PHASE_FLIP_PREARM_RELIEF"
+#: How many consecutive relief attempts one direction may spend before the
+#: shortfall is called persistent. BOUNDED BY A COUNT, not a clock: the ladder
+#: is synchronous, so a deadline would be measured across a call that cannot be
+#: interrupted anyway, and an unbounded loop spills the instance flat.
+DEFAULT_PREARM_RELIEF_ATTEMPTS = 3
+ENV_PREARM_RELIEF_ATTEMPTS = "SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS"
+
+
+def _prearm_relief_enabled() -> bool:
+    return os.environ.get(ENV_PREARM_RELIEF, "1") not in ("0", "false", "False")
+
+
+def _prearm_relief_attempts() -> int:
+    """A malformed or non-positive bound falls back to the default rather than
+    to zero: a zero bound would refuse every dip without ever asking the
+    ladder, which is the behaviour this term exists to replace."""
+    raw = os.environ.get(ENV_PREARM_RELIEF_ATTEMPTS)
+    if raw is None:
+        return DEFAULT_PREARM_RELIEF_ATTEMPTS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREARM_RELIEF_ATTEMPTS
+    return n if n > 0 else DEFAULT_PREARM_RELIEF_ATTEMPTS
+
+
 #: The guard a capped seam installs. ``arm`` already refuses on
 #: ``blocking_guards``, so appending here is what makes "stay in the current
 #: phase" a STATE rather than a hope -- and it surfaces in the status string.
@@ -335,6 +368,30 @@ def seam_cap_retire_hysteresis_bytes() -> int:
     return max(0, mib) * 1024 * 1024
 
 
+def _seam_transient_floor_bytes(law_floor_bytes: int) -> int:
+    """The floor a CUTOVER TRANSIENT is judged against: the band's lower edge.
+
+    The corridor law is a band and its verdict is the continuous minimum
+    against the floor, so a dip that lasts one wave walk is lawful down to the
+    floor. Judging a transient against the CENTRE reserves the band's whole
+    tolerance for nothing and delays flips the law permits.
+
+    Falls back to the value it was given if the band cannot be read: delaying a
+    legal flip costs throughput, entering an illegal one costs the law, so the
+    fallback goes the delaying way.
+    """
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+        mib = 1 << 20
+        floor_mib = int(
+            round((int(law_floor_bytes) / mib) * (1.0 - CORRIDOR_BAND_FRACTION))
+        )
+        return max(0, floor_mib) * mib
+    except Exception:  # pragma: no cover - the seam must not fail on this
+        return int(law_floor_bytes)
+
+
 def seam_entry_margin_bytes() -> int:
     """The designed headroom a seam must have ON TOP OF its staging ask.
 
@@ -403,6 +460,24 @@ def seam_backoff_skips(consecutive_abandons: int, backoff_max: int) -> int:
     if k >= 32:  # 2**31 is already far past any sane clamp; do not overflow it
         return max(0, int(backoff_max))
     return min((1 << (k - 1)) - 1, max(0, int(backoff_max)))
+
+
+def _seam_staging_reserve_bytes(server_args) -> int:
+    """The user reserve, minus the band tolerance the seam may transiently use.
+
+    Returns BYTES. Falls back to the reserve itself if the band cannot be
+    read, which is the previous behaviour and the safe direction: a seam that
+    reserves too much refuses a flip, while one that reserves too little
+    breaches the law it is supposed to respect.
+    """
+    reserve_mib = int(getattr(server_args, "rank_user_reserve_mib", None) or 1024)
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+        floor_mib = int(round(reserve_mib * (1.0 - CORRIDOR_BAND_FRACTION)))
+    except Exception:  # pragma: no cover - the band must never break a boot
+        floor_mib = reserve_mib
+    return max(0, floor_mib) * 1024 * 1024
 
 
 def park_deadline_s() -> float:
@@ -933,6 +1008,41 @@ def _probe_allocated_extent(scheduler, reqs) -> None:
         logger.warning("%s flip extent probe failed: %s", LOG_PREFIX, exc)
 
 
+_DISK_TIER_ARM_WARNED = False
+
+
+def _warn_first_disk_tier_arm(server_args) -> None:
+    """Say once, on the first flip arm carrying a disk tier, that this path has
+    a history (#703 review gate).
+
+    A refusal here would be the counter-vs-actuator pattern -- the defect it
+    named is fixed and covered -- but the path DID wedge once, so silence is
+    not right either. Warning, not blocker, per corridor canon: the line exists
+    so that a future regression is attributed in one grep instead of a
+    bisect.
+    """
+    global _DISK_TIER_ARM_WARNED
+    if _DISK_TIER_ARM_WARNED:
+        return
+    if not getattr(server_args, "enable_hierarchical_cache", False):
+        return
+    backend = getattr(server_args, "hicache_storage_backend", None)
+    if not backend:
+        return
+    _DISK_TIER_ARM_WARNED = True
+    logger.warning(
+        "PHASE FLIP arming with a HiCache DISK tier (backend=%r). This "
+        "combination wedged at warmup once (#630: PP x disk HiCache). It is "
+        "ALLOWED because that wedge's root fix -- 9da9dfd025, bounded "
+        "collectives in mem_cache/hicache_collective.py -- is an ancestor of "
+        "this build, and test/registered/unit/mem_cache/"
+        "test_hicache_bounded_waits_630.py is the active protection, not a "
+        "refusal in flip_blocking_guards. If a warmup hang reappears on this "
+        "path, start from that suite and that commit.",
+        backend,
+    )
+
+
 def flip_blocking_guards(scheduler) -> List[str]:
     """Features that refuse flip arming (DESIGN_631 3.7). Mirrors the
     #297 Stage-A guard shape, plus the #630 PP x disk-HiCache wedge."""
@@ -945,8 +1055,34 @@ def flip_blocking_guards(scheduler) -> List[str]:
             guards.append("PD disaggregation")
     except ImportError:
         pass
-    if getattr(server_args, "enable_hierarchical_cache", False):
-        guards.append("hierarchical cache (#630: PP x disk HiCache wedges at warmup)")
+    # HiCache is a TIER SHAPE, not a feature flag (#703, same lesson the kvso
+    # clause below already learned). This used to refuse arming whenever
+    # hierarchical cache was merely ENABLED, which made the phase flip and any
+    # prefix retention mutually exclusive: the deployment answered by running
+    # `enable_hierarchical_cache=False`, i.e. with no cache tier at all on the
+    # serving line. The wedge that earned the guard was specifically the DISK
+    # tier at warmup, and it was fixed -- 9da9dfd025 bounded the collectives
+    # (mem_cache/hicache_collective.py) and test_hicache_bounded_waits_630.py
+    # covers it. The guard now names the tier that actually wedged, so the
+    # device+host-local configuration can carry a prefix cache across the flip.
+    # #703 stage 2: the #630 clause is GONE, not narrowed further. Keeping the
+    # disk tier refused was my own stage-1 conservatism ("pending its own
+    # evidence"), but the evidence is the same evidence that cleared the host
+    # tier: the wedge's root fix is 9da9dfd025 (bounded collectives,
+    # mem_cache/hicache_collective.py), it is an ancestor of every deployed
+    # commit since, and test_hicache_bounded_waits_630.py covers it. A guard
+    # cannot be justified by a defect that a green suite says is fixed.
+    #
+    # The live protection is that suite, not this clause. What remains gated is
+    # the KV key's pp suffix, which is a statement about BYTES and belongs with
+    # the whole-page format (#706) -- refusing the backend never protected the
+    # bytes, it only prevented anyone from reaching them.
+    #
+    # WARNING-NOT-BLOCKER (corridor canon): this path did wedge once for real,
+    # so the first arm that carries a disk tier says so exactly once. If
+    # anything ever regresses here, this line is the attribution -- it names the
+    # defect, the commit that fixed it, and the suite that keeps it fixed.
+    _warn_first_disk_tier_arm(server_args)
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which
     # made the host half of spec items 6/12/15c and the phase flip mutually
@@ -1384,6 +1520,22 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             if _ladder is not None:
                 _ladder.on_enter_tp(stacks.draft_worker)
             arm_draft_bootstrap_all_reachable(scheduler, want_draft)
+
+            # #662-F4: AND THE MIRROR OF THE RECOVERY BELOW. Since the rung
+            # funds the seam from whichever layout is RESIDENT, the tp_to_pp
+            # leg pays out of the TP layout's pool -- the source, whose rows
+            # above the live set hold nothing. Entering TP makes that pool
+            # active again, so the relief taken against it has to be handed
+            # back here, exactly as the PP pool's is on the other leg.
+            #
+            # Without this the reduction is a RATCHET: the seam restores each
+            # layout to its own ``size``, which the shrink lowered, so the TP
+            # pool would come back smaller after every tp_to_pp and never
+            # climb. The grow is corridor-bounded inside ``recover``, so it
+            # cannot breach the law to do it.
+            from sglang.srt.managers.phase_flip_spill import recover_kv_backing
+
+            recover_kv_backing(scheduler, reduce_fn=reduce_fn)
         else:
             # ``stacks.draft_worker``, not ``want_draft``: want_draft is None
             # on this leg by design (that is the point of the leg), while the
@@ -1467,6 +1619,29 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # sit between a failed completeness check and the exception.
         from sglang.srt.managers.phase_flip_output_trace import trace_cutover
 
+        # #719: move the HiCache pool bindings to the phase that is now active.
+        # Runs AFTER the stack swap, because the incoming pools are what it
+        # binds to -- the mirror of #703's writeback, which runs BEFORE
+        # anything moves because it reads the outgoing ones.
+        #
+        # Refusal is logged, not raised, for the reason the seam always gives:
+        # with requests parked a raise takes down an instance that was serving
+        # fine. A refused rebind is SAFE by construction -- the binding does not
+        # move, so #718 keeps device-tier I/O disarmed in this phase, which is
+        # exactly the state that held before this feature existed.
+        try:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                rebind_for_cutover,
+            )
+
+            rebind_for_cutover(scheduler, "tp" if tp_phase else "pp")
+        except Exception as e:
+            logger.error(
+                "%s #719 HiCache rebind refused (%s); device-tier I/O stays "
+                "disarmed for this phase and the flip continues.",
+                LOG_PREFIX,
+                e,
+            )
         trace_cutover(scheduler, direction)
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
@@ -1687,11 +1862,28 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         # The flip must leave the user's reserve alone, so it takes the
         # number from the same flag the rest of the server does rather than
         # carrying a second opinion about how much VRAM is not ours.
-        staging_reserve_bytes=int(
-            (getattr(server_args, "rank_user_reserve_mib", None) or 1024)
-        )
-        * 1024
-        * 1024,
+        #
+        # #662: BUT THE SEAM IS A TRANSIENT, AND THE RESERVE IS A BAND. The
+        # operator's corridor is 1024 MiB +-20 %, and the verdict is the
+        # continuous minimum against the band FLOOR -- a cutover that dips to
+        # 819 MiB for the length of a wave walk is lawful, which is the whole
+        # reason the band was granted. Holding the CENTRE as a hard reserve
+        # during staging spends that tolerance on nothing and refuses flips
+        # the law permits.
+        #
+        # Measured on this rig 2026-08-15, GATE C, device 0:
+        #   staging 1059 MiB needed, only 1000 MiB spendable, refused by 59;
+        #   eight consecutive refusals then latched the direction "unfundable"
+        #   and the instance held in TP with 50k+ tokens pending at
+        #   1000-1600 tok/s, where the PP layout does 4000-7000.
+        # Against the band floor the same instant offers 2024 - 819 = 1205
+        # MiB and the flip funds.
+        #
+        # SCOPED TO THE SEAM DELIBERATELY. This is the staging reserve, not
+        # the corridor law: the guard still judges every ordinary allocation
+        # against the centre, and only the cutover -- bounded, unanimous and
+        # over in seconds -- may reach into the band's tolerance.
+        staging_reserve_bytes=_seam_staging_reserve_bytes(server_args),
         # Label it as OURS: a shared helper reporting under its own
         # module's name sent a live wedge into the wrong subsystem.
         collective_min=flip_collective_min,
@@ -1743,6 +1935,45 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
     )
     # #631 J: read-only handle for the pool census straddling the cutover.
     runtime._census_scheduler = scheduler
+    # #665-F1 item 7: price the seam at boot instead of discovering it at arm
+    # time. The design point is the live set at the deployed ladder's arming
+    # threshold -- the smallest backlog that will actually ask for a flip, so
+    # the projection answers "can the seam this config will attempt be paid
+    # for?" A projection must never fail a boot, hence the broad guard inside.
+    try:
+        policy_cfg = getattr(scheduler, "phase_policy_cfg", None)
+        design_tokens = int(getattr(policy_cfg, "flip_tokens", 0) or 0)
+        page = int(
+            getattr(
+                getattr(scheduler, "token_to_kv_pool_allocator", None),
+                "page_size",
+                1,
+            )
+            or 1
+        )
+        if design_tokens > 0:
+            base = max(1, -(-design_tokens // page))
+            # THE LIVE SET IS THE RESIDENT POOL, NOT THE PENDING BACKLOG.
+            # Projecting at the arming threshold under-read a real flip by a
+            # constant ~511 MiB, and multiplying the threshold barely moved it
+            # (+93 MiB for 4x the slots). Solving the slope put the real live
+            # set near 200k slots -- i.e. the OCCUPIED POOL, which is what the
+            # seam carries across, not the backlog that triggered it.
+            #
+            # So the named points are pool occupancies, which is both the
+            # honest assumption and the one an operator can match to intended
+            # load. The threshold point is kept as the floor of the range.
+            pool = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+            pool_slots = max(0, -(-pool // page))
+            points = [("threshold", base)]
+            for frac in (0.50, 0.75, 0.90):
+                if pool_slots > 0:
+                    points.append(
+                        (f"pool @ {int(frac * 100)}%", int(pool_slots * frac))
+                    )
+            runtime.log_staging_projection(points=tuple(points))
+    except Exception as exc:
+        logger.warning("%s staging projection skipped: %r", LOG_PREFIX, exc)
     return runtime
 
 
@@ -2389,7 +2620,10 @@ class PhaseFlipRuntime:
         #: costs nothing. Flip latency at 16 is +4% against the floor arm,
         #: inside the spread between ranks.
         #:
-        #: INERT WITHOUT A COMMIT CHUNK, which is still off by default:
+        #: LIVE SINCE #688: the commit chunk now defaults to 8 MiB, so these
+        #: blocks are reached in a default boot. Priced under load at
+        #: 216-377 MiB per rank saved (memory_pool._alloc_post_capture_buffers
+        #: carries the table). Formerly inert:
         #: ``_effective_row_blocks`` mirrors ``_execute``'s gate and returns
         #: 1 when the arena cannot do span ops, so a default boot is
         #: unchanged. Pair this with ``SGLANG_FLIP_SEAM_CHUNK_MIB=16``; that
@@ -2458,6 +2692,162 @@ class PhaseFlipRuntime:
         return self._pending
 
     # -- arming (replicated callers) -----------------------------------------
+    def _prearm_floor_relief(self, direction: str) -> Tuple[bool, str]:
+        """SPILL for the arming floor before arming. NEVER refuse for it.
+
+        "IT CAN ALWAYS BE SPILLED" IS TRUE BEFORE ARMING, AND ONLY BEFORE.
+        The sizer charges the floor at boot, so a correctly planned instance
+        never reaches this. What reaches it is the transient a sizer cannot
+        see: a co-tenant, a capture peak, a rank that drifted. Letting that
+        stop a flip is the same mistake as sizing without the floor -- it turns
+        a recoverable dip into a phase the instance cannot enter.
+
+        IT DOES NOT REFUSE, AND THE FIRST VERSION OF THIS METHOD DID. That
+        version returned False when the ladder could not reach the floor, on
+        the argument that "a rank that refuses simply does not arm, which the
+        consensus round already handles". METAL SAYS OTHERWISE, and it is the
+        second time the same error was made in one day, one layer apart.
+
+        Measured on boot_slo_proof_r3.log: PP0 sat at 3130 MiB against its 1728
+        MiB floor and ARMED; PP1 and PP2 sat at 1514 and 1982 against 1772 and
+        2414 and REFUSED. The group split, and the armed rank parked at the
+        entry -- "WITHHOLDING presence (8854 rounds so far) -- still owes a
+        chain send" -- spinning for ever, no decode, all three cards at 0%.
+
+        The existing blocking guards get away with being rank-local because
+        they are config facts, identical on every rank in practice. A verdict
+        keyed to this rank's FREE VRAM never is. So this rung keeps the half
+        that is safe and rank-local -- SPENDING the ladder, which frees memory
+        and cannot desync anything -- and leaves the REFUSING to the seam gate,
+        which reduces its verdict across the group and already prints the
+        numbers. One unanimous decision, not two.
+
+        WHY THE RELIEF STILL BELONGS HERE rather than at that gate. The gate
+        runs after the arm is committed, at the last point before the no-return
+        region; by then the group has agreed to a flip and the staged fund must
+        stay hard-resident, so freeing underneath it is the evictable-seam-fund
+        mistake that produced the served-nothing class in #656 boots E/G. Here
+        nothing is armed and nothing is staged, so a spill is free.
+
+        BOUNDED, because an unbounded relief loop spills the instance flat.
+        Attempts are counted per direction and reset the moment the floor is
+        clear, so a rig that dips once pays one ladder.
+
+        The (bool, str) shape is kept so the caller reads like every other
+        precondition, but the bool is now always True: this rung reports, it
+        does not decide.
+        """
+        if not _prearm_relief_enabled():
+            return True, ""
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:
+            return True, ""
+        try:
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            guard = get_corridor_guard(scheduler)
+            if guard is None:
+                return True, ""
+            # THE GUARD'S OWN FLOOR, NOT A SECOND DERIVATION OF IT. The gate
+            # arms against ``floor_bytes``; re-deriving the same number here
+            # would be two computations that must agree, which is how a rank
+            # ends up spilling for a level nothing enforces. The sizer targets
+            # this floor PLUS a load margin so the card starts above it; at
+            # runtime the floor itself is the thing to reach.
+            floor = int(guard.floor_bytes)
+            free = int(guard.free_bytes())
+        except Exception as e:  # pragma: no cover - defensive
+            # AN UNREADABLE INSTRUMENT MAY NOT BLOCK A FLIP. The floor is a
+            # precaution; failing to measure it is not evidence that it is
+            # short, and refusing here would turn a probe failure into a
+            # permanently stuck phase.
+            logger.warning(
+                "%s pre-arm floor could not be read (%s); arming proceeds",
+                LOG_PREFIX,
+                e,
+            )
+            return True, ""
+        if not hasattr(self, "_prearm_relief_attempts"):
+            self._prearm_relief_attempts = {PP_TO_TP: 0, TP_TO_PP: 0}
+        if free >= floor:
+            self._prearm_relief_attempts[direction] = 0
+            return True, ""
+        spent = int(self._prearm_relief_attempts.get(direction, 0))
+        bound = _prearm_relief_attempts()
+        if spent >= bound:
+            # THE LADDER IS SPENT, AND THE ARM STILL PROCEEDS. The bound stops
+            # a hot loop from spilling the instance flat; it is not a verdict.
+            # The seam gate decides, unanimously, a few rounds from here.
+            logger.warning(
+                "%s %s arming floor still short: free %d MiB below %d MiB by "
+                "%d MiB after %d bounded relief attempts. The arm PROCEEDS and "
+                "the seam gate refuses if it must -- a rank-local refusal here "
+                "split the group once already (r3: PP0 armed, its peers did "
+                "not, and the armed rank parked at the entry for ever).",
+                LOG_PREFIX,
+                direction,
+                free >> 20,
+                floor >> 20,
+                (floor - free) >> 20,
+                spent,
+            )
+            return True, ""
+        self._prearm_relief_attempts[direction] = spent + 1
+        # ``ensure_headroom`` guarantees ``free_after - want >= law``, so the
+        # ask that lands the card ON the arming floor is the floor MINUS the
+        # law the guard already defends. Asking for the whole floor would
+        # spill a second corridor's worth for nothing.
+        want = max(0, floor - int(guard.law_floor_bytes))
+        try:
+            res = guard.ensure_headroom(
+                want, reason=f"pre-arm arming floor for {direction}"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "%s pre-arm relief raised (%s); arming proceeds on the "
+                "seam gate's own ladder",
+                LOG_PREFIX,
+                e,
+            )
+            return True, ""
+        reclaimed = int(getattr(res, "reclaimed", 0) or 0)
+        providers = tuple(getattr(res, "used_providers", ()) or ())
+        if getattr(res, "ok", False):
+            logger.info(
+                "%s pre-arm relief funded the %s arming floor: free %d -> "
+                "%d MiB against a %d MiB floor, %d MiB reclaimed from %s. "
+                "Spilled BEFORE the arm, so the staged fund stays resident "
+                "once the flip begins.",
+                LOG_PREFIX,
+                direction,
+                free >> 20,
+                int(getattr(res, "free_after", free)) >> 20,
+                floor >> 20,
+                reclaimed >> 20,
+                list(providers) or ["nothing"],
+            )
+            self._prearm_relief_attempts[direction] = 0
+            return True, ""
+        # SHORT, AND SAID SO WITH THE NUMBERS -- but not a refusal. The
+        # operator asked for "how much was short and what the ladder freed",
+        # and that is exactly what this line carries; what it must not carry is
+        # a rank-local decision about whether the group flips.
+        logger.warning(
+            "%s %s arming floor NOT funded: free %d MiB is below %d MiB by "
+            "%d MiB; the ladder freed %d MiB from %s (attempt %d of %d). The "
+            "arm proceeds; the seam gate reduces the verdict.",
+            LOG_PREFIX,
+            direction,
+            free >> 20,
+            floor >> 20,
+            (floor - free) >> 20,
+            reclaimed >> 20,
+            list(providers) or ["nothing"],
+            spent + 1,
+            bound,
+        )
+        return True, ""
+
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
         """Arm a flip. Replicated call; the consensus round commits it once
         every rank is armed AND ready. Returns (ok, msg)."""
@@ -2467,9 +2857,50 @@ class PhaseFlipRuntime:
         # refusal is an event every rank sees.
         self._arm_seq = getattr(self, "_arm_seq", 0) + 1
         if self.blocking_guards:
-            msg = f"phase flip refused (guards): {', '.join(self.blocking_guards)}"
-            logger.warning("%s %s", LOG_PREFIX, msg)
-            return False, msg
+            # #662: THE THIRD DAMPER ON THE SAME PATH, and the last one.
+            #
+            # The policy hold and the seam's own abandon counter both learned
+            # to stand down while the arming condition persists; this one then
+            # blocked every entry anyway, so the seam was never re-priced.
+            # Measured: arms climbed 22, 23, 24, 25 against "seam unfundable:
+            # tp_to_pp abandoned 8 times consecutively" with 92k tokens
+            # pending. Three independent counters guarding one decision is how
+            # a fix keeps looking wrong after it is right.
+            #
+            # The abandon-cap guard is the only one that stands down: it is a
+            # statement about affordability, and affordability is exactly what
+            # a full pool changes. Every other blocking guard is a statement
+            # about SAFETY (a half-built stack, a missing carrier) and keeps
+            # refusing, because no amount of pending work makes those safe.
+            standing = [
+                g
+                for g in self.blocking_guards
+                if not g.startswith(SEAM_ABANDON_CAP_GUARD)
+            ]
+            if standing or not self._arming_condition_persists():
+                msg = (
+                    "phase flip refused (guards): "
+                    f"{', '.join(standing or self.blocking_guards)}"
+                )
+                logger.warning("%s %s", LOG_PREFIX, msg)
+                return False, msg
+            if not self._storm_limiter_allows(direction):
+                msg = (
+                    f"phase flip {direction}: abandon-cap guard would stand "
+                    "down, but the arm RATE limiter is holding this attempt. "
+                    "Re-pricing is paced, never blocked -- the next attempt "
+                    "runs on schedule."
+                )
+                logger.debug("%s %s", LOG_PREFIX, msg)
+                return False, msg
+            logger.info(
+                "%s abandon-cap guard STOOD DOWN at arm %d: work is still "
+                "waiting, so the seam is re-priced instead of refused unheard. "
+                "Affordability is what a full pool changes; safety guards are "
+                "unaffected and still refuse.",
+                LOG_PREFIX,
+                self._arm_seq,
+            )
         if direction not in _DIR_ID:
             return False, f"unknown flip direction {direction!r}"
         # #485: DAMP A REFUSAL THAT CANNOT CHANGE. Declining here rather than
@@ -2483,6 +2914,34 @@ class PhaseFlipRuntime:
             self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
             self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
         retry_at = self._seam_retry_at_arm.get(direction, 0)
+        # #662: THE SECOND TIMER. The policy's own backoff was replaced with
+        # dwell-paced retry while the arming condition persists, and this
+        # counter then vetoed the retry anyway -- so the KV rung was still
+        # never asked. Measured on this rig: PP0 printed "the load still wants
+        # this layout, so the next attempt is in 0.2s and it will ask the KV
+        # rung again", and the very next arm was declined by "5 consecutive
+        # group abandons, next entry at arm 38 (this is arm 26)".
+        #
+        # Two independent dampers on one path is how a fix lands half-wired.
+        # While work is still waiting, this one stands down for the same
+        # reason the other did: waiting frees no memory, and the pool being
+        # full is what pays for the flip once the rung is reached.
+        #
+        # The counter is kept and still counts -- it is the right damper for
+        # its actual case, an arming condition that has GONE AWAY, where the
+        # bypass below is false and the skip applies exactly as before.
+        if self._arm_seq < retry_at and self._arming_condition_persists():
+            logger.info(
+                "%s %s abandon backoff STOOD DOWN at arm %d (would have "
+                "waited until %d): work is still waiting, so the attempt "
+                "proceeds and the KV rung gets asked. Waiting frees no "
+                "memory; the full pool is what funds the seam.",
+                LOG_PREFIX,
+                direction,
+                self._arm_seq,
+                retry_at,
+            )
+            retry_at = 0
         if self._arm_seq < retry_at:
             self.seam_backoff_skips[direction] = (
                 self.seam_backoff_skips.get(direction, 0) + 1
@@ -2512,6 +2971,17 @@ class PhaseFlipRuntime:
                 direction,
                 source,
             )
+        # #662-F4 / A0: SPILL for the arming floor here, where relief is still
+        # free -- nothing is armed, no rank has entered the seam, and the
+        # staged fund does not exist yet to be pulled out from under.
+        #
+        # ITS VERDICT IS DELIBERATELY DISCARDED. This rung is rank-local, and a
+        # rank-local refusal splits the arm: on r3 PP0 cleared its floor and
+        # armed while its peers did not, and the armed rank parked at the entry
+        # for ever. Refusing is the seam gate's job, because the gate reduces
+        # its verdict across the group. Ignoring the return value here is what
+        # makes that structural rather than a promise in a docstring.
+        self._prearm_floor_relief(direction)
         self._pending = direction
         # A fresh arm starts a fresh round sequence. The epoch already
         # distinguishes this arm from any earlier one, so the round
@@ -3890,8 +4360,7 @@ class PhaseFlipRuntime:
             reduced = self._collective_min([vote])
         except Exception as exc:  # noqa: BLE001 -- a probe never kills the loop
             logger.debug(
-                "%s seam cap retire vote could not be reduced (%s); the "
-                "verdict stands",
+                "%s seam cap retire vote could not be reduced (%s); the verdict stands",
                 LOG_PREFIX,
                 exc,
             )
@@ -3937,6 +4406,84 @@ class PhaseFlipRuntime:
         return True
 
     # -- staging affordability ------------------------------------------------
+    def project_staging_bytes(self, direction: str, n_slots: int) -> int:
+        """What the seam WILL want, for a live set of ``n_slots`` rows.
+
+        #665-F1 item 7. The cost of a configuration change used to be
+        discovered at arm time, by staging, being refused and abandoning on a
+        live instance -- 512 -> 2048 took the pp_to_tp want from ~907 MiB to
+        2481 and wedged the return leg with nothing having predicted it.
+
+        This is the same `_staging_bytes` the gate itself calls, evaluated
+        ahead of time against a projected live set, so it is EXACT rather than
+        fitted and inherits every future change to the formula for free. An
+        earlier attempt fitted want = base + k*chunk^2 to three measured
+        anchors; it was falsified on a held-out point, and the anchors turned
+        out to be one per RANK, so the curve was tracking per-rank arena_tail
+        offsets rather than chunk width. There was never anything to fit: the
+        plan's only live-set input is the slot count, and everything else is
+        static layout.
+
+        Per rank by construction -- `arena_tail` and the layer map differ
+        across ranks, which is exactly what the fit mistook for a trend.
+        """
+        src, dst = self._src_dst(direction)
+        waves = self._flip_waves(direction)
+        slots = torch.arange(int(max(0, n_slots)), dtype=torch.int64)
+        tr = build_phase_flip_transition(
+            slots, self._map, self._n_layers, self._vec, self._rank, direction
+        )
+        return self._staging_bytes(tr, direction, src, dst, waves)
+
+    def log_staging_projection(
+        self, points: Sequence[Tuple[str, int]], floor_mib: float = 819.0
+    ) -> None:
+        """Print the projected want per direction at NAMED live-set points.
+
+        A boot-time projection can only ever be a stated-assumption number,
+        never an oracle: the seam is priced against the live set it actually
+        meets, and at boot nobody knows what that will be. So every line names
+        the assumption it was evaluated under, and several are printed, because
+        the first version of this projected only at the ladder's arming
+        threshold and under-read the real want by a constant ~511 MiB -- the
+        flip ARMS at the threshold but EXECUTES against whatever has
+        accumulated plus the resident set. The number was right; the sentence
+        it silently implied was wrong.
+
+        Reading these: find the line whose assumption is closest to the load
+        you intend to run, and compare its "needs N MiB free" against the
+        corridor. A configuration whose seam cannot be paid for at the live set
+        you expect is visible here, at boot, instead of as a run of abandons on
+        a live instance.
+        """
+        for label, n_slots in points:
+            for direction in (TP_TO_PP, PP_TO_TP):
+                try:
+                    want = self.project_staging_bytes(direction, n_slots) / (1 << 20)
+                except Exception as exc:  # must never fail a boot
+                    logger.warning(
+                        "%s staging projection unavailable for %s @ %s: %r",
+                        LOG_PREFIX,
+                        direction,
+                        label,
+                        exc,
+                    )
+                    continue
+                logger.warning(
+                    "%s STAGING PROJECTION rank %s %s: want %.0f MiB "
+                    "projected @ %s = %d slots, + floor %.0f = needs %.0f MiB "
+                    "free. Evaluated from _staging_bytes against the plan, not "
+                    "fitted; valid for THIS stated live set only.",
+                    LOG_PREFIX,
+                    self._rank,
+                    direction,
+                    want,
+                    label,
+                    n_slots,
+                    floor_mib,
+                    want + floor_mib,
+                )
+
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
         """Device bytes the move will hold at once, from the PLAN.
 
@@ -4463,7 +5010,9 @@ class PhaseFlipRuntime:
         if torch.cuda.is_available():  # pragma: no cover - needs a device
             torch.cuda.empty_cache()
 
-    def _staging_affordable(self, staging_bytes: int) -> Tuple[bool, str]:
+    def _staging_affordable(
+        self, staging_bytes: int, direction: str = ""
+    ) -> Tuple[bool, str]:
         """Can this rank stage ``staging_bytes`` without eating the reserve?
 
         THE TWO POOLS OF MEMORY ARE NOT EQUIVALENT, and conflating them
@@ -4520,6 +5069,9 @@ class PhaseFlipRuntime:
                 return int(free_dev), int(max(0, cached_free))
 
         reserve = self._staging_reserve_bytes
+        # Remembered for the ABANDONED census, which runs later and otherwise
+        # has no way to quote the figure the refusal was about.
+        self._last_staging_bytes = int(staging_bytes)
         driver_free, cached_free = probe()
         from_driver = max(0, driver_free - reserve)
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
@@ -4543,6 +5095,80 @@ class PhaseFlipRuntime:
         usable = from_driver
         if staging_bytes <= usable:
             return True, ""
+
+        # #689 THE GUARD IS ASKED BEFORE THE FLIP IS ABANDONED.
+        #
+        # THE MEASUREMENT THAT PUT THIS HERE. At an ABANDONED instant the
+        # staging budget census read, per rank:
+        #     rank0 5090 : needs 1305, spendable 1599, arena    0  -> fits
+        #     rank1 3080 : needs 1059, spendable  867, arena  815  -> SHORT 192
+        #     rank2 3080 : needs 1763, spendable 2051, arena 1456  -> fits
+        # The binding rank was short by 192 MiB while holding 815 MiB of the
+        # INACTIVE layout's weights -- 4.2x the shortfall -- and its headroom
+        # over the corridor floor was 150 MiB against 1606 and 1334 on the
+        # peers. So the seam was not failing on the corridor floor and not on
+        # the live set: one rank was holding the OTHER layout's arena while
+        # trying to stage this one, and nothing ever asked it to give it back.
+        #
+        # ensure_headroom IS THE DESIGNED COMPOSITION POINT, not a new
+        # mechanism -- its own docstring discusses the seam ("at the seam:
+        # abandon the flip") and refusal_is_fatal for exactly this leg. The
+        # draft-weights provider is already registered in the rebalance tier;
+        # it simply was never asked from here.
+        #
+        # refusal_is_fatal ON pp_to_tp, for the reason that docstring gives:
+        # strict purity forbids decode in PP, so a refused pp_to_tp starves
+        # decode and NOTHING IN PP CAN FREE the memory that would end the
+        # refusal. That leg has no survivable wait, so the host tier opens.
+        shortfall = int(staging_bytes) - int(usable)
+        guard = None
+        try:
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            sched = getattr(self, "_census_scheduler", None)
+            guard = get_corridor_guard(sched) if sched is not None else None
+        except Exception:  # noqa: BLE001 - never break the refusal path
+            guard = None
+        if guard is not None and shortfall > 0:
+            try:
+                res = guard.ensure_headroom(
+                    shortfall,
+                    reason=f"seam staging {direction}",
+                    refusal_is_fatal=(direction == PP_TO_TP),
+                    # #689: the seam has ALREADY accounted the free column --
+                    # `usable` above is computed from it. It needs the ladder
+                    # to RELEASE `shortfall` more, so the ask must be judged by
+                    # the measured delta. Without this the guard answered "are
+                    # 178 MiB free" (trivially yes at 1428 free), reported
+                    # success three times having freed nothing, and the seam
+                    # abandoned believing it was funded.
+                    must_reclaim=True,
+                )
+                driver_free, cached_free = probe()
+                usable = max(0, driver_free - reserve)
+                logger.info(
+                    "%s seam staging asked the corridor guard for %.0f MiB "
+                    "(%s): ok=%s, spendable now %.0f MiB against a need of "
+                    "%.0f MiB. ok=False here means the ladder RELEASED nothing "
+                    "(must_reclaim judges the delta, not the free column), so "
+                    "the shortfall is real and every registered provider is "
+                    "dry.",
+                    LOG_PREFIX,
+                    shortfall / (1024 * 1024),
+                    direction,
+                    getattr(res, "ok", "?"),
+                    usable / (1024 * 1024),
+                    staging_bytes / (1024 * 1024),
+                )
+                if staging_bytes <= usable:
+                    return True, ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s seam staging could not ask the corridor guard (%r); "
+                    "falling through to the abandon path unchanged.",
+                    LOG_PREFIX,
+                    exc,
+                )
         mib = 1024 * 1024
         return False, (
             f"staging {staging_bytes / mib:.0f} MiB needed but only "
@@ -4552,8 +5178,237 @@ class PhaseFlipRuntime:
             f"{self._staging_reserve_bytes / mib:.0f} MiB kept free). The "
             f"KV pool is too full to carry its own contents across the "
             f"flip; serving continues in this layout and the flip is "
-            f"retried when occupancy drops"
+            f"retried when occupancy drops. "
+            + (
+                # #688: when the flip was armed because NOTHING can run, an
+                # unfunded seam is an idle window, not a deferral. Say so, name
+                # the shortfall, and name the event that can change it -- an
+                # operator reading "retried when occupancy drops" has no way to
+                # know that occupancy cannot drop, because the only thing that
+                # would drop it is the flip being refused here.
+                f"ARMED IDLE-LOCKED, so this is a STALL, not a deferral: "
+                f"{(staging_bytes - usable) / mib:.0f} MiB short after the "
+                f"relief rung was asked for the margin as mandatory. Nothing "
+                f"in this layout can admit or decode, so occupancy will NOT "
+                f"drop on its own; the next event that can change this is a "
+                f"resident request completing or being aborted. "
+                if bool(getattr(self, "armed_idle_locked", False))
+                else ""
+            )
+            + self._kv_rung_verdict()
         )
+
+    #: Minimum seconds between arm ATTEMPTS on one direction while a damper is
+    #: standing down. Not a latch: it paces re-pricing, it never stops it, and
+    #: an attempt that made PROGRESS resets it to zero so a funding run is
+    #: never throttled.
+    SEAM_ARM_MIN_INTERVAL_S = 2.0
+
+    def _storm_limiter_allows(self, direction: str) -> bool:
+        """Pace arm attempts without ever blocking a funded one.
+
+        THE STORM IS REAL AND SO IS THE FIX THAT CAUSED IT. Removing three
+        dampers made the seam re-priceable, which is what let it fund at high
+        occupancy -- and also let arms run at ~20/min where boot E's pathology
+        was 179 in nine minutes. F1's pin is right to call that a storm.
+
+        A LATCH IS THE WRONG SHAPE, which is the whole lesson of this ticket:
+        every latch here blocked re-pricing while the arming condition
+        persisted, and each one cost the prefill layout. So this is a RATE
+        limiter. It bounds attempts per direction in time and nothing else:
+
+        * it never refuses because of a COUNT, only because of an interval;
+        * an attempt that made progress -- a completed flip, or a KV release
+          that moved the driver -- clears the interval immediately, so a run
+          that is actually funding is never throttled;
+        * it applies only where a damper is already standing down, so the
+          ordinary path is untouched.
+
+        The result is that a seam which CAN fund keeps funding at full speed,
+        and a seam which cannot stops burning a core on it.
+        """
+        now = time.monotonic()
+        if not hasattr(self, "_seam_last_arm_at"):
+            self._seam_last_arm_at = {}
+        last = self._seam_last_arm_at.get(direction)
+        if last is not None and (now - last) < self.SEAM_ARM_MIN_INTERVAL_S:
+            return False
+        self._seam_last_arm_at[direction] = now
+        return True
+
+    def note_seam_progress(self, direction: str) -> None:
+        """A flip completed or the rung released bytes: stop pacing this one.
+
+        Called on the paths that represent real progress, so the limiter can
+        never throttle a direction that is successfully funding itself.
+        """
+        try:
+            if hasattr(self, "_seam_last_arm_at"):
+                self._seam_last_arm_at.pop(direction, None)
+        except Exception:  # pragma: no cover - pacing must not raise
+            pass
+
+    def _arming_condition_persists(self) -> bool:
+        """Is there still work waiting that wants the other layout?
+
+        Deliberately coarse: any queued request is enough. The POLICY has
+        already decided which layout this load wants and only issues an arm
+        when it wants one, so this is not a second opinion about the decision
+        -- it only distinguishes "the load is still there" from "the load has
+        gone away", which is the one distinction the abandon counter needs and
+        never had.
+
+        False on anything unreadable, which keeps the counter's old behaviour
+        exactly: an unreadable queue must not be able to disable a damper.
+        """
+        try:
+            scheduler = getattr(self, "_census_scheduler", None)
+            if scheduler is None:
+                return False
+            # QUEUED **OR RUNNING**, and the difference cost a whole boot.
+            #
+            # The first version of this asked only about the waiting queue,
+            # which is empty exactly when the work has been admitted -- so at
+            # 90k tokens resident the log read "#running-req: 1,
+            # #full token: 457724, #queue-req: 0" and the damper did NOT stand
+            # down, because by its reading nothing was waiting. The load that
+            # most wants the other layout is the load that is already in the
+            # machine.
+            for name in ("waiting_queue", "grammar_queue"):
+                q = getattr(scheduler, name, None)
+                if q and len(q) > 0:
+                    return True
+            running = getattr(scheduler, "running_batch", None)
+            reqs = getattr(running, "reqs", None) if running is not None else None
+            if reqs and len(reqs) > 0:
+                return True
+            cur = getattr(scheduler, "cur_batch", None)
+            cur_reqs = getattr(cur, "reqs", None) if cur is not None else None
+            return bool(cur_reqs and len(cur_reqs) > 0)
+        except Exception:  # noqa: BLE001 - a damper must not raise
+            return False
+
+    def staging_budget_census(self, staging_bytes: int = 0) -> str:
+        """WHO IS HOLDING THIS RANK'S SEAM STAGING BUDGET, in MiB.
+
+        The ABANDONED receipt says the pool is too small and, on eight of the
+        twelve abandons measured 2026-08-16 11:05, that "This rank: fits (a
+        peer did not)" -- which names a BINDING RANK and nothing about what is
+        binding it. Three remedies were then plausible (arena tail, inactive
+        layout arena, draft weights) with no way to choose between them, so
+        this prints the occupants instead of leaving the next reader to guess.
+
+        A CENSUS, NEVER A GATE: every term is read defensively and a failure
+        prints as "?" rather than raising, because a refusal path is the worst
+        possible place to add a new exception.
+        """
+        mib = 1024 * 1024
+
+        def q(fn, default="?"):
+            try:
+                v = fn()
+                return f"{v / mib:.0f}" if isinstance(v, (int, float)) else str(v)
+            except Exception:  # noqa: BLE001 - a census must not raise
+                return default
+
+        probe = self._mem_probe
+        driver_free = cached = None
+        try:
+            if probe is not None:
+                driver_free, cached = probe()
+            elif torch.cuda.is_available():
+                driver_free, _t = torch.cuda.mem_get_info()
+                cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        except Exception:  # noqa: BLE001
+            pass
+        # The REAL accessors, not invented attribute names: the runtime keeps
+        # the scheduler as ``_census_scheduler`` and both the guard and the
+        # measured reserve are fetched through their own modules, exactly as
+        # the prearm-relief path above does.
+        sched = getattr(self, "_census_scheduler", None)
+        res = guard = None
+        try:
+            from sglang.srt.managers.phase_flip_seam_reserve import read_seam_reserve
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            if sched is not None:
+                guard = get_corridor_guard(sched)
+                res = read_seam_reserve(
+                    sched.server_args, int(getattr(self, "_rank", 0) or 0)
+                )
+        except Exception:  # noqa: BLE001 - a census must not raise
+            pass
+        parts = [
+            f"staging needs {staging_bytes / mib:.0f}",
+            f"driver free {q(lambda: driver_free)}",
+            f"allocator cache {q(lambda: cached)} (reclaimable)",
+            f"staging reserve kept free {q(lambda: self._staging_reserve_bytes)}",
+            f"seam fixed {q(lambda: res.fixed_bytes)}",
+            # NOT "the inactive layout's weights held on this card". This is
+            # reserve.arena_fixed_bytes: the tp_to_pp leg's FUTURE commit cost,
+            # priced into staging, and ZERO on pp_to_tp. Measured per rank:
+            # rank1 arena_fixed 815 with pp_to_tp tail 0 / tp_to_pp tail 815;
+            # rank2 1456 with 0 / 1456; rank0 0 / 0 / 0. The old label read as
+            # reclaimable memory and sent a design note down a dead end -- rung
+            # 3 has already released the real tail by then (receipts: "rung 3
+            # released 1410.0 MiB ... TP layout needs 8977.8 of 10434.0").
+            f"tp_to_pp ARENA COMMIT DUE (0 on this leg if pp_to_tp) "
+            f"{q(lambda: res.arena_fixed_bytes)}",
+            f"reserve active={getattr(res, 'active', '?')}",
+            f"corridor floor {q(lambda: guard.floor_bytes)}",
+        ]
+        # THE TWO DERIVED NUMBERS THAT ACTUALLY DECIDE IT. Absolutes make the
+        # reader do the arithmetic; the question "could this rank have paid"
+        # is driver_free minus what must stay free, and that is what a
+        # binding-rank diagnosis turns on.
+        try:
+            spendable = int(driver_free) - int(self._staging_reserve_bytes)
+            parts.append(f"=> SPENDABLE {spendable / mib:.0f}")
+        except Exception:  # noqa: BLE001
+            parts.append("=> SPENDABLE ?")
+        try:
+            parts.append(
+                f"headroom over corridor floor "
+                f"{(int(driver_free) - int(guard.floor_bytes)) / mib:.0f}"
+            )
+        except Exception:  # noqa: BLE001
+            parts.append("headroom over corridor floor ?")
+        return (
+            "STAGING BUDGET CENSUS (MiB) -- " + ", ".join(parts) + ". The "
+            "arena term is a SCHEDULED COMMIT for the tp_to_pp leg, not memory "
+            "held idle now and not reclaimable here: rung 3 releases the real "
+            "tail immediately after each refill, so at a pp_to_tp gate the "
+            "arena is already committed exactly to the active PP layout."
+        )
+
+    def _kv_rung_verdict(self) -> str:
+        """What the KV rung decided this round, for a REFUSAL message.
+
+        A refusal is not an edge, so the rung's edge-triggered trace is
+        typically silent at exactly the moment a reader needs it -- and a
+        silent decline is indistinguishable from a rung that was never
+        reached. Those have completely different fixes, and on 2026-08-15 the
+        difference cost a wrong diagnosis: the seam was refused by 59 MiB, the
+        rung had logged nothing for five minutes, and that was read as a
+        missing call when the rung had in fact been consulted every gate and
+        declined quietly.
+
+        Never raises and never blocks the refusal it is decorating: an
+        instrument that can break the message it rides on is worse than no
+        instrument.
+        """
+        try:
+            from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+            scheduler = getattr(self, "_census_scheduler", None)
+            relief = (
+                getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+            )
+            if relief is None:
+                return "No KV rung is installed on this rank."
+            return relief.last_proposal_summary()
+        except Exception as e:  # noqa: BLE001 - decoration must not raise
+            return f"(the KV rung's verdict could not be read: {e})"
 
     def _corridor_gate(
         self,
@@ -4696,13 +5551,27 @@ class PhaseFlipRuntime:
             # with ``available_size() == 0``. The margin's shortfall has a
             # graded answer (delay, then yield) and the staging's does not, so
             # the margin is the half that may be bounded and the staging is not.
+            # #688: AN IDLE-LOCKED FLIP HAS NO MARGIN TO PROTECT. The C20
+            # entry margin is discretionary because the rung pays for it out
+            # of ADMISSION CAPACITY, and an unbounded ask once drove the rung
+            # to its floor 42 times. But this flip was armed precisely because
+            # nothing can be ADMITTED in this layout, so the capacity that
+            # bound protects cannot be spent by anyone -- and leaving the
+            # margin unfunded is exactly what leaves the seam short
+            # (09:43:11Z: 1706 MiB needed, 1635 spendable, 71 MiB short).
+            # Mandatory in that one state, discretionary everywhere else.
+            discretionary_margin = (
+                0
+                if bool(getattr(self, "armed_idle_locked", False))
+                else int(margin_bytes)
+            )
             kv_freed = collective_kv_backing_relief(
                 scheduler,
                 self._collective_min,
                 want_bytes=int(ask_bytes),
                 guard=guard,
                 direction=direction,
-                discretionary_bytes=int(margin_bytes),
+                discretionary_bytes=int(discretionary_margin),
                 # #656 C22-d rides here too. See _agree_live_slots.
                 slots_digest=int(slots_digest),
                 max_live_row=int(max_live_row),
@@ -4748,6 +5617,45 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
                 kv_freed / (1024 * 1024),
                 direction,
+            )
+        else:
+            # A RUNG THAT RETURNS NOTHING MUST STILL SAY SO.
+            #
+            # This branch used to be absent, and the silence cost a whole
+            # morning of misdiagnosis on 2026-08-16. At 06:47:48 the seam was
+            # refused 76 times with no relief line anywhere in the log, so
+            # "the rung returned 0" and "the rung never ran" looked identical
+            # -- and the guard's own "reclaimed 0 MiB from [nothing]" was then
+            # read as the rung being exhausted. It never said that: that
+            # string is the GUARD LADDER's provider list, which contains only
+            # allocator-cache and draft-weights. No KV provider is registered
+            # with the guard at all, by design (the cap is a group decision
+            # and the ladder is rank-local), so the rung's bytes arrive as
+            # `kv_freed` BEFORE the probe and can never appear in that list.
+            #
+            # Logged at the same level as the success so a seam's funding
+            # story is one grep, and carrying the rung's own view of why it
+            # could not pay -- the three causes are not interchangeable:
+            # the floor is a healthy limit, an empty evictable set means the
+            # pool is genuinely live, and a disqualified rung is a defect.
+            from sglang.srt.managers.phase_flip_spill import (
+                KV_BACKING_RELIEF_ATTR as _RUNG_ATTR,
+            )
+
+            rung = getattr(scheduler, _RUNG_ATTR, None) if scheduler else None
+            logger.info(
+                "%s KV backing relief returned NOTHING before the gate (%s): "
+                "rung=%s, evicted %s rows over %s shrinks so far. This is not "
+                "the guard's '[nothing]' -- no KV provider is registered with "
+                "the guard, so the rung never appears in its provider list. "
+                "Check in order: the admission floor (healthy), an empty "
+                "evictable set (the pool is genuinely live), a disqualified "
+                "rung (a defect).",
+                LOG_PREFIX,
+                direction,
+                "absent" if rung is None else "present",
+                getattr(rung, "evicted_rows_total", "?"),
+                getattr(rung, "evict_count", "?"),
             )
         if guard is None:
             return ""
@@ -4853,8 +5761,27 @@ class PhaseFlipRuntime:
         law_want = max(int(staging_bytes), measured_draw)
         predicted_trough = int(verdict.free_after) - law_want
         draw_short = measured_draw > 0 and predicted_trough < law_floor
+        # #662: THE SEAM TRANSIENT IS JUDGED AGAINST THE BAND FLOOR, second
+        # site of the same rule as the staging reserve (5658c9683f).
+        #
+        # The corridor is 1024 MiB +-20 % and its verdict is the continuous
+        # minimum against the FLOOR, so a cutover that dips to 819 for the
+        # length of a wave walk is lawful. Comparing against the CENTRE here
+        # delayed flips the law permits: measured 2026-08-15, want 2251 MiB
+        # against free 3206 leaves 955 -- which is 69 MiB under the centre and
+        # 136 MiB CLEAR of the floor -- and 21,480 tokens waited ~35 s for a
+        # flip that was legal the whole time.
+        #
+        # AND THE MARGIN WAS NEVER IN THIS COMPARISON. ``margin_bytes`` is an
+        # enable flag here, nothing more, yet the delay message named it -- so
+        # the log said "the 512 MiB C20 entry margin is not met" about an
+        # arithmetic in which 512 appears nowhere. That is why this read as a
+        # double-counted arming floor from outside; the arming floor is not in
+        # it either. The message below now names the number that actually
+        # bound.
+        seam_floor = _seam_transient_floor_bytes(law_floor)
         law_ok = margin_bytes > 0 and (
-            int(verdict.free_after) - int(staging_bytes) >= law_floor
+            int(verdict.free_after) - int(staging_bytes) >= seam_floor
         )
         # WHY THE MEASURED DRAW DOES NOT MOVE ``law_ok``, WHICH IS THE
         # OBVIOUS THING TO DO AND IS WRONG HERE.
@@ -4914,8 +5841,10 @@ class PhaseFlipRuntime:
             if spent < budget:
                 self.seam_margin_delays += 1
                 logger.warning(
-                    "%s seam entry DELAYED (%s): the corridor law is met but "
-                    "the %d MiB C20 entry margin is not (%s). The deepest "
+                    "%s seam entry DELAYED (%s): staging would leave less than "
+                    "the %d MiB seam floor (the corridor band's lower edge, "
+                    "which is what a cutover transient is judged against) "
+                    "(%s). The deepest "
                     "troughs of this corpus are made INSIDE a cutover and the "
                     "level recovers between them -- consecutive abandoned "
                     "attempts %d of a budget of %d, after which the law "
@@ -4958,31 +5887,40 @@ class PhaseFlipRuntime:
             # once decode drains in the degraded layout the memory comes back
             # and the very next round enters with room.
             if draw_short:
-                self.seam_yields_withheld = getattr(self, "seam_yields_withheld", 0) + 1
+                # USER DECISION 2026-08-16: WARN, DO NOT WITHHOLD.
+                #
+                # This branch used to return a margin-delay tag, which is
+                # EXEMPT from the stand-down cap by design -- so when the
+                # condition did not clear, nothing bounded it. Measured at
+                # 07:02:15: PP1 withheld on a predicted 864 MiB trough while
+                # PP2 yielded, the ranks disagreed, "consecutive delayed
+                # attempts" climbed 15/16/17 with no exit, and the instance
+                # sat at bs 0, GPU 0%, with 794179 tok pending.
+                #
+                # Its safety argument was also self-defeating: it justified
+                # waiting by pointing at the purity valve, but the valve opens
+                # on the stand-down cap that this very tag is exempt from.
+                #
+                # The law is a fill-quality target, not a gate. A predicted
+                # dip is now SAID and stepped over. The prediction keeps its
+                # job -- it sizes the warning, and it is what the pre-flip
+                # spill rung aims at -- it just no longer stops the machine.
+                self.seam_law_warned = getattr(self, "seam_law_warned", 0) + 1
                 logger.warning(
-                    "%s seam entry margin YIELD WITHHELD (%s): the budget of "
-                    "%d attempts is spent, but this rank's own worst MEASURED "
-                    "draw of %d MiB against %d MiB free predicts a %d MiB "
-                    "trough, below the %d MiB corridor law. Entering on the "
-                    "law alone is what made every breach in this corpus, so "
-                    "the seam waits instead. This objection is a DELAY, not "
-                    "an abandon: it does not spend the stand-down cap, and "
-                    "the purity valve lets the starved work class run in the "
-                    "current layout meanwhile, so the instance keeps serving "
-                    "while the memory comes back.",
+                    "%s CANNOT FULLY HOLD THE CORRIDOR FLOOR through this "
+                    "seam entry (%s): predicted trough %d MiB below the %d "
+                    "MiB law -- this rank's worst MEASURED draw of %d MiB "
+                    "against %d MiB free. PROCEEDING ANYWAY: the law is a "
+                    "fill-quality target and only OOM is hard (user decision "
+                    "2026-08-16). The seam is no longer delayed on a margin "
+                    "prediction; an idle instance was never the cheaper side "
+                    "of this trade.",
                     LOG_PREFIX,
                     direction,
-                    budget,
-                    measured_draw // (1024 * 1024),
-                    int(verdict.free_after) // (1024 * 1024),
                     predicted_trough // (1024 * 1024),
                     law_floor // (1024 * 1024),
-                )
-                return (
-                    f"{SEAM_MARGIN_DELAY_TAG}: measured draw "
-                    f"{measured_draw // (1024 * 1024)} MiB predicts a "
-                    f"{predicted_trough // (1024 * 1024)} MiB trough under "
-                    f"the {law_floor // (1024 * 1024)} MiB law ({direction})"
+                    measured_draw // (1024 * 1024),
+                    int(verdict.free_after) // (1024 * 1024),
                 )
             self.seam_margin_yields += 1
             logger.warning(
@@ -5035,6 +5973,36 @@ class PhaseFlipRuntime:
         else:
             self._corridor_pp_refusals = 0
         return f"corridor gate refused the seam staging: {verdict.detail}"
+
+    def _seam_funding_verdict(self, staging_bytes: int, direction: str, **kw) -> str:
+        """The gate's verdict, with #662-F4's per-direction injection on top.
+
+        WHY THIS WRAPS THE GATE INSTEAD OF LIVING INSIDE IT. Everything
+        ``_corridor_gate`` runs -- the KV rung's reduction, the guard's
+        ladder, the C20 margin -- sits on a path every rank reaches
+        unconditionally, which is the entire argument
+        ``collective_kv_backing_relief`` makes for living where it lives. An
+        injection that short-circuited the gate would skip a reduction the
+        peers had already entered, the first time one rank read the variable
+        differently, and this file's standing rule is that "safe because a
+        value upstream is agreed" is precisely the reasoning that produces
+        collective hangs. So the gate always runs in full, and only its
+        VERDICT is overridden. The cost is one ladder that spent for nothing;
+        what it buys is that no rank can skip a collective.
+
+        The result joins ``too_small`` like any other objection, so the
+        abandon it produces is the real one: the same unanimous MIN, the same
+        FLIP ABANDONED log, the same per-direction hold and backoff. What the
+        gate itself decided is kept in the message, because a proof that hides
+        the state it overrode is not evidence.
+        """
+        from sglang.srt.managers.phase_flip_spill import seam_unfundable_objection
+
+        detail = self._corridor_gate(staging_bytes, direction, **kw)
+        injected = seam_unfundable_objection(direction)
+        if not injected:
+            return detail
+        return f"{injected} [the gate itself said: {detail or 'the seam was fundable'}]"
 
     # -- the move -------------------------------------------------------------
     def _pack_outgoing(
@@ -5280,6 +6248,36 @@ class PhaseFlipRuntime:
         # The aggregate cost was measured from outside the process; which
         # STAGE spends it was not, and the candidates have different fixes.
         seam_census.begin(direction, self._rank)
+        # #703: push warm prefixes to the geometry-neutral store BEFORE
+        # anything moves. Ordering is the whole content of the hook: the radix
+        # cache is bound to the pool that BUILT it (the boot PP stack's), so
+        # this is the last moment at which reading that pool reads live bytes.
+        # After the cutover the same copy would read a pool the model is no
+        # longer writing into.
+        #
+        # NEVER RAISES INTO THE FLIP. The configuration errors this hook cares
+        # about -- no storage tier, or a store without the #706 canonical
+        # format -- are refused at PARSE time by ServerArgs, where refusing is
+        # free. Here, with requests already parked, a raise climbs into the
+        # event loop and takes down an instance that was serving fine in its
+        # current phase, which is the lesson the bounds check below learned the
+        # expensive way. A prefix that misses the store costs a later cache
+        # miss; that is the cheaper failure, and it is logged, not thrown.
+        try:
+            from sglang.srt.mem_cache.hicache_flip_writeback import (
+                maybe_flip_writeback,
+            )
+
+            if maybe_flip_writeback(getattr(self, "_census_scheduler", None)):
+                seam_census.mark("flip_writeback")
+        except Exception as e:
+            logger.error(
+                "%s #703 flip-time writeback did not run (%s); the flip "
+                "continues and prefixes written in this phase will miss in "
+                "the next one.",
+                LOG_PREFIX,
+                e,
+            )
         slots = self._live_slots_fn()
         slots = torch.unique(slots.detach().to("cpu", torch.int64))
         tr: PhaseFlipTransition = build_phase_flip_transition(
@@ -5340,7 +6338,7 @@ class PhaseFlipRuntime:
         # _agree_live_slots for the trigger this closes and why the count
         # agreement above it was not enough.
         slot_ballot: dict = {}
-        corridor_detail = self._corridor_gate(
+        corridor_detail = self._seam_funding_verdict(
             staging_bytes,
             direction,
             slots_digest=self._slots_membership_digest(slots),
@@ -5376,7 +6374,9 @@ class PhaseFlipRuntime:
             too_small.append(slot_detail)
         if corridor_detail:
             too_small.append(corridor_detail)
-        affordable, staging_detail = self._staging_affordable(staging_bytes)
+        affordable, staging_detail = self._staging_affordable(
+            staging_bytes, direction
+        )
         if not affordable:
             too_small.append(staging_detail)
 
@@ -5532,6 +6532,19 @@ class PhaseFlipRuntime:
                     "; ".join(too_small) if too_small else "fits (a peer did not)",
                     self._phase,
                 )
+                # #689: NAME THE OCCUPANT, not just the shortfall. Which rank
+                # binds is already in the line above; what is holding that
+                # rank's budget was not, and without it the remedy is a guess.
+                try:
+                    logger.error(
+                        "%s %s",
+                        LOG_PREFIX,
+                        self.staging_budget_census(
+                            int(getattr(self, "_last_staging_bytes", 0) or 0)
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - never break the refusal path
+                    pass
             # #485: BOUND THE RETRY, AND END IT IF IT CANNOT WIN.
             #
             # Only real abandons are bounded. A margin DELAY is a by-design
@@ -5854,6 +6867,20 @@ class PhaseFlipRuntime:
         # destination allocator", and those have opposite fixes. Straddling
         # the cutover answers it directly: if the unaccounted page is
         # already there BEFORE, the enumeration is innocent.
+        # #690: TIME THE TAIL, because it is most of the flip and nothing
+        # measured it. read/exchange/write cover the wave loop only -- the
+        # backing swap included, since t_write0 is taken before it -- so
+        # everything below fell into the residual. Measured over 291
+        # same-regime DONE lines that residual is 2.0-2.1 s and FLAT across a
+        # 3600x range of live slots (123 -> 440095), i.e. 81 % of a
+        # low-occupancy flip. A term that large cannot stay a subtraction:
+        # #677 prices windows against it and #692 prices depth against it.
+        #
+        # Split into movers vs cutover because they have different fixes. The
+        # movers are occupancy-INDEPENDENT by construction (the weights arena
+        # refill is the same bytes whatever the KV live set is), which is the
+        # leading explanation for the flatness; the cutover is the group step.
+        t_movers0 = self._clock()
         self._pool_census("pre-cutover", direction)
         for fn in self._pre_cutover_fns:
             fn(direction)
@@ -5861,9 +6888,12 @@ class PhaseFlipRuntime:
             # have different sizes AND different fixes, so one combined
             # "pre_cutover" bar would be unattributable.
             seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
+        movers_ms = (self._clock() - t_movers0) * 1000.0
+        t_cutover0 = self._clock()
         self._cutover_fn(direction)
         seam_census.mark("cutover")
         self._pool_census("post-cutover", direction)
+        cutover_ms = (self._clock() - t_cutover0) * 1000.0
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
         self._armed_at = None
@@ -5885,6 +6915,10 @@ class PhaseFlipRuntime:
             "read_ms": read_ms,
             "exchange_ms": xfer_ms,
             "write_ms": write_ms,
+            # #690: the tail, so the fixed cost is a MEASUREMENT and not a
+            # residual anyone has to regress for.
+            "movers_ms": movers_ms,
+            "cutover_ms": cutover_ms,
             "total_ms": total_ms,
         }
         self.last_stats = stats
@@ -5892,7 +6926,8 @@ class PhaseFlipRuntime:
             "%s DONE %s (epoch %d) in %.1f ms over %d seam wave(s): %d live "
             "slots, sent %d cells / %.2f MiB, received %d cells / %.2f MiB, "
             "local %.2f MiB, staging reserved %.2f MiB (read %.1f ms, "
-            "exchange %.1f ms, write %.1f ms)",
+            "exchange %.1f ms, write %.1f ms, movers %.1f ms, "
+            "cutover %.1f ms)",
             LOG_PREFIX,
             direction,
             self._epoch,
@@ -5908,6 +6943,8 @@ class PhaseFlipRuntime:
             read_ms,
             xfer_ms,
             write_ms,
+            movers_ms,
+            cutover_ms,
         )
         census = seam_census.end()
         if census is not None:

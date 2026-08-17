@@ -76,9 +76,7 @@ class _Card:
 
 
 def _guard(card, floor=1024, delta=256):
-    return cg.CorridorGuard(
-        0, floor_mib=floor, delta_mib=delta, probe=card.probe
-    )
+    return cg.CorridorGuard(0, floor_mib=floor, delta_mib=delta, probe=card.probe)
 
 
 class ChecksAgainstTheAllocationTest(unittest.TestCase):

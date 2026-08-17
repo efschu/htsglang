@@ -339,9 +339,7 @@ def _run_ranks_probing(runtimes, directions, probe_rank, probe, rounds=8):
 def _plan_legs(live, rank, direction, src, dst, layer_map=MAP_625):
     """Bytes each leg of the move owes, straight from the plan."""
     slots = torch.unique(live.detach().to("cpu", torch.int64))
-    tr = build_phase_flip_transition(
-        slots, layer_map, N_LAYERS, VEC, rank, direction
-    )
+    tr = build_phase_flip_transition(slots, layer_map, N_LAYERS, VEC, rank, direction)
 
     def _src_idx(f):
         return layer_map[rank].index(f) if direction == PP_TO_TP else f
@@ -379,9 +377,7 @@ class TestMoverLiveSetIsBounded(CustomTestCase):
         if direction == TP_TO_PP:
             # Reach the TP phase honestly first, unprobed.
             quiet = LiveStorageProbe(exclude=persistent)
-            errs = _run_ranks_probing(
-                runtimes, [PP_TO_TP] * 3, probe_rank, quiet
-            )
+            errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, probe_rank, quiet)
             self.assertEqual([e for e in errs if e], [])
         src = pp_views[probe_rank] if direction == PP_TO_TP else tp_views[probe_rank]
         dst = tp_views[probe_rank] if direction == PP_TO_TP else pp_views[probe_rank]
@@ -391,7 +387,9 @@ class TestMoverLiveSetIsBounded(CustomTestCase):
         probe = LiveStorageProbe(exclude=persistent)
         errs = _run_ranks_probing(runtimes, [direction] * 3, probe_rank, probe)
         self.assertEqual([e for e in errs if e], [])
-        self.assertEqual(runtimes[probe_rank].completed, 1 if direction == PP_TO_TP else 2)
+        self.assertEqual(
+            runtimes[probe_rank].completed, 1 if direction == PP_TO_TP else 2
+        )
         return probe.peak, outgoing, incoming, local, probe.peak_breakdown
 
     def _assert_bounded(self, direction):
@@ -622,9 +620,7 @@ class TestWireFormatUnchanged(CustomTestCase):
 
         for peer in tr.send_layers:
             parts = [
-                src.read_rows(
-                    MAP_625[0].index(f), tr.send_rows[peer]
-                ).reshape(-1)
+                src.read_rows(MAP_625[0].index(f), tr.send_rows[peer]).reshape(-1)
                 for f in tr.send_layers[peer]
             ]
             flat = torch.cat(parts)

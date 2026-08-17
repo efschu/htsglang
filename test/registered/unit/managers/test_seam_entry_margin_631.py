@@ -76,7 +76,10 @@ import unittest
 
 from sglang.srt.managers import phase_flip_spill
 from sglang.srt.managers.corridor_guard import GuardResult
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from sglang.srt.managers.phase_flip_runtime import (
+    SEAM_MARGIN_DELAY_TAG,
+    PhaseFlipRuntime,
+)
 
 MIB = 1024 * 1024
 STAGING = 300 * MIB
@@ -419,10 +422,26 @@ class TestTheBudgetPreventsAWedge(unittest.TestCase):
 class TestNoPathProceedsIntoABreach(unittest.TestCase):
     """THE FALSIFIER. Everything above is optimisation; this is the law."""
 
-    def test_a_seam_below_the_law_is_refused_even_with_the_budget_spent(self):
+    def test_a_seam_below_the_BAND_FLOOR_is_refused_even_with_the_budget_spent(self):
+        """#678: RE-AIMED AT THE BAND FLOOR, because that is where breach is.
+
+        This fixture used ``capacity = STAGING - 1`` and called it "cannot even
+        fund the staging: the LAW would be broken". Under 2e00987d27 that is no
+        longer a breach: a cutover transient is judged against the band's lower
+        edge (819 MiB here), and that fixture leaves 1023 MiB free -- below the
+        1024 MiB centre but comfortably INSIDE the band, so entering is lawful
+        and a DELAY is the correct class for it.
+
+        The property the test exists for is untouched and is what is asserted
+        now: a seam that would take the card below the BAND FLOOR is refused,
+        never delayed and never yielded through, however spent the budget is.
+        The margin-delay tag is exempt from the abandon cap, so mis-classifying
+        a real breach as a delay would launder it past that cap -- which is
+        exactly what this file must make impossible.
+        """
         with _Margin(margin_mib=512, budget=1):
-            # Cannot even fund the staging: the LAW would be broken.
-            g = _Guard(capacity_bytes=STAGING - 1)
+            # 724 MiB would remain: below the 819 MiB band floor. A breach.
+            g = _Guard(capacity_bytes=STAGING - 300 * MIB)
             r = _runtime()
             verdicts = []
             with _Patched(g):
@@ -473,11 +492,15 @@ class TestNoPathProceedsIntoABreach(unittest.TestCase):
         self.assertIn("refused", detail)
         self.assertEqual(r.seam_margin_delays, 0)
 
-    def test_a_law_refusal_is_reported_as_a_refusal_not_as_a_delay(self):
-        """The two are different events and the extract must not merge them."""
+    def test_a_BREACH_refusal_is_reported_as_a_refusal_not_as_a_delay(self):
+        """The two are different events and the extract must not merge them.
+
+        #678: aimed at the band floor for the reason above. A delay is exempt
+        from the abandon cap; a breach may never wear that tag.
+        """
         with _Margin(margin_mib=512, budget=4):
             r = _runtime()
-            with _Patched(_Guard(STAGING - 1)):
+            with _Patched(_Guard(STAGING - 300 * MIB)):
                 detail = r._corridor_gate(STAGING, "pp_to_tp")
         self.assertIn("refused", detail)
         self.assertEqual(r.seam_margin_delays, 0)
@@ -488,9 +511,7 @@ class TestNoPathProceedsIntoABreach(unittest.TestCase):
         old = phase_flip_spill.get_corridor_guard
         old_kv = phase_flip_spill.collective_kv_backing_relief
         phase_flip_spill.get_corridor_guard = lambda _s: None
-        phase_flip_spill.collective_kv_backing_relief = (
-            lambda *a, **k: 0
-        )  # noqa: ARG005
+        phase_flip_spill.collective_kv_backing_relief = lambda *a, **k: 0  # noqa: ARG005
         try:
             with _Margin(margin_mib=512, budget=2):
                 r = _runtime()
@@ -515,8 +536,16 @@ class TestTheDecisionIsGroupUniform(unittest.TestCase):
         self.assertNotIn(
             "all_reduce", src, "the seam-entry margin must add no collective"
         )
+        # #662-F4's injection wraps the gate, so it is held to the same rule:
+        # it may override the verdict, it may not add a reduction.
+        wrapper_src = inspect.getsource(PhaseFlipRuntime._seam_funding_verdict)
+        self.assertNotIn(
+            "all_reduce",
+            wrapper_src,
+            "the unfundable injection must add no collective",
+        )
         exec_src = inspect.getsource(PhaseFlipRuntime._execute)
-        gate_at = exec_src.index("_corridor_gate")
+        gate_at = exec_src.index("_seam_funding_verdict")
         # The payload is BUILT from ``fits`` and then reduced -- #656 R2 added
         # the frame parts to it, so the literal call no longer carries the
         # list inline. The property under test is unchanged and is asserted
@@ -568,3 +597,60 @@ class TestTheDecisionIsGroupUniform(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheDelayExemptionMayNotLaunderABreachTest(unittest.TestCase):
+    """#678: the boundary, pinned from BOTH sides.
+
+    The margin-delay tag is deliberately exempt from the seam abandon cap --
+    that exemption is what keeps a transient shortfall a delay rather than a
+    permanent stand-down. It is also the one thing that could carry a real
+    breach past the cap, so the classification boundary is the load-bearing
+    part of this file and neither side of it is left to inference.
+
+    The boundary is the BAND FLOOR, not the corridor centre: the law's verdict
+    is the continuous minimum against the band's lower edge, so a dip that
+    lasts one wave walk is lawful down to it (2e00987d27).
+    """
+
+    def _verdict_at(self, remaining_mib):
+        """One gate decision that would leave ``remaining_mib`` free."""
+        r = _runtime()
+        # free_after = capacity + LAW, and the gate compares
+        # free_after - staging against the band floor.
+        capacity = STAGING + remaining_mib * MIB - LAW
+        with _Margin(margin_mib=512, budget=4):
+            with _Patched(_Guard(capacity_bytes=capacity)):
+                return r, r._corridor_gate(STAGING, "pp_to_tp")
+
+    def test_just_INSIDE_the_band_is_a_delay(self):
+        r, detail = self._verdict_at(900)  # above the 819 MiB floor
+        self.assertIn(SEAM_MARGIN_DELAY_TAG, detail)
+        self.assertEqual(r.corridor_aborts, 0)
+
+    def test_just_BELOW_the_band_floor_is_a_refusal(self):
+        r, detail = self._verdict_at(700)  # below the 819 MiB floor
+        self.assertNotIn(
+            SEAM_MARGIN_DELAY_TAG,
+            detail,
+            "a breach wearing the delay tag would be exempt from the abandon "
+            "cap -- the one way a refusal can be laundered past it",
+        )
+        self.assertIn("refused", detail)
+        self.assertEqual(r.seam_margin_delays, 0)
+        self.assertEqual(r.corridor_aborts, 1)
+
+    def test_a_breach_is_never_yielded_through_however_spent_the_budget(self):
+        for spent in range(6):
+            r = _runtime()
+            capacity = STAGING + 700 * MIB - LAW
+            with _Margin(margin_mib=512, budget=1):
+                with _Patched(_Guard(capacity_bytes=capacity)):
+                    for _ in range(spent + 1):
+                        detail = r._corridor_gate(STAGING, "pp_to_tp")
+                        _abandon(r, "pp_to_tp")
+            with self.subTest(spent=spent):
+                self.assertIn("refused", detail)
+                self.assertEqual(
+                    r.seam_margin_yields, 0, "a yield here enters a breach"
+                )

@@ -298,9 +298,7 @@ _TOKENS = [11, 12, 13, 14]
 class TestRuntimeExport(CustomTestCase):
     def test_happy_path_export_commit(self):
         rt = _runtime(_FakeTree(_TOKENS))
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertTrue(out.success, out.message)
         manifest = json.loads(out.manifest_json)
         self.assertEqual(manifest["kv_keys"], [f"h{t}" for t in _TOKENS])
@@ -315,9 +313,7 @@ class TestRuntimeExport(CustomTestCase):
         # RESUME: commit releases the park; abort afterwards is refused.
         hid = manifest["handover_id"]
         self.assertTrue(
-            rt.handle(
-                SessionHandoverReqInput(action="commit", handover_id=hid)
-            ).success
+            rt.handle(SessionHandoverReqInput(action="commit", handover_id=hid)).success
         )
         self.assertIsNone(rt.parked_conflict(_TOKENS))
         out = rt.handle(SessionHandoverReqInput(action="abort", handover_id=hid))
@@ -326,14 +322,10 @@ class TestRuntimeExport(CustomTestCase):
 
     def test_abort_rolls_back(self):
         rt = _runtime(_FakeTree(_TOKENS))
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         hid = json.loads(out.manifest_json)["handover_id"]
         self.assertTrue(
-            rt.handle(
-                SessionHandoverReqInput(action="abort", handover_id=hid)
-            ).success
+            rt.handle(SessionHandoverReqInput(action="abort", handover_id=hid)).success
         )
         self.assertIsNone(rt.parked_conflict(_TOKENS))
 
@@ -341,18 +333,14 @@ class TestRuntimeExport(CustomTestCase):
         # THE runtime-level #212 falsifier: hybrid tree whose mamba blob
         # never reaches the store. Export must fail loudly AND roll back.
         rt = _runtime(_FakeTree(_TOKENS, withhold_mamba=True))
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertFalse(out.success)
         self.assertIn("#212", out.message)
         self.assertIsNone(rt.parked_conflict(_TOKENS))  # rollback happened
 
     def test_non_hybrid_export_passes_without_mamba(self):
         rt = _runtime(_FakeTree(_TOKENS, hybrid=False))
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertTrue(out.success, out.message)
         manifest = json.loads(out.manifest_json)
         self.assertIsNone(manifest["mamba_key"])
@@ -365,9 +353,7 @@ class TestRuntimeExport(CustomTestCase):
             rid="r-1", origin_input_ids=list(_TOKENS), output_ids=[42]
         )
         rt.scheduler.running_batch.reqs.append(req)
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertFalse(out.success)
         self.assertIn("in-flight", out.message)
         self.assertIsNone(rt.parked_conflict(_TOKENS))  # nothing left parked
@@ -381,18 +367,14 @@ class TestRuntimeExport(CustomTestCase):
             best_match_node=tree.leaf,
         )
         rt = _runtime(tree)
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertFalse(out.success)
         self.assertIn("resident", out.message)
 
     def test_tp_gt_1_source_refused(self):
         rt = _runtime(_FakeTree(_TOKENS))
         rt.scheduler.server_args.tp_size = 2
-        out = rt.handle(
-            SessionHandoverReqInput(action="export", token_ids=_TOKENS)
-        )
+        out = rt.handle(SessionHandoverReqInput(action="export", token_ids=_TOKENS))
         self.assertFalse(out.success)
         self.assertIn("TP=1", out.message)
 

@@ -446,9 +446,50 @@ def uneven_dcp_owner_bounds() -> Optional[tuple]:
     return prefix[-1], lo, hi
 
 
+def _shards_missing_against_index(model_path: str, present: set) -> tuple:
+    """``(missing_shard_names, declared_total_bytes)`` from the safetensors index.
+
+    ``([], 0)`` when there is no index to check against -- a single-file
+    checkpoint has no manifest and therefore cannot be short of one.
+    """
+    import json
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return [], 0
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+    except Exception:
+        return [], 0
+    named = set((index.get("weight_map") or {}).values())
+    if not named:
+        return [], 0
+    declared = int((index.get("metadata") or {}).get("total_size") or 0)
+    return sorted(named - present), declared
+
+
 def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     """Total on-disk checkpoint size (MiB), 0 if unknown. Deterministic in
-    every process so the derived token vector is identical everywhere."""
+    every process so the derived token vector is identical everywhere.
+
+    Summing whatever ``*.safetensors`` happen to be present is only the size
+    of the checkpoint when those files ARE the checkpoint. A directory that is
+    still downloading answers this question with a smaller model, confidently
+    and without complaint, and the planner anchors every quantized family's
+    bytes/param on the answer.
+
+    Measured 2026-08-14: planning Qwen3.8-27B-INT8 with 4 of 18 shards on disk
+    reported it as SMALLER than the Qwen3.6 checkpoint it replaces, when the
+    complete checkpoint is 4.76 GiB LARGER. Nothing was wrong with any single
+    step; the input was simply never checked.
+
+    So the index -- the checkpoint's own statement of what it consists of --
+    gates the measurement. Complete: measure, as before. Incomplete: say so
+    loudly, and fall back to the declared total, or to 0 ("unknown", which
+    callers already treat as "use the config-derived estimate") when the index
+    declares no total. Never a partial sum presented as a whole.
+    """
     import glob
 
     if not model_path:
@@ -457,13 +498,36 @@ def _checkpoint_size_mib(model_path: Optional[str]) -> int:
         return os.path.getsize(model_path) // 2**20
     if not os.path.isdir(model_path):
         return 0
-    total = sum(
-        os.path.getsize(f) for f in glob.glob(os.path.join(model_path, "*.safetensors"))
-    )
+    shards = glob.glob(os.path.join(model_path, "*.safetensors"))
+    total = sum(os.path.getsize(f) for f in shards)
     if total == 0:
         total = sum(
             os.path.getsize(f) for f in glob.glob(os.path.join(model_path, "*.gguf"))
         )
+        return total // 2**20
+
+    missing, declared = _shards_missing_against_index(
+        model_path, {os.path.basename(f) for f in shards}
+    )
+    if missing:
+        logger.warning(
+            "Checkpoint at %s is INCOMPLETE: %d of the %d shards named by "
+            "model.safetensors.index.json are absent (%s%s). The %d MiB "
+            "actually on disk is NOT this model's size; using the index's "
+            "declared total (%d MiB) instead%s. Any plan or token vector "
+            "derived from a partial checkpoint describes a model that does "
+            "not exist.",
+            model_path,
+            len(missing),
+            len(missing) + len(shards),
+            ", ".join(missing[:5]),
+            ", ..." if len(missing) > 5 else "",
+            total // 2**20,
+            declared // 2**20,
+            "" if declared else " (index declares none -> reporting 0/unknown)",
+        )
+        return declared // 2**20
+
     return total // 2**20
 
 

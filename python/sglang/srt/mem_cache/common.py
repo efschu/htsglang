@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import numpy as np
 import torch
@@ -396,13 +397,80 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     return extra
 
 
+def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
+    """One clause naming the promise-versus-delivery gap, or ''.
+
+    #681. The allocation error used to report ``available + evictable`` and
+    nothing else, so an operator read "66039 tokens available" beside "failed
+    to allocate 512" and had no way to see that the eviction in between had
+    under-delivered. Naming it here is the difference between a confusing
+    message and a diagnosis.
+    """
+    if evicted >= asked:
+        return ""
+    #: `evictable_size()` RAISES NotImplementedError on MambaRadixCache and
+    #: SWARadixCache -- both split the count in two and say so -- and that is
+    #: the class this note was written for, so the original single call
+    #: reported -1 on exactly the boot it was meant to explain. Ask for the
+    #: full-attention count first and fall back only for the flat classes.
+    evictable = -1
+    for name in ("full_evictable_size", "evictable_size"):
+        getter = getattr(tree_cache, name, None)
+        if getter is None:
+            continue
+        try:
+            evictable = int(getter())
+            break
+        except Exception:  # noqa: BLE001 - a diagnostic must not raise
+            continue
+    return (
+        f"\nEVICTION UNDER-DELIVERED: asked for {asked} tokens, freed "
+        f"{evicted}. The tree still reports {evictable} evictable tokens. "
+        f"THIS LINE SHOULD BE UNREACHABLE: since #681 the frontier can pay "
+        f"every unlocked leaf it selects (mamba tombstone leaves included), so "
+        f"the count and the actuator's capability agree. If you are reading "
+        f"it, treat it as a REGRESSION SIGNAL -- a new class of node is being "
+        f"counted that the peel cannot consume -- not as the expected shape of "
+        f"an out-of-memory."
+    )
+
+
+def _flush_deferred_frees(allocator) -> int:
+    """Apply frees the allocator has staged in an open batching group.
+
+    #681 third root. Returns tokens applied, 0 when there is nothing staged or
+    the allocator has no group protocol.
+
+    A CAPABILITY PROBE, NOT A DEFENSIVE DEFAULT. ``flush_free_group`` is
+    defined on ``BaseTokenToKVPoolAllocator``, so every allocator in the tree
+    has it; the check is here because this module is also driven by test
+    stand-ins and by allocators that stub the group protocol out entirely
+    (``allocator/hisparse.py`` makes begin/end no-ops). A missing method means
+    "this allocator never stages", which is a real answer -- unlike a missing
+    MEASUREMENT, which is the case #606 says must never be defaulted.
+    """
+    flush = getattr(allocator, "flush_free_group", None)
+    if flush is None:
+        return 0
+    try:
+        return int(flush() or 0)
+    except Exception as exc:  # noqa: BLE001 - a relief step must not mask the OOM
+        logger.warning(
+            "#681: flushing the allocator's staged frees raised (%s); the "
+            "allocation continues to the relief ladder and, failing that, to "
+            "the original error.",
+            exc,
+        )
+        return 0
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evicted = evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
     if backup_state:
@@ -411,10 +479,77 @@ def alloc_token_slots(
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
+        # #679: ONE BOUNDED RELIEF, ONE RETRY, THEN THE ORIGINAL ERROR.
+        #
+        # Measured 2026-08-15 23:41:01: available 0, evictable 0, and this
+        # raise killed all three ranks at once -- "terminate called without an
+        # active exception" as the death rattle. The only relief attempted at
+        # this site is ``evict_from_tree_cache`` above, which with nothing
+        # evictable is a guaranteed no-op that returns no signal, so the raise
+        # was reached with no other path having been tried at all.
+        #
+        # THIS IS A NET, NOT THE GUARANTEE. The fix that prevents the state is
+        # on the admission side, where the decision can be group-uniform; by
+        # the time execution is here the group has already committed to a
+        # batch. Providers are therefore rank-local by contract -- see
+        # register_extend_relief_provider -- and a failure still raises, so
+        # fail-loud remains the last word rather than being softened into a
+        # silent stall.
+        # #681 THIRD ROOT, AND IT IS TRIED FIRST BECAUSE IT IS NOT RELIEF.
+        #
+        # The rungs below give something up -- host bandwidth, a victim's
+        # decode progress. This gives up nothing: it applies frees the tree has
+        # ALREADY performed and already counted, which are sitting in
+        # ``allocator.free_group`` because a batching window was open when the
+        # eviction ran (batch_result_processor.py:92 and :741 open one inside
+        # the event loop). Measured 2026-08-16 13:58:37 on all three ranks:
+        # eviction reported its full 512 tokens, ``available_size`` stayed at
+        # 392, and no under-delivery note printed -- because by the tree's
+        # books the eviction HAD delivered. The pages were payable the whole
+        # time; nothing had asked for them.
+        #
+        # Cold path only: this runs after an allocation has already failed, so
+        # a healthy alloc pays one list check less than nothing.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            if backup_state:
+                # The snapshot above predates the flush, so rolling back to it
+                # would drop the pages the flush just applied. No caller passes
+                # backup_state on this path today; re-taking it keeps that a
+                # fact about the callers rather than a dependency of this fix.
+                state = allocator.backup_state()
+            out_cache_loc = allocator.alloc(num_tokens)
+            logger.warning(
+                "extend allocation of %d tokens failed with %d tokens already "
+                "freed but still staged in the allocator's batching group; "
+                "applying them %s. This is #681's third root: an eviction "
+                "inside a free-group window counts tokens the pool cannot yet "
+                "hand out.",
+                num_tokens,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
+
+    if out_cache_loc is None:
+        freed = _attempt_extend_relief(num_tokens)
+        if freed > 0:
+            out_cache_loc = allocator.alloc(num_tokens)
+            logger.warning(
+                "extend allocation of %d tokens failed; rank-local relief "
+                "returned %d tokens and the retry %s. Admission should have "
+                "prevented this -- treat a recurring line here as an "
+                "admission defect, not as relief working.",
+                num_tokens,
+                freed,
+                "SUCCEEDED" if out_cache_loc is not None else "still failed",
+            )
+
+    if out_cache_loc is None:
         error_msg = (
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
+            f"{_eviction_shortfall_note(tree_cache, num_tokens, evicted)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
@@ -422,6 +557,194 @@ def alloc_token_slots(
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def fundable_extend_tokens(tree_cache) -> int:
+    """Tokens an extend allocation could actually get RIGHT NOW, group-uniform.
+
+    #679. The admission budget (``PrefillAdder.rem_total_tokens``) reads this
+    rank's own ``available_size() + evictable_size()``. Under uneven DCP those
+    differ per rank, so a BRANCH taken on them can split the group -- the
+    rank-local-test-before-a-collective family this tree keeps paying for. The
+    availability term therefore comes from ``uniform_avail_for_evict``, the
+    same group-published floor eviction already decides on, so every rank
+    reaches the same verdict on the same iteration.
+
+    Evictable is added because eviction is exactly what ``alloc_token_slots``
+    attempts before allocating: tokens the radix tree can give back are
+    genuinely fundable. What is NOT counted is anything a relief provider might
+    produce later -- that is a hope, and this number is used to decide whether
+    work may be admitted now.
+    """
+    if tree_cache is None:
+        return 0
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return 0
+    try:
+        avail = int(uniform_avail_for_evict(tree_cache, allocator))
+    except Exception:  # noqa: BLE001 - an admission gate must not raise
+        return 0
+    try:
+        evictable = int(tree_cache.evictable_size())
+    except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
+        evictable = 0
+    return max(0, avail) + max(0, evictable)
+
+
+def published_fundable_floor(tree_cache) -> Optional[int]:
+    """`fundable_extend_tokens`, but ONLY when a group floor was published.
+
+    #681. The chunked gate one function up may safely read a 0 from
+    `fundable_extend_tokens`: 0 means "park this chunk and retry next round",
+    a self-clearing state. The NEW-request gate uses the same number as a
+    BUDGET CEILING, and there a spurious 0 is not a park -- it admits nothing,
+    for every request, on every subsequent round. A read failure would wedge
+    the instance harder than the crash this ticket is about.
+
+    `fundable_extend_tokens` cannot distinguish "the pool really is empty"
+    from "the pool could not be read": every failure path returns 0. So the
+    ceiling is applied only when the scheduler actually PUBLISHED a group
+    floor -- i.e. the ranks' pools are uneven, which is the one state the
+    ceiling exists for. With no floor (single rank, or pools that agree) the
+    local budget is already the group's budget, the ceiling adds nothing, and
+    returning None keeps the reference boot byte-identical.
+    """
+    if tree_cache is None:
+        return None
+    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+        return None
+    return fundable_extend_tokens(tree_cache)
+
+
+#: #679 rung 1-3: may an admission spend RELIEF before it parks?
+#:
+#: OFF BY DEFAULT, and the default is the whole compatibility argument: with
+#: this unset the ladder returns 0 immediately and admission behaves exactly as
+#: c4b88e1923 did, which is the boot currently serving. The ladder changes how
+#: much the pool can fund; it never admits or refuses anything itself.
+ENV_ADMISSION_RELIEF_LADDER = "SGLANG_ADMISSION_RELIEF_LADDER"
+
+#: #679 rung 3 SEPARATELY, because it is the only rung that destroys progress.
+#: A victim loses its whole decode and re-prefills, so an operator may want
+#: rungs 1-2 (spill and throttle, which cost bandwidth and latency) without
+#: rung 3. Requires the ladder itself to be on.
+ENV_ADMISSION_RETRACTION = "SGLANG_ADMISSION_RELIEF_RETRACT"
+
+
+def admission_relief_ladder_enabled() -> bool:
+    return os.environ.get(ENV_ADMISSION_RELIEF_LADDER, "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def admission_retraction_enabled() -> bool:
+    """Rung 3 needs BOTH flags. A retraction rung reachable while the ladder
+    is off would be a second admission-side actuator nobody asked for."""
+    if not admission_relief_ladder_enabled():
+        return False
+    return os.environ.get(ENV_ADMISSION_RETRACTION, "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+def chunk_tokens_the_pool_can_fund(
+    fundable_tokens: int, page_size: int, rem_chunk_tokens: int
+) -> int:
+    """How many tokens a chunked prefill may schedule. ZERO means PARK.
+
+    #679, extracted as a pure function because the decision it makes is the one
+    that killed the instance and a decision worth a post-mortem is worth a
+    falsifier that does not need a scheduler to run.
+
+    Below one page nothing useful can be allocated, so the chunk is parked and
+    retried when memory frees. Above it the chunk takes what the pool can
+    actually give rather than the nominal size -- the old code took the nominal
+    size even when the pool reported nothing at all.
+    """
+    fundable = max(0, int(fundable_tokens))
+    page = max(1, int(page_size))
+    if fundable < page:
+        return 0
+    return max(0, min(int(rem_chunk_tokens), fundable))
+
+
+#: #679: rank-local relief consulted when an extend allocation is about to fail.
+#:
+#: THE SHAPE IS ``_mem_create_reclaiming``'s (mem_cache/kv_vmm_backing.py): one
+#: bounded reclaim, one retry, then the original error propagates unchanged.
+#: That is the only "catch OOM, reclaim, retry" precedent in this tree and it
+#: is deliberately followed rather than reinvented.
+#:
+#: RANK-LOCAL PROVIDERS ONLY, and the restriction is the whole safety argument.
+#: This runs deep inside ``prepare_for_extend``, after the group has committed
+#: to a batch; a provider that took a collective here would hang the first time
+#: one rank reached it and its peers did not. Anything needing agreement
+#: belongs on the admission path, which decides from a group-published floor.
+_extend_relief_providers: List[Callable[[int], int]] = []
+
+#: Emitted once per process when the alloc site is reached with an empty
+#: registry, so "no relief existed" is a fact in the log rather than an
+#: inference from its absence.
+_announced_empty_relief = False
+
+
+def register_extend_relief_provider(fn: Callable[[int], int]) -> None:
+    """Register a RANK-LOCAL provider: ``fn(num_tokens) -> tokens freed``."""
+    if fn not in _extend_relief_providers:
+        _extend_relief_providers.append(fn)
+
+
+def clear_extend_relief_providers() -> None:
+    """Test seam, and the reason it exists is that a global registry which
+    cannot be emptied makes every test after the first one a liar."""
+    global _announced_empty_relief
+    _extend_relief_providers.clear()
+    _announced_empty_relief = False
+
+
+def _attempt_extend_relief(num_tokens: int) -> int:
+    """Ask every registered provider for ``num_tokens``. Never raises.
+
+    A provider that raises is a provider that failed, not an instance that
+    should die: the caller's next step is a re-raise of the real allocation
+    error, which is strictly more informative than a relief bug's traceback.
+    """
+    if not _extend_relief_providers:
+        # SAY THAT THE NET IS EMPTY, ONCE. Nothing registers a provider today:
+        # the rank-local reliefs that could pay here (eviction) are already
+        # spent by the time this runs, and the ones that could genuinely free
+        # tokens -- retraction, session spill -- are collective and belong on
+        # the admission path, not inside a batch the group has committed to.
+        #
+        # So this registry is a SEAM, and a seam that quietly does nothing is
+        # the "present but inert" failure this tree keeps finding. An operator
+        # reading a crash log must be able to see that no relief was available
+        # rather than assume some was tried.
+        global _announced_empty_relief
+        if not _announced_empty_relief:
+            _announced_empty_relief = True
+            logger.warning(
+                "extend allocation failed and NO relief provider is "
+                "registered: the alloc-site net is empty on this boot, so the "
+                "guarantee against this crash is entirely the admission guard "
+                "(chunk_tokens_the_pool_can_fund). If you are reading this "
+                "line, admission let through work the pool could not fund."
+            )
+        return 0
+    freed = 0
+    for fn in tuple(_extend_relief_providers):
+        try:
+            freed += max(0, int(fn(int(num_tokens))))
+        except Exception as e:  # noqa: BLE001 - relief must not mask the OOM
+            logger.warning("extend relief provider %r failed: %s", fn, e)
+    return freed
 
 
 def uniform_avail_for_evict(tree_cache, allocator) -> int:
@@ -665,12 +988,19 @@ def peer_needs_mamba_evict(tree_cache, need: int = 1) -> bool:
     return int(floor) < int(need)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int) -> int:
+    """Evict toward ``num_tokens``. Returns tokens ACTUALLY evicted (#681).
+
+    The return value is the whole point: ``evictable_size_`` is a COUNT of
+    unlocked tokens in the tree, while ``evict`` can only reach the leaf
+    frontier. When those disagree the caller must know, because the next thing
+    it does is allocate on the strength of the count.
+    """
     if tree_cache is None:
-        return
+        return 0
 
     if tree_cache.is_chunk_cache():
-        return
+        return 0
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
@@ -682,9 +1012,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
+            result = tree_cache.evict(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
+            return int(getattr(result, "num_tokens_evicted", 0) or 0)
     else:
         # Standard allocator
         #
@@ -701,7 +1032,30 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # single rank) => the live local value, unchanged.
         avail = uniform_avail_for_evict(tree_cache, allocator)
         if avail < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            # #681: READ THE RECEIPT. ``evict`` returns how many tokens it
+            # ACTUALLY freed, and this call site threw that away -- so an
+            # eviction that under-delivered was indistinguishable from one that
+            # worked, and the allocation three lines later raised with a
+            # message reporting plenty of memory.
+            #
+            # Measured 2026-08-16 01:46:10, all three ranks identically:
+            #   Try to allocate 512 tokens.
+            #   Available full tokens: 66039 (available=273 + evictable=65766)
+            # 512 needed, 65766 reported evictable, allocation failed anyway.
+            # #681 FOLLOW-UP, CORRECTING THIS COMMENT'S FIRST VERSION: the gap
+            # was NOT "tokens behind a locked chain". Locking walks a node to
+            # the ROOT and `_split_node` copies the ref onto the new upper half,
+            # so an unlocked node can never have a locked descendant and the
+            # peel always reaches it -- pinned by
+            # test_evictable_reachability_681.TestLockRefsAreAncestorClosed.
+            # The real gap was at the other end of the frontier: an unlocked
+            # MAMBA TOMBSTONE LEAF was counted, was selected first, and made
+            # `_evict_leaf_node` ASSERT rather than under-deliver. That is now
+            # paid in `MambaRadixCache.evict_full`, so the receipt below should
+            # always equal the request.
+            result = tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            return int(getattr(result, "num_tokens_evicted", 0) or 0)
+    return 0
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -768,6 +1122,20 @@ def alloc_paged_token_slots_extend(
     else:
         out_cache_loc = out
 
+    if out_cache_loc is None:
+        # #681 RULE 3: every alloc path reachable from prefill admission gets
+        # the same net. This is the page_size > 1 twin of alloc_token_slots and
+        # it had none -- the audit found three raise sites on this path
+        # (alloc_req_slots, alloc_token_slots, this one) and only one covered.
+        freed = _attempt_extend_relief(extend_num_tokens)
+        if freed > 0:
+            logger.warning(
+                "paged extend allocation of %d tokens failed; rank-local "
+                "relief returned %d tokens. Admission should have prevented "
+                "this -- treat a recurring line here as an admission defect.",
+                extend_num_tokens,
+                freed,
+            )
     if out_cache_loc is None:
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
@@ -864,6 +1232,12 @@ def alloc_req_slots(
                 "free -- raise --max-mamba-cache-size, or look for mamba slots "
                 "held by unevictable radix checkpoints"
             )
+        # #681 RULE 3: the third raise site on the prefill admission path.
+        # This one exhausts REQUEST SLOTS (and mamba states), not KV tokens, so
+        # a token-shaped relief cannot pay it -- the net is asked anyway
+        # because a provider may free a whole request, and the ask is what
+        # tells an operator the site was covered rather than forgotten.
+        _attempt_extend_relief(len(reqs))
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
             "Please set a smaller number for `--max-running-requests`. " + detail

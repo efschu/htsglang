@@ -446,9 +446,7 @@ class RecoveryMayNotBreachTheCorridorItWasRelievingTest(unittest.TestCase):
         relief.recover()
         self.assertLessEqual(pool.full_pool_backed_rows, 400000 + 1976)
         self.assertGreater(pool.full_pool_backed_rows, 400000)
-        self.assertNotIn(
-            500000, pool.grew_to, "the full grow must never be attempted"
-        )
+        self.assertNotIn(500000, pool.grew_to, "the full grow must never be attempted")
 
     def test_a_partial_recovery_keeps_the_cap_at_the_level_it_reached(self):
         relief, pool, _card = self._rank_at(3000, 400000)
@@ -579,13 +577,53 @@ class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
         self.assertEqual(len(pool.calls), 1)
         self.assertEqual(len(calls), 1)
 
-    def test_tp_to_pp_abstains_but_still_joins_the_reduction(self):
+    def test_tp_to_pp_is_funded_too_662(self):
+        """#662: the leg into the PREFILL layout must have a funder.
+
+        This pin was inverted on 2026-08-15 and the reason is a measured
+        production failure, not a preference. With the rung excluded here,
+        every tp_to_pp arm on the max-KV vector abandoned with
+
+            seam entry margin short: want 2194 MiB, free 2892 -> 3098 MiB,
+            reclaimed 206 MiB from [allocator-cache]
+
+        -- 206 MiB of torch cache against a 2194 MiB ask, because
+        allocator-cache was the only tier left that pays. Eight abandons
+        install the "seam unfundable" guard and the instance NEVER ENTERS
+        THE PREFILL LAYOUT AGAIN, so long prompts are prefilled at TP speed
+        forever. That is the reported defect.
+
+        The old exclusion was right that the shrink is undone by the
+        post-cutover recovery, and wrong that this makes it pointless: the
+        undo is the price of the flip happening at all.
+        """
         freed, pool, calls = self._run("tp_to_pp")
+        self.assertGreater(freed, 0, "the tp_to_pp leg must be fundable")
+        self.assertEqual(len(pool.calls), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_tp_to_pp_abstains_when_funding_is_disabled(self):
+        """The shipped one-leg behaviour, kept as a VALUE of the same term.
+
+        SGLANG_SEAM_FUND_TP_TO_PP=0 restores it exactly, which is what makes
+        the metal comparison a one-variable experiment.
+        """
+        import os
+
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        prev = os.environ.get(pfs.ENV_FUND_TP_TO_PP)
+        os.environ[pfs.ENV_FUND_TP_TO_PP] = "0"
+        try:
+            freed, pool, calls = self._run("tp_to_pp")
+        finally:
+            if prev is None:
+                os.environ.pop(pfs.ENV_FUND_TP_TO_PP, None)
+            else:
+                os.environ[pfs.ENV_FUND_TP_TO_PP] = prev
         self.assertEqual(freed, 0)
         self.assertEqual(pool.calls, [], "the pool that is about to go live")
-        self.assertEqual(
-            len(calls), 1, "abstaining is not the same as walking away"
-        )
+        self.assertEqual(len(calls), 1, "abstaining is not the same as walking away")
 
 
 if __name__ == "__main__":

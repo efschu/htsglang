@@ -94,7 +94,12 @@ __all__ = [
     "dump_trace",
     "is_recording_phases",
     "mark",
+    "mark_serving",
     "read_marks",
+    "read_serving_marks",
+    "reset_serving_pacer",
+    "SERVING_PHASE",
+    "SERVING_INTERVAL_ENV",
     "list_boots",
     "boot_id",
     "publish_boot_id",
@@ -124,6 +129,27 @@ BOOT_ID_ENV = "SGLANG_VRAM_FLIGHT_BOOT_ID"
 #: Directory for the phase-mark log (source 1) and any snapshot dumps. Absent,
 #: every entry point in this module returns immediately and allocates nothing.
 DIR_ENV = "SGLANG_VRAM_FLIGHT_DIR"
+
+#: The boot ledger: one mark per boot POST, paired by name by its readers
+#: (``reconcile`` asks for the ``weights_loaded -> kv_pool_sized`` delta).
+MARKS_FILE_STEM = "flight_marks_rank"
+
+#: The serving series (#684), kept in its OWN file for the reason above: a
+#: boot post is a unique boundary and a serving sample is a time series, and
+#: thousands of the latter in the ledger would turn a table of posts into a
+#: log with posts in it. Same schema, same writer, different destination.
+SERVING_FILE_STEM = "flight_serving_rank"
+
+#: Phase name of a serving sample. Distinct from every boot post so a reader
+#: can never mistake one for a boundary.
+SERVING_PHASE = "serving"
+
+#: Seconds between serving samples. The call site is once per scheduler
+#: iteration -- thousands of times a second -- so the pacer is what makes the
+#: instrument affordable. ``0`` disables the series while leaving the boot
+#: marks armed.
+SERVING_INTERVAL_ENV = "SGLANG_VRAM_FLIGHT_SERVING_S"
+DEFAULT_SERVING_INTERVAL_S = 30.0
 
 #: The boot boundaries, in order, and what the gap AFTER each one contains.
 #: This is the contract between the instrument and its reader, and a
@@ -531,6 +557,7 @@ def mark(
     device_index: Optional[int] = None,
     directory: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
+    _filename: Optional[str] = None,
 ) -> Optional[dict]:
     """Record one phase boundary. No-op unless :data:`DIR_ENV` is set.
 
@@ -601,7 +628,14 @@ def mark(
         record["extra"] = dict(extra)
     try:
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, f"flight_marks_rank{rank}.jsonl")
+        # ONE RECORD BUILDER, TWO DESTINATIONS (#684). The serving series is
+        # written by this same function so the two can never drift into two
+        # schemas -- a copy of the record layout is exactly how the field a
+        # post-mortem needs ends up present in one file and missing in the
+        # other.
+        path = os.path.join(
+            directory, _filename or f"{MARKS_FILE_STEM}{rank}.jsonl"
+        )
         with open(path, "a") as f:
             f.write(json.dumps(record) + "\n")
     except OSError as e:  # pragma: no cover - filesystem differences
@@ -610,7 +644,131 @@ def mark(
     return record
 
 
-def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[dict]]:
+class _ServingPacer:
+    """Decides when the next serving sample is due, on the MONOTONIC clock.
+
+    Wall time is not usable for this: an NTP step backwards would stall the
+    series for the length of the step, and a step forwards would flood it --
+    and the one boot that most needs the record is the one whose clock is
+    being corrected because it has been up a long time.
+
+    The interval is resolved ONCE and cached, on the same argument the
+    corridor sampler's ``start`` uses: this is consulted thousands of times a
+    second, and an env lookup per scheduler iteration is a cost the instrument
+    has no reason to charge.
+    """
+
+    def __init__(self) -> None:
+        self._last: Optional[float] = None
+        self._interval: Optional[float] = None
+
+    def interval_s(self) -> float:
+        if self._interval is None:
+            raw = os.environ.get(SERVING_INTERVAL_ENV)
+            if raw is None:
+                self._interval = DEFAULT_SERVING_INTERVAL_S
+            else:
+                try:
+                    self._interval = float(raw)
+                except (TypeError, ValueError):
+                    # An unreadable cadence must not silence the instrument:
+                    # a typo in a boot script would otherwise cost the next
+                    # post-mortem its whole serving record.
+                    logger.warning(
+                        "VRAM flight recorder: %s=%r is not a number; using "
+                        "the %.0fs default",
+                        SERVING_INTERVAL_ENV,
+                        raw,
+                        DEFAULT_SERVING_INTERVAL_S,
+                    )
+                    self._interval = DEFAULT_SERVING_INTERVAL_S
+        return self._interval
+
+    def due(self, now: float) -> bool:
+        interval = self.interval_s()
+        if interval <= 0:
+            return False
+        # The FIRST call always marks, so a boot has a serving datum before
+        # any drift starts and the series has a baseline to be read against.
+        if self._last is None or (now - self._last) >= interval:
+            self._last = now
+            return True
+        return False
+
+    def reset(self) -> None:
+        self._last = None
+        self._interval = None
+
+
+_serving_pacer = _ServingPacer()
+
+
+def reset_serving_pacer() -> None:
+    """Forget the cadence and the last sample time (tests, and re-arming)."""
+    _serving_pacer.reset()
+
+
+def mark_serving(
+    *,
+    rank: int = 0,
+    device_index: Optional[int] = None,
+    directory: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    now: Optional[float] = None,
+) -> Optional[dict]:
+    """One paced serving-time sample. No-op unless :data:`DIR_ENV` is set.
+
+    WHY THIS EXISTS, MEASURED. The recorder's last boot post is
+    ``first_forward``. On 2026-08-16 an instance died 36 minutes later with
+    ``76.38 MiB is free ... Process 1920108 has 4.29 GiB memory in use``, and
+    naming that process took hours of log archaeology plus a pid-clock
+    interpolation across two boots. Every fact needed to answer it in one line
+    -- the card's free bytes and the full pid->bytes map of everyone on it --
+    was already computed by :func:`_nvml_view` on every mark. Nothing was
+    marking.
+
+    NOT THE SAME JOB AS THE #605 CORRIDOR SAMPLER, which does run during
+    serving: that one keeps a fixed-size RAM ring, so it dies with the process
+    that crashes, and its ``Sample`` discards the per-pid map it reads. Marks
+    are appended to a FILE and survive the crash -- which is not theoretical,
+    since the surviving boot marks are what made that pid clock calibratable
+    after the fact.
+
+    Returns the record when a sample was taken, ``None`` when the pace was not
+    due. Never raises: the caller is a scheduler iteration.
+    """
+    directory = directory or os.environ.get(DIR_ENV)
+    if not directory:
+        return None
+    if not _serving_pacer.due(time.monotonic() if now is None else float(now)):
+        return None
+    return mark(
+        SERVING_PHASE,
+        rank=rank,
+        device_index=device_index,
+        directory=directory,
+        extra=extra,
+        _filename=f"{SERVING_FILE_STEM}{rank}.jsonl",
+    )
+
+
+def read_serving_marks(
+    directory: str, *, boot: Optional[str] = None
+) -> Dict[int, List[dict]]:
+    """The serving series for ONE boot, ``{pid: [sample, ...]}`` (#684).
+
+    Same grouping and boot-selection contract as :func:`read_marks`, over the
+    serving file instead of the boot ledger.
+    """
+    return read_marks(directory, boot=boot, _stem=SERVING_FILE_STEM)
+
+
+def read_marks(
+    directory: str,
+    *,
+    boot: Optional[str] = None,
+    _stem: str = MARKS_FILE_STEM,
+) -> Dict[int, List[dict]]:
     """``{pid: [mark, ...]}`` for ONE boot, latest by default.
 
     THE FILE HOLDS MORE THAN ONE BOOT and that is the point of the format: a
@@ -646,7 +804,7 @@ def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[
         return out
     records: List[dict] = []
     for name in sorted(os.listdir(directory)):
-        if not (name.startswith("flight_marks_rank") and name.endswith(".jsonl")):
+        if not (name.startswith(_stem) and name.endswith(".jsonl")):
             continue
         path = os.path.join(directory, name)
         with open(path) as f:

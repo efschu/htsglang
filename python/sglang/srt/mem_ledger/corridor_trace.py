@@ -231,8 +231,20 @@ class CorridorTrace:
             "free_max_mib": max(free) // MIB,
             "free_last_mib": free[-1] // MIB,
             "corridor_mib": corridor_mib,
-            # The verdict the law actually asks for: did the WORST instant hold.
-            "breach": bool(floor // MIB < corridor_mib),
+            # THE VERDICT IS THE BAND FLOOR; THE TARGET IS THE CENTRE.
+            #
+            # The corridor is a band (corridor_guard.CORRIDOR_BAND_FRACTION):
+            # below its floor is a breach, and nothing inside it is. The
+            # margin is still measured to the CENTRE, because that is the
+            # number the self-correcting sizing pulls back to -- a mechanism
+            # that aims at the edge of its own tolerance has none left.
+            #
+            # Reported separately so a reader can never confuse "how far from
+            # the target" with "did the law hold": on this rig the cutover
+            # transient sat at 895-935 MiB, which is 89-129 MiB from the
+            # centre and comfortably inside the band.
+            "corridor_band_floor_mib": _band_floor_mib(corridor_mib),
+            "breach": bool(floor // MIB < _band_floor_mib(corridor_mib)),
             "margin_mib": floor // MIB - corridor_mib,
             "arena_backed_min_mib": min(s.kv_arena_backed_bytes for s in samples)
             // MIB,
@@ -261,15 +273,61 @@ class CorridorTrace:
         return path
 
 
+def _band_floor_mib(corridor_mib: int) -> int:
+    """The breach threshold for a given corridor centre.
+
+    DERIVED FROM THE CENTRE IT IS GIVEN, not from the global law, so an
+    explicit ``corridor_mib`` still decides the verdict -- that parameter
+    exists precisely so a caller can audit against a corridor other than the
+    one in force, and a band read from the global would silently ignore it.
+    The FRACTION comes from the one declaration in ``corridor_guard``, so the
+    tolerance itself cannot drift between the instrument and the gate.
+    """
+    from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+
+    return int(corridor_mib - corridor_mib * CORRIDOR_BAND_FRACTION)
+
+
 def requested_period_ms() -> Optional[int]:
+    """The sampling cadence in ms, or None when the operator turns it off.
+
+    ON BY DEFAULT SINCE 2026-08-15, and the inversion is a bug fix rather than
+    a preference.
+
+    This sampler is the ONLY instrument in the tree that can answer the
+    corridor law's own question, because the law is a continuous minimum and
+    everything else here takes snapshots. While it was opt-in, a default boot
+    could not see the law it is held to -- and worse, the self-correcting
+    machinery downstream is fed from it: ``Scheduler._corridor_trace_tick``
+    reports a breach only if this returns a trace, and
+    ``record_corridor_shortfall`` only ever writes a number that audit
+    produced. So on every default boot ``corridor_shortfall_bytes`` stayed 0
+    for ever, ``seam_margin_bytes`` stayed at its constant, and the pool
+    sizer's fixed point had nothing pulling it back above the law.
+
+    Measured on this rig, 2026-08-15, two boots: an external 100 ms NVML
+    sampler recorded 57 and 15 breaches with minima of 895 and 935 MiB, while
+    "CORRIDOR LAW BREACHED on this rank's card" appeared ZERO times in either
+    serving log. The instance believed it was holding the law throughout.
+
+    The cost this was avoiding is one daemon thread reading NVML every 100 ms.
+    That is not a price worth a law nobody can see, so the default flips and
+    the escape hatch stays: ``SGLANG_CORRIDOR_TRACE_MS=0`` (or ``off``) turns
+    it off, any positive value sets the cadence.
+    """
     raw = os.environ.get(TRACE_ENV)
-    if not raw:
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_PERIOD_MS
+    text = str(raw).strip().lower()
+    if text in ("0", "off", "false", "no"):
         return None
     try:
-        value = int(raw)
+        value = int(text)
     except (TypeError, ValueError):
         return DEFAULT_PERIOD_MS
-    return DEFAULT_PERIOD_MS if value <= 1 else value
+    if value <= 0:
+        return None
+    return DEFAULT_PERIOD_MS if value == 1 else value
 
 
 def start(capacity: int = DEFAULT_CAPACITY) -> Optional[CorridorTrace]:

@@ -303,9 +303,7 @@ def test_a_probe_failure_never_holds_the_loop():
 
 def test_the_default_path_walks_the_slots_exactly_as_the_for_loop_did():
     """With the flip disabled the while loop IS ``for mb_id in range(n)``."""
-    r = _Rank(
-        arm_at_iteration=10**9, armed_spins=1, enable_phase_flip=False, tail=8
-    )
+    r = _Rank(arm_at_iteration=10**9, armed_spins=1, enable_phase_flip=False, tail=8)
     r.disarmed = True  # so the stop condition can fire
     r.run()
     assert r.slots_seen[:6] == [0, 1, 2, 0, 1, 2]
@@ -319,9 +317,7 @@ def test_the_slot_does_not_advance_while_the_armed_window_spins():
 
 
 @pytest.mark.parametrize("spins_a,spins_b", [(7, 50), (11, 12), (3, 97)])
-def test_two_ranks_with_different_spin_counts_resume_on_the_same_slot(
-    spins_a, spins_b
-):
+def test_two_ranks_with_different_spin_counts_resume_on_the_same_slot(spins_a, spins_b):
     """THE PROPERTY THE FEATURE NEEDS, and the one metal falsified.
 
     The ranks arm together -- the arm rides the 1:1 ordered request chain,

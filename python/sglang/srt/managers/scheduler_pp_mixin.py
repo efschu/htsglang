@@ -141,6 +141,66 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+def _release_dynamic_chunk_probe(scheduler, req) -> None:
+    """Hand back everything one dynamic-chunk probe took: KV, MAMBA, req slot.
+
+    THE MAMBA SLOT WAS THE ONE NOBODY FREED, and it is why
+    ``--enable-dynamic-chunking`` could not boot the phase-flip stack.
+    ``ReqToTokenPool.free`` releases the REQ slot only; the mamba state has its
+    own allocator and its own call. The profiler freed KV and the req slot and
+    nothing else, so every probe consumed one mamba slot permanently. With
+    ``--max-mamba-cache-size 12`` the twelfth probe found the pool empty:
+
+        Profiling prefill latency for dynamic chunking:  9%| | 12/128
+        mamba state slot pool exhausted and nothing evictable ... pool=12
+        [PP Dynamic Chunk] [PP0] profiling failed (alloc_req_slots runs out
+          of memory ...)
+        ValueError: pool memory leak detected!
+          [full] total=509621, available=509621   <- KV came back
+          [mamba] total=12, available=0, leaked_mamba_pages={1,...,12}
+
+    It failed at exactly the pool size, and the full pool came back untouched.
+    That is the whole diagnosis: not a chunk-size change racing the seam, and
+    nothing to do with the seam at all -- the instance died in ``on_idle`` at
+    boot, before it ever served a request.
+
+    ORDER IS LOAD-BEARING: the mamba release reads
+    ``req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]``,
+    and ``free`` sets ``req_pool_idx`` to None. Freeing the req slot first
+    makes the mamba release either raise or free the wrong buffer.
+
+    Idempotent and never raises: it runs on the abort path too, where the
+    request may hold some slots and not others, and an instrument that can
+    raise while cleaning up after a failure turns one defect into two.
+    """
+    if req is None:
+        return
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    if pool is None:
+        return
+    try:
+        if getattr(req, "req_pool_idx", None) is not None:
+            end = getattr(getattr(req, "extend_range", None), "end", None)
+            if end:
+                kv_indices = pool.req_to_token[req.req_pool_idx, :end]
+                scheduler.token_to_kv_pool_allocator.free(kv_indices)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("[PP Dynamic Chunk] probe KV release failed: %s", exc)
+    try:
+        # MAMBA BEFORE THE REQ SLOT. See the ordering note above.
+        if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+            pool, "free_mamba_cache"
+        ):
+            pool.free_mamba_cache(req)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("[PP Dynamic Chunk] probe mamba release failed: %s", exc)
+    try:
+        if getattr(req, "req_pool_idx", None) is not None:
+            pool.free(req)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("[PP Dynamic Chunk] probe req-slot release failed: %s", exc)
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -1610,6 +1670,10 @@ class SchedulerPPMixin:
                     )
                     req.full_untruncated_fill_ids = req.origin_input_ids
                     req.logprob_start_len = -1
+                    # The abort path below releases whatever the in-flight
+                    # probe is holding; without this the request that RAISED
+                    # keeps its slots for the life of the process.
+                    self._dyn_chunk_probe_req = req
                     req.set_extend_range(
                         len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                     )
@@ -1672,7 +1736,10 @@ class SchedulerPPMixin:
                     batch.prepare_for_extend()
 
                     # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
-                    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    if (
+                        batch.input_ids is None
+                        and batch.prefill_input_ids_cpu is not None
+                    ):
                         batch.input_ids = batch.prefill_input_ids_cpu.to(
                             self.device, non_blocking=True
                         )
@@ -1693,13 +1760,9 @@ class SchedulerPPMixin:
                     seq_lens.append(len(input_ids))
                     latencies.append(latency_ms)
 
-                    # Release KV cache
-                    if req.req_pool_idx is not None:
-                        kv_indices = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx, : req.extend_range.end
-                        ]
-                        self.token_to_kv_pool_allocator.free(kv_indices)
-                        self.req_to_token_pool.free(req)
+                    # Release everything this probe took. KV, MAMBA, req slot.
+                    _release_dynamic_chunk_probe(self, req)
+                    self._dyn_chunk_probe_req = None
 
                 logger.info(
                     f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1756,6 +1819,14 @@ class SchedulerPPMixin:
                     "blocking in the broadcast below.",
                     e,
                 )
+                # AND HAND BACK WHAT THE FAILED PROBE HOLDS. Publishing empty
+                # samples makes every rank decline together, which is right --
+                # but the probe that raised is still holding a req slot, a
+                # mamba slot and its KV, and nothing else will ever free them.
+                _release_dynamic_chunk_probe(
+                    self, getattr(self, "_dyn_chunk_probe_req", None)
+                )
+                self._dyn_chunk_probe_req = None
                 seq_lens, latencies = [], []
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2177,7 +2248,9 @@ class SchedulerPPMixin:
             pass
         return (int(mb_id), int(self._pp_proxy_seq), rows)
 
-    def _pp_recv_proxy_tensors(self: Scheduler, mb_id: int = -1) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy_tensors(
+        self: Scheduler, mb_id: int = -1
+    ) -> Optional[PPProxyTensors]:
         """Receive this slot's hidden states, and PROVE they are this slot's.
 
         #631 VARIANT B, second cut. The stamp is the DETECTION half of the

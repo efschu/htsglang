@@ -170,7 +170,6 @@ class TestAttribution(unittest.TestCase):
         self.assertIsNone(census.active())
 
 
-
 class TestTheLabelCannotReSeedTheOriginalError(unittest.TestCase):
     """A flip that ENDS lower than it started spent a PHASE STEP, not a
     transient. Conflating the two is precisely what put a withdrawn
@@ -187,9 +186,9 @@ class TestTheLabelCannotReSeedTheOriginalError(unittest.TestCase):
         # Shape measured on metal for tp_to_pp rank 0: free RISES at the
         # backing release, falls at the restore, and the flip ends there.
         probe = _probe_sequence(
-            (6819, 0, 0),   # entry
+            (6819, 0, 0),  # entry
             (10335, 0, 0),  # backing_release -- source pages handed back
-            (5663, 0, 0),   # backing_restore -- destination committed
+            (5663, 0, 0),  # backing_restore -- destination committed
         )
         census.begin("tp_to_pp", 0, probe=probe)
         census.mark("backing_release")
@@ -209,6 +208,7 @@ class TestTheLabelCannotReSeedTheOriginalError(unittest.TestCase):
         line = census.end().format_line()
         self.assertIn("transient", line)
         self.assertNotIn("phase step", line)
+
 
 if __name__ == "__main__":
     unittest.main()

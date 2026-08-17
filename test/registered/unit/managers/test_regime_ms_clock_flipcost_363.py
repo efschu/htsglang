@@ -156,9 +156,7 @@ def test_a_longer_horizon_makes_the_same_flip_affordable():
     """The horizon is policy and it is the ONLY judgement in the term."""
     cur = make_stage("balanced", gain=0.0, band=1.0, flip_cost_s=0.05)
     dear = make_stage("dear", gain=30.0, band=1.0, flip_cost_s=8.0)
-    taken = run(
-        MsStageDecider(flip_payback_s=600.0), cur, [dear], WAIT_BOUND, 6
-    )
+    taken = run(MsStageDecider(flip_payback_s=600.0), cur, [dear], WAIT_BOUND, 6)
     assert taken.target == "dear"
     assert taken.flip_cost_pct == pytest.approx(100.0 * 8.0 / 600.0)
 
