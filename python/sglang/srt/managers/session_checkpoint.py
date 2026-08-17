@@ -417,6 +417,32 @@ def take_file_tier_pins(store, checkpoint_id: str, keys: Sequence[str]) -> FileT
     return FileTierPins(len(keys), len(getattr(result, "stems", ()) or ()), (), True, "")
 
 
+def pin_imported_pages(store, checkpoint_id: str, manifest: Dict) -> FileTierPins:
+    """Pin an imported session's pages on the target's file tier (#411).
+
+    THE GDN BLOB IS PART OF THE SET, not an extra. #212: a KV-only prefix is
+    worth zero usable tokens on a hybrid model, so a session whose mamba blob
+    was evicted is not a partially usable session, it is an unusable one. It is
+    pinned with the KV pages or the protection is decorative.
+
+    Called AFTER ``verify_restore`` -- there is nothing to pin until the pages
+    are in the store -- and BEFORE the session is seeded. Verification proves
+    the pages are there NOW; it does not stop the evictor reclaiming them a
+    moment later, and a freshly imported session is unreferenced by any running
+    request until it is used, so a store under pressure can drop it before it
+    is ever read.
+
+    This is the capability the export refusal already advised and could not
+    name (`NOTE_411_portable_sessions.md` §C5): the pin ledger did not exist on
+    that base. It does here.
+    """
+    keys = list(manifest.get("kv_keys") or [])
+    mamba_key = manifest.get("mamba_key")
+    if mamba_key:
+        keys.append(mamba_key)
+    return take_file_tier_pins(store, checkpoint_id, keys)
+
+
 class CheckpointLedger:
     """Every live checkpoint and what derives from it. Pure, hermetic.
 
@@ -1026,6 +1052,24 @@ class SessionCheckpointRuntime:
             raise SessionCheckpointError(
                 f"imported bundle did not verify against this rank's store: "
                 f"{message}"
+            )
+
+        # 4b. PIN what was just verified, before anything is created. An
+        # imported session's pages are the youngest entries in the LRU and are
+        # referenced by no running request until the seeded session uses them,
+        # so a store under pressure can evict them before they are ever read.
+        # Refuses by name if a page did not land; a session whose prefix is
+        # already reclaimable must not be created.
+        imported_id = (
+            (manifest.get("checkpoint") or {}).get("checkpoint_id") or session_id or ""
+        )
+        import_pins = pin_imported_pages(self._file_tier_store(), imported_id, manifest)
+        if not import_pins.protected:
+            logger.info(
+                "SESSION-IMPORT %s has NO file-tier protection: %s. The seeded "
+                "session survives radix eviction only, not a restart.",
+                imported_id,
+                import_pins.reason,
             )
 
         controller = getattr(self.scheduler, "session_controller", None)

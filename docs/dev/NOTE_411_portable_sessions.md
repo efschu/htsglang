@@ -279,3 +279,77 @@ Slice 2 (pinning) is still absent on this base — re-checked, `pin_ledger.py`
 does not exist — so an imported bundle's checkpoint is not pinned on seed and
 the dangling-reference note stands. Cross-rig proof remains the filed window
 item; nothing here has crossed a machine.
+
+---
+
+# CUT 4 — pin-through-import, and C5 closes
+
+## C5 is closed, by the dependency arriving rather than by an argument
+
+Cut 2 recorded that the export refusal's advice -- "re-pin the checkpoint (#410
+slice 2)" -- named a capability the branch lacked, and filed the Slice-2
+dependency as the one "that decides whether the refusal is rare or routine".
+
+On this base that dependency is satisfied. `mem_cache/pin_ledger.py` exists,
+`LRUFileEvictor` honours it, and `take_file_tier_pins` is wired into the
+checkpoint path. The advice is now actionable, so the dangling reference stops
+dangling. See `NOTE_411_reconciliation_port.md` for how the ledger got here and
+`VERDICT_411_two_410_formats.md` for why there were two #410 lineages to
+reconcile first.
+
+## Why import needs its own pin, when it already verifies
+
+`import_bundle_and_seed` materialises the payloads and then runs
+`verify_restore` against the store. **Verification proves the pages are there
+NOW; it does not stop the evictor reclaiming them a moment later.**
+
+An imported bundle is the worst case for that. Its pages are freshly written --
+so they are the youngest entries in the LRU, which sounds safe -- but they are
+referenced by no running request until the seeded session is used. A store
+under pressure can evict a just-imported session before it is ever read, and the
+user sees a session that will not continue.
+
+## The ordering, which is the same rule as the checkpoint path
+
+    materialise -> verify_restore -> PIN -> branch_from
+
+AFTER verification, because there is nothing to pin until the pages are in the
+store. BEFORE seeding, because a session that cannot be protected must not be
+created: the alternative is a live session whose prefix is already reclaimable,
+which fails later, further from the cause, and to a user rather than an
+operator.
+
+Note the asymmetry with the radix pin: `_pin` runs AFTER `branch_from` because
+it needs the seeded node to lock. The file-tier pin does not, so it goes first.
+Two tiers, two positions, each chosen by what it needs rather than by symmetry.
+
+## The GDN blob is part of the pin set, not an extra
+
+#212: a KV-only prefix is worth zero usable tokens on a hybrid model. A session
+whose mamba blob was evicted is not partially usable, it is unusable, so
+`pin_imported_pages` appends `mamba_key` to the KV keys. Mutating that line
+away reds `test_the_gdn_blob_is_pinned_too` and nothing else, which is the
+proof that the clause is load-bearing rather than decorative.
+
+## A target with no file tier is reported, not refused
+
+#407 may hold the imported session on vram or host, where there are no stems to
+pin. That is logged as unprotected -- "survives radix eviction only, not a
+restart" -- exactly as the checkpoint path does. Refusing a placement the tier
+policy chose would be this layer overruling the one whose decision it is.
+
+## A test defect worth recording
+
+The first version of the ordering test asserted
+`src.index("pin_imported_pages") < src.index("branch_from")` and failed against
+correct code: the method's own docstring names `branch_from` while describing
+the order, so the bare-name index found the prose, not the statement. Fixed by
+matching the CALL forms. Grepping a name inside source you are asserting about
+finds documentation as readily as code.
+
+## Unchanged
+
+Cross-rig import remains unproven and stays the filed window item: everything
+here is one machine, tmpdirs and an injected page reader. `IDENTITY_LAYOUT_GAP`
+still stands -- the identity hash covers the kv-cache dtype NAME, not its byte
+layout -- and is still quoted into every identity refusal.
