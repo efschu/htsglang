@@ -68,6 +68,7 @@ separated from the scheduler adapter so the falsifiers run hermetically.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import time
@@ -332,6 +333,88 @@ class CheckpointRecord:
             "hybrid_gdn": bool(self.manifest.get("hybrid_gdn")),
             "kv_pages": len(self.manifest.get("kv_keys") or []),
         }
+
+
+class PinCoverageIncomplete(SessionCheckpointError):
+    """A checkpoint could not pin every reference it depends on.
+
+    Raised at CHECKPOINT time, which is the point. ``stems_with_sizes`` drops a
+    stem whose file is absent -- correct for the budget, silent to the caller --
+    so without this a checkpoint could pin four of its six pages and report
+    success. The other two would then be evicted and the failure would surface
+    at the BRANCH, later and further from its cause.
+
+    Nothing here can make an absent page exist. This moves the refusal to where
+    the caller can still act on it, and names what is missing.
+    """
+
+    def __init__(self, checkpoint_id: str, unpinned: Sequence[str]):
+        self.checkpoint_id = checkpoint_id
+        self.unpinned = tuple(unpinned)
+        super().__init__(
+            f"checkpoint {checkpoint_id!r} could not pin {len(self.unpinned)} of "
+            f"its references on the file tier, so it would protect less than it "
+            f"claims: {list(self.unpinned)!r}. Nothing was pinned."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FileTierPins:
+    """What the file tier actually protects for one checkpoint."""
+
+    requested: int
+    pinned: int
+    unpinned: Tuple[str, ...] = ()
+    protected: bool = True
+    reason: str = ""
+
+
+def take_file_tier_pins(store, checkpoint_id: str, keys: Sequence[str]) -> FileTierPins:
+    """Pin a checkpoint's references on the FILE tier, or say why not.
+
+    THIS IS A DIFFERENT TIER FROM ``_pin``. That one takes
+    ``tree.inc_lock_ref`` on the radix chain: in memory, for the life of the
+    process. This one protects the on-disk stems from the file evictor and
+    across a restart. A checkpoint needs both, and this lineage had only the
+    first -- an A checkpoint survives radix eviction and does not survive
+    file-tier eviction.
+
+    NOT EVERY CHECKPOINT HAS A FILE TIER. #407 may place one on vram or host,
+    where there are no stems to pin. That is reported as unprotected rather
+    than raised: refusing a placement the tier policy chose would be this layer
+    overruling the one whose decision it is.
+    """
+    keys = list(keys)
+    if not keys:
+        return FileTierPins(0, 0, (), True, "no references to pin")
+    if store is None:
+        return FileTierPins(
+            len(keys), 0, (), False, "no file tier holds this checkpoint"
+        )
+    if not hasattr(store, "pin_checkpoint"):
+        return FileTierPins(
+            len(keys),
+            0,
+            (),
+            False,
+            "storage backend does not support pinning (pre-#410 wheel)",
+        )
+
+    result = store.pin_checkpoint(checkpoint_id, keys)
+    unpinned = tuple(getattr(result, "unpinned", ()) or ())
+    if unpinned:
+        # Roll back: a partially pinned checkpoint holds bytes for a promise it
+        # cannot keep, and the orphan reaper would only collect them after its
+        # age gate.
+        try:
+            store.unpin_checkpoint(checkpoint_id)
+        except Exception:  # pragma: no cover - best-effort rollback
+            logger.exception(
+                "SESSION-CHECKPOINT could not release pins after refusing %s",
+                checkpoint_id,
+            )
+        raise PinCoverageIncomplete(checkpoint_id, unpinned)
+    return FileTierPins(len(keys), len(getattr(result, "stems", ()) or ()), (), True, "")
 
 
 class CheckpointLedger:
@@ -622,6 +705,17 @@ class SessionCheckpointRuntime:
 
     # -- tier selection (#407 consumer) -------------------------------------
 
+    def _file_tier_store(self):
+        """The HiCache file backend, or None when this boot has no file tier.
+
+        Reached through the cache controller because that is who owns it;
+        ``storage_backend`` is None when no storage tier is configured, and a
+        checkpoint on vram or host legitimately has none.
+        """
+        tree = getattr(self.scheduler, "tree_cache", None)
+        controller = getattr(tree, "cache_controller", None)
+        return getattr(controller, "storage_backend", None)
+
     def _tier_registry(self):
         if self._registry is None:
             from sglang.srt.memtier.profile import collect_local_facts, nvml_card_facts
@@ -767,6 +861,23 @@ class SessionCheckpointRuntime:
             parent_checkpoint_id=parent,
             label=label,
         )
+        # FILE-TIER PINS, before the record exists. _pin below locks the radix
+        # chain, which protects this checkpoint in memory for the life of the
+        # process; this protects the on-disk stems from the file evictor and
+        # across a restart. Taken FIRST so a checkpoint that cannot be
+        # protected never becomes a record: the alternative is a ledger entry
+        # promising a branch whose pages are already reclaimable.
+        file_pins = take_file_tier_pins(
+            self._file_tier_store(), checkpoint_id, list(base_manifest["kv_keys"])
+        )
+        if not file_pins.protected:
+            logger.info(
+                "SESSION-CHECKPOINT %s has NO file-tier protection: %s. It "
+                "survives radix eviction only, not a restart.",
+                checkpoint_id,
+                file_pins.reason,
+            )
+
         record = self.ledger.add(
             CheckpointRecord(
                 checkpoint_id=checkpoint_id,
