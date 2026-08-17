@@ -811,8 +811,17 @@ class KvBackingRelief:
         # Measured on 0b61699cc3: current=137216, floor=398471. The floor
         # formula is right -- margin_rows defaults to 0 and is never passed,
         # and the admission reserve is chunked_prefill_size (512) -- so
-        # floor = max_live + 513 and max_live was 397,958: a live row id 2.9x
-        # ABOVE the cap, i.e. ids that outlived the pool they were measured in.
+        # floor = max_live + 513 and max_live was 397,958.
+        #
+        # CORRECTED (#717, F4-r4 c4e557963e): I first read that as a stale id
+        # outliving a pool shrink. It is not. 397,958 is a VALID id in the
+        # ~437k id space while only 137,216 rows are backed -- the live set is
+        # SPARSE, so a high-water id above the backed-row count is normal. The
+        # actual root there was _resident_ceiling encoding "none" and "unknown"
+        # as the same -1 sentinel, so an idle box read as an unreadable split
+        # and eviction was never priced. This guard stays because the CONDITION
+        # it reports is real and disabling: whatever the cause, a floor above
+        # the cap pins slack to 0 and the rung cannot fund.
         # slack is max(0, ...), so it pins to 0 for as long as that holds and
         # the rung can never propose a shrink. The evict-rung funding path is
         # then permanently unavailable and every flip falls back on the raw
@@ -825,8 +834,10 @@ class KvBackingRelief:
                 f" -- FLOOR UNREACHABLE: it exceeds the current cap by {gap} "
                 "rows, so this rung can never fund and every flip depends on "
                 "the raw seam fund alone. The floor is max_live + 1 + margin + "
-                "admission reserve, so a floor above the cap means max_live is "
-                "above the cap: live row ids outliving a pool shrink/reshard."
+                "admission reserve over a SPARSE live set: max_live is a "
+                "high-water ID in the id space, not a count of backed rows, so "
+                "it can legitimately exceed the number of rows backed. State "
+                "the fact, do not infer the cause."
             )
         return (
             f"KV rung: current={t['current']} rows, floor={t['floor_rows']}, "
