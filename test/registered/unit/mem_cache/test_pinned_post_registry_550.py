@@ -140,5 +140,106 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
             )
 
 
+class TheAllocationFailureWindow(unittest.TestCase):
+    """The residual filed by merge train 2: a post registered with nothing behind it.
+
+    Every producer declares its post BEFORE allocating -- deliberately, and
+    read_buffer_pool.py:70-72 states why: "an over-commitment is refused
+    instead of discovered: the registry's whole job is to fail at the
+    declaration rather than at the allocation". Correct for the CHECK, and it
+    opens a window: if the allocation then FAILS, the post stays registered
+    while its bytes never existed.
+
+    That matters because of #706's credit-back (``d7d85b4e37``), which subtracts
+    already-allocated posts from the demand on the grounds that live
+    ``available`` has already lost their bytes. A post that never allocated is
+    credited back anyway, so the next admission is charged too little and can
+    be admitted into memory that is not there -- the exact over-commitment the
+    registry exists to refuse, arrived at through the registry.
+    """
+
+    def setUp(self):
+        clear_registered_posts()
+        self.addCleanup(clear_registered_posts)
+
+    def test_a_failed_pinned_image_leaves_no_post_behind(self):
+        from sglang.srt.model_executor import weights_arena
+
+        boom = RuntimeError("cudaHostRegister refused: cannot lock pages")
+        with (
+            patch.object(weights_arena, "_alloc_with_host_register", side_effect=boom),
+            patch.object(weights_arena, "_torch_pinned_zeros", side_effect=boom),
+            patch.object(weights_arena, "_torch_pinned_empty", side_effect=boom),
+        ):
+            with self.assertRaises(RuntimeError):
+                weights_arena._alloc_host_image(4096, pin=True)
+
+        self.assertEqual(
+            [p.name for p in registered_posts()],
+            [],
+            "the image post outlived the allocation that failed: the registry "
+            "now charges bytes that do not exist, and #706's credit-back will "
+            "subtract them from the next admission's demand",
+        )
+
+    def test_the_real_error_is_not_masked_by_the_cleanup(self):
+        """#386 discipline: cleanup never substitutes the diagnosis."""
+        from sglang.srt.model_executor import weights_arena
+
+        boom = RuntimeError("cudaHostRegister refused: cannot lock pages")
+        with (
+            patch.object(weights_arena, "_alloc_with_host_register", side_effect=boom),
+            patch.object(weights_arena, "_torch_pinned_zeros", side_effect=boom),
+            patch.object(weights_arena, "_torch_pinned_empty", side_effect=boom),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                weights_arena._alloc_host_image(4096, pin=True)
+        self.assertIn("cudaHostRegister refused", str(ctx.exception))
+
+    def test_a_successful_image_still_registers(self):
+        """The other half: the fix must not unregister a post that DID
+        allocate. Without this the failure case passes trivially."""
+        from sglang.srt.model_executor import weights_arena
+
+        import torch
+
+        # The real pinned route needs a CUDA context; the point here is the
+        # BOOKKEEPING either side of it, so the allocation is stood in for.
+        with patch.object(
+            weights_arena,
+            "_alloc_with_host_register",
+            return_value=torch.zeros(4096, dtype=torch.uint8),
+        ):
+            image = weights_arena._alloc_host_image(4096, pin=True)
+        self.assertIsNotNone(image)
+        self.assertEqual(len(registered_posts()), 1)
+
+    def test_a_failed_read_buffer_ring_leaves_no_post_behind(self):
+        """The same window in the sibling producer (read_buffer_pool.py:73-79)."""
+        from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+
+        def _boom():
+            raise RuntimeError("cannot pin the ring")
+
+        with patch(
+            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            return_value=(64 * _GB, 40 * _GB),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                ReadBufferPool(
+                    capacity=2,
+                    page_bytes=1024,
+                    factory=_boom,
+                    name="ring",
+                    flag="--ring",
+                )
+        self.assertIn("cannot pin the ring", str(ctx.exception))
+        self.assertEqual(
+            [p.name for p in registered_posts()],
+            [],
+            "the ring's post outlived the buffers it never allocated",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

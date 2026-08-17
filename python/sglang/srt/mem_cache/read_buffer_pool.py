@@ -76,7 +76,25 @@ class ReadBufferPool:
                 requested_bytes=self.capacity * self.page_bytes,
             )
             self._registered = True
-        self._free = [factory() for _ in range(self.capacity)]
+        # SAME WINDOW as weights_arena's image post, closed the same way. The
+        # declaration above is deliberately BEFORE the buffers exist; if making
+        # them then fails, the post would describe bytes that never existed and
+        # #706's credit-back would subtract them from the next admission. Only
+        # the failure path is new -- the original error is re-raised untouched.
+        try:
+            self._free = [factory() for _ in range(self.capacity)]
+        except BaseException:
+            if self._registered:
+                from sglang.srt.mem_cache.pinned_host_budget import (
+                    unregister_pinned_post,
+                )
+
+                try:
+                    unregister_pinned_post(self.name)
+                except Exception:  # noqa: BLE001 -- cleanup never masks
+                    pass
+                self._registered = False
+            raise
 
     def acquire(self):
         """Borrow a buffer. Falls back to a fresh one when the ring is dry."""
