@@ -1228,6 +1228,12 @@ class Envs:
     # Forwards between two re-rank decisions, per layer. Small = re-ranks on
     # noise and pays PCIe for it; large = tracks a drifting workload slowly.
     SGLANG_MOE_HEAT_PERIOD = EnvInt(512)
+    # #516 longer-horizon miss budget for the heat re-rank. 0.0 = OFF and the
+    # OFF path is byte-identical. When > 0, a window whose miss rate is at or
+    # below this is left alone instead of re-ranked, so a swap is spent only
+    # where the miss rate says it is needed. Simulation on the recorded #302a
+    # series favours 0.04; nothing here has run on metal.
+    SGLANG_MOE_HEAT_MISS_BUDGET = EnvFloat(0.0)
     # Decay multiplied into every expert's count at each round boundary.
     # 1.0 = whole-run heat, 0.0 = only the last period counts.
     SGLANG_MOE_HEAT_DECAY = EnvFloat(0.5)

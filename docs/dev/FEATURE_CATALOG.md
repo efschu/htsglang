@@ -3633,6 +3633,44 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **MoE miss budgets (#516) — TWO of them, at different horizons.**
+  `DESIGN_516_miss_slot_budget.md`. Conflating them is why the half read as
+  unbuilt.
+  **PER-WAVE — ALREADY BUILT, under another name.** `ExpertOffload.resolve()`
+  (`layers/moe/expert_offload.py:528-586`) raises past `self.scratch` and sends
+  the caller to `plan_token_waves` (`:262-284`), which splits TOKENS so "every
+  token is still computed exactly once with all its experts resident ->
+  byte-identical". Cap = `scratch`, exhaustion = wave-split, losslessness by
+  construction. This is the one that matters for the GRAPHS half: a captured
+  graph needs a fixed slot shape and `scratch` IS that shape.
+  **LONGER-HORIZON — BUILT HERE, DEFAULT-OFF.**
+  `HeatWindow.budget_holds()` / `plan()` in
+  `layers/moe/expert_heat_migration.py`, flag
+  `SGLANG_MOE_HEAT_MISS_BUDGET` (default `0.0` = inert; 0.0 means "the budget
+  has nothing to say", NOT "always skip").
+  WHY IT IS LOSSLESS BY CONSTRUCTION, not by care: at exhaustion a miss cannot
+  be declined (the wave's GEMM needs those weights), deferral does not exist
+  inside a wave, and substituting a resident expert is a DIFFERENT computation.
+  So the only lossless lever left is whether to pay for a RE-RANK — the budget
+  gates the placement change, never admission. A test pins that its decision
+  function contains no routing vocabulary, so the property cannot decay.
+  ONE AUTHORITY: it reads `window_hit_activations`/`window_miss_activations`
+  that `HeatWindow` already maintained. No new module, no new counter.
+  EVIDENCE, and the trick that made it answerable: single-shot
+  `expert_stats_*.json` dumps are aggregate histograms with NO time axis, but
+  the `stats_series_*` dirs hold 12 CUMULATIVE snapshots per rank at 45 s
+  intervals — differencing gives 11 real per-window deltas.
+  `scripts/dev/302a_heat_desk/simulate_miss_budget.py`: at budget 0.04 it beat
+  swap-every-window on ALL NINE recorded rank/series combinations, worst case
+  +0.0021 hit rate, mean +0.0052, at 15-54% of the swaps. The sweep shows a
+  real peak (0.02 wins but gains less; 0.06 loses one; 0.10 is 6/9 and
+  mean-negative), so 0.04 is not tuned-to-fit.
+  THE MECHANISM was already named in the module: `period_forwards`' own comment
+  says "small values re-rank on noise and pay H2D for it" — a window inside
+  budget is a window whose top-R movement is noise.
+  NOT CLAIMED: simulation only. No H2D time measured, no live router, no
+  interaction with graph capture (#302a's refusal under capture is untouched).
+  Activation is a window decision.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an

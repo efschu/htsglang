@@ -72,6 +72,23 @@ class HeatMigrationConfig:
     # so the window is exponentially weighted rather than whole-run. 1.0 = never
     # forget (whole-run heat), 0.0 = only the last period counts.
     decay: float = 0.5
+    # #516 LONGER-HORIZON MISS BUDGET. 0.0 = OFF, and off is byte-identical:
+    # every swap the periodic policy would have made is still made.
+    #
+    # When > 0 it is the window MISS RATE below which the resident set is left
+    # alone: placement that is already meeting the budget is not re-ranked, so
+    # the swap is spent only where the miss rate says it is needed. This is the
+    # principled form of the hazard the `period_forwards` comment above already
+    # names -- "small values re-rank on noise and pay H2D for it" -- because a
+    # window whose miss rate is fine is exactly a window whose top-R movement
+    # is noise.
+    #
+    # Measured on the recorded #302a series (see
+    # scripts/dev/302a_heat_desk/simulate_miss_budget.py): at 0.04 the trigger
+    # beat swap-every-window on ALL NINE recorded rank/series combinations,
+    # worst case +0.0021 hit rate, mean +0.0052, at 26% of the swaps. Simulation
+    # only -- it has not run on metal.
+    miss_budget: float = 0.0
     # A candidate must be this much hotter than the victim it would displace.
     # Without it a pair whose heats differ by one activation swaps every round
     # and the migration pays PCIe forever for nothing.
@@ -99,6 +116,7 @@ class HeatMigrationConfig:
         return cls(
             enabled=bool(envs.SGLANG_MOE_HEAT_MIGRATION.get()),
             period_forwards=max(1, int(envs.SGLANG_MOE_HEAT_PERIOD.get())),
+            miss_budget=max(0.0, float(envs.SGLANG_MOE_HEAT_MISS_BUDGET.get())),
             decay=min(1.0, max(0.0, float(envs.SGLANG_MOE_HEAT_DECAY.get()))),
             hysteresis=max(0.0, float(envs.SGLANG_MOE_HEAT_HYSTERESIS.get())),
             min_gain=max(0.0, float(envs.SGLANG_MOE_HEAT_MIN_GAIN.get())),
@@ -126,6 +144,8 @@ class HeatMigrationStats:
     window_hit_activations: int = 0
     window_miss_activations: int = 0
     last_window_hit_rate: float = 0.0
+    # #516: rounds where the miss budget held and no swap was planned.
+    budget_held_rounds: int = 0
 
     def as_dict(self) -> dict:
         d = {
@@ -140,6 +160,7 @@ class HeatMigrationStats:
             "h2d_bytes": self.h2d_bytes,
             "d2h_bytes": self.d2h_bytes,
             "last_window_hit_rate": self.last_window_hit_rate,
+            "budget_held_rounds": self.budget_held_rounds,
         }
         return d
 
@@ -302,6 +323,27 @@ class HeatWindow:
         # grow to hold every expert forever at a negligible weight.
         self.heat = {e: v * decay for e, v in self.heat.items() if v * decay >= 1e-3}
 
+    def budget_holds(self) -> bool:
+        """True when the closing window's miss rate is within the budget.
+
+        Pure and side-effect free, so the decision can be pinned without a
+        window object's history. ``miss_budget <= 0`` disables it and this
+        always returns False, which is what makes the OFF path byte-identical:
+        a False here means "the budget has nothing to say", not "swap".
+
+        Reads the CLOSING window's counters, i.e. the same numbers
+        ``close_round`` is about to fold into ``last_window_hit_rate``. It must
+        run BEFORE the round closes, which is where :meth:`plan` calls it.
+        """
+        budget = float(self.cfg.miss_budget)
+        if budget <= 0.0:
+            return False
+        s = self.stats
+        total = s.window_hit_activations + s.window_miss_activations
+        if total <= 0:
+            return False
+        return (s.window_miss_activations / total) <= budget
+
     def plan(
         self,
         resident_ids: Iterable[int],
@@ -309,6 +351,12 @@ class HeatWindow:
         pinned: Optional[FrozenSet[int]] = None,
         delegated: Optional[FrozenSet[int]] = None,
     ) -> List[Tuple[int, int]]:
+        # #516: spend the swap only where the miss rate says it is needed. A
+        # window already inside the budget is left alone -- its top-R movement
+        # is the noise the module's own period comment warns about paying for.
+        if self.budget_holds():
+            self.stats.budget_held_rounds += 1
+            return []
         return plan_heat_swaps(
             self.heat,
             resident_ids,
