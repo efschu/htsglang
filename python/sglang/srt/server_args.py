@@ -58,7 +58,6 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -105,6 +104,25 @@ from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_av
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
+
+#: FLA's chunk size, INLINED rather than imported (#673 follow-up).
+#:
+#: This used to be
+#: ``from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE``,
+#: which dragged torch, triton and the whole FLA kernel chain into EVERY
+#: process that touches ServerArgs -- launcher, tokenizer manager, detokenizer
+#: -- to learn one integer. Worse than the cost: ``fla/utils.py`` probes the
+#: device AT IMPORT TIME (``get_available_device`` -> ``torch.cuda.is_available``,
+#: plus the triton driver), so processes that must never hold a CUDA context
+#: were touching the driver during argument parsing -- the #237/#403
+#: second-context family.
+#:
+#: The upstream value is a plain literal, so there is nothing to derive. It is
+#: pinned against the authoritative definition by
+#: ``test_server_args_import_weight_673.py``, which imports FLA properly (in a
+#: test, where the cost is fine) and fails if the two ever diverge -- so drift
+#: is loud rather than silent.
+FLA_CHUNK_SIZE = 64
 
 logger = logging.getLogger(__name__)
 
@@ -5570,13 +5588,13 @@ class ServerArgs:
             help="#673: destroy this scheduler's process groups on the graceful "
             "shutdown path, instead of leaving them to the interpreter. torch "
             "already reports the omission on every boot "
-            "(\"destroy_process_group() was not called before program exit\"), "
+            '("destroy_process_group() was not called before program exit"), '
             "and the cost is the #673 abort: ProcessGroupNCCL's watchdog and "
             "heartbeat are C++ threads joined by the group's destructor, so "
             "with the group never destroyed they are still joinable when the "
             "process tears down -- and destroying a joinable std::thread calls "
-            "std::terminate, which is the observed \"terminate called without "
-            "an active exception\" after a CLEAN drain. Default off because "
+            'std::terminate, which is the observed "terminate called without '
+            'an active exception" after a CLEAN drain. Default off because '
             "the destroy path also closes barlink (a POSIX shm segment and the "
             "device-mapped abort word that spinning kernels read), which is "
             "task #722's live machinery.",

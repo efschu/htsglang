@@ -89,11 +89,9 @@ import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
 from PIL import Image
-from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -2176,6 +2174,12 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            # #673 sweep: torchvision is imported HERE, not at module scope.
+            # This module is loaded by every process (the package root reaches
+            # it), and torchvision pulls its own torch extension and image
+            # codecs -- for one call, on a path that is already CUDA-only.
+            from torchvision.io import decode_jpeg
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -2895,6 +2899,11 @@ def set_prometheus_multiproc_dir():
 def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    # #673 sweep: starlette alongside prometheus_client, for the same reason
+    # the line above gives -- this is the only use, and every process that
+    # merely parses arguments was paying for a web framework at import.
+    from starlette.routing import Mount
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
