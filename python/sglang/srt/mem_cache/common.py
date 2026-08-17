@@ -1198,6 +1198,40 @@ def alloc_paged_token_slots_extend(
     out_cache_loc = _attempt_alloc()
 
     if out_cache_loc is None:
+        # #715 / #681 THIRD ROOT, AND IT IS TRIED FIRST BECAUSE IT IS NOT
+        # RELIEF -- the same ordering, for the same reason, as in
+        # alloc_token_slots.
+        #
+        # RULE 3 was applied to this path for the relief NET but not for the
+        # third root, so a paged prefill reached its raise without ever asking
+        # whether the pages it needed were already freed and merely staged.
+        # That is the 2026-08-17 02:18 crash: 512 tokens refused with 147,456
+        # counted evictable, because the eviction ran inside a free-group
+        # window (batch_result_processor.py:92 and :741) and honestly reported
+        # full delivery while available_size could not yet see the pages.
+        #
+        # Costs nothing: it applies frees the tree has ALREADY performed and
+        # already counted. Cold path only -- reached after an allocation has
+        # failed, so a healthy alloc pays one list check less than nothing.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            if backup_state:
+                # The snapshot above predates the flush; re-take it so a
+                # rollback cannot drop the pages the flush just applied.
+                state = allocator.backup_state()
+            out_cache_loc = _attempt_alloc()
+            logger.warning(
+                "paged extend allocation of %d tokens failed with %d tokens "
+                "already freed but still staged in the allocator's batching "
+                "group; applying them %s. This is #681's third root on the "
+                "paged path: an eviction inside a free-group window counts "
+                "tokens the pool cannot yet hand out.",
+                extend_num_tokens,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
+
+    if out_cache_loc is None:
         # #681 RULE 3: every alloc path reachable from prefill admission gets
         # the same net. This is the page_size > 1 twin of alloc_token_slots and
         # it had none -- the audit found three raise sites on this path
@@ -1454,6 +1488,34 @@ def alloc_paged_token_slots_decode(
             batch.out_cache_loc_dsv4 = bundle
     else:
         out_cache_loc = out
+
+    if out_cache_loc is None:
+        # #715 / #681 THIRD ROOT, decode twin. The free-group window that
+        # strands pages is opened by the event loop and does not care which
+        # allocation runs inside it, so this path can reach its raise with the
+        # pages it needs already freed and merely staged -- exactly as the
+        # extend path did. Applying them gives up nothing; the raise below is
+        # unchanged, so fail-loud still has the last word.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            out = allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
+            )
+            if is_dsv4:
+                bundle = out
+                out_cache_loc = None if bundle is None else bundle.out_full_loc
+                if batch is not None:
+                    batch.out_cache_loc_dsv4 = bundle
+            else:
+                out_cache_loc = out
+            logger.warning(
+                "paged decode allocation of %d tokens failed with %d tokens "
+                "already freed but still staged in the allocator's batching "
+                "group; applying them %s.",
+                len(seq_lens) * token_per_req,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
 
     if out_cache_loc is None:
         error_msg = (
