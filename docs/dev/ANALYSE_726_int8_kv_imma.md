@@ -167,3 +167,84 @@ the first thing to produce if the microbench comes back favourable.
 Whether V should stay int8 (NInfer keeps it int8 in cache and dequantizes once
 to bf16, since PV is not a key-contracted int8 accumulation) versus K-only
 quantization is a real quality/bandwidth fork and is **not** decided here.
+
+---
+
+## 8 — Backend and pool map (folded in after §7 was written)
+
+The delegated map completed after the verdict above and independently
+reproduced all three premise corrections in §0 — including the zero-hits grep
+for int8 KV and the absence of `int8_pth` anywhere in the fork. It also
+supplied four things that change what a build would have to do. The two
+load-bearing ones I verified directly rather than adopting on trust.
+
+**(1) Today's fp8 KV scale mechanism is hard-coded to PER-TENSOR, and says so.**
+`layers/quantization/kv_cache.py:76-79`:
+
+```python
+if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+    raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+```
+
+So a group-64 per-token scale layout is not an extension of the fp8 path; that
+path actively refuses anything finer than one float per layer. **VERIFIED.**
+
+**(2) The one existing group-scale precedent dequantizes EAGERLY — which is
+exactly what this design refuses.** `MHATokenToKVPoolFP4`
+(`mem_cache/memory_pool.py:3302-3350`) keeps a separate per-layer
+`k_scale_buffer` with one scale per 16-element block — structurally the right
+shape to imitate — but `_get_key_buffer` then calls
+`BlockFP4KVQuantizeUtil.batched_dequantize(...)`, materialising full precision
+before any backend sees it. **VERIFIED.**
+
+That is the trap. Copying the fp4 pattern would deliver the **VRAM** saving and
+NOT the **bandwidth** saving, and bandwidth is the entire point of IMMA-QK —
+NInfer explicitly refuse a standalone quant/dequant kernel because it "would
+defeat the halved-bandwidth goal" (`gqa_attention_kv_quant.cuh:5-8`). A build
+that reused the fp4 machinery would look like it had landed the feature while
+delivering half of it.
+
+**(3) The closest carrier is the grouped Triton kernel, and its scale handling
+is the gap.** `_fwd_grouped_kernel_stage1`
+(`python/sglang/kernels/ops/attention/decode_attention.py:352+`) already casts
+Q to K's dtype and does `qk = tl.dot(q_k, k)` — a real `tl.dot`, which Triton
+can lower to tensor-core MMA. But `k_scale` is folded into `sm_scale` as a
+**single scalar before the kernel is entered** (`:899-969`), so there is no
+per-token/per-group descale inside the kernel at all. The non-grouped MHA path
+is further away still: it does `qk = tl.sum(q[None, :] * k, 1)`, not a dot.
+
+**(4) IMMA is already in-tree, in the wrong place.**
+`sgl-kernel/csrc/gemm/int8_gemm_kernel.cu` runs
+`mma.sync.aligned.m16n8k32.s8` via CUTLASS for W8A8 **linear layers**, and is
+reached from `layers/quantization/w8a8_int8.py` — never from the KV pool or any
+attention backend. `sgl-kernel/csrc/gemm/per_token_group_quant_8bit.cu` is a
+group-size-templated per-token quant kernel and is a plausible reusable
+primitive, also not applied to KV today.
+
+Read together: the instruction is proven present and callable in this tree, and
+the arithmetic shape of a group-64 scale buffer has a precedent. What does not
+exist is a fused read path — and the fp4 precedent is a worked example of
+solving the layout while missing the point.
+
+## 9 — Correction to §4: the collision surface is closed only for the DTYPE STRING
+
+§4 said the key-collision surface is already closed. That is right for the
+question asked and **incomplete** for the question a build would raise.
+
+`compute_model_identity_hash` hashes the dtype **string**, not the byte layout
+within it. Once `int8` exists as a value, a later change to its internal layout
+— group-64 → group-128, or an fp16 scale becoming bf16 — keeps the same
+`--kv-cache-dtype=int8` string and therefore the same identity hash, while the
+pages on disk mean something different. Persistent tiers outlive the process,
+so that is a silent wrong hit of exactly the kind this hash was built to
+prevent, and exactly the #513 class it already documents for uneven-TP bytes.
+
+**Named as a build requirement, not pinned.** A pin asserting that two int8
+layouts produce different keys cannot fail today, because neither layout
+exists; writing one would encode a green state that does not exist, which this
+strand has refused twice already. The requirement is: if int8 KV is built, its
+layout parameters (group size, scale dtype) must enter the identity, not just
+the dtype name.
+
+This does not change §5. It is one more item on the build's bill, and the build
+is not the next step.
