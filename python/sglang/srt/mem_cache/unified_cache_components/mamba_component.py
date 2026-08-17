@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval
 from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
@@ -89,10 +90,16 @@ class MambaComponent(TreeComponent):
         # states. We temporarily skip branching-state fill in that mode and can
         # add a HiCache-aware branching policy later.
         if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_server_args().mamba_cache_chunk_size
-            aligned_seqlen = (
-                sum(len(v) for v in value_chunks) // chunk_size
-            ) * chunk_size
+            # #747: the branching position must sit on the CHECKPOINT grid when
+            # one is configured, not merely on the FLA chunk grid. Mirrors
+            # mamba_radix_cache.py:1600 (`branch_grid = interval or chunk_size`)
+            # -- the same rule, read from the same place, so the two lineages
+            # cannot drift apart the way they did before #747.
+            sa = get_server_args()
+            branch_grid = sa.mamba_checkpoint_interval or sa.mamba_cache_chunk_size
+            aligned_seqlen = floor_to_interval(
+                sum(len(v) for v in value_chunks), branch_grid
+            )
             branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
         else:
             branching_seqlen = None

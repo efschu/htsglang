@@ -62,7 +62,11 @@ import logging
 import os
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval, is_on_interval
+from sglang.srt.mem_cache.mamba_ckpt_utils import (
+    floor_to_interval,
+    is_on_interval,
+    protect_deepest_anchors,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -1098,7 +1102,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if self.disable or mamba_num <= 0:
             return 0
-        protect = self.mamba_checkpoint_interval is not None
+        # #747: one rule, both lineages. MambaRadixCache is device-only, so
+        # an evicted anchor is a lost anchor and the protection stays on.
+        protect = protect_deepest_anchors(
+            self.mamba_checkpoint_interval, host_tier_present=False
+        )
         mamba_num_evicted = self._evict_mamba_pass(mamba_num, protect_window=protect)
         if protect and mamba_num_evicted < mamba_num:
             mamba_num_evicted += self._evict_mamba_pass(
