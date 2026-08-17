@@ -1172,37 +1172,55 @@ def alloc_paged_token_slots_extend(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    def _attempt_alloc():
+        """One allocation attempt, including the DSV4 bundle unwrap.
 
-    if is_dsv4:
-        bundle = out
-        out_cache_loc = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
-    else:
-        out_cache_loc = out
+        A closure so the RETRY below is the same call as the first attempt --
+        the previous shape duplicated neither, and that is exactly how the
+        retry came to be missing.
+        """
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
+        if is_dsv4:
+            bundle = out
+            if batch is not None:
+                batch.out_cache_loc_dsv4 = bundle
+            return None if bundle is None else bundle.out_full_loc
+        return out
+
+    out_cache_loc = _attempt_alloc()
 
     if out_cache_loc is None:
         # #681 RULE 3: every alloc path reachable from prefill admission gets
         # the same net. This is the page_size > 1 twin of alloc_token_slots and
         # it had none -- the audit found three raise sites on this path
         # (alloc_req_slots, alloc_token_slots, this one) and only one covered.
+        #
+        # #681 REMAINDER: and having asked for relief, SPEND IT. This path used
+        # to consult the provider, log that relief had SUCCEEDED, and then fall
+        # through to the raise without retrying -- the net was cast, the catch
+        # announced, and the batch died anyway. alloc_token_slots has retried
+        # since #679 (see its `allocator.alloc(num_tokens)` after the same
+        # call); this is that discipline applied verbatim, not a new policy.
+        # The raise below is unchanged, so fail-loud still has the last word.
         freed = _attempt_extend_relief(extend_num_tokens)
         if freed > 0:
+            out_cache_loc = _attempt_alloc()
             logger.warning(
                 "paged extend allocation of %d tokens failed; rank-local "
-                "relief returned %d tokens. Admission should have prevented "
-                "this -- treat a recurring line here as an admission defect.",
+                "relief returned %d tokens and the retry %s. Admission should "
+                "have prevented this -- treat a recurring line here as an "
+                "admission defect, not as relief working.",
                 extend_num_tokens,
                 freed,
+                "SUCCEEDED" if out_cache_loc is not None else "still failed",
             )
     if out_cache_loc is None:
         error_msg = (
