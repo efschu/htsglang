@@ -3443,6 +3443,40 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **#588/#597 TP all-reduce overlap levers, and the prefill collective floor**
+  — `DESIGN_588_collective_floor.md`. Two independent opt-in levers, both
+  DEFAULT OFF: #588 in-call pipelining at `RowParallelLinear`
+  (`layers/linear.py:2288`) hides a collective under the producing GEMM; #597
+  deferred-join (`distributed/tp_ar_pipeline.py`) hides it under everything
+  between producer and first consumer.
+  **#588 IS STRUCTURALLY INERT ON PLAIN TP, not merely unset**: its gate
+  requires `not is_allocation_symmetric()`, and that predicate is
+  `not is_dp_attention_enabled() or is_dp_max_padding()`
+  (`layers/dp_attention.py:309`), i.e. TRUE whenever DP attention is off. It
+  cannot engage on a dense plain-TP config even with `SGLANG_TP_AR_PIPELINE`
+  set — the pipeline needs the symmetric-memory context DISABLED and plain TP
+  is where it is enabled.
+  **#597 HAS EXACTLY ONE ISSUE SITE** (`layers/moe/fused_moe_triton/layer.py:2062`,
+  MoE-only), so on a dense model it cannot fire either. Its JOIN half is
+  producer-agnostic (`layers/communicator.py:675`, `:873`, `:891`).
+  THE ASYMMETRY THAT DECIDES THE DESIGN: at
+  `layers/communicator.py:1204` the reduce is COMMUNICATOR-owned, so hooking
+  there needs suppression — the exact case `note_reduce_site`
+  (`tp_ar_pipeline.py:888`) was planted to catch. At `layers/linear.py:2338`
+  the reduce is PRODUCER-owned, structurally identical to the MoE site, so its
+  absence is SCOPING rather than hazard. Recommendation is to extend #597 to
+  that site (no suppression anywhere), gated on establishing #597's own
+  "nothing downstream reduces this tensor" property for the dense path.
+  GUARD DIRECTIONALITY, worth knowing before designing here: `note_reduce_site`
+  covers issue-without-suppression (double reduce — counted, warned, joined).
+  It does NOT cover suppression-without-issue (activations never reduced): that
+  tensor carries no handle and returns untouched at `tp_ar_pipeline.py:902`.
+  The silent direction is the unguarded one.
+  FALSIFIER ALREADY EXISTS, do not rebuild:
+  `test/registered/unit/distributed/test_tp_ar_deferred_join.py:258`
+  (`test_double_reduce_falsifier_can_fail`) fires the guard AND shows the
+  second reduction would corrupt; `:238` pins the zero-side invariant; `:453`
+  pins that every communicator all-reduce site carries the guard.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
