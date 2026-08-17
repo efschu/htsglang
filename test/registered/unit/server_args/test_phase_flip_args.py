@@ -84,7 +84,19 @@ class TestPhaseFlipArgs(CustomTestCase):
         # TP decode phase and is allowed here. See
         # TestFlipV1SpeculationBlockers for what stays refused and why.
         for extra, pat in (
-            ({"enable_hierarchical_cache": True}, "#630"),
+            # #630 RESTORED 2026-08-17, and NARROWED to match the runtime
+            # twin exactly: a pipeline carrying a STORAGE-BACKED tier is what
+            # wedged on metal (649 s in pp_sync, all three ranks). The
+            # device+host-local tier is deliberately still reachable, so the
+            # flag alone is no longer a blocker -- naming the backend is what
+            # makes this the refused combination.
+            (
+                {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "file",
+                },
+                "#630",
+            ),
             ({"dp_size": 2}, "dp-size"),
             ({"disaggregation_mode": "prefill"}, "disaggregation"),
         ):

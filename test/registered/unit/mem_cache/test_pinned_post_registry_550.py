@@ -80,11 +80,20 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
         )
 
     def test_a_post_that_fits_alone_is_refused_once_others_are_registered(self):
-        """A third tier must not be admitted on its own arithmetic."""
+        """A third tier must not be admitted on its own arithmetic.
+
+        FIXTURE CORRECTED 2026-08-17 (#706 `d7d85b4e37`). ``available`` is read
+        LIVE, so an ALLOCATED 30 GB post is already missing from it -- a static
+        40 GB alongside a registered 30 GB post is a state the machine cannot
+        be in, and the old numbers only refused because the backstop billed
+        allocated posts twice. 64 total with 30 GB already taken leaves 10, and
+        the intent is unchanged: 20 GB fits on its own arithmetic and must not
+        be admitted on it.
+        """
         register_pinned_post(
             PinnedHostPost(name="existing", flag="--existing", nbytes=30 * _GB)
         )
-        with self._with_host(64, 40):
+        with self._with_host(64, 10):
             with self.assertRaises(ValueError) as ctx:
                 check_and_register_pinned_post(
                     name="newcomer", flag="--newcomer", requested_bytes=20 * _GB
@@ -102,7 +111,16 @@ class TheAdmissionChargesEveryRegisteredPost(unittest.TestCase):
         self.assertIn("newcomer", [p.name for p in registered_posts()])
 
     def test_an_admitted_post_is_registered_so_the_next_one_sees_it(self):
-        with self._with_host(64, 40):
+        """FIXTURE CORRECTED 2026-08-17: ``available`` must FALL as posts
+        allocate. Holding it at 40 GB across both calls modelled a machine
+        where allocating 20 GB costs nothing, and only the double-billing made
+        that look like a refusal. Reading 40 then 20 is what the live figure
+        actually does, and the assertion is the same one: the second post sees
+        the first."""
+        with patch(
+            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            side_effect=[(64 * _GB, 40 * _GB), (64 * _GB, 20 * _GB)],
+        ):
             check_and_register_pinned_post(
                 name="first", flag="--first", requested_bytes=20 * _GB
             )

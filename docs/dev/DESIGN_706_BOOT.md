@@ -363,10 +363,31 @@ Sections 1-4 are the reasoning. This section is the ticket: it assumes nothing
 from the rest of the document and can be executed as written. It contains no
 boot -- it describes one.
 
-### 5.1 Preconditions (all four, before any process starts)
+### 5.1 Preconditions (all five, before any process starts)
+
+> **PRECONDITION 0 -- THIS BOOT IS BLOCKED TODAY.** A pipeline (`pp_size > 1`)
+> carrying a STORAGE-BACKED tier is refused, at parse time and again at arming,
+> by the #630 guard restored on 2026-08-17. It is not a stale blocker: measured
+> that day, `10:57:50 -> 11:08:39`, all three ranks sat inside `pp_sync` for
+> ~649 s with the send and its matching receive both posted on the same group
+> and tag. `9da9dfd025` BOUNDED that wait; it never rooted the desync, and
+> `test_hicache_bounded_waits_630.py` proves only that a bounded call raises on
+> schedule against mocked Work objects.
+>
+> **Unblocks when** the pp_sync rendezvous is rooted and a test proves two REAL
+> ranks meet — not when one proves a wait expires. Guard `90e84ad268` (runtime,
+> `phase_flip_runtime.flip_blocking_guards`) and its parse-time twin
+> (`server_args._handle_phase_flip`) lift together, with that evidence.
+>
+> **What is still reachable meanwhile**, because the guard was narrowed to the
+> combination that actually wedged: a single-stage flip, and the
+> device+host-local tier at any stage count. Everything in this run-card except
+> the disk-tier rows can be exercised there; §5.4 row 5 and the §3.5 retention
+> claims are the parts that wait.
 
 | # | check | pass condition | if it fails |
 | --- | --- | --- | --- |
+| 0 | #630 pp_sync rooted | the guard above has been LIFTED with rendezvous evidence | **stop -- this boot is refused and would wedge; see the block note** |
 | 1 | `free -g` available | `> 24.3 G` (the #721 floor) -- and see the note below | do not start; the pinned budget refuses at attach, not at OOM |
 | 2 | serving line carries the flip | `--enable-phase-flip` boots today | the flip is the dependency, not this ticket -- see #722 (barlink) if it is flip-less |
 | 3 | disk L3 sized | `~100 GB` free at `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` | shrink the retention expectation, not the min-free floor |

@@ -7896,13 +7896,48 @@ class ServerArgs:
         # runtime clause is not enough -- this one refuses at parse time, before
         # a scheduler exists, so both must move together or the flag is still
         # unusable.
-        # #703 stage 2: the #630 blocker is REMOVED, matching its runtime twin
-        # in phase_flip_runtime.flip_blocking_guards. The disk tier is the
-        # retention store the design needs (user decision: disk is plentiful,
-        # host RAM is not), and the wedge that earned this blocker was fixed by
-        # 9da9dfd025 with a green suite. See the comment at the runtime clause
-        # for why the pp-suffix decision, not the backend allowance, is the
-        # thing that stays gated on #706's whole-page format.
+        # #703 stage 2 REMOVED this blocker, arguing that 9da9dfd025 (bounded
+        # collectives) had fixed the wedge and that the runtime twin was gone.
+        # RESTORED 2026-08-17, narrowed to match that twin EXACTLY, because
+        # both halves of the removal's premise were withdrawn by measurement:
+        # 9da9dfd025 BOUNDED the wait, it never rooted the desync, and
+        # test_hicache_bounded_waits_630.py proves only that the bounded calls
+        # raise on schedule against mocked Work objects -- never that two real
+        # ranks rendezvous, which is the thing that fails. Measured 2026-08-17
+        # 10:57:50 -> 11:08:39 on a PP=3 line with --enable-hierarchical-cache
+        # --hicache-storage-backend file: all three ranks sat INSIDE pp_sync
+        # for ~649 s with the send and its matching receive both posted, same
+        # group, same tag. The mechanism is UNROOTED.
+        #
+        # The narrowing is the point: this refuses only the combination that
+        # has actually wedged on metal -- a PIPELINE carrying a storage-backed
+        # tier. Single-stage flips and the device+host-local tier stay
+        # reachable, which is what #703 was for.
+        #
+        # WHY AT PARSE TIME as well as at runtime: the runtime twin fires when
+        # the scheduler arms, i.e. after a full weight load and into warmup.
+        # Refusing here costs the operator a second; refusing there cost 11
+        # minutes and a dead instance. Both move together or the flag is
+        # unusable -- that part of #703's reasoning still holds.
+        #
+        # LIFT BOTH when a test proves two ranks RENDEZVOUS, not when one
+        # proves a wait expires. DESIGN_706_BOOT.md's run-card carries the same
+        # condition as an explicit precondition, so the blocked boot and the
+        # ticket that describes it cannot drift apart.
+        if (
+            self.pp_size > 1
+            and getattr(self, "enable_hierarchical_cache", False)
+            and getattr(self, "hicache_storage_backend", None)
+        ):
+            blockers.append(
+                f"pipeline parallelism (pp_size={self.pp_size}) with a "
+                f"storage-backed hierarchical cache "
+                f"({self.hicache_storage_backend!r}) -- #630's pp_sync desync "
+                "is bounded but NOT fixed; measured 2026-08-17 as a 649 s "
+                "HiCacheCollectiveTimeoutError on all three ranks at warmup. "
+                "This is the parse-time twin of the clause in "
+                "phase_flip_runtime.flip_blocking_guards"
+            )
         if getattr(self, "dual_group_lane", False):
             blockers.append("--dual-group-lane")
         if self.dp_size > 1:
