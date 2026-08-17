@@ -15,12 +15,18 @@ class _FakeWork:
         self.waited = False
 
     def is_completed(self) -> bool:
-        # #630: the drain now polls before it waits, so the stub has to answer
-        # the same question a real torch.distributed.Work does.
+        # Kept because a real Work has it, though the drain no longer polls:
+        # polling was the #630 livelock (is_completed REPORTS, wait DRIVES), so
+        # the bound is now handed to wait() itself. See
+        # test_pp_sync_rendezvous_630.py.
         return True
 
-    def wait(self):
+    def wait(self, *args, **kwargs):
+        # Must accept the deadline a real torch.distributed.Work accepts; this
+        # stub previously took no arguments at all, which is why handing the
+        # bound to wait() surfaced here as a TypeError.
         self.waited = True
+        return True
 
 
 class _Holder:
