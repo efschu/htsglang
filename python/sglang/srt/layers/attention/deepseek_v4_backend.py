@@ -90,6 +90,41 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
+def verify_swa_window(model_config) -> int:
+    """Refuse a checkpoint whose DECLARED SWA window is not the compiled-in one.
+
+    #447 candidate F ("read the SWA window from config instead of the bare
+    constant"), built as a CHECK rather than a plumb-through, because the
+    window is not actually a free parameter here: the C128 compressor pools a
+    page with ``tl.static_range(COMPRESS_RATIO)`` and the backend asserts
+    ``swa_page_size == SWA_WINDOW`` and ``swa_page_size % SWA_WINDOW == 0``.
+    Feeding a different number through would not make the kernels honour it --
+    it would compute against the wrong span, or trip an assert far from the
+    cause.
+
+    Every DSV4 checkpoint on this box declares ``"sliding_window": 128``
+    (0731-GGUF/UD-Q3_K_XL, the DSpark head, and its filtered sibling), so the
+    constant was right by LUCK rather than by check. This turns that luck into
+    a named refusal at init, with both numbers, and changes nothing otherwise.
+
+    An UNDECLARED window keeps today's behaviour deliberately: most configs in
+    this family carry no such key, and refusing them would be a regression in
+    the name of tidiness.
+    """
+    declared = getattr(model_config, "sliding_window_size", None)
+    if declared is None:
+        return SWA_WINDOW
+    if int(declared) == SWA_WINDOW:
+        return SWA_WINDOW
+    raise ValueError(
+        f"this checkpoint declares a sliding window of {int(declared)}, but the "
+        f"DSV4 backend is built around SWA_WINDOW={SWA_WINDOW}: the C128 "
+        f"compressor pools a fixed 128-slot page and the SWA page arithmetic "
+        f"asserts equality with it. Running anyway would compress against the "
+        f"wrong span silently. Refused here, at init, rather than in a kernel."
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -508,7 +543,10 @@ class DeepseekV4AttnBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.swa_page_size = 128
+        # #447 candidate F: the window is CHECKED against the checkpoint now,
+        # not assumed. Returns SWA_WINDOW so the value in use still has exactly
+        # one definition.
+        self.swa_page_size = verify_swa_window(model_runner.model_config)
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
