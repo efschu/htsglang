@@ -539,6 +539,7 @@ def admission_wedge_verdict(
     seconds_since_progress: float,
     threshold: float = ADMISSION_WEDGE_SECONDS,
     idle_locked_seen: bool = False,
+    seconds_since_prefill_progress: Optional[float] = None,
 ):
     """``(alarm, detail)`` for the admission-wedge class (#699, from #713).
 
@@ -555,6 +556,22 @@ def admission_wedge_verdict(
     clock -- a long generation legitimately produces none for minutes -- and
     forward passes are the wrong clock for the reason above.
 
+    PREFILL IS ALSO PROGRESS (#739). The first-token clock alone cannot tell a
+    wedge from a mega-prefill: a ~500k-token backlog chunking at 512 produces
+    NO first token for minutes while prefill batches run the whole time, and it
+    presents with the identical three numbers (queued > 0, running 0, large
+    age) because a chunked request stays in the waiting queue and nothing is
+    decoding. ``seconds_since_prefill_progress`` is the age of the last
+    COMPLETED prefill chunk; when one landed inside the window this is not a
+    wedge, whatever the first-token clock says.
+
+    That clock is an EVENT TIMESTAMP, deliberately not a pending-token delta:
+    the pending counter is the one #731 shows double-billed, and a detector
+    keyed to a counter under repair would inherit its noise and its rebases.
+
+    ``None`` means the signal is unavailable, and reproduces the pre-#739
+    verdict exactly.
+
     ``idle_locked_seen`` is the PHASE-POLICY IDLE-LOCKED TERMS line, which
     corroborates when present. It is deliberately NOT required: the wedge class
     is broader than the phase-policy path, and a detector that only fired
@@ -567,17 +584,34 @@ def admission_wedge_verdict(
         return False, "no queue: nothing is waiting, so nothing is wedged"
     if r > 0:
         return False, (
-            f"{r} request(s) running: the box is serving, not wedged "
-            f"(queued {q})"
+            f"{r} request(s) running: the box is serving, not wedged " f"(queued {q})"
         )
     if age < float(threshold):
         return False, (
             f"queued {q}, running 0, but only {age:.1f}s since the last first "
             f"token (< {float(threshold):.1f}s) -- ordinary scheduling latency"
         )
+    prefill_age = (
+        None
+        if seconds_since_prefill_progress is None
+        else float(seconds_since_prefill_progress)
+    )
+    if prefill_age is not None and prefill_age < float(threshold):
+        return False, (
+            f"queued {q}, running 0, and no first token for {age:.1f}s -- but a "
+            f"prefill chunk completed {prefill_age:.1f}s ago "
+            f"(< {float(threshold):.1f}s): the box is PREFILLING, not wedged. A "
+            f"mega-prefill produces no first token for minutes by construction"
+        )
     return True, (
         f"{ADMISSION_WEDGE}: {q} queued, 0 running, and NO first token for "
-        f"{age:.1f}s (>= {float(threshold):.1f}s). Work is admissible and "
+        f"{age:.1f}s (>= {float(threshold):.1f}s)"
+        + (
+            " and no prefill chunk either"
+            if prefill_age is not None
+            else " (no prefill-progress signal available)"
+        )
+        + ". Work is admissible and "
         f"nothing is serving it. forward_ct and health both read healthy in "
         f"this state, which is why neither catches it"
         + (
@@ -623,8 +657,18 @@ def check_admission_wedge_once(
     queued = len(scheduler.waiting_queue)
     running = len(scheduler.running_batch.reqs)
     age = now - scheduler.last_first_token_progress_time
+    # #739: absent on an older scheduler -> None -> the pre-#739 verdict.
+    prefill_stamp = getattr(scheduler, "last_prefill_progress_time", None)
+    seconds_since_prefill_progress = (
+        None if prefill_stamp is None else now - prefill_stamp
+    )
 
-    alarm, verdict_detail = admission_wedge_verdict(queued, running, age)
+    alarm, verdict_detail = admission_wedge_verdict(
+        queued,
+        running,
+        age,
+        seconds_since_prefill_progress=seconds_since_prefill_progress,
+    )
     detail = (
         f"queue age {age:.1f}s since last first-token progress "
         f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
@@ -660,9 +704,7 @@ def create_admission_wedge_watchdog(
             except Exception as e:  # noqa: BLE001 - a watchdog must not die
                 logger.error(f"admission-wedge watchdog check failed: {e}")
 
-    t = threading.Thread(
-        target=_loop, daemon=True, name="admission-wedge-watchdog"
-    )
+    t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
     t.start()
     return t
 
