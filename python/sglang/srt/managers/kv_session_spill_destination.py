@@ -104,6 +104,14 @@ logger = logging.getLogger(__name__)
 #: accounting read, so it is reported once per episode rather than per decline.
 _LADDER_REPORT_EVERY_ITERS: int = 512
 
+# #673: how long teardown waits for kvso-dest-io before detaching it. Bounded
+# on purpose -- the worker can be parked in cudaEventSynchronize on a device
+# that is not answering, and hanging shutdown is worse than the abort it
+# prevents. Long enough for an in-flight tier write to finish on a healthy box,
+# short enough that a wedged one still exits.
+KVSO_WORKER_JOIN_TIMEOUT_S: float = 2.0
+KVSO_LOG_PREFIX = "[#673 kvso-dest-io]"
+
 
 def _local_host_name() -> str:
     """This machine's name, as the tier ids spell it.
@@ -799,6 +807,57 @@ class SpillDestinationController:
         return t
 
     # -- worker ------------------------------------------------------------
+
+    def stop_worker(self, timeout_s: float = KVSO_WORKER_JOIN_TIMEOUT_S) -> str:
+        """Stop the ``kvso-dest-io`` thread. Returns what happened (#673).
+
+        The loop already knows how to stop -- ``_worker_loop`` returns on a
+        ``None`` sentinel -- but until now nothing sent one and nothing joined,
+        so the thread was created unconditionally in ``__init__`` and leaked on
+        every boot that uses kvso. Its body calls ``evt.synchronize()``
+        (cudaEventSynchronize), and a thread sitting in a CUDA call while the
+        process tears down is the #673 abort shape. ``daemon=True`` does not
+        save it: it means the interpreter stops WAITING, which is exactly how
+        the thread ends up mid-C++-call at exit.
+
+        THE JOIN IS BOUNDED, and that is the whole design point. On a wedged
+        device the worker can be parked inside ``cudaEventSynchronize`` and
+        will never read the sentinel. Blocking teardown on it would trade an
+        abort for a hang, which is worse -- the abort at least ends the
+        process. So when the deadline passes the thread is detached, and it is
+        said out loud: a silent detach reads exactly like a clean join in the
+        log, which is how this class of leak stays invisible.
+
+        Never raises, and idempotent: teardown paths get called twice.
+        """
+        worker = getattr(self, "_worker", None)
+        if worker is None or not worker.is_alive():
+            return "already stopped"
+        jobs = getattr(self, "_jobs", None)
+        if jobs is not None:
+            try:
+                jobs.put(None)
+            except Exception as e:  # noqa: BLE001 - teardown must not raise
+                logger.warning(
+                    "%s could not post the stop sentinel to kvso-dest-io: %s",
+                    KVSO_LOG_PREFIX,
+                    e,
+                )
+        worker.join(timeout=float(timeout_s))
+        if worker.is_alive():
+            logger.warning(
+                "%s kvso-dest-io did not stop within %.2fs and is being "
+                "DETACHED deliberately. It is most likely parked in "
+                "cudaEventSynchronize on a device that is not answering; "
+                "waiting further would hang shutdown instead of ending it. "
+                "The thread stays joinable, so a std::terminate at exit "
+                "remains possible -- this line is the evidence that the "
+                "trade was made on purpose.",
+                KVSO_LOG_PREFIX,
+                float(timeout_s),
+            )
+            return "detached"
+        return "joined"
 
     def _worker_loop(self) -> None:
         while True:

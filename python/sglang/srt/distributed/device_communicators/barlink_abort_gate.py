@@ -403,6 +403,42 @@ def unregister(transport: Any) -> None:
             _transports.remove(transport)
 
 
+def rearm_inline_reads() -> int:
+    """Give the abort-word read back to the transports (#673 Option B).
+
+    Clears ``_abort_poll_active`` on every registered transport, so
+    ``check_aborted`` resumes the pre-#517 in-line device read. Returns how
+    many transports were changed.
+
+    WHY THIS EXISTS. ``_arm_status_poll`` hands the read to the watchdog ONCE
+    at bring-up and the latch is one-way, so stopping the watchdog afterwards
+    would leave the word read by nobody -- ``check_aborted`` short-circuits on
+    the latch and would answer "not aborted" forever. ``should_poll_status``
+    above already declares the intended degradation, *"the guard degrades to
+    the #517-phase-1 behaviour rather than to blindness"*; it is evaluated only
+    at bring-up, and this is what makes that sentence true at teardown too.
+
+    THE ABORT-WORD SEMANTICS ARE NOT TOUCHED. The word stays sticky, nothing
+    writes it, no code is cleared -- only WHO READS IT changes, back to the
+    reader it had before #517 phase 2.
+
+    Cost note: the in-line read is the pre-#517 per-collective device read, so
+    it is paid only AFTER a stop -- i.e. during teardown, never during serving.
+
+    Never raises: it runs on the teardown path, and a transport that objects to
+    being asked must not take the others down with it.
+    """
+    changed = 0
+    for transport in registered():
+        try:
+            if getattr(transport, "_abort_poll_active", False):
+                transport._abort_poll_active = False
+                changed += 1
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            logger.exception("barlink abort gate: could not re-arm an in-line read")
+    return changed
+
+
 def registered() -> List[Any]:
     with _lock:
         return list(_transports)

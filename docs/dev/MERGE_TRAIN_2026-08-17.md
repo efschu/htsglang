@@ -43,8 +43,14 @@ Two findings the provided list did not carry, both from git:
 
 * **`fix/713-admission-intake` is already in the serving line** (+0 commits, 0
   files). It is not a train item; merging it is a no-op. Do not schedule it.
-* **`fix/728-max-bytes-uniform` points at `79216e6052`** — byte-identical to
-  `feat/706-phase-uniform-hicache-keys` — and **has no remote**. Either it is a
+* **`fix/728-max-bytes-uniform` — IDENTITY RESOLVED 2026-08-17 (Slot-3): it was
+  the second case, a lane that had branched and not yet committed.** It now
+  points at **`887a6d477f`** and **is pushed** to `origin`. It is NOT an alias
+  and must NOT be deleted — deleting by that name would destroy the #728 fix.
+  It is a real train item, for the FOLLOW-UP train only (see §5). The original
+  observation below was correct at 08:08 and is now stale; kept for the record.
+  It read: points at `79216e6052`, byte-identical to
+  `feat/706-phase-uniform-hicache-keys`, and **has no remote**. Either it is a
   local alias of that head or a lane branched and has not committed yet. It
   must not be merged as a separate item, and someone should say which it is
   before the train runs; a local-only branch is the one kind that vanishes with
@@ -193,10 +199,19 @@ Contents of the branch, oldest first:
 Also held, and named so nobody schedules them:
 
 * **`fix/713-admission-intake`** — already in the serving line, +0 commits.
-* **`fix/728-max-bytes-uniform`** — no remote, head identical to
-  `feat/706-phase-uniform-hicache-keys`; resolve its identity before the train.
-* Cluster A and Cluster B (§3) — deferred until their owners have rebased or
-  agreed a resolution. The clean six-step train can run without them.
+* **`fix/728-max-bytes-uniform`** — RESOLVED: real branch at `887a6d477f`,
+  pushed. Held from the speed boot ON PURPOSE: it changes barlink transport
+  bring-up (`pipe_on` is now AND-reduced across the group before `max_payload`
+  and `geometry`), so it needs its own soak rather than riding a speed boot.
+  **FOLLOW-UP TRAIN.**
+* **Cluster A — SUPERSEDED by `fix/673-teardown-stack`** (this branch). All
+  four #673 thread-stop branches are composed there in one ordered sequence,
+  with the current integration base merged in so it applies post-train. Steps
+  4-6 of §3 should be struck and replaced by that single item; step 3
+  (`fix/673-lockstep-sentinel-stop`) is contained in it and must not be
+  scheduled separately, or the same functions land twice.
+* Cluster B (§3) — still deferred until its three owners have agreed a
+  resolution. The clean six-step train can run without it.
 
 ## 5b. CLUSTER B — CORRECTED, AND RECONCILED (2026-08-17, after trial merges)
 
@@ -264,9 +279,9 @@ requirement — appropriate for the follow-up train, wrong for the speed boot.
    of writing (pushed with this document). Every other train branch was pushed.
 2. Cluster A needs one owner and one order; Cluster B needs its three owners.
 3. Per-branch `unit/managers` baselines (see §4).
-4. `fix/728-max-bytes-uniform` identity — remote-less and byte-identical to
-   `feat/706-phase-uniform-hicache-keys`; **delete it once Slot-3's real #728
-   branch lands**, so the alias cannot be mistaken for a train item.
-5. DO-NOT-DROP: `feat/677-park-wiring` is the sole carrier of the six
+4. ~~`fix/728-max-bytes-uniform` identity.~~ RESOLVED: real branch, pushed at
+   `887a6d477f`, follow-up train.
+5. Cluster A: RESOLVED as `fix/673-teardown-stack`; steps 3-6 collapse to it.
+6. DO-NOT-DROP: `feat/677-park-wiring` is the sole carrier of the six
    serving-only commits enumerated in §2. No step may drop or rewrite it.
-6. Merge `fix/717-rebuild` at `67572ceac3`, not at its tip (§5c).
+7. Merge `fix/717-rebuild` at `67572ceac3`, not at its tip (§5c).

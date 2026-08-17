@@ -9864,16 +9864,48 @@ def run_scheduler_process(
             # without an active exception", after a clean drain, which is the
             # #673 signature. Graceful path only and flag-gated: the destroy
             # path runs barlink's close(), which is #722's machinery.
+            # #673 TEARDOWN STACK -- ONE ORDERED SEQUENCE, and the order is
+            # the content. Four background threads and the collectives they
+            # run on must come down in a direction that never leaves a thread
+            # using something that is already gone, and never blinds the
+            # machinery that reports on the ones still dying.
+            #
+            #   1. kvso-dest-io      -- a host IO thread whose body is
+            #      cudaEventSynchronize. It runs no collective and nothing
+            #      reports through it, so it goes first: the earlier it stops,
+            #      the smaller the window in which it can be inside a CUDA call
+            #      while anything below tears down.
+            #   2. dual-group lanes  -- CUDA stream workers that launch
+            #      kernels. Stopped before the abort readers, because a lane
+            #      dying badly is exactly the event those readers exist to
+            #      report.
+            #   3. barlink watchdog  -- an abort READER (#650/#653 family). It
+            #      stays alive through 1 and 2 on purpose, so their deaths are
+            #      still observed; stopping it re-arms the transports' in-line
+            #      reads, so the guard survives losing its reader.
+            #   4. lockstep sentinel -- LAST of the threads, because the other
+            #      stops report divergence through its 0.5 s gloo gather.
+            #   5. release_distributed -- destroys the groups, which also closes
+            #      barlink_comm. Everything above must already be down.
+            #
+            # Steps 3 and 4 are ALSO called inside release_distributed, which is
+            # deliberate belt-and-braces on the ORDERING only: they are
+            # idempotent, and repeating them there means the destroy cannot be
+            # reached with either thread still running even if this block is
+            # later reordered by a careless edit. It is not a second stop.
             from sglang.srt.managers.scheduler_teardown import (
+                release_barlink_watchdog,
                 release_distributed,
+                release_dual_group_lanes,
+                release_kv_session_offload_io,
                 release_lockstep_sentinel,
             )
 
-            # #673: the sentinel's sidecar runs all_gather_object on its own
-            # gloo group every 0.5 s. It must be stopped AND JOINED before any
-            # group is destroyed, so it goes first here -- and release_distributed
-            # repeats the call internally, because this ordering must survive a
-            # careless edit to this block.
+            release_kv_session_offload_io(
+                scheduler, graceful=scheduler.gracefully_exit
+            )
+            release_dual_group_lanes(scheduler, graceful=scheduler.gracefully_exit)
+            release_barlink_watchdog(scheduler, graceful=scheduler.gracefully_exit)
             release_lockstep_sentinel(scheduler, graceful=scheduler.gracefully_exit)
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
