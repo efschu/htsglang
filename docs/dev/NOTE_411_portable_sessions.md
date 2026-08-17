@@ -353,3 +353,71 @@ Cross-rig import remains unproven and stays the filed window item: everything
 here is one machine, tmpdirs and an injected page reader. `IDENTITY_LAYOUT_GAP`
 still stands -- the identity hash covers the kv-cache dtype NAME, not its byte
 layout -- and is still quoted into every identity refusal.
+
+---
+
+# TP>1 VERDICT: the refusal stands, and per-rank merge is not desk-fundable
+
+Asked to implement per-rank manifest merging if it was desk-fundable, and to
+leave a named refusal plus a filed residue if it was not. It is not, and the
+reason is structural rather than a missing function.
+
+## The refusal already exists and is correct
+
+`session_checkpoint.py:654` and `session_handover.py:608` both refuse
+`tp_size != 1 or pp_size != 1` by name, and the checkpoint one already points at
+the cause: "the manifest is rank-local and a TP>1 checkpoint needs the per-rank
+manifest merging named as #261's follow-up". Nothing here needed adding; the
+gate a reader would hit already tells them what is missing.
+
+## Why merging is not a desk addition
+
+A TP>1 export must collect every rank's manifest into one, because each rank
+holds a different shard of the KV under its own suffixed stems. Collecting them
+means a group collective.
+
+`SessionCheckpointRuntime` is built to issue none. Its class docstring
+(`session_checkpoint.py:548-552`) states the property and the reason:
+
+> Runs entirely on the scheduler thread (control requests are processed between
+> scheduling iterations), so the radix tree cannot mutate under a snapshot, a
+> lock reference or a rewind ... **No group collective is issued anywhere:
+> every operation is rank-local.**
+
+That is not incidental. It is the whole correctness argument for why none of
+this needs a lock: the runtime never blocks the scheduler thread waiting on a
+peer. Adding a manifest-merge collective would put a rank-to-rank wait inside a
+control request handled between scheduling iterations, which is how a control
+path becomes a scheduler stall on the slowest rank -- and, if a peer is mid-
+drain, a deadlock.
+
+So per-rank merge is not "the merge function nobody wrote". It is a change to
+the concurrency contract that makes the lock-free argument hold, and it belongs
+with #261's drain coordination, where that contract is already being negotiated,
+rather than bolted onto a runtime whose safety depends on the opposite property.
+
+## Filed residue, with its dependency named
+
+**TP>1 portable export.** Needs, in this order:
+
+1. per-rank drain coordination (#261's follow-up), which is where the collective
+   and its ordering already have to be designed;
+2. a merged manifest whose page set is the union of the ranks' shards, keyed so
+   an import can tell which shard a page belongs to;
+3. import-side placement: the geometry gate refuses a differing `tp_size`
+   outright today, so a TP>1 bundle either lands on an identical geometry or
+   goes through the manifest-scoped umsharder -- which itself inherits the
+   `page_size == 1` limit (`session_checkpoint.py:662`).
+
+Item 1 is the blocker and it is not this module's to solve.
+
+## What step 5 does deliver
+
+* compat gate: built in Cuts 1-2 and verified here as a COMPOSITION of
+  `verify_import` + `verify_geometry` rather than a second implementation --
+  Cut 2 removed Cut 1's hand-rolled duplicate, and `IDENTITY_LAYOUT_GAP` is
+  quoted into every identity refusal so a reader learns where the gate stops;
+* pin-through-import: Cut 4 above, closing C5;
+* TP>1: this verdict.
+
+Cross-rig import remains the filed window item. Nothing in this note claims it.
