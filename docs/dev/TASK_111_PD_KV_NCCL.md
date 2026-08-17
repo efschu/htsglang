@@ -233,3 +233,59 @@ Tests: +16 hermetic cases. Falsifier-checked — reverting the identity fix reds
 the hang), skipping the world check reds 3. One previously-passing test,
 `test_differing_dcp_is_allowed`, encoded the defect and is now inverted to
 `test_differing_dcp_is_REFUSED`.
+
+---
+
+## Wire path landed (2026-08-17), and what it does NOT claim
+
+Remainder items 1 and 2 are addressed; 3 and 4 are unchanged. Read this before
+the GPU window, because the boundary between "written" and "proven" moved and
+it moved only a little.
+
+### What is built
+
+* **`NcclLink.transfer` is implemented.** It orders the plan, bounds-checks it
+  against the registered regions, moves block by block, refuses partial
+  success, and books bytes only after the wire call returns.
+* **`order_blocks`** is the ordering rule, and it is the design decision worth
+  the most scrutiny. NCCL send/recv pair up POSITIONALLY, and the two instances
+  build their block lists independently from their own page tables. Rather than
+  coordinate, both sides sort by a key each can compute alone
+  (region, then offsets). A disagreement here would not fail — it would land
+  the right bytes at the wrong offset, which is #345's class one layer down.
+* **`TransferBackend.NCCL` exists**, and selecting it raises a NAMED refusal
+  from `get_kv_class` instead of an opaque enum error. This is a smaller step
+  than "registered": what is missing is the whole KV manager family (KVArgs,
+  KVManager, KVSender, KVReceiver, KVBootstrapServer) that a PD pair actually
+  drives. The refusal says so and points here.
+* **The wire is opt-in per link** (`NcclLink(wire_enabled=True)`, default
+  False). With it off, `transfer` raises the pre-wire `NotImplementedError`
+  VERBATIM. An unproven transport must not become reachable by upgrading.
+
+### What is explicitly NOT proven
+
+`TorchDistributedOps` (the two `dist.send`/`dist.recv` calls, bounded through
+the #312 helpers) and `default_region_view` (materialising a region range as a
+tensor, via `__cuda_array_interface__` for device memory and ctypes for host)
+have **never executed**. They are isolated behind injectable seams precisely so
+the surrounding contract could be tested without them, and so the GPU ticket
+can replace either without touching the logic around it.
+
+17 hermetic tests cover ordering, bounds, opt-in, message-class validation,
+byte accounting, partial failure and the backend refusal — all through a
+recording double. None of them is evidence about a wire.
+
+### GPU window: the mock-smoke handoff
+
+The §"What the two-instance GPU ticket must validate" list above is unchanged
+and still governs. Two additions now that the code exists:
+
+1. **Run the hermetic suite first, on the window's own checkout.** It is the
+   contract the wire must not violate; a wire that passes bytes while failing
+   these is moving them in an order the peer did not agree to.
+2. **The first wire test is a loopback-shaped smoke, not a KV payload.** Bring
+   up the two-member group, register one small region on each side, and move a
+   single known block with `wire_enabled=True`. Compare bytes. Only then run
+   the KV cases in the list above. If `default_region_view` is wrong for device
+   memory, that is where it shows — cheaply, and before any page table is
+   involved.

@@ -335,7 +335,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -412,6 +411,11 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    #: #111. The LINK seam (setup/register/transfer/close) is built and unit
+    #: tested; the KV manager family this enum resolves to is NOT. The member
+    #: exists so selecting it gives the named refusal in get_kv_class below
+    #: instead of an opaque enum error -- see that refusal for what is missing.
+    NCCL = "nccl"
 
 
 class KVClassType(Enum):
@@ -532,6 +536,22 @@ def get_kv_class(
             KVClassType.RECEIVER: (FakeKVReceiver),
         }
         return class_mapping.get(class_type)
+
+    elif transfer_backend == TransferBackend.NCCL:
+        raise ValueError(
+            "transfer backend 'nccl' (#111) cannot be selected yet. What "
+            "EXISTS is the cross-instance link seam "
+            "(sglang.srt.disaggregation.nccl.link: setup/register/transfer/"
+            "close, the transport contract, the route policy and the block "
+            "planner), and its wire path is opt-in per link "
+            "(NcclLink(wire_enabled=True)) because no two-instance exchange "
+            "has ever run. What does NOT exist is this backend's KV manager "
+            "family -- KVArgs, KVManager, KVSender, KVReceiver and "
+            "KVBootstrapServer -- which is what this function resolves and "
+            "what a PD pair actually drives. Use 'mooncake' for a working "
+            "cross-instance transfer; see docs/dev/TASK_111_PD_KV_NCCL.md for "
+            "the ticket that lands the rest."
+        )
 
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 

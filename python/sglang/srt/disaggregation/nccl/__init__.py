@@ -19,9 +19,15 @@ Layout, and why it is split this way:
                  KV DTYPE, #241), the message classes (#240), the direct-vs-
                  store route policy (#212), and the block planner.
 
-Deliberately NOT registered in ``TransferBackend`` yet. Adding the enum member
-would advertise a working backend, and the wire path has never run; the ticket
-lands the member together with the proof.
+``TransferBackend.NCCL`` now EXISTS, and selecting it raises a named refusal
+from ``get_kv_class`` rather than an opaque enum error. The reasoning that kept
+the member out still holds and is why the refusal is there: this backend has no
+KV manager family (KVArgs / KVManager / KVSender / KVReceiver /
+KVBootstrapServer), which is what a PD pair actually drives, and the wire path
+below has never met a peer. The wire is additionally opt-in per link
+(``NcclLink(wire_enabled=True)``); with it off, ``transfer`` raises exactly the
+message it raised before the path was written. The ticket lands the manager
+family together with the proof.
 """
 
 from sglang.srt.disaggregation.nccl.contract import (
