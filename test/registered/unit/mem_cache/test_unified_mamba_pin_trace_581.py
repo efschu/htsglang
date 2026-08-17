@@ -348,9 +348,29 @@ class TestAckDrainAcrossRanks(unittest.TestCase):
                 f"rank{rank} still holds acks after idle rounds",
             )
 
-    def test_ranks_with_queues_stay_throttled_to_the_slowest(self):
-        """The fix must not turn the drain into a free-for-all: a rank whose
-        head event is NOT ready still throttles the others."""
+    def test_a_slow_rank_no_longer_throttles_the_others(self):
+        """THE THROTTLE IS WITHDRAWN BY DESIGN (#737), and this records it.
+
+        This asserted the opposite -- that a rank whose head event is not ready
+        holds every other rank at zero. That property came from MIN-reducing the
+        ready count across the group, and that reduction was the #737 deadlock:
+        it sat inside the per-microbatch path of a pipeline, whose stages are at
+        different offsets by construction, so PP0/PP1 waited in it for a PP2
+        that was blocked in `_pp_recv_proxy_tensors` waiting for them.
+
+        The reduction is gone and counting is rank-local. What that costs is
+        PACING, not correctness: ranks may now run further apart in ack
+        processing. Correctness is owned by #706's per-page completeness marker
+        -- an incomplete page reads as a MISS, never as wrong bytes -- and a
+        replacement backpressure bound is FILED rather than guessed, with a
+        drain-depth observability line so the first real fast-rank pressure
+        specimen is attributable.
+
+        What #581 actually needed SURVIVES and is asserted below: a rank that
+        cannot drain must not stop the ranks that can. That was the exhaustion
+        this file exists for, and rank-local counting makes it unreachable
+        rather than merely compensated.
+        """
         allreduce = _MinAllReduce(self.RANKS)
         caches, drained, errors = [], {}, {}
         for rank in range(self.RANKS):
@@ -381,8 +401,16 @@ class TestAckDrainAcrossRanks(unittest.TestCase):
         for t in threads:
             t.join(timeout=60)
         self.assertEqual(errors, {}, f"rank thread raised: {errors}")
-        for rank in range(self.RANKS):
-            self.assertEqual(len(drained[rank]), 0, f"rank{rank} ran ahead")
+        # rank 2's head is still in flight, so it drains nothing...
+        self.assertEqual(len(drained[2]), 0, "rank2's unready head must not drain")
+        # ...and that no longer holds anybody else back. This is the #581
+        # property that mattered, now true by construction.
+        for rank in (0, 1):
+            self.assertEqual(
+                len(drained[rank]),
+                3,
+                f"rank{rank} was throttled by a peer it no longer consults",
+            )
 
 
 class _RecordingPop(dict):

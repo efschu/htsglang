@@ -6253,6 +6253,20 @@ class Scheduler(
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
         # of them read this rank's own pool. See _drain_prefetch_progress.
+        #
+        # #737 -- WHAT THIS GUARANTEE IS NOT. It secures uniform entry WITHIN
+        # this function once a rank calls it. It says nothing about whether all
+        # ranks CALL this function on the same tick, and under pipeline
+        # parallelism they provably do not: `_get_new_batch_prefill_raw` runs in
+        # the per-microbatch loop body, whose very next step
+        # (`_pp_recv_proxy_tensors`) blocks a stage on its upstream, leaving
+        # stages at different microbatch offsets by design.
+        #
+        # A collective placed here therefore requires an alignment this position
+        # cannot supply. The HiCache ack-count reduction leaned on this comment
+        # and deadlocked on 2026-08-17 (PP0/PP1 in the drain, PP2 in the
+        # pipeline recv); it is now rank-local. Anything added above that needs
+        # GROUP agreement needs a pipeline-aligned point, not this one.
         prefetch_verdicts = self._drain_prefetch_progress()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:

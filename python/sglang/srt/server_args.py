@@ -5785,9 +5785,37 @@ class ServerArgs:
         int,
         "Number of threads per rank for checkpoint prefetching (default: 4).",
     ] = 4
+    weight_loader_direct_io: A[
+        bool,
+        # #738: the only lever that works on this pool. Both eviction-advice
+        # rungs are no-ops on ZFS -- fadvise(DONTNEED) per #408, and MADV_PAGEOUT
+        # measured dead on 2026-08-17 (rc=0 "accepted", 0.4% freed). You cannot
+        # evict what you never cached, so this stops the cache filling instead.
+        # Requires --weight-loader-disable-mmap: O_DIRECT is a READ path, and the
+        # mmap path has no read to redirect.
+        "Read safetensors shards with O_DIRECT, bypassing the page cache "
+        "entirely, instead of caching them and trying to evict afterwards. "
+        "Needs --weight-loader-disable-mmap. Opt-in and byte-identical: only the "
+        "route into memory changes. Real direct I/O requires OpenZFS >= 2.3 on a "
+        "dataset with direct != disabled; measured on this rig as a page-cache "
+        "delta of ZERO over a 1.20 GB shard. Cuts the weights-load spike that "
+        "OOM-killed the container at a 111.3G peak.",
+    ] = False
     weight_loader_drop_cache_after_load: A[
         bool,
-        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        # STALE TEXT CORRECTED (#408/#721). This said "Call posix_fadvise("
+        # "DONTNEED) on each safetensors shard", which is the PRE-#408
+        # mechanism and is a NO-OP on ZFS -- DONTNEED does not free mapped
+        # pages there, not even after unmap. Reading the help alone, an
+        # operator on this rig would conclude the flag is inert and skip the
+        # one lever that works. The implementation is the #408 PAGEOUT ladder:
+        # MADV_PAGEOUT walks the page table of the live mapping, with plain
+        # fadvise kept only as the no-mapping/no-madvise fallback. See
+        # weight_utils._drop_file_cache_after_load.
+        "Release the page cache behind each safetensors shard after loading it, "
+        "via the #408 MADV_PAGEOUT ladder (posix_fadvise(DONTNEED) alone is a "
+        "no-op on ZFS and is only the fallback). Cuts the weights-load page-cache "
+        "spike that can OOM a container before reclaim catches up.",
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
@@ -8035,6 +8063,8 @@ class ServerArgs:
                     "--phase-flip-writeback-deadline-s must be > 0, got "
                     f"{self.phase_flip_writeback_deadline_s}."
                 )
+        self._validate_direct_io()
+
         if self.phase_flip_canonical_kv_page:
             # #706: the two conditions the whole-page protocol is defined on.
             # Both are checkable here, and both are silent corruption if left
@@ -15971,6 +16001,25 @@ class ServerArgs:
             "linear": 2.0 * ((gdn or attn_proj) + mlp),
             "core": 4.0 * q_heads * head_dim,
         }
+
+    def _validate_direct_io(self, args=None):
+        """#738: --weight-loader-direct-io is inert without --disable-mmap.
+
+        Extracted so the rule can be exercised on its own: a validation buried
+        in a 300-line method is one nobody tests, and this one exists precisely
+        because an inert-but-enabled-looking flag is what cost the #738 window.
+        """
+        a = args if args is not None else self
+        if getattr(a, "weight_loader_direct_io", False) and not getattr(
+            a, "weight_loader_disable_mmap", False
+        ):
+            raise ValueError(
+                "--weight-loader-direct-io needs --weight-loader-disable-mmap: "
+                "O_DIRECT redirects a READ, and the mmap path performs none. "
+                "Refused rather than ignored -- silently accepting it would "
+                "leave the page-cache spike in place while the flag suggests "
+                "otherwise, which is the #738 failure mode."
+            )
 
     def _handle_pp_stage_ratio(self):
         """--pp-stage-ratio: derive the uneven layer split from per-stage
