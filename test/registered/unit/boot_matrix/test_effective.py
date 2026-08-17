@@ -44,6 +44,9 @@ GOOD_BOOT = "\n".join(
         "capacity 320340 tokens / ratio 30 = unit 10678 (vector [30, 17, 17]).",
         "[2026-08-01 00:00:02 TP0] sglang is using nccl==2.28.9",
         "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin.",
+        # A real spec boot prints BOTH roles; the target line is the one
+        # `graphs` is resolved from (#349).
+        "[2026-08-01 00:00:06 TP0] Capture target verify CUDA graph begin.",
         f"[2026-08-01 00:00:09] {READY_MARKER}",
     ]
 )

@@ -1374,16 +1374,16 @@ loaders. The scale helper `ggml_cuda_e8m0_to_fp32_half` returns 2^(e-128) —
 already halved against the doubled lattice — and is bit-identical to the host
 reference, so dequant is compared EXACTLY, not within a tolerance. Kernel
 presence is a wheel property, probed via the `ggml_mxfp4_native` marker op (the
-#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:281`,
+#73 pattern, `gguf.py:276`) and evaluated ONCE at import (`:281`,
 `MXFP4_NATIVE = _mxfp4_kernels_present()` — corrected 2026-08-04, was cited as
 `:277`, which is `except Exception:` inside the probe function, not the
 module-level assignment).
 `SGLANG_GGUF_MXFP4_NATIVE=0` hands the checkpoint back to the repack —
-first-character test (`:265`), so `false`/`no`/`off` do NOT disable it. The
+first-character test (`:269`), so `false`/`no`/`off` do NOT disable it. The
 "no-op on a native wheel" is a short-circuit, not a cheap pass: `_type_map()`
 returns `{}` before any tensor is read (`gguf_mxfp4_repack.py:113-115`). Second,
 undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1,
-`environ.py:1897`) empties the same map (`repack_source_types()`,
+`environ.py:1982`) empties the same map (`repack_source_types()`,
 `gguf_mxfp4_repack.py:118-124` — the file is named explicitly because the
 previous bare `:122-124` shorthand sat right after an `environ.py:NNNN`
 citation and could be misread as belonging to that file, when the sentence's
@@ -1398,12 +1398,17 @@ coverage, since `MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES`
 PENDING under window #537:
 (Line-number history, kept because BOTH prior citations were wrong by the
 time this merge ran: the integration line cited `environ.py:1776` and the
-pool-audit branch "corrected" it to `:1803`. Re-derived at merge time,
-2026-08-12, the symbol is at `environ.py:1897`; `:1776` is now
+pool-audit branch "corrected" it to `:1803`. Re-derived 2026-08-17 for the third time, the symbol is at `environ.py:1982`
+(`:1897` is now a MiniMax-M3 comment); at merge time 2026-08-12 it was
+`:1897`; `:1776` is now
 `SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS` and `:1803` is past
 nothing useful. Verify a line number against the tree before quoting it —
 this one has drifted twice.)
-`TICKET_398_mxfp4_validation.md`.
+`TICKET_398_mxfp4_validation.md`. The repack module is
+`model_loader/gguf_mxfp4_repack.py` (NOT under `layers/quantization/`, where
+the surrounding sentences might suggest). Turnkey Gate-A/A' runner:
+`bench/398/run_398_gate_a.py` (`--self-test` is hermetic and pinned);
+`VERDICT_398_desk_half.md`.
 **#479 traced the served checkpoint and found no untraced fallback.** The
 active UD-IQ3_XXS driver carries exactly two type-39 tensors,
 `blk.26`/`blk.42.ffn_down_exps` (2.125 GiB), and their gate/up siblings are
@@ -3580,6 +3585,19 @@ taxonomy and the global importance ladder.
   GATE: none. Read `EffectiveConfig` before trusting an arm's declared
   configuration — #340 published a wrong verdict from a harness environment
   that silently carried `SGLANG_UNEVEN_DCP=1`.
+  PROVENANCE: a run writes `provenance.json` (head, branch, dirty, arm
+  roster) into its out-dir BEFORE the first boot — `sweep.py`
+  `collect_provenance` / `write_provenance`. Added by the #349 determination,
+  which could only establish the last real sweep's tree from `git log` and
+  directory mtimes. A verdict set with no tree identity cannot answer the
+  only question a standing net is ever asked.
+  REACH, as determined 2026-08-17: the net covers the spec × DCP × offload ×
+  dual-lane × video-cotenancy cross. It is structurally BLIND to the
+  phase-flip world — no arm sets any of the 33 `SGLANG_*FLIP/SEAM/REGIME`
+  switches, so `kvso_flip_contract.restore_permitted` (`:268`) takes its
+  no-phase-means-always-permitted branch in every arm and the wrong-phase
+  restore guard is unreachable under the matrix. See
+  `VERDICT_349_net_reach.md`.
 - **stage measurement canon (#584 second half)** — the persisted per-stage
   measurement the #363 stage table promotes a SOLVED candidate from: measured
   gain over the reference stage, the band that gain was taken against, and the

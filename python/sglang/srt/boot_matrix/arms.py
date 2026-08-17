@@ -67,12 +67,13 @@ COHERENCE_TIERS = ("byte+graded", "graded_only", "none")
 #: the timeout kill, and a clean reject also exits non-zero).
 BOOT_STATUSES = ("ready", "timeout", "crashed", "refused")
 
-#: The literal the decode-path spill emits (``kv_session_offload.py:3865``).
+#: The literal the decode-path spill emits
+#: (``managers/kv_session_offload.py:4178``).
 #: Kept here rather than inlined per arm so a renamed message is one edit and
 #: not a silently always-absent marker in eight places.
 SPILL_MARKER_DECODE = "kv-session-offload SPILL(partial): rid="
 #: The literal the PS2 born-spilled prefill path emits
-#: (``kv_session_offload.py:4189``). A different mechanism, so a different
+#: (``managers/kv_session_offload.py:4526``). A different mechanism, so a different
 #: marker: an arm that can only decode-spill must not be allowed to satisfy
 #: its precondition with a prefill-spill line, and vice versa.
 SPILL_MARKER_PREFILL = "kv-session-offload PREFILL-SPILL (PS2, born-spilled deep): rid="
@@ -596,7 +597,12 @@ ARMS: Tuple[Arm, ...] = (
         flags=("--draft-kv-layout", "dcp", "--speculative-cross-algorithm",
                "--speculative-cross-algorithm-force", "nextn",
                "--speculative-draft-model-path", DFLASH_DRAFT_MODEL),
-        reject_markers=("--draft-kv-layout dcp", "--speculative-cross-algorithm"),
+        # The guard words this as prose and never prints the flag spelling,
+        # so matching on "--speculative-cross-algorithm" made this arm report
+        # FAIL on every sweep (2026-08-01 included) while the server refused
+        # for exactly the right reason (#349).
+        reject_markers=("--draft-kv-layout dcp",
+                        "cross-algorithm speculative serving"),
         expected_seconds=60.0,
     ),
     Arm(
@@ -726,7 +732,7 @@ ARMS: Tuple[Arm, ...] = (
             "--hicache-mem-layout", "page_first_direct",
             # THE PIN. #236's total-volume regler declines a spill AT
             # ADMISSION when the projected host-resident volume exceeds it
-            # (budget_admission_violation, kv_session_offload.py:1588-1589) and
+            # (budget_admission_violation, kv_session_offload.py:1788) and
             # the decline falls back to stock retraction -- today's behaviour
             # when no host region is free. At 1 token every real session's
             # tail overshoots, so no spill is ever admitted, while kvso stays
@@ -735,8 +741,8 @@ ARMS: Tuple[Arm, ...] = (
             # event under study.
             #
             # WHY NOT max-spills 0: --kv-session-offload-max-spills is
-            # validated >= 1 (server_args.py:6762) and clamped to >= 1 again
-            # in the manager (kv_session_offload.py:2395), so there is no
+            # validated >= 1 (server_args.py:7308) and clamped to >= 1 again
+            # in the manager (kv_session_offload.py:2690-2692), so there is no
             # "armed but zero regions" setting to pin with. WHY NOT dropping
             # --enable-kv-session-offload: that removes the pinned host pool
             # too, so the control would no longer share the treatment's host

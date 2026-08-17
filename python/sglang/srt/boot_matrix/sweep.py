@@ -30,9 +30,11 @@ band, never against a guessed number.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -346,8 +348,6 @@ def run_arm(
         # model three times in a row.
         wait_for_vram_release()
 
-    with open(log_path, errors="replace") as f:
-        log_text = f.read()
     _write_artifacts(arm_dir, arm, boot_status, probes)
     return check_arm(arm, arm_dir)
 
@@ -392,6 +392,67 @@ def _run_probes(
             probe["min_score"] = int(band.get(name, 0))
         out.append(probe)
     return out
+
+
+def _git(repo_dir: str, *args: str) -> Optional[str]:
+    """One git query, or None if this is not a usable repo.
+
+    Never raises: a sweep is an hour of card time and must not be lost to a
+    missing git binary or an exported tree.
+    """
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.strip()
+
+
+def collect_provenance(repo_dir: Optional[str] = None) -> Dict[str, object]:
+    """What tree this sweep is being taken against.
+
+    THE POINT. The boot matrix is a STANDING net, so the only question ever
+    asked of a result is "is this still true at today's HEAD". A verdict set
+    with no tree identity cannot answer it: the #349 determination had to
+    reconstruct the last real sweep's tree from ``git log`` and directory
+    mtimes, and found that the artifacts predated their own arm roster by two
+    commits. Recording the head and the roster makes that readable from the
+    artifacts instead of inferred.
+
+    ``git_dirty`` is carried because a green taken on a dirty tree is not a
+    green at that commit, and the difference is invisible afterwards.
+    """
+    if repo_dir is None:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+    head = _git(repo_dir, "rev-parse", "HEAD")
+    status = _git(repo_dir, "status", "--porcelain")
+    return {
+        "git_head": head,
+        "git_branch": _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD"),
+        # Unknown tree means unknown cleanliness; report dirty rather than
+        # claim a clean tree we did not verify.
+        "git_dirty": bool(status) if head is not None else True,
+        "collected_utc": datetime.datetime.now(datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "arm_count": len(ARMS),
+        "arm_names": [a.name for a in ARMS],
+    }
+
+
+def write_provenance(out_dir: str, repo_dir: Optional[str] = None) -> Dict[str, object]:
+    """Write ``provenance.json`` beside the sweep's other artifacts."""
+    prov = collect_provenance(repo_dir=repo_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "provenance.json"), "w") as f:
+        json.dump(prov, f, indent=2)
+    return prov
 
 
 def _write_artifacts(
@@ -600,6 +661,16 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     # so every arm carried ref_text="" and min_score=0 and the coherence half
     # of the gate could not fail. Sweep 1 reported "coherence within the
     # A-vs-A band" for arms that were never compared against anything.
+    # BEFORE the first boot, not after the last one. A sweep that dies or is
+    # killed halfway still leaves artifacts a reader will try to interpret,
+    # and those are exactly the artifacts whose tree identity is hardest to
+    # reconstruct afterwards.
+    prov = write_provenance(args.out)
+    print(
+        f"provenance: head={prov['git_head']} branch={prov['git_branch']} "
+        f"dirty={prov['git_dirty']} arms={prov['arm_count']}"
+    )
+
     reference_probes, band, baseline = _measure_band(
         selected, model_path=args.model, out_dir=args.out, port=args.port
     )
