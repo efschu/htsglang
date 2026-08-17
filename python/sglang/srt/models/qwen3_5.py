@@ -1394,6 +1394,25 @@ class Qwen3_5ForCausalLM(nn.Module):
 
                 if not gguf_dense_vocab():
                     embedding_quant_config = quant_config
+            elif (
+                quant_config is not None
+                and quant_config.get_name() == "compressed-tensors"
+            ):
+                # #727: only when the checkpoint ACTUALLY quantized the vocab.
+                # Every checkpoint we serve today lists embed_tokens in
+                # quantization_config.ignore, so this stays None and the dense
+                # BF16 path runs byte-identically. A requantized checkpoint
+                # (tools/requant_vocab_int8.py) drops that entry, and then the
+                # int8 rows are dequantized on gather instead of materialized.
+                from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                    vocab_is_quantized,
+                )
+
+                if vocab_is_quantized(
+                    getattr(quant_config, "config", None) or {},
+                    add_prefix("embed_tokens", prefix),
+                ):
+                    embedding_quant_config = quant_config
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

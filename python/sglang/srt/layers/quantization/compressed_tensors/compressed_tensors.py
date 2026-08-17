@@ -283,6 +283,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedEmbeddingMethod,
+        )
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -294,6 +297,26 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+        # #727: a vocab matrix the checkpoint actually quantized. Gated on the
+        # checkpoint's own ignore list, so every checkpoint that still excludes
+        # embed_tokens -- which is all of ours today -- falls through to the
+        # dense path exactly as before. Checked BEFORE FusedMoE only because a
+        # VocabParallelEmbedding is neither a LinearBase nor a FusedMoE and
+        # would otherwise reach the end and get nothing.
+        from sglang.srt.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        if isinstance(layer, VocabParallelEmbedding):
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                CompressedTensorsEmbeddingMethod,
+                vocab_is_quantized,
+            )
+
+            if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix):
+                return UnquantizedEmbeddingMethod()
+            return CompressedTensorsEmbeddingMethod()
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
