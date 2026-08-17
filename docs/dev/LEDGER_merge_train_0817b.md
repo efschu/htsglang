@@ -182,3 +182,135 @@ desk one, and it is flagged here rather than resolved: nothing from
 train was being assembled. They are low-risk docs, but the brief's list was
 explicit and silently widening a train that F4-r4 will boot is the wrong
 default. Follow-on items.
+
+---
+
+# RECONCILIATION with `train/0817-exec` (2026-08-17, second pass)
+
+Both escalations from §7/§8 were decided by the coordinator and executed here.
+`train/0817-exec` is the SERVING LINEAGE and authoritative for serving-critical
+content; it was merged into this train.
+
+* HEAD after reconciliation: see the branch tip; base for all deltas is still
+  `a157bf1889`.
+
+## R1. The merge, and where "docs keep yours" was wrong
+
+Three conflicts, all documentation — and the category rule did NOT decide them.
+Two of exec's three doc edits are **corrections to my own desk output, found by
+a boot**, so exec won those on content:
+
+* `docs/dev/DESIGN_706_BOOT.md` — **exec wins.** Its edits fix my run-card:
+  `--hicache-size` takes an INTEGER number of gigabytes (`server_args.py:4187`),
+  so my `5G` was simply wrong and would have failed the boot the card exists to
+  drive; and precondition 1's `24.3 G` is recalibrated. A "docs keep mine"
+  reflex would have shipped a bad flag value in a turnkey ticket.
+* `docs/dev/NOTE_545_runtime_disk_tier.md` — **exec wins.** Their side strikes
+  a claim of mine and replaces it with 101 lines backed by a real
+  attach/detach run.
+* `docs/dev/MERGE_TRAIN_2026-08-17.md` — **mine wins**, because my side is
+  already the union built in §2 and carries the newer RESOLVED status.
+
+The lesson worth keeping: "serving files vs desk files" is the right default,
+but the deciding question is which side has EVIDENCE, and a doc can carry a
+boot measurement.
+
+## R2. Failure #1 (#630) did NOT clear — and the reason is a cross-lane contradiction
+
+The coordinator expected exec's `90e84ad268` to clear
+`server_args/test_phase_flip_args.py::test_v1_blockers_named`. It does not, and
+the cause is worth stating precisely because it is a real disagreement, not a
+missing patch.
+
+There are TWO #630 guards:
+
+* the RUNTIME one in `phase_flip_runtime.py` — exec restored it
+  (`90e84ad268`, "bounded is not fixed");
+* the PARSE-TIME one in `server_args._handle_phase_flip()` — still absent, and
+  absent **deliberately**: `7336c08d0e [#703] Narrow the boot-time #630 blocker
+  too, or the flag stays unusable`, whose code comment reads "#703 stage 2: the
+  #630 blocker is REMOVED, matching its runtime twin"
+  (`server_args.py:7899`).
+
+Verified directly: the `dp_size` and `disaggregation_mode` blockers still
+raise; only `enable_hierarchical_cache` does not.
+
+So #703 removed the parse-time guard *because* the runtime twin was gone, and
+exec then brought the twin back — which invalidates the removal's stated
+reason. **Restoring the parse-time blocker was NOT done here**, for a reason
+that needs a decision rather than a merge: it would refuse the exact boot this
+train's own `DESIGN_706_BOOT.md` run-card instructs F4-r4 to perform (phase flip
+WITH `--enable-hierarchical-cache`). Either the flip+HiCache boot is allowed and
+the test is stale, or it is refused and the run-card is wrong. That belongs to
+the #630/#703 owners.
+
+**Left failing, cause named.** 1 failure in `server_args`.
+
+## R3. Failures #2 and #3 — fixed and filed
+
+* **#612** — `decoupled_kv` is now declared in `RUNTIME_COMMUNICATOR_GROUPS`
+  (`mem_ledger/engine.py`). The contract checks construction SITES, and
+  `initialize_decoupled_kv_group` has no production caller yet; the entry says
+  that rather than implying a boot allocates it. `mem_ledger`: 0 failures.
+* **#584** — both constants FILED with differentiated verdicts, never a silent
+  baseline bump:
+  * `planner/boot_instruments.py::_CHAIN_TOLERANCE_MIB` — **NOT A DEMAND
+    DECISION**, call site read: it is the rounding slack for verifying the
+    budget-chain identity (posts carry three decimals of a GiB), and it
+    reserves nothing.
+  * `managers/phase_flip_seam_reserve.py::DEFAULT_ARMING_MARGIN_MIB` —
+    **NEEDS AUDIT**, verdict withheld: it does gate a VRAM decision (the
+    #662-F4 arming floor above the corridor law), while its own comment argues
+    it is an instrument tolerance. That call belongs to the #662-F4 owner.
+
+## R4. A NEW regression the reconciliation introduced, and it may be a real one
+
+`unit/mem_cache` went from **0 failures to 2** when exec was merged:
+`test_pinned_post_registry_550.py::TheAdmissionChargesEveryRegisteredPost` —
+both cases, "ValueError not raised".
+
+Cause: exec's `d7d85b4e37` ("the pinned-host backstop billed allocated posts
+twice") credits already-allocated posts back, because `available` is read live
+and their bytes are already missing from it. That fix is measured and
+boot-motivated (a Flip+HiCache boot refused on PP0 at "40.42 GB requested ...
+33.97 GB available", of which 35.18 GB was three weight images already in RSS).
+
+It is sound **only under the invariant its own comment states**: "registration
+FOLLOWS allocation for every producer of a post". The #550 tests register a
+30 GB post through `register_pinned_post` directly, WITHOUT allocating it, and
+then expect a 20 GB newcomer to be refused against a synthetic 40 GB available.
+Under the new model that scenario cannot occur, so nothing is charged and
+nothing refuses.
+
+**Not resolved here, deliberately.** Two readings remain, and they differ in
+consequence: either #550's fixture encodes an impossible state and the test is
+stale, or some producer does register without allocating and the credit-back
+under-charges. Rewriting another lane's test to match a third lane's model
+would erase that question. Owners: #706 (exec's fix) and #550.
+
+## R5. Final gate — base `a157bf1889` vs reconciled head
+
+| suite | BASE | RECONCILED | delta |
+| --- | --- | --- | --- |
+| `mem_ledger` | 0 F / 444 P | **0 F** / 494 P | clean (was +2, fixed in R3) |
+| `server_args` | 0 F / 627 P | 1 F / 670 P | +1, explained in R2 |
+| `boot_matrix` | 0 F / 140 P | 0 F / 159 P | clean |
+| `spec` | 13 F / 711 P | 13 F / 711 P | unchanged |
+| `entrypoints` | 4 F / 417 P / 3 E | 4 F / 450 P / 3 E | unchanged |
+| `planner` | 2 F / 2494 P | 1 F / 2880 P | −1 improved |
+| `distributed` | 21 F / 2689 P | 27 F / 2764 P | +6 inherited (`fix/701-ledger-wiring`) |
+| `managers` | 9 F / 1587 P | 19 F / 2391 P | +10 inherited (`reconcile/cluster-b-seam-model` alone reports the same 19) |
+| `mem_cache` | 940 F / 748 P | 2 F / 1142 P | −938 net; the 2 are R4 |
+
+**Zero UNEXPLAINED new failures.** Three failures remain against base and each
+has a named cause and a named owner: R2 (1, `server_args`), R4 (2,
+`mem_cache`). The inherited `managers` +10 and `distributed` +6 are attributed
+by measurement, not assertion.
+
+## R6. Also filed
+
+`docs/dev/TICKET_702_unify_revisions.md` — `WorldMemory` canonical (boot 2
+validated it), `PhasePoolModel`'s attention-layer divisor and #723 frontier
+completeness to be ported as an EXTENSION, never a parallel model. The four
+mechanical conflict resolutions from the aborted `fix/602-fill-side` merge are
+recorded there so the next attempt does not re-derive them.
