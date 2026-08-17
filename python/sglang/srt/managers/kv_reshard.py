@@ -66,6 +66,18 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "KV-RESHARD"
 
+#: #363 last mile. How long an arm may sit on the same hold reason before it is
+#: re-reported, and the age past which the report escalates to WARNING. An arm
+#: that cannot execute is not an error -- the hold reasons are all legitimate
+#: waits -- but one that has waited THIS long under load is the shape the #656
+#: audit predicted (``_execute`` is gated on ``is_fully_idle()``, which a loaded
+#: server may never satisfy), and it means the controller believes it acted.
+HOLD_REPORT_INTERVAL_S = 60.0
+HOLD_ESCALATE_AFTER_S = 300.0
+
+#: The greppable marker for a stuck arm, so a watchdog keys on one string.
+HOLD_STUCK_MARKER = f"{LOG_PREFIX} arm still pending"
+
 #: Consensus payload fields, packed as (value, -value) pairs so ONE
 #: MIN-reduction yields (min, -max) per field. ``armed``, ``ready`` and
 #: ``headroom`` are MIN-checked (divergence legal -> wait or refuse);
@@ -470,6 +482,16 @@ class KvReshardRuntime:
         self._epoch = 0
         self._pending: Optional[Tuple[int, ...]] = None
         self._last_hold_reason: Optional[str] = None
+        #: #363 last mile: when the pending arm was taken, and when its hold was
+        #: last reported. A hold is logged once per CHANGE of reason, which is
+        #: right for a reason that changes and wrong for one that does not: the
+        #: #656 audit established that ``_execute`` needs a fully-idle round and
+        #: that "under continuous load a fully idle round may never arrive", so
+        #: the one hold reason that can persist forever was also the one that
+        #: printed exactly once and then went quiet. These two carry the AGE, so
+        #: a decision that never became a move is visible as such.
+        self._pending_since: Optional[float] = None
+        self._last_hold_report_at: Optional[float] = None
         self.desync_checks = 0
         self.completed = 0
         self.last_stats: Optional[dict] = None
@@ -545,6 +567,12 @@ class KvReshardRuntime:
                 vec,
                 source,
             )
+        # The age belongs to the TARGET, not to the call: re-arming the same
+        # vector must not restart the clock, or a controller that re-proposes
+        # every boundary would keep a permanently stuck arm looking fresh.
+        if self._pending != vec or self._pending_since is None:
+            self._pending_since = self._clock()
+            self._last_hold_report_at = None
         self._pending = vec
         msg = (
             f"reshard armed: {self._current} -> {vec} (source {source}); "
@@ -647,9 +675,54 @@ class KvReshardRuntime:
         return self._execute(plan)
 
     def _hold(self, reason: str) -> None:
-        if reason != self._last_hold_reason:
+        """Report why the armed move did not run this boundary.
+
+        Deduplicated by reason, as before -- a boundary-rate log would bury
+        itself. What is new is that dedup no longer means SILENCE: an arm whose
+        reason does not change is exactly the case the #656 audit named, so the
+        hold is re-reported on an interval with the arm's AGE, and escalates to
+        WARNING once the wait stops being plausibly transient.
+
+        The age is the only number here that is not already in the reason
+        string, and it is the one that separates "waiting for the next idle
+        round" from "this reshard is never going to run".
+        """
+        now = self._clock()
+        changed = reason != self._last_hold_reason
+        last = self._last_hold_report_at
+        due = last is None or (now - last) >= HOLD_REPORT_INTERVAL_S
+        if not changed and not due:
+            return
+
+        self._last_hold_reason = reason
+        self._last_hold_report_at = now
+        if self._pending_since is None:
+            # No arm to age (a hold without a pending vector); keep the old
+            # shape rather than inventing an age of zero.
             logger.info("%s hold: %s", LOG_PREFIX, reason)
-            self._last_hold_reason = reason
+            return
+
+        age_s = now - self._pending_since
+        if age_s >= HOLD_ESCALATE_AFTER_S:
+            logger.warning(
+                "%s (%.0fs) -> %s, held by: %s. The move is ARMED and has not "
+                "run: _execute needs a fully-idle round, and under continuous "
+                "load one may never arrive (#656). The controller counts this "
+                "stage as acted on. Disarm it or accept that the vector will "
+                "not change.",
+                HOLD_STUCK_MARKER,
+                age_s,
+                list(self._pending),
+                reason,
+            )
+        else:
+            logger.info(
+                "%s hold (%.0fs, target %s): %s",
+                LOG_PREFIX,
+                age_s,
+                list(self._pending),
+                reason,
+            )
 
     # -- #363 headroom -------------------------------------------------------
     def _plan_move(self) -> "_MovePlan":
@@ -754,6 +827,8 @@ class KvReshardRuntime:
         unbounded hold would just be the same refusal with no record.
         """
         self._pending = None
+        self._pending_since = None
+        self._last_hold_report_at = None
         self.refused_headroom += 1
         self._last_hold_reason = None
         d = hr_local or {}
@@ -888,6 +963,8 @@ class KvReshardRuntime:
         self._cutover_fn(target)
         self._current = target
         self._pending = None
+        self._pending_since = None
+        self._last_hold_report_at = None
         self._epoch += 1
         self.completed += 1
         total_ms = (self._clock() - t0) * 1000.0
