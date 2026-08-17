@@ -129,6 +129,8 @@ TERM_LOAD_TRANSIENT = "load transient (allocator peak over resident)"
 #: measures the quantity this constant stands in for; feeding the measurement
 #: back through ``DemandInputs.load_transient_mib_per_rank`` replaces the
 #: constant with a CALIBRATED per-rank number carrying the rig fingerprint.
+#: #584: filed in measured.CALIBRATION_QUEUE -- known-unmeasured, awaiting a
+#: recorder post. Do not recalibrate this from a desk.
 LOAD_TRANSIENT_REFERENCE_MIB = 70
 
 #: The fingerprint the inherited number above carries. Deliberately a WINDOW
@@ -182,6 +184,8 @@ _FIXED_BACKEND_WORKSPACE_MIB.update(
 #: ``_handle_gpu_memory_settings``. Named rather than inlined so the ledger row
 #: can say which existing constant it is quoting instead of appearing to invent
 #: a factor of its own.
+#: #584: filed in measured.CALIBRATION_QUEUE -- measured 3.3-3.8x LOW and
+#: still shipped. Awaiting a per-rung post. Do not recalibrate from a desk.
 GRAPH_MIB_PER_CAPTURED_TOKEN = 2
 
 

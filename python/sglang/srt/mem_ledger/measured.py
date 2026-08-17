@@ -69,6 +69,33 @@ MIN_BOOTS = 5
 #: that are otherwise constant.
 DEFAULT_TOLERANCE_BYTES = 8 * MIB
 
+#: #584: ledger terms that are KNOWN to be guesses and are WAITING for a
+#: measurement. Filed, not fixed: a desk-recalibrated number would repeat the
+#: exact class this module exists to end, and the honest state of a wrong
+#: number is "wrong, and known to be, with the measurement named".
+#:
+#: An entry leaves this queue by acquiring a POST_TO_RESIDUAL mapping and the
+#: stability evidence MIN_BOOTS demands. Never by picking a better number.
+CALIBRATION_QUEUE: Dict[str, str] = {
+    "LOAD_TRANSIENT_REFERENCE_MIB": (
+        "engine.py: 70 MiB, INHERITED and, by its own docstring, 'NOT MEASURED "
+        "BY ANYTHING IN THIS TREE' -- it comes from one #602 corridor "
+        "acceptance window. engine.DemandInputs already has the field that "
+        "would carry a measured value (load_transient_mib_per_rank) and "
+        "nothing sets it. Needs: a recorder post for the load-time transient, "
+        "then this mapping."
+    ),
+    "GRAPH_MIB_PER_CAPTURED_TOKEN": (
+        "engine.py: 2 MiB/token, quoted from the stock heuristic, and the same "
+        "file records it measured 3.3-3.8x LOW (192 MiB booked against 633-730 "
+        "MiB actually taken, 2026-08-05 window). This is the sharper of the "
+        "two: a term the ledger KNOWS is wrong by a factor of three. Needs: a "
+        "per-rung graph-capture post (#586/#707 measure this shape already), "
+        "then this mapping."
+    ),
+}
+
+
 #: Post name -> the :class:`CardResidual` field it calibrates. Only posts whose
 #: measurement means the SAME THING as the field appear here; a post that
 #: merely correlates with a field is not a calibration for it.
