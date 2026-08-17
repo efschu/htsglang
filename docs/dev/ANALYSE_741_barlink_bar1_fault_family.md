@@ -10,6 +10,108 @@ per the operator's ack, and any boot goes on F4-r4's window list.
                              its abort path", at all_reduce
 
 
+> **RETRACTED AND REPLACED, 2026-08-17, by the author.** Section 1 below
+> claimed the root was a teardown-ordering race in `Bar1Transport.close()`.
+> That claim is WITHDRAWN. It is a rediscovery of task **#722**, which was
+> already filed with the same mechanism *and then retracted* on live evidence
+> (the abort-poll is REPORTER, not perpetrator; the standing order is
+> "barlink-Umbau NICHT bauen, Reopen nur bei neuem Post-Revert-Specimen").
+> I reproduced a retracted verdict because I gated my prior-art search on the
+> repository, and both #722 and #634 live in `OPERATOR-STATE.md`, outside it.
+> The corrected root is section 0 below. Sections 1-4 are kept as the record
+> of what was claimed and why it is wrong; section 5's fix shape is
+> superseded.
+
+## 0. CORRECTED VERDICT — it is #717 x phase-flip, not barlink
+
+**S2's root is the `kv_backing_relief` rung evicting rows that the phase flip
+is about to pack.** Evidence, all from S2's own log
+(`/spinning/evidence-665-f1/boot_bundle.log.20260817T193224Z`):
+
+    48743  19:30:31  PHASE-FLIP phase flip armed: pp_to_tp
+    48749  19:30:31  FLIP EXTENT PROBE: seqlen=51311 kv_allocated_len=51310
+    48740  19:30:31  POOL CENSUS at-arm: cached=127182 cur_slot_reqs=4
+                     ... backing=309464  highest live row=183998
+    48931  19:30:40  KV-BACKING EVICTED 127731 recomputable row(s) to bring
+                     the high-water mark below 61303 (resident ceiling -1)
+    48935  19:30:40  backing 61303 rows instead of 116736, highest live row 0
+    48955  19:30:4x  torch.AcceleratorError: CUDA illegal memory access
+
+Twenty-four lines separate the eviction from the fault.
+
+**The mechanism.** `_nothing_resident()` (`kv_backing_relief.py`) returns True
+when `_last_live_split["req_rows"] == 0`. During a `pp_to_tp` flip the requests
+are PARKED for the consensus round, so `req_rows` reads 0 — while 127,182 rows
+are still cached and the flip's own extent probe has just measured a request at
+`seqlen=51311`. The rung therefore takes the nothing-resident branch, evicts
+127,731 "recomputable" rows and shrinks backing 309,464 -> 61,303.
+
+The flip then reads the rows it was about to move:
+`phase_flip_runtime.py:6926 _execute` -> `_pack_outgoing` ->
+`kv_reshard.py:359 _checksum` -> `weights_arena.py:127 uint8_checksum`. Those
+rows are above the new cap. That is the illegal address.
+
+**Why the existing safety net does not cover it.** Site A's comment
+(`:1213-1229`) says the optimistic pricing "is only safe BECAUSE"
+`_shrink_to` re-reads the live set afterwards. It re-reads the LIVE REQUEST
+set — and the flip's pending pack is not a live request. It is parked, which is
+precisely the state that made `req_rows` zero in the first place. The check and
+the hazard share the same blind spot, so the net cannot catch this case by
+construction.
+
+This is the same failure the first #717 attempt produced —
+`b7868580a9`'s revert text: "backing shrank to 69,054 rows under a highest live
+row of 233,289, and the next access above the cap was an illegal address" —
+recurring through the REBUILD (`675793cdc8`) along a path the rebuild did not
+consider: not a live request reading above the cap, but the phase flip.
+
+### Lineage: which world each specimen ran in
+
+Serving commit at S2 is `92552585cc` (2026-08-17 15:06). Ancestry checked with
+`git merge-base --is-ancestor`:
+
+| commit | date | in `92552585cc`? |
+|---|---|---|
+| `c4e557963e` #717 attempt 1 | 08-17 02:48 | yes |
+| `b7868580a9` REVERT of it | 08-17 05:44 | **yes** |
+| `675793cdc8` #717 rebuild | 08-17 06:26 | **yes** |
+
+**S2 is post-revert — and also post-REBUILD.** That distinction is the whole
+answer. "Post-revert" alone would suggest a barlink reopen; post-rebuild says
+the reverted defect came back through its own replacement, on a new path.
+
+**S3 (2026-08-05) is pre-everything** — before the #622 fix (08-08) and long
+before #717 (08-17). It belongs to the old world and is not a reopen trigger.
+
+### Consequences for the tickets
+
+- **#722 / #634 do NOT reopen.** The reopen trigger is "a new post-revert
+  specimen" of a BARLINK perpetrator. S2 is post-revert in the calendar but its
+  perpetrator is the KV rung, and the abort-poll is once again the reporter —
+  exactly what #722's retraction concluded. The retraction stands, and this
+  note is a second, independent confirmation of it rather than a challenge.
+- **#741 does not close as a barlink family.** It reclassifies as a **#717
+  rebuild x phase-flip regression**, which is a live defect with a named root
+  and no owner yet.
+- **Do not build the barlink stand-down/re-arm change.** The standing order
+  holds and my section 5 is superseded.
+
+### Fix shape for the real root (not built)
+
+The rung must not treat a flip-park as an idle box. Options, for the owner:
+
+1. **Make the flip's pending extent visible to the split.** The extent probe
+   already measures it at arm time (`seqlen=51311`); if `req_rows` counted
+   parked-for-flip rows, `_nothing_resident()` would be false and the branch
+   would never fire. Smallest change, closest to the defect.
+2. **Refuse to evict while a flip is armed.** A phase gate on the rung between
+   `phase flip armed` and flip completion. Blunter, and it costs the idle-box
+   win #717 exists to collect, but it cannot be wrong.
+3. **Extend `_shrink_to`'s re-read to the flip's pending set**, so the stated
+   safety net actually covers the case its comment claims it covers.
+
+(1) is preferred; (2) is the safe interim if the window is short.
+
 ## 1. Verdict: ONE defect
 
 **`Bar1Transport.close()` releases the device memory the watchdog is still
