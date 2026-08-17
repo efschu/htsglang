@@ -3324,6 +3324,55 @@ class Scheduler(
         other = "tp" if phase == "pp" else "pp"
         here = self._layout_admits(phase, running_bs, pending_tokens)
         there = self._layout_admits(other, running_bs, pending_tokens)
+        # #713: NAME THE TERMS WHEN THE VERDICT IS THE EXPENSIVE ONE.
+        #
+        # Measured 2026-08-17 03:0x: a TEN-token prompt waited 31.64 s on an
+        # idle box -- 0 running, 1 queued, 3 mamba slots free, 72033 KV rows
+        # free -- because this returned target_can_admit=False and the policy
+        # declined to flip. But replaying _layout_admits with exactly those
+        # numbers returns pp=True/tp=False, i.e. the simulation is RIGHT for
+        # that state and would have armed. So the inputs it reads in-process
+        # differ from what /metrics reports, and no external sampling can show
+        # which -- the terms have to be printed where they are computed.
+        #
+        # Emitted only on the refusal (nothing here, nothing there), and rate
+        # limited, because the whole point is to catch a state that persists
+        # for tens of seconds rather than to narrate healthy rounds.
+        if (not here) and (not there):
+            now = time.perf_counter()
+            last = getattr(self, "_idle_locked_diag_at", 0.0)
+            if now - last >= 5.0:
+                self._idle_locked_diag_at = now
+                mamba = getattr(
+                    getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+                )
+                try:
+                    slots = int(mamba.available_size()) if mamba is not None else -1
+                except Exception as exc:  # noqa: BLE001 - a probe must not break
+                    slots = f"RAISED {type(exc).__name__}"
+                alloc = getattr(self, "token_to_kv_pool_allocator", None)
+                try:
+                    avail = int(alloc.available_size()) if alloc is not None else -1
+                except Exception as exc:  # noqa: BLE001
+                    avail = f"RAISED {type(exc).__name__}"
+                logger.warning(
+                    "PHASE-POLICY IDLE-LOCKED TERMS phase=%s running_bs=%s "
+                    "pending_tokens=%s | here(%s)=%s there(%s)=%s | "
+                    "post_evict_rows=%s allocator_avail=%s mamba_slots=%s "
+                    "chunk=%s -- both layouts refused; these are the numbers "
+                    "the simulation actually read.",
+                    phase,
+                    running_bs,
+                    pending_tokens,
+                    phase,
+                    here,
+                    other,
+                    there,
+                    self._post_evict_rows(),
+                    avail,
+                    slots,
+                    getattr(self.server_args, "chunked_prefill_size", None),
+                )
         return (not here), there
 
     def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
