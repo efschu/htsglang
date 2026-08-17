@@ -67,7 +67,7 @@ import io
 import json
 import os
 import tarfile
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 __all__ = [
     "BUNDLE_FORMAT_VERSION",
@@ -101,6 +101,36 @@ class PortableSessionError(RuntimeError):
     """Export or import refused. Always names what mismatched."""
 
 
+def referenced_blobs(manifest: Dict[str, Any]) -> list:
+    """Every blob key the manifest references, in a stable order.
+
+    #411 CUT 2 CORRECTION. Cut 1 read ``page_hashes`` -- a field name taken
+    from DESIGN_410's prose. The manifest the code actually builds
+    (``session_handover.build_manifest``) carries ``kv_keys``, ``mamba_key``
+    and ``draft_keys``, and the difference is not cosmetic: exporting a hybrid
+    session without its ``mamba_key`` produces a bundle that imports cleanly
+    and replays a WRONG session, because a missing recurrent state truncates
+    the prefix match at the destination and silently re-prefills. That is the
+    #212 failure verbatim, and the source gate exists to make it loud.
+
+    ``page_hashes`` is still honoured when present so a manifest written to
+    the design's prose shape is not silently dropped.
+    """
+    keys: list = []
+    keys.extend(manifest.get("kv_keys") or manifest.get("page_hashes") or [])
+    mamba_key = manifest.get("mamba_key")
+    if mamba_key:
+        keys.append(mamba_key)
+    keys.extend(manifest.get("draft_keys") or [])
+    seen = set()
+    ordered = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
 def export_bundle(
     manifest: Dict[str, Any],
     page_bytes_for: Callable[[str], Optional[bytes]],
@@ -119,7 +149,7 @@ def export_bundle(
 
     Returns a summary dict (also stored as ``bundle.json``).
     """
-    hashes = list(page_hashes if page_hashes is not None else manifest.get("page_hashes") or [])
+    hashes = list(page_hashes if page_hashes is not None else referenced_blobs(manifest))
     payloads: list[Tuple[str, bytes]] = []
     missing: list[str] = []
     for page_hash in hashes:
@@ -191,49 +221,41 @@ def check_compatibility(
     *,
     local_identity: str,
     local_geometry: Dict[str, Any],
-    accepted_envelope_versions: Optional[Iterable[int]] = None,
+    exists_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[bool, str]:
-    """Version, then identity, then geometry. First failure wins, by name.
+    """Delegate to ``session_checkpoint.verify_restore``. Nothing is re-decided.
 
-    Order is deliberate: a bundle from an unknown version may not even have
-    the fields the later checks read, so asking about identity first would
-    produce a confusing refusal about a field that means something else.
+    #411 CUT 2, SECOND CORRECTION. Cut 1 hand-rolled version and identity
+    checks. The first pass of Cut 2 replaced them with a hand-rolled
+    COMPOSITION of ``verify_import`` + ``verify_geometry`` -- which is itself
+    already a function: ``verify_restore``, in the same order, with the same
+    reasoning ("Identity failing is the more fundamental problem, so it is the
+    message the caller sees"). DESIGN_410 section 7 specifies exactly that
+    composition. Re-composing it here was a second authority one level up from
+    the one I had just avoided.
+
+    So this now calls ``verify_restore`` and adds exactly one thing of its
+    own: the #726 note on an identity refusal, because the identity hash
+    covers the kv-cache dtype NAME and not the byte layout within it, and a
+    reader of a refusal should learn where the gate stops.
+
+    ``exists_fn`` answers "is this blob in the bundle". Omitted means the
+    presence half is skipped, which is what a caller inspecting a manifest
+    without its payloads wants.
     """
-    envelope = manifest.get("checkpoint") or {}
-    version = envelope.get("envelope_version")
-    accepted = (
-        set(accepted_envelope_versions)
-        if accepted_envelope_versions is not None
-        else _default_accepted_versions()
-    )
-    if version not in accepted:
+    from sglang.srt.managers.session_checkpoint import verify_restore
+
+    probe = exists_fn if exists_fn is not None else (lambda _key: True)
+    try:
+        ok, detail = verify_restore(manifest, probe, local_identity, local_geometry)
+    except KeyError as e:
         return False, (
-            f"unknown checkpoint envelope version {version!r}; this server "
-            f"accepts {sorted(accepted)}. Refusing to best-effort parse a "
-            f"format it does not know."
+            f"malformed manifest: required field {e} is absent, so this "
+            f"bundle cannot be judged rather than judged leniently"
         )
-
-    got_identity = manifest.get("model_identity") or manifest.get("model_identity_hash")
-    if got_identity != local_identity:
-        return False, (
-            f"model identity mismatch: bundle {got_identity!r} vs this server "
-            f"{local_identity!r}. The hash covers weights, dtype, quantization "
-            f"and KV byte format, so this bundle was not written by a server "
-            f"this one can replay. {IDENTITY_LAYOUT_GAP}"
-        )
-
-    from sglang.srt.managers.session_checkpoint import verify_geometry
-
-    ok, detail = verify_geometry(manifest, local_geometry)
-    if not ok:
-        return False, detail
-    return True, "compatible: " + detail
-
-
-def _default_accepted_versions() -> set:
-    from sglang.srt.managers.session_checkpoint import CHECKPOINT_ENVELOPE_VERSION
-
-    return {int(CHECKPOINT_ENVELOPE_VERSION)}
+    if not ok and "model identity mismatch" in detail:
+        return False, f"{detail}. {IDENTITY_LAYOUT_GAP}"
+    return ok, detail
 
 
 def import_bundle(
@@ -241,26 +263,40 @@ def import_bundle(
     *,
     local_identity: str,
     local_geometry: Dict[str, Any],
-    accepted_envelope_versions: Optional[Iterable[int]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, bytes]]:
-    """Gate FIRST, then read payloads. Returns ``(manifest, pages)``.
+    """Gate FIRST, on NAMES, then read payloads. Returns ``(manifest, pages)``.
 
-    Nothing is extracted until the gate passes -- so a rejected bundle costs
-    one member read, and an incompatible bundle can never leave a partially
-    seeded session behind, because seeding has not begun.
+    #411 CUT 2: the completeness check runs against the bundle's member NAMES,
+    which the tar directory yields without extracting a byte. So an incomplete
+    or incompatible bundle is refused before ANY payload is read -- and, since
+    nothing is returned, before any caller could have begun seeding from it.
+
+    THE FAILURE DIRECTION THIS MAKES IMPOSSIBLE is partial-seed-then-fail. A
+    gate that ran after extraction could still be recovered from; one that ran
+    after seeding could not, because a half-seeded session decodes wrong
+    rather than failing. The completeness rule is #410's own
+    (``validate_manifest_completeness`` on the write side, ``verify_import``
+    on the read side); this only extends the boundary it applies at.
     """
     manifest = read_manifest(path)
-    ok, detail = check_compatibility(
-        manifest,
-        local_identity=local_identity,
-        local_geometry=local_geometry,
-        accepted_envelope_versions=accepted_envelope_versions,
-    )
-    if not ok:
-        raise PortableSessionError(f"import refused: {detail}")
 
-    pages: Dict[str, bytes] = {}
     with tarfile.open(path, "r") as tar:
+        present = {
+            name[len(PAGE_PREFIX) :]
+            for name in tar.getnames()
+            if name.startswith(PAGE_PREFIX)
+        }
+
+        ok, detail = check_compatibility(
+            manifest,
+            local_identity=local_identity,
+            local_geometry=local_geometry,
+            exists_fn=lambda key: key in present,
+        )
+        if not ok:
+            raise PortableSessionError(f"import refused: {detail}")
+
+        pages: Dict[str, bytes] = {}
         for member in tar.getmembers():
             if not member.name.startswith(PAGE_PREFIX):
                 continue
@@ -268,15 +304,4 @@ def import_bundle(
             if handle is None:  # pragma: no cover - directory entry
                 continue
             pages[member.name[len(PAGE_PREFIX) :]] = handle.read()
-
-    expected = list(manifest.get("page_hashes") or [])
-    absent = [h for h in expected if h not in pages]
-    if absent:
-        # Completeness BEFORE seeding, mirroring #410's own rule.
-        raise PortableSessionError(
-            f"import refused: bundle is missing {len(absent)} of "
-            f"{len(expected)} pages the manifest references (first: "
-            f"{absent[0]!r}). Seeding a partial chain would produce a session "
-            f"that decodes wrong rather than one that fails."
-        )
     return manifest, pages

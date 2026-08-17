@@ -125,3 +125,83 @@ not have.
    import successfully — which is the #411-as-converter claim, end to end.
 4. Export a long-idle session whose pages have been evicted: refused, not
    holed. With Slice 2 merged, re-pin and export successfully.
+
+---
+
+# CUT 2 — the wire, and three corrections to my own Cut 1
+
+The prior-art gate found more in Cut 1 than the wire it was meant to add.
+
+## C1 — Cut 1 exported the WRONG BLOB SET, and it was a #212 failure
+
+Cut 1 read `page_hashes` — a field name taken from DESIGN_410's **prose**. The
+manifest `session_handover.build_manifest` actually writes carries
+`kv_keys`, `mamba_key`, `hybrid_gdn` and `draft_keys`.
+
+Not cosmetic. A hybrid-GDN session exported by Cut 1 would have carried its KV
+pages and **not its recurrent state**, producing a bundle that imports cleanly
+and replays a **wrong session** — because a missing mamba blob truncates the
+prefix match at the destination and silently re-prefills. That is exactly what
+`validate_manifest_completeness` calls "a wrong session, not a slow one".
+
+Fixed: `referenced_blobs()` enumerates kv + mamba + draft, de-duplicated, with
+`page_hashes` still honoured so a prose-shaped manifest is not silently
+dropped.
+
+## C2 — Cut 1's gate duplicated `verify_import`
+
+Version and identity checks are already in `session_handover.verify_import`,
+together with blob presence **and** the #212 hybrid-GDN clause. I had
+re-implemented two of the four.
+
+## C3 — my first Cut 2 pass duplicated `verify_restore`
+
+Having replaced C2 with a composition of `verify_import` + `verify_geometry`,
+I then found that composition is itself a function:
+`session_checkpoint.verify_restore`, same order, same stated reasoning
+("Identity failing is the more fundamental problem, so it is the message the
+caller sees"), and specified as such in DESIGN_410 §7.
+
+So `check_compatibility` now calls `verify_restore` and adds exactly one thing
+of its own: the #726 layout-gap note on an identity refusal. Two rounds of
+removing my own duplication, one level apart.
+
+## C4 — the design/code contradiction I reported does NOT exist in the repo
+
+Cut 1's note said DESIGN_410 claims "content only, no placement" while the code
+binds geometry, and proposed fixing the design text.
+
+**That was wrong.** The repo document (`docs/dev/DESIGN_410_session_checkpoints.md`
+§7) already states the shipped behaviour: `verify_restore` = `verify_import`
+**then** `verify_geometry`, with cross-geometry "refused **by name**, naming
+the offline `hicache_migrate --manifest` route, and … never silently
+converted."
+
+The "content only" text is in a **different, older draft** in the evidence
+directory. I compared code against a stale copy and reported a contradiction
+that the shipped doc does not contain. No design text needed fixing; the brief's
+item 2 is moot, and saying so is better than editing a correct document to
+match a claim I got wrong.
+
+## C5 — Slice 2 is still absent, so the dangling reference stays
+
+Re-checked on this base: `3550e20acf` is not an ancestor and
+`mem_cache/pin_ledger.py` does not exist. The export refusal's "re-pin the
+checkpoint (#410 slice 2)" advice therefore still names a capability this
+branch lacks. Kept, honestly, per the standing instruction.
+
+## What Cut 2 actually added
+
+`import_bundle` now gates on the tar's member **names** — which the directory
+yields without extracting a byte — so an incomplete or incompatible bundle is
+refused before any payload is read, and nothing is returned for a caller to
+have begun seeding from. **Partial-seed-then-fail is unreachable**, which is
+the failure direction the brief named: a gate after extraction is recoverable,
+a gate after seeding is not, because a half-seeded session decodes wrong
+rather than failing.
+
+22 pins. Mutation: dropping the gate fails 6, including every partial-seed pin.
+
+Unchanged: this is still the file layer. Handing `(manifest, pages)` to the
+live seeding path is the next cut, and cross-rig proof remains the filed
+window item.
