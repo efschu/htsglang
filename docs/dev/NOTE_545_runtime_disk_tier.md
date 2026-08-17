@@ -1,0 +1,149 @@
+# #545 — runtime attach/resize/detach of the HiCache disk tier
+
+Desk only, 2026-08-17. No boot, no server, no GPU. **Nothing built**, and the
+reason is that it is already built. §4 is the one gap that is real.
+
+## 0 — The control path exists, end to end
+
+The brief asked to build it. It is there:
+
+| operation | route | file:line |
+|---|---|---|
+| attach | `PUT /hicache/storage-backend` | `entrypoints/http_server.py:1415` |
+| detach | `DELETE /hicache/storage-backend` | `:1449` |
+| status | `GET /hicache/storage-backend` | `:1476` |
+| resize | `POST /hicache/storage-backend/resize` | `:1495` |
+| clear | `POST /hicache/storage-backend/clear` | `:1395` |
+
+Each carries `@auth_level(AuthLevel.ADMIN_OPTIONAL)` **plus** an explicit
+`if not server_args.admin_api_key: return _admin_api_key_missing_response()`
+inside the handler — the #510 regime, applied with the belt-and-braces the
+most sensitive routes are supposed to get. They reach
+`attach_storage_backend` / `detach_storage_backend` / `resize_storage_backend`
+on the tree cache through scheduler handlers
+(`managers/scheduler.py:7625/7681/7728`).
+
+The semantics the brief specified are the semantics implemented:
+
+- **attach/detach refuse a non-idle scheduler by name** — *"Reject attach:
+  scheduler is not idle. #queue-req=… #running-req=…"* (`scheduler.py:7635`).
+- **resize-down evicts before acknowledging.** `LRUFileEvictor.set_limits`
+  (`storage/file/lru_file_evictor.py:257-337`): *"Shrinking evicts LRU victims
+  inline … and returns once usage is back under the new cap. In-flight
+  (reserved but uncommitted) writes are never evicted"* — so it does not
+  truncate live pages, and the write interlock is `_pending_writes` rather
+  than a race with the backup queue.
+- **resize deliberately does NOT require idleness**, because it only touches
+  the evictor's own lock and counters. That is a narrower and better interlock
+  than attach/detach's whole-scheduler gate, and it is intentional.
+
+## 1 — Retraction: I claimed resize was untested. It is not.
+
+I wrote a hermetic pin file on the finding that "resize has no coverage at
+all", having grepped for `resize` inside the E2E attach/detach test and found
+nothing.
+
+**Wrong.** `test/registered/unit/mem_cache/test_hicache_runtime_resize_545.py`
+exists with **21 tests**, covering every property I pinned and several I did
+not: grow-evicts-nothing, shrink-until-under-cap, LRU victim order,
+enable-at-runtime-adopts-existing-files, in-flight-write-not-evicted,
+lifting-the-cap-disables-eviction, non-owner-MLA-rank-inert, the request
+validation layer, and both `HiRadixCache` and `UnifiedRadixCache`.
+
+My file was 100% duplicate and is **deleted**. Shipping it would have created
+a second authority for the same properties — the thing I refused in #536 when
+I reverted a client-side default that duplicated `launch.py`.
+
+The error is the same one I made in #726 and #677: concluding absence from the
+file I happened to open, instead of grepping for the thing itself. Third
+instance; the rule is that "no coverage" requires a search for the coverage,
+not a search inside one file.
+
+My harness also had a defect worth recording: it passed `max_size_bytes` /
+`min_free_bytes` as `extra_config` keys, but the real names are `max_size` /
+`min_free_space` (`lru_file_evictor.py:157-162`). Every evictor it constructed
+came up UNCONFIGURED, and most pins still passed — because they configure via
+`set_limits()` anyway. A harness passing for the wrong reason.
+
+## 2 — Two more premise items that do not exist
+
+**`MixedLayoutError`** — the guard the brief said attach must reuse. **Not in
+this tree.** Zero hits across `python/`. The commit the brief cites
+(`19f4c68864`, #558) describes it in its message, but no such class is in the
+worktree; the nearest relative is `DraftKvLayoutMismatch`
+(`disaggregation/draft_kv_canonical.py:65`), which guards PD draft-KV, not
+HiCache attach. The guard attach actually uses is a same-backend check in
+`hiradix_cache.py:544-568`, refusing a *different* backend by name and telling
+the caller to detach first.
+
+**`ReadBufferPool` / #720** — **not in this tree either.** No class of that
+name, no `#720` reference. Whatever accounting the brief meant, it is not
+present under that name and I did not design around a guess.
+
+## 3 — Prior art the brief did not mention
+
+`docs/dev/NOTE_544_hicache_runtime_preserve_thinking.md` is a prior
+desk-complete investigation of this exact ticket, with the layer diagram and
+the design that was then implemented, and
+`docs/advanced_features/hicache_storage_runtime_attach_detach.md` is the
+user-facing documentation of the shipped feature. Both predate this task.
+
+## 4 — The one gap that IS real, and it lands on this rig's models
+
+`UnifiedRadixCache.attach_storage_backend` and `detach_storage_backend`
+(`mem_cache/unified_radix_cache.py:2769`, `:2783`) are **hard stubs that always
+fail**:
+
+```
+"UnifiedRadixCache does not support runtime HiCache storage attach yet.
+ Configure hicache_storage_backend at startup instead."
+```
+
+`resize_storage_backend` on that class works; attach and detach do not.
+
+**Why that matters here rather than being a footnote:** `UnifiedRadixCache` is
+what `mem_cache/registry.py:191` constructs, on the path that appends the
+MAMBA component for `is_hybrid_ssm` — the hybrid-GDN family this rig serves. So
+on our own models the shipped runtime story is **resize yes, attach/detach
+no**, and the ticket's headline capability is exactly the half that is stubbed.
+
+I did not verify which cache class our specific boot instantiates (that needs
+the boot config, not the source) — so this is "the path hybrid-SSM models are
+routed to", not "confirmed for our running server".
+
+Also NOT ESTABLISHED, from the map: no test raises or mocks a real
+`OSError(ENOSPC)`; disk-full is exercised only through the `min_free_space`
+watermark refusal.
+
+## 5 — Recommendation
+
+Do not build a control path. Two candidates, in order:
+
+1. **Implement `UnifiedRadixCache.attach/detach`** so the hybrid-GDN family
+   gets the capability the rest already has. That is the ticket's actual
+   remaining work, and it is a real implementation task rather than a
+   plumbing one — the stubs are stubs because the unified cache's controller
+   lifecycle differs from `HiRadixCache`'s, which is what would have to be
+   made restartable.
+2. **A real ENOSPC injection test** for the write path, since the current
+   coverage stops at the watermark.
+
+## 6 — Acceptance for the live window (filed, not run)
+
+For the Flip+HiCache boot list, on a server started **without** a storage
+backend:
+
+1. attach mid-load via `PUT /hicache/storage-backend` with `admin_api_key`
+   set; expect success only when the scheduler is idle, and the named
+   non-idle refusal otherwise.
+2. hit rate rises afterwards — measured from the same `#cached-token` source
+   the #703 acceptance uses, never `cache_hit_rate`.
+3. no stall attributable to the attach: per-request latency across the attach
+   boundary stays inside its band.
+4. `POST /resize` down while serving: usage falls under the new cap and the
+   call returns only after it has, with no request failure.
+5. `DELETE` detach: subsequent lookups become misses, never corruption —
+   content-addressed, the same argument #703 uses for drops.
+
+On a hybrid-GDN model, expect (1) and (5) to fail with the §4 refusal. That
+is the acceptance for the gap, not a bug to file twice.
