@@ -15801,6 +15801,41 @@ class ServerArgs:
         for count in counts:
             per_stage_full.append(sum(1 for k in kinds[start : start + count] if k))
             start += count
+        # A SUBSTITUTION MUST ANNOUNCE ITSELF. #505(a) class.
+        #
+        # These scores are capability RATIOS, so deriving a different layer
+        # split is correct by design -- but when the operator passes a vector
+        # that sums to the model depth they are spelling out layer counts, and
+        # silently getting a different cut is how 2026-08-17's speed boot died:
+        # `--pp-stage-ratio 31,17,16` was snapped to 32,16,16, which moved a
+        # FULL-ATTENTION layer onto stage 0 (8/4/4 instead of 7/5/4), shifted KV
+        # mass against a pinned pool, and OOM'd inside an NCCL send at 08:53:51.
+        # The derived split was logged, but nothing said "you did not get what
+        # you asked for", so the boot record read as the requested cut.
+        #
+        # The remedy is NAMED, not hinted: the full-attention counts of the
+        # requested ranges are exactly the --pp-attn-stage-ratio that realizes
+        # them, so it is computed and printed rather than left as an exercise.
+        if attn_scores is None and sum(scores) == depth and list(counts) != list(scores):
+            want_full, start = [], 0
+            for count in scores:
+                want_full.append(sum(1 for k in kinds[start : start + count] if k))
+                start += count
+            logger.warning(
+                "--pp-stage-ratio %s sums to the model depth (%d), so it reads "
+                "as an explicit layer split -- but the coupled derivation gave "
+                "%s instead. The two families were balanced together; to hold "
+                "the layer counts you asked for, decouple them with "
+                "--pp-attn-stage-ratio %s (the full-attention counts of your "
+                "own ranges), or spell the split out with --pp-layer-ratio %s. "
+                "Proceeding with %s.",
+                ",".join(str(s) for s in scores),
+                depth,
+                ",".join(str(c) for c in counts),
+                ",".join(str(f) for f in want_full),
+                ",".join(str(s) for s in scores),
+                ",".join(str(c) for c in counts),
+            )
         self.pp_layer_ratio = counts
         logger.info(
             "--pp-stage-ratio %s%s: derived --pp-layer-ratio %s over %d layers "
