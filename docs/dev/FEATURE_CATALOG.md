@@ -3499,6 +3499,24 @@ taxonomy and the global importance ladder.
   `AssetClassDescriptor` are the VRAM eviction-priority registry (see §17's
   warning that "#286 offload register" names two modules); `ASSET_CLASSES`
   here is a round-trip inventory with its own reasons.
+- **flip-policy admission early-false (#713)** — DETERMINATION ONLY on this
+  lineage; the mechanism and its fix live on `train/0817-control`
+  (`ANALYSE_713_admission_early_false_determination.md`). Recorded here so the
+  question is not re-opened: the phase policy is evaluated by `recv_requests`
+  BEFORE the arriving request reaches `waiting_queue`
+  (`scheduler_components/request_receiver.py:103`, append at
+  `scheduler.py:4089`), so `_pending_prefill_tokens` reads 0 and
+  `_layout_admits` (`scheduler.py:3320`) early-falses on its first line,
+  `if int(pending_tokens) <= 0: return False` — before the pp terms it would
+  have passed. Measured 31.64 s TTFT for a ten-token prompt on an empty box.
+  THE 22 IS THE TRUTH AND THE 0 IS THE DEFECT. Fixed at the INPUT and not the
+  rule by `3c1aa6f29b`: `_arriving_prefill_tokens` (`:422`),
+  `_pending_prefill_tokens(inflight=None)` (`:8600`),
+  `maybe_arm_phase_policy(inflight_reqs=None)` (`:8686`), one reading for both
+  verdict and message (`:8836`). Not to be confused with the reverted #713
+  commit `4a16043d1a` (post-cutover settle). Line numbers are
+  `train/0817-control`'s; none of this exists in this branch's tree, whose
+  `scheduler.py` is 8675 lines against that branch's 9950.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
