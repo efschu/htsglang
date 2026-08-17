@@ -1349,6 +1349,27 @@ def bc_plan(nbytes: int, slot: int) -> list:
     ]
 
 
+def pipe_on_group_verdict(gathered) -> bool:
+    """The group's answer for ``pipe_on``: on only if EVERY rank has it (#728).
+
+    Split out as a pure function so the reduction can be falsified without a
+    process group -- the gather that feeds it needs one, the decision does not.
+
+    AND, not OR or majority, and the direction matters. ``pipe_on`` feeds the
+    payload ceiling and the slot offsets, so the group must agree on the layout
+    the WEAKEST rank can build. A rank that could not compile the pipelined
+    extension cannot run it however many peers could.
+
+    An empty or all-``None`` carrier answers False: "nobody reported that they
+    can" is not "everybody can", and defaulting the other way would enable a
+    path on the strength of a failed exchange.
+    """
+    values = [v for v in gathered if v is not None]
+    if not values:
+        return False
+    return all(bool(v) for v in values)
+
+
 def max_payload(world: int, region_bytes: int, with_a2a: bool = True,
                  with_pipe: bool = False, result_ring: int = 0,
                  pipe_range: int = 0) -> int:
@@ -2242,6 +2263,47 @@ class BarlinkBar1Transport:
                 self.pipe_on = False
                 self._pipe_ext = None
 
+        # #728: RECONCILE pipe_on ACROSS THE GROUP, here, before anything is
+        # derived from it.
+        #
+        # The build above is a RANK-LOCAL try/except: a compile that fails on
+        # one rank's disk or ccache state and succeeds on its neighbour used to
+        # leave the two with different pipe_on. That is not a local matter,
+        # because pipe_on feeds max_payload() below, which feeds BOTH
+        # ``max_bytes`` -- the ceiling ``handles()`` compares against, so two
+        # ranks answer differently for the same payload and one enters a
+        # collective the other does not -- AND ``geometry()``, which fixes the
+        # slot OFFSETS.
+        #
+        # Reconciling here rather than later is the whole point. A late group
+        # minimum on max_bytes would be exactly the "silent shrinking of the
+        # payload" that the window check below refuses by name: "the slot
+        # offsets are fixed in both kernels, and a rank with a different layout
+        # would write to the wrong place". Fixing the INPUT keeps every derived
+        # quantity uniform by construction and leaves that check untouched.
+        #
+        # AND-reduce, so the weakest rank decides: if any rank could not build
+        # the extension, the whole group runs without it. Same shape as
+        # ``parallel_state._harmonize_ca_comm_enablement``.
+        if self.world > 1:
+            local_pipe_on = bool(self.pipe_on)
+            carrier_pipe: list[object] = [None] * self.world
+            dist.all_gather_object(carrier_pipe, local_pipe_on, group=self.cpu_group)
+            group_pipe_on = pipe_on_group_verdict(carrier_pipe)
+            if group_pipe_on != local_pipe_on:
+                logger.warning(
+                    "barlink-BAR1: the pipelined extension is available on "
+                    "this rank but NOT on every rank of the group (%s), so it "
+                    "is disabled group-wide. One rank's failed build lowers "
+                    "the payload ceiling for the whole session -- which is the "
+                    "correct trade: a smaller ceiling is slow, a per-rank "
+                    "ceiling hangs.",
+                    [bool(x) for x in carrier_pipe],
+                )
+            self.pipe_on = group_pipe_on
+            if not self.pipe_on:
+                self._pipe_ext = None
+
         # 1. Memory layout. The largest payload follows from the window the
         # caller grants -- not the other way around.
         if self.pipe_on and not (2 <= self.pipe_lead <= self.pipe_t):
@@ -2928,12 +2990,22 @@ class BarlinkBar1Transport:
         """``True`` only if the path can really carry this operation.
 
         Every condition is **rank-uniform**: it depends only on group-wide
-        reconciled sizes (``_proofs_hold`` comes from a distribution per
-        directed pair, ``_window_minimum`` and ``max_bytes`` from an
-        ``all_gather``, the thresholds from rank-uniform environment
-        variables). Two ranks must never answer differently here -- one
-        would run into the collective and the other would not, and the
-        result would be a hang instead of an error.
+        reconciled state (``_proofs_hold`` comes from a distribution per
+        directed pair, ``_window_minimum`` from an ``all_gather``, the
+        thresholds from rank-uniform environment variables). Two ranks must
+        never answer differently here -- one would run into the collective and
+        the other would not, and the result would be a hang instead of an
+        error.
+
+        ``max_bytes`` (#728) is uniform BY CONSTRUCTION rather than by a
+        gather of its own: it is ``max_payload()`` of inputs that are each
+        already reconciled -- ``window_bytes`` from the window exchange, and
+        ``pipe_on`` AND-reduced across the group right after its build. This
+        docstring previously claimed ``max_bytes`` came "from an all_gather".
+        It did not, and it does not now; it comes from reconciled inputs, which
+        is the stronger property because the SLOT OFFSETS are derived from the
+        same value and a value reconciled after the fact would leave the layout
+        divergent.
 
         The data type is NOT a factor: ``handles`` does not see it. The
         extension accepts float32/float16/bfloat16 and rejects everything
