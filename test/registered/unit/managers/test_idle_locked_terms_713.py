@@ -139,7 +139,6 @@ class TestDiagnosticProbesAreAllDefended713(CustomTestCase):
     """
 
     def _raising_sched(self, which):
-        from sglang.srt.managers.scheduler import Scheduler
 
         def boom():
             raise RuntimeError("probe exploded")
