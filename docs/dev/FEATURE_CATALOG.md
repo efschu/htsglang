@@ -207,6 +207,17 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   rather than refuses: a gate that cannot see must not veto a working
   container. Cut 2 was already delivered (the launcher-published rank ->
   card-UUID vector, `registry/rank_cards.py`).
+  CUT 8 (backend half) SHIPPED: `StorageBackendFactory._registry` is the
+  authority on which HiCache storage backends exist —
+  `registered_storage_backends()` reads it and
+  `_validate_storage_backend_registered` refuses an unbuildable name,
+  listing what IS registered. The argparse `choices=` literal stays (deriving
+  it at annotation time would give `server_args` its first module-level
+  `mem_cache` import and pull the storage stack into argument PARSING);
+  a test makes the two unable to drift. The drift was already real: the
+  help text named 5 of the 8 built-ins. L2's declared capacity is the
+  open half and is a WINDOW item — a capacity of usable provenance comes
+  from a probe, and `apply_outcome` refuses a non-MEASURED rate.
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream
