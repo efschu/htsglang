@@ -805,10 +805,33 @@ class KvBackingRelief:
             if t["deficit"] <= 0
             else "KV capacity is the funder"
         )
+        # #714: a floor ABOVE the cap is not a tight round, it is an
+        # impossible one, and "slack=0" alone cannot tell them apart.
+        #
+        # Measured on 0b61699cc3: current=137216, floor=398471. The floor
+        # formula is right -- margin_rows defaults to 0 and is never passed,
+        # and the admission reserve is chunked_prefill_size (512) -- so
+        # floor = max_live + 513 and max_live was 397,958: a live row id 2.9x
+        # ABOVE the cap, i.e. ids that outlived the pool they were measured in.
+        # slack is max(0, ...), so it pins to 0 for as long as that holds and
+        # the rung can never propose a shrink. The evict-rung funding path is
+        # then permanently unavailable and every flip falls back on the raw
+        # seam fund alone -- which is why that boot abandoned three times over
+        # a 55 MiB shortfall instead of funding it from KV once.
+        unreachable = ""
+        if t["floor_rows"] > t["current"]:
+            gap = int(t["floor_rows"]) - int(t["current"])
+            unreachable = (
+                f" -- FLOOR UNREACHABLE: it exceeds the current cap by {gap} "
+                "rows, so this rung can never fund and every flip depends on "
+                "the raw seam fund alone. The floor is max_live + 1 + margin + "
+                "admission reserve, so a floor above the cap means max_live is "
+                "above the cap: live row ids outliving a pool shrink/reshard."
+            )
         return (
             f"KV rung: current={t['current']} rows, floor={t['floor_rows']}, "
             f"slack={max(0, t['current'] - t['floor_rows'])}, deficit="
-            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why})"
+            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why}){unreachable}"
         )
 
     def _mark_exhausted(self, target: Optional[int] = None) -> None:
