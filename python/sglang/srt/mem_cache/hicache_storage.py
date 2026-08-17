@@ -931,11 +931,22 @@ class HiCacheFile(HiCacheStorage):
         """
         from sglang.srt.mem_cache.pin_ledger import stems_with_sizes
 
+        import dataclasses
+
         pairs = []
+        missing: list[str] = []
         for key in keys:
             stem = self._get_suffixed_key(key)
-            pairs.append((stem, self._existing_path(stem)))
-        return self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+            path = self._existing_path(stem)
+            pairs.append((stem, path))
+            # `stems_with_sizes` drops a stem whose file is gone -- correct for
+            # the budget, invisible to the caller. Record it here, where the
+            # CONTENT key is still known, so the refusal can name what the
+            # caller actually asked for rather than a suffixed stem.
+            if not os.path.exists(path):
+                missing.append(key)
+        result = self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+        return dataclasses.replace(result, unpinned=tuple(missing))
 
     def unpin_checkpoint(self, checkpoint_id: str) -> int:
         """Release a checkpoint's pins, returning the bytes actually freed."""

@@ -97,6 +97,36 @@ class CheckpointNotFound(ManifestError):
     """No checkpoint by that id in this store."""
 
 
+class PinCoverageIncomplete(ManifestError):
+    """A pin was requested for references the store could not actually pin.
+
+    Raised at CREATE, which is the whole point. ``verify_against_store`` and
+    ``pin_checkpoint`` consult different authorities -- the first can answer
+    from the metadata cache, the second stats the filesystem -- so a reference
+    can pass verification and still have no file to pin by the time the sizes
+    are taken. ``stems_with_sizes`` drops it, correctly, because charging the
+    budget for protection nobody gets is the #715 error.
+
+    What was missing is that the drop was SILENT. A checkpoint then reported
+    success while protecting less than it claimed, and the shortfall surfaced
+    at the branch as "a reference was evicted" -- later, and further from the
+    cause. Nothing here can make a deleted page survive; this moves the
+    refusal to where the caller can still act on it.
+    """
+
+    def __init__(self, checkpoint_id: str, unpinned: tuple):
+        self.checkpoint_id = checkpoint_id
+        self.unpinned = tuple(unpinned)
+        super().__init__(
+            f"{LOG_PREFIX} checkpoint {checkpoint_id!r} could not pin "
+            f"{len(self.unpinned)} of its references, so it would protect less "
+            f"than it claims: {list(self.unpinned)!r}. These passed the "
+            "existence check and then had no file to pin -- the store's "
+            "metadata cache and its filesystem disagreed. Nothing was created "
+            "and nothing stays pinned."
+        )
+
+
 class CheckpointExists(ManifestError):
     """Refusing to overwrite an existing checkpoint id.
 
@@ -115,6 +145,11 @@ class CheckpointRecord:
     pinned: bool
     bytes_added: int = 0
     bytes_shared: int = 0
+    #: What the caller asked to protect, and what it got. Equal on every
+    #: successful pinned create -- a create that could not reach equality is
+    #: refused rather than recorded.
+    references_requested: int = 0
+    references_pinned: int = 0
 
 
 def checkpoint_dir(store: Any) -> str:
@@ -188,13 +223,35 @@ def create_checkpoint(
 
     pinned = False
     added = shared = 0
+    # Zero for an unpinned create: it promised nothing, so it reports nothing
+    # protected rather than a coverage figure that would read as a shortfall.
+    n_requested = n_pinned = 0
     if pin:
         # Budget refusal propagates verbatim -- it already names the checkpoint
         # and every number (want, held, budget, overshoot), and this layer has
         # nothing truer to add.
-        result = store.pin_checkpoint(checkpoint_id, list(manifest.references()))
+        requested = list(manifest.references())
+        result = store.pin_checkpoint(checkpoint_id, requested)
         pinned = True
         added, shared = int(result.bytes_added), int(result.bytes_shared)
+        n_requested = len(requested)
+        n_pinned = len(getattr(result, "stems", ()) or ())
+
+        # COVERAGE. Asking for N pins and getting fewer is not a partial
+        # success, it is a promise this checkpoint cannot keep. Roll the pins
+        # back and refuse here rather than letting the branch discover it.
+        unpinned = tuple(getattr(result, "unpinned", ()) or ())
+        if unpinned:
+            try:
+                store.unpin_checkpoint(checkpoint_id)
+            except Exception:  # pragma: no cover - best-effort rollback
+                logger.exception(
+                    "%s could not release pins after refusing %s for "
+                    "incomplete coverage; the orphan reaper will collect them.",
+                    LOG_PREFIX,
+                    checkpoint_id,
+                )
+            raise PinCoverageIncomplete(checkpoint_id, unpinned)
 
     try:
         _write_atomic(path, dumps(manifest))
@@ -230,6 +287,8 @@ def create_checkpoint(
         pinned=pinned,
         bytes_added=added,
         bytes_shared=shared,
+        references_requested=n_requested,
+        references_pinned=n_pinned,
     )
 
 
