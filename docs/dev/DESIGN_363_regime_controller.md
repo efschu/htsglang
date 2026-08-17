@@ -1714,3 +1714,112 @@ consumption of the verdict — today it is reported to a planner reader, not to
 a controller. The switch-cost constants remain the §20.2 physics estimate and
 the #102 analogy; only the KV delta inherits a measurement (#297). §20.3's
 measurement duty is unchanged and unmet.
+
+---
+
+## 21. Remainder determination (2026-08-17) — the three candidates, at code
+
+Asked: what did #363 promise that #656 / #677 / #704 do NOT already deliver?
+Answered per candidate with a commit or a file:line, never from the roadmap.
+Two were delivered, one was superseded on both of its axes, and one thing
+nobody had listed turned out to be genuinely open.
+
+### 21.1 (a) Per-rank ms/round as the TRIGGER — DELIVERED (desk), boot-gated
+
+Delivered by `b2f0a749ac` ("Intra-phase stage actuator: ms/round decides, the
+corridor admits"). `MsStageDecider.decide` (`regime_ms_clock.py:718`) computes
+an improvement from the measured compute/wait split and, when it clears
+hysteresis over `enter_window`/`exit_window` boundaries, OVERRIDES the
+label-only target (`regime_runtime.py:436-438`).
+
+It is routed exactly as §7.2 demanded, which is the part worth recording: the
+clock consumes a GROUP statistic via `pack_ms_sample`/`unpack_ms_sample`
+(`regime_ms_clock.py:188-248`) — round length is the MAX total (slowest rank
+sets the barrier), wait is the MIN wait — never this rank's own number. So the
+rank-local signal reaches the decision through a reduction, and #287 rule 1
+(replicated inputs only) is not broken.
+
+Note the distinction the codebase already draws: the AGGREGATE
+`rank_ms_spread_pct` that is reachable in plain observe mode is a VETO only
+(interlock 4, `regime_runtime.py:653-664`), never a trigger. `classify_sample`
+(`regime_classifier.py:239-270`) still reads only occupancy, prefill/decode
+share, queued tokens and queued reqs — no timing field. Both statements are
+true at once, and conflating them is how this candidate looked open.
+
+NOT open for desk work: `--regime-stage-clock` requires `--regime-controller
+act`, which is refused at parse time without a 4-item evidence file
+(`regime_stages.py` `EntryGate`), and the module states its own status —
+"desk code ... none of it has run on metal yet" (`regime_ms_clock.py:141-144`,
+`docs/dev/363/TICKET_363_STAGE_CLOCK.md`). What remains is §11.7's card gates.
+
+### 21.2 (b) The #297 KV delta-move at the phase boundary — SUPERSEDED, both axes
+
+**Weight axis (§20.2's diff-spill mover): dead by pricing.** #704a
+(`7cdb198a06`) established that the actuator which exists is
+`PhaseFlipStacks.refill` — a contiguous host->device memcpy of a whole
+boot-baked arena image (`phase_flip_boot.py:361`, `arena_refill :539`,
+`dst.copy_(payload) :576`). "The bytes on the wire are the same whether one
+layer moves or six", and the step cost is CONSTANT IN THE DISTANCE TRAVELLED
+(1575.3 ms). A diff move therefore buys nothing over a full refill. The absence
+of a cross-rank weight mover is explicit, not inferred:
+`regime_stages.py:100`, `REACH_NO_WEIGHT_MOVER`, "no runtime actuator moves
+weights -- switching arms needs a restart (#354/#357)".
+
+**KV axis: dead at the seam.** `46399c045c` settled by audit that
+`kv_reshard._execute` is gated on `is_fully_idle()` (`scheduler.py:6211`) while
+the flip's quiescence predicate deliberately requires none of its three
+conditions (`phase_flip_runtime.py:303`, `:307`, `:392`). The reshard can be
+ARMED from the regime actuator (`regime_act.py:226-229`) but commits only at a
+fully-idle round, which is not the phase boundary and, under continuous load,
+may never arrive.
+
+So §20.2 stands superseded. `REACH_RESHARD`'s reason string
+(`regime_stages.py:107`) still calls it a "phase-boundary KV reshard"; that
+phrasing predates the audit and should be read as "at a fully-idle round",
+which is the condition the code actually waits on.
+
+### 21.3 (c) The #330 VRAM-budget dial as a regime stage — DELIVERED
+
+`Stage.vram_budget_mib` (`regime_classifier.py:544-545`) is a load-bearing
+field: `RegimeActuator.apply` diffs it against the current stage
+(`regime_act.py:165-172`) and applies it through
+`kv_capacity_runtime.apply_budget_request` (`regime_act.py:293-298`), GROW
+direction only — a shrink is refused before any actuator call
+(`regime_act.py:191-199`) because it flushes the radix cache.
+
+`b2f0a749ac` closed the half that was missing: the dial's GROW path checked
+only its own floor and the VA ceiling, spending the corridor ladder only on a
+SHRINK (`vram_dial.py:565-580`), so the one direction that CONSUMES free VRAM
+was never priced against the corridor law. `regime_admission.py` now prices the
+residency delta from the stages' own budget vector — the same vector the dial
+is handed, so price and move cannot disagree.
+
+### 21.4 What was genuinely open: an arm that never becomes a move
+
+Not on the candidate list, found while checking 21.2. The controller can arm a
+KV reshard; `_execute` then waits for a fully-idle round that may never come.
+`_hold` reported the reason once per CHANGE of reason (`kv_reshard.py`), which
+is correct for a reason that changes and exactly wrong for the one that cannot:
+the permanent hold printed a single INFO line and then went silent for as long
+as the arm sat there. The #363 loop therefore ended at "armed", with the
+controller counting the stage as acted on and nothing ever contradicting it.
+
+Closed minimally: the pending arm carries its age, the hold is re-reported on
+an interval with that age, and it escalates to WARNING under the greppable
+marker `KV-RESHARD arm still pending` once the wait stops being plausibly
+transient. The age belongs to the TARGET, so a controller re-proposing the same
+vector every boundary cannot keep a stuck arm looking fresh. Five hermetic
+tests through the real `arm`/`on_round` path, four executed can-fail arms.
+
+### 21.5 Proposed closure
+
+#363's DESK work is complete. Every remaining item is boot- or
+measurement-gated, and they are already written down: §11.7's four gates, the
+never-run status of the intra-phase axis, §20.3's unmet measurement duty, and
+the §20.4 list (boot-time pre-capture, VMM remap for an inactive family's
+pools). None of them can be advanced without a card.
+
+Recommendation: close #363 as DESK-COMPLETE and carry the residue as a
+boot ticket on the window list, rather than leaving a design task open against
+work that only a GPU window can move. The one thing that could still be built
+without a card has been built (21.4).
