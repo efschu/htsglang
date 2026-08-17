@@ -633,6 +633,18 @@ class HiCacheFile(HiCacheStorage):
         # to one makedirs per shard instead of one per page.
         self._known_shards: set[str] = set()
 
+        # #410: the pin ledger, loaded before anything can evict or sweep. It
+        # is durable because a checkpoint outlives the process, so a pin that
+        # only lived in memory would silently stop protecting anything at the
+        # next restart.
+        from sglang.srt.mem_cache.pin_ledger import PinLedger
+
+        self.pins = PinLedger(
+            self.file_path,
+            budget_bytes=int(envs.SGLANG_HICACHE_PIN_BUDGET_BYTES.get() or 0),
+        )
+        self.pins.load()
+
         # #558: a stem in BOTH layouts means two candidate pages for one
         # content-addressed key, and the read path would silently prefer one.
         # Checked once, at attach, and refused loudly rather than resolved.
@@ -667,7 +679,11 @@ class HiCacheFile(HiCacheStorage):
             from sglang.srt.mem_cache.canonical_page_store import sweep_partials
 
             try:
-                sweep_partials(self.file_path, older_than_s=self._partial_ttl_s)
+                sweep_partials(
+                    self.file_path,
+                    older_than_s=self._partial_ttl_s,
+                    is_pinned=self.pins.is_pinned,
+                )
             except OSError as e:
                 # A store that cannot be swept is still usable; orphans only
                 # cost disk, and the free-space watchdog still sees them.
@@ -723,6 +739,7 @@ class HiCacheFile(HiCacheStorage):
             writer_count=writer_count,
             path_for_stem=self._existing_path,
             iter_existing=self._iter_existing_files,
+            pins=self.pins,
         )
 
     # Longest filename most Linux filesystems accept, in bytes.
@@ -904,6 +921,28 @@ class HiCacheFile(HiCacheStorage):
                 and stem.endswith(self.kv_config_suffix)
             ):
                 self.metadata_cache.add(stem)
+
+    def pin_checkpoint(self, checkpoint_id: str, keys: List[str]):
+        """Pin every store object a checkpoint references (#410 slice 2).
+
+        Translates CONTENT keys -- what a manifest holds -- into the suffixed
+        stems the evictor indexes, so the manifest never has to know the
+        store's key layout and the ledger never has to guess a size.
+        """
+        from sglang.srt.mem_cache.pin_ledger import stems_with_sizes
+
+        pairs = []
+        for key in keys:
+            stem = self._get_suffixed_key(key)
+            pairs.append((stem, self._existing_path(stem)))
+        return self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+
+    def unpin_checkpoint(self, checkpoint_id: str) -> int:
+        """Release a checkpoint's pins, returning the bytes actually freed."""
+        return self.pins.unpin(checkpoint_id)
+
+    def pin_stats(self) -> dict:
+        return self.pins.ledger()
 
     def _canonical_space_check(self, need_bytes: int) -> None:
         """Refuse a canonical write that would take the store below the floor."""

@@ -636,7 +636,12 @@ def marker_path(final_path: str) -> str:
     return final_path + MARKER_SUFFIX
 
 
-def sweep_partials(root_dir: str, *, older_than_s: float) -> int:
+def sweep_partials(
+    root_dir: str,
+    *,
+    older_than_s: float,
+    is_pinned: Optional[Callable[[str], bool]] = None,
+) -> int:
     """Reap orphaned ``.part706`` / ``.slots706`` files. Returns the count.
 
     A partial blob is invisible to every reader and untracked by the LRU
@@ -659,6 +664,12 @@ def sweep_partials(root_dir: str, *, older_than_s: float) -> int:
                 continue
         except FileNotFoundError:
             continue
+        if is_pinned is not None and is_pinned(_stem_of_partial(path)):
+            # #410: a conversation checkpoint references this page. Its partial
+            # may be mid-assembly by another stage, and reaping it would reset
+            # work the checkpoint is waiting on -- age alone cannot tell those
+            # apart, but a pin can.
+            continue
         _unlink_quiet(path)
         reaped += 1
     if reaped:
@@ -669,6 +680,18 @@ def sweep_partials(root_dir: str, *, older_than_s: float) -> int:
             root_dir,
         )
     return reaped
+
+
+def _stem_of_partial(path: str) -> str:
+    """The store stem a ``.part706`` / ``.slots706`` file belongs to."""
+    name = os.path.basename(path)
+    for suffix in (PART_SUFFIX, MARKER_SUFFIX):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if name.endswith(".bin"):
+        name = name[:-4]
+    return name
 
 
 def _iter_partial_files(root_dir: str):

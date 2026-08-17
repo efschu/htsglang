@@ -973,6 +973,11 @@ class Envs:
     # the only protection is the LRU evictor's watermark -- which is disabled
     # unless --hicache-storage-backend-extra-config sets a cap or a min-free.
     SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES = EnvInt(0)
+    # #410 slice 2: ceiling on bytes pinned by conversation checkpoints. Pinned
+    # bytes are bytes eviction can never reclaim, so a checkpoint whose pins
+    # would cross this is REFUSED with the numbers rather than quietly turning
+    # the cache into a pin museum. 0 = no ceiling.
+    SGLANG_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
