@@ -8772,7 +8772,15 @@ class Scheduler(
             # would make the decline rank-dependent (#616g). None when it
             # cannot be read, which the policy reports as "not measured"
             # instead of guessing.
-            kv_available_tokens=self._uniform_kv_available(),
+            # getattr, because this gate is driven in tests by scheduler
+            # STAND-INS that carry only the fields the policy reads -- the
+            # same trap that broke _idle_locked_inputs and the both-blocked
+            # relief earlier in this series. A stand-in without the probe has
+            # measured nothing, and 'not measured' is a state the policy
+            # already reports honestly.
+            kv_available_tokens=getattr(
+                self, "_uniform_kv_available", lambda: None
+            )(),
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
