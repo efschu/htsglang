@@ -5771,7 +5771,19 @@ class ServerArgs:
     ] = 4
     weight_loader_drop_cache_after_load: A[
         bool,
-        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        # STALE TEXT CORRECTED (#408/#721). This said "Call posix_fadvise("
+        # "DONTNEED) on each safetensors shard", which is the PRE-#408
+        # mechanism and is a NO-OP on ZFS -- DONTNEED does not free mapped
+        # pages there, not even after unmap. Reading the help alone, an
+        # operator on this rig would conclude the flag is inert and skip the
+        # one lever that works. The implementation is the #408 PAGEOUT ladder:
+        # MADV_PAGEOUT walks the page table of the live mapping, with plain
+        # fadvise kept only as the no-mapping/no-madvise fallback. See
+        # weight_utils._drop_file_cache_after_load.
+        "Release the page cache behind each safetensors shard after loading it, "
+        "via the #408 MADV_PAGEOUT ladder (posix_fadvise(DONTNEED) alone is a "
+        "no-op on ZFS and is only the fallback). Cuts the weights-load page-cache "
+        "spike that can OOM a container before reclaim catches up.",
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
