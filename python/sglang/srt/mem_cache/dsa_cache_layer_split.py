@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
 from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import (
@@ -73,15 +74,9 @@ def shard_start_global(start_layer, my_start, local_slot_of):
     silently. Carrying a layer SET across the wire is a separate design
     question, filed in docs/dev/DESIGN_pp_layer_set.md.
     """
-    if local_slot_of is not None:
-        raise NotImplementedError(
-            "layer-shard KV transfer requires contiguous layer ownership: the "
-            "PD descriptor carries prefill_start_layer plus a layer COUNT, "
-            "which cannot express the non-contiguous set "
-            f"{sorted(local_slot_of)} owned by this stage under "
-            "SGLANG_PP_LAYER_SET. Use contiguous PP partitioning for "
-            "disaggregated layer-split serving."
-        )
+    refuse_noncontiguous_layer_descriptor(
+        local_slot_of, "layer-shard KV transfer (prefill_start_layer + COUNT)"
+    )
     return start_layer + my_start
 
 

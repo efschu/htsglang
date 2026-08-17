@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -163,6 +164,14 @@ class PrefillBootstrapQueue:
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
             not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+        )
+        # The plain path builds a contiguous (start_layer, end_layer) pair and
+        # the receiver slices its buffer lists with it, so a layer set would
+        # describe the SPAN and mismatch buffers silently. Same rule as the
+        # layer-shard path above.
+        refuse_noncontiguous_layer_descriptor(
+            getattr(self.token_to_kv_pool, "_local_slot_of", None),
+            "prefill KV transfer descriptor",
         )
         kv_args.prefill_start_layer = (
             getattr(

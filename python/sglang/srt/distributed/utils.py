@@ -1611,6 +1611,36 @@ def parse_pp_layer_sets(
     return [frozenset(layers) for layers in parsed]
 
 
+def refuse_noncontiguous_layer_descriptor(local_slot_of, where: str) -> None:
+    """Refuse to build a layer descriptor that assumes contiguous ownership.
+
+    Disaggregated transfer describes a stage's layers as a contiguous
+    ``(start, end)`` pair -- either ``start_layer``/``end_layer`` directly, or a
+    start plus a layer COUNT -- and the receiving side slices its buffer lists
+    with it. Under ``SGLANG_PP_LAYER_SET`` those bounds are ``min(owned)`` and
+    ``max(owned) + 1``, i.e. the SPAN, which for a stage owning
+    ``[35, 39, ..., 63]`` names 29 layers of which 21 are not owned.
+
+    No index translation repairs this: the descriptor has no way to carry a
+    set. A wrong descriptor mismatches KV buffers silently, so the unsupported
+    combination is refused where it is built rather than diagnosed later.
+    Carrying a layer set across the wire is an open design question -- see
+    docs/dev/DESIGN_pp_layer_set.md.
+
+    Passing ``None`` (contiguous ownership) is a no-op.
+    """
+    if local_slot_of is None:
+        return None
+    raise NotImplementedError(
+        f"{where}: disaggregated KV transfer requires contiguous layer "
+        "ownership. The transfer descriptor carries a contiguous layer range, "
+        "which cannot express the non-contiguous set "
+        f"{sorted(local_slot_of)} owned by this stage under "
+        "SGLANG_PP_LAYER_SET. Use contiguous PP partitioning for "
+        "disaggregated serving."
+    )
+
+
 def get_pp_layer_set(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Optional[FrozenSet[int]]:

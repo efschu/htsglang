@@ -2043,7 +2043,7 @@ def make_layers(
                 (
                     layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                     if idx in owned
-                    else PPMissingLayer(return_tuple=return_tuple)
+                    else PPMissingLayer(return_tuple=return_tuple, unowned_layer_id=idx)
                 )
                 for idx in range(num_hidden_layers)
             ]

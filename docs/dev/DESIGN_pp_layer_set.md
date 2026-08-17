@@ -230,9 +230,84 @@ single-node PP+TP with no prefill/decode disaggregation, so it never builds this
 descriptor. Carrying a layer SET across the PD wire is a real design question
 (descriptor format + both endpoints), and it is open.
 
-## 7. What remains
+## 7. Iteration — the other half, and why a guard beats 34 edits
+
+Translation (§6) fixed global -> local INDEXING. Iteration is separate:
+`for i in range(self.start_layer, self.end_layer)` is correct only while
+ownership is an interval.
+
+`owned_layer_ids(layers, start, end)` reads the `owned_layers` frozenset
+`make_layers` already publishes. Contiguous ownership returns the identical
+`range` object; a set returns the owned ids in ascending order (order is
+semantic, and a set has none, so the helper guarantees it rather than the
+caller).
+
+**A correction to my own note in `make_layers`.** It said interleaved
+placeholders "are the same object as placeholders at the ends". True as
+objects, false in the way that matters. `PPMissingLayer.forward` returns its
+FIRST argument, and that was harmless only because it was never invoked --
+loop bounds and ownership were the same thing, so placeholders sat outside the
+iterated interval. A gapped set is the first case where a loop can reach one:
+
+* `hidden_states, residual = layer(positions, hidden_states, ...)` raises a
+  confusing unpack error, and
+* `hidden_states = layer(positions, hidden_states, forward_batch)` --
+  `orion.py:270`, `persimmon.py:253`, `phi3_small.py:356` -- SILENTLY
+  substitutes the positions tensor for the hidden states.
+
+So the span is not merely wasteful to iterate; it is wrong.
+
+**Converted:** `qwen3_5.py`, the family plan's own model
+(`Qwen3_5ForConditionalGeneration` is what the Qwen3.6-27B checkpoints
+declare). **Not converted:** the other ~33 model forward loops.
+
+That is a deliberate choice, not an omission. Those models cannot be executed
+on this rig, so a conversion in them would be unverifiable here -- the same
+argument that keeps the 19 vendor NPU sites untouched (`hardware_backend/npu/`:
+vendor code, unreachable on this hardware, so a conversion could not be
+tested). Instead the failure is made loud at ONE point: placeholders built
+under non-contiguous ownership are armed at construction, and invoking one
+raises a `RuntimeError` naming the layer and pointing at `owned_layer_ids`.
+Contiguous ownership arms nothing, so the default path keeps the pass-through
+byte-for-byte. A missed loop is then a named error at first forward instead of
+a corrupted hidden state -- which is the property that actually matters, and it
+holds for all ~33 without editing any of them.
+
+## 8. The audit in §3.1 was NOT complete
+
+§3.1 counted ~100 translation sites and located them in `mem_cache/`,
+`model_runner.py` and `swa_memory_pool.py`. A second sweep found raw
+`- start_layer` translations OUTSIDE that scope, which the tally therefore
+never covered:
+
+| site | note |
+| --- | --- |
+| `layers/attention/aiter_utils.py:147-148` | `sub_pool.k_buffer[id - sub_pool.start_layer]`; ROCm path, not this rig |
+| `layers/attention/flashinfer_backend.py:2845-2851` | `_wl_full_layer_idx`, after a second mapping through `_transfer_full_attention_id` |
+| `layers/attention/flashinfer_backend.py:3321-3329` | `_sess_full_layer_idx`, same shape |
+
+The flashinfer pair is on this rig's backend AND on the hybrid linear/full
+attention path the family plan uses, so it matters. It is filed rather than
+converted: both compose a raw subtraction with `_transfer_full_attention_id`,
+a SECOND translation whose interaction with set ownership I have not
+established, and the rules of engagement say file an ambiguous site rather
+than force it. These remain a silent-wrongness risk under a layer set and
+should be the next slice.
+
+Also found, all LOUD under a set rather than silent, so lower priority:
+`routed_experts_weights_of_layer` dicts in 7 model files (indexing a
+placeholder's `.mlp` raises `AttributeError`), `deepseek_v2.py:2549`
+(`next_full_attention_layer_id` built from consecutive SPAN ids),
+`deepseek_v4.py:2611`, `bailing_moe_linear.py:1119`,
+`deepseek_weight_loader.py:484`, `quest_algorithm.py:36` (over-allocates, does
+not corrupt), and `model_runner.py:1629` (`adjust_hybrid_swa_layers_for_pp`,
+which also carries a pre-existing `end_layer + 1` worth a separate look).
+
+## 9. What remains
 
 - The transport (§5): the schedule drives a `Link`; no wire exists yet.
+- The two flashinfer translations in §8 — the remaining SILENT risk.
 - KV-pool LAYOUT for non-contiguous FA ownership, beyond index translation.
   Adjacent prior art: #718/#719 pool-rebind.
-- The PD descriptor question above, if disaggregation ever meets a layer set.
+- Carrying a layer SET across the PD wire (§6.1). Both descriptor paths now
+  refuse rather than mislabel, so this is a missing feature, not a live bug.
