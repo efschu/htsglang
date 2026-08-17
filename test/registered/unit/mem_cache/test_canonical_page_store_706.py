@@ -446,6 +446,38 @@ class TestWindowFromPools(CustomTestCase):
             build_page_window(ATTN_LAYER_IDS, pool, host)
 
 
+class TestNoStoreOwnedBuffers(CustomTestCase):
+    """#550 spec note: the store allocates no host memory of its own.
+
+    Pinned by CONTRACT rather than by measurement, which is the part that can
+    actually rot: both directions take caller-owned buffers, so there is
+    nothing for the process-wide pinned budget to account for. A future change
+    that made the store allocate its own staging buffer would break these, and
+    that change is exactly the one that would need to register with
+    ``check_and_register_pinned_post``.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.page = os.path.join(self._tmp.name, "cafe.bin")
+        self.addCleanup(self._tmp.cleanup)
+        self.window = window_for_layers(SPEC, ATTN_LAYER_IDS, ATTN_LAYER_IDS)
+
+    def test_read_fills_the_callers_own_tensor(self):
+        write_slice(self.page, self.window, _payload(self.window, 10))
+        out = _empty(self.window)
+        returned = read_slice(self.page, self.window, out)
+        self.assertTrue(returned)
+        # Filled in place: no buffer of the store's was created and copied.
+        self.assertTrue(torch.equal(out, _payload(self.window, 10)))
+
+    def test_write_consumes_the_callers_own_tensor(self):
+        payload = _payload(self.window, 10)
+        before = payload.data_ptr()
+        write_slice(self.page, self.window, payload)
+        self.assertEqual(payload.data_ptr(), before)
+
+
 class TestPartialSweep(CustomTestCase):
     """Orphaned partials: invisible to readers, untracked by the LRU evictor
     (it walks ``.bin`` only), so nothing else would ever reap them."""

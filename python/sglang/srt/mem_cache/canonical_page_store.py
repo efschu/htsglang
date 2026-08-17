@@ -61,6 +61,23 @@ file must stay pure bytes: ``HiCacheFile.get`` reads a whole file into an
 exactly-sized tensor, the LRU evictor accounts raw file bytes, and
 ``hicache_migrate`` parses the store as bare pages. A header would corrupt all
 three at once, and quietly.
+PINNED HOST MEMORY: this store allocates NONE, so it registers nothing with
+the process-wide pinned budget (``pinned_host_budget.check_and_register_pinned_post``,
+whose consumers are the kvso host pool, the HiCache host pool and the
+phase-flip weight images). Both directions take CALLER-OWNED buffers --
+``write_extents`` reads the payload it is handed, ``read_extents`` fills the
+target it is handed -- and the file I/O is ``os.pwrite`` / ``os.pread`` against
+those. There is no steady-state buffer of the store's own to account for, which
+is why "register at attach/resize" does not apply here rather than having been
+overlooked.
+
+One transient allocation on this path is worth naming for whoever owns the
+budget question, because it is NOT the store's and is NOT registered: the
+backend obtains its read target from ``host_pool.get_dummy_flat_data_page()``,
+which allocates a fresh PINNED tensor per read on both pool families
+(``pin_memory=self.pin_memory``). It predates this work and scales with
+concurrent reads rather than with tier size, so it is a per-operation spike the
+joint budget cannot see, not a pool the budget is missing.
 """
 
 from __future__ import annotations
