@@ -153,10 +153,44 @@ not the weights, which fit comfortably.
 the tree's shape code; it does not include allocator granularity, fragmentation
 or any per-slot overhead beyond the state tensors.
 
-## 5. Not built here
+## 5. The crossing schedule — BUILT against the shape, not a transport
 
-The crossing schedule (send at every ownership change). The addressing contract
-above is its precondition — a schedule needs to know where a boundary IS — but
-the schedule itself wants the send/recv SHAPE that Slot-3 is defining, and
-writing it against a guessed interface is how two halves end up disagreeing.
-Filed rather than begun.
+`distributed/pp_crossing_schedule.py`. Given a layer map it emits every
+ownership change in layer order, with a **per-pair slot** so a transport can
+match a send to its recv without a global sequence number.
+
+**31 is now executable rather than asserted.** The suite computes it from the
+actual map: 16 crossings leave the GDN card, 15 return, and the missing 32nd is
+the terminal layer, whose output goes to the head. A contiguous map through the
+same function still yields `pp_size - 1`, which is the falsifier — the 31 has
+to come from non-contiguity and not from the function counting something else.
+
+**Slot-3's corrections are baked in.** Cost is priced PER LINK
+(`schedule_cost`), because the rig's edges differ and a schedule's cost depends
+on WHICH pairs it uses, not only on how many crossings it makes. An unpriced
+pair falls back to a default rather than costing zero: a modelling gap must
+show up as a number instead of vanishing.
+
+**The terminal-layer lever is measured, not claimed.** Whichever stage owns the
+final layer is owed one fewer crossing (15 rather than 16 touching it), so
+giving that half to the SLOWEST link is free — the split is 8/8 either way. On
+this rig that means the x4-linked card should hold the half containing layer
+63. The suite measures the difference rather than asserting it.
+
+It also pins why 8/8 is free in COUNT but not in TIME: `len(s88) == len(s124)`
+while the per-link cost of 8/8 is higher, which is exactly the trade Slot-3's
+survey priced (8/8 stays, and buys KV at a cost in ms/pass).
+
+**The double is deliberately strict.** `LoopbackLink` refuses a recv with no
+sender (the bounded-wait requirement made visible), refuses a second recv on a
+consumed slot, and refuses a reused slot within one pass. A double more
+permissive than the transport it stands for proves nothing about a schedule
+driven through it.
+
+**Still not built**: the transport itself. This module moves no bytes and knows
+no wire format — by design, so it could be finished before the wire exists.
+
+## 6. What remains
+
+The KV-pool index translation (§3.1): ~80 inlined subtractions that must route
+through a rank-lookup accessor. Its own slice, with a correctness surface.
