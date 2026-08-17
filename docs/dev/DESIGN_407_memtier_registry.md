@@ -551,3 +551,171 @@ Cross-reference: `DESIGN_363_regime_controller.md` §20.3's residency ladder
 is the first named instance of this doctrine outside the registry itself; a
 future consumer describing its own eviction order should point here rather
 than restate the ladder above.
+
+---
+
+## 9. #224 remainder determination (2026-08-17)
+
+Recorded here rather than in a new file because #224's delivery rides on this
+registry: question (d) below IS §5's migration state, measured.
+
+### 9.1 The four answers
+
+**(a) TARGET LIST configurable — DELIVERED, user-facing.**
+`--kv-session-offload-destinations` (`server_args.py:2257+`) takes an ordered
+comma-separated list. Unset is byte-identical to today (local pinned host RAM
+only). The vocabulary is real: `SUPPORTED_PARK_BACKENDS = ("file", "mooncake",
+"dynamic")` (`kv_session_spill_destination.py:124`), and the other HiCache
+backends (nixl, eic, simm, mori, hf3fs, aibrix) are **rejected by name at
+validation** as a "named, liftable exclusion" — so the refusal this
+determination might otherwise have had to build already exists.
+
+**(b) REMOTE host-RAM as a target — BUILT, never exercised, rig-blocked.**
+This is NOT the #309 descriptor-only shape, and saying so matters: `mooncake`
+is a real implementation — registered-buffer pointer I/O straight from the
+pinned spill pool, a producer-identity fingerprint (model, quantization, KV
+dtype, TP/rank-tp-ratio, DCP geometry, head geometry, layer count) verified
+before an unpark commits, and a mismatch that is a hard error rather than a
+silent restore.
+
+What it has never had is a byte. The module's own tier note marks `file` as
+"validated end-to-end on CPU" and gives `mooncake` no such claim; every
+mooncake reference in the suite was a CONFIG assertion
+(`destinations_error(["local","mooncake"])` is None), and the one test double
+set `pointer_io = False`, so the branch mooncake uses had zero coverage.
+The rig cannot supply the missing half: #659 measured Rig-2 RAM unroutable
+(75 MB/s on the only routable path, swap-backed RAM against a ~12.9 GB
+region), and `memtier/profiles/rig1.json:154` records rig-2's RAM with
+`{"value": null, "provenance": "absent"}` — "the registry does not guess a
+remote machine's size". #659 deliberately does not read those remote rows
+(register C24).
+
+Closed here to the extent a desk can: see 9.3.
+
+**(c) DIRECTION configurable — NO, and deliberately so.** The first entry must
+be `local`, enforced by `destinations_error()`. That is a physical boundary,
+not a preference: the device's D2H DMA lands in locally pinned host RAM, so
+every further hop stages through it. #659 cut 1 made this DERIVED rather than
+asserted — `kv_spill_tier_selection` builds the ladder from measured capacity
+and cost, and `local_first_disagreement()` reports when the hardcoded law and
+the measured ladder diverge while deliberately NOT reordering, because a
+cheaper-looking park tier is evidence of a bad number, not a reason to move.
+CORRECTION — this section's first draft said "beyond that first slot, order is
+by measured bandwidth, not by operator preference". That is wrong. Below the
+local slot the operator's configured order in `--kv-session-offload-destinations`
+IS respected; a measurement may promote a tier above it only when that tier is
+at least `PROMOTION_RATIO = 4.0` times faster (`kv_spill_park_tier.py:134`,
+applied by `_park_ranking`, `kv_session_spill_destination.py:1259-1300`). That
+ratio is a module constant exposed by no flag and no env var.
+
+So the honest answer to "direction configurable" is two-part: the first slot is
+physically fixed and refused as such, while the ORDER BELOW IT IS ALREADY
+OPERATOR-CONFIGURABLE — which means #224's "Zielliste + Richtung konfigurierbar"
+is more delivered than the first draft credited. What is not configurable is the
+promotion threshold that can override the operator's order.
+
+**(d) #407 migration state — no longer inert; §5's cuts are partly done.**
+This package's own `__init__` still said "No consumer reads any of this yet",
+true at landing and false since #659 cut 1 (`6d95ad3d67`). Corrected in this
+commit, because that sentence is exactly what gets a second registry built
+beside this one. Production importers today:
+`managers/kv_spill_tier_selection.py` (the first real consumer — ladder from
+measured capacity/cost), `managers/kv_session_spill_destination.py`,
+`model_executor/short_term_offload_register.py` (TierQuery/TierId for the #286
+classes), `mem_cache/pinned_host_budget.py`, `server_args.py`,
+`mem_ledger/host_shmem.py`, and `planner/placement_overrides.py`.
+
+### 9.2 Checked and found clean — no change made
+
+The `absent` provenance path was audited for a null-capacity leak, since a
+remote row carries `value: null`. It is rigorous: `Rate.absent(source)`
+requires a reason, and `profile.py:130` refuses "an absent rate must not carry
+a value". Nothing can silently read a remote row's missing capacity as zero or
+as unlimited. No fix needed.
+
+### 9.3 Built: the pointer-I/O contract, on CPU, without a transport
+
+`test/registered/unit/managers/test_spill_pointer_io_224.py` (8 hermetic
+tests). The transport needs hardware; the CONTRACT does not. `make_tier` lets
+a `dynamic` tier opt into the same `pointer_io` branch via
+`extra_config["pointer_io"]` (`kv_session_spill_destination.py:507`), so the
+branch is driven with a fake registered-buffer store that reads and writes
+through the pointer exactly as mooncake does.
+
+Covered: byte-exact round trip; that the call carries **nbytes, not numel** (a
+multi-byte dtype would under-copy 4x); a wide-dtype round trip; that a
+non-contiguous tensor is parked as its VALUES, not whatever lies between its
+strides; a miss as a clean `False`; and a raising backend swallowed into
+`False`, which is the declared fall-over contract — a raise there would abort
+a spill that had somewhere else to go.
+
+This does not claim mooncake works. It claims the pointer-I/O half moves the
+right bytes in the right direction, so that when a routable peer exists the
+remaining risk is the transport rather than this code.
+
+**One honest gap, not faked:** `get_meta`'s pointer branch allocates its probe
+buffer with `pin_memory=True`, which needs a CUDA context, so it cannot run
+hermetically. It is wrapped in a bare `except` returning `None`, which means on
+a CPU-only path a meta fetch fails SILENTLY rather than reporting why. Left
+alone deliberately — changing it is a behaviour change on a path this rig
+cannot exercise — but it is the first thing to look at if a remote unpark ever
+returns "no meta" on hardware.
+
+### 9.4 Proposed rescope
+
+#224's desk work is done. (a) and (c) are delivered — (c) as a reasoned
+refusal. (d) is this document's own §5, now advanced and correctly labelled.
+Only (b) remains, and it is not a coding task: it needs a routable peer with
+enough non-swap RAM, which this rig does not have. Its named dependencies are
+#212/#261 (mooncake transport, proven for KV+mamba) and a second host.
+
+Recommendation: mark #224 desk-complete, carry (b) as a transport-gated item
+against those deps rather than an open feature task, and let the ladder keep
+picking between `local` and `file` — which is what it does today, by
+measurement, and which is the whole of #224 that this rig can express.
+
+### 9.5 Four refinements, verified after the first draft
+
+Added on a second pass; each re-checked at code rather than taken on report.
+
+1. **The remote row cannot reach a ladder even if someone read it.** I wrote in
+   9.1(b) that the spill path "deliberately does not read" `rig1.json`'s remote
+   rows, which is true but understates the guard. `host:rig-2` carries
+   `"health": {"reachable": false, "verdict": "warn", "reason": "... treat the
+   tier as unreachable until a probe says otherwise"}` (`rig1.json:164`), and
+   `TierRegistry` refuses on exactly that before any other rule:
+   `if tier.health.verdict == "block" or not tier.health.reachable`
+   (`registry.py:353`), with a named reason attached. So the tier is
+   enumerable via `tiers()` and can never appear in a `select()` candidate
+   list. The honesty is structural, not a convention someone must remember.
+
+2. **#286's `remote` slot is an always-refusing stub**, and says so in the
+   refusal text: `"remote: stub tier (#224 RDMA attachment point, not wired
+   yet)"` (`offload_movement.py:750`). Worth recording because #286 and #224
+   both use the word "remote" for different things — #286's is a placeholder
+   in the expert-offload ladder, not the kvso park tier.
+
+3. **The #286 registry consumer is unreachable from production.**
+   `price_park_target` is the function that actually calls
+   `registry.select(TierQuery(...))` and is annotated as the fork's first
+   memtier consumer, but its only callers are in
+   `test_short_term_offload_register.py` — it is exported and tested, never
+   invoked by a serving path. `memtier/consumers.py::expert_offload_host_targets`
+   is the same shape. So 9.1(d)'s importer list needs this qualification: seven
+   modules import memtier, but only `kv_spill_tier_selection` /
+   `kv_session_spill_destination` perform tier SELECTION on a live path; the
+   others consume type helpers or capacity numbers, and #286's selection entry
+   point has no caller. That is the #421-F3 shape again, inside #407's own
+   migration.
+
+4. **A provenance defect the profile records against itself.** `rig1.json:172`
+   carries `"line_pairing_warning": "the 3.43 GB/s and 1.47 us figures quoted
+   together in kv_session_spill_destination.destinations_error come from
+   DIFFERENT lines (100G and 40G)"`. Those paired numbers appear in the
+   `--kv-session-offload-destinations` help text as the justification for the
+   local-first law. The LAW is not in doubt — it is a D2H-staging argument, not
+   a bandwidth argument — but the numbers cited beside it are mismatched, and
+   an operator reading the flag help is reading a mixed pair. Not fixed here
+   (it is help-text prose, and the correct replacement pair needs the #266
+   run's numbers re-read, not invented), but named so the next edit of that
+   help text does not re-copy it.

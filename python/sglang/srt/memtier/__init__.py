@@ -62,10 +62,24 @@ enforcement is structural rather than editorial:
 ``TierRegistry.from_profile`` no longer defaults to the bundled rig record --
 that default was #421 F6's quiet half, and it is now a required argument.
 
-No consumer reads any of this yet; :mod:`~sglang.srt.memtier.consumers` holds
-one read-only shim, exercised by tests, so that "consumable" is demonstrated
-rather than asserted. The migrations are cut 2 and later, in the order
-``DESIGN_407_memtier_registry.md`` §5 gives.
+CONSUMERS (corrected 2026-08-17, #224 determination). This paragraph used to
+read "No consumer reads any of this yet", which was true when #407 landed and
+false since #659 cut 1 (``6d95ad3d67``) put the KV spill rung on the registry.
+It is corrected rather than deleted because the stale version told the next
+reader the package was inert -- the reading that gets a second registry built
+beside this one. Production importers today:
+
+*   ``managers/kv_spill_tier_selection.py`` -- the first real consumer: builds
+    the ladder from measured capacity and cost instead of a hardcoded order;
+*   ``managers/kv_session_spill_destination.py`` -- the kvso destination side;
+*   ``model_executor/short_term_offload_register.py`` -- ``TierQuery`` /
+    ``TierId`` for the #286 asset classes;
+*   ``mem_cache/pinned_host_budget.py``, ``server_args.py`` and
+    ``mem_ledger/host_shmem.py`` -- the host-pinning capacity questions;
+*   ``planner/placement_overrides.py`` -- tier-id parsing.
+
+:mod:`~sglang.srt.memtier.consumers` still holds the read-only shim. Remaining
+migrations follow ``DESIGN_407_memtier_registry.md`` §5.
 
 Import weight: stdlib plus ``msgspec`` at module scope. NVML, torch and
 ``socket`` are imported lazily, inside the functions that need them.
