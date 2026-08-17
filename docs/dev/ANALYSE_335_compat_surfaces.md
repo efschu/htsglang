@@ -18,7 +18,7 @@ route registration is an advertised-but-unwired feature.
 | **OpenAI files / fine-tuning** | exists, wired | `/v1/files*`, `/v1/fine_tuning/jobs*` |
 | **Ollama emulation** | **exists, wired, PARTIAL — and was silently dropping fields** | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`; `OllamaServing` mounted at `:327`. See §2. |
 | **ComfyUI node pack** | **ABSENT** | one prose mention in `planner/webui.py:6808`; no node pack, no routes |
-| **A1111 `sdapi`** | **ABSENT** | no hit anywhere under `python/sglang/srt/` |
+| **A1111 `sdapi`** | **BUILT 2026-08-17, see §7** | `entrypoints/sdapi/`, routes in `http_server.py` |
 | **KoboldCpp** | **ABSENT** | no hit anywhere under `python/sglang/srt/` |
 
 So the OpenAI front is materially complete, and the #335 gap is narrower than
@@ -171,3 +171,82 @@ change wants to be defensible to upstream rather than a fork divergence; and
 its current behaviour is what existing Ollama clients have been served, so the
 refactor needs the contract tests from `test_ollama_no_silent_drops_335.py`
 extended to the happy path first, or it is a rewrite without a net.
+
+
+---
+
+## 7. A1111 `sdapi` — BUILT, and §3's blocker was stale
+
+Prior-art gate first: no `sdapi` / `a1111` HTTP surface anywhere in the tree or
+on any branch (`git log --all -i --grep`), and no module-name duplicate. The one
+adjacent hit is `multimodal_gen/.../lora_format_adapter.py`, which handles
+A1111's LoRA **file format** and not its API.
+
+**§3 said this was blocked on "image generation as a serving surface (#333)".
+That is no longer true, and the evidence is in this tree:** the OpenAI images
+front is wired (`http_server.py:2216`) to a real diffusion lane through
+`OpenAIServingImages` (`entrypoints/openai/serving_images.py`), which resolves
+a lane URL and — this is the part that matters — **already refuses by name when
+no lane is configured**, carrying the registry's own numbers
+(`_reject_no_lane`, `:62`). So the dependency the blocker named exists, and the
+"capability not served by the backend" case the surface must handle is already
+handled one layer down.
+
+`entrypoints/sdapi/` therefore composes rather than parallels, exactly as §5's
+Kobold adapter does: it builds an OpenAI images request and hands it to
+`OpenAIServingImages`. It never resolves a lane URL, never forwards HTTP, and a
+source pin forbids `tokenizer_manager` / `sampling_params` / `httpx` from
+appearing in the module at all. **What composing buys is not tidiness:** the
+lane-absent refusal and the #344 client-disconnect cancellation in `_guard` are
+inherited rather than re-derived, and a parallel path would have got the second
+one wrong.
+
+### What is refused, and why each is a refusal rather than a mapping
+
+A1111 carries diffusion controls the OpenAI images protocol has no field for —
+`steps`, `cfg_scale`, `sampler_name`, `seed`, `subseed`, `denoising_strength`,
+`restore_faces`, `tiling`. There is no lossy mapping available; there is no
+mapping. Passing them through would drop them at the boundary and render an
+image the caller did not ask for with nothing saying so — **the #710
+tool-arg-loss family, which is the same defect §2 of this very note was written
+to fix on the Ollama front.** So a non-default value is refused by name in
+A1111's own error envelope, and the refusal routes to
+`POST /v1/images/generations`.
+
+Three more judgements worth recording:
+
+* **`negative_prompt` is refused, not concatenated.** Folding it into the
+  prompt would send it as a POSITIVE instruction — wrong in the direction
+  hardest to notice in the output.
+* **An unexpressible canvas is refused, not rounded.** A1111 accepts any
+  multiple of 8; the OpenAI protocol expresses five sizes. Rounding someone's
+  768x768 to a neighbour silently is the same class of defect as dropping
+  `steps`.
+* **`img2img` is 501, not routed to `/v1/images/edits`.** img2img re-noises the
+  whole image to `denoising_strength` and denoises back; `edits` is MASK
+  INPAINTING. A client asking for a 0.3-strength restyle would get its image
+  back with a hole filled in.
+
+**`/sdapi/v1/progress` returns honest zeros** in the protocol's shape with the
+reason in `textinfo`, because `serving_images.py`'s own `_guard` records that
+"an image generation writes once, at the end, so there are no frames for a
+progress-based watchdog to count". 404 would look like a broken server to a
+client polling on a timer; a number would be invented.
+
+Inert fields (`save_images`, `script_name`, `styles`, `override_settings`, …)
+are **declared inert with reasons**, following §2's `keep_alive` precedent.
+
+22 pins, 26 subtests. Can-fail proven on all three load-bearing properties:
+dropping the unmappable fields fails 12; emitting `info` as an object instead
+of a JSON string fails 1; introducing engine vocabulary into the module fails 2.
+
+Routes registered in the #510 state-changing ratchet with their reasoning —
+`txt2img` because it composes the same front `/v1/images/generations` does, and
+`img2img` because it is an unconditional 501 that mutates nothing, with the
+condition attached that a real implementation must be re-judged rather than
+inherit the line.
+
+**NOT claimed:** no stock A1111 client has been pointed at this, and no image
+has been generated. Whether a real client is SATISFIED by these refusals — as
+opposed to receiving them — is the same live question §4 raised for Ollama, and
+it belongs to the same window.

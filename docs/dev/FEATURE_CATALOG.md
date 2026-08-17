@@ -3443,6 +3443,49 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **client-compatibility surfaces (#335)** — third-party client protocols
+  emulated as THIN ADAPTERS OVER THE OPENAI FRONT. The rule the family is built
+  on: translate, never serve. A compat surface that drives the engine itself
+  becomes a second sampling path, which is why the Ollama front cannot reach
+  `response_format` and its `format` field had to be refused instead of wired
+  (`ANALYSE_335_compat_surfaces.md` §2). Matrix, with mount proven by route
+  registration in `entrypoints/http_server.py` and not by a directory existing
+  (the #421 lesson): OpenAI core/images/audio/files — wired, upstream;
+  **Ollama** — wired, PARTIAL, upstream code (`31d48d7f6f`) whose four
+  silently-dropped fields (`format`, `think`, `keep_alive`, unmapped `options`)
+  are now named refusals (`entrypoints/ollama/serving.py`), a parallel path
+  whose compose-refactor is scoped in §6 but NOT built;
+  **KoboldCpp** — BUILT (`ec44aa37ca`), `entrypoints/kobold/`, composes
+  `openai_serving_completion`;
+  **A1111 `sdapi`** — BUILT, `entrypoints/sdapi/`, composes
+  `openai_serving_images` (routes at `http_server.py:2749`);
+  **ComfyUI** — ABSENT, and not an HTTP surface at all (a node package shipped
+  into ComfyUI's tree: different artifact, different release path).
+  THE FAMILY'S SHARED DISCIPLINE, to preserve when extending it: a parameter
+  with no equivalent on the OpenAI side is REFUSED BY NAME in the client's own
+  error envelope with a route to the working path — never mapped approximately,
+  because a dropped sampling control renders output the caller did not ask for
+  with nothing saying so (#710 tool-arg-loss). Worked examples: Kobold's
+  `rep_pen` (multiplicative vs OpenAI's additive `frequency_penalty`); sdapi's
+  `steps`/`cfg_scale`/`sampler_name`/`seed`; sdapi's `negative_prompt`
+  (concatenating would send it as a POSITIVE); sdapi's canvas sizes (silently
+  rounding 768x768 to a neighbour is the same defect). Endpoints whose SEMANTICS
+  differ are 501 rather than approximated: Kobold streaming/abort, sdapi
+  `img2img` (re-noises the whole image vs the backend's mask inpainting).
+  Merely inert fields are DECLARED inert (Ollama `keep_alive`, sdapi
+  `save_images`). `/sdapi/v1/progress` returns honest zeros with the reason in
+  `textinfo`, because the images path writes once at the end
+  (`serving_images.py` `_guard`).
+  GATE: each surface's module carries a source pin forbidding engine vocabulary
+  (`tokenizer_manager`, `sampling_params`, `apply_chat_template`; for sdapi also
+  `httpx`/`image_lane_url`), so "thin translation" is enforced rather than
+  intended. State-changing routes are registered in the #510 ratchet with
+  reasoning. `ANALYSE_335_compat_surfaces.md` §3's claim that sdapi was blocked
+  on #333 is STALE: `OpenAIServingImages` resolves the diffusion lane and
+  already refuses by name when none is configured (`serving_images.py:62`), so
+  the backend-cannot-serve case is handled one layer down.
+  NOT CLAIMED: no stock client of any of these has been pointed at a running
+  server — window item.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an

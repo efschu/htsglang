@@ -81,6 +81,8 @@ from sglang.srt.entrypoints.ollama.protocol import (
 )
 from sglang.srt.entrypoints.kobold.protocol import KoboldGenerateRequest
 from sglang.srt.entrypoints.kobold.serving import KoboldServing
+from sglang.srt.entrypoints.sdapi.protocol import Txt2ImgRequest
+from sglang.srt.entrypoints.sdapi.serving import SdapiServing
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.errors import (
     LaneUnavailable,
@@ -495,6 +497,14 @@ async def lifespan(fast_api_app: FastAPI):
     # so it cannot grow a second serving path.
     fast_api_app.state.kobold_serving = KoboldServing(
         model_name=_global_state.tokenizer_manager.served_model_name
+    )
+
+    # #335: the A1111 sdapi surface COMPOSES openai_serving_images the same
+    # way -- it is handed the front rather than the lane, so it cannot forward
+    # HTTP itself and cannot grow a second image path.
+    fast_api_app.state.sdapi_serving = SdapiServing(
+        fast_api_app.state.openai_serving_images,
+        model_name=_global_state.tokenizer_manager.served_model_name,
     )
 
     # Initialize Anthropic-compatible serving handler
@@ -2727,6 +2737,45 @@ async def kobold_generate_stream(raw_request: Request):
 async def kobold_abort(raw_request: Request):
     """Refused by name: multi-tenant servers have no 'the' generation."""
     return raw_request.app.state.kobold_serving.refuse_abort()
+
+
+# ---------------------------------------------------------------------------
+# AUTOMATIC1111 /sdapi/v1 surface (#335). A thin translation over the OpenAI
+# IMAGES front -- see entrypoints/sdapi/serving.py for why it composes rather
+# than parallels, and which A1111 parameters are refused instead of guessed.
+# ---------------------------------------------------------------------------
+
+
+@app.post(os.environ.get("SGLANG_SDAPI_TXT2IMG_ROUTE", "/sdapi/v1/txt2img"))
+async def sdapi_txt2img(request: Txt2ImgRequest, raw_request: Request):
+    """A1111-compatible text-to-image."""
+    return await raw_request.app.state.sdapi_serving.handle_txt2img(
+        request, raw_request
+    )
+
+
+@app.post(os.environ.get("SGLANG_SDAPI_IMG2IMG_ROUTE", "/sdapi/v1/img2img"))
+async def sdapi_img2img(raw_request: Request):
+    """Refused by name: img2img re-noises, /v1/images/edits inpaints."""
+    return raw_request.app.state.sdapi_serving.refuse_img2img()
+
+
+@app.get(os.environ.get("SGLANG_SDAPI_PROGRESS_ROUTE", "/sdapi/v1/progress"))
+async def sdapi_progress(raw_request: Request):
+    """Honest zeros: this backend writes once, at the end."""
+    return raw_request.app.state.sdapi_serving.progress()
+
+
+@app.get(os.environ.get("SGLANG_SDAPI_OPTIONS_ROUTE", "/sdapi/v1/options"))
+async def sdapi_options(raw_request: Request):
+    """A1111-compatible options probe."""
+    return raw_request.app.state.sdapi_serving.options()
+
+
+@app.get(os.environ.get("SGLANG_SDAPI_MODELS_ROUTE", "/sdapi/v1/sd-models"))
+async def sdapi_sd_models(raw_request: Request):
+    """A1111-compatible checkpoint list."""
+    return raw_request.app.state.sdapi_serving.sd_models()
 
 
 @app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))

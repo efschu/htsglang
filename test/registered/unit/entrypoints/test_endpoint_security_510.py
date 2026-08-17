@@ -584,6 +584,19 @@ class TestStateChangingRouteRatchet(unittest.TestCase):
         "/api/extra/abort",
         "/api/extra/generate/stream",
         "/api/v1/generate",
+        # #335 A1111 sdapi surface. Inference-shaped for the same reason:
+        # /sdapi/v1/txt2img composes the same openai_serving_images that
+        # /v1/images/generations does, so it reaches nothing an api-key-only
+        # deployment was not already meant to reach.
+        #
+        # /sdapi/v1/img2img is listed despite being POST because it is an
+        # unconditional 501 that mutates nothing -- img2img re-noises a whole
+        # image while the backend offers mask inpainting, so it is refused
+        # rather than approximated. Same resolution as /api/extra/abort, and
+        # the same condition attached: if it ever grows a real implementation
+        # it must be re-judged here rather than inheriting this line.
+        "/sdapi/v1/img2img",
+        "/sdapi/v1/txt2img",
         "/classify",
         "/close_session",
         "/detokenize",
