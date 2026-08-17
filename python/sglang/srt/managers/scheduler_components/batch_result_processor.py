@@ -84,6 +84,13 @@ class SchedulerBatchResultProcessor:
     # kv-session-offload (S1): manager for host-spilled sessions; None when
     # the feature is off (default) -> the finish path below is untouched.
     kv_session_offload: Optional[object] = None
+    # #699: stamps the scheduler-wide first-token-progress clock. Called ONLY
+    # at the instant a request's first output token is committed (never on a
+    # forward pass alone -- see process_batch_result_prefill), which is the
+    # exact clock the admission-wedge detector needs (queue age vs progress).
+    # Defaults to a no-op so callers that don't wire the watchdog are
+    # unaffected.
+    record_first_token_progress: Callable[[], None] = lambda: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -266,6 +273,10 @@ class SchedulerBatchResultProcessor:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    # #699: this IS the first output token for req, never a
+                    # forward-pass event -- stamp the admission-wedge clock
+                    # here, not at forward_entry_time.
+                    self.record_first_token_progress()
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
