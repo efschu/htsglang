@@ -3474,6 +3474,34 @@ taxonomy and the global importance ladder.
   waits for exists". One sweep row was rejected on exactly that — the barlink
   NCCL-reference docstring is CORRECT that the measurement does not exist; only
   its LOADER does.
+- **club-3090 model coverage (#334) — CLOSED, determined-with-filed-residue.**
+  `ANALYSE_334_club3090_coverage.md` + its closing determination (2026-08-17).
+  The survey's finding, re-verified at code: coverage was better than the brief
+  assumed and the gaps were not where the model names suggested. Of five named
+  families — **agents-a1** was never a model (an operator transcription error;
+  its first occurrence is the #334 task subject itself); **DiffusionGemma** is
+  deliberately declined with a live reason (`llada2.py` + `dllm_config` already
+  serve the text-diffusion class, and a second architecture adds nothing until
+  the first one's DCP/spec semantics settle); **Nemotron-Puzzle** is DELIVERED
+  as a hetero enabler that outlived its originating model (`d55deb6cd3`, the
+  per-layer family table, now in `uneven_perf.py` and useful to ANY
+  heterogeneous-layer model); **Qwen3-Omni Thinker** is DELIVERED for free
+  because it is the A3B MoE geometry the fork already serves
+  (`models/qwen3_omni_moe.py`); **ik-llama IQ quants** are determined down to
+  ONE gap, `IQ4_KS`, effort M (`addf27b339` — EXISTS-OTHER-LINEAGE, not an
+  ancestor of `train/0817-control`).
+  A USEFUL NEGATIVE from that appendix: `q4_0`/`q8_0`/`q5_0`, which dominate
+  the recipe mentions, are the KV-CACHE dtype flag and not weight types at all
+  — the wrong axis, and the reason the quant gap looked far larger than it is.
+  RESIDUE, each with its gate: IQ4_KS (artifact-gated by the survey's own "no
+  downloads to justify work" stop rule — nothing on this box uses it); Omni
+  audio-out (gated behind #333's tenant/stage composition — modelling a
+  3-engine pipeline as a TP group is the wrong shape); dllm DCP/spec semantics
+  (a design question, not an integration one).
+  ATTRIBUTION NOT CONFIRMED: task **#373**, cited elsewhere as covering the
+  Thinker half, has no trace in this tree (docs, sources, `git log --all`). The
+  WORK is delivered; only the ticket pointer is unverifiable from here, and it
+  is recorded rather than repeated.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an

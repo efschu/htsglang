@@ -323,3 +323,72 @@ layout should be read off the real file rather than from a description.
   rule holds until the list grows.
 * The user actually downloading an IQ4_KS build — at that point the yield
   stops being hypothetical and the block layout becomes readable.
+
+---
+
+# CLOSING DETERMINATION (2026-08-17)
+
+Re-checked at code and in `git log --all` on `train/0817-control`
+(`4a16043d1a`). **Verdict: #334 closes as DETERMINED-WITH-FILED-RESIDUE. No
+named family lacks a scoping.**
+
+## Per-family status
+
+| family | integration path | status | evidence |
+| --- | --- | --- | --- |
+| **Qwen3-Omni Thinker** | already ours — it is the A3B MoE geometry, not a new family | **DELIVERED** | `models/qwen3_omni_moe.py`; §2 marks Load/unevenTP/DCP/spec/spill/graphs all inherited |
+| **Qwen3-Omni Talker + Code2Wav** (audio-out) | a 3-engine tenant composition, not a TP group | **SCOPED, DEFERRED BY STOP RULE** | §5: "Stop on Omni audio-out until #333 lands a tenant/stage composition" — modelling it as a TP group "is the wrong shape and would have to be undone" |
+| **Nemotron-Puzzle** (hetero layers) | per-layer family table in the uneven-TP partitioner + planner cost library | **DELIVERED** | `d55deb6cd3` (`Merge feat/per-layer-family-table-371`), an ancestor of this branch; the table lives in `uneven_perf.py` |
+| **Ornith / ik-llama IQ quants** | GGUF type-code support | **DETERMINED; one gap named** | `addf27b339` (`Merge docs/393-ik-llama-survey`) — **EXISTS-OTHER-LINEAGE**, not an ancestor of `train/0817-control`. Appendix verdict: **IQ4_KS is the only real gap, effort M**; IQ4_XS/Q4_K_M/Q8_K_XL already load, and `q4_0`/`q8_0`/`q5_0` were the wrong axis entirely (KV-cache dtype, not weights) |
+| **DiffusionGemma** | none, deliberately | **SCOPED-OUT WITH A REASON** | §5: "Do not chase DiffusionGemma as a model" — the text-diffusion class is already served by `llada2.py` + `dllm_config`, and a second architecture "adds nothing until the first one's DCP/spec semantics are settled" |
+| **agents-a1** | none — no such artifact | **RESOLVED, STRAND CLOSED** | §3e: investigated 2026-08-01; the name's first occurrence is the #334 task subject itself, an operator transcription error |
+
+## The two families the closing brief flagged as possible remainders
+
+Both already carry an analysis, so neither is the honest remainder:
+
+* **agents-a1** is not unscoped — it is *resolved*. A survey cannot cover a
+  name that names nothing, and §3e says so with the date it was checked.
+* **DiffusionGemma** is not unscoped either — it carries an explicit STOP RULE
+  with a reason that still holds: `llada2` is on hand and upstream is actively
+  working that path. Declining a model for a stated reason is a scoping, not a
+  gap.
+
+## One attribution I could not confirm
+
+The closing brief attributes the Thinker half to a task **#373**. That number
+has **no trace anywhere in this tree** — not in `docs/dev/`, not in the
+sources, not in `git log --all`. What *is* verifiable is that the Thinker
+itself is DELIVERED at code, so the work is not missing; only the ticket
+attribution is unconfirmable from here. Recorded rather than silently adopted:
+it may live in the operator's register outside this repo, and an audit that
+repeats a number it cannot check is how a wrong pointer propagates (the same
+class this week's stale-gate sweep found in `layers/dcp/owner.py:127`).
+
+## Residue, with its gating class
+
+1. **IQ4_KS loader** — effort **M**, and gated by §5's own stop rule: *no
+   downloads to justify work*. There is no IQ4_KS artifact on this box. The
+   gap is real and priced; it should stay unbuilt until a user need names it.
+2. **Omni audio-out** — gated behind **#333** (tenant/stage composition). Not
+   a model-coverage task at all once you accept that framing.
+3. **dllm DCP/spec semantics** — a design question, not an integration one;
+   §3c holds it as the thing that must settle before any second
+   diffusion-LM architecture is worth considering.
+
+## Rollup
+
+#334 asked which club-3090 model families the fork cannot serve. The survey's
+own finding was that the coverage was better than the brief assumed and the
+gaps were not where the model names suggested, and this re-check confirms it
+held up: of the five families, one was never a model (agents-a1, a
+transcription error), one is deliberately declined with a live reason
+(DiffusionGemma, because `llada2` already covers the class), one is delivered
+as a hetero enabler that outlived its originating model (#371's per-layer
+family table, now in `uneven_perf.py` and useful to any heterogeneous-layer
+model), one is delivered for free because it turned out to be an
+already-served geometry (the Omni Thinker), and one is determined down to a
+single named gap (IQ4_KS, M, artifact-gated). What remains is not a coverage
+question but three items belonging to other lines of work — a quant type code,
+a tenant composition, and a diffusion-LM semantics decision — each with its
+gate named. #334 can close.
