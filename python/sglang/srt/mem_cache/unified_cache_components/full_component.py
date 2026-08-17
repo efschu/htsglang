@@ -49,14 +49,17 @@ class FullComponent(TreeComponent):
 
     def create_match_validator(
         self, match_device_only: bool = False
-    ) -> Callable[[UnifiedTreeNode], bool]:
+    ) -> Callable[[UnifiedTreeNode, int], bool]:
+        # `depth` (#747) is unused: full KV validity does not depend on the
+        # node's absolute position.
         if match_device_only:
             return (
-                lambda node: node.component_data[self.component_type].value is not None
+                lambda node, depth: node.component_data[self.component_type].value
+                is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
-        return lambda node: (
+        return lambda node, depth: (
             node.component_data[self.component_type].value is not None or node.backuped
         )
 

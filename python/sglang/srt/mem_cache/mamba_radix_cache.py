@@ -65,6 +65,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mamba_ckpt_utils import (
     floor_to_interval,
     is_on_interval,
+    is_resume_candidate,
     protect_deepest_anchors,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -1518,8 +1519,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None and is_on_interval(
-                cum_tokens, self.mamba_checkpoint_interval
+            # #747: one anchor rule, both lineages (see mamba_ckpt_utils).
+            if is_resume_candidate(
+                cum_tokens,
+                self.mamba_checkpoint_interval,
+                has_device_value=node.mamba_value is not None,
             ):
                 best_value_len = len(value)
                 best_last_node = node
@@ -1539,8 +1543,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if len(key):
                     child_key = key.child_key(self.page_size)
         # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None and is_on_interval(
-            cum_tokens, self.mamba_checkpoint_interval
+        if is_resume_candidate(
+            cum_tokens,
+            self.mamba_checkpoint_interval,
+            has_device_value=node.mamba_value is not None,
         ):
             best_value_len = len(value)
             best_last_node = node

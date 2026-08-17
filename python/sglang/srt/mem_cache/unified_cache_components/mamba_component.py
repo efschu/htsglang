@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -29,7 +30,11 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval
+from sglang.srt.mem_cache.mamba_ckpt_utils import (
+    floor_to_interval,
+    is_on_interval,
+    is_resume_candidate,
+)
 from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
@@ -61,18 +66,37 @@ class MambaComponent(TreeComponent):
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+        # #747: --mamba-checkpoint-interval grid, cached once exactly like
+        # MambaRadixCache (:503/:511). None = grid off, every decision below
+        # degenerates to the pre-#747 behaviour.
+        self.mamba_checkpoint_interval = get_server_args().mamba_checkpoint_interval
+        self.mamba_ckpt_strict_resume = envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.get()
+        self._off_grid_insert_refusals = 0
 
     def create_match_validator(
         self, match_device_only: bool = False
-    ) -> Callable[[UnifiedTreeNode], bool]:
+    ) -> Callable[[UnifiedTreeNode, int], bool]:
         ct = self.component_type
+        interval = self.mamba_checkpoint_interval
+        # #747 match seam: the anchor decision (state present AND on the
+        # checkpoint grid) is the shared `is_resume_candidate` rule -- the
+        # same call MambaRadixCache._match_prefix_helper makes, so the two
+        # lineages cannot drift. With interval=None this is byte-identical
+        # to the old pure presence test.
         if match_device_only:
-            return lambda node: node.component_data[ct].value is not None
+            return lambda node, depth: is_resume_candidate(
+                depth,
+                interval,
+                has_device_value=node.component_data[ct].value is not None,
+            )
 
         # HiCache: evicted + backuped (host_value present) is also a valid match
-        return lambda node: (
-            node.component_data[ct].value is not None
-            or node.component_data[ct].host_value is not None
+        return lambda node, depth: is_resume_candidate(
+            depth,
+            interval,
+            has_device_value=node.component_data[ct].value is not None,
+            has_host_value=node.component_data[ct].host_value is not None,
+            device_only=False,
         )
 
     def finalize_match_result(
@@ -85,24 +109,57 @@ class MambaComponent(TreeComponent):
         cow_mamba = params.cow_mamba
         req = params.req
         last_node = result.best_match_node
+        interval = self.mamba_checkpoint_interval
+
+        # #747 strict resume, mirroring the SGLANG_MAMBA_CKPT_STRICT_RESUME
+        # block in MambaRadixCache._match_post_processor (:1591-1607):
+        # identical requests must resume at the DEEPEST interval boundary of
+        # their match or not at all -- a shallower surviving anchor depends on
+        # which entries the LRU churn spared and would vary run-to-run.
+        # Mirrored only where the chunk sums are exact token depths
+        # (cache_controller is None: no evicted-but-backuped nodes, so
+        # `value_chunks` is gap-free). Under a host tier the premise is weaker
+        # to begin with: an evicted anchor stays matchable via its host backup
+        # (see `create_match_validator`), so device-LRU churn does not move
+        # the resume point there.
+        zeroed_by_strict_resume = False
+        effective_best_len = best_value_len
+        if (
+            interval is not None
+            and self.mamba_ckpt_strict_resume
+            and self.cache.cache_controller is None
+            and best_value_len > 0
+        ):
+            total_match_tokens = sum(len(v) for v in value_chunks)
+            best_depth = sum(len(v) for v in value_chunks[:best_value_len])
+            if best_depth != floor_to_interval(total_match_tokens, interval):
+                result = zero_match_result(self.cache, result)
+                effective_best_len = 0
+                zeroed_by_strict_resume = True
 
         # HiCache can still use prefix matches and load back host-backed Mamba
         # states. We temporarily skip branching-state fill in that mode and can
         # add a HiCache-aware branching policy later.
-        if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
+        if self.cache.cache_controller is None and len(value_chunks) > effective_best_len:
             # #747: the branching position must sit on the CHECKPOINT grid when
             # one is configured, not merely on the FLA chunk grid. Mirrors
-            # mamba_radix_cache.py:1600 (`branch_grid = interval or chunk_size`)
+            # mamba_radix_cache.py:1614 (`branch_grid = interval or chunk_size`)
             # -- the same rule, read from the same place, so the two lineages
             # cannot drift apart the way they did before #747.
-            sa = get_server_args()
-            branch_grid = sa.mamba_checkpoint_interval or sa.mamba_cache_chunk_size
+            branch_grid = interval or get_server_args().mamba_cache_chunk_size
             aligned_seqlen = floor_to_interval(
                 sum(len(v) for v in value_chunks), branch_grid
             )
             branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
         else:
             branching_seqlen = None
+
+        if zeroed_by_strict_resume:
+            # Full re-prefill; the branching seqlen still points at the grid
+            # position whose checkpoint the re-prefill will re-establish
+            # (device lineage: the branch-grid block runs after the strict
+            # zeroing too).
+            return result._replace(mamba_branching_seqlen=branching_seqlen)
 
         mamba_value = last_node.component_data[self.component_type].value
         if cow_mamba and mamba_value is not None:
@@ -161,6 +218,30 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
     ) -> None:
         assert params.mamba_value is not None
+        # #747 retention backstop: mamba is leaf-only data, so the target
+        # node's absolute position is the full inserted key length. An
+        # off-grid commit is refused (the node keeps a tombstone) instead of
+        # planting an anchor that would move resume points off the grid.
+        # Unreachable through `prepare_for_caching_req`, which already gates
+        # `cache_len`; this covers every OTHER InsertParams producer (session
+        # restore paths) and the case where another component shrank the
+        # effective cache_len below mamba's on-grid choice -- in both cases
+        # the donated state would sit DEEPER than the key it is filed under.
+        # `mamba_exist=True` routes the donated value into the caller's
+        # existing duplicate-cleanup, which frees it.
+        if not is_on_interval(len(params.key), self.mamba_checkpoint_interval):
+            self._off_grid_insert_refusals += 1
+            count = self._off_grid_insert_refusals
+            if count <= 3 or count % 1000 == 0:
+                logger.warning(
+                    "mamba checkpoint interval: refusing off-grid insert at "
+                    "%d (interval %d), occurrence=%d",
+                    len(params.key),
+                    self.mamba_checkpoint_interval,
+                    count,
+                )
+            result.mamba_exist = True
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
@@ -407,6 +488,24 @@ class MambaComponent(TreeComponent):
     ) -> Optional[int]:
         if self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
+            # #747 cache_len seam (mirrors mamba_radix_cache.py:626-640 and
+            # :795-809): the tracked position is on the checkpoint grid by
+            # construction (prefill targets and decode tracking both use the
+            # interval); enforce it so an off-grid state can never enter the
+            # tree. Off-grid -> this step caches NOTHING. Never floor: rounding
+            # the retained key down while donating a deeper state would pair
+            # state and key at different positions (silent corruption).
+            if cache_len is not None and not is_on_interval(
+                cache_len, self.mamba_checkpoint_interval
+            ):
+                logger.warning(
+                    "mamba checkpoint interval: off-grid tracked position %d "
+                    "(interval %d), skipping cache, rid=%s",
+                    cache_len,
+                    self.mamba_checkpoint_interval,
+                    req.rid,
+                )
+                return 0
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
@@ -422,6 +521,15 @@ class MambaComponent(TreeComponent):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
+            # #747 retention seam (mirrors mamba_radix_cache.py:652-659 and
+            # :795-809): the donated state sits exactly at `cache_len`; there
+            # is no mechanism to snapshot an earlier position, so an off-grid
+            # end is not cached at all. Silent like the device lineage: a
+            # no_buffer end lands off-grid legitimately on edge paths, while
+            # an extra_buffer tracked target SHOULD be on-grid (hence the
+            # warning above). The cursor reset above must still happen.
+            if not is_on_interval(cache_len, self.mamba_checkpoint_interval):
+                return 0
 
         if is_finished:
             if cache_len is None:
