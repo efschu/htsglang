@@ -64,9 +64,19 @@ class _FakeGroup:
 class _WedgedWork:
     """A ``Work`` that never completes -- the dead/lagging peer.
 
-    ``wait()`` blocks forever, exactly as the real one does against a peer that
-    never posts the matching operation. Any test that reaches it has proven the
-    call site is unbounded.
+    UNTIMED ``wait()`` blocks forever, exactly as the real one does against a
+    peer that never posts the matching operation. Any test that reaches that
+    branch has proven the call site is unbounded.
+
+    TIMED ``wait(timeout=...)`` raises ``RuntimeError``, which is what gloo
+    actually does when the deadline expires -- measured 2026-08-17 against a
+    real gloo Work. The stub carried only the untimed behaviour because
+    ``bounded_wait`` used to poll ``is_completed()`` and never handed a deadline
+    to ``wait()`` at all. That polling was the #630 livelock (see
+    test_pp_sync_rendezvous_630.py): ``is_completed()`` reports, ``wait()``
+    drives, so two polling peers never advanced the exchange. Now that the
+    bound is handed to the wait itself, a stub that ignored the timeout would
+    hang this suite instead of exercising it.
     """
 
     def __init__(self):
@@ -77,8 +87,11 @@ class _WedgedWork:
 
     def wait(self, *args, **kwargs):
         self.wait_calls += 1
-        threading.Event().wait()
-        return True
+        timeout = kwargs.get("timeout", args[0] if args else None)
+        if timeout is None:
+            threading.Event().wait()
+            return True
+        raise RuntimeError("gloo: wait timeout (stub)")
 
 
 class _CompletedWork:
