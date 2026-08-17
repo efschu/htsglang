@@ -26,6 +26,7 @@ work and kept raw blocking calls on the same collectives.
 
 from __future__ import annotations
 
+import datetime
 import time
 from typing import Any, Optional
 
@@ -90,6 +91,17 @@ def collective_rank_desc(holder: Any) -> str:
     return " ".join(parts) or "rank=unknown"
 
 
+def _timeout_message(label: str, timeout_s: float, waited: float, rank_desc: str) -> str:
+    return (
+        f"HiCache control collective '{label}' did not complete "
+        f"within {timeout_s:g}s (waited {waited:.1f}s) on "
+        f"[{rank_desc or collective_rank_desc(None)}]. A peer rank is "
+        "dead or wedged; this rank aborts instead of blocking in the "
+        "collective until the process-group timeout (2h) expires. "
+        "Adjust the bound with SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S."
+    )
+
+
 def bounded_wait(
     work: Optional[torch.distributed.Work],
     label: str,
@@ -111,27 +123,46 @@ def bounded_wait(
         work.wait()
         return
 
+    # THE BOUND MUST NOT REPLACE THE PROGRESS. This loop used to be
+    #
+    #     while not work.is_completed():  ... sleep ...
+    #     work.wait()
+    #
+    # which polls passively and only calls ``wait()`` once the poll has already
+    # succeeded. For gloo that never happens: ``is_completed()`` REPORTS state,
+    # ``wait()`` DRIVES the transfer. With both peers polling, neither side
+    # advances the exchange and every rank sits until its own deadline -- so
+    # the #630 bound, written to stop a hang, produced a livelock instead.
+    #
+    # PROVEN by a red/green pair on a 3-process gloo harness driving this exact
+    # function (evidence-665-f1/repro_pp_sync_630.py), no CUDA and no serving:
+    #
+    #   timeout_s = 8.0  (this poll)          -> all three ranks time out with
+    #                                            pp_sync/isend[0]->pp1,
+    #                                            recv<-pp0, recv<-pp1
+    #   timeout_s = 0.0  (the wait() escape)  -> rendezvous, rank 1 receives
+    #                                            rank 0's values
+    #
+    # and matching the live wedge of 2026-08-17 label for label. Raw gloo
+    # isend/irecv with the same tag and group rendezvous fine when waited, which
+    # is what isolated the defect to this wrapper rather than to gloo.
+    #
+    # So the wait is BLOCKING again, with the deadline handed to the wait
+    # itself. ``Work.wait`` takes a timeout and raises on expiry, which gives
+    # both properties at once: the transfer progresses, and a dead peer still
+    # cannot park this rank for the group's two-hour timeout.
     started = time.monotonic()
-    deadline = started + timeout_s
-    spins = 0
-    sleep_s = COLLECTIVE_POLL_MIN_S
-    while not work.is_completed():
-        spins += 1
-        if spins <= COLLECTIVE_POLL_SPINS:
-            continue
-        now = time.monotonic()
-        if now >= deadline:
-            raise HiCacheCollectiveTimeoutError(
-                f"HiCache control collective '{label}' did not complete "
-                f"within {timeout_s:g}s (waited {now - started:.1f}s) on "
-                f"[{rank_desc or collective_rank_desc(None)}]. A peer rank is "
-                "dead or wedged; this rank aborts instead of blocking in the "
-                "collective until the process-group timeout (2h) expires. "
-                "Adjust the bound with SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S."
-            )
-        time.sleep(sleep_s)
-        sleep_s = min(sleep_s * 2, COLLECTIVE_POLL_MAX_S)
-    work.wait()
+    try:
+        completed = work.wait(timeout=datetime.timedelta(seconds=timeout_s))
+    except RuntimeError as exc:
+        raise HiCacheCollectiveTimeoutError(
+            _timeout_message(label, timeout_s, time.monotonic() - started, rank_desc)
+        ) from exc
+    # Some backends report expiry by returning False rather than raising.
+    if completed is False:
+        raise HiCacheCollectiveTimeoutError(
+            _timeout_message(label, timeout_s, time.monotonic() - started, rank_desc)
+        )
 
 
 def bounded_recv(

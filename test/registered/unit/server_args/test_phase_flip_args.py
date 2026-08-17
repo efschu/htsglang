@@ -21,6 +21,11 @@ def make_args(**kwargs):
     return ServerArgs(model_path="dummy", **kwargs)
 
 
+#: The minimal flip configuration the V1 blocker tests vary one term at a time.
+_BASE_FLIP_ARGS = dict(
+    enable_phase_flip=True, phase_flip_tp_vector="30,17,17", pp_size=3
+)
+
 class TestPhaseFlipArgs(CustomTestCase):
     def test_default_off_is_silent(self):
         args = make_args()
@@ -76,33 +81,45 @@ class TestPhaseFlipArgs(CustomTestCase):
             args._handle_phase_flip()
 
     def test_v1_blockers_named(self):
-        base = dict(
-            enable_phase_flip=True, phase_flip_tp_vector="30,17,17", pp_size=3
-        )
+        base = _BASE_FLIP_ARGS.copy()
         # NEXTN used to be on this list, refused as "the named phase-flip
         # follow-up". That follow-up shipped: speculation now runs in the
         # TP decode phase and is allowed here. See
         # TestFlipV1SpeculationBlockers for what stays refused and why.
         for extra, pat in (
-            # #630 RESTORED 2026-08-17, and NARROWED to match the runtime
-            # twin exactly: a pipeline carrying a STORAGE-BACKED tier is what
-            # wedged on metal (649 s in pp_sync, all three ranks). The
-            # device+host-local tier is deliberately still reachable, so the
-            # flag alone is no longer a blocker -- naming the backend is what
-            # makes this the refused combination.
-            (
-                {
-                    "enable_hierarchical_cache": True,
-                    "hicache_storage_backend": "file",
-                },
-                "#630",
-            ),
             ({"dp_size": 2}, "dp-size"),
             ({"disaggregation_mode": "prefill"}, "disaggregation"),
         ):
             args = make_args(**base, **extra)
             with self.assertRaisesRegex(ValueError, pat):
                 args._handle_phase_flip()
+
+    def test_pp_with_a_storage_tier_is_no_longer_a_blocker(self):
+        """#630 LIFTED 2026-08-17, against the condition the guard itself set.
+
+        This combination -- a pipeline carrying a STORAGE-BACKED tier -- was
+        refused because pp_sync wedged on metal for 649 s with the send and its
+        matching receive both posted. The cause is now rooted: `bounded_wait`
+        polled `work.is_completed()` and only called `work.wait()` after the
+        poll succeeded, and for gloo `is_completed()` REPORTS while `wait()`
+        DRIVES -- so two polling peers never advanced the exchange and the #630
+        bound was itself the livelock (e4f1ae2556).
+
+        The guard's stated exit condition was "a test proves two ranks
+        RENDEZVOUS, not that a wait expires". That proof is
+        test_pp_sync_rendezvous_630.py: three REAL processes over a REAL gloo
+        group, mutation-proven. Metal confirmed it -- the same PP=3 boot went
+        from three HiCacheCollectiveTimeoutError occurrences to ZERO.
+
+        If this wedges again, restore BOTH twins and do not accept a green mock
+        suite as grounds to lift them a third time.
+        """
+        args = make_args(
+            **_BASE_FLIP_ARGS,
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+        )
+        args._handle_phase_flip()  # must not raise
 
 
 class TestSpecInTpDecodePhaseGate(CustomTestCase):

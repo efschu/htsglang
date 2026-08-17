@@ -57,10 +57,20 @@ class _FakeWork:
 
     def wait(self, *args, **kwargs):
         self.wait_calls += 1
-        if not self._completes:
-            # The real blocking wait against a dead peer: never returns.
+        if self._completes:
+            return True
+        timeout = kwargs.get("timeout", args[0] if args else None)
+        if timeout is None:
+            # The real UNTIMED wait against a dead peer: never returns.
             threading.Event().wait()
-        return True
+            return True
+        # A TIMED wait against a dead peer: gloo raises when the deadline
+        # expires (measured 2026-08-17). The stub modelled only the untimed
+        # case because `bounded_wait` used to poll `is_completed()` and never
+        # handed a deadline to `wait()` -- the polling that turned out to be
+        # the #630 livelock, since `is_completed()` reports while `wait()`
+        # drives. See test_pp_sync_rendezvous_630.py.
+        raise RuntimeError("gloo: wait timeout (stub)")
 
 
 def _holder(*, timeout_s=0.05, tp_world_size=2):
