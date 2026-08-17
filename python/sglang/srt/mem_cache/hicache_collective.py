@@ -155,8 +155,35 @@ def bounded_wait(
     try:
         completed = work.wait(timeout=datetime.timedelta(seconds=timeout_s))
     except RuntimeError as exc:
+        waited = time.monotonic() - started
+        # #734: A DEAD PEER IS NOT A SLOW PEER, and the log must not say it is.
+        #
+        # `Work.wait(timeout=...)` raises RuntimeError for BOTH expiry and
+        # transport failure, and reporting every one as a timeout produced a
+        # self-contradicting line on 2026-08-17:
+        #
+        #   'pp_sync/isend[2]->pp2' did not complete within 600s (waited 34.3s)
+        #
+        # -- 34.3 s against a 600 s bound. The real cause was underneath:
+        # `gloo ... Connection closed by peer`, i.e. the peer process had died.
+        # An operator reading "timeout" goes looking for a slow rank and finds
+        # a healthy one, while the corpse is on another node.
+        #
+        # The discriminator is NUMERIC, not a string match on the backend's
+        # wording: if the wait returned before its own deadline, the deadline
+        # is not what ended it. Backend messages change between versions;
+        # arithmetic does not.
+        if waited < timeout_s * 0.95:
+            raise HiCacheCollectiveError(
+                f"HiCache control collective '{label}' FAILED after "
+                f"{waited:.1f}s, well inside its {timeout_s:g}s bound, on "
+                f"[{rank_desc or collective_rank_desc(None)}]. This is NOT a "
+                f"timeout -- the transport ended the wait early, which usually "
+                f"means a peer process died or its connection dropped. Look for "
+                f"a dead rank, not a slow one. Underlying error: {exc}"
+            ) from exc
         raise HiCacheCollectiveTimeoutError(
-            _timeout_message(label, timeout_s, time.monotonic() - started, rank_desc)
+            _timeout_message(label, timeout_s, waited, rank_desc)
         ) from exc
     # Some backends report expiry by returning False rather than raising.
     if completed is False:
