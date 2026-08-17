@@ -114,13 +114,6 @@ class TestPinsUnderPressure(CustomTestCase):
         self.assertTrue(store.exists("aa_keepme"), "pinned page was evicted")
         self.assertFalse(store.exists("bb_dropme"), "unpinned page survived")
 
-    @unittest.skip(
-        "BLOCKED on unit unification (#411 reconciliation): this lineage's "
-        "evictor accounts APPARENT bytes while the ported pin ledger charges "
-        "ALLOCATED bytes, so used-minus-pinned is not a coherent subtraction. "
-        "stats() reports accounting_overshoot_bytes so the incoherence is "
-        "visible; this test re-activates once both sides charge one unit."
-    )
     def test_pinned_bytes_are_not_reported_as_reclaimable(self):
         """#715: never report as deliverable what the actuator cannot deliver."""
         store = _backend(self.root, extra={"max_size": str(64 * self.page_cost)})

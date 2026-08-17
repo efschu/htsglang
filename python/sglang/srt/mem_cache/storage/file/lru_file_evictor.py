@@ -228,11 +228,30 @@ class LRUFileEvictor:
         return True
 
     def commit(self, suffixed_key: str) -> None:
-        """Mark a reserved write as durably on disk (clears its in-flight flag)."""
+        """Mark a reserved write as durably on disk (clears its in-flight flag).
+
+        RECONCILE HERE, because ``reserve`` could only estimate. A reservation
+        is taken before the file exists, so it charges the payload length --
+        the only number available then. Once the write has landed the
+        filesystem's own answer is available, and on a filesystem that
+        allocates in blocks it is larger: a 64-byte page occupies 512 bytes on
+        ZFS. Correcting at commit is what keeps ``_total_bytes`` in allocated
+        units without making ``reserve`` stat a file that is not there yet.
+        """
         if not self._eviction_enabled:
             return
+        actual = None
+        try:
+            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+        except OSError:
+            pass  # gone or unreadable; keep the reservation's estimate
         with self._lock:
             self._pending_writes.discard(suffixed_key)
+            if actual is not None:
+                prev = self._lru.get(suffixed_key)
+                if prev is not None and prev != actual:
+                    self._lru[suffixed_key] = actual
+                    self._total_bytes += actual - prev
 
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
@@ -252,9 +271,11 @@ class LRUFileEvictor:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)
                 return
-        # Untracked file: stat without holding the lock.
+        # Untracked file: stat without holding the lock. Charged at its
+        # ALLOCATED cost like every other entry -- adopting it at apparent
+        # length would reintroduce the undercount one file at a time.
         try:
-            size = os.path.getsize(tensor_path)
+            size = self._allocated_size(os.stat(tensor_path))
         except OSError:
             return
         with self._lock:
@@ -320,11 +341,18 @@ class LRUFileEvictor:
                 st = os.stat(fp)
             except OSError:
                 continue
-            entries.append((st.st_mtime, stem, st.st_size))
+            # ALLOCATED, matching every other accounting site and the
+            # pin ledger's unit.
+            entries.append((st.st_mtime, stem, self._allocated_size(st)))
         entries.sort(key=lambda e: e[0])  # oldest first
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
+
+    def _path_for_stem(self, stem: str) -> str:
+        """The file this stem names. One join, so the evictor, the
+        accounting and the pin ledger all stat the same path."""
+        return os.path.join(self.file_path, f"{stem}.bin")
 
     @staticmethod
     def _allocated_size(st: os.stat_result) -> int:
