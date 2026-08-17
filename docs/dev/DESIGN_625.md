@@ -270,6 +270,33 @@ shared launch configs keep working). A PD decode arm launched with
 which is exactly the failure shape AUDIT_505 is about, and it would quietly
 destroy the decode optimum the whole feature exists to protect.
 
+> **SUPERSEDED 2026-08-17 (#107 determination). The paragraph above is no
+> longer true, and it is the paragraph that prices this route's main
+> obstacle — so read the correction before planning against it.**
+>
+> #631a and #631b rewrote this decision, and the hook now holds all of it in
+> one place (`arg_groups/pd_disaggregation_hook.py`; the `:34-46` line
+> reference above no longer points at the spec logic at all):
+>
+> * the DEFAULT is now a hard refusal, not a silent disable — the refusal text
+>   names the required shape and the alternatives (`:314-331`);
+> * the auto-disable survives only as an OPT-IN escape hatch behind
+>   `SGLANG_PD_AUTO_DISABLE_SPEC`, and it logs a WARNING naming the arm and the
+>   algorithm it is switching off (`:264-281`);
+> * #631b goes further and ADMITS speculation for congruent shapes —
+>   `tp_size == 1` is accepted outright, "so the draft and target pools are
+>   both addressed by global token ids and the shared index array needs no
+>   reslicing" (`:286-292`);
+> * a separate boot gate refuses the corrupting combination by name rather
+>   than letting it run: `--draft-kv-layout` against a token-sharded PD arm
+>   (`:194-200`), the #345 right-token/wrong-slot class.
+>
+> So "the route is NOT available today" overstates the blocker by a wide
+> margin: spec on a PD arm is refused loudly where it is unsafe and permitted
+> where it is congruent. What remains true from the paragraph above is only
+> the underlying physics — an uneven-head-sharded draft pool still cannot be
+> transferred to a token-sharded arm, which is why the refusal exists.
+
 **Why this is still much cheaper than Route B.** The named obstacle is narrow:
 it is the DRAFT KV pool at the boundary, not the main KV and not the weights.
 NEXTN is a single draft layer. Two ways out, both bounded:
@@ -608,3 +635,121 @@ it, but a PP prefill group cannot go into production until #630 closes.
   must convert it into a loud refusal for the decode arm before it can be
   trusted, or a boot that looks correct will have lost NEXTN without saying
   so.
+
+---
+
+## 9. #107 remainder determination (2026-08-17)
+
+Recorded here because §7 is where #107's route is priced. §7's spec-blocker
+paragraph is corrected in place above; this section is the component verdict.
+
+### 9.1 (a) Disjoint-card prefill/decode groups — DELIVERED and wired
+
+`--disaggregation-topology {disjoint, colocated-congruent, colocated-process}`
+(`bb40020afd`), reachable through a real boot path:
+`server_args._handle_pd_disaggregation` (`server_args.py:6315`) ->
+`handle_pd_disaggregation` (`arg_groups/pd_disaggregation_hook.py`) ->
+`apply_pd_topology` (`disaggregation/topology.py:718`). It carries a per-card
+VRAM feasibility check (`topology.py:622-675`) and, after `d6d6a66e15`, keys
+those totals by CUDA order rather than NVML order — a real bug found during
+#107's own GPU validation, harmless for congruent but wrong for disjoint.
+The PD pair underneath is #99/#212, with the satellite carrying hybrid GDN
+(KV+mamba over mooncake, `disaggregation/prefill.py:911`).
+
+### 9.2 (b) The UNEVEN prefill group (3:1) — split verdict, and the TP axis is refused
+
+This promise means two different things on two different axes, and the answer
+differs:
+
+* **Pipeline/layer axis — DELIVERED.** `--disaggregation-prefill-layer-split`
+  takes exactly the "3:1" shape the task asks for ("e.g. 36,12"), mapped onto
+  the uneven-PP machinery (`SGLANG_PP_LAYER_PARTITION`). An uneven prefill
+  group in the layer sense exists.
+* **TP-ratio axis (`--rank-tp-ratio`) — ABSENT, and structurally refused where
+  it would collide.** Three sites, not one:
+  - `topology.py:342` REFUSES the combination outright: "tp_size must be 1 on
+    the prefill server ... Combining a layer split with partial TP is the
+    hierarchical-parallelism track, not this flag."
+  - `disaggregation/utils.py:757` states the transfer-layer reason: the DECODE
+    computes its per-sub-block slices "with its own possibly weighted
+    --rank-tp-ratio plan, **which the prefill sender lacks**". The uneven-TP PD
+    integration exists only on the receive side.
+  - `colocated-congruent` enforces `prefill_set == decode_gpus`
+    (`topology.py:278-300`) — congruent by construction, the opposite of a
+    differently-shaped prefill group.
+
+So "uneven prefill group" is delivered on the axis #107 can express and
+refused, by name, on the axis it cannot. That refusal is not a gap to close
+under #107; `topology.py:342` assigns it to the hierarchical-parallelism track.
+
+### 9.3 (c) The MPS arm — a gate, not a capability, and never executed here
+
+`colocated-process` is the MPS arm. What exists is a genuine prerequisite gate:
+`check_process_colocation_prerequisites` (`topology.py:683-710`) calls
+`probe_mps` (`rigmon/capabilities.py:567-621`), which is presence-detection of
+`CUDA_MPS_PIPE_DIRECTORY` and tells the operator to run
+`nvidia-cuda-mps-control -d` themselves. Nothing in the tree starts, stops or
+configures an MPS daemon; the overlap scheduling is delegated entirely to the
+driver.
+
+And the arm has never run here: #107's own validation record (`526fb6b4b8`)
+reports it **double-gated on this rig — NCCL 2.28.9 < 2.30 and no MPS daemon**.
+So the gate is delivered, the arm is rig-gated, and no measurement exists.
+
+The co-location that DOES run is `colocated-congruent`, and it is explicitly
+NOT MPS: "Because the two roles are lanes of ONE process there is one NCCL rank
+per card — the NCCL >= 2.30 co-location threshold and the MPS daemon
+requirement of two-process sharing do not apply" (`topology.py:33-36`). It is
+wired into the live scheduler (construction `scheduler.py:845-849`, consulted
+in batch selection every iteration).
+
+### 9.4 (d) Superseded by the phase-flip world? No — the relationship is inverted
+
+§7 of this document prices **Route A = PD disaggregation (#99/#106/#107/#212)**
+against **Route B = an in-process weight-topology actuator**, and its verdict is
+"**Route A is the preferred route**", because it turns the problem "from 'build
+a new actuator class' into 'compose existing groups + threshold routing policy
++ residency budgeting'". §7a is titled "Route A guards (**#631a/#631b**)". So
+#631 is not a rival that superseded #107 — it is the guarding of #107's own
+route. Closing #107 as "superseded by #631" would invert the record.
+
+**But the distinct value must be stated honestly, and today it is narrower
+than the task implies.** Concurrency is NOT yet the differentiator: `29540dfb92`
+says so itself — "Overlap needs the comm-B split first; named follow-up, not a
+silent property" — and the lane keeps execution serial, one lane tick replacing
+one device iteration (`congruent_lane.py:39-47`). Measured solo, the congruent
+lane is a **null effect**: prefill +0.12 %, decode +0.31 %, KV pool
+byte-identical to stock — "the lane is pure scheduling policy, not a resource
+line item" (`526fb6b4b8`).
+
+What remains genuinely distinct to #107 is therefore the DISJOINT-card,
+two-process arrangement and its Ungestoertheit property, which #212 measured
+honestly (TTFT loses, undisturbedness wins) — plus, once built, overlap.
+
+One further measured result worth carrying, because it bounds the whole family
+(`3d988260c7`): on a quant small enough to fit one 5090 solo, **solo TP=1 is
+1.65x faster end-to-end than TP=3 uneven-DCP** at 4.21x less KV capacity, and a
+single request at 32k context does not use that headroom. "The trade edge is
+closed, not tight" — PD only pays when a card cannot hold the model solo.
+
+### 9.5 Proposed rescope
+
+* **Stages 1 and 2 CLOSE as delivered**: the topology choice, the VRAM
+  feasibility check, the CUDA-order fix, and the executing congruent lane.
+* **Residue 1 — OVERLAP** (concurrent prefill+decode on separate streams).
+  Named by its own commit as needing the comm-B split. This is the item that
+  would give #107 value beyond scheduling policy, and it is the one worth
+  keeping open under this number.
+* **Residue 2 — the `colocated-process`/MPS arm: RIG-GATED**, deps named by
+  measurement rather than guess: NCCL >= 2.30 (rig has 2.28.9) and a running
+  MPS daemon. It should not sit in an in_progress task this rig cannot close.
+* **Not #107's**: the uneven TP-ratio prefill group, reassigned by
+  `topology.py:342` to the hierarchical-parallelism track.
+* **#258 (PD autotune)** — stated cautiously because it could not be verified:
+  no fork implementation commit for #258 exists (the `#258` matches in the log
+  are coincidental upstream PR numbers), and the references
+  (`INTEGRATION_R3_VALIDATION.md:4722, 5120, 5567`) tie it to two-lane card
+  allocation and a PD/main split slider. The dual-group runtime that work
+  points at is now delivered (#121/#274), so the dependency plausibly clears —
+  but no explicit gate statement was found to cite, so this is a lead to
+  re-check, not a finding.
