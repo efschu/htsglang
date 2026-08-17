@@ -377,6 +377,35 @@ direction.
 | 4 | `#719 HiCache rebind refused` | **ZERO occurrences** with the flag off | its presence means someone armed `--phase-flip-rebind-hicache`; see below |
 | 5 | `[#703 demote] dropping demotions` | absent under steady load | disk tier is not keeping up; raise the cap (a dropped demotion is a later miss, never corruption) |
 | 6 | `overflow_allocations` | zero with `READ_BUFFERS=8` | the #720 spike is back; raise the ring or accept knowingly |
+| 7 | `[#703 demote] stats` | present, with `landed_pct` near 100 and `demoted` climbing | see below -- this is the row that says whether retention happened AT ALL |
+
+**On row 7, the retention question itself.** Rows 2 and 5 tell you about hits
+and about drops, but until now nothing reported whether evicted prefixes
+actually REACHED the disk tier: the demotion counters existed and no code
+outside their module read them. The periodic line closes that, and it is the
+one to read first when the decode-bs claim does not reproduce:
+
+```
+  [#703 demote] stats demoted=N dropped_backpressure=N failed=N \
+      skipped_not_persistable=N skipped_no_storage=N attempted=N landed_pct=P
+```
+
+* line ABSENT entirely -> demotion is off. `SGLANG_HICACHE_DEMOTE_ON_EVICT` is
+  0 or unset, so nothing is being retained under pressure and rows 2/5 are
+  measuring the insert-time path only. This is the single most likely reason a
+  retention experiment shows no effect.
+* `demoted=0` with `skipped_no_storage` climbing -> no storage tier is
+  attached; the disk tier never armed.
+* `demoted=0` with `skipped_not_persistable` climbing -> nodes are reaching
+  eviction without a `hash_value`, so they cannot be keyed. Check that
+  `--enable-hierarchical-cache` and the storage backend are both set, since
+  `hash_value` is only computed when storage (or kv-cache-events) is on.
+* `landed_pct` well below 100 -> the disk tier is not keeping up; row 5's
+  warning names the cap to raise.
+
+Emission is rate-limited (60 s) and silent while nothing changes, so a steady
+`landed_pct=100.0` prints once rather than every minute. Absence after a change
+is therefore meaningful; absence at steady state is not.
 
 **On row 4, so no one holds the boot for it.** The refusal is
 logged-never-raised at the cutover (`phase_flip_runtime.py:1638`, a `try` that

@@ -1754,6 +1754,15 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        # #703: the demotion counters were write-only -- nothing outside
+        # hicache_demotion ever read them, so a deployment could not see
+        # dropped_backpressure climbing and had no way to tell that evicted
+        # prefixes were silently failing to reach disk. Emitted here rather
+        # than behind enable_storage_metrics because that flag gates Prometheus
+        # export, and this number has to be readable from the LOG (the boot
+        # acceptance greps it; cache_hit_rate reports 0.0 despite real hits).
+        # Self-gating and rate-limited: see maybe_log_stats.
+        _demotion.maybe_log_stats()
 
     def drain_storage_control_queues(self):
         """

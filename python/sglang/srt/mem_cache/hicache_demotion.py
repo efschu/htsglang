@@ -49,11 +49,21 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import Any
+import time
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "[#703 demote]"
+
+#: How often the periodic stats line may be emitted, in seconds. This runs off
+#: the scheduler's per-iteration event drain, so the fast path below must stay a
+#: float compare -- see ``maybe_log_stats``.
+STATS_INTERVAL_S = 60.0
+
+#: The greppable marker. The boot acceptance and the #604 watchdog both key on
+#: this exact string, so it is a constant rather than an inline f-string.
+STATS_MARKER = f"{LOG_PREFIX} stats"
 
 
 @dataclasses.dataclass
@@ -74,17 +84,93 @@ _STATS = DemotionStats()
 _LOCK = threading.Lock()
 _WARNED_BACKPRESSURE = False
 
+#: Periodic-line state. ``_LAST_LOG_TS == 0.0`` means "never emitted", which is
+#: what makes the FIRST line unconditional: a boot has to be able to see that
+#: demotion is on at all, before any counter has moved.
+_LAST_LOG_TS = 0.0
+_LAST_SNAPSHOT: Optional[tuple] = None
+
 
 def stats() -> DemotionStats:
     return _STATS
 
 
+def stats_line() -> str:
+    """The one greppable line, with every counter and the ratio that matters.
+
+    ``landed_pct`` is the number the retention claim is actually made in: bytes
+    demoted are only worth something if they REACHED the disk tier, and the
+    three ways they do not (backpressure drop, write failure, nothing to write)
+    are each on the line so the reason is never inferred from a hole.
+
+    ``skipped_*`` are excluded from ``attempted`` deliberately -- they are not
+    failed demotions, they are evictions that were never candidates (no bytes,
+    no key, no storage tier). Folding them in would depress a ratio that is
+    supposed to answer "is the disk tier keeping up".
+    """
+    with _LOCK:
+        d = dataclasses.asdict(_STATS)
+    attempted = d["demoted"] + d["dropped_backpressure"] + d["failed"]
+    landed_pct = (100.0 * d["demoted"] / attempted) if attempted else 100.0
+    return (
+        f"{STATS_MARKER} demoted={d['demoted']} "
+        f"dropped_backpressure={d['dropped_backpressure']} "
+        f"failed={d['failed']} "
+        f"skipped_not_persistable={d['skipped_not_persistable']} "
+        f"skipped_no_storage={d['skipped_no_storage']} "
+        f"attempted={attempted} landed_pct={landed_pct:.1f}"
+    )
+
+
+def maybe_log_stats(
+    *, interval_s: float = STATS_INTERVAL_S, now: Optional[float] = None
+) -> bool:
+    """Emit the periodic stats line. Returns True when it logged.
+
+    Three properties, in the order the hot path meets them:
+
+    1. FAST PATH FIRST. This is called from the scheduler's per-iteration event
+       drain, so the common case is one float compare and a return -- before
+       the env read in ``enabled()`` and before the lock.
+    2. SILENT WHEN OFF. Nothing is emitted unless demotion is enabled, so the
+       default path's log is byte-identical.
+    3. SILENT WHEN UNCHANGED. After the first line, a line is emitted only if a
+       counter actually moved. A steady state that repeats the same numbers
+       every minute for hours trains the reader to skip the line, which is how
+       a stat meant to be watched stops being read.
+    """
+    global _LAST_LOG_TS, _LAST_SNAPSHOT
+    ts = time.monotonic() if now is None else float(now)
+    last = _LAST_LOG_TS
+    if last and (ts - last) < interval_s:
+        return False
+    if not enabled():
+        return False
+    with _LOCK:
+        snapshot = dataclasses.astuple(_STATS)
+        first = _LAST_SNAPSHOT is None
+        if not first and snapshot == _LAST_SNAPSHOT:
+            # Nothing moved. Do NOT restamp the clock: restamping would push the
+            # next check a full interval away, so a change landing right after
+            # this call would wait an extra interval to be reported.
+            return False
+        _LAST_LOG_TS = ts
+        _LAST_SNAPSHOT = snapshot
+    logger.info(stats_line())
+    return True
+
+
 def reset_stats() -> None:
-    global _WARNED_BACKPRESSURE
+    global _WARNED_BACKPRESSURE, _LAST_LOG_TS, _LAST_SNAPSHOT
     with _LOCK:
         for field in dataclasses.fields(DemotionStats):
             setattr(_STATS, field.name, 0)
         _WARNED_BACKPRESSURE = False
+        # The periodic line's state resets with the counters it reports, or the
+        # next call would compare fresh zeros against a stale snapshot and stay
+        # silent about a store that just started demoting again.
+        _LAST_LOG_TS = 0.0
+        _LAST_SNAPSHOT = None
 
 
 def enabled() -> bool:
