@@ -58,12 +58,23 @@ string, a metric, or an HTTP response field — recorded in the cell's
 These are not opinions from the catalog; each was read out of the source in
 this worktree.
 
-- **S1 — kvso and HiCache are mutually exclusive.** `server_args.py:6773`
-  (`if self.enable_hierarchical_cache or self.enable_unified_memory: raise`).
-  The production serving recipe runs `--enable-hierarchical-cache
+- **S1 — SUPERSEDED 2026-08-17 (was: "kvso and HiCache are mutually
+  exclusive").** **#550 closed this**: the combination is now an OPT-IN, not a
+  refusal. The gate is `KVSO_ALLOW_HICACHE` (`server_args.py:7502`,
+  `if os.environ.get("KVSO_ALLOW_HICACHE", "0") != "1": raise`) — set it to `1`
+  and the boot proceeds. Per that refusal's own text, the two host pools are
+  **independent objects with disjoint key spaces**, and their pinned host RAM
+  is summed by **one joint budget guard** rather than each validating alone;
+  what remains is a measurement (spill-copy vs prefetch contention), not a
+  mechanism. `FEATURE_CATALOG.md` §3 has carried the corrected version since
+  #550 — the catalog was right and this paragraph was stale.
+  The original text, kept so the change is legible: *kvso and HiCache are
+  mutually exclusive,* `server_args.py:6773`
+  (`if self.enable_hierarchical_cache or self.enable_unified_memory: raise`);
+  the production serving recipe runs `--enable-hierarchical-cache
   --hicache-storage-backend file`, so **kvso cannot run on the production
-  recipe at all**. Every HOT cell therefore needs its own boot with the
-  hicache flags removed. Composability is task **#547** per
+  recipe at all**; every HOT cell therefore needs its own boot with the
+  hicache flags removed. Composability was task **#547** per
   `docs/rig-runbook.md:877` (the briefing called this #550 — the in-tree name
   is #547).
 - **S2 — kvso x speculation is opt-in, not refused.** `server_args.py:6698-6744`
@@ -223,7 +234,7 @@ env: `SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_MAMBA_SSM_DTYPE=bf
 | H12 | Adaptive/self-calibrating tick cadence | `kv-session-offload: SELF-CALIBRATING spill-tick cadence armed` (`:2464`) | NOT-EXAMINED |
 | H13 | Fast-lane interaction with eviction (fast_lane is term 2 of the victim key) | a fast-lane request is NOT chosen while a non-fast-lane candidate exists | NOT-EXAMINED |
 | H14 | Prefill-spill / born-spilled (`--kv-session-offload-prefill`) | `kv-session-offload prefill-spill (born-spilled) ENABLED` (`:2201`) | NOT-EXAMINED |
-| H15 | kvso x HiCache | — | REFUSED-BY-DESIGN(`server_args.py:6773`) — composability is #547. Measured, not built. |
+| H15 | kvso x HiCache | — | **SUPERSEDED by #550**: OPT-IN via `KVSO_ALLOW_HICACHE=1` (`server_args.py:7502`), disjoint key spaces + joint budget guard. Was: REFUSED-BY-DESIGN(`server_args.py:6773`), composability #547. |
 | H16 | kvso x #330 VRAM dial | — | REFUSED-BY-DESIGN(`managers/vram_dial.py:1052`) |
 | H17 | kvso x weightless-KV fastlane | — | REFUSED-BY-DESIGN(`server_args.py:6673`) |
 | H18 | kvso x PD disagg / dp>1 / pp>1 / page_size>1 / non-flashinfer | — | REFUSED-BY-DESIGN(`server_args.py:6596-6641`) |

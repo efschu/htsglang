@@ -3715,6 +3715,33 @@ found audit line-numbers had drifted, two of three into the wrong file.
   safe shapes, and one pinned-unreachable suspect are recorded in
   `DESIGN_679_admission_relief_ladder.md` §7. Cross-reference, do not duplicate
   here. #679/#681/#684/#715/#694 — VERIFIED (authored 2026-08-17)
+* **`check_every` / `SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY` — NOT dead, but
+  path-dependent; default is 1, not 32.** Settles the former §19.3 conflict.
+  `check_every()` returns **1** when the env var is unset
+  (`barlink_abort_gate.py:189-197`), i.e. check every launch. Two consumers:
+  `barlink_bar1.py:5177` reaches it UNCONDITIONALLY (after the
+  `abort_check_enabled` / pending-launch gates), so the knob is LIVE on bar1;
+  `barlink_device.py:1562` sits in the in-line fallback path BELOW #517's
+  `_abort_poll_active` early return, so on the device transport it is bypassed
+  entirely whenever the watchdog feeds the flag.
+  **Both ledger readings were partially right and neither was complete**: "dead
+  since #517" is true of the DEVICE path only (that is what phase 2 made cheap),
+  while bar1 never got that treatment. `NOTE_517` treated `..._EVERY` as arm B3
+  expected to buy nothing on top of the staged read — "buys nothing measurable"
+  is not "the consumer was removed". The #431 utilisation figure predates #517.
+  **The production boot recipe does NOT set it** (absent from
+  `startkommandos-rig.md`), so there is no dead knob misleading the next
+  operator. verdict. #431/#517/#599/#600 — VERIFIED
+  *Same bar1-vs-device asymmetry as the #673 finding that bar1's
+  `check_aborted` never consults `_abort_poll_active` — converged twice.*
+* **`kv_cache_dtype` has no int8 — #726 must CREATE the surface, not find it.**
+  Cross-reference for the INT8-KV IMMA-QK builder: the dtype surface does not
+  exist (choices at `server_args.py:1026`), the fp8 KV scale path is hard-coded
+  per-tensor, and the one per-group-scale precedent (`MHATokenToKVPoolFP4`)
+  dequantises eagerly before any backend sees it — copying it yields VRAM
+  savings but NOT the bandwidth savings an int8-KV lane exists for. Budget the
+  dtype plumbing as new work. dark / zero code. #489, #726 — VERIFIED (anchor),
+  UNVERIFIED-LEDGER (the FP4 precedent's eager dequant, from ANALYSE_726)
 * **`PhaseFlipStacks.refill` — rung-change cost is CONSTANT in distance.**
   There is no cross-rank weight mover (`REACH_NO_WEIGHT_MOVER`,
   `regime_stages.py:100`); the actuator is a whole-arena host->device memcpy, so
@@ -3774,17 +3801,13 @@ Recorded so they are not re-derived from scratch; **open the code before acting.
 * **striped spill declined; non-reconstructible state must NEVER be striped** —
   all tiers sit behind the one link the data must leave over. BINDING. #423
 
-### 19.3 Conflicting — resolve before relying on either
-
-* **`SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY=32`** — the ledger carries BOTH "an
-  active shipped mitigation raising bs=1 decode utilisation 72-84% -> 86-91%"
-  (#431) and "dead since the #517 watchdog, 38.89 vs 38.88 ms/round = noise,
-  already removed from the shipped path" (#599 audit). Check the current
-  `server_args`/env default directly before quoting either. #431/#599/#600
+### 19.3 Conflicting — (empty; the EVERY=32 conflict was settled 2026-08-17, see §19.1)
 
 ### 19.4 Stale cross-reference found while sweeping
 
-* `ANALYSE_spill_matrix_20260804.md` §S1 still says kvso and HiCache are
-  mutually exclusive. **The catalog is correct and that doc is stale**: #550
-  superseded it (opt-in `KVSO_ALLOW_HICACHE=1`, catalog §3 lines ~845-847). Risk
-  is an agent reading only the older doc.
+* `ANALYSE_spill_matrix_20260804.md` §S1 said kvso and HiCache are mutually
+  exclusive. **FIXED 2026-08-17** in that doc (§S1 and the H15 matrix row both
+  marked SUPERSEDED, original text kept so the change is legible). The catalog
+  was correct throughout: #550 made it OPT-IN via `KVSO_ALLOW_HICACHE`
+  (`server_args.py:7502` — ANCHOR CORRECTION, the gate is not at :7385-7395),
+  with disjoint key spaces and one joint host-RAM budget guard.
