@@ -35,11 +35,19 @@ from sglang.test.test_utils import CustomTestCase
 PATCH_MODULE = "sglang.srt.utils.triton_patch"
 
 
-def _patch_path() -> str:
-    """File path of the hook module, for loading it without the package root."""
-    import sglang.srt.utils.triton_patch as tp
+def _hook_path() -> str:
+    """File path of the GENERIC post-import hook.
 
-    return tp.__file__
+    The isolated probes load THIS by path rather than ``triton_patch``: since
+    the triton patch now delegates to the shared hook, importing it by name
+    executes the sglang package root (transformers -> torch._dynamo -> triton)
+    and the probe would no longer be isolated. The ordering guarantee lives in
+    the generic hook, so that is where it is proven -- stdlib-only, therefore
+    loadable standalone.
+    """
+    import sglang.srt.utils.post_import_hook as hook
+
+    return hook.__file__
 
 
 def _probe(script: str) -> str:
@@ -71,11 +79,11 @@ class TestTritonPatchOrdering(CustomTestCase):
         """
         answer = _probe(f"""
             import importlib.util, sys, pathlib
-            path = pathlib.Path({str(_patch_path())!r})
-            spec = importlib.util.spec_from_file_location('_tp_probe', path)
+            path = pathlib.Path({str(_hook_path())!r})
+            spec = importlib.util.spec_from_file_location('_hook_probe', path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            mod.install()
+            mod.install('triton', lambda m: setattr(m, 'next_power_of_2', len))
             print('triton' in sys.modules)
             """)
         self.assertEqual(
@@ -100,14 +108,16 @@ class TestTritonPatchOrdering(CustomTestCase):
         answer = _probe(f"""
             import importlib.util, sys, pathlib
             spec = importlib.util.spec_from_file_location(
-                '_tp_probe', pathlib.Path({str(_patch_path())!r}))
+                '_hook_probe', pathlib.Path({str(_hook_path())!r}))
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            mod.install()
+            def _patch(triton_module):
+                triton_module.next_power_of_2 = lambda n: 1 << (n - 1).bit_length()
+                triton_module._patched_by_hook = True
+            mod.install('triton', _patch)
             assert 'triton' not in sys.modules, 'probe is not isolated'
             import triton
-            value = triton.next_power_of_2
-            print(value.__module__ == '_tp_probe' and value(100) == 128)
+            print(getattr(triton, '_patched_by_hook', False) and triton.next_power_of_2(100) == 128)
             """)
         self.assertEqual(
             answer,
@@ -159,7 +169,8 @@ class TestTritonPatchOrdering(CustomTestCase):
             from {PATCH_MODULE} import install, is_armed
             install(); install(); install()
             finders = [f for f in sys.meta_path
-                       if type(f).__name__ == '_TritonPatchFinder']
+                       if type(f).__name__ == '_PostImportFinder'
+                       and getattr(f, 'name', None) == 'triton']
             print(len(finders) == 1 and is_armed())
             """)
         self.assertEqual(answer, "True")
