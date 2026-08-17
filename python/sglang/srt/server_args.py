@@ -5799,7 +5799,9 @@ class ServerArgs:
         "Release the page cache behind each safetensors shard after loading it, "
         "via the #408 MADV_PAGEOUT ladder (posix_fadvise(DONTNEED) alone is a "
         "no-op on ZFS and is only the fallback). Cuts the weights-load page-cache "
-        "spike that can OOM a container before reclaim catches up.",
+        "spike that can OOM a container before reclaim catches up. Refused with "
+        "--load-format fastsafetensors (#742): that path reads via GPU Direct "
+        "Storage and never populates a page cache to release.",
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
@@ -16474,6 +16476,30 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.load_format = "gguf"
+
+        # #742 CONTRACT HONESTY. Every loader branch forwards
+        # weight_loader_drop_cache_after_load except the FASTSAFETENSORS one
+        # (model_loader/loader.py: fastsafetensors_weights_iterator takes the
+        # file list and nothing else), so the flag was silently dropped there
+        # while the help promised the page cache would be released.
+        #
+        # This is refused rather than passed through, because passing it
+        # through would be theatre: that iterator reads via GPU Direct
+        # Storage, which BYPASSES the page cache, so there is nothing behind
+        # those shards to release. An impossibility is named as one -- see
+        # #547 -> #550 on refusals that describe instead of explaining.
+        if (
+            self.load_format == "fastsafetensors"
+            and self.weight_loader_drop_cache_after_load
+        ):
+            raise ValueError(
+                "--weight-loader-drop-cache-after-load cannot be honoured with "
+                "--load-format fastsafetensors: that loader reads through GPU "
+                "Direct Storage (GDS), which bypasses the page cache, so there "
+                "is no page cache behind the shards to release. Drop one of the "
+                "two flags -- the combination has never done anything, and this "
+                "refusal replaces silently ignoring it."
+            )
 
         # #89 hibernate: mutual-requirement + auto-detect. A valid manifest in
         # --hibernate-dir that coarse-matches the launch args (model, quant,
