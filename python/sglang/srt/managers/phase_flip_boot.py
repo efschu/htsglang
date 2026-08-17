@@ -462,12 +462,30 @@ class PhaseFlipStacks:
         )
 
     def _commit_refill_high_water(self) -> None:
-        if self.arena_carrier is None:
-            return
-        # set_active_prefix GROWS to the high-water here and can never shrink
-        # to it, because the high-water is the maximum of both layouts and the
-        # arena is never committed above that.
-        self.arena_carrier.set_active_prefix(self.refill_high_water_bytes())
+        from sglang.srt.managers import phase_flip_seam_census as seam_census
+
+        if self.arena_carrier is not None:
+            # set_active_prefix GROWS to the high-water here and can never
+            # shrink to it, because the high-water is the maximum of both
+            # layouts and the arena is never committed above that.
+            self.arena_carrier.set_active_prefix(self.refill_high_water_bytes())
+        # THE ONE BOUNDARY INSIDE THE REFILL LEG: arena COMMIT above, H2D copy
+        # below (refill() calls this immediately before arena_refill on both
+        # directions). Without it the whole leg lands in a single
+        # 'weights_refill' bar, and a commit that stalls on the driver is
+        # indistinguishable from a transfer that is merely bandwidth-bound --
+        # the two have different fixes and live in different modules.
+        #
+        # Marked OUTSIDE the carrier guard on purpose: with no carrier the
+        # commit is a no-op and the boundary is a zero-width step, which is
+        # itself the answer to "was it the commit?". Skipping the mark there
+        # would make a no-carrier rank's bar silently mean something else than
+        # its peers'.
+        #
+        # mark() is a no-op when no census is open and swallows its own
+        # exceptions, so this cannot become the reason a flip dies -- the
+        # no-return-path contract this instrument has carried since #631.
+        seam_census.mark("refill_highwater")
 
 
 def build_flip_draft_worker(scheduler, tp_worker, tp_args, world_rank):
