@@ -3530,6 +3530,26 @@ taxonomy and the global importance ladder.
   cuda, `pp_size == 1`
   (`managers/scheduler_components/metrics_reporter.py:341`). There is no
   decode/verify-round equivalent (#505-D14) — do not read one into it.
+  NO ENV FLAG: `_install_rank_prefill_timer` runs unconditionally from
+  `SchedulerMetricsReporter.__post_init__` (`:373` → `:458`), so the
+  instrument is LIVE on every CUDA boot — reading the socket needs a boot log,
+  not a special arm. Reader + floor/skew classifier:
+  `bench/588/run_588_socket.py`.
+- **#588 prefill collective socket** — decomposed 2026-08-17 from the window-8
+  record: `tp.all_reduce` 929/871/878 ms and `dcp.all_reduce` 250/266/259 ms
+  are FLOORS (every rank pays them, ~1.18 s together = the reported "1.2 s
+  socket"); `dcp.all_gather` 292/135/146 ms is SKEW. `tp.all_reduce` fires 129
+  times = 2×64 layers + 1, the DENSE per-layer pattern. "Wait is 2-3× compute"
+  holds for TP1/TP2 (2.48×/2.57×) but TP0 is **4.91×** — smallest shard, so it
+  finishes first and waits longest; the per-batch ratio spans 0.19×–7.87×, so
+  never quote one number. Both overlap levers are INERT here: #588's
+  `SGLANG_TP_AR_PIPELINE` is unset by any caller AND its branch requires
+  `not is_allocation_symmetric()` (`linear.py:2288`), which is False on plain
+  TP; #597's only issue site is `fused_moe_triton/layer.py:2062`, which a dense
+  model never reaches (`qwen3_5.py:975`), leaving the three `join_deferred`
+  sites permanent no-ops. The unhooked case is the `reduce_results=False`
+  producer whose reduce the LayerCommunicator owns (`communicator.py:1204`).
+  `VERDICT_588_remainder.md`.
 - **CollectiveCensus** — per-rank collective ring history plus divergence
   detection; the instrument that turns "rank 2 is stuck" into "rank 2 is
   three collectives behind and here they are".

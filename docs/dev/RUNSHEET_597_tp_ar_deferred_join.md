@@ -12,9 +12,34 @@ may be run separately or together.
 
 Window 8 measured the target family in production: **`tp.all_reduce`
 932.2 ms over 129 calls** of a 96k-token prefill. It is not issued by a
-row-parallel linear. `qwen3_5` builds `o_proj`/`out_proj` with
-`reduce_results=False` and reduces the MoE output inside the MoE layer, so
-#588's in-call hook never saw it.
+row-parallel linear: `qwen3_5` builds `o_proj`/`out_proj` with
+`reduce_results=False`, so #588's in-call hook never saw it.
+
+> **CORRECTION 2026-08-17 (#588 remainder determination).** The sentence that
+> stood here also said the reduce happens "inside the MoE layer". That is not
+> true of the model this number came from, and the mis-attribution is
+> load-bearing because it is what chose the hook site.
+>
+> Window 8 ran `Qwen3.6-27B-INT8-W8A8`
+> (`/spinning/gpu-battery-results/2026-08-05_window8/boot_A2_588_coverage.log`,
+> where `tp.all_reduce 932.2/129x` appears), and that checkpoint is **DENSE**:
+> `model_type: qwen3_5` (not `qwen3_5_moe`), no `num_experts` /
+> `moe_intermediate_size`, plain `intermediate_size=17408`. `qwen3_5.py:975`
+> takes the "Dense MLP for non-MoE variant" branch and `:1323` computes
+> `is_moe = "moe" in model_type` -> False, so **no `FusedMoE` is ever
+> constructed**. The call count settles it arithmetically: the model has 64
+> layers, and `2 x 64 + 1 = 129` is exactly the observed count -- one reduce
+> for the attention output and one for the MLP output per layer, plus one
+> final. That is the dense pattern; an MoE model would not produce it.
+>
+> So the 932.2 ms family is issued by `reduce_results=False` producers whose
+> reduce belongs to the `LayerCommunicator` -- the case the "Follow-up"
+> section below correctly identifies as the remaining unhooked one. This
+> lever's single issue site is `fused_moe_triton/layer.py:2062`
+> (`issue_deferred_all_reduce`'s only caller in the tree), which a dense model
+> never reaches. The machinery, the ceiling algebra and the counters are
+> sound; the target attribution was not. See
+> `VERDICT_588_remainder.md`.
 
 This lever issues that same reduction on the comm stream at the site that
 already owned it (`fused_moe_triton/layer.py:2041` `forward_impl`) and joins
