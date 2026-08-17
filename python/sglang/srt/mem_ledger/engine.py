@@ -663,6 +663,14 @@ RUNTIME_COMMUNICATOR_GROUPS: Mapping[str, str] = {
         "(parallel_state.py:3079): the kv-session-offload comm B, a second "
         "communicator over the same dcp ranks"
     ),
+    "decoupled_kv": (
+        "built by initialize_decoupled_kv_group over the planned pipeline "
+        "ranks (parallel_state.py:3567-3600, #704b decoupled KV). Declared "
+        "for INVENTORY completeness: this contract is checked against "
+        "construction SITES, and the initializer has no production caller "
+        "today, so no boot allocates it yet. Declaring it now is what keeps "
+        "the day someone wires it from looking like an undeclared group"
+    ),
     "attn_cp": (
         "built only when attn_cp_size != tp_size (parallel_state.py:3113-3129); "
         "equal sizes ALIAS _TP and construct nothing"

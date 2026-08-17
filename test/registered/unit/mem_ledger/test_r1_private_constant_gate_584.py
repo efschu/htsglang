@@ -181,6 +181,34 @@ KNOWN = {
         "HARNESS threshold in the boot-matrix sweep, not a serving-path "
         "decision about how much VRAM anything gets."
     ),
+    # ======================================================================
+    # FILED BY MERGE TRAIN 2 (2026-08-17). Both surfaced when this gate was
+    # merged alongside the branches that introduced them (#662-F4 / #685-#696
+    # and the boot-instrument chain). Filed with a verdict where the call site
+    # was read and WITHHELD where it was not -- a baseline bump without a
+    # reason is the thing this file exists to prevent.
+    # ======================================================================
+    "planner/boot_instruments.py::_CHAIN_TOLERANCE_MIB": (
+        "NOT A DEMAND DECISION, call site read (boot_instruments.py:36-38, "
+        "88-91): a rounding tolerance for VERIFYING the budget-chain "
+        "identity, not for sizing anything. The emitted posts carry three "
+        "decimals of a GiB, so ~1 MiB of rounding per term is expected and "
+        "3.0 is the slack the comparison allows. It reserves no VRAM and "
+        "gates no allocation; moving it into the ledger would put an "
+        "assertion tolerance among demand terms."
+    ),
+    "managers/phase_flip_seam_reserve.py::DEFAULT_ARMING_MARGIN_MIB": (
+        "NEEDS AUDIT: demand-shaped and knowingly so -- it is how much free "
+        "VRAM the #662-F4 arming floor requires ON TOP of the corridor law "
+        "(phase_flip_seam_reserve.py:495-501), so it does gate a decision "
+        "about VRAM. Its own comment says it carries the same shape and "
+        "default as the seam measurement's error bar, which is the argument "
+        "for it being an instrument tolerance rather than a demand term. "
+        "That is exactly the call this gate wants made deliberately, and it "
+        "belongs to the #662-F4 owner, not to a merge train. Env-overridable "
+        "via SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
+        "silent constant."
+    ),
 }
 
 
