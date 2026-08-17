@@ -274,6 +274,21 @@ contract (`hibernate_dir` + weights/draft CPU/disk backup flags), and a
 118-name retired-env guard that refuses stale SGLANG_* variables loudly.
 
 ## 7. Collectives / transport
+**barlink is COLLECTIVE-ONLY, and that is load-bearing for placement (#732).**
+Its dispatch seams are `all_reduce` (`parallel_state.py:1100`),
+`reduce_scatter*` (`:1299`, `:1374`, `:1498`) and `all_to_all_single*`
+(`:1438`, `:1450`, `:1480`) — there is no `send`/`recv` on `barlink_bar1.py`.
+So BAR1 accelerates COLLECTIVES (measured 1.13/1.34/1.15/1.04/1.30x vs NCCL at
+20 KiB…16 MiB, `DESIGN_407_memory_tier_registry.md:131`) and carries no
+point-to-point traffic. A PP stage handoff is point-to-point
+(`send_tensor_dict`, `:2178`, on a `use_custom_allreduce=False` group `:3121`),
+so "no P2P" reasoning about PP crossings must NOT be read as "no direct
+transport" — and equally, BAR1 must not be dismissed for collective work.
+Consequence for #705's TP-decode family split: its baseline `ar_10kb_us`
+31.0–33.7 µs is an **NCCL** probe (`uneven_perf.py:1329-1330`), and re-scaling
+by the measured BAR1 ratio turns its +0.022…+0.152 ms margin NEGATIVE
+(−0.034…−0.356 ms) — a faster interconnect makes collective-REMOVAL worth
+less, so that refusal strengthens. `ANALYSE_732_bar1_repricing.md`.
 **barlink** (own vendor-neutral CCL): NCCL-parity device transport,
 cross-vendor byte-exact, UCX transport (chunk pipelining, dual worker), tuned
 all_gather ring, graph-capable direct mode. **Smallbar BAR1 direct path**:
