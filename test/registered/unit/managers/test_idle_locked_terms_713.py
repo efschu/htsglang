@@ -117,3 +117,58 @@ class TestIdleLockedDiagnostic713(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiagnosticProbesAreAllDefended713(CustomTestCase):
+    """Review amendment: every probe inside the diagnostic must be armoured.
+
+    A bare call in the logger arguments would let the diagnostic KILL the
+    scheduler round it exists to observe -- which is exactly how #715's RADIX
+    SHAPE walk died inside the crash it was written to explain.
+
+    ONE HONEST LIMIT, FOUND BY MUTATION. The _post_evict_rows arm of this is
+    UNREACHABLE and is therefore not tested: that method swallows its own
+    accessor exceptions internally, so it cannot raise, and a test that broke
+    the accessors underneath PASSED against a deliberately undefended call
+    site -- i.e. it proved nothing. Forcing the raise requires patching the
+    bound method, which then raises inside _layout_admits (also a bare call)
+    before the diagnostic is reached, so it tests neither. The hardening is
+    kept as cheap insurance against a future edit that makes _post_evict_rows
+    raise, but it is NOT claimed to fix a reachable defect today, and no test
+    pretends otherwise. The mamba probe below IS reachable and is tested.
+    """
+
+    def _raising_sched(self, which):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        def boom():
+            raise RuntimeError("probe exploded")
+
+        s = _sched(avail=0, slots=0)
+        s._round_built_nothing = True
+        s.phase_flip_active_stack = "tp"
+        s._idle_locked_diag_at = 0.0
+        if which == "slots":
+            s.req_to_token_pool = SimpleNamespace(
+                mamba_allocator=SimpleNamespace(available_size=boom)
+            )
+        return s
+
+    def test_a_raising_probe_never_breaks_the_round(self):
+        for which in ("slots",):
+            with self.subTest(probe=which):
+                s = self._raising_sched(which)
+                # must RETURN, not raise: the round survives its own diagnostic
+                nothing_can_run, target = s._idle_locked_inputs(0, PENDING)
+                self.assertTrue(nothing_can_run)
+                self.assertFalse(target)
+
+    def test_the_line_still_prints_with_a_raising_probe(self):
+        from sglang.srt.managers import scheduler as m
+
+        s = self._raising_sched("slots")
+        with self.assertLogs(m.logger, level="WARNING") as cm:
+            s._idle_locked_inputs(0, PENDING)
+        out = "\n".join(cm.output)
+        self.assertIn("IDLE-LOCKED TERMS", out, out)
+        self.assertIn("RAISED", out, "a raising probe must be NAMED, not read as 0")

@@ -3355,6 +3355,17 @@ class Scheduler(
                     avail = int(alloc.available_size()) if alloc is not None else -1
                 except Exception as exc:  # noqa: BLE001
                     avail = f"RAISED {type(exc).__name__}"
+                # THE THIRD PROBE GETS THE SAME ARMOUR, and it is not
+                # decoration: called bare inside the logger arguments, a raise
+                # here would kill the scheduler round this line exists to
+                # OBSERVE -- which is exactly how #715's RADIX SHAPE walk died
+                # inside the crash it was written to explain. "Probably safe
+                # because _layout_admits just evaluated it" is the reasoning
+                # the RAISED pattern exists to replace.
+                try:
+                    rows_seen = self._post_evict_rows()
+                except Exception as exc:  # noqa: BLE001
+                    rows_seen = f"RAISED {type(exc).__name__}"
                 logger.warning(
                     "PHASE-POLICY IDLE-LOCKED TERMS phase=%s running_bs=%s "
                     "pending_tokens=%s | here(%s)=%s there(%s)=%s | "
@@ -3368,7 +3379,7 @@ class Scheduler(
                     here,
                     other,
                     there,
-                    self._post_evict_rows(),
+                    rows_seen,
                     avail,
                     slots,
                     getattr(self.server_args, "chunked_prefill_size", None),
