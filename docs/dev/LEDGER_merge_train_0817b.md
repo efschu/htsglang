@@ -414,3 +414,69 @@ Six suites now have ZERO failures. The two remaining deltas:
 **No unexplained failures remain.** Every non-zero suite is either identical to
 base, attributed by measurement to a contributing branch, or named as
 order-dependent with the evidence for that claim.
+
+---
+
+# FOURTH PASS — the residual closed (2026-08-17)
+
+The `weights_arena` allocation-failure window filed in T2 is closed, and the
+audit it triggered found the shape is SYSTEMIC rather than a weights_arena
+quirk.
+
+## F1. Why the window exists at all
+
+Every producer declares its post BEFORE allocating, and that is deliberate:
+"an over-commitment is refused instead of discovered: the registry's whole job
+is to fail at the declaration rather than at the allocation"
+(`read_buffer_pool.py:70-72`). Correct for the CHECK — and it necessarily
+opens a failure window. If the allocation then raises, the post describes bytes
+that never existed, and #706's credit-back subtracts already-allocated posts
+from the next admission's demand. A post that never allocated is credited back
+anyway, so the next admission is charged too little: **the registry would wave
+through the exact over-commitment it exists to refuse.**
+
+## F2. The audit (brief item 3) — every producer, named
+
+All eight register then allocate. The brief expected two siblings; there are
+seven.
+
+| producer | allocation after registration | state |
+| --- | --- | --- |
+| `model_executor/weights_arena.py:428` | `:439-460` pinned alloc + fallback | **FIXED** |
+| `mem_cache/read_buffer_pool.py:73` | `:79` `[factory() ...]` | **FIXED** |
+| `mem_cache/memory_pool_host.py:141` | `conv_device_ptrs` | AFFECTED, filed |
+| `mem_cache/memory_pool_host.py:770` | `alloc_func` / `kv_buffer` | AFFECTED, filed |
+| `mem_cache/memory_pool_host.py:1147` | `alloc_func` / `kv_buffer` | AFFECTED, filed |
+| `mem_cache/memory_pool_host.py:1680` | `alloc_func` | AFFECTED, filed |
+| `mem_cache/pool_host/mha.py:684` | `k_data_refs` | AFFECTED, filed |
+| `mem_cache/pool_host/base.py:164` | `init_kv_buffer()` | AFFECTED, filed |
+
+None is clean. The six unfixed are on the KV-pool hot path and each wants its
+own allocation-failure test; fixing all eight in one commit on a train branch
+is a blast radius this slice did not need. `unregister_pinned_post` already
+exists and both fixes use it, so the remaining six are mechanical.
+
+## F3. The fix shape
+
+Constraint honoured: the success path is byte-identical — same allocator, same
+fallback, same return. Only the failure path is new, and it obeys #386: the
+post is taken back and the ORIGINAL exception is re-raised untouched, so the
+operator still reads `cudaHostRegister`'s own words rather than a cleanup
+message. `_register_image_post` now returns the name it registered so there is
+something to take back; returning `None` means nothing was registered and there
+is nothing to undo.
+
+## F4. Tests — extended, not rebuilt
+
+Added to `test_pinned_post_registry_550.py` (the #548/#550 characterization
+file, per the gate), 4 new cases: the poisoned state, the #386 no-masking
+property, a success-path guard so the fix cannot pass by never registering, and
+the same window in `read_buffer_pool`.
+
+Can-fail proven three ways: cleanup made a no-op reds the poisoned-state case;
+wrapping the error in a new `RuntimeError` reds the no-masking case; disabling
+the ring's cleanup reds the sibling case. Each reds ONLY its own test.
+
+`unit/mem_cache`: 1148 passed, 0 failed. `unit/model_executor`: 15 failed / 660
+passed, IDENTICAL to the pre-slice commit `fac99d644d` measured in a pristine
+worktree — the 15 are pre-existing and this slice adds none.

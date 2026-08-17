@@ -1928,6 +1928,19 @@ halves — six of its tests go red against the old one-sentence refusal, and the
 structural half goes red the moment the seam gains a producer or a reader
 outside the layer that makes the reasoning true.
 
+REGISTER-THEN-ALLOCATE WINDOW (2026-08-17). Every producer declares its post
+BEFORE allocating -- deliberately, so an over-commitment is refused at the
+declaration rather than discovered at the allocation
+(`read_buffer_pool.py:70-72`). That ordering opens a failure window: if the
+allocation then raises, the post describes bytes that never existed, and #706's
+credit-back (`d7d85b4e37`) subtracts already-allocated posts from the next
+admission's demand -- so a post that never allocated is credited back anyway and
+the next admission is charged too little. Closed at `weights_arena.py`
+(`_alloc_host_image`, post taken back on failure, original error re-raised
+untouched) and `read_buffer_pool.py:79`. STILL OPEN, same shape, filed with
+file:line: `memory_pool_host.py:141`, `:770`, `:1147`, `:1680`,
+`pool_host/mha.py:684`, `pool_host/base.py:164`.
+
 RESOLVED IN #550, and the split between the two halves is the lesson. Gap (1)
 was a MECHANISM and could be built at the desk: `mem_cache/pinned_host_budget`
 is now the single owner of "may this pinned host buffer be allocated", every

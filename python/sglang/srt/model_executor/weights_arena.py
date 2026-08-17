@@ -337,8 +337,13 @@ def _torch_pinned_empty(total: int) -> torch.Tensor:
 _image_post_seq = 0
 
 
-def _register_image_post(nbytes: int) -> None:
-    """Record a pinned host image in the shared post registry. Never raises."""
+def _register_image_post(nbytes: int) -> Optional[str]:
+    """Record a pinned host image in the shared post registry. Never raises.
+
+    Returns the NAME it registered, so the caller can take it back if the
+    allocation this post describes then fails. Returning None means nothing
+    was registered and there is nothing to undo.
+    """
     global _image_post_seq
     try:
         from sglang.srt.mem_cache.pinned_host_budget import (
@@ -347,15 +352,40 @@ def _register_image_post(nbytes: int) -> None:
         )
 
         _image_post_seq += 1
+        name = f"phase-flip host weight image #{_image_post_seq}"
         register_pinned_post(
             PinnedHostPost(
-                name=f"phase-flip host weight image #{_image_post_seq}",
+                name=name,
                 flag="--enable-phase-flip",
                 nbytes=int(nbytes),
             )
         )
+        return name
     except Exception as exc:  # noqa: BLE001 -- bookkeeping never kills a boot
         logger.debug("could not register host image post: %s", exc)
+    return None
+
+
+def _unregister_image_post(name: Optional[str]) -> None:
+    """Take back a post whose allocation never happened. Never raises.
+
+    THE WINDOW THIS CLOSES. Every producer of a pinned post declares it BEFORE
+    allocating, deliberately -- the registry's job is to refuse an
+    over-commitment at the declaration rather than discover it at the
+    allocation. If the allocation then fails, the post describes bytes that do
+    not exist, and #706's credit-back (d7d85b4e37) subtracts already-allocated
+    posts from the next admission's demand. A post that never allocated is
+    credited back anyway, so the next admission is charged too little: the
+    registry itself would wave through the over-commitment it exists to refuse.
+    """
+    if not name:
+        return
+    try:
+        from sglang.srt.mem_cache.pinned_host_budget import unregister_pinned_post
+
+        unregister_pinned_post(name)
+    except Exception as exc:  # noqa: BLE001 -- cleanup never kills a boot
+        logger.debug("could not unregister host image post %s: %s", name, exc)
 
 
 def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
@@ -425,7 +455,7 @@ def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
     # images sat outside it. Registered, not CHECKED: a new refusal path here
     # could break a boot that works today, and the diagnosis this is for is
     # served by the number being present, not by a veto.
-    _register_image_post(total)
+    _image_post = _register_image_post(total)
     # #695 risk 2 -- the opt-out arm. SGLANG_PHASE_FLIP_EXACT_PIN=0 restores the
     # pre-#695 allocation so the two allocators can be compared through ONE
     # harness on ONE binary, the arms differing by this variable and nothing
@@ -436,6 +466,22 @@ def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
     # commit and are correct under either allocator.
     from sglang.srt.environ import envs
 
+    # ONLY THE FAILURE PATH IS NEW. The success path below is byte-identical:
+    # same allocator, same fallback, same return. What changes is that an
+    # allocation which raises out of here takes its post back with it, instead
+    # of leaving the registry charging bytes that never existed. The original
+    # exception is re-raised untouched -- cleanup must never substitute the
+    # diagnosis (#386), so the operator still sees cudaHostRegister's own words.
+    try:
+        return _alloc_host_image_inner(total, zero, envs)
+    except BaseException:
+        _unregister_image_post(_image_post)
+        raise
+
+
+def _alloc_host_image_inner(total: int, zero: bool, envs) -> torch.Tensor:
+    """The allocation itself, unchanged. Split out so the post-cleanup wrapper
+    above has a single expression to guard rather than a duplicated body."""
     if not envs.SGLANG_PHASE_FLIP_EXACT_PIN.get():
         logger.warning(
             "#695 exact-size pinned host images DISABLED by "
