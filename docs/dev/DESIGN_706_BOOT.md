@@ -365,19 +365,41 @@ boot -- it describes one.
 
 ### 5.1 Preconditions (all five, before any process starts)
 
-> **PRECONDITION 0 -- THIS BOOT IS BLOCKED TODAY.** A pipeline (`pp_size > 1`)
-> carrying a STORAGE-BACKED tier is refused, at parse time and again at arming,
-> by the #630 guard restored on 2026-08-17. It is not a stale blocker: measured
-> that day, `10:57:50 -> 11:08:39`, all three ranks sat inside `pp_sync` for
-> ~649 s with the send and its matching receive both posted on the same group
-> and tag. `9da9dfd025` BOUNDED that wait; it never rooted the desync, and
-> `test_hicache_bounded_waits_630.py` proves only that a bounded call raises on
-> schedule against mocked Work objects.
+> **PRECONDITION 0 -- SATISFIED WITH EVIDENCE, 2026-08-17.** The history stays
+> because the gate cycled three times and the failure mode was procedural.
 >
-> **Unblocks when** the pp_sync rendezvous is rooted and a test proves two REAL
-> ranks meet — not when one proves a wait expires. Guard `90e84ad268` (runtime,
-> `phase_flip_runtime.flip_blocking_guards`) and its parse-time twin
-> (`server_args._handle_phase_flip`) lift together, with that evidence.
+> *Was blocked:* a pipeline (`pp_size > 1`) carrying a STORAGE-BACKED tier was
+> refused at parse time and again at arming by the #630 guard restored that
+> morning. Not a stale blocker -- measured `10:57:50 -> 11:08:39`, all three
+> ranks sat inside `pp_sync` for ~649 s with the send and its matching receive
+> both posted on the same group and tag. `9da9dfd025` BOUNDED that wait; it
+> never rooted the desync, and `test_hicache_bounded_waits_630.py` proves only
+> that a bounded call raises on schedule against mocked Work objects.
+>
+> *Unblocked because the stated condition was met, not waived.* The rendezvous
+> is ROOTED: `bounded_wait` polled `work.is_completed()` and only called
+> `work.wait()` after the poll succeeded -- `is_completed()` REPORTS, `wait()`
+> DRIVES, so two polling peers never advanced the exchange and the #630 bound
+> was itself the livelock (`e4f1ae2556`). The required proof exists:
+> **`test/registered/unit/mem_cache/test_pp_sync_rendezvous_630.py`** runs THREE
+> REAL PROCESSES over a REAL gloo group and asserts the ring rendezvouses with
+> the bound ACTIVE, that downstream ranks receive rank 0's values, and that a
+> dead peer still raises the named error; mutation-proven. Three mock stubs that
+> modelled a deadline-ignoring `wait()` were corrected in the same commit.
+>
+> *Confirmed on metal:* the same PP=3 boot went from **three**
+> `HiCacheCollectiveTimeoutError` occurrences to **ZERO**, and warmup advanced
+> past the collective. Both twins lifted with that evidence -- runtime
+> (`d4e71e64cf`) and parse-time (this train).
+>
+> *If it wedges again:* restore BOTH twins and do not accept a green mock suite
+> as grounds to lift them a third time.
+>
+> **STILL BLOCKED, different defect:** after the collective was fixed, warmup
+> reached a healthy flip arm (`POOL CENSUS at-arm pp_to_tp: size=436275
+> free=436153`) and the CUTOVER never committed, ending on the 600 s HTTP
+> timeout with ZERO collective timeouts. Rows 2-6 remain unreached. That stall
+> is a separate, open item -- this precondition no longer covers it.
 >
 > **What is still reachable meanwhile**, because the guard was narrowed to the
 > combination that actually wedged: a single-stage flip, and the

@@ -7901,47 +7901,36 @@ class ServerArgs:
         # a scheduler exists, so both must move together or the flag is still
         # unusable.
         # #703 stage 2 REMOVED this blocker, arguing that 9da9dfd025 (bounded
-        # collectives) had fixed the wedge and that the runtime twin was gone.
-        # RESTORED 2026-08-17, narrowed to match that twin EXACTLY, because
-        # both halves of the removal's premise were withdrawn by measurement:
-        # 9da9dfd025 BOUNDED the wait, it never rooted the desync, and
-        # test_hicache_bounded_waits_630.py proves only that the bounded calls
-        # raise on schedule against mocked Work objects -- never that two real
-        # ranks rendezvous, which is the thing that fails. Measured 2026-08-17
-        # 10:57:50 -> 11:08:39 on a PP=3 line with --enable-hierarchical-cache
-        # --hicache-storage-backend file: all three ranks sat INSIDE pp_sync
-        # for ~649 s with the send and its matching receive both posted, same
-        # group, same tag. The mechanism is UNROOTED.
+        # collectives) had fixed the wedge. RESTORED 2026-08-17 when the
+        # configuration wedged on metal for 649 s, and LIFTED AGAIN the same
+        # day -- this time against the condition both twins named for
+        # themselves, and with the defect rooted rather than deferred.
         #
-        # The narrowing is the point: this refuses only the combination that
-        # has actually wedged on metal -- a PIPELINE carrying a storage-backed
-        # tier. Single-stage flips and the device+host-local tier stay
-        # reachable, which is what #703 was for.
+        # ROOT CAUSE (e4f1ae2556): bounded_wait POLLED work.is_completed()
+        # against a deadline and only called work.wait() once the poll had
+        # already succeeded. For gloo, is_completed() REPORTS state while
+        # wait() DRIVES the transfer -- so with both peers polling, neither
+        # side advanced the exchange and each sat until its own deadline. The
+        # #630 bound, written to stop a hang, WAS the livelock. Fixed by
+        # handing the deadline to the wait, which progresses and stays bounded.
         #
-        # WHY AT PARSE TIME as well as at runtime: the runtime twin fires when
-        # the scheduler arms, i.e. after a full weight load and into warmup.
-        # Refusing here costs the operator a second; refusing there cost 11
-        # minutes and a dead instance. Both move together or the flag is
-        # unusable -- that part of #703's reasoning still holds.
+        # THE EVIDENCE IS OF THE REQUIRED KIND, which is the whole point of the
+        # restore that preceded it. test_pp_sync_rendezvous_630.py runs THREE
+        # REAL PROCESSES over a REAL gloo group and asserts the ring
+        # RENDEZVOUSES with the bound ACTIVE, that downstream ranks actually
+        # receive rank 0's values, and that a dead peer still raises the named
+        # bounded error. Mutation-proven: restoring the poll turns the first two
+        # red. Three mock stubs that modelled a wait() ignoring its deadline
+        # were corrected in the same commit -- they encoded the defect's own
+        # assumption, which is why no mock suite could ever have caught it.
         #
-        # LIFT BOTH when a test proves two ranks RENDEZVOUS, not when one
-        # proves a wait expires. DESIGN_706_BOOT.md's run-card carries the same
-        # condition as an explicit precondition, so the blocked boot and the
-        # ticket that describes it cannot drift apart.
-        if (
-            self.pp_size > 1
-            and getattr(self, "enable_hierarchical_cache", False)
-            and getattr(self, "hicache_storage_backend", None)
-        ):
-            blockers.append(
-                f"pipeline parallelism (pp_size={self.pp_size}) with a "
-                f"storage-backed hierarchical cache "
-                f"({self.hicache_storage_backend!r}) -- #630's pp_sync desync "
-                "is bounded but NOT fixed; measured 2026-08-17 as a 649 s "
-                "HiCacheCollectiveTimeoutError on all three ranks at warmup. "
-                "This is the parse-time twin of the clause in "
-                "phase_flip_runtime.flip_blocking_guards"
-            )
+        # CONFIRMED ON METAL, 2026-08-17: the same PP=3 boot with
+        # --enable-hierarchical-cache --hicache-storage-backend file went from
+        # THREE HiCacheCollectiveTimeoutError occurrences to ZERO, and warmup
+        # advanced past the collective to a healthy flip arm.
+        #
+        # If this configuration wedges again: restore BOTH twins, and do not
+        # accept a green mock suite as grounds to lift them a third time.
         if getattr(self, "dual_group_lane", False):
             blockers.append("--dual-group-lane")
         if self.dp_size > 1:
