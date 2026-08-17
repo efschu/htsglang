@@ -29,6 +29,15 @@ TenantMover, plus the coresidency policy/registry pair and the KV-session-
 offload composability work. The largest of the three by file count
 (`managers/*`), and it merged without touching anything #744 or #731 changed.
 
+**`#748` — shipped ON the train, before the freeze.** My own #744 armed-only
+gate turned out to strangle the flip's own funder: specimen 21:46:32, 35
+refused `tp_to_pp` flips and an IDLE-LOCK with 407,622 tokens pending and 0
+resident. The parked extent is now an EXCLUSION SET rather than a gate — rows
+inside it are refused, every row above is recomputable prefix and stays
+evictable, which is the funding the flip waits on. 4 mutants killed covering
+both directions (over- and under-covering). The review boot must not carry the
+unrefined gate, so this had to land before the tip was named.
+
 **`fix/739-prefill-progress-signal` (clean).** Slot-2's detector prefill-
 progress stamp at both retirement sites in `batch_result_processor.py`, so a
 visible mega-prefill stops reading as a wedge. Branched from the #699 progress-
@@ -96,3 +105,26 @@ message.
 
 The 57 + 4 are the standing pre-existing set on this lineage; this pass did not
 attempt to reduce them and does not claim to.
+
+### A finding that is NOT a train regression, and how it was settled
+
+Three later full-scope runs showed ~50-51 additional failures, concentrated in
+`distributed/test_uniform_*` (the collective floor family), `test_dcp_context_
+ceiling`, `test_pp_world_sizing` and `test_uneven_tp_memory`. The obvious
+suspect was the last merge, #739.
+
+**#739 is exonerated, and the proof is a same-commit contradiction.** Commit
+`3c49cbc0c2` (the tree *before* #739) was run twice on the identical scope:
+once showing ZERO new failures, once showing FIFTY. Same commit, same command,
+opposite results. Whatever these are, no merge in this pass caused them.
+
+Further evidence, all consistent: `test_uniform_evict_floor_616g` passes 13/13
+in isolation; pairing each newly-merged suite with it individually stays green;
+and `distributed/` run alone reports 27 failures rather than 27+50.
+
+So the combined `managers/ + distributed/` run is **order-dependent at roughly
+fifty tests** on this lineage. That is a test-infrastructure defect worth its
+own ticket — a suite that reports fifty different answers on one commit cannot
+gate anything — but it is not a property of this train and it does not block
+the tip. Recorded here rather than quietly re-run until it looked green, which
+is the tempting move and the wrong one.
