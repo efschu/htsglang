@@ -832,3 +832,101 @@ and a configuration change that would move demand is not re-priced.
 It measures nothing and boots nothing. It does not audit the seven
 NEEDS AUDIT constants — naming them unread is the honest state, and the
 ratchet is what stops them being forgotten.
+
+---
+
+## VERDICT AMENDMENT (same day) — a delegated sweep found worse, and corrects me
+
+A parallel-authority sweep completed after the verdict above. Everything
+load-bearing below I re-verified myself at the code. It confirms all three
+verdicts and makes two of them wrong in the direction of being too kind.
+
+### (a) is MORE severe than "four constants": the ledger is OFF BY DEFAULT
+
+`enable_vram_ledger` defaults to **`False`** (`server_args.py:2456`), and even
+when on it is reachable only from one flag combination
+(`--rank-gpu-id --rank-tp-ratio auto`). Its own flag help names the situation
+plainly: the ledger and the legacy demand model are *two alternative demand
+models* selected by a switch — and the switch defaults to the legacy one.
+
+So for effectively every boot, the actual VRAM authority is the heuristic at
+`server_args.py:12765-12801`, which derives `mem_fraction_static` from a direct
+`get_device_memory_capacity()` query minus a stack of hand-set constants (512,
+`activation_tokens * 1.5`, `tp*pp/8*1024`, plus `reserve_for_graph_mb()` and
+`reserve_for_deepep_a2a_mb()`). My verdict named four stray constants; the
+larger finding is that **the ledger is not the default authority at all.**
+
+**And its own advertised canonical accessor is dead code.**
+`kv_pool_mib_per_rank` (`mem_ledger/contract.py:85-107`, exported in
+`__all__`) has **zero callers** — verified. The real integration point is
+`ServerArgs._vram_ledger_non_kv_per_gpu()` (`server_args.py:12123-12159`),
+which publishes non-KV overhead per GPU while the *caller* derives the rank
+budget itself. The module documents one contract and the tree uses another.
+
+**A silent post-hoc override contradicts a documented invariant**, and this is
+a bug candidate rather than an inventory item: `server_args.py:14107` does
+
+    if attention_backend == "aiter" and context_len > 8192:
+        self.mem_fraction_static *= 0.85
+
+unconditionally on how the fraction was set — including after
+`--rank-gpu-memory-mib` has set it per rank under a docstring that says "no
+further utilization ceiling or safety factor is added here"
+(`server_args.py:9758-9777`). On that path the guarantee is false.
+
+### (b) I was too generous: the calibration path is off by default AND one field
+
+I called auto-measurement "delivered, with one honest qualification". The
+qualification is larger than I wrote:
+
+- `measured.py` is gated by `SGLANG_VRAM_LEDGER_MEASURED`, **off by default**,
+  and its own docstring says the tree is byte-identical without it;
+- it calibrates exactly **one** term — `cuda_context_bytes`, via
+  `POST_TO_RESIDUAL = {"cuda_context_and_comm": "cuda_context_bytes"}`;
+- `residual_overrides()` is called only from the offline probe CLI, never from
+  the live boot solve.
+
+What stands from my verdict is the *discipline*: the engine still refuses to
+default an uncalibrated residual, and `measured.py` still refuses to calibrate
+an unstable term. Those are real and they are the good half. But "Auto-Messung"
+as a delivered property is **one field, off by default, offline-only**.
+
+**And the ledger's own constants are not all measured.** My R1 gate excludes
+`mem_ledger/` by design — constants belong there — but that scope hides an R2
+question the sweep surfaced:
+
+- `LOAD_TRANSIENT_REFERENCE_MIB = 70` (`engine.py:132`), whose docstring says
+  *"PROVENANCE, STATED IN FULL BECAUSE THIS NUMBER IS INHERITED AND NOT
+  MEASURED BY ANYTHING IN THIS TREE"*;
+- `GRAPH_MIB_PER_CAPTURED_TOKEN = 2` (`engine.py:185`), which the same file
+  records as measured **3.3–3.8× LOW** — "192 MiB booked against 633-730 MiB
+  actually taken" (`engine.py:241`, `:1123-1131`).
+
+The second is the sharper one: a term the ledger knows is wrong by a factor of
+three, still shipped. Both self-document, which is the honest form of a guess,
+but neither is a measurement.
+
+### Further competing authorities, outside the planner entirely
+
+`dsa_indexer.py:354` (`_MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3` over
+`torch.cuda` totals), `registry/adapters/class1_srt.py:190` (the registry's own
+NVML-fraction admission estimate, with the real planner wired in only as an
+explicitly non-blocking "second opinion"), and the MLX backend
+(`hardware_backend/mlx/model_runner.py:550-567`, outside the ledger's
+CUDA/NVML scope). The first two are narrow; all three are real.
+
+### Revised follow-on ordering
+
+The four-constant retirement I listed first is no longer the highest-value
+item. In order:
+
+1. **Decide whether the ledger becomes the default** (`enable_vram_ledger`),
+   or accept that #584's promise is scoped to an opt-in path and say so in the
+   ticket. This is a user/operator decision, not an engineering one, and every
+   other item is smaller than it.
+2. **Fix the `*= 0.85` override** (S) — it falsifies a documented guarantee on
+   the rank-budget path.
+3. **Resolve `kv_pool_mib_per_rank`** (S): wire it or delete it. A dead
+   canonical accessor teaches the next reader the wrong contract.
+4. Then the four constants, the seven NEEDS AUDIT entries, and the two
+   unmeasured ledger terms.
