@@ -328,7 +328,117 @@ frame, which is what its buffers are laid out for. Applied in
 there is no map to drop and it is a no-op. Verified at unit level against the
 frame mismatch; NOT verified by a boot.
 
-## 9. What remains
+### 8.2 The flashinfer pair: the index's full journey
+
+Written down before touching the code, because §8.1 showed the hazard is the
+FRAME an id is in, not the arithmetic.
+
+**Hop 1 -- what produces the incoming id.** `layer.layer_id` on a
+`RadixAttention` is a GLOBAL model layer id. It is never stage-local: the layer
+module is constructed with its global index in `make_layers`.
+
+**Hop 2 -- what the pool does with it.** Two shapes, and they differ:
+
+| helper | pool it indexes | chain |
+| --- | --- | --- |
+| `_wl_full_layer_idx` (`:2845`) | `_wl_full_pool = token_to_kv_pool.full_kv_pool` -- always the SUB-pool | global id -> `_transfer_full_attention_id` -> DENSE full-attention index -> `- start_layer` |
+| `_sess_full_layer_idx` (`:3321`) branch A | `_sess_full_pool = getattr(pool, "full_kv_pool", pool)` -- the SUB-pool when a wrapper exists | same as above |
+| `_sess_full_layer_idx` (`:3321`) branch B | `_sess_full_pool` falls back to `pool` ITSELF -- the MAIN, globally indexed pool | global id -> `- start_layer`, with no first hop at all |
+
+So the two helpers are not the same site twice. The verdict differs per branch:
+
+* **The sub-pool branches are already correct**, and for a reason worth stating
+  rather than trusting: `_transfer_full_attention_id` returns the DENSE
+  `full_attention_layer_id_mapping` index, and `HybridLinearKVPool` builds its
+  sub-pool with `layer_num=` but no `start_layer=`, so `KVCache.__init__`'s
+  `start_layer or 0` leaves it at 0. The subtraction subtracts ZERO. It is a
+  no-op that merely looks like a translation.
+* **Branch B is a genuine global -> local translation** on a globally indexed
+  pool -- the same shape as the ~100 sites already converted, and it was missed
+  because it hides behind a `getattr` fallback rather than reading as a pool
+  access.
+
+Both are routed through `local_slot` on the pool they actually index, so the
+frame is chosen by the pool rather than by the call site. On the sub-pool
+branches that degenerates to `mapped - 0` (unchanged); on branch B it becomes
+the rank lookup, which is the fix.
+
+**aiter_utils.py:147 has the identical two-branch shape** (`layers_mapping`
+present -> sub-pool ids; absent -> `sub_pool = pool` and a global id). It is
+left untouched, on the same grounds as the vendor NPU sites: it is the AMD/ROCm
+path, unreachable on this NVIDIA rig, so a conversion there could not be
+executed or tested here. It is not covered by the `PPMissingLayer` refusal --
+that guards layer MODULE invocation, not KV index arithmetic -- so if the ROCm
+path is ever brought under a layer set, branch B there needs the same one-line
+routing applied here.
+
+## 9. Integration readiness
+
+**Everything below is DESK-PROVEN and BOOT-GATED.** Every claim rests on
+hermetic unit evidence with can-fail proofs. Nothing here has run a model. No
+number in this document was measured on hardware.
+
+Desk-proven:
+
+* the layer-set contract, its parser and its named refusals (§1, §2);
+* `num_effective_layers` as a COUNT, not the span (the KV pool would otherwise
+  be sized 3.6x too large for the FA stage);
+* global -> local indexing through `KVCache.local_slot`, ~100 sites, including
+  the derived pools and both flashinfer helpers (§6, §8.2);
+* iteration through `owned_layer_ids`, plus a refusal at the single point where
+  a missed loop would otherwise corrupt a forward pass (§7);
+* sub-pool layer frames (§8.1);
+* both PD descriptor paths refusing rather than mislabelling (§6.1);
+* the crossing schedule against a loopback double (§5).
+
+### 9.1 The first boot should NOT be the family layout
+
+The family layout needs the per-layer wire, which does not exist yet. But
+addressing can be separated from transport, and should be, because a failure in
+a combined first boot would be ambiguous:
+
+**Step 1 -- contiguous-as-set (bootable today, no new transport).** Express an
+ordinary contiguous PP split through the SET mechanism:
+
+    SGLANG_PP_LAYER_SET="0-31;32-63"   # with --pipeline-parallel-size 2
+
+Ownership is still contiguous, so the existing stage-boundary transport carries
+it unchanged, while the entire new path is exercised: parser, `make_layers` set
+branch, `local_slot`, `owned_layer_ids`, pool sizing, the sub-pool frames.
+
+*Acceptance:* byte-identical output against the same run with the env var
+unset, same seed and prompt; identical KV pool sizing in the startup log; and
+NO `PPMissingLayer` RuntimeError, since with contiguous ownership no
+placeholder sits inside the iterated interval. That last one is the point: the
+guard must stay silent here, and a firing guard means the loop conversion is
+wrong, not the layout.
+
+**Step 2 -- a gapped set (needs Slot-3's wire).** Only after step 1 is clean:
+
+    SGLANG_PP_LAYER_SET="0-2,4-6,...;3,7,11,..."   # GDN vs FA, per §4
+
+*Acceptance:* the 31 crossings of §5 observed on the wire, and generated text
+matching the contiguous baseline for the same seed.
+
+### 9.2 Refusals that SHOULD fire, and are part of acceptance
+
+A guard nobody has seen fire is not evidence. Each of these should be triggered
+once, deliberately:
+
+| trigger | expected |
+| --- | --- |
+| any layer set + prefill/decode disaggregation | `NotImplementedError` naming the set and the descriptor |
+| a layer set + a model whose loop was not converted (any but qwen3_5) | `RuntimeError` naming the layer and `owned_layer_ids` |
+| a set that omits a layer, duplicates one, or has the wrong stage count | `PPLayerSetError` naming the layer and stages |
+
+### 9.3 Known-unverifiable
+
+The 19 vendor NPU sites and `aiter_utils.py:147` (AMD/ROCm) are untouched:
+unreachable on this NVIDIA rig, so a conversion there could not be executed.
+~33 model forward loops are unconverted for the same reason and are covered by
+the refusal instead of by edits.
+
+## 10. What remains
 
 - The transport (§5): the schedule drives a `Link`; no wire exists yet.
 - The two flashinfer translations in §8 — the remaining SILENT risk.
