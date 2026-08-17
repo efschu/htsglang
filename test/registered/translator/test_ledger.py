@@ -122,7 +122,8 @@ class TestParkRestoreActuallyMovesBytes(unittest.TestCase):
         # tensors alive would free nothing and pass a weaker assertion.
         for tensor in self.module.state_dict().values():
             self.assertEqual(
-                tensor.device.type, "meta",
+                tensor.device.type,
+                "meta",
                 "park left a live tensor behind; no VRAM was actually freed",
             )
 
@@ -160,7 +161,9 @@ class TestParkRestoreActuallyMovesBytes(unittest.TestCase):
         measured = self.ledger.get("trunk").measured_restore_ms
         self.assertIsNotNone(measured)
         self.assertGreater(measured, 0.0)
-        self.assertEqual(self.ledger.to_json()["assets"][0]["restore_ms"], round(measured, 1))
+        self.assertEqual(
+            self.ledger.to_json()["assets"][0]["restore_ms"], round(measured, 1)
+        )
 
     def test_repeated_cycles_are_stable(self):
         for _ in range(3):
@@ -198,9 +201,7 @@ class TestMultiModulePolicy(unittest.TestCase):
 
     def test_ensure_resident_restores_only_what_is_parked(self):
         ledger = AudioAssetLedger()
-        ledger.register_all(
-            [("talker", tiny_module()), ("codec", tiny_module())]
-        )
+        ledger.register_all([("talker", tiny_module()), ("codec", tiny_module())])
         ledger.park("codec")
         restored = ledger.ensure_resident()
         self.assertEqual(list(restored), ["codec"])
@@ -208,9 +209,7 @@ class TestMultiModulePolicy(unittest.TestCase):
 
     def test_park_all_then_restore_all(self):
         ledger = AudioAssetLedger()
-        ledger.register_all(
-            [("talker", tiny_module()), ("codec", tiny_module())]
-        )
+        ledger.register_all([("talker", tiny_module()), ("codec", tiny_module())])
         freed = ledger.park_all()
         self.assertGreater(freed, 0)
         self.assertEqual(ledger.to_json()["resident_mib"], 0.0)
@@ -338,3 +337,97 @@ class TestNonPersistentBuffersSurviveAParkRound(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _OnlyNonPersistentBuffers(torch.nn.Module):
+    """A module whose ENTIRE state is non-persistent buffers.
+
+    Not contrived: a rotary cache is exactly this shape, and the audio stack
+    carries them as standalone submodules.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("inv_freq", torch.arange(256.0), persistent=False)
+        self.register_buffer("cos_cached", torch.ones(128), persistent=False)
+
+
+class _MixedWithNested(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(32, 32))
+        self.register_buffer("inv_freq", torch.arange(64.0), persistent=False)
+        self.rot = _OnlyNonPersistentBuffers()
+
+
+class TestNonPersistentBuffersAreAccountedFor(unittest.TestCase):
+    """#568, second half: the park path carries these buffers, but the LEDGER
+    did not count them and the RESTORE guard did not look for them.
+
+    Both are the same omission as the original bug -- ``state_dict()`` is not
+    the module's state -- one layer up.
+    """
+
+    def _ledger_with(self, module, name="a"):
+        ledger = AudioAssetLedger(tenant_id="t-568b", pin_host_copies=False)
+        ledger.register(name, module)
+        return ledger
+
+    def _true_bytes(self, module):
+        seen = {}
+        for t in list(module.parameters()) + list(module.buffers()):
+            seen[id(t)] = t.nbytes
+        return sum(seen.values())
+
+    def test_registered_size_matches_what_park_actually_frees(self):
+        """The ledger prices victims on size_bytes() and reports parked_bytes
+        from the park. They described different sets of tensors, so a parked
+        module reported freeing MORE than it was ever registered as holding."""
+        for module in (_RotaryLike(), _MixedWithNested(), _OnlyNonPersistentBuffers()):
+            with self.subTest(module=type(module).__name__):
+                ledger = self._ledger_with(module)
+                registered = ledger.get("a").size_bytes()
+                self.assertEqual(registered, self._true_bytes(module))
+                freed = ledger.park("a")
+                self.assertEqual(
+                    freed,
+                    registered,
+                    "park freed a different number of bytes than the ledger "
+                    "registered -- the two enumerate different tensor sets",
+                )
+
+    def test_a_module_of_only_non_persistent_buffers_survives_the_round_trip(self):
+        """The sharp case. Its state dict is EMPTY, so the restore guard used to
+        declare it unrecoverable while its bytes sat on the host -- a park that
+        succeeded followed by a restore that refused."""
+        module = _OnlyNonPersistentBuffers()
+        expected = module.inv_freq.detach().clone()
+        self.assertEqual(len(module.state_dict()), 0)
+
+        ledger = self._ledger_with(module)
+        self.assertGreater(ledger.get("a").size_bytes(), 0)
+        ledger.park("a")
+        ledger.restore("a")
+
+        self.assertTrue(torch.equal(module.inv_freq, expected))
+        self.assertTrue(torch.isfinite(module.cos_cached).all())
+
+    def test_such_a_module_is_not_silently_treated_as_empty(self):
+        """Before the fix its tensors() was empty, which sent park down the
+        'nothing to do' path: marked parked, nothing freed, nothing saved."""
+        module = _OnlyNonPersistentBuffers()
+        ledger = self._ledger_with(module)
+        self.assertEqual(len(ledger.get("a").tensors()), 2)
+        self.assertGreater(ledger.park("a"), 0)
+
+    def test_a_genuinely_interrupted_park_is_still_refused(self):
+        """The guard must not become permissive: with BOTH stores empty the
+        module really is unrecoverable, and saying so is the point."""
+        module = _RotaryLike()
+        ledger = self._ledger_with(module)
+        ledger.park("a")
+        asset = ledger.get("a")
+        asset._cpu_state = {}
+        asset._cpu_nonpersistent = {}
+        with self.assertRaises(ParkError):
+            ledger.restore("a")

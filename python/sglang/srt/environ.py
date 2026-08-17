@@ -978,6 +978,12 @@ class Envs:
     # would cross this is REFUSED with the numbers rather than quietly turning
     # the cache into a pin museum. 0 = no ceiling.
     SGLANG_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
+    # #703: cap on OUTSTANDING eviction-time demotions to the disk tier, and
+    # the on/off switch (0 = off, today's behaviour). Eviction runs under
+    # memory pressure, so demotion enqueues onto the existing backup queue and
+    # DROPS beyond this cap rather than queueing without limit -- a dropped
+    # demotion is a later miss, never corruption.
+    SGLANG_HICACHE_DEMOTE_ON_EVICT = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
