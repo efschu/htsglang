@@ -199,9 +199,26 @@ defect from an unattributed remainder and must not be hidden by `max(0, …)`.
 
 **#685 is not it.** #685 (`0e50e486ab`, `f1774d7f65`) is an
 `UnboundLocalError: cannot access local variable 'cell'` startup crash — a
-use-before-bind in the cold seam-pricing branch. It has no arena-tail content,
-and no 1456 MiB figure appears anywhere in the records or source. The
-candidate is a misattribution and is refuted.
+use-before-bind in the cold seam-pricing branch. It has no arena-tail content.
+The ticket attribution is a misattribution and is refuted.
+
+> **CORRECTION (2026-08-17, #702 repricing).** I also wrote here that "no
+> 1456 MiB figure appears anywhere in the records or source". **That part was
+> wrong.** The measured per-rank arena tails are recorded in
+> `managers/phase_flip_seam_reserve.py`, `record_path` docstring: *"the arena
+> tail is `max(0, pp_bytes - tp_bytes)` on THIS rank's two layouts, and on the
+> ship boot that is 1436 MiB on rank2 against 466 MiB on rank1 and 0 on
+> rank0."* 1436, not 1456 — but plainly the figure the candidate meant, and I
+> missed it by grepping the docs tree and the ticket rather than the module
+> that owns the quantity. The ticket attribution was still wrong; the number
+> was real.
+>
+> It also CONFIRMS the candidate below quantitatively, which no longer needs a
+> boot to settle: against the standing pool reduction per rank
+> (704 / 801 / 1443 MiB — the arming floor above the corridor law), the
+> measured tail is **99.5%** of rank 2's, 58% of rank 1's and 0% of rank 0's.
+> Rank 2's floor excess *is* its arena tail. See
+> `/spinning/evidence-665-f1/NOTE_702_CUT_TABLE.md` §D4.
 
 **What does order the three ranks** is the arena growth each must commit,
 computed from the layout image sizes I measured in #690:
