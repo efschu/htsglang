@@ -391,7 +391,15 @@ here rather than left implicit.
   --phase-flip-writeback
   --phase-flip-writeback-deadline-s 2.0
   --hicache-size 5
+  --hicache-mem-layout page_first_direct
 ```
+
+`--hicache-mem-layout page_first_direct` is REQUIRED on a hybrid checkpoint and
+was missing from this list: `MambaPoolHost only supports
+layout='page_first_direct', got 'page_first'` kills the boot at pool
+construction. Setting it also switches `--hicache-io-backend` to `direct`
+automatically (`server_args.py:_resolve_layout_io_compatibility`). Cost a boot
+on 2026-08-17.
 
 ```
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<disk L3, ~100 GB>
