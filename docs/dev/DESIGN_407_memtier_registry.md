@@ -415,13 +415,13 @@ document did not carry.
 |---|---|---|---|---|---|
 | **1 (done)** | — | node layer, no consumers | inspectability | none | — |
 | **1b (this slice)** | — | fingerprint, store, bootstrap, adapters, link identity, one read-only shim | the registry becomes usable on hardware nobody measured; the rig-1 default is gone | none — still zero production importers, pinned by #421's own test | — |
-| **2** | #77/#123 expert offload, half A | publish the rank → card-UUID vector at startup from `IdentityMap`, feed `resolve_host_shard_ratio` | **the only measured yield in the plan: 145 → 86 ms/token on the cold tier** (ANALYSE_393 §7.3/§7.4); revives #394's merged, tested link-proportional sharding | low — one datum, no allocator change | nothing |
+| **2 (DELIVERED 2026-08-17)** | #77/#123 expert offload, half A | publish the rank → card-UUID vector at startup from `IdentityMap`, feed `resolve_host_shard_ratio` | **the only measured yield in the plan: 145 → 86 ms/token on the cold tier** (ANALYSE_393 §7.3/§7.4); revives #394's merged, tested link-proportional sharding | low — one datum, no allocator change | nothing |
 | **3** | #224 kvso | `SUPPORTED_PARK_BACKENDS` / `ALL_STORAGE_BACKENDS` → capability queries; the `local`-first law → staging-graph reachability | retires vocabulary V2; resolves C1; makes GDN's device-bound invariant machine-checked | medium — changes a shipped validation error | staging graph |
 | **4** | #286 short-term register | `CapacityLedger` becomes a view of `registry/ledger.py`; keys widen `(target, ordinal)` → `TierId` | resolves C2; satisfies DESIGN_305 §6; makes `peer_vram` reachable in practice | medium — touches the live movement path | cut 3 |
 | **5** | #77/#123 half B | the five `device="cpu"` literals and three `_moe_dev` sites resolve a tier | retires the last consumer with no tier vocabulary | medium — must answer at weight-creation time, very early in load | cut 4 |
-| **6** | #89 hibernate | `--hibernate-dir` resolves through a `persistent=True`, `flock`-capable tier | closes the tmpfs-hibernate silent-correctness hole | low | driver-free enumeration — **shipped in 1b** |
+| **6 (DELIVERED 2026-08-17)** | #89 hibernate | `--hibernate-dir` resolves through a `persistent=True`, `flock`-capable tier | closes the tmpfs-hibernate silent-correctness hole | low | driver-free enumeration — **shipped in 1b** |
 | **7** | #305 residency ladder | consume the registry as the mechanism `transition_refusal()` names as missing | fewer refusals | medium | cut 4 (no second ledger) |
-| **8** | HiCache L1/L2/L3 | `choices=` list and `_create_builtin_backend` become registry lookups; L2 gets a declared capacity. **Ladder untouched (X1)** | retires V4 and V3-as-a-second-enumeration | low | — |
+| **8 (backend enumeration DELIVERED 2026-08-17; L2 capacity still open)** | HiCache L1/L2/L3 | `choices=` list and `_create_builtin_backend` become registry lookups; L2 gets a declared capacity. **Ladder untouched (X1)** | retires V4 and V3-as-a-second-enumeration | low | — |
 | **9** | #389 NVMe expert tier, #306 cold compression | declare the tier and the capability flag | both become a data change | low | M5/M6 |
 | **10** | **#423 striping** | gate on `link_disjointness`; refuse to stripe on `UNKNOWN` | prevents the 2.34×-for-1.28× failure mode from being shipped as an optimisation | low | complete link paths (topology parse) |
 
@@ -719,3 +719,38 @@ Added on a second pass; each re-checked at code rather than taken on report.
    (it is help-text prose, and the correct replacement pair needs the #266
    run's numbers re-read, not invented), but named so the next edit of that
    help text does not re-copy it.
+
+---
+
+## Cut-table status, 2026-08-17
+
+Verified at code rather than from the table's own wording; each delivered cut
+carries a self-naming comment so the next reader can confirm it in one grep
+(`grep -rn "#407 cut"`).
+
+| Cut | Status | Where |
+|---|---|---|
+| 1, 1b | delivered | `memtier/registry.py`, `reservations.py`, `profile.py` |
+| **2** | **delivered** | `entrypoints/engine.py:657` publishes the vector; `expert_compute_placement.py:608` reads it; `environ.py:1135` |
+| 3 | gated on the staging graph | — |
+| 4 | gated on cut 3 | — |
+| 5 | gated on cut 4 | — |
+| **6** | **delivered** | `memtier/hibernate_tier.py`, called from `ServerArgs` |
+| 7 | gated on cut 4 | — |
+| **8** | **half delivered** | backend enumeration: `registered_storage_backends()` + `_validate_storage_backend_registered`. **L2 declared capacity: OPEN**, see below |
+| 9 | gated on probes M5/M6 — **window item** | — |
+| 10 | gated on the topology parse (#423) | — |
+
+**Cut 8's remaining half is a window item, not a desk one.** Giving L2 a
+declared capacity needs a capacity NUMBER for the host tier, and a number of
+usable provenance comes from a probe, not from a literal — `apply_outcome`
+refuses an `ok` outcome carrying a non-`MEASURED` rate, which is exactly the law
+that stops me inventing one here. Filed as: **L2 host-tier capacity, needs the
+host probe; blocked on nothing but a run.**
+
+Cut 9's M5/M6 are likewise measurement-gated and named here so they are on the
+window list rather than mistaken for desk work.
+
+**No remaining cut is desk-fundable.** 3/4/5/7 are a dependency chain behind the
+staging graph, 9 needs probes, 10 needs the topology parse. The next #407 work
+is either that chain or a window.

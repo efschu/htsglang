@@ -789,6 +789,22 @@ _CAPACITY_FIRST_DEFAULT_NOTICE = (
 )
 
 
+def registered_storage_backends() -> tuple:
+    """The HiCache storage backends this build can actually construct (#407 cut 8).
+
+    Read from ``StorageBackendFactory._registry``, which is what
+    ``create_backend`` looks in -- so this is the authority rather than a fourth
+    copy of the list. Imported lazily on purpose: ``server_args`` carries no
+    module-level ``mem_cache`` import, so argument PARSING does not pull the
+    storage stack, and computing the argparse ``choices=`` at annotation time
+    would have broken that for a cosmetic gain. The literal list stays as an
+    argparse convenience and a test makes the two unable to disagree.
+    """
+    from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+
+    return tuple(StorageBackendFactory._registry)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -4222,7 +4238,7 @@ class ServerArgs:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix, eic, simm, mori. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "mooncake",
@@ -9447,6 +9463,9 @@ class ServerArgs:
         self._apply_cuda_graph_compatibility()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
+        # #407 cut 8: the factory registry is the authority on which
+        # storage backends exist, not the hand-maintained choices= list.
+        self._validate_storage_backend_registered()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
         # which is the only way to get 'full' for prefill today).
@@ -16411,6 +16430,31 @@ class ServerArgs:
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 
+    def _validate_storage_backend_registered(self) -> None:
+        """Refuse a storage backend this build cannot construct (#407 cut 8).
+
+        argparse's ``choices=`` already rejects an unknown NAME, but it is a
+        hand-maintained literal; the factory registry is what
+        ``create_backend`` actually consults. Checking here makes the registry
+        the authority, so a backend added to the factory and forgotten in the
+        list fails loudly at parse time rather than at first cache write.
+
+        ``dynamic`` is a MODE, not a registered backend -- ``create_backend``
+        handles it on its own branch -- so it passes without being in the
+        registry.
+        """
+        name = getattr(self, "hicache_storage_backend", None)
+        if not name or name == "dynamic":
+            return
+        available = registered_storage_backends()
+        if name not in available:
+            raise ValueError(
+                f"--hicache-storage-backend {name!r} is not a backend this "
+                f"build can construct. Registered backends: "
+                f"{sorted(available)!r}, plus 'dynamic' with "
+                "--hicache-storage-backend-extra-config."
+            )
+
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
         # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
@@ -16443,9 +16487,17 @@ class ServerArgs:
                 raise ValueError(
                     "--hibernate-dir requires --enable-weights-disk-backup."
                 )
+            from sglang.srt.memtier.hibernate_tier import (
+                refuse_volatile_hibernate_dir,
+            )
             from sglang.srt.model_loader.hibernate import (
                 hibernate_manifest_matches,
             )
+
+            # #407 cut 6: the park is only a backup if the medium survives a
+            # reboot. Checked here, before any weight is written, because the
+            # failure it prevents is silent -- every write to a tmpfs succeeds.
+            refuse_volatile_hibernate_dir(self.hibernate_dir)
 
             if self.load_format != "gguf":
                 raise ValueError(

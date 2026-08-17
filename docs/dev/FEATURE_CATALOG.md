@@ -1040,6 +1040,34 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   (`memtier/bootstrap.py:241`) and in the bundled remote rows, DISJOINT is
   currently unreachable from real data (#500-B12).
   Design: `docs/dev/DESIGN_407_memtier_registry.md`.
+  `UNKNOWN` is contractually a refusal the caller must handle
+  (`tiers.py:566`), and mechanically it is RETURNED rather than raised --
+  both statements are true and the second is why no caller can rely on an
+  exception.
+  TWO #407 DESIGNS, deliberately: `DESIGN_407_memory_tier_registry.md` is
+  the design of record (node layer, consumer survey, tier interface,
+  measurement plan, cut plan); `DESIGN_407_memtier_registry.md` is the
+  #434 amendment and WINS on its three enumerated overrides. Both now
+  cross-reference; see `VERDICT_407_two_designs.md`.
+  CUT 6 SHIPPED: `--hibernate-dir` resolves through the registry and
+  refuses a provably volatile medium by name
+  (`memtier/hibernate_tier.py`, called from `ServerArgs`), closing the
+  tmpfs-hibernate silent-correctness hole -- a park that reported success
+  and lost the backup at the next reboot. An UNRESOLVABLE mount warns
+  rather than refuses: a gate that cannot see must not veto a working
+  container. Cut 2 was already delivered (the launcher-published rank ->
+  card-UUID vector, `registry/rank_cards.py`).
+  CUT 8 (backend half) SHIPPED: `StorageBackendFactory._registry` is the
+  authority on which HiCache storage backends exist —
+  `registered_storage_backends()` reads it and
+  `_validate_storage_backend_registered` refuses an unbuildable name,
+  listing what IS registered. The argparse `choices=` literal stays (deriving
+  it at annotation time would give `server_args` its first module-level
+  `mem_cache` import and pull the storage stack into argument PARSING);
+  a test makes the two unable to drift. The drift was already real: the
+  help text named 5 of the 8 built-ins. L2's declared capacity is the
+  open half and is a WINDOW item — a capacity of usable provenance comes
+  from a probe, and `apply_outcome` refuses a non-MEASURED rate.
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream

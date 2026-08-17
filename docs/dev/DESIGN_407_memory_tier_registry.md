@@ -5,6 +5,27 @@ Charter (user directive, verbatim): *every memory you have access to must be a
 disk / RAM / VRAM, local as well as remote.* #224 is consumer number one, #305
 is the policy layer above.
 
+> **READ THIS FIRST — there is a second #407 design document, and it wins where
+> the two disagree.** `DESIGN_407_memtier_registry.md` (2026-08-02, slice 1b,
+> directive #434) is scoped to what #434 changed and to slice 1. **This document
+> remains the design of record** for the node layer, the consumer survey (§2),
+> the tier interface (§3), the measurement plan (§4) and the cut plan (§5) --
+> the newer one cites those rather than restating them. But it overrides this
+> document on exactly three points, enumerated in its §2: the profile default
+> (`profiles/rig1.json` is a *candidate* matched against hardware, not a
+> normal-path default), the empty `cards` list in that profile (functional, not
+> a TODO -- it can only match at MODEL scope and asserts nothing about a
+> reader's host or disks), and `TierCaps` provenance (values may now enter from
+> an artifact adapter, though `apply_outcome` is still the only writer and its
+> refusals are unchanged). Everything else here stands, including all four
+> exclusions (X1 HiCache ladder, X2 GDN state, X3 cross-rig GPU-to-GPU, X4
+> compute placement) and the C1/C2 contradictions.
+>
+> This pointer was added on 2026-08-17. The forward reference already existed;
+> the back reference did not, so a reader who opened this document first had no
+> way to learn it had been partially superseded. See
+> `VERDICT_407_two_designs.md`.
+
 Desk work, no cards (`CUDA_VISIBLE_DEVICES=99`). Branch
 `docs/407-tier-registry-design`, base `1421d20dce`
 (`integration/r3-probe-next2`). This document designs; it changes no code.
@@ -128,8 +149,8 @@ below was supplied from general knowledge.
 | **T0 local VRAM** — RTX 5090 | 32607 MiB total, 31.34 GiB after context | membw 1558 GB/s, gemv 1533.5 GB/s | — | MEASURED. `rig-runbook.md:2977,3468`; `TASK_103_SPEC_K_POLICY.md:187`; `INTEGRATION_R3_VALIDATION.md:12152`. Probe: `rigmon/card_probe.py` |
 | **T0 local VRAM** — RTX 3080 x2 | 20480 MiB each | membw 723 GB/s, gemv 718.2 GB/s | — | MEASURED, same sources |
 | | aggregate 72 GB over three cards | | | `ANALYSE_389_nvme_expert_tier.md:99` |
-| **T1 peer VRAM** via barlink BAR1 | BAR1 aperture: 3080 **256 MiB** nominal, of which **96 MiB maps contiguously**; 5090 **32 GiB** (ReBAR) | vs NCCL, interleaved, bf16, 3 cards: **1.13 / 1.34 / 1.15 / 1.04 / 1.30x** at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB | smallest datapoint is a **20 KiB three-rank all_reduce at 45.59 us** — a collective, not a point latency | MEASURED. `EVAL_gdr_uebernahme.md:141`; `FEATURES_VS_UPSTREAM.md:1339,1341`; commit `137e3a6c25` |
-| | **effective** aperture per directed pair | | **"1-3 us posted write"** | **ABSENT** — `scripts/p2p_readiness/` has never been run, no `results/` exists. The us class is an *assumption*, `EVAL_p2p_prefill_decode_split.md:140` |
+| **T1 peer VRAM** via barlink BAR1 | BAR1 aperture: 3080 **256 MiB** nominal, of which **96 MiB maps contiguously**; 5090 **32 GiB** (ReBAR) | vs NCCL, interleaved, bf16, 3 cards: **1.13 / 1.34 / 1.15 / 1.04 / 1.30x** at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB | smallest datapoint is a **20 KiB three-rank all_reduce at 45.59 us** — a collective, not a point latency | MEASURED. Commit `137e3a6c25` ("BAR1-Transport laeuft: drei Raenge 1,03x bis 1,51") is the source VERIFIED PRESENT on this branch; `FEATURES_VS_UPSTREAM.md:1341` carries the table but is not tracked here. The former `EVAL_gdr_uebernahme.md:141` citation is REMOVED (#732 amendment, re-verified 2026-08-17): that file exists at `docs/EVAL_gdr_uebernahme.md` and contains none of these figures -- `1.13`, `1.34` and `45.59` all return zero matches in it. |
+| | **effective** aperture per directed pair | | **"1-3 us posted write"** | **ABSENT** — `scripts/p2p_readiness/` has never been run, no `results/` exists. RE-VERIFIED 2026-08-17 against the #732 amendment, which reported this claim stale: on this branch it HOLDS. The package is present (`capability_matrix.py`, `d2d_bench.py`, `nccl_transport_check.py`, `p2p_common.py`) and there is no `results/` directory in any checkout examined (`wt-train2b`, `shvllm`, `wt-706-hicache-keys`, `htsglang`). A `results/` seen elsewhere would be untracked and local to that worktree. The us class is an *assumption*, `EVAL_p2p_prefill_decode_split.md:140` |
 | **T2 host RAM** | 103.3 GB `MemTotal`, cgroup limit 98.5 GiB, no swap | DRAM sustained **32-45 GB/s, central 38** | — | **ESTIMATE.** Peak 51.2 GB/s is *assumed* (dual-channel DDR4-3200; `dmidecode -t 17` empty under the VM), `ANALYSE_393_ik_llama.md:299-300`, named as an open item at `:554` |
 | **T2 host RAM** — per-card reach | | H2D pinned: **6.4 / 13 / 13 GB/s** (gen4 x4 / x8 / x8), aggregate 32.4 GB/s. Second measurement, barlink host-staged: 14.3 / 6.5 / 13.2 GB/s | — | MEASURED. `ANALYSE_393_ik_llama.md:301-304`; `rig-runbook.md:98`; `pd_disagg_single_node.md:52-53`. Probe: 64 MiB pinned, one direction alone, best-of wall clock, `card_probe.py:561-586` |
 | **T3 local NVMe** (`/spinning`, ZFS) | 729 GB free | **1.8 GB/s cold**, `iflag=direct`, reproduced three times. Warm 3.8 / 9.5 GB/s are ARC, explicitly not credited to the tier | — | MEASURED. `ANALYSE_389_nvme_expert_tier.md:77-89`; commit `71fc6356be` |
