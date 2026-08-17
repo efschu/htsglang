@@ -274,6 +274,18 @@ contract (`hibernate_dir` + weights/draft CPU/disk backup flags), and a
 118-name retired-env guard that refuses stale SGLANG_* variables loudly.
 
 ## 7. Collectives / transport
+**barlink p2p: HOST has it, BAR1 does not.** `barlink_host.send`/`recv`
+(`barlink_host.py:1100`, `:1120`) is a working point-to-point path with a
+per-pair slot, flags, per-peer sequence and bounded timeout. BAR1 has no
+equivalent: its three kernels are collectives and it owns no p2p kernel.
+`barlink_bar1_p2p.py` supplies the DESK half of that seam — directed-pair
+slot algebra, 256-byte flag lines, append-only layout (`off_p2p = -1` when
+absent), caller-side chunking, and refusals carrying their arithmetic —
+wired into nothing, so existing layouts stay byte-for-byte. CAPTURE: send is
+capturable (`put()` is a stream `memcpy_async`), recv is NOT (no device-side
+wait; a host spin in a capture raises `cudaErrorStreamCaptureUnsupported`),
+so a PP crossing over this seam is BREAKABLE and priced with #494's clock.
+`NOTE_732_bar1_p2p_seam.md`.
 **barlink is COLLECTIVE-ONLY, and that is load-bearing for placement (#732).**
 Its dispatch seams are `all_reduce` (`parallel_state.py:1100`),
 `reduce_scatter*` (`:1299`, `:1374`, `:1498`) and `all_to_all_single*`
