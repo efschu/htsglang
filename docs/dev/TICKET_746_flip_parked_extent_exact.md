@@ -1,5 +1,8 @@
-# TICKET 745 — the parked extent should be exact, not last-seen
+# TICKET 746 — the parked extent should be exact, not last-seen
 
+
+> Register task **#746**. Filed briefly as "TICKET 745", which collided with
+> register-#745 (GDN checkpoints) — renamed. Nothing here relates to GDN.
 Follow-up to **#744** (`5085766fa9`), filed by its author against its own
 known limitation. Small, desk-sized, not urgent — #744 is safe without it.
 
