@@ -343,22 +343,35 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         key="pp_with_spec",
         what="pipeline parallelism together with speculative decoding",
         verdict=(
-            "BLOCKED by the engine: pp_size > 1 asserts "
-            "disable_overlap_schedule and speculative_algorithm is None. It "
-            "is a hard assert, not an auto-disable — the boot dies at arg "
-            "parse. Every PP number on this rig is therefore a no-spec "
-            "number and must not be put next to a NEXTN one"
+            "BLOCKED for PLAIN pipeline parallelism: under pp_size > 1 a hard "
+            "assert refuses a speculative algorithm, and the boot dies at arg "
+            "parse. EXEMPT under --enable-phase-flip, which the assert now "
+            "names explicitly: a phase-flip instance runs PP for prefill with "
+            "no draft worker built at all and arms speculation on the TP "
+            "decode stack at cutover, so the combination is enforced by "
+            "construction rather than refused. A plain-PP number is therefore "
+            "still a no-spec number and must not be put next to a NEXTN one; "
+            "a phase-flip number is NOT covered by this row"
         ),
         gain="speculative decoding across pipeline stages",
-        cost="the boot dies at argument parse",
+        cost="the boot dies at argument parse, unless --enable-phase-flip",
         why=(
-            "pp_size > 1 asserts that no speculative algorithm is set -- a hard "
-            "assert, not a quiet auto-disable. Every pipeline figure is "
-            "therefore a no-spec figure and must not be compared with a NEXTN "
-            "one."
+            "pp_size > 1 asserts no speculative algorithm unless "
+            "enable_phase_flip -- still a hard assert, so PLAIN pipeline "
+            "figures stay no-spec figures. The sibling half went the other "
+            "way: disable_overlap_schedule is set by a post-process pass "
+            "before its assert can fire, making that half an auto-disable."
         ),
         level=BLOCKED,
-        evidence="server_args.py:16240-16245 (assert), re-verified #625",
+        evidence=(
+            "server_args.py:17583 (if pp_size > 1) and server_args.py:17598 "
+            "(spec assert, "
+            "'or self.enable_phase_flip'); the overlap half is auto-disabled "
+            "first at arg_groups/overrides.py:2163 "
+            "(_pipeline_parallel_overlap_disable). Re-verified #704b; the "
+            "earlier :16240-16245 cite had drifted and its verdict text "
+            "predated both the phase-flip exemption and the auto-disable"
+        ),
         tags=("pipeline-parallel", "speculation"),
         scope="general",
     ),
