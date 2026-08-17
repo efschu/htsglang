@@ -1840,13 +1840,20 @@ class TestOutputConfigEffortMapping(unittest.TestCase):
         chat = self._serving()._convert_to_chat_completion_request(req)
         self.assertIsNone(getattr(chat, "reasoning_effort", None))
 
-    def test_xhigh_collapses_to_max(self):
-        """The documented mapping -- and the trap: ``max`` is the value that
-        answers 500 on Qwen3.8. Pinned so the collapse is a decision on the
-        record rather than a surprise at the router."""
+    def test_xhigh_is_passed_through(self):
+        """MERGE RESOLUTION (train 0817). This case was written as
+        ``test_xhigh_collapses_to_max`` to RECORD the hazard before it was
+        fixed: the collapse sent ``max``, which the Qwen3.8 template rejects
+        with raise_exception, so a client asking for the tier the model does
+        implement got HTTP 500. ``fix/540-effort-collapse`` made the value pass
+        through, and the two branches merged textually clean while disagreeing
+        semantically -- exactly what that fix\'s commit message flagged. The
+        resolution it named is applied here: the pin follows the fix, the fix
+        is not reverted. See test_effort_passthrough_540.py for the full
+        contract."""
         req = self._request(output_config={"effort": "xhigh"})
         chat = self._serving()._convert_to_chat_completion_request(req)
-        self.assertEqual(chat.reasoning_effort, "max")
+        self.assertEqual(chat.reasoning_effort, "xhigh")
 
     def test_other_efforts_pass_through_unchanged(self):
         for effort in ("low", "medium", "high", "max"):
