@@ -1985,6 +1985,24 @@ def zero_kv_data_buffers(kvcache) -> int:
     return zeroed
 
 
+def mark_as_sub_pool(pool) -> None:
+    """Declare that `pool` is addressed in its OWN layer frame, not the global
+    PP frame, and drop any global ownership map it picked up.
+
+    `KVCache.__init__` attaches a map keyed by GLOBAL layer ids, which is right
+    for a pool the model addresses with global ids. A sub-pool is different: its
+    wrapper re-indexes first. `HybridLinearKVPool` maps a global id through
+    `_transfer_full_attention_id` into a DENSE full-attention index before
+    calling into `full_kv_pool`, so under SGLANG_PP_LAYER_SET the id arriving is
+    0..N-1 while the map holds e.g. {35: 0, 39: 1, ...} and every lookup misses.
+
+    Dropping the map makes the sub-pool's accessor degenerate to the plain
+    subtraction inside its own dense frame, which is what its buffers are laid
+    out for. On the contiguous path there is no map to drop and this is a no-op.
+    """
+    pool._local_slot_of = None
+
+
 def _owned_layers_for_pool():
     """This stage's owned layer ids, or ``None`` on the contiguous path.
 
@@ -3775,6 +3793,9 @@ class HybridLinearKVPool(KVCache):
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
             )
+        # The sub-pool is addressed with the DENSE index below, not a global
+        # layer id, so it must not carry a global ownership map.
+        mark_as_sub_pool(self.full_kv_pool)
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }

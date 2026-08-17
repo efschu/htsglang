@@ -303,6 +303,31 @@ placeholder's `.mlp` raises `AttributeError`), `deepseek_v2.py:2549`
 not corrupt), and `model_runner.py:1629` (`adjust_hybrid_swa_layers_for_pp`,
 which also carries a pre-existing `end_layer + 1` worth a separate look).
 
+### 8.1 A defect the accessor itself introduced: sub-pool layer frames
+
+Following the flashinfer sites down produced a concrete instance of the filed
+"KV pool layout" question, and it is one I created.
+
+`KVCache.__init__` attaches an ownership map keyed by GLOBAL layer ids to every
+pool. That is right for a pool the model addresses with global ids. It is wrong
+for a SUB-pool, because its wrapper re-indexes first: `HybridLinearKVPool`
+(`memory_pool.py:3796`) maps a global id through
+`full_attention_layer_id_mapping` into a DENSE 0..N-1 full-attention index and
+then calls `full_kv_pool.get_key_buffer(mapped)`. Under a layer set the map
+holds `{35: 0, 39: 1, ...}` while the arriving id is `0..7`, so every lookup
+misses.
+
+It fails LOUDLY -- the accessor refuses an unowned layer rather than answering
+-- which is the property that made this findable at all. But it would break the
+family plan's own pool, since the plan is exactly GDN + full attention.
+
+Fixed by `mark_as_sub_pool(pool)`: a sub-pool carries no global ownership map,
+so its accessor degenerates to the plain subtraction inside its own dense
+frame, which is what its buffers are laid out for. Applied in
+`HybridLinearKVPool` and to both `SWAKVPool` sub-pools. On the contiguous path
+there is no map to drop and it is a no-op. Verified at unit level against the
+frame mismatch; NOT verified by a boot.
+
 ## 9. What remains
 
 - The transport (§5): the schedule drives a `Link`; no wire exists yet.

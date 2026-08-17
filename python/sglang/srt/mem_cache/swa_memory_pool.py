@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
+    mark_as_sub_pool,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
@@ -76,6 +77,10 @@ class SWAKVPool(BaseSWAKVPool):
             layer_num=self.full_layer_nums,
             **kwargs,
         )
+        # Both sub-pools are addressed with SWA/full-local ids, not global
+        # layer ids, so neither carries a global ownership map.
+        mark_as_sub_pool(self.swa_kv_pool)
+        mark_as_sub_pool(self.full_kv_pool)
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
