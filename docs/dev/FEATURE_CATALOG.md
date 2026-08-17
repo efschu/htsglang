@@ -2914,7 +2914,30 @@ are excluded from the percentile, or the feature would disable itself the
 first time it worked. The wake is STAGED in pipeline need order (ASR -> talker
 -> codec) with each waiter released at its own rank, and `wake_start` is
 emitted BEFORE the first byte moves, carrying per-card NVML-resolved MiB — the
-event contract #553 (elastic co-residency) will react to. Latency is reported
+event contract #553 (elastic co-residency) reacts to.
+**#553 actuation reach, measured at code 2026-08-17:** the hot/cold event
+layer (`managers/coresidency_policy.py`) drives the KV pool in BOTH
+directions (#330 dial grow/shrink + read-back), GDN slots in the COLD
+direction ONLY (`GdnSlotRuntime.unbind`, no rebind on hot — named gap G1),
+and until now reached #287's rungs in NEITHER. `managers/relief_rung_executor.py`
+closes that third target: it maps a chosen RELIEF rung to the actuator of
+the feature it names, taking the vocabulary from `RELIEF_FEATURES` rather
+than restating it. Before it, the only consumers of that vocabulary were
+the ladder that defines it and the table that validates membership — the
+ladder could rank and ascend and nothing would change. An unknown feature,
+an unwired actuator, and a geometry_flip/external rung all REFUSE: a relief
+step that silently no-ops lets the ladder ascend believing pressure was
+relieved. Cut 4 (arbitration) is gated on #305's multi-model binding, not
+only on cuts 1-3. `ANALYSE_553_elastic_coresidence.md` §10.
+`managers/tenant_mover.py` completes cut 2: it registers TENANTS over the
+translator ledger's existing `ParkRoute` protocol rather than reimplementing
+parking, taking each tenant's restore order as CONFIGURATION so the
+translator's ASR->talker->codec need order is not worn by a second tenant.
+A route asked to park that reports nothing is STRANDED, never zero, and
+`release_fn()` hands `cold_event` a None in that case so it surfaces at the
+policy layer. With it, #553's DESK surface is exhausted: cut 4 is gated on
+#305's multi-model binding, cut 5 is rig-gated by its own text, G1 (GDN slot
+rebind on hot) is filed, and the live bindings are window items. Latency is reported
 SPLIT: time-to-first-serve vs time-to-full-restore. `--never-park` is the hard
 override. GPU verification of the nvidia-smi drop and the wake numbers is
 BOOT-PENDING (NOTE_546 §6).

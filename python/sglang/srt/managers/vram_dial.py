@@ -1172,6 +1172,44 @@ def _commit_on_scheduler(
     return released
 
 
+def reclaimable_bytes_for(participant, floor_rows: Optional[int]) -> Optional[int]:
+    """#553 Cut 2: bytes this participant could return, or None if unknown.
+
+    A LIVE READ, not a plan number: ``full_pool_backed_rows`` is the bound
+    eager launches actually pass (the same quantity
+    ``verify_pool_reached_capacity`` checks a commit against), and
+    ``_pool_row_nbytes`` measures the pool's real per-row K+V bytes.
+
+    ``floor_rows`` is REQUIRED and is not derived here. There is no per-pool
+    floor authority in this module -- the dial's floor is a card-level NVML
+    measurement (:func:`_measure_local_floor_bytes`) taken at boot, and
+    inventing a per-pool one would create a second authority for a number the
+    #584 rule says has exactly one. A caller that cannot supply it gets None.
+
+    NONE, NEVER ZERO, when anything is unreadable. Zero would read as "this
+    pool is at its floor" -- a measurement -- when the truth is "nobody
+    measured". That is the #606 defaulted-measurement defect, and here it
+    would quietly remove a real source from an elastic plan.
+    """
+    if floor_rows is None:
+        return None
+    pool = getattr(participant, "pool", None)
+    if pool is None:
+        return None
+    backed = getattr(pool, "full_pool_backed_rows", None)
+    if backed is None:
+        return None
+    try:
+        row_nbytes = _pool_row_nbytes(pool)
+    except Exception:
+        # A pool that cannot report its row width is unmeasured, not empty.
+        return None
+    spare_rows = int(backed) - int(floor_rows)
+    if spare_rows <= 0:
+        return 0
+    return spare_rows * int(row_nbytes)
+
+
 def verify_pool_reached_capacity(participant, target_backing: int) -> None:
     """Post-commit check that a participant pool REALLY carries the new
     capacity -- both bounds, not just the live one (#352).

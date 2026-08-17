@@ -1522,20 +1522,76 @@ def spill_snapshot(
     )
 
 
+#: #552: consecutive fast-lane deferrals a spilled session tolerates before its
+#: restore is forced through once.
+#:
+#: The fast-lane deferral in ``_maybe_restore_flow`` is correct and has a good
+#: reason -- restoring while a fast request waits only re-triggers the
+#: fast-pressure spill, one full D2H+H2D per cycle -- but it was UNBOUNDED: it
+#: resets the hysteresis streak and returns, so no progress accumulates, and
+#: under continuous fast-lane traffic an older spilled session never restores.
+#: "Fast beats FCFS" was meant as a tie-break, not as an indefinite hold.
+#:
+#: The scheduler already solved this exact shape for the other lane:
+#: ``fast_lane_heavy_aging_ms`` (server_args) promotes a heavy request that has
+#: waited too long AHEAD of the fast tier for one admission. This is the same
+#: rule in the units this loop actually has (iterations, not milliseconds).
+#:
+#: Generous on purpose: it fires only in the pathological case, so the normal
+#: "fast beats FCFS" behaviour is untouched. FAILURE DIRECTION, stated: when it
+#: does fire, one restore happens while a fast request is waiting, which may
+#: cost that fast request a re-spill. That is the price of not stranding a
+#: session forever, and it is bounded to one restore per aged-out session.
+DEFAULT_RESTORE_DEFER_LIMIT = 100
+
+
 class RestoreHysteresis:
     """Restore fires only after the memory condition has held for
-    ``steps`` consecutive checks (anti-flutter)."""
+    ``steps`` consecutive checks (anti-flutter).
 
-    def __init__(self, steps: int):
+    Also carries the #552 anti-starvation counter, because the thing that
+    zeroes the streak (a fast-lane deferral) is exactly the thing that has to
+    be bounded -- keeping the two in one object means a deferral cannot reset
+    progress without also recording that it did.
+    """
+
+    def __init__(self, steps: int, defer_limit: int = DEFAULT_RESTORE_DEFER_LIMIT):
         self.steps = max(1, int(steps))
+        #: <= 0 disables the bound entirely (restores the pre-#552 behaviour).
+        self.defer_limit = int(defer_limit)
         self._streak = 0
+        self._deferrals = 0
 
     def update(self, ok: bool) -> bool:
         self._streak = self._streak + 1 if ok else 0
         return self._streak >= self.steps
 
+    def defer(self) -> bool:
+        """Record one fast-lane deferral. True when the bound is EXCEEDED.
+
+        Returning True does not itself restore anything -- it tells the caller
+        this session has been held off long enough that the next check must be
+        allowed through, so the decision stays at the call site.
+        """
+        self._streak = 0
+        self._deferrals += 1
+        if self.defer_limit <= 0:
+            return False
+        return self._deferrals >= self.defer_limit
+
+    @property
+    def deferrals(self) -> int:
+        return self._deferrals
+
     def reset(self):
         self._streak = 0
+
+    def clear_deferrals(self) -> None:
+        """Called once a restore actually happens: the session is no longer
+        being starved, so the count starts again from zero. Kept separate from
+        ``reset`` because a deferral must NOT clear it -- that would make the
+        bound unreachable, which is the bug this exists to fix."""
+        self._deferrals = 0
 
 
 def wave_back_advance(
@@ -4891,8 +4947,22 @@ class KVSessionOffloadManager:
             getattr(r, "is_fast_lane", False)
             for r in getattr(self.scheduler, "waiting_queue", ())
         ):
-            slot.hysteresis.reset()
-            return running_batch
+            # #552: BOUNDED. `defer()` resets the streak exactly as the bare
+            # `reset()` did, and additionally counts. Only when the count
+            # exceeds the limit does this fall through and let the restore be
+            # considered -- otherwise an older spilled session is stranded for
+            # as long as fast-lane traffic continues, which is an indefinite
+            # hold rather than the tie-break "fast beats FCFS" describes.
+            if not slot.hysteresis.defer():
+                return running_batch
+            logger.warning(
+                "kv-session-offload: session %s restore forced through after "
+                "%d consecutive fast-lane deferrals: 'fast beats FCFS' is a "
+                "tie-break, not an indefinite hold. One fast request may pay a "
+                "re-spill for this.",
+                getattr(slot.req, "rid", "?"),
+                slot.hysteresis.deferrals,
+            )
 
         req = slot.req
         # Quiescence: a spilled session may only FINALIZE/one-shot-restore on an
@@ -5685,6 +5755,12 @@ class KVSessionOffloadManager:
         device decode path, free its region, and merge it into the running
         batch."""
         req = slot.req
+        # #552: the session is no longer being held off, so the anti-starvation
+        # count starts again from zero. Deliberately NOT done in
+        # RestoreHysteresis.reset(): a fast-lane deferral calls that, and
+        # clearing the count there would make the bound unreachable -- which is
+        # exactly the bug the bound exists to fix.
+        slot.hysteresis.clear_deferrals()
         req.kv_spill_state = None
         req.kv_spill_boundary = 0
         # try_spill freed the speculative draft overhang and set
