@@ -2760,8 +2760,29 @@ def get_decoupled_kv_group() -> GroupCoordinator:
 
 
 def set_decoupled_kv_active(active: bool) -> None:
-    """Arm/disarm B1 routing. Off is byte-identical to the pre-#704b path."""
+    """Arm/disarm B1 routing. Off is byte-identical to the pre-#704b path.
+
+    REFUSES to arm without an initialized group, following
+    ``set_phase_flip_tp_active`` above rather than the silently-no-oping
+    ``set_dcp_spill_active``. The reason is the same one stated there: arming
+    a route whose group was never built leaves every later collective on the
+    primary group, "a silent no-op all-reduce, the exact corruption class this
+    routing exists to prevent". The fall-through in ``get_dcp_group`` stays as
+    a second line of defence -- it protects a state this setter now makes
+    unreachable, and defence in depth is cheap here.
+
+    Disarming is unconditional: it returns to the pre-#704b route, which is
+    valid regardless of what was or was not built.
+    """
     global _DECOUPLED_KV_ACTIVE
+    if active and _DECOUPLED_KV is None:
+        raise RuntimeError(
+            "set_decoupled_kv_active(True) without an initialized #704b "
+            "decoupled-KV group (initialize_decoupled_kv_group was never "
+            "called). Arming now would route the attention merge to the "
+            "primary DCP group while the pool is sized for decoupled "
+            "ownership -- silently wrong output, not a crash."
+        )
     _DECOUPLED_KV_ACTIVE = bool(active)
 
 

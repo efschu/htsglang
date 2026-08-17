@@ -2203,3 +2203,393 @@ Slice 1 is deliberately the cheapest metal-provable cut: a rung pair inside the
 attention plateau, so it proves the mover and the hysteresis **without moving a
 single KV byte** — the two mechanisms that everything else depends on, isolated
 from the one that is hardest to get right.
+
+## §4.2h — R6 reconciliation with the #635/#646 neighbours (post-4fdefe8404)
+
+4fdefe8404's commit message flagged the neighbour work as unreachable from
+this branch. **That flag was wrong and is withdrawn.** The miss was a search
+error: I grepped the decorated forms `[#646]`/`[#635]`, while the subjects
+use `#646:` and `(#635)`. Canon entry: **grep ticket numbers bare, then filter
+the noise** — never narrow by adding decoration. (Bare `--grep=646` returns 80
+hits here, mostly `(#18646)` PR-number substring collisions. The noise is what
+tempted the decoration; filtering is the answer, not a tighter pattern.)
+
+### Verdict 1 — `7fd2b566b2` "R6 verdict (#635)": **COMPLEMENTARY, not duplicate**
+
+It is a **different R6**. That commit's R6 is a risk-register item in
+`docs/dev/DESIGN_625.md` about the PD **handover** — moving KV between two
+engines — and it was already superseded there ("New R7 replaces R6"). This
+R6 is a #704b slice about pool **allocation** inside one engine. Two
+registers, one letter-number. It IS an ancestor of this branch, so I could
+have read it; the delineation is real, the excuse was not.
+
+They meet on one object, the token-sharded pool: #635 says how bytes ARRIVE
+into one (`BaseKVSender.send_metadata` owned_ordinals, `base/conn.py:186-204`;
+decode-side owner rule `decode.py:1103-1125`), this slice says how one is
+SIZED.
+
+### The defect that meeting point exposed
+
+The built door's ownership is a **residue band**: `layers/dcp/owner.py:406-436`
+assigns slot `L` to a rank iff `(L % cp_S)` is in `[cp_lo, cp_hi)`, so the
+realized share is exactly `(cp_hi - cp_lo) / cp_S` — a rational with
+denominator `cp_S`, never a free real.
+
+`plan_decoupled` accepted **any float in (0, 1]** and never checked it. A pool
+sized off that grid is sized for a token count the rank is never handed, and
+the mismatch is **silent**: the compact write `loc = block * cp_ratio + (off -
+cp_lo)` indexes an allocation that was never made that long. Under-size and it
+writes past its end; over-size and the rows are dead.
+
+This is not hypothetical, and the cleanest evidence is that it contradicts
+**my own** earlier work: `planner/decoupled_kv.py:270-273` already states the
+`ratio_r / S` constraint in its `quantize_shares` docstring. The new module
+was written without honouring a rule I had already written down — a
+self-consistency failure, not a missing external fact.
+
+Fix: `period` is now **required** at arming (`plan_decoupled`, `plan_for_rank`),
+and `validate_share_realizable` **refuses** an off-grid share rather than
+rounding it — rounding would hide that the caller skipped `quantize_shares`.
+`realized_share(period, lo, hi)` reads the share off the owner rule's own
+expression so the planner is not a third copy of it.
+
+### Verdict 2 — `b851df7626` (#646): **COMPLEMENTARY; the defect is NOT recreated, the rule is adopted**
+
+Note first: #646 is **NOT an ancestor of this branch** (it lives on
+`feat/dual-group-631` only; `num_target_kv_buffers` greps empty here). So the
+fix is not in this tree.
+
+#646's defect was a flat list that stopped being one section once the draft
+pool was appended, after which a boundary recovered by halving mispaired
+source V buffers with destination K buffers — silently, no exception on the
+mispaired path. This module consumes a **different** list (the model's
+attention layer ids, `model_runner_kv_cache_mixin.py:2496-2500`, which the
+draft pool does not enter), so it does not inherit that defect.
+
+The rule is adopted anyway, because the armed path shards by token share
+whatever it is handed: an appended section would be sized as target layers and
+**split across ranks**, when #646 established such a section is owned WHOLE by
+the last PP stage. `_validate_target_section` refuses a repeating or
+non-increasing list by name. Armed path only — the unarmed path must not
+acquire a new way to fail, and a test pins that it did not.
+
+### Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`)
+
+- `test_decoupled_kv_pool_plan_704b.py`: **23 passed** (13 -> 23).
+- Can-fail by breakage: neutering `validate_share_realizable` +
+  `_validate_target_section` turns **exactly 5** tests red
+  (`..._share_OFF_the_owner_rule_grid...`, `..._names_the_grid_it_wanted`,
+  `..._REFUSED_not_rounded`, `..._SECOND_SECTION_appended...`,
+  `..._concatenated_layer_list...`); restoring returns 23.
+- Same period, different verdict: share `0.135` is accepted at `period=1000`
+  (135/1000) and refused at `period=3`. The period decides, not the share's
+  plausibility.
+- Wider run under `/spinning/htsglang-gpu/.venv/bin/python3`: **2836 passed,
+  123 skipped, 157 subtests**, 2 pre-existing failures unrelated to this work
+  (see below).
+
+### Two environment/branch facts found while validating
+
+1. **System `python3` can no longer collect 67 of these suites**
+   (`ModuleNotFoundError: datasets`, plus `chess`). The venv at
+   `/spinning/htsglang-gpu/.venv/bin/python3` still has them. Any "green" run
+   on bare `python3` after this drift is a collection error, not a pass.
+2. **A drifted evidence pin, pre-existing at HEAD**, verified by removing my
+   diff and re-running: `planner/rejected.py:361` cites
+   `server_args.py:16240-16245 (assert)`, but that region is now
+   `_handle_tokenizer_batching`. The pinned assert moved to
+   `server_args.py:13693-13694` and changed shape (`view.disable_overlap_
+   schedule`, not `self.`). Two reds in
+   `test/registered/unit/planner/test_rejected_evidence_pins.py`. Not mine and
+   not fixed here — the register belongs to another strand.
+
+## §4.2i — #704b arming slice (build + arm + route)
+
+### The scope correction that mattered most: (c) was framed wrong
+
+The task framed (c) as "the attention path reads `get_decoupled_kv_group` when
+armed — the 16 attn layers' KV ops route through the B1 group". **The
+attention KV ops do not route through any group at all.** `get_kv_buffer` /
+`set_kv_buffer` are LOCAL memory operations on this rank's pool; a repo-wide
+grep for group accessors inside `forward_extend` / `forward_decode` /
+`set_kv_buffer` / `get_kv_buffer` and in `radix_attention.py`,
+`base_attn_backend.py`, `forward_context.py` returns nothing.
+
+The group enters one level up, at the **cross-rank LSE merge**:
+`cp_lse_ag_out_ar_mha_uneven` (`layers/dcp/comm.py:231`), which takes its
+`cp_group` as a PARAMETER. The callers supply it —
+`flashinfer_backend.py:5634` (and `:2478`, `:5684`, `:5747`, `:5863`) and
+`triton_backend.py:2311` — as `group = get_parallel().dcp_group`.
+
+So B1 needed **no new call site**. `runtime_context.py:392-394` resolves
+`dcp_group` through `_v()` (`:240-242`), which calls the getter on EVERY
+access rather than caching, and `parallel_state.get_dcp_group()` already
+carries the B1 branch (`:2744`). The chain is live end to end, and what the
+slice owed was a TEST of the resolution rather than a wiring change. That test
+pins the uncached property specifically: if `dcp_group` ever starts caching,
+arming would silently stop taking effect after the first read.
+
+There is also **no choke point** for KV access — ~15 attention-backend files
+call `set_kv_buffer`/`get_kv_buffer` inline. Any design that needed to
+intercept every KV access would have had to touch all of them. It does not,
+because ownership is expressed in the POOL SHAPE and the MERGE GROUP, not at
+the access sites.
+
+### (a) The build now consumes the plan — and R6's anchor was wrong
+
+R6 cited `model_runner_kv_cache_mixin.py:2496-2500` as the ownership filter.
+That site is real but lives in `_init_unified_mamba_pools` (`:2467`), which
+`_init_pools` reaches ONLY under `--enable-unified-memory` (`:3194-3200`) — a
+path this deployment does not take. The filter that governs our hybrid-mamba
+config is the classic-path one at `:3929-3934`, inside the
+`HybridLinearKVPool` construction (`:3913`). Same logic, wrong citation, and
+the byte-identity claim had therefore never been stated against the path it
+would actually be tested on. Corrected in the module docstring.
+
+Wiring: `_decoupled_kv_pool_override(all_attn_layer_ids, default_size)`
+returns `(None, default_size)` unless `SGLANG_DECOUPLED_KV=1`. `None` means
+"unchanged", and the call site keeps ITS OWN expression in the else-branch
+rather than receiving a reconstructed copy — which is what makes the unarmed
+path unchanged rather than "recomputed the same way". Gate is an env var
+because B1 deliberately has no CLI surface (`dcp_size` was explicitly not
+overloaded, and `server_args.py` has no decoupled-kv flag).
+
+### R6 had duplicated a shipped sizing rule, with the wrong rounding
+
+`plan_decoupled` computed `round(share * C)`. The shipped rule is
+`dcp_compact_pool_rows` (`layers/dcp/owner.py:155-181`), already called by
+this very build path at `:3765-3767`, and its docstring states the rule is
+written once because "a sizing rule whose off-by-one has already cost a
+debugging round must not exist twice". R6 had made it exist twice AND rounded
+the wrong way: the shipped rule CEILS to a whole owner block, and flooring is
+what let trailing-partial-block slots scatter out of bounds (async illegal
+memory access, found by the kv-session-offload S1 test at
+`--max-total-tokens 3000` on `cp_S=64`). A planner handing the build a floored
+row count re-creates exactly that bug at the seam.
+
+`plan_decoupled` now delegates to `dcp_compact_pool_rows`. Consequences taken
+rather than papered over: the plan carries the `period` it ceiled against, and
+world conservation derives the ceil's slack from it (at most `period` rows
+across the world) instead of being handed a slack that could be widened until
+it passed. A zero-row pool also became UNREACHABLE rather than caught, since
+the ceil always yields at least one whole block.
+
+### (b) The arming point
+
+`phase_flip_runtime.py` step 1, alongside `_ps.set_phase_flip_tp_active(
+tp_phase)` (`:1196`) inside `_cutover` (`:1160`, built by
+`build_production_flip_cutover` `:1147`). That slot is after the group-wide
+quiesce (`on_round` consensus `:3066`, hold `:3121-3126`, execute `:3128`) and
+after the physical KV wave-move, but BEFORE any group handle is re-derived
+(`:1224`) or any collective runs on the new layout.
+
+B1 is a PP-PREFILL mechanism, so `arm_for_cutover` arms going into PP and
+DISARMS going into TP. It does not rely on the flip route out-ranking B1 in
+`get_dcp_group`: precedence is the net, disarming is the contract. Relying on
+branch order is how a later reorder becomes silent capture.
+
+### (e) The red-first case, and the guard shape
+
+The dangerous state is armed routing over a stage-local pool. Under decoupled
+routing a rank may be asked for ANY attention layer; a stage-local pool has no
+rows for the layers it does not own, so
+`HybridLinearKVPool._transfer_full_attention_id` (`memory_pool.py:3855-3859`)
+misses the mapping or — where the id happens to exist — returns another
+layer's rows. Wrong output, no error.
+
+`record_pool_plan` records what the build ACTUALLY built (not what someone
+intended — an intention cannot be compared against reality), and
+`arm_decoupled_kv` refuses to arm unless that plan is DECOUPLED and covers the
+full attention set. Deliberate asymmetry: DISarming is never refused, because
+requiring a healthy pool in order to stop using it turns the recovery path
+into a second failure.
+
+Separately, `set_decoupled_kv_active` now REFUSES to arm without an
+initialized group, matching `set_phase_flip_tp_active`
+(`parallel_state.py:2670-2687`) instead of the silently-no-oping
+`set_dcp_spill_active`. That precedent names the failure class exactly: "a
+silent no-op all-reduce, the exact corruption class this routing exists to
+prevent". The routing fall-through stays as defence in depth for a state the
+setter now makes unreachable.
+
+### Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`, venv interpreter)
+
+- 58 passed across the three B1/R6 suites (was 40 before this slice).
+- Can-fail by breakage: neutering `assert_pool_supports_arming` and the
+  `set_decoupled_kv_active` group check turns **exactly 6** tests red, and
+  restoring returns 58.
+- Regression, measured against a real baseline rather than assumed: with the
+  diff removed, `test/registered/unit/mem_cache` is 944 failed / 835 passed
+  and `test/registered/unit/distributed` is 21 failed / 2706 passed. With the
+  diff: **944 / 853** and **21 / 2706** — same failures, +18 passes, zero new
+  reds. `planner` 2805 passed, `model_executor` clean.
+- Those 965 pre-existing reds are the hermetic-mode consequence
+  ("No accelerator (CUDA, XPU, ...) is available", `utils/common.py:1322`),
+  NOT a repo defect and NOT caused here. A hermetic run of these directories
+  can only ever be read as a delta against that baseline.
+
+### BOOT DEPENDENCIES (nothing below is proven without a reviewed boot)
+
+1. **`phase_flip_runtime.py` is NOT wired.** `arm_for_cutover` exists and is
+   tested, but no call was inserted at `:1196`. Reason: this worktree's copy
+   (6666 lines, `[#690]`) is BEHIND the deploy tree's (6984 lines, `[#717]`,
+   ~355 diff lines apart), and the deploy tree has no B1 symbols at all. A
+   call inserted against the stale revision is likely to be discarded on
+   merge. The insertion point is documented in the function's docstring;
+   inserting it is a boot-window task for whoever owns that file.
+2. **`SGLANG_DECOUPLED_KV=1` has never been booted.** The build override is
+   unit-tested inert-when-off and correct-when-on, but no pool has been
+   allocated from it on a GPU.
+3. **The share vector at boot is unverified.** `_decoupled_kv_pool_override`
+   reads `get_cp_token_ratios()` / `cp_token_split_factor(dcp_size)`. Whether
+   those are populated at the moment `_init_pools` runs is a boot fact, not a
+   desk fact.
+4. **The LSE merge has never run over B1.** The resolution chain is pinned by
+   test; the collective itself has not been executed on the decoupled group.
+5. **Pool/group world agreement is unchecked at boot.** B1's manifest check
+   covers the group; nothing yet cross-checks that every rank recorded a plan
+   with the same period and layer set.
+
+## §5 — #704a: the layout ladder indexed by FILL, and what a rung change costs
+
+**Status: MECHANISM, not a recommendation.** Every pool and speed number below
+is solver output on the STRUCTURAL free-bytes fixture, which the review gate
+established was fitted against the incumbent and does not reproduce measured
+boots. No cut is recommended here; the only cut on the user's morning list is
+#702's, and this section does not add to it. What the ladder contributes is the
+mechanism and the *cost* side, and the cost side rests on measured inputs
+(arena bytes, link rates) rather than on the fitted vector.
+
+### The machinery already existed; what was missing was the price
+
+`planner/layout_ladder.py` already solved rungs as a Pareto frontier, indexed
+them by occupancy (`Rung.admit_up_to_tokens`), and derived hysteresis bands
+(`Transition.descend_below_tokens` / `ascend_above_tokens`). This slice did not
+rebuild any of that. It corrected what a step COSTS and added the fill-indexed
+view over it.
+
+### The mispricing: a rung change is not a delta move
+
+`_solve_transitions` charged a step as `moved_layers x weight_mib_per_layer`
+over the gating link. That prices a cross-rank weight mover — which does not
+exist, and whose absence is explicit (`regime_stages.py:100`,
+`REACH_NO_WEIGHT_MOVER`).
+
+The actuator that does exist is `PhaseFlipStacks.refill`
+(`managers/phase_flip_boot.py:361`, `arena_refill` `:539`,
+`dst.copy_(payload)` `:576`): a CONTIGUOUS host→device memcpy of a whole
+boot-baked arena image, swapping which pre-loaded layout occupies a rank's
+arena. The bytes on the wire are the same whether one layer moves or six.
+
+With the #690-rev2 refill of 9614.9 MiB per rank over the measured links
+(13 / 13 / 6.4 GB/s, authoritative mapping), and noting that nothing crosses a
+rank boundary so the refills run CONCURRENTLY and the slowest card sets the
+step:
+
+| | x8 card | x8 card | x4 card | step |
+|---|---|---|---|---|
+| refill 9614.9 MiB | 776 ms | 776 ms | **1575 ms** | **1575.3 ms** |
+
+Against the moved-layer estimate the correction is **10.7x to 21.3x**. A rung
+change is **38–79% of a whole phase flip** (#690's fixed 2.0–4.2 s), not a
+cheap dial.
+
+The band consequence is real but small: a longer move must start earlier, so
+every `ascend_above_tokens` drops — by ~30k tokens, under 1% of pool at these
+sizes. **The mispricing mattered for the DECISION, not for the guard.**
+
+### The consequence that changes how a ladder should be driven
+
+The switch cost is **constant in the distance travelled** — it is the whole
+arena either way. So crossing twelve rungs one at a time costs
+`12 x 1.575 s = 18.9 s`; crossing them in ONE jump costs 1.575 s. A
+constant-cost actuator inverts the usual ladder intuition:
+
+> **A ladder with a constant-cost step must be traversed in single jumps, never
+> rung by rung.** Rungs are choices of destination, not stations to stop at.
+
+The per-step value is also wildly unequal, which the fill table makes visible
+(arena depth 40, draining leg):
+
+| fill | cut | pool | speed | step | payback |
+|---|---|---|---|---|---|
+| 346,192 | [33,15,16] | 364,413 | 1.0000 | — | — |
+| 276,954 | [39,12,13] | 309,458 | 1.2308 | 1575 ms | **8.4 s** |
+| 207,715 | [40,12,12] | 278,513 | 1.2532 | 1575 ms | **87.9 s** |
+| 138,477 | [40,12,12] | 278,513 | 1.2532 | 0 | — |
+
+The first step buys 23% for 1.575 s; the next buys 1.8% for the same 1.575 s
+and needs 88 s of prefill to repay. A controller stepping uniformly would pay
+full price for a marginal rung.
+
+### Arena depth is the master knob, and it is a real trade
+
+The arena is sized for the DEEPEST reachable rung and is resident at EVERY
+rung, so asking for ladder range makes every rung poorer:
+
+| deepest rank0 | rungs | roomiest pool | fastest | pool span | end-to-end payback |
+|---|---|---|---|---|---|
+| 36 | 2 | 421,894 | 1.0071 | 0.3% | **224.7 s** |
+| 38 | 5 | 418,848 | 1.1538 | 13.2% | 11.8 s |
+| 40 | 8 | 364,413 | 1.2532 | 23.6% | **7.8 s** |
+
+At depth 36 the ladder is **economically dead**: 1.575 s buys 0.7%, repaid
+after 225 s. At depth 40 it is live, but the roomiest rung has lost 13.6% of
+its pool against depth 36 purely for holding the option. **The viability
+condition is a property of the arena depth, not of the ladder.**
+
+### The two kinds of step, and a defect this found in my own API
+
+A ladder is traversed in both directions and only ONE direction is an economic
+decision:
+
+* **ASCEND** (fill rising → roomier, slower rung) is **MANDATORY**. Its
+  alternative is not "stay fast", it is "stop admitting". Payback is correctly
+  infinite, and reading that as "never do this" inverts the meaning.
+* **DESCEND** (fill draining → tighter, faster rung) is **DISCRETIONARY**, and
+  is the only step the #677 economics decide.
+
+The first cut of `solve_fill_ladder` required ASCENDING fill levels. Rising
+fill only ever moves to roomier, slower rungs, so the interface could express
+nothing but forced moves and reported an infinite payback on every one of
+them — the discretionary step, the one the function exists to price, was
+unreachable through it. Monotone in either direction now; a test pins both legs.
+
+### Integration with the #677 economics controller
+
+They share the arena machinery, so they are spending from the SAME budget: a
+cut jump and a phase flip are both an arena refill, and a rank cannot do both
+at once. The controller therefore ranks them rather than running two policies.
+
+Admit a discretionary cut jump only when all four hold:
+
+1. **It is a jump, not a step.** Target the fastest rung the projected
+   occupancy admits, never the adjacent one. Cost is distance-independent.
+2. **Payback fits the window.** `payback = switch_s / (1 - s_from/s_to)` must
+   be shorter than the expected residence at the target, using #677's own
+   backlog-derived window rather than a fixed horizon.
+3. **It beats the flip for the same stall.** Both cost one refill. A cut jump
+   buys a prefill factor within one regime; a flip changes regime. Where a
+   decode backlog is what is starving, the flip wins on the same budget — the
+   cut jump is only preferred when the workload is prefill-bound at an
+   occupancy the faster rung still admits.
+4. **The band still holds.** The #677 decision is a veto on top of the
+   hysteresis, never a replacement: `descend_below_tokens` prevents
+   oscillation, and economics only decide whether an already-safe step is
+   worth its stall.
+
+Mandatory ascends bypass all four. They are not economic and must not be
+gated on payback.
+
+### What is NOT established
+
+- No cut is recommended, and the arena-depth table is a trade to be decided,
+  not a proposal.
+- Pool values inherit the fitted free vector and the ±500 MiB unbooted arming
+  floor uncertainty (~7% at 8 attention layers).
+- 9614.9 MiB is taken as given from #690-rev2 and assumed uniform per rank; if
+  arenas differ per rank the gating term changes, though the concurrency
+  argument does not.
+- Nothing here has booted. The ladder has never performed a rung change on
+  metal, so the 1575 ms is an arithmetic prediction from measured bandwidth,
+  not a measured switch.

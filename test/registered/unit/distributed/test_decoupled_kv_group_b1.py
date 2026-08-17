@@ -212,9 +212,18 @@ def test_the_full_precedence_chain_in_one_table(routes):
 
 
 def test_an_armed_flag_with_no_group_falls_through(routes):
-    """Arming without initializing must not crash the routing."""
+    """Arming without initializing must not crash the routing.
+
+    set_decoupled_kv_active now REFUSES this (parity with
+    set_phase_flip_tp_active), so the state is set directly here: the routing
+    fall-through is defence in depth for a state the setter makes
+    unreachable, and it must keep working even though nothing can now produce
+    it through the front door.
+    """
     ps._DECOUPLED_KV = None
-    ps.set_decoupled_kv_active(True)
+    with pytest.raises(RuntimeError, match="without an initialized"):
+        ps.set_decoupled_kv_active(True)
+    ps._DECOUPLED_KV_ACTIVE = True  # bypass the setter on purpose
     assert ps.get_dcp_group().name == "primary"
 
 

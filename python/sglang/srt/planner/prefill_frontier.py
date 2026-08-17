@@ -140,20 +140,56 @@ def solve_prefill_frontier(
     # The incumbent is always a row, even when it is not the fastest split at
     # its own depth -- and on this rig it is not. The user needs to see where
     # they are standing, not only where they could go.
+    def _pool_of(counts: Sequence[int]) -> float | None:
+        """Pool tokens for a cut, or None if the provider refuses it."""
+        attn = tuple(int(a) for a in attn_counts_for(counts))
+        if any(a <= 0 for a in attn):
+            return None
+        try:
+            avail = [float(x) for x in available_bytes_for(counts, attn)]
+        except ValueError:
+            return None
+        if min(avail) <= 0.0:
+            return None
+        cell = int(kv_bytes_per_token_per_attn_layer)
+        return min(avail[i] / (attn[i] * cell) for i in range(n_stages))
+
     candidates: list[tuple[int, ...]] = [incumbent]
     for n0 in range(int(incumbent[0]), int(total_layers) - (n_stages - 1) + 1):
         if max_rank0_layers is not None and n0 > int(max_rank0_layers):
             break
-        # For a given lead depth, the tail split that minimises pipelined time.
-        best: tuple[int, ...] | None = None
-        best_ms = float("inf")
+        # #723: for a given lead depth, keep the PARETO SET over
+        # (pipelined time, pool) -- not the tail that minimises time alone.
+        #
+        # The speed-argmin was silently making a trade on the user's behalf.
+        # At n0=30 it returned [30,16,18] (130.95 ms, 343,951 tokens) and
+        # discarded [30,18,16] (139.32 ms, 436,275 tokens): six percent of
+        # speed bought at twenty-seven percent of pool, decided inside an
+        # enumeration and never surfaced. [30,18,16] holds the incumbent's own
+        # pool while running 1.11x faster, so it STRICTLY DOMINATES the layout
+        # in production, and the solver whose purpose is to find such cuts
+        # could not emit it.
+        #
+        # Sorting by time ascending and keeping only strict pool improvements
+        # yields the frontier at this depth. The first element is the
+        # speed-argmin, so every pre-#723 row still appears, unmoved; the rest
+        # are additions, each of which is roomier than everything faster.
+        scored: list[tuple[float, float, tuple[int, ...]]] = []
         for tail in _tails(int(total_layers) - n0, n_stages - 1):
             counts = (n0, *tail)
-            ms = pipelined(counts)
-            if ms < best_ms - 1e-12:
-                best_ms, best = ms, counts
-        if best is not None and best not in candidates:
-            candidates.append(best)
+            pool = _pool_of(counts)
+            if pool is None:
+                continue
+            scored.append((pipelined(counts), -pool, counts))
+        scored.sort()
+        best_pool = float("-inf")
+        for ms, neg_pool, counts in scored:
+            pool = -neg_pool
+            if pool <= best_pool + 1e-9:
+                continue
+            best_pool = pool
+            if counts not in candidates:
+                candidates.append(counts)
 
     for best in candidates:
         best_ms = pipelined(best)
@@ -206,12 +242,33 @@ def solve_prefill_frontier(
 
     # A candidate needs the lever when every shallower candidate beats it
     # without one: depth you cannot cash in until the overhead is hidden.
-    running = float("-inf")
-    finished: list[FrontierPoint] = []
+    # #723: the flag is a property of the DEPTH, evaluated on that depth's
+    # fastest tail, and shared by its siblings.
+    #
+    # It says "this depth cannot be cashed in until the overhead is hidden".
+    # Evaluating it per tail would flag a roomier, slower sibling as needing a
+    # lever it is not reaching for -- that cut is trading speed for pool, not
+    # buying depth, and the lever would not help it. Using the depth's fastest
+    # tail also reproduces the pre-#723 flags exactly, because before this
+    # change that tail was the only candidate at its depth.
+    order: list[int] = []
+    fastest_at: dict[int, FrontierPoint] = {}
     for p in points:
-        needs = p.net_no_pipelining < running - 1e-12
-        finished.append(dataclasses.replace(p, needs_pipelining=needs))
-        running = max(running, p.net_no_pipelining)
+        d = p.counts[0]
+        if d not in fastest_at:
+            order.append(d)
+            fastest_at[d] = p
+        elif p.compute_speedup > fastest_at[d].compute_speedup:
+            fastest_at[d] = p
+    running = float("-inf")
+    needs_at: dict[int, bool] = {}
+    for d in order:
+        net = fastest_at[d].net_no_pipelining
+        needs_at[d] = net < running - 1e-12
+        running = max(running, net)
+    finished = [
+        dataclasses.replace(p, needs_pipelining=needs_at[p.counts[0]]) for p in points
+    ]
 
     return PrefillFrontier(
         points=tuple(finished),
