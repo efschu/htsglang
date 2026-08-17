@@ -732,3 +732,103 @@ only one that should ever wait on a GPU window.
   assumption, and R9 forbids those.
 - **The pressure ladder's autonomy overlaps the planner's authority.** Slice 5
   must resolve this or the two will fight over the same pool under load.
+
+---
+
+# VERDICT (2026-08-17) — the three-part promise, determined on the serving head
+
+The user's promise was **"eine Autoritaet, Auto-Messung, dynamische
+Neuberechnung"**. Those map onto R1, R2 and R6. Verdicts below are from the
+code on `integration/r2`, each with the file:line that decides it.
+
+## (a) ONE AUTHORITY — **NOT delivered.** Verified violations remain.
+
+R1: "No component keeps a private constant, a private fraction, or a private
+reserve."
+
+**R1's own named falsifier did not exist.** The mem_ledger suite pins terms,
+wiring, calibration and reconciliation; `test_module_state_ratchet.py` guards
+module-level *mutable* state, a different concern. Nothing refused a new
+constant. It exists now:
+`test/registered/unit/mem_ledger/test_r1_private_constant_gate_584.py`, an AST
+ratchet over every module-level MiB/MB/GiB-scale constant outside the ledger —
+29 pinned with a verdict each, a new one fails, and a stale entry fails too so
+the list cannot describe a tree that has moved.
+
+**Four verified violations**, and the first two are pointed:
+
+- `uneven_perf.py::_PREDICT_OVERHEAD_MIB` — **the constant the ledger's own
+  refusal message names**: *"a constant here is the `_PREDICT_OVERHEAD_MIB`
+  guess this ledger replaces"* (`mem_ledger/engine.py:1533`). The ledger
+  replaced it; the constant did not leave.
+- `distributed/utils.py::_CP_TOKEN_OVERHEAD_MIB = 1536` — a private VRAM
+  reserve subtracted from each rank's budget to size the uneven KV split
+  (`utils.py:596`). Its value is one of the three R1 names as the template for
+  what must not recur, and the ledger owns this quantity as
+  `TERM_HARDWARE_RESIDUAL`.
+- `uneven_perf.py::_PREDICT_MAMBA_ACT_RESERVE_MIB`, `_SOLO_HOST_WORKSPACE_MIB`
+  — same family.
+
+Seven more are demand-shaped and **listed as NEEDS AUDIT** rather than judged
+from their names (`MAMBA_AUTO_ACTIVATION_RESERVE_MIB`,
+`DEFAULT_ATTN_SCRATCH_BUDGET_MIB`, `FIXED_PROCESS_POST_MIB`, the three
+`graphmem` estimates, `MAMBA_CEILING_FIT_MIN_KV_MIB`). The remainder are
+legitimate: stated policy (the corridor law is *headroom*, which R2 assigns to
+the user), hysteresis thresholds, unit conversions, and backend allocations the
+ledger prices rather than re-decides.
+
+## (b) AUTO-MESSUNG — **delivered, with one honest qualification.**
+
+The measured-not-guessed rule is *enforced*, not merely intended:
+
+- `mem_ledger/measured.py` (#605 stage 4) calibrates a term from boot history
+  **only where that history is stable** — pinned at
+  `test_measured_source_605.py`, whose docstring names the temptation it
+  refuses: taking a median of a post that ranges over 2408 MiB "converts
+  variance into false precision and is the guessing game wearing a lab coat".
+- `mem_ledger/engine.py:1525-1533` **refuses to default** an uncalibrated
+  residual, adds it to `unbounded`, and names the tool that measures it.
+- The recorder→ledger link is itself pinned
+  (`test_history_into_ledger_605.py`, `test_ledger_dump_reaches_production_605.py`).
+
+**The qualification:** calibration is **operator-triggered**, not
+self-running. `mem_ledger/probe.py` is a CLI (`python -m
+sglang.srt.mem_ledger.probe`), referenced from `server_args.py:2453` and
+`engine.py:1529` as an instruction to a human. Nothing re-measures on its own.
+That satisfies "Auto-Messung" in the sense that matters — no number is
+invented — but not in the sense of a system that keeps itself calibrated.
+
+## (c) DYNAMISCHE NEUBERECHNUNG — **NOT delivered. The ledger is boot-frozen.**
+
+`build_card_ledgers` (`engine.py:894`) is the entry, and every consumer outside
+`mem_ledger/` is in **`server_args.py`** — argument resolution, at boot. No
+scheduler loop, VRAM dial or corridor guard re-enters it.
+
+The distinction matters and is easy to blur: the **dial and corridor do react
+at runtime** (capacity moves, relief fires — #330/#657, and #553 Cut 3 now
+actuates on them). What does not happen is the **ledger re-pricing its demand
+model**. A term measured wrong at boot stays wrong for the process lifetime,
+and a configuration change that would move demand is not re-priced.
+
+## Scoped follow-ons
+
+1. **Retire the four verified constants** (S–M). `_PREDICT_OVERHEAD_MIB` and
+   `_CP_TOKEN_OVERHEAD_MIB` resolve through `TERM_HARDWARE_RESIDUAL`, which
+   already exists and already refuses to guess. The work is routing the two
+   call sites, not inventing a term. The ratchet keeps them visible meanwhile.
+2. **Discharge the seven NEEDS AUDIT entries** (S each, mechanical): read the
+   call site, then either move it into the ledger or record why it is policy.
+3. **Runtime re-pricing** (L, and a design question before a build): what
+   events should re-price demand, and what does a re-price cost mid-serving?
+   The #704a precedent applies — a rung change costs a full ~1575 ms arena
+   refill, so "re-solve on change" needs the same debounce reasoning #553 §8
+   worked out, or it is a thrash generator.
+4. **Self-calibration** (M): let a boot whose fingerprint has no calibration
+   run the probe itself instead of refusing with an instruction. The stability
+   rule in `measured.py` is what makes this safe to consider at all.
+
+## What this verdict does not do
+
+It measures nothing and boots nothing. It does not audit the seven
+NEEDS AUDIT constants — naming them unread is the honest state, and the
+ratchet is what stops them being forgotten.
