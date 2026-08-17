@@ -802,7 +802,9 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
+    reasoning_effort: Optional[
+        Literal["none", "low", "medium", "high", "max", "xhigh"]
+    ] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
@@ -811,7 +813,14 @@ class ChatCompletionRequest(BaseModel):
         "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path."
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
-        "support it treat it the same as 'high'.",
+        "support it treat it the same as 'high'. 'xhigh' is a second such "
+        "extension, added for checkpoints whose chat template names that tier "
+        "literally: the Qwen3.8 family accepts exactly ('xhigh', 'medium', "
+        "'low') and RAISES on anything else, so its maximum tier is only "
+        "reachable by sending 'xhigh' or by omitting the field (the template's "
+        "own default). The value is passed to the template verbatim; whether a "
+        "given checkpoint accepts it is the template's decision, not this "
+        "schema's.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]

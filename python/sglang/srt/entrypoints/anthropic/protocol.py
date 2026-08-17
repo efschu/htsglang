@@ -350,13 +350,13 @@ class AnthropicThinkingParam(BaseModel):
         if self.type == "enabled":
             if self.budget_tokens is None:
                 raise ValueError(
-                    "thinking.budget_tokens is required when "
-                    "thinking.type is 'enabled'"
+                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
                 )
             if self.budget_tokens < 1024:
                 raise ValueError(
-                    "thinking.budget_tokens must be >= 1024 "
-                    "(got {})".format(self.budget_tokens)
+                    "thinking.budget_tokens must be >= 1024 (got {})".format(
+                        self.budget_tokens
+                    )
                 )
         elif self.type == "disabled":
             if self.budget_tokens is not None:
@@ -366,8 +366,7 @@ class AnthropicThinkingParam(BaseModel):
                 )
             if self.display is not None:
                 raise ValueError(
-                    "thinking.display is not allowed when "
-                    "thinking.type is 'disabled'"
+                    "thinking.display is not allowed when thinking.type is 'disabled'"
                 )
         elif self.type == "adaptive":
             if self.budget_tokens is not None:
@@ -395,8 +394,14 @@ class AnthropicTaskBudget(BaseModel):
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
-    ``effort`` maps to the OpenAI ``reasoning_effort`` knob (``xhigh`` →
-    ``max`` because the OpenAI Literal does not include ``xhigh``).
+    ``effort`` maps to the OpenAI ``reasoning_effort`` knob and is passed
+    through VERBATIM, ``xhigh`` included -- the sglang schema carries
+    ``xhigh`` for exactly this reason. It used to collapse ``xhigh`` onto
+    ``max``, which was backwards for the Qwen3.8 family: its chat template
+    accepts only ``('xhigh', 'medium', 'low')`` and raises otherwise, so the
+    rewrite turned a supported request into an HTTP 500. Set
+    ``SGLANG_ANTHROPIC_XHIGH_EFFORT=max`` to restore the collapse for a
+    deployment whose template names its top tier ``max``.
     ``task_budget`` is propagated as a custom-param hint.
     """
 

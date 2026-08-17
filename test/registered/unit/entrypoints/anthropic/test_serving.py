@@ -813,7 +813,11 @@ class TestAnthropicServing(unittest.TestCase):
             ("low", "low"),
             ("medium", "medium"),
             ("high", "high"),
-            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            # #540: xhigh is passed THROUGH. It used to collapse to "max",
+            # which the Qwen3.8 template rejects with raise_exception (it
+            # accepts only xhigh/medium/low) -- see
+            # test_effort_passthrough_540.py.
+            ("xhigh", "xhigh"),
             ("max", "max"),
         ]:
             with self.subTest(anthropic_effort=anthropic_effort):
