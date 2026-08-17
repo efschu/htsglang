@@ -234,6 +234,30 @@ Same load, ring off (`=0`) vs ring on: allocation count per read must drop from
 one-per-read to at most the ring size. If it does not, the ring is not on the
 path being measured.
 
+### 3.5 Eviction demotion (#703), and the hit metric to judge it by
+
+`SGLANG_HICACHE_DEMOTE_ON_EVICT=<cap>` turns on the eviction-time demotion: a
+prefix about to leave memory is written to the disk tier first. Off by default;
+the first boot should carry it, because it is the half that makes retention
+survive PRESSURE rather than only survive a flip.
+
+What to check, and note that the obvious metric is broken:
+
+* `cache_hit_rate` reports 0.0 despite real hits (known separate defect). Do
+  NOT judge this by it. The hit metric is the PREFILL LOG LINE: count requests
+  whose line carries `#cached-token: > 0`, over requests issued. That is the
+  number every #703 claim must be stated in.
+* BEFORE/AFTER at the same offered load, same prompts: the cached-token share
+  must rise, and the rise must survive eviction pressure -- i.e. hold while the
+  device pool is at its cap, which is the state the ticket is about.
+* `[#703 demote] dropping demotions` must NOT appear under steady load. If it
+  does, the disk tier is not keeping up with eviction and the cap needs
+  raising; a dropped demotion is a later miss, not corruption.
+* The decode-bs claim (1.30 at queue 5-9) is UNVALIDATED on metal and stays
+  that way until this boot. State the measured decode bs at the same queue
+  depth before and after; if it does not move, the retention hypothesis is
+  wrong for this traffic and that is the finding, not a failure of the boot.
+
 ## 4. Risks, ranked
 
 1. **Second-pool RAM vs the OOM-kill family (#721).** Highest, and the reason
