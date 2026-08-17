@@ -519,6 +519,74 @@ class SchedulerInvariantChecker:
             self.tree_cache.sanity_check()
 
 
+#: #699: seconds a request may sit admissible-but-unserved before the
+#: admission wedge is called. 20 s is chosen from the measured specimen, not
+#: round: the #713 idle refusal held a TEN-token prompt for 31.64 s with 0
+#: running and 1 queued, and an 8-arm run put every TTFT between 11.87 s and
+#: 62.65 s. A threshold above 11.87 s would miss the fastest real wedge; 20 s
+#: sits above ordinary scheduling latency on this rig (healthy TTFT for a short
+#: prompt is sub-second) and below the fastest observed wedge's own duration.
+ADMISSION_WEDGE_SECONDS: float = 20.0
+
+ADMISSION_WEDGE = "ADMISSION-WEDGE"
+
+
+def admission_wedge_verdict(
+    queued: int,
+    running: int,
+    seconds_since_progress: float,
+    threshold: float = ADMISSION_WEDGE_SECONDS,
+    idle_locked_seen: bool = False,
+):
+    """``(alarm, detail)`` for the admission-wedge class (#699, from #713).
+
+    WHY forward_ct CANNOT SEE THIS, which is the whole reason this exists.
+    ``create_scheduler_watchdog`` fires when ``forward_ct`` stops advancing
+    while a batch exists. In the measured wedge BOTH signals read healthy:
+    chunked prefill kept running, so ``forward_ct`` advanced, and
+    ``cur_batch_for_debug`` stayed non-None -- for 31.64 s during which a
+    ten-token prompt produced no first token, with 0 running and 1 queued.
+    Health-200 is blind to it for the same reason. The signal is therefore
+    QUEUE AGE VERSUS PROGRESS, never batch existence or forward count.
+
+    PROGRESS means a request reached its FIRST TOKEN. Completions are the wrong
+    clock -- a long generation legitimately produces none for minutes -- and
+    forward passes are the wrong clock for the reason above.
+
+    ``idle_locked_seen`` is the PHASE-POLICY IDLE-LOCKED TERMS line, which
+    corroborates when present. It is deliberately NOT required: the wedge class
+    is broader than the phase-policy path, and a detector that only fired
+    alongside a policy log would miss every wedge arising anywhere else.
+    """
+    q = int(queued)
+    r = int(running)
+    age = float(seconds_since_progress)
+    if q <= 0:
+        return False, "no queue: nothing is waiting, so nothing is wedged"
+    if r > 0:
+        return False, (
+            f"{r} request(s) running: the box is serving, not wedged "
+            f"(queued {q})"
+        )
+    if age < float(threshold):
+        return False, (
+            f"queued {q}, running 0, but only {age:.1f}s since the last first "
+            f"token (< {float(threshold):.1f}s) -- ordinary scheduling latency"
+        )
+    return True, (
+        f"{ADMISSION_WEDGE}: {q} queued, 0 running, and NO first token for "
+        f"{age:.1f}s (>= {float(threshold):.1f}s). Work is admissible and "
+        f"nothing is serving it. forward_ct and health both read healthy in "
+        f"this state, which is why neither catches it"
+        + (
+            "; PHASE-POLICY IDLE-LOCKED TERMS corroborates on this round"
+            if idle_locked_seen
+            else "; no phase-policy corroboration seen -- the wedge class is "
+            "broader than that path"
+        )
+    )
+
+
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
