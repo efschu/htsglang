@@ -189,3 +189,51 @@ stage feed to be bound first (see `TICKET_363_S8_stage_feed.md`) — an
 arbitration policy fed by a table that permanently holds one stage would be a
 policy with nothing to choose between, which is the same failure #363/S8 just
 documented one level up.
+
+---
+
+## 6. Cut 1 DELIVERED (2026-08-17)
+
+`managers/coresidency_registry.py` + 16 pins in
+`test/registered/unit/managers/test_coresidency_registry_553.py`.
+
+**The gap was real and unbuilt.** Confirmed before building: nothing in the
+tree imports both `vram_dial` and `short_term_offload_register` — the two
+registries genuinely could not see each other, so "free 4 GiB for the video
+tenant" had no addressee. §2's diagnosis holds exactly.
+
+**What landed.** One query — `enumerate_reclaim_sources(...)` — returning a
+`ReclaimView` of ranked `ReclaimSource`s (dial participants first: returning
+VMM pages inside the band is cheaper than parking a class) plus, and this is
+the design point, a list of `Unavailable`s **carrying their reason**.
+
+Four properties, each pinned and each with a failure it prevents:
+
+- **Refusal is carried, not filtered.** "Nothing can give bytes" and "three
+  things could but none may" must not look alike to a caller.
+- **VA stability is ASKED, never re-derived.** The module calls
+  `AssetClassDescriptor.va_stability_required(graph_addressed=…)` and passes
+  the route flag through, because #468's route-acquired pin flips the same
+  class's answer. Re-deriving that rule here would have created a second
+  authority for it.
+- **No silent partial** (#268): `plan_for` returns `None`, never a short list.
+  Unavailable bytes never count toward `can_fund`.
+- **No invented numbers.** Neither registry publishes a byte figure, so with
+  no probe injected a source is refused BY NAME rather than assumed empty or
+  assumed plentiful — both guesses hide.
+
+Mutation: making refusals fall through and `plan_for` return what it has fails
+5 of 16.
+
+**Deliberately not done here.** It enumerates and ranks; it does not move,
+choose a victim, or fire an actuator. The actuators have very different prices
+— a #704a rung change costs a full ~1575 ms arena refill, a GDN slot vacate
+does not — and a module that both priced and pulled would hide that. Cuts 2-4
+remain as listed in §3.
+
+**Honest limit.** Both byte probes are injected and no caller supplies them
+yet, so on a live boot this returns all-unavailable with the "no probe" reason.
+That is the intended first state: the bridge exists and says truthfully that
+nobody has taught it to measure. Wiring the dial's rows-above-floor and the
+register's live extent is the first half of Cut 2, and it needs the live
+proof named in §4 rather than a desk number.
