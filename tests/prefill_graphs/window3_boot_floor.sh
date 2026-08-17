@@ -114,19 +114,76 @@ if [ "$STAGE" = "nccl" ] || [ "$STAGE" = "all" ]; then
 fi
 
 if [ "$STAGE" = "barlink" ] || [ "$STAGE" = "all" ]; then
-  # PRECONDITION, enforced not assumed: barlink arms only run on a tree that
-  # carries the #583 fix (b001d102fa, tripped spin kernel must not kill the
-  # CUDA context), and only once barlink-583's repro window has confirmed the
-  # fix holds under live load. Operator passes BARLINK_VERDICT=confirmed.
+  # PRECONDITION 1, enforced not assumed: the #583 fix (b001d102fa, a tripped
+  # spin kernel must not kill the CUDA context) must be in the tree.
+  # STATUS 2026-08-17: MET on the current integration lineage. Kept enforced
+  # because this script also runs on older trees.
   if ! git -C "$WT" merge-base --is-ancestor b001d102fa HEAD 2>/dev/null; then
     echo "REFUSING barlink stage: #583 fix b001d102fa is not in this tree."
     exit 2
   fi
+
+  # PRECONDITION 2: an operator attestation that barlink holds under live
+  # load. STILL REQUIRED -- an attestation is not something a script may grant
+  # itself -- but its EVIDENCE BASE has moved, and a stale reason is worse
+  # than a strict one because it sends the operator to the wrong window.
+  #
+  # It used to read "barlink-583's repro window must clear the fix under live
+  # load first". No such window is recorded. What HAS since been recorded is
+  # stronger and closer to what this stage actually stresses: #632
+  # (b42405c0ee) found the bar1 mesh/a2a peer barrier deadlocking INSIDE GRAPH
+  # REPLAY -- the one defect class that would specifically break a captured
+  # arm -- replaced it with a consumption-ack barrier that is device-side and
+  # capture/replay-safe, and merged it (c6f5b57c3f) on a 2h26m+ amplified-load
+  # soak: zero aborts, zero FREEZE, 9.2M ack-barrier rounds with strict
+  # cross-rank watermark growth THROUGH graph replay.
+  #
+  # There is also a direct data point this stage's own family produced:
+  # window 4 (3b4526c4ac, 2026-08-05) booted and completed 8 barlink arms with
+  # no fault, recorded there as "a clean data point for #583".
+  #
+  # So the question the operator is attesting is no longer "did #583's repro
+  # window run" but "does the soaked barlink stack hold on THIS tree under
+  # THIS recipe". Confirm that, then pass BARLINK_VERDICT=confirmed.
+  #
+  # NOTE ON SCOPE: window 4 has since answered the barlink THROUGHPUT question
+  # this stage was built to ask -- interleaved, both points, each against its
+  # own floor: +10.25% on 1900 single-stream, -4.62% on 256x4 concurrent. This
+  # stage is therefore a CONFIRMATION run, not the primary experiment, and its
+  # 1900-only arms cover the point already measured to lose. Re-run it for a
+  # boot-floor cross-check; do not re-derive the verdict from it.
   if [ "${BARLINK_VERDICT:-}" != "confirmed" ]; then
     echo "REFUSING barlink stage: BARLINK_VERDICT is not 'confirmed'"
-    echo "(barlink-583's repro window must clear the fix under live load first)."
+    echo "(attest that the #622/#632-soaked barlink stack holds on this tree"
+    echo " under this recipe; see c6f5b57c3f's 2h26m soak. Precondition 1," 
+    echo " the #583 fix b001d102fa, is already satisfied here.)"
     exit 2
   fi
+
+  # PRECONDITION 3: the BG arm CAPTURES, so the transport must be capturable.
+  # A host-staged transport (shm/gloo/ucx) raises
+  # cudaErrorStreamCaptureUnsupported from whichever kernel happens to be
+  # capturing, which reads as an unrelated CUDA fault deep inside a boot we
+  # already paid for. Checked here, before any card is touched.
+  # Capturable: device/host always; bar1/matrix while the #369 release switch
+  # SGLANG_BARLINK_GRAPH_ENABLE is on (its default). Default transport is
+  # "device", so an unset environment passes.
+  _tp="${SGLANG_BARLINK_TRANSPORT:-device}"
+  case "$_tp" in
+    device|host) ;;
+    bar1|matrix)
+      case "${SGLANG_BARLINK_GRAPH_ENABLE:-1}" in
+        0|false|False|off|OFF)
+          echo "REFUSING barlink stage: transport '$_tp' is capturable only"
+          echo "while SGLANG_BARLINK_GRAPH_ENABLE is on, and it is off here."
+          exit 2 ;;
+      esac ;;
+    *)
+      echo "REFUSING barlink stage: SGLANG_BARLINK_TRANSPORT='$_tp' is"
+      echo "host-staged and cannot be captured; the BG arm would fault."
+      exit 2 ;;
+  esac
+
   export SGLANG_BARLINK=1
   # Only the two points the 2x2 is stated over: the long-prompt point and the
   # bs>1 short-prompt concurrency mix.

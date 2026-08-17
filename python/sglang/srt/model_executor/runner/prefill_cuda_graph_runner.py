@@ -94,6 +94,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.model_executor.runner.prefill_graph_regime import (
+    regime_permits_graph,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -656,6 +659,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # monkey-patch in replay(): the captured bs=1 graph runs the
         # transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live multi-req metadata.
+        #
+        # #613 REGIME GATE, LAST and DEFAULT OFF. Everything above is a
+        # correctness question; this is a performance one, so it runs after
+        # them and can only ever REFUSE a batch the checks above admitted --
+        # never admit one they refused. Window 4 (3b4526c4ac) measured the
+        # captured prefill at -4.62% on short concurrent batches and +10.25%
+        # on a long single-stream one under barlink, both clearing their own
+        # floors, so a blanket on/off is the wrong shape. With the lever unset
+        # this returns True and the path is byte-identical to today.
+        verdict = regime_permits_graph(
+            batch_size=forward_batch.batch_size, num_tokens=num_tokens
+        )
+        if not verdict.permits:
+            logger.debug("prefill graph refused by #613 regime gate: %s", verdict.reason)
+            return False
         return True
 
     def _build_capture_spec_info(self, num_tokens: int):

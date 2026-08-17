@@ -1141,6 +1141,28 @@ only the DECODE graph (`server_args.py:8190`) and keeps the default BREAKABLE
 prefill graph — but the breakable-compat sweep drops that prefill graph for
 `attn_cp_size > 1` and for MLA attention (`server_args.py:8278-8288`), i.e.
 every DCP plan runs the prefill satellite eager.
+**Prefill graph x barlink (#613)**: barlink NEVER gated the prefill graph —
+`git log -S'barlink' -- server_args.py cuda_graph_config.py` returns only the
+#613 fix itself. What makes production prefill eager is the upstream
+transport-agnostic `multimodal model` rule in
+`_disable_breakable_cudagraph_if_incompatible` (`server_args.py:9546`), which
+fires because the served checkpoint is a `Qwen3_5ForConditionalGeneration` with
+333 `model.visual.*` tensors. Both named barlink defects are FIXED and in
+lineage (`501ccb14b3` the graph_grid_default/1blk mismatch worth 16.1% captured
+prefill; `b001d102fa` #583 spin-kernel/CUDA-context), and #632's bar1 barrier
+deadlock INSIDE GRAPH REPLAY is fixed and soaked 2h26m (`c6f5b57c3f`).
+Measured under barlink (`3b4526c4ac`, window 4): **-4.62% at 256x4 concurrent,
++10.25% at 1900 single-stream**, each clearing its own floor (2.3x, 85x) — a
+REGIME SPLIT, so a blanket flag is the wrong shape. The actuator is per-batch:
+`prefill_graph_regime.regime_permits_graph`, consulted LAST in `can_run_graph`
+(performance may only refuse what correctness admitted), DEFAULT OFF via
+`SGLANG_PREFILL_GRAPH_REGIME`. It permits only the measured-win regime and
+refuses the 256..1974 tokens/request middle AS UNMEASURED rather than
+interpolating a crossover. Still open: the barlink eager-vs-eager CONTENT floor
+(window 4 saw 1/8 vs 4/8 under NCCL but ran the gate on pair 1 only, so the 1/8
+is indistinguishable from boot noise) and the multimodal rule itself.
+Boot validation: `bench/613/run_613_regime_gate.py` (3 arms, `--self-test`
+hermetic and pinned); `VERDICT_613_prefill_graph_barlink.md`.
 
 ## 6. Weightless KV lane
 A card holds ONLY KV + attention (no weights): chunked prefill/extend, fp8/int4
