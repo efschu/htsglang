@@ -59,6 +59,49 @@ question with a correctness surface, not a mechanical rename. Adjacent prior
 art is the #718/#719 pool-rebind work. **Not attempted here**; a wrong choice
 would be silently wrong per layer, which is the worst available outcome.
 
+### 3.1 The audit completed — one concept, ~80 inlined copies
+
+Counting the shapes that can be wrong under a set, across `python/sglang/srt`:
+
+| shape | sites | verdict |
+| --- | --- | --- |
+| `layer_id - self.start_layer` | **100** | **THE hazard** — see below |
+| `range(self.start_layer, …)` | 56 | iterate the owned SET instead; 19 are vendor NPU |
+| `end_layer - self.start_layer` | 5 | span-vs-count; the one on this rig's path is FIXED |
+| `== self.start_layer` | 6 | SAFE — "am I the first owned layer", which `min(owned)` preserves |
+| `== self.end_layer` | 2 | same shape, safe |
+
+**The 100 `layer_id - start_layer` sites are one concept, not a hundred
+problems**: translating a global layer id into a stage-LOCAL slot index. Under
+a contiguous stage that translation is a subtraction. Under a set it is a RANK
+LOOKUP — the position of `layer_id` within the sorted owned ids — and for a
+stage owning `{3, 7, 11, …}` the subtraction gives layer 7 index 4 where its
+its local index is 1.
+
+Where they live: **63 in `mem_cache/memory_pool.py`**, 19 in the vendor
+`hardware_backend/npu/memory_pool_npu.py`, 11 in
+`mem_cache/dsa_cache_layer_split.py`, 5 in
+`mem_cache/deepseek_v4_memory_pool.py`, 1 each in `model_runner.py` and
+`swa_memory_pool.py`. **That is the KV pool**, which is exactly the design
+question filed above — now with its concrete shape and count.
+
+**The accessor already exists as a concept.**
+`dsa_cache_layer_split.py:81-82` names it:
+
+```python
+def _local_layer_idx(self, layer_id: int) -> int:
+    return layer_id - self.start_layer
+```
+
+So the fix is not inventing an abstraction — it is routing ~80 inlined
+subtractions through an accessor that does a rank lookup instead. Mechanical in
+form, but with a correctness surface: each site must genuinely mean "local slot
+index" and not something else that happens to be spelled the same way, and a
+site that means something else and is converted anyway is silently wrong for
+one layer. **That is why this is filed rather than done in this cut** — 80
+call-site conversions verified individually is its own slice, and doing it
+carelessly is worse than not doing it.
+
 Also noted, not fixed: `hardware_backend/npu/memory_pool_npu.py` iterates
 `range(self.start_layer, …)` in six places; vendor-owned and not on this rig's
 path. `deepseek_v2.py`, `glm4_moe_lite.py`, `kimi_linear.py`,
