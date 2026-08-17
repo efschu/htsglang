@@ -11,7 +11,7 @@ from typing import AsyncIterator, Union
 
 import orjson
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -38,6 +38,73 @@ class OllamaServing:
     def _get_timestamp(self) -> str:
         """Get current timestamp in Ollama format."""
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    #: Ollama request fields this adapter ACCEPTS AND DOES NOT HONOUR.
+    #: #335/#710: a field the caller set that silently vanishes is the defect
+    #: class this codebase keeps paying for. Each entry says what the caller
+    #: would get instead, so a refusal teaches rather than merely blocks.
+    UNSUPPORTED_FIELDS = {
+        "format": (
+            "structured output (format=json / a JSON schema) is not wired on "
+            "the Ollama surface: this adapter drives the tokenizer manager "
+            "directly and does not reach the OpenAI front's response_format "
+            "machinery. Accepting it would return free-form text to a caller "
+            "that is about to json.loads() it. Use the OpenAI-compatible "
+            "/v1/chat/completions with response_format instead."
+        ),
+        "think": (
+            "the think field is not wired on the Ollama surface. Reasoning is "
+            "controlled by the server's --reasoning-parser and, on the "
+            "OpenAI/Anthropic fronts, by chat_template_kwargs. Accepting it "
+            "here would silently ignore an explicit request."
+        ),
+    }
+
+    #: Accepted and deliberately inert, with the reason. NOT a silent drop:
+    #: the caller's intent is satisfied, it just costs nothing here.
+    INERT_FIELDS = {
+        "keep_alive": (
+            "SGLang keeps the model resident for the process lifetime, so "
+            "keep_alive has nothing to schedule; accepted and ignored."
+        ),
+    }
+
+    #: Ollama options this adapter maps. Anything else in ``options`` is
+    #: refused by name rather than dropped -- a caller that set
+    #: repeat_penalty or num_ctx and got neither has been silently
+    #: overruled, and the output is wrong in a way nothing explains.
+    SUPPORTED_OPTIONS = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "num_predict",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+    )
+
+    def unsupported_reasons(self, request) -> list:
+        """Named refusals for anything this adapter would otherwise drop.
+
+        Returns a list of human-readable strings, empty when the request is
+        fully honourable. Kept as a pure function of the request so it can be
+        pinned without a server.
+        """
+        reasons = []
+        for field_name, why in self.UNSUPPORTED_FIELDS.items():
+            if getattr(request, field_name, None) is not None:
+                reasons.append(f"{field_name!r}: {why}")
+        options = getattr(request, "options", None) or {}
+        unknown = sorted(k for k in options if k not in self.SUPPORTED_OPTIONS)
+        if unknown:
+            reasons.append(
+                f"options {unknown}: not mapped by this adapter. Supported: "
+                f"{sorted(self.SUPPORTED_OPTIONS)}. An unmapped option would "
+                f"be dropped, so the model would sample differently than you "
+                f"asked and nothing would say so."
+            )
+        return reasons
 
     def _convert_options_to_sampling_params(self, options: dict = None) -> dict:
         """Convert Ollama options to SGLang sampling params."""
@@ -70,6 +137,23 @@ class OllamaServing:
         self, request: OllamaChatRequest, raw_request: Request
     ) -> Union[OllamaChatResponse, StreamingResponse]:
         """Handle /api/chat endpoint."""
+        # #335: refuse BEFORE generating. A field that vanishes between the
+        # request and the sampler is the #710 tool-arg-loss class: the caller
+        # is silently overruled and the output is wrong in a way nothing
+        # explains. 400 with the reasons named beats a plausible wrong answer.
+        reasons = self.unsupported_reasons(request)
+        if reasons:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        "this Ollama-compatible surface cannot honour part of "
+                        "the request, and will not answer as though it had: "
+                        + " | ".join(reasons)
+                    )
+                },
+            )
+
         model_name = self.tokenizer_manager.served_model_name
 
         # Convert messages to SGLang format
@@ -182,6 +266,23 @@ class OllamaServing:
         self, request: OllamaGenerateRequest, raw_request: Request
     ) -> Union[OllamaGenerateResponse, StreamingResponse]:
         """Handle /api/generate endpoint."""
+        # #335: refuse BEFORE generating. A field that vanishes between the
+        # request and the sampler is the #710 tool-arg-loss class: the caller
+        # is silently overruled and the output is wrong in a way nothing
+        # explains. 400 with the reasons named beats a plausible wrong answer.
+        reasons = self.unsupported_reasons(request)
+        if reasons:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        "this Ollama-compatible surface cannot honour part of "
+                        "the request, and will not answer as though it had: "
+                        + " | ".join(reasons)
+                    )
+                },
+            )
+
         model_name = self.tokenizer_manager.served_model_name
 
         # Build prompt
