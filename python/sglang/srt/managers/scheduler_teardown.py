@@ -104,3 +104,51 @@ def release_distributed(scheduler: Any, *, graceful: bool) -> Optional[str]:
             " + ".join(done),
         )
     return " + ".join(done) if done else None
+
+
+def release_dual_group_lanes(scheduler: Any, *, graceful: bool) -> Optional[str]:
+    """Stop the dual-group lane workers before the interpreter exits (#673).
+
+    From the #673 inventory: ``dual_group_lane.stop_worker`` had ZERO callers,
+    so every lane worker -- each owning a live ``torch.cuda.Stream`` and
+    launching kernels -- was leaked at teardown. This supplies the caller. The
+    component owns HOW (``stop_dual_group_lanes``); this decides WHETHER, which
+    is the same split the kvso sibling uses.
+
+    Same three properties as the rest of the family: graceful path only (on the
+    exception path the device may be wedged), never raises, idempotent.
+    """
+    if not graceful:
+        return None
+    try:
+        lanes = getattr(scheduler, "dual_group_lanes", None)
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s could not read the lanes: %s", LOG_PREFIX, e)
+        return None
+    if not lanes:
+        return None
+    try:
+        from sglang.srt.model_executor.dual_group_lane import stop_dual_group_lanes
+
+        outcomes = stop_dual_group_lanes(scheduler)
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s stopping the dual-group lanes failed: %s", LOG_PREFIX, e)
+        return None
+    if not outcomes:
+        return None
+    if any(o == "detached" for o in outcomes):
+        logger.warning(
+            "%s %d of %d lane workers had to be detached; see the "
+            "dual-group-lane warnings above for which.",
+            LOG_PREFIX,
+            sum(1 for o in outcomes if o == "detached"),
+            len(outcomes),
+        )
+    else:
+        logger.info(
+            "%s joined %d lane worker(s) before exit; their CUDA streams are "
+            "no longer in use by a live thread.",
+            LOG_PREFIX,
+            len(outcomes),
+        )
+    return " + ".join(sorted(set(outcomes)))

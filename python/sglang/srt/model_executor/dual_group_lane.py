@@ -77,6 +77,14 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
+# #673: how long teardown waits for a lane worker before detaching it. Bounded
+# and short on purpose -- the worker can be inside a kernel launch or a stream
+# sync where it never observes the stop event, and hanging shutdown is worse
+# than the abort it prevents. Replaces an unmeasured 10 s, and matches the
+# kvso-dest-io sibling so the family has one deadline class.
+DGL_WORKER_JOIN_TIMEOUT_S: float = 2.0
+DGL_LOG_PREFIX = "[#673 dual-group-lane]"
+
 __all__ = [
     "LaneColumnParallelShell",
     "LaneRowParallelShell",
@@ -2167,13 +2175,47 @@ class DualGroupLane:
             high,
         )
 
-    def stop_worker(self) -> None:
-        if self._thread is None:
-            return
+    def stop_worker(self, timeout_s: float = DGL_WORKER_JOIN_TIMEOUT_S) -> str:
+        """Stop this lane's worker thread. Returns what happened (#673).
+
+        THE HANDLE IS ONLY CLEARED ON A REAL JOIN. The previous version set
+        ``self._thread = None`` UNCONDITIONALLY after a timed-out join, with no
+        ``is_alive()`` check and no log. A thread still running -- with its own
+        CUDA stream, launching kernels -- was detached silently AND the object
+        forgot it existed, so a second call returned success for a thread it
+        had abandoned. That is the #673 abort shape with the evidence deleted.
+
+        THE DEADLINE IS BOUNDED, and short. The old 10 s was never measured
+        against anything; a teardown budget is seconds, not tens of seconds,
+        and this worker can be parked in a kernel launch or a stream sync where
+        it will not observe the stop event at all. Waiting longer would trade
+        an abort for a hang, which is worse: the abort at least ends the
+        process.
+
+        Never raises, idempotent.
+        """
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.is_alive():
+            self._thread = None
+            return "already stopped"
         self._stop.set()
         self._wake.set()
-        self._thread.join(timeout=10.0)
+        thread.join(timeout=float(timeout_s))
+        if thread.is_alive():
+            logger.warning(
+                "%s %s did not stop within %.2fs and is being DETACHED "
+                "deliberately. It owns a CUDA stream and launches kernels, so "
+                "it is most likely inside one; waiting further would hang "
+                "shutdown instead of ending it. The handle is KEPT so the leak "
+                "stays visible -- a later stop will report 'detached' again "
+                "rather than claiming success.",
+                DGL_LOG_PREFIX,
+                thread.name,
+                float(timeout_s),
+            )
+            return "detached"
         self._thread = None
+        return "joined"
 
     def _worker_loop(self) -> None:
         with self._lane_runtime_scope():
@@ -5554,6 +5596,34 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
             concurrent,
             lane_draft_mib,
         )
+
+
+def stop_dual_group_lanes(scheduler) -> list:
+    """Stop every lane this module built for ``scheduler`` (#673).
+
+    THE COUNTERPART THAT WAS MISSING. ``build_dual_group_lanes`` had no
+    opposite number, so ``DualGroupLane.stop_worker`` sat with ZERO callers and
+    every lane worker -- each owning a live ``torch.cuda.Stream`` -- was leaked
+    at exit. The component keeps the knowledge of how to stop what it built;
+    the caller only decides whether now is the time.
+
+    Never raises and never stops early: one lane refusing to stop must not
+    strand the lanes behind it in the list, because those are the ones still
+    holding streams.
+    """
+    lanes = getattr(scheduler, "dual_group_lanes", None) or []
+    outcomes = []
+    for lane in lanes:
+        try:
+            outcomes.append(lane.stop_worker())
+        except Exception as e:  # noqa: BLE001 - teardown must not raise
+            logger.warning(
+                "%s stopping lane %s failed: %s",
+                DGL_LOG_PREFIX,
+                getattr(lane, "lane_id", "?"),
+                e,
+            )
+    return outcomes
 
 
 def resolve_lane_spec_rungs(server_args) -> Tuple[int, ...]:

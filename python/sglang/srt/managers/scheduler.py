@@ -9573,6 +9573,16 @@ def run_scheduler_process(
             from sglang.srt.managers.scheduler_teardown import release_distributed
 
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
+            # #673: stop the dual-group lane workers. Each owns a live CUDA
+            # stream and launches kernels, and stop_worker had ZERO callers --
+            # so at exit they were joinable std::threads inside CUDA work, the
+            # same abort shape as the collectives above. Bounded join, and a
+            # detach on the deadline is logged rather than implied.
+            from sglang.srt.managers.scheduler_teardown import (
+                release_dual_group_lanes,
+            )
+
+            release_dual_group_lanes(scheduler, graceful=scheduler.gracefully_exit)
 
 
 # ---------------------------------------------------------------------------
