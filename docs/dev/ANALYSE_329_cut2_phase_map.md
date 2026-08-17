@@ -18,11 +18,11 @@ a general per-session KV export, and nothing composes the four.
 | SNAPSHOT | weights → disk | **EXISTS**, in-process | `park_weights_to_disk` `model_loader/hibernate.py:474-605`, writer `sparse_write.py:273` (#456) |
 | SNAPSHOT | GDN/mamba state | **EXISTS**, in-process, tested | `MambaPool.export_state_blob` `mem_cache/memory_pool.py:970-1023` |
 | SNAPSHOT | buffers incl. non-persistent | **EXISTS**, general rule, twice | `weight_updater.py:361-366`; `translator/ledger.py:436-446` (post-#568) |
-| SNAPSHOT | KV per session, general export | **MISSING** | closest is OOM-pressure spill `kv_session_offload.py`; cross-process `session_handover.py` |
+| SNAPSHOT | KV per session, general export | **EXISTS**, other lineage | `session_handover.export_session_snapshot:415` on `train/0818-desk-410-reconcile`; see `ANALYSE_329_per_session_kv_determination.md` |
 | RESTORE | **weights, in-process** | **MISSING** | `HibernateModelLoader.load_model` `model_loader/loader.py:2468-2545` builds a NEW skeleton via `_initialize_model` `:2529` — cold-process shaped, selected at parse time `server_args.py:16097-16109` |
 | RESTORE | GDN/mamba state | **EXISTS**, in-process | `import_state_blob` `memory_pool.py:1024-1055` |
 | RESTORE | buffers | **EXISTS**, in-place into the live model | `_import_static_state` `weight_updater.py:369-374` |
-| RESTORE | KV per session, general import | **MISSING** | same as its export half |
+| RESTORE | KV per session, general import | **EXISTS**, other lineage | `session_handover.verify_import:253` (present on both lineages) |
 | RESUME | bring graphs back | **EXISTS**, two mechanisms | recapture `model_runner.py:2822-2830` → `:3643`; **VMM remap** `weight_updater.py:228-245` + `torch_memory_saver_adapter.py:50-92` |
 | RESUME | unpark drafter | **EXISTS, UNWIRED** | as above |
 | RESUME | re-open admission | **EXISTS**, wired | `tokenizer_manager.py:1787-1791`; `scheduler.py:7998-8018` |
@@ -83,7 +83,9 @@ Not built, and named rather than smuggled:
 * the in-process weight RESTORE (the missing phase above) — it needs a live
   model to take bytes back without rebuilding a skeleton, and that is a
   serving-path change requiring review and a boot;
-* the general per-session KV export/import;
+* wiring the two `world_roundtrip` snapshot seams to the EXISTING per-session
+  mover -- blocked on Slot-3's #410 A+B reconciliation, see
+  `ANALYSE_329_per_session_kv_determination.md`;
 * wiring the drafter lifecycle, which has been unwired since #309 and is pinned
   as such;
 * the byte-identity window falsifier: round-trip identity of KV and GDN state

@@ -3467,8 +3467,24 @@ taxonomy and the global importance ladder.
   (`model_loader/loader.py:2468`) rebuilds a NEW skeleton via
   `_initialize_model` (`:2529`) and is selected at parse time
   (`server_args.py:16097`) — cold-process shaped. GDN blob and buffer
-  restore already work in-process; per-session KV export/import and the
-  orchestrator were the other holes, the latter closed here.
+  restore already work in-process; the orchestrator was the other hole and is
+  closed here.
+  PER-SESSION KV EXPORT/IMPORT IS **NOT** A HOLE — determination on record,
+  do not re-litigate (`ANALYSE_329_per_session_kv_determination.md`). The
+  canonical mover is `session_handover.export_session_snapshot` with
+  `verify_import` as its half — "there is exactly ONE session serialization in
+  this fork" (`session_checkpoint.py`) — and it already carries KV pages AND
+  the GDN blob, refuses a hybrid-GDN export without the blob (#212), and
+  encodes the owner rules a new mover would have had to re-derive:
+  `GEOMETRY_FIELDS = ("tp_size", "page_size", "dcp_owner_mode")`,
+  `page_size == 1` inherited from `dcp_owner_mode`, mismatch refused by name
+  in `verify_geometry`, and `REFUSED_HOST_LAYOUTS = ("page_head",)`. It is NOT
+  `kv_session_offload`, which is spill-to-keep-computing (resume flag default
+  OFF) rather than the at-rest counterpart. What remains for #329 is only to
+  wire the two `_Seams` snapshot callables to it per session — a small change
+  that WAITS on the #410 A+B reconciliation, because
+  `export_session_snapshot` currently lives on that lineage and writing a
+  second serialization is the one thing its owner module forbids.
   CORRECTION ON RECORD, do not re-litigate: the #568 non-persistent-buffer fix
   **does generalize**. It is a rule over the persistence property —
   `translator/ledger.py:436` iterates `named_buffers()` and carries every
