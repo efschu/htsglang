@@ -237,3 +237,69 @@ That is the intended first state: the bridge exists and says truthfully that
 nobody has taught it to measure. Wiring the dial's rows-above-floor and the
 register's live extent is the first half of Cut 2, and it needs the live
 proof named in §4 rather than a desk number.
+
+## 7. Cut 2 FIRST HALF DELIVERED (2026-08-17) — the two byte probes
+
+The bridge no longer answers all-unavailable when a caller supplies probes.
+
+**Dial side** — `vram_dial.reclaimable_bytes_for(participant, floor_rows)`. A
+LIVE read: `full_pool_backed_rows` (the bound eager launches actually pass,
+the same quantity `verify_pool_reached_capacity` checks a commit against) times
+`_pool_row_nbytes` (the pool's real per-row K+V bytes), minus the floor.
+
+`floor_rows` is **required and not derived there**. There is no per-pool floor
+authority in that module — the dial's floor is a card-level NVML measurement
+(`_measure_local_floor_bytes`) taken at boot — and inventing a per-pool one
+would create a second authority for a number #584 says has exactly one.
+
+**Register side** — `OffloadRegister.reclaimable_bytes(offload_class)`,
+mirroring `latency_term_ms`'s lock-and-filter shape so the register answers
+about itself rather than the bridge re-deriving its accounting. Resident AND
+not hot: parked bytes are already gone (counting them promises the same bytes
+twice) and `park()` refuses hot items unconditionally, so hot bytes are
+resident but not reclaimable. An unanswerable hotness predicate counts as HOT
+— the safe direction is refusing to reclaim, never assuming free to move.
+
+**The distinction the whole cut turns on:** `ProbeUnavailable` vs zero. Zero is
+a measurement ("at its floor" / "nothing resident"); a failed probe is the
+absence of one. Both probes return `None`/raise rather than 0, and the bridge
+turns that into a NAMED refusal. Collapsing them would remove a real source
+from an elastic plan while looking like it was considered — the #606
+defaulted-measurement defect. Mutation: making a failed probe collapse to 0
+fails 3 of 30 pins.
+
+**HONEST LIMIT, unchanged.** The hermetic proof exercises the PLUMBING with
+faked dial/register state. No live number's correctness is claimed here; that
+remains the window item §4 already names. In particular the dial probe is only
+as right as the floor its caller supplies, and no caller supplies one yet.
+
+## 8. Cold-direction policy — SKETCH ONLY, not built
+
+What would consume the bridge on a tenant-idle event. Recorded so the shape is
+on record before anyone writes it; every number below is a placeholder.
+
+1. **Event.** Tenant idle timer fires (the translator already has one, #546
+   `ledger.park_all`). The event carries a tenant id and nothing else — it does
+   not name an actuator.
+2. **Query.** `enumerate_reclaim_sources(graph_addressed=<route>)`. If
+   `plan_for(want)` returns None, the event ends there: refuse, do not take a
+   partial. There is no "free what you can" path, by design (#268).
+3. **Order: cheap first.** GDN slot vacate (#364) before the dial, because the
+   dial's grow/shrink is in-band VMM work while a slot vacate is a pure
+   release. The bridge's `cost_rank` already encodes this ordering; the policy
+   consumes it rather than re-deciding.
+4. **Then the dial** (#330) grows the KV pool into the freed bytes, staying
+   below the captured bound — above it, re-capture is not built and the event
+   must stop rather than attempt one.
+5. **Debounce, and #704a is the reason.** A rung change costs a full ~1575 ms
+   arena refill. An idle/hot flap that crossed a rung boundary twice would pay
+   that twice for no net capacity. So: hysteresis on the EVENT (a tenant must
+   stay idle for N ticks) and a separate refusal if the plan would cross a rung
+   boundary within a cooldown. Without that the policy is a thrash generator
+   with good intentions — the same reasoning the KVSO spill/restore pendulum
+   already carries as `SpillCooldownRegistry`.
+
+**Stays refused / design-only:** anything requiring a geometry flip. Those
+share the #677 arming-floor budget, and the flip's price is a separate
+decision with its own gate — see NOTE_677 §5 for why crediting on-demand
+capacity against a standing floor is not a small build.

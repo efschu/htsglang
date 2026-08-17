@@ -225,3 +225,180 @@ class TestItReadsTheRealRegistriesByDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCut2TheProbesAreWired(unittest.TestCase):
+    """#553 Cut 2 first half: the bridge stops answering all-unavailable.
+
+    Before this, every source came back refused with "no probe supplied".
+    These pins are the transition -- a wired probe turns a specific source
+    from refused-no-probe into ranked-with-bytes -- and, more importantly,
+    that a probe which CANNOT MEASURE still refuses by name rather than
+    ranking the source at zero (#606: zero is a measurement, a failed probe
+    is the absence of one, and collapsing them removes a real source from an
+    elastic plan while looking like it was considered).
+    """
+
+    def test_a_wired_dial_probe_turns_refusal_into_a_ranked_source(self):
+        before = _view(dial_participants=[_Participant()])
+        self.assertEqual(before.available, ())
+        self.assertIn("will not invent", before.unavailable[0].reason)
+
+        after = _view(
+            dial_participants=[_Participant()],
+            dial_reclaimable_bytes=lambda p: 8192,
+        )
+        self.assertEqual(len(after.available), 1)
+        self.assertEqual(after.available[0].reclaimable_bytes, 8192)
+
+    def test_an_unmeasurable_dial_probe_refuses_by_name(self):
+        """THE #606 PIN. Not 0 bytes; a named refusal."""
+        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+
+        def _blind(participant):
+            raise ProbeUnavailable("unbooted pool")
+
+        view = _view(
+            dial_participants=[_Participant()], dial_reclaimable_bytes=_blind
+        )
+        self.assertEqual(view.available, ())
+        self.assertEqual(len(view.unavailable), 1)
+        self.assertIn("unbooted pool", view.unavailable[0].reason)
+
+    def test_an_unmeasurable_asset_probe_refuses_by_name(self):
+        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+
+        def _blind(name, descriptor):
+            raise ProbeUnavailable("no offload register on this process")
+
+        view = _view(
+            asset_classes={"experts": _Descriptor()},
+            asset_reclaimable_bytes=_blind,
+        )
+        self.assertEqual(view.available, ())
+        self.assertIn("no offload register", view.unavailable[0].reason)
+
+    def test_a_measured_zero_is_distinguishable_from_an_unmeasured_one(self):
+        """The distinction the whole exception exists for."""
+        measured = _view(
+            dial_participants=[_Participant()], dial_reclaimable_bytes=lambda p: 0
+        )
+        self.assertIn("floor", measured.unavailable[0].reason)
+
+        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+
+        def _blind(p):
+            raise ProbeUnavailable("unmeasurable row width")
+
+        unmeasured = _view(
+            dial_participants=[_Participant()], dial_reclaimable_bytes=_blind
+        )
+        self.assertIn("unmeasurable", unmeasured.unavailable[0].reason)
+        self.assertNotEqual(
+            measured.unavailable[0].reason, unmeasured.unavailable[0].reason
+        )
+
+
+class TestCut2TheDialProbeReadsLive(unittest.TestCase):
+    """``vram_dial.reclaimable_bytes_for``: a live read, None when unknown."""
+
+    class _Pool:
+        def __init__(self, backed=None, rows_raise=False):
+            self.full_pool_backed_rows = backed
+            self._raise = rows_raise
+            self.full_kv_pool = self
+
+        @property
+        def k_buffer(self):
+            if self._raise:
+                raise RuntimeError("no buffers")
+            import torch
+
+            return [torch.zeros(4, 8)]
+
+        @property
+        def v_buffer(self):
+            import torch
+
+            return [torch.zeros(4, 8)]
+
+    def _probe(self, pool, floor):
+        from sglang.srt.managers.vram_dial import reclaimable_bytes_for
+
+        return reclaimable_bytes_for(
+            type("P", (), {"pool": pool})(), floor
+        )
+
+    def test_no_floor_authority_is_none_not_zero(self):
+        self.assertIsNone(self._probe(self._Pool(backed=100), None))
+
+    def test_unreadable_backed_rows_is_none_not_zero(self):
+        self.assertIsNone(self._probe(self._Pool(backed=None), 10))
+
+    def test_unmeasurable_row_width_is_none_not_zero(self):
+        self.assertIsNone(self._probe(self._Pool(backed=100, rows_raise=True), 10))
+
+    def test_at_or_below_the_floor_is_a_measured_zero(self):
+        self.assertEqual(self._probe(self._Pool(backed=10), 10), 0)
+        self.assertEqual(self._probe(self._Pool(backed=5), 10), 0)
+
+    def test_rows_above_the_floor_become_bytes(self):
+        # one row = k(8 floats*4B) + v(8 floats*4B) = 64 B
+        self.assertEqual(self._probe(self._Pool(backed=12), 10), 2 * 64)
+
+
+class TestCut2TheRegisterProbeExcludesWhatItMustNot(unittest.TestCase):
+    """``OffloadRegister.reclaimable_bytes``: resident AND not hot."""
+
+    def _register(self, items):
+        from sglang.srt.model_executor.offload_register import OffloadRegister
+
+        reg = OffloadRegister.__new__(OffloadRegister)
+        import threading
+
+        reg._lock = threading.RLock()
+        reg._items = {str(i): it for i, it in enumerate(items)}
+        return reg
+
+    def _item(self, cls="experts", size=100, parked=False, hot=False, hot_raises=False):
+        def _hot():
+            if hot_raises:
+                raise RuntimeError("cannot answer")
+            return hot
+
+        return type(
+            "I",
+            (),
+            {
+                "offload_class": cls,
+                "size_bytes": size,
+                "parked": parked,
+                "hot": staticmethod(_hot),
+            },
+        )()
+
+    def test_resident_and_cold_counts(self):
+        reg = self._register([self._item(size=100), self._item(size=50)])
+        self.assertEqual(reg.reclaimable_bytes("experts"), 150)
+
+    def test_parked_bytes_are_not_counted_twice(self):
+        reg = self._register([self._item(size=100, parked=True), self._item(size=50)])
+        self.assertEqual(reg.reclaimable_bytes("experts"), 50)
+
+    def test_hot_items_are_excluded_because_park_refuses_them(self):
+        reg = self._register([self._item(size=100, hot=True), self._item(size=50)])
+        self.assertEqual(
+            reg.reclaimable_bytes("experts"),
+            50,
+            "hot bytes are resident but NOT reclaimable; counting them hands "
+            "the caller a figure it cannot spend",
+        )
+
+    def test_an_unanswerable_hotness_predicate_is_treated_as_hot(self):
+        """Safe direction: refuse to reclaim, never assume free to move."""
+        reg = self._register([self._item(size=100, hot_raises=True)])
+        self.assertEqual(reg.reclaimable_bytes("experts"), 0)
+
+    def test_other_classes_do_not_leak_in(self):
+        reg = self._register([self._item(cls="other", size=999), self._item(size=50)])
+        self.assertEqual(reg.reclaimable_bytes("experts"), 50)

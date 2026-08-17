@@ -807,6 +807,40 @@ class OffloadRegister:
         with self._lock:
             return sum(i.size_bytes for i in self._items.values() if not i.parked)
 
+    def reclaimable_bytes(self, offload_class: Optional[str] = None) -> int:
+        """#553 Cut 2: bytes this class could give back RIGHT NOW.
+
+        Resident AND not hot. Both conditions are load-bearing:
+
+        * ``parked`` bytes are already gone -- counting them would promise the
+          same bytes twice;
+        * ``hot()`` items are refused by ``park()`` unconditionally, so their
+          bytes are resident but NOT reclaimable. Including them would hand a
+          caller a figure it cannot spend, which is the silent-partial shape
+          the #553 bridge exists to avoid.
+
+        Reads under the register's own lock and from its own items, so this is
+        the register answering about itself rather than a second authority
+        re-deriving its accounting from outside.
+        """
+        with self._lock:
+            total = 0
+            for item in self._items.values():
+                if item.parked:
+                    continue
+                if offload_class is not None and item.offload_class != offload_class:
+                    continue
+                try:
+                    if item.hot():
+                        continue
+                except Exception:
+                    # A hotness predicate that cannot answer is treated as HOT.
+                    # The safe direction is refusing to reclaim, not assuming
+                    # the item is free to move.
+                    continue
+                total += int(item.size_bytes)
+            return total
+
     def retrieval_latency_ms(self, item_id: str) -> float:
         """The #279-dispatcher view of an item: a parked item contributes its
         estimated wave-in latency as a LATENCY TERM; a resident item

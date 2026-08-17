@@ -62,6 +62,7 @@ import dataclasses
 from typing import Callable, List, Optional, Sequence, Tuple
 
 __all__ = [
+    "ProbeUnavailable",
     "ReclaimSource",
     "Unavailable",
     "ReclaimView",
@@ -72,6 +73,16 @@ __all__ = [
 #: half of the bridge produced a row without importing either module.
 ORIGIN_DIAL = "vram_dial"
 ORIGIN_ASSET = "offload_register"
+
+
+class ProbeUnavailable(RuntimeError):
+    """A probe could not measure. Distinct from measuring zero.
+
+    #606: a probe that fails must NOT be reported as 0 bytes available. Zero
+    is a measurement ("this source is at its floor / holds nothing"); a failed
+    probe is the absence of one. Collapsing them removes a real source from an
+    elastic plan while looking like it was considered.
+    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,6 +178,62 @@ def _default_asset_classes():
     return ASSET_CLASSES
 
 
+def dial_probe(floor_rows_for: Callable[[object], Optional[int]]):
+    """#553 Cut 2: the real dial probe, given a floor authority.
+
+    ``floor_rows_for`` is injected rather than looked up because this module
+    must not become a second authority for the floor -- the dial derives it
+    from a card-level NVML measurement and #584 says that number has one
+    owner. A caller that has no floor gets a refusal, which is the honest
+    answer and keeps the bridge's "no probe" path meaningful.
+
+    Returns a callable suitable for ``dial_reclaimable_bytes``. It raises
+    :class:`ProbeUnavailable` rather than returning 0 when the live read
+    fails, so the caller refuses BY NAME instead of ranking a source at zero
+    that was never measured (#606).
+    """
+
+    def _probe(participant) -> int:
+        from sglang.srt.managers.vram_dial import reclaimable_bytes_for
+
+        nbytes = reclaimable_bytes_for(participant, floor_rows_for(participant))
+        if nbytes is None:
+            raise ProbeUnavailable(
+                "dial reclaimable bytes unreadable (unbooted pool, missing "
+                "floor authority, or unmeasurable row width)"
+            )
+        return int(nbytes)
+
+    return _probe
+
+
+def asset_probe(register=None):
+    """#553 Cut 2: the real per-class probe over the #286 register.
+
+    Delegates to ``OffloadRegister.reclaimable_bytes(class)`` -- resident and
+    NOT hot, computed under the register's own lock -- rather than summing
+    items here. Same reason as the dial side: the register answers about
+    itself.
+    """
+
+    def _probe(name: str, descriptor) -> int:
+        reg = register
+        if reg is None:
+            from sglang.srt.model_executor.offload_register import get_global_register
+
+            reg = get_global_register()
+        if reg is None:
+            raise ProbeUnavailable("no offload register on this process")
+        fn = getattr(reg, "reclaimable_bytes", None)
+        if fn is None:
+            raise ProbeUnavailable(
+                "offload register has no reclaimable_bytes accessor"
+            )
+        return int(fn(name))
+
+    return _probe
+
+
 def enumerate_reclaim_sources(
     *,
     graph_addressed: bool = False,
@@ -211,7 +278,13 @@ def enumerate_reclaim_sources(
                 )
             )
             continue
-        nbytes = int(dial_reclaimable_bytes(participant))
+        try:
+            nbytes = int(dial_reclaimable_bytes(participant))
+        except ProbeUnavailable as e:
+            unavailable.append(
+                Unavailable(name=name, origin=ORIGIN_DIAL, reason=str(e))
+            )
+            continue
         if nbytes <= 0:
             unavailable.append(
                 Unavailable(
@@ -271,7 +344,13 @@ def enumerate_reclaim_sources(
                 )
             )
             continue
-        nbytes = int(asset_reclaimable_bytes(name, descriptor))
+        try:
+            nbytes = int(asset_reclaimable_bytes(name, descriptor))
+        except ProbeUnavailable as e:
+            unavailable.append(
+                Unavailable(name=name, origin=ORIGIN_ASSET, reason=str(e))
+            )
+            continue
         if nbytes <= 0:
             unavailable.append(
                 Unavailable(name=name, origin=ORIGIN_ASSET, reason="nothing resident")
