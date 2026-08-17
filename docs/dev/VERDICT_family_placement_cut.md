@@ -35,6 +35,19 @@ two goals that can be traded against each other; they are one monotone knob.
 **The incumbent sits exactly on the frontier** -- 31 is the most layers a stage
 can hold while carrying only 7 FA layers. There is no slack being left unused.
 
+### The FULL version is transport-foreclosed, not merely frontier-foreclosed
+
+The frontier above bounds what a CONTIGUOUS cut can do. The plan in its full
+form -- ALL 48 GDN layers on the 5090, ALL 16 full-attention layers on the
+3080s -- is not a cut at all: it requires NON-CONTIGUOUS stage assignment, and
+the period-4 interleave then forces the activation to change card at almost
+every block boundary. Walking the layer chain under that placement gives **31
+card crossings per token, against 2 for the incumbent (PP0->PP1->PP2) -- 15.5x
+more**. This rig has no P2P and every pair is PHB, so each crossing is a
+host-staged hop. The full plan is therefore foreclosed by the interconnect
+before the memory ledger is even consulted, and no cut solver can rescue it:
+the cost is in the placement's shape, not in the boundary's position.
+
 ### What `--pp-attn-stage-ratio` really buys, and its bound
 
 Called through `derive_pp_layer_split` both ways on the real checkpoint:
