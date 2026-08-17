@@ -127,9 +127,72 @@ returned" presupposes the breakage is currently GONE; for both guards it is
 not. Writing pins now would encode a green state that does not exist. They
 belong with the fixes, and each fix is named above.
 
-## Not delivered
+## Follow-up round: the three items closed
 
-The #261-Gate short-run without the harness shim is **not** written. Preparing
-it turnkey needs the gate's shim details verified at the code, which I have not
-done, and shipping a script I cannot stand behind would be worse than saying
-so. It is the one item of this brief left open.
+### 1. The guard shipped
+
+`check_page_head_alignment` in `sgl-kernel/csrc/kvcacheio/transfer.cu`,
+called from **both** page-head entries — `transfer_kv_all_layer_lf_ph` and
+`transfer_kv_per_layer_ph_lf`. Guarding only the reported one would have left
+the same asymmetry #717 was reverted for: a defect that looks fixed from one
+side.
+
+The message names the two facts that explain the rule — the `.b64` PTX width
+and the subdividing offset formula — because a reader who learns only the rule
+will work around it by changing `head_num`.
+
+Pinned in `test_page_head_offset_alignment_441.py`: the predicate refuses the
+faulting shape, does **not** falsely refuse the reported-crash shapes or this
+rig's shapes, and agrees with actual offset alignment on every shape (so a
+future edit cannot keep the tests green by tuning the constant). A source pin
+holds it wired at both entries. Mutation proof: unguarding one entry and
+weakening the predicate to the old `% 8` turns 2 pins red.
+
+### 2. Both reason strings corrected
+
+`sgl-kernel/tests/test_kvcacheio.py`: the skip now states that the segfault
+reproduces on **both wheels**, that the root is **not yet attributed**, that
+the alignment defect found here is real but is *not* this crash's cause, and
+where the metal falsifier lives. The `>= 13` condition is deliberately left
+as-is and the note says why: widening it would hide the cu12 signal the
+falsifier needs, removing it would hand CI a known segfault.
+
+`test_minimax_sparse_pool_host_unit.py`: the batchcopy comment now leads with
+the reading it previously only implied — the flag guards a **contract
+violation committed by the test**, not a wheel, ABI or CUDA-13 bug, and the
+measured matrix proves it because the pinned + side-stream cell passes on the
+same wheel that fails the other three. It states explicitly that the #436
+rebuild cannot make it obsolete, since a rebuild cannot change a contract the
+test breaks by construction.
+
+### 3. #261 gate: the "shim" is LOAD-BEARING, and the meaningful variant is filed
+
+Verified at the code, which is what was owed. Step 4 of
+`scripts/handover/live_handover_gate.sh` is
+`python -m sglang.srt.mem_cache.hicache_migrate` with `--target-tp-size` /
+`--target-ratios` / GDN layout arguments.
+
+**It is not a harness shim.** The live gate runs source A at TP=1 and
+destination B at TP=N (`live_handover_gate.sh:37`), and stored KV pages and GDN
+state blobs carry the source's shard geometry. Without the conversion, B is not
+reading the host tier the hard way — it is handed bytes in a layout it cannot
+interpret. A no-shim 1→N run would fail for a reason unrelated to the host
+tier, so it is structurally meaningless, exactly the stop condition the brief
+named. The cross-geometry handover *is* the umsharder; removing it removes the
+thing under test.
+
+**What is meaningful** is to hold the geometry EQUAL and drop the migration:
+then no conversion is needed by construction and what remains under test is
+the host tier end to end — write-through to the store, park/export, prefetch
+on the destination, resume from cache, byte-identical continuation. Weaker
+than the 1→N gate, and real.
+
+Filed as `scripts/handover/hostier_gate_noshim.sh` (syntax-checked, refuses
+cleanly on missing env; not run). Its preflight **refuses** when the two
+servers' geometry/checkpoint differ, rather than producing a red a reader
+could mistake for a host-tier finding — that refusal is the script's safety
+property. It also keeps the two load-bearing pieces of the original gate: the
+A-vs-A floor first (a cross-server byte claim on a rig whose own repeat is not
+byte-identical is not a claim about handover) and `--expect-cached` (without
+it a destination that simply re-prefilled reproduces the same greedy tokens
+and the comparison passes while proving nothing).

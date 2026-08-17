@@ -45,6 +45,7 @@ this file pins that fact too so the distinction cannot be lost. Attributing
 that crash needs the GPU falsifier filed alongside this analysis.
 """
 
+import pathlib
 import unittest
 
 # transfer.cu:20-23 -- the copy helper's unit is uint64_t.
@@ -211,6 +212,107 @@ class TestWhatThisDoesNotExplain(unittest.TestCase):
         """No production shape on this rig is exposed to the defect."""
         self.assertEqual(RIG.head_size, 256)
         self.assertEqual(RIG.misaligned_ph(), [])
+
+
+KERNEL_SRC = (
+    pathlib.Path(__file__).resolve().parents[4]
+    / "sgl-kernel"
+    / "csrc"
+    / "kvcacheio"
+    / "transfer.cu"
+)
+
+
+def guard_predicate(shape):
+    """The shipped guard's condition, transcribed from `check_page_head_alignment`.
+
+    Kept as its own function so the pins below test the PREDICATE, not a
+    restatement of the shapes -- a predicate that merely enumerated the known
+    cases would pass every test here and still admit the next bad shape.
+    """
+    return shape.item_size % (PTX_ALIGNMENT * shape.head_num) == 0
+
+
+class TestTheShippedGuard(unittest.TestCase):
+    """The guard must refuse exactly the shapes that would fault.
+
+    This suite cannot compile CUDA, so it pins two things that together are
+    the claim: the predicate is right (arithmetic, here) and the predicate is
+    WIRED at both page-head entries (source, below). Either alone would be a
+    half-truth -- a correct predicate nobody calls, or a call site whose
+    condition is wrong.
+    """
+
+    def test_the_guard_refuses_the_faulting_shape(self):
+        self.assertTrue(
+            FAULTING.passes_launcher_guard,
+            "precondition: the old guard admitted this shape",
+        )
+        self.assertFalse(
+            guard_predicate(FAULTING),
+            "the new guard must refuse head_num=2 head_dim=2 fp16 loudly "
+            "instead of letting it fault inside the kernel",
+        )
+
+    def test_the_guard_does_not_falsely_refuse_the_reported_crash_shapes(self):
+        """No false refusal: these shapes are aligned and must still run."""
+        self.assertTrue(guard_predicate(MINIMAX_TEST))
+
+    def test_the_guard_does_not_falsely_refuse_the_rig_shapes(self):
+        self.assertTrue(guard_predicate(RIG))
+
+    def test_the_predicate_agrees_with_the_offsets_on_every_shape(self):
+        """The guard is right for the REASON it claims, not by coincidence.
+
+        Its condition must match actual offset alignment on each shape, so a
+        future edit that keeps the tests green by adjusting the constant gets
+        caught.
+        """
+        for shape in (FAULTING, RIG, MINIMAX_TEST):
+            with self.subTest(head_num=shape.head_num, head_dim=shape.head_dim):
+                self.assertEqual(
+                    guard_predicate(shape),
+                    not shape.misaligned_ph(),
+                    "the guard admits exactly the shapes whose page-head "
+                    "offsets are all 8-byte aligned",
+                )
+
+
+class TestTheGuardIsWiredAtBothEntries(unittest.TestCase):
+    """Source pin. Guarding one direction and not the other is the asymmetry
+    class #717 was reverted for -- a defect that looks fixed from one side."""
+
+    def setUp(self):
+        if not KERNEL_SRC.exists():  # pragma: no cover - source tree layout
+            self.skipTest(f"kernel source not present at {KERNEL_SRC}")
+        self.src = KERNEL_SRC.read_text()
+
+    def test_the_guard_exists_with_the_proven_condition(self):
+        self.assertIn("check_page_head_alignment", self.src)
+        self.assertIn("item_size % (8 * head_num) == 0", self.src)
+
+    def test_both_page_head_entries_call_it(self):
+        for entry in (
+            "transfer_kv_all_layer_lf_ph",
+            "transfer_kv_per_layer_ph_lf",
+        ):
+            with self.subTest(entry=entry):
+                self.assertIn(
+                    f'check_page_head_alignment(item_size, head_num, "{entry}")',
+                    self.src,
+                )
+
+    def test_the_message_teaches_the_reason_not_just_the_rule(self):
+        """A reader hitting this must learn WHY. The two facts that explain
+        it are the PTX width and the subdividing formula; without them the
+        message is just a rule to work around."""
+        for token in (
+            "ld.global.nc.b64",
+            "get_global_offset_ph",
+            "head_size=",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, self.src)
 
 
 if __name__ == "__main__":

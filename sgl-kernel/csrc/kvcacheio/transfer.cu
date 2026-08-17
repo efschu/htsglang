@@ -256,6 +256,54 @@ __global__ void transfer_kernel_impl(
   }
 }
 
+// #441: the page-head layout's alignment precondition, which the launcher's
+// own `item_size % 8` check does NOT cover.
+//
+// WHY IT IS SEPARATE. `transfer_item_warp` moves bytes with 64-bit PTX
+// (`ld.global.nc.b64` / `st.global.cg.b64`, this file, ~line 29), and `.b64`
+// faults on a misaligned address rather than taking a slow path. Every
+// non-page-head offset function builds addresses only as multiples of
+// `item_size_bytes` and of `layout_dim` (= item_size * layers), so those
+// paths inherit alignment from `item_size % 8 == 0` and need nothing more.
+//
+// `get_global_offset_ph` does not. It SUBDIVIDES by `head_num` in three of
+// its four terms:
+//
+//     page_dim / head_num * head_id * page_size
+//     page_id % page_size * page_dim / head_num
+//     layer_id * item_size_bytes / head_num
+//
+// and the page-head kernel copies `head_size_bytes = item_size / head_num`
+// rather than a whole item. So a shape can satisfy `item_size % 8 == 0` and
+// still generate misaligned 64-bit accesses -- e.g. head_num=2, head_dim=2,
+// fp16: item_size=8 passes, head_size=4 does not.
+//
+// Refusing loudly here is the point: the failure this replaces is a segfault
+// inside a kernel, which tells the reader nothing about which of the two
+// alignment conditions they violated.
+inline void check_page_head_alignment(int64_t item_size, int64_t head_num, const char* fn_name) {
+  TORCH_CHECK(head_num > 0, fn_name, ": head_num must be positive, got ", head_num);
+  TORCH_CHECK(
+      item_size % (8 * head_num) == 0,
+      fn_name,
+      ": page-head layout needs item_size divisible by 8*head_num, but "
+      "item_size=",
+      item_size,
+      " head_num=",
+      head_num,
+      " gives head_size=",
+      item_size / head_num,
+      " bytes, which is not 8-byte aligned. The page-head offset formula "
+      "(get_global_offset_ph) subdivides every address term by head_num, and "
+      "the copy helper moves 64-bit words with ld.global.nc.b64 / "
+      "st.global.cg.b64, which FAULT on a misaligned address. The launcher's "
+      "item_size % 8 check does not cover this: it holds for the layer-first "
+      "and page-first paths, whose offsets are whole multiples of item_size, "
+      "but not for page-head, whose per-head stride is item_size/head_num. "
+      "Use a head_dim x element_size that is a multiple of 8 bytes, or a "
+      "non-page-head layout.");
+}
+
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
@@ -423,6 +471,10 @@ void transfer_kv_per_layer_ph_lf(
     int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block) {
+  // Same invariant, same reason: this is the other direction over the same
+  // page-head offset formula, so guarding only one of the two would leave the
+  // asymmetry that makes a defect look fixed.
+  check_page_head_alignment(item_size, head_num, "transfer_kv_per_layer_ph_lf");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_ph<const char>, get_global_offset_per_head_lf<char>, false, true>(
       src_k,
@@ -528,6 +580,7 @@ void transfer_kv_all_layer_lf_ph(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  check_page_head_alignment(item_size, head_num, "transfer_kv_all_layer_lf_ph");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_ph<char>, false, true>(
       empty,

@@ -35,6 +35,20 @@ def _cuda_major() -> int:
         return 0
 
 
+# READ THIS FIRST (#441): DESPITE ITS NAME, THIS FLAG DOES NOT GUARD A WHEEL,
+# AN ABI OR A CUDA-13 BUG. It guards a CONTRACT VIOLATION COMMITTED BY THIS
+# TEST. `cudaMemcpyBatchAsync` has two documented requirements; production
+# satisfies both and this test satisfies neither, and the measured matrix
+# below shows the failure follows the SHAPE, not the toolkit -- the pinned +
+# side-stream cell passes on the same wheel that fails the other three.
+#
+# The consequence for anyone doing guard hygiene: the #436 rebuild landing
+# does NOT make this flag obsolete, because a rebuild cannot change a contract
+# the test breaks by construction. Flipping it leaves the test red for exactly
+# the reasons enumerated here. The fix is to make the test production-shaped
+# (pin the host pool, copy on a side stream); that is a test change, and
+# verifying it is GPU work because the failure mode is a CUDA runtime error.
+#
 # direct+page_first_direct routes to transfer_kv_all_layer_direct_lf_pf, which on
 # CUDA 13 throws (cudaErrorInvalidValue) instead of falling back. M3 uses kernel+layer_first.
 # NOT a production defect -- this skip is a TEST-SHAPE artifact, measured under
@@ -66,8 +80,17 @@ def _cuda_major() -> int:
 # host pool and copy on a side stream), not merely unskipped -- unskipping alone
 # leaves it red for the reasons above. Its sibling
 # test_device_to_host_kernel_page_first still segfaults on BOTH wheels via a
-# different path (transfer_kv_all_layer_lf_ph) and owes its own ticket, so this
-# file cannot go green until both are addressed.
+# different path (transfer_kv_all_layer_lf_ph), so this file cannot go green
+# until both are addressed.
+#
+# #441 UPDATE on that sibling: it no longer "owes its own ticket" in the sense
+# of having nothing behind it. A real latent defect in that path was found and
+# guarded -- the page-head offset formula subdivides by head_num while the copy
+# helper uses 8-byte-aligned-only PTX, so `item_size % (8 * head_num) == 0` is
+# now checked at both page-head entries (`check_page_head_alignment`,
+# csrc/kvcacheio/transfer.cu). But that is NOT this segfault's cause: the
+# shapes here are aligned. The attribution is still open and its metal
+# falsifier is written and filed at tools/441/falsify_lf_ph_441.py.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 
