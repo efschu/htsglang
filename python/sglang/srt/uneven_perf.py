@@ -74,7 +74,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -791,6 +791,19 @@ _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
     "nvfp4_a4": (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN),
     "nvfp4_a16": (LANE_NVFP4_MARLIN,),
     "int8": (LANE_INT8_NATIVE,),
+}
+
+#: Formats this table RECOGNISES but has no measured lane for. The distinction
+#: is #606's: "we know this format and no lane of it is measurable here" is a
+#: different statement from "we do not recognise this format at all", and a
+#: reader of the bf16 fallback could not previously tell them apart.
+#:
+#: ``int8_a16`` (weight-only INT8) is here rather than in ``_FORMAT_LANES``
+#: for the reason the comment above gives: the serving path has no weight-only
+#: int8 arm, so registering a lane would make the plan lie.
+FORMATS_WITHOUT_LANES: Dict[str, str] = {
+    "int8_a16": "weight-only INT8 (W8A16): no weight-only int8 arm exists in "
+    "this tree, so no lane can be measured for it",
 }
 
 #: Human-readable lane names for the plan log.
@@ -2139,21 +2152,47 @@ def _dominant(values: Sequence[str]) -> Optional[str]:
     return best
 
 
-def _per_family_formats(qc: dict) -> Dict[str, str]:
+#: Every family the GEMM score describes, in marker order. A class selector
+#: quantizes a COMPLEMENT over this set, so it has to be derivable rather than
+#: spelled out a second time.
+_ALL_GEMM_FAMILIES: Tuple[str, ...] = tuple(fam for fam, _ in _GEMM_FAMILY_MARKERS)
+
+
+def _is_class_selector(target: str) -> bool:
+    """True for a compressed-tensors target naming a module CLASS, not a path.
+
+    ``targets: ["Linear"]`` is the common shape and it means "every Linear in
+    the model", i.e. every GEMM family. A path (``model.layers.0.mlp``) or a
+    regex (``re:.*mlp.*``) names specific modules and must NOT be read this
+    way -- treating one as a class would quantize families it never mentioned.
+    """
+    t = (target or "").strip()
+    if not t or t.startswith("re:") or "." in t or "*" in t or "/" in t:
+        return False
+    return t.isidentifier() and gemm_family_of_module(t) is None
+
+
+def _per_family_formats(
+    qc: dict, layer_split: Optional[Mapping[str, int]] = None
+) -> Dict[str, str]:
     """``{family: format key}`` for the families the config declares a scheme
     for, ``{}`` when it declares no per-module split at all.
 
-    Two config shapes carry a genuine per-module split:
+    Three config shapes carry a genuine per-module split:
 
-    * ModelOpt ``MIXED_PRECISION``, whose ``quantized_layers`` maps each module
-      path to its own ``quant_algo`` (``ModelOptMixedPrecisionConfig``,
-      modelopt_quant.py:666-770);
-    * compressed-tensors with more than one ``config_groups`` entry, each
-      naming the modules it covers in ``targets``.
+    * ModelOpt ``MIXED_PRECISION`` (``quantized_layers`` -> per-module algo);
+    * compressed-tensors ``config_groups``, at ANY group count -- the split may
+      live in ``ignore`` rather than in a second group (#485 item 1);
+    * the ``ignore`` list itself: a GEMM family the quantizer was told to skip
+      is BF16-RESIDENT, and that is a fact about the checkpoint exactly as much
+      as a declared scheme is.
 
-    A single-group / single-algo config returns ``{}`` -- there is nothing to
-    split, and the scalar key already describes it exactly."""
-    per_family: Dict[str, List[str]] = {}
+    ``layer_split`` optionally carries #371's per-layer counts
+    (``{"gdn": n, "full": n}``). It is used only to resolve the attention
+    family, which spans ``self_attn`` AND ``linear_attn`` and therefore has no
+    single answer at family granularity -- see the resolution note below.
+    """
+    per_family: Dict[str, List[Tuple[str, str]]] = {}
 
     layers = qc.get("quantized_layers")
     if isinstance(layers, dict) and layers:
@@ -2164,25 +2203,95 @@ def _per_family_formats(qc: dict) -> Dict[str, str]:
             algo = str((info or {}).get("quant_algo") or "")
             key = _modelopt_algo_format(algo)
             if key is not None:
-                per_family.setdefault(family, []).append(key)
+                per_family.setdefault(family, []).append((key, str(module)))
+
+    # The ignored families first: a class selector's complement is defined
+    # against them, so they have to be known before the groups are read.
+    ignored: Dict[str, List[str]] = {}
+    for entry in qc.get("ignore") or []:
+        family = gemm_family_of_module(str(entry))
+        if family is not None:
+            ignored.setdefault(family, []).append(str(entry))
 
     groups = qc.get("config_groups")
-    if not per_family and isinstance(groups, dict) and len(groups) > 1:
+    if not per_family and isinstance(groups, dict) and groups:
+        # NOT `len(groups) > 1` any more (#485 item 1): a single-group config
+        # can still describe a split, because the split may live in `ignore`.
         for group in groups.values():
             key = _ct_group_format(group or {})
             if key is None:
                 continue
             for target in (group or {}).get("targets") or []:
-                family = gemm_family_of_module(str(target))
+                target = str(target)
+                if _is_class_selector(target):
+                    # COMPLEMENT, not enumeration: a class selector covers
+                    # every GEMM family the ignore list does not name. A family
+                    # it does name is bf16-resident as far as this config can
+                    # say, and claiming it here would overwrite that with a
+                    # scheme the quantizer was explicitly told not to apply.
+                    for family in _ALL_GEMM_FAMILIES:
+                        if family not in ignored:
+                            per_family.setdefault(family, []).append((key, target))
+                    continue
+                family = gemm_family_of_module(target)
                 if family is not None:
-                    per_family.setdefault(family, []).append(key)
+                    per_family.setdefault(family, []).append((key, target))
 
-    resolved = {}
-    for family, keys in per_family.items():
+    for family, entries in ignored.items():
+        for entry in entries:
+            per_family.setdefault(family, []).append(("bf16", entry))
+
+    resolved: Dict[str, str] = {}
+    for family, evidence in per_family.items():
+        keys = [key for key, _src in evidence]
+        distinct = set(keys)
+        if len(distinct) > 1 and "bf16" in distinct:
+            # A family carrying both bf16 and quantized evidence is genuinely
+            # MIXED. `_dominant` would pick by CONFIG-ENTRY count, which bears
+            # no relation to how many LAYERS carry each scheme, so it would
+            # invent the answer.
+            #
+            # For the attention family that split IS knowable: it spans
+            # `self_attn` (full-attention layers) and `linear_attn` (GDN
+            # layers), and #371's census counts both. Weighted by layers the
+            # answer is a measurement rather than a vote. Any other family
+            # stays unresolved and is left OUT.
+            weighted = _weigh_attn_gdn_by_layers(family, evidence, layer_split)
+            if weighted is not None:
+                resolved[family] = weighted
+            continue
         key = _dominant(keys)
         if key is not None:
             resolved[family] = key
     return resolved
+
+
+def _weigh_attn_gdn_by_layers(
+    family: str,
+    evidence: Sequence[Tuple[str, str]],
+    layer_split: Optional[Mapping[str, int]],
+) -> Optional[str]:
+    """Resolve the attention family's mixed evidence by LAYER count (#371).
+
+    Returns ``None`` when the split is unknown or the family is not the
+    attention one -- an unresolvable family is omitted rather than guessed.
+    """
+    if family != GEMM_FAMILY_ATTN_GDN or not layer_split:
+        return None
+    gdn = int(layer_split.get("gdn", 0) or 0)
+    full = int(layer_split.get("full", 0) or 0)
+    if gdn <= 0 and full <= 0:
+        return None
+    weights: Dict[str, int] = {}
+    for key, source in evidence:
+        # `linear_attn` evidence describes the GDN layers; everything else in
+        # this family (self_attn, qkv/o projections) describes the full ones.
+        n = gdn if "linear_attn" in source.lower() else full
+        weights[key] = weights.get(key, 0) + n
+    if not weights:
+        return None
+    best = max(weights.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else None
 
 
 def _is_nvfp4_like(method: str, fmt: str, qc: dict) -> Optional[str]:
@@ -2306,12 +2415,40 @@ def checkpoint_compute_format_families(
     qc = _checkpoint_quant_config(model_path, cfg)
     if not qc:
         return fmt, desc, {}
-    families = _per_family_formats(qc)
+    # #371's per-layer counts, so a family that spans two layer kinds can be
+    # resolved by measurement instead of by config-entry vote. Same derivation
+    # the checkpoint model uses (`layer_types` -> full / linear attention).
+    text = cfg.get("text_config", cfg) if isinstance(cfg, dict) else {}
+    layer_types = (text or {}).get("layer_types") or []
+    layer_split = {
+        "full": sum(1 for t in layer_types if t == "full_attention"),
+        "gdn": sum(1 for t in layer_types if t == "linear_attention"),
+    }
+
+    families = _per_family_formats(qc, layer_split=layer_split or None)
     if len(set(families.values())) <= 1:
         # One scheme across the board (or none declared per module): the
         # checkpoint-wide key already says everything the families would.
         return fmt, desc, {}
     detail = ", ".join(f"{fam}={families[fam]}" for fam in sorted(families))
+    if layer_split.get("gdn") and GEMM_FAMILY_ATTN_GDN in families:
+        # The attention family spans two layer kinds, so a single key is a
+        # majority statement rather than a uniform one. Say so, and say which
+        # layers the key does NOT describe -- a reader who assumes uniformity
+        # here would mis-price the minority.
+        gdn, full = layer_split["gdn"], layer_split["full"]
+        key = families[GEMM_FAMILY_ATTN_GDN]
+        minority = (
+            f", and does NOT describe the {full} full_attention layer(s)"
+            if key == "bf16" and full
+            else f", and does NOT describe the {gdn} linear_attention layer(s)"
+            if key != "bf16" and gdn
+            else ""
+        )
+        detail += (
+            f" [attn_gdn spans {gdn} linear_attention / {full} full_attention"
+            f" layers; the key describes its majority{minority}]"
+        )
     return fmt, f"{desc}; per-family: {detail}", families
 
 
@@ -2347,6 +2484,19 @@ def rank_gemm_scores(
         for entry in entries:
             scores.append(float(entry["gemm_tflops"]))
             labels.append(_LANE_LABELS[LANE_BF16])
+        known = FORMATS_WITHOUT_LANES.get(fmt)
+        if known:
+            warnings.append(
+                f"checkpoint format '{fmt}' is recognised but has no measured "
+                f"GEMM lane: {known}. The prefill objective is scoring every "
+                "rank on the DENSE BF16 probe, which is the wrong format for "
+                "this checkpoint; this is a KNOWN gap, not an unrecognised "
+                "format."
+            )
+            for entry in entries:
+                scores.append(float(entry["gemm_tflops"]))
+                labels.append(_LANE_LABELS[LANE_BF16])
+            return scores, labels, warnings
         warnings.append(
             f"checkpoint format '{fmt}' has no GEMM lane table: the prefill "
             "objective is scoring every rank on the DENSE BF16 probe, which "
