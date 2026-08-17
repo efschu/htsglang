@@ -116,9 +116,7 @@ def freed_state_bytes(
     ALSO booking it somewhere would be the parallel ledger this design does
     not have.
     """
-    dropped = int(profiled_slots) - effective_state_slots(
-        profiled_slots, resident_cap
-    )
+    dropped = int(profiled_slots) - effective_state_slots(profiled_slots, resident_cap)
     return max(0, dropped) * max(0, int(bytes_per_slot))
 
 
@@ -215,9 +213,7 @@ def vacate_plan(
     restore = [sid for sid in resumed_ids if sid in parked]
 
     # Residents after the restores, minus the ones already parked.
-    resident_ids = [
-        sid for sid in by_id if sid not in parked or sid in restore
-    ]
+    resident_ids = [sid for sid in by_id if sid not in parked or sid in restore]
     overshoot = len(resident_ids) - cap
     skipped: Dict[str, str] = {}
     vacate: List[str] = []
@@ -244,16 +240,23 @@ def vacate_plan(
 def cap_is_binding(resident_cap: Optional[int], profiled_slots: int) -> bool:
     """True when the cap actually changes the pool geometry. Used to keep
     every downstream hook off the default path entirely."""
-    return (
-        resident_cap is not None
-        and int(resident_cap) < int(profiled_slots)
-    )
+    return resident_cap is not None and int(resident_cap) < int(profiled_slots)
 
 
-#: Where the PRE-CAP profiled slot count is remembered. Underscore-prefixed
-#: on purpose: ``ServerArgs.__setattr__`` exempts private names from the
-#: strict post-resolution mutation guard, and ``copy.deepcopy`` carries it.
-PROFILED_SLOTS_ATTR = "_gdn_profiled_state_slots"
+#: Where the PRE-CAP profiled slot count is remembered.
+#:
+#: This was ``_gdn_profiled_state_slots``, and the leading underscore was
+#: chosen precisely because ``ServerArgs.__setattr__`` exempts private names
+#: from the strict post-resolution mutation guard (``server_args.py:17437``).
+#: That is guard EVASION, not a naming convention: it made a real
+#: post-resolution mutation invisible to the mechanism built to see it. The
+#: name is public now and the write goes through ``ServerArgs.override()``, so
+#: the route the evasion used is closed rather than merely unused.
+#:
+#: The other stated reason for the underscore -- that ``copy.deepcopy`` carries
+#: the attribute -- never depended on the prefix: ``deepcopy`` copies the whole
+#: instance dict either way. The write-once contract below is unchanged.
+PROFILED_SLOTS_ATTR = "gdn_profiled_state_slots"
 
 
 def remember_profiled_state_slots(server_args) -> int:
@@ -285,7 +288,14 @@ def remember_profiled_state_slots(server_args) -> int:
     remembered = getattr(server_args, PROFILED_SLOTS_ATTR, None)
     if remembered is None:
         remembered = int(server_args.max_mamba_cache_size)
-        setattr(server_args, PROFILED_SLOTS_ATTR, remembered)
+        # Through override(): this runs post-resolution, during ModelRunner KV
+        # profiling. Write-once still holds -- the guard above is what makes it
+        # once -- but the write is now audited instead of hidden behind a
+        # private name.
+        server_args.override(
+            "gdn_slot_ladder.remember_profiled_state_slots",
+            **{PROFILED_SLOTS_ATTR: remembered},
+        )
     return int(remembered)
 
 

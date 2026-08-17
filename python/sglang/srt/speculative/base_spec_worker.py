@@ -76,7 +76,6 @@ def duplicate_prefix_tail_to_draft_branches(
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
-
 def should_capture_draft_graphs(server_args) -> bool:
     """Whether to capture CUDA graphs for the speculative DRAFT model.
 
@@ -107,9 +106,9 @@ def should_capture_draft_graphs(server_args) -> bool:
         # safe direction is still inert, and a knob that cannot refuse
         # measures nothing.
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            server_args = get_global_server_args()
+            server_args = get_server_args()
         except Exception:
             return True
     if server_args is None:
@@ -120,6 +119,7 @@ def should_capture_draft_graphs(server_args) -> bool:
         # the phase flip is fighting for.
         return False
     return not getattr(server_args, "disable_draft_cuda_graph", False)
+
 
 class EagleDraftWorkerBase(ABC):
     # Draft-solo placement (--speculative-draft-placement solo) flags.

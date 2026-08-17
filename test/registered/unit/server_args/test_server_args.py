@@ -1250,7 +1250,24 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """
 
     def _reload_server_args_with_env(self, *, enabled: bool):
+        # RELOAD LEAKS, AND IT LEAKS PROCESS-WIDE. importlib.reload re-executes
+        # the module body and installs a NEW ServerArgs class in the module
+        # dict. Every method in server_args.py resolves the bare name
+        # ``ServerArgs`` through that dict, so class-level state -- e.g. the
+        # once-per-process latch _ledger_reserve_refusal_named -- moves to the
+        # new class, while any test module that did `from ... import
+        # ServerArgs` at collection time is left holding the orphan. That is
+        # not hypothetical: it made
+        # mem_ledger/test_ledger_pool_wiring_590.py fail whenever this file ran
+        # first (its setUp reset a latch nobody read).
+        #
+        # A second reload cannot undo the first -- it just makes a third class
+        # -- so consumers must resolve through the live module (that file now
+        # does). What IS restorable is the env-derived module state this test
+        # changes, so restore it here rather than leaving the process holding
+        # whichever choice list the last subtest happened to build.
         previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        self.addCleanup(self._restore_server_args_module, previous)
         os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
         try:
             return importlib.reload(server_args_module)
@@ -1259,6 +1276,23 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
                 os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
             else:
                 os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+
+    @staticmethod
+    def _restore_server_args_module(previous):
+        """Rebuild the module under the ambient env, so later tests see the
+        default choice lists rather than this test's."""
+        saved = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        if previous is None:
+            os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+        else:
+            os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+        try:
+            importlib.reload(server_args_module)
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+            else:
+                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = saved
 
     def test_token_oracle_rejected_when_env_disabled(self):
         reloaded = self._reload_server_args_with_env(enabled=False)

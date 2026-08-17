@@ -57,8 +57,24 @@ RATIO = 3
 USER_MAX_RUNNING = 4
 
 
+class _ArgsStub(SimpleNamespace):
+    """A ServerArgs stand-in that carries the one method under test.
+
+    ``remember_profiled_state_slots`` writes through ``ServerArgs.override``
+    now, so a stub without it would fail for the wrong reason -- and a stub
+    that silently swallowed the call would let the production path rot. This
+    mirrors override's post-state (set the field) and records the source, so
+    the tests can assert the write was audited rather than bare.
+    """
+
+    def override(self, source, **fields):
+        self.overrides = getattr(self, "overrides", []) + [(source, dict(fields))]
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
 def _args(max_mamba_cache_size, cap):
-    return SimpleNamespace(
+    return _ArgsStub(
         max_running_requests=USER_MAX_RUNNING,
         max_mamba_cache_size=max_mamba_cache_size,
         gdn_resident_state_slots=cap,
@@ -97,12 +113,30 @@ def _resolve(r, token_capacity=277468):
 class TestProfiledSlotsMemory(CustomTestCase):
     """The write-once memory itself."""
 
-    def test_the_attribute_is_private_so_the_args_accept_it(self):
-        # ServerArgs.__setattr__ raises on post-resolution assignment under
-        # the strict harness EXCEPT for underscore-prefixed names. The whole
-        # mechanism rests on that, so pin it here rather than discovering it
-        # at boot.
-        self.assertTrue(PROFILED_SLOTS_ATTR.startswith("_"))
+    def test_the_attribute_is_public_so_the_guard_can_see_it(self):
+        # THIS PIN IS THE INVERSE OF THE ONE IT REPLACES. The attribute used
+        # to be underscore-prefixed precisely BECAUSE ServerArgs.__setattr__
+        # exempts private names from the strict post-resolution guard
+        # (server_args.py:17437), and the old test pinned that as the
+        # mechanism the design "rests on". It was guard evasion: a real
+        # post-resolution mutation made invisible to the mechanism built to
+        # see it. The name is public now and the write goes through
+        # override(), so the route is closed rather than unused.
+        self.assertFalse(PROFILED_SLOTS_ATTR.startswith("_"))
+
+    def test_the_write_is_audited_not_bare(self):
+        a = _args(PROFILED, RESIDENT_CAP)
+        remember_profiled_state_slots(a)
+        sources = [src for src, _ in getattr(a, "overrides", [])]
+        self.assertEqual(sources, ["gdn_slot_ladder.remember_profiled_state_slots"])
+
+    def test_write_once_still_holds_through_override(self):
+        """One override call, not one per caller."""
+        a = _args(PROFILED, RESIDENT_CAP)
+        remember_profiled_state_slots(a)
+        remember_profiled_state_slots(a)
+        remember_profiled_state_slots(a)
+        self.assertEqual(len(getattr(a, "overrides", [])), 1)
 
     def test_first_call_records_the_pre_cap_count(self):
         a = _args(PROFILED, RESIDENT_CAP)

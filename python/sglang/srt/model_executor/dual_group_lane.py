@@ -1865,14 +1865,14 @@ class DualGroupLane:
         LIVE size sources and movement-payload binding; the moving itself is
         the backend's job. Gated behind SGLANG_OFFLOAD_REGISTER (default off
         => no-op; the default path is byte-unchanged)."""
+        from sglang.srt.model_executor.offload_movement import (
+            SuspendPayload,
+            TagPayload,
+        )
         from sglang.srt.model_executor.offload_register import (
             maybe_bind_movement_payload,
             maybe_register_item,
             offload_register_enabled,
-        )
-        from sglang.srt.model_executor.offload_movement import (
-            SuspendPayload,
-            TagPayload,
         )
 
         if not offload_register_enabled():
@@ -5492,7 +5492,12 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
     # operation. Named in the log, because eager is a state the reader has to
     # know about.
     if _lane_spans_cards(server_args) and not server_args.dual_group_lane_eager:
-        server_args.dual_group_lane_eager = True
+        # Through override(), not a bare assignment: this runs inside
+        # Scheduler.__init__ on the live, already-resolved server_args, which
+        # is exactly the post-resolution mutation the config contract routes
+        # through one audited entry point. Same resulting value, plus
+        # provenance, and it no longer needs the strict guard to look away.
+        server_args.override("dual_group_lane.spans_cards", dual_group_lane_eager=True)
         logger.warning(
             "dual-group lane spans cards (--dual-group-lane-part-gpu-id %s): "
             "forcing EAGER. The shells' cross-card activation hops are not "
