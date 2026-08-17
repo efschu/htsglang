@@ -118,6 +118,34 @@ def _cached_prompt_tokens(usage) -> int:
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
 
+def _reported_cached_tokens(usage) -> Optional[int]:
+    """Cached prompt tokens as REPORTED, or None when nothing was reported.
+
+    #557. Three states, and collapsing any two of them loses a fact:
+
+      * details present, ``cached_tokens`` > 0 -> a cache hit of that size;
+      * details present, ``cached_tokens`` == 0 -> a measured MISS. This must
+        surface as 0, not as absence, or a client cannot tell "no cache hit"
+        from "this server does not report cache usage";
+      * no ``prompt_tokens_details`` at all -> the backend reported nothing.
+        This must stay ABSENT. Answering 0 here would publish a measurement
+        that was never taken, which is the same defaulted-measurement defect
+        the #606 lesson names, and it would silently convert "unknown" into
+        "definitely no cache".
+
+    ``_cached_prompt_tokens`` keeps returning an int because the input-token
+    arithmetic needs one; this function is for the REPORTING side, where the
+    difference between unknown and zero is the whole point.
+    """
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    if prompt_tokens_details is None:
+        return None
+    cached = getattr(prompt_tokens_details, "cached_tokens", None)
+    if cached is None:
+        return None
+    return int(cached)
+
+
 def _anthropic_input_tokens(usage) -> int:
     prompt = getattr(usage, "prompt_tokens", 0) or 0
     cached = _cached_prompt_tokens(usage)
@@ -149,11 +177,22 @@ def _anthropic_usage_from_openai(
         )
 
     usage_fields: dict[str, int] = {}
-    cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
         usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-        if cached_tokens:
-            usage_fields["cache_read_input_tokens"] = cached_tokens
+        # #557: report a MEASURED zero as 0, and report nothing when nothing
+        # was measured.
+        #
+        # This was `if cached_tokens:`, which is falsy at 0, so a request that
+        # simply got no cache hit omitted the field entirely -- and a client
+        # then cannot tell "no cache hit" from "this server does not report
+        # cache usage". Those are different facts.
+        #
+        # The cure is not "always emit a number": a backend that sent no
+        # prompt_tokens_details reported nothing, and answering 0 for it would
+        # publish a measurement never taken. See _reported_cached_tokens.
+        reported_cached = _reported_cached_tokens(usage)
+        if reported_cached is not None:
+            usage_fields["cache_read_input_tokens"] = reported_cached
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -665,6 +704,26 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+
+        # #557: pass the caller's chat-template arguments through.
+        #
+        # Set only when present, so a request that did not ask does not
+        # acquire a dict it never sent -- an always-present ``{}`` reads
+        # downstream as "the caller specified no kwargs" rather than "the
+        # caller said nothing", and those differ for any template that
+        # branches on the dict's presence.
+        #
+        # Placed BEFORE construction on purpose: the ``thinking`` handling
+        # below runs after and calls ``apply_reasoning_enabled``, which merges
+        # into whatever this request carries and overrides only the reasoning
+        # toggle. So a caller's unrelated keys survive, while Anthropic's
+        # typed ``thinking`` semantics stay authoritative over the toggle --
+        # which is the existing OpenAI write-side behaviour, mirrored rather
+        # than re-decided here.
+        if anthropic_request.chat_template_kwargs is not None:
+            request_data["chat_template_kwargs"] = dict(
+                anthropic_request.chat_template_kwargs
+            )
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
