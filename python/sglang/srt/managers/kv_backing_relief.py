@@ -544,6 +544,8 @@ class KvBackingRelief:
         admission_reserve_rows: int = DEFAULT_ADMISSION_RESERVE_ROWS,
         tree_cache_fn: Optional[Callable[[], Any]] = None,
         pool_fn: Optional[Callable[[], Any]] = None,
+        flip_pending_fn: Optional[Callable[[], Any]] = None,
+        flip_armed_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._pool = pool
         #: THE ID-SPACE OWNER, and it never moves. The scheduler holds ONE
@@ -560,6 +562,26 @@ class KvBackingRelief:
         #: happened to be active when this object was built, and on the
         #: tp_to_pp leg that is the EMPTY one. See :meth:`_rebind`.
         self._pool_fn = pool_fn
+        #: #744: THE PARKED EXTENT. A phase flip quiesces its requests before
+        #: it packs them, and a quiesced request is in none of the batch
+        #: structures ``_live_reqs`` enumerates -- so ``req_rows`` reads 0
+        #: while its rows are still allocated and about to be read by
+        #: ``_pack_outgoing``. Both the trigger (``_nothing_resident``) and
+        #: the safety net (``_shrink_to`` via ``_max_live_row``) go through
+        #: that one enumeration, so they were blind together. This side
+        #: channel is what they see the parked rows through.
+        #:
+        #: Returns ``(rows, max_row_id)``; ``(-1, -1)`` means UNKNOWN, which
+        #: is treated as blocking, never as empty. ``None`` leaves the rung
+        #: exactly as it was.
+        self._flip_pending_fn = flip_pending_fn
+        #: #744 second line: refuse to evict at all while a flip is armed.
+        #: Independent of the extent above on purpose -- the failure is a
+        #: SILENT eviction followed by a delayed illegal access, so one
+        #: mechanism is not enough. Gated on ARMED only: the rung must stay
+        #: fully alive outside flips (#688's evict-rung funding depends on
+        #: it), and ``test_744`` pins that it is not dead.
+        self._flip_armed_fn = flip_armed_fn
         #: Per-pool backing state, keyed by pool identity. Geometry, the boot
         #: reservation and the exhaustion marker are all facts about ONE
         #: arena and must not follow the rung across a rebind.
@@ -1084,9 +1106,25 @@ class KvBackingRelief:
         # Read from the live-set function's own side channel -- enumerating
         # is the expensive half and it has just been done.
         self._last_live_split = getattr(self._live_slots_fn, "last_split", None)
+        # #744: THE SAFETY NET READS THIS FUNCTION TOO. ``_shrink_to``
+        # re-measures through here to turn the cap from a hope into a fact,
+        # but it re-measures the SAME enumeration that missed the parked
+        # request -- so trigger and net were blind together, and fixing only
+        # the trigger would leave the net equally blind to any other caller
+        # that shrinks during a park. Folding the parked extent in HERE is
+        # what makes both see it from one source.
+        pending_rows, pending_top = self._flip_pending()
+        if pending_rows < 0:
+            # Unknown parked extent: refuse to shrink, same reading as an
+            # unknown live set above.
+            logger.warning(
+                "%s parked flip extent unreadable -- refusing to shrink",
+                LOG_PREFIX,
+            )
+            return -1
         if live is None or int(getattr(live, "numel", lambda: 0)()) == 0:
-            return 0
-        return int(live.max())
+            return max(0, pending_top)
+        return max(int(live.max()), pending_top)
 
     def _floor_rows(self, max_live: int) -> int:
         """The lowest row count this rank may be capped to, in rows.
@@ -1126,6 +1164,38 @@ class KvBackingRelief:
         return int(math.ceil(floor / page) * page)
 
     # -- #662: the watermark actuator -------------------------------------
+
+    def _flip_pending(self) -> tuple:
+        """``(rows, max_row_id)`` the flip has parked. ``(-1, -1)`` = unknown.
+
+        UNKNOWN IS NOT EMPTY. An unreadable probe returns ``(-1, -1)`` and
+        every caller below treats that as "something may be parked", because
+        the cost of guessing wrong is an unmapped row under a live read.
+        """
+        # getattr, not attribute access: these methods are invoked UNBOUND
+        # against stubs by the #717 suites (constructing a real rung needs a
+        # pool, an allocator and a live-set function), so an object without
+        # the channel must degrade to "nothing parked", not raise.
+        fn = getattr(self, "_flip_pending_fn", None)
+        if fn is None:
+            return (0, -1)
+        try:
+            rows, top = fn()
+            return (int(rows), int(top))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s flip-pending probe failed: %s", LOG_PREFIX, e)
+            return (-1, -1)
+
+    def _flip_armed(self) -> bool:
+        """True when a phase flip is armed on this rank (or unreadable)."""
+        fn = getattr(self, "_flip_armed_fn", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s flip-armed probe failed: %s", LOG_PREFIX, e)
+            return True
 
     def _evict_enabled(self) -> bool:
         return os.environ.get(KV_RADIX_EVICT_ENV, "1") not in ("0", "false", "False")
@@ -1186,6 +1256,16 @@ class KvBackingRelief:
         The split records ``req_rows`` beside ``req_max``, so the two states
         are distinguishable from data already on hand -- no new enumeration.
         """
+        # #744: a request PARKED for a phase flip is in none of the batch
+        # structures the split enumerates, so ``req_rows == 0`` is also what a
+        # mid-flip quiesce looks like. On 2026-08-17 19:30:40 that read
+        # evicted 127,731 rows the flip was about to pack and the next access
+        # above the new cap was an illegal address, 24 log lines later. The
+        # parked extent is consulted FIRST because it is the one state in
+        # which the rest of this predicate is confidently wrong.
+        pending_rows, _ = self._flip_pending()
+        if pending_rows != 0:
+            return False
         split = getattr(self, "_last_live_split", None)
         if not split:
             return False
@@ -1206,6 +1286,13 @@ class KvBackingRelief:
         """
         plain = self._floor_rows(max_live)
         if not self._evict_enabled():
+            return plain, 0
+        # #744 second line, independent of the extent probe: while a flip is
+        # ARMED its requests are being quiesced, so every read of "what is
+        # resident" is in motion. Refuse for the duration. Gated on ARMED
+        # only -- outside a flip this rung stays fully live, which #688's
+        # funding depends on.
+        if self._flip_armed():
             return plain, 0
         tree = self._tree_cache()
         if tree is None:
@@ -1255,6 +1342,11 @@ class KvBackingRelief:
             return 0
         tree = self._tree_cache()
         if tree is None:
+            return 0
+        # #744: same refusal on the collecting half. Both sides must agree on
+        # what an armed flip means, for the reason the comment below already
+        # gives about the branch: a disagreement becomes an illegal address.
+        if self._flip_armed():
             return 0
         req_max = self._resident_ceiling()
         if req_max < 0 and not self._nothing_resident():
@@ -2305,10 +2397,37 @@ def kv_backing_provider(
         return None
     from sglang.srt.managers.phase_flip_runtime import build_flip_live_slots_fn
 
+    live_fn = build_flip_live_slots_fn(scheduler)
+
+    def _flip_armed() -> bool:
+        """#744 line 2. Unreadable is treated as ARMED, never as idle."""
+        rt = getattr(scheduler, "phase_flip_runtime", None)
+        if rt is None:
+            return False
+        try:
+            return bool(rt.is_armed())
+        except Exception:  # noqa: BLE001 - an unreadable flip is not an idle one
+            return True
+
+    def _flip_pending():
+        """#744 line 1: ``(rows, max_row_id)`` the flip has parked.
+
+        Consulted only while a flip is armed, which is what makes the sticky
+        value on ``live_fn`` safe: outside a flip this answers "nothing
+        parked" unconditionally, so the rung stays fully live and #688's
+        funding path is untouched. While armed and with no enumeration on
+        record yet, the honest answer is UNKNOWN -- which blocks.
+        """
+        if not _flip_armed():
+            return (0, -1)
+        return getattr(live_fn, "last_req_extent", None) or (-1, -1)
+
     return KvBackingRelief(
         pool,
         allocator,
-        live_slots_fn=build_flip_live_slots_fn(scheduler),
+        live_slots_fn=live_fn,
+        flip_armed_fn=_flip_armed,
+        flip_pending_fn=_flip_pending,
         bytes_per_row=row_bytes,
         probe=probe,
         device_index=device_index,

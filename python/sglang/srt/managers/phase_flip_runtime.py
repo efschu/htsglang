@@ -880,6 +880,19 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             # to know the other's plumbing.
             _live.last_split = split
             scheduler.flip_live_split = split
+            # #744: REMEMBER THE LAST ENUMERATION THAT SAW REQUESTS. A flip
+            # quiesces its requests before packing them, so by the time the
+            # KV rung asks, this same function reports req_rows=0 -- which is
+            # indistinguishable from an idle box and is what let the rung
+            # evict 127,731 rows the flip was about to read (ANALYSE_741).
+            # The rung consults this ONLY while a flip is armed, so a stale
+            # value cannot outlive the flip and cannot leave the rung dead
+            # outside one.
+            if int(split["req_rows"]) > 0:
+                _live.last_req_extent = (
+                    int(split["req_rows"]),
+                    int(split["req_max"]),
+                )
         except Exception as e:  # pragma: no cover - an instrument, never a gate
             logger.warning("%s live-split instrument failed: %s", LOG_PREFIX, e)
             _live.last_split = None
