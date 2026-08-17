@@ -72,11 +72,17 @@ class LRUFileEvictor:
         is_mla_model: bool,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
+        pins: Optional[Any] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
+        # #410: the pin ledger, or None. None is the default and every code
+        # path below is written so that a store without one behaves exactly as
+        # it did before pins existed -- this is a protection added to the
+        # evictor, not a change to how it evicts.
+        self._pins = pins
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -320,6 +326,58 @@ class LRUFileEvictor:
             self._lru[stem] = size
             self._total_bytes += size
 
+    @staticmethod
+    def _allocated_size(st: os.stat_result) -> int:
+        """Disk bytes a file occupies: the larger of its blocks and its length.
+
+        The filesystem charges allocated blocks, not apparent length: on the
+        incident filesystem the 512-byte pages each occupied 8704 bytes, a 17x
+        undercount over 5.8M files. ``st_blocks`` is always in 512-byte units.
+        It is not enough alone -- delayed allocation reports a single block for
+        a just-written file -- so never go below the payload length.
+
+        Ported with #410's pin ledger, which charges the SAME unit. A ledger
+        accounting apparent bytes against an evictor accounting allocated ones
+        would make ``reclaimable = used - pinned`` subtract centimetres from
+        inches.
+        """
+        blocks = getattr(st, "st_blocks", None)
+        if blocks is None:
+            return st.st_size
+        return max(int(blocks) * 512, st.st_size)
+
+    def stats(self) -> dict:
+        """Capacity and pin accounting, in the evictor's own unit.
+
+        ``reclaimable_bytes`` excludes pinned bytes deliberately: a caller
+        asking how much it can free must not be told a number that counts
+        pages the evictor is contractually unable to touch.
+        """
+        pinned_bytes = self._pins.pinned_bytes() if self._pins else 0
+        # UNIT MISMATCH, SURFACED RATHER THAN CLAMPED AWAY (#411 reconciliation).
+        # This evictor accounts APPARENT bytes (`st_size` on scan, `value_bytes`
+        # on reserve); the ported pin ledger charges ALLOCATED bytes
+        # (`_allocated_size`). On any filesystem that allocates more than it
+        # stores, pinned_bytes can EXCEED used_bytes for the same files, and
+        # `used - pinned` is then centimetres minus inches -- the #715 shape the
+        # ledger's own docstring warns about.
+        #
+        # `reclaimable_bytes` stays clamped so no caller sees a negative
+        # capacity, but the overshoot is reported instead of vanishing into the
+        # clamp: a silent max(0, ...) would make an incoherent ledger look like
+        # a full store. Non-zero here means the two accountings must be unified
+        # before this number can be trusted.
+        overshoot = max(0, pinned_bytes - self._total_bytes)
+        return {
+            "max_size_bytes": self.max_size_bytes,
+            "used_bytes": self._total_bytes,
+            "entries": len(self._lru),
+            "pinned_entries": self._pins.pinned_entries() if self._pins else 0,
+            "pinned_bytes": pinned_bytes,
+            "reclaimable_bytes": max(0, self._total_bytes - pinned_bytes),
+            "accounting_overshoot_bytes": overshoot,
+        }
+
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.
 
@@ -338,6 +396,14 @@ class LRUFileEvictor:
         evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
         if evict_stem in self._pending_writes:
             # Keep in-flight reservations; their file isn't committed yet.
+            self._lru[evict_stem] = evict_size
+            return "skipped", 0
+        if self._pins is not None and self._pins.is_pinned(evict_stem):
+            # #410: a pinned page belongs to a conversation checkpoint that
+            # paid to keep it. Same skip-and-repin an in-flight write gets, and
+            # deliberately so: a store whose entries are ALL pinned cannot spin
+            # here -- it exhausts the caller's attempts and the caller learns
+            # the space is not there, rather than looping forever.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
         tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
