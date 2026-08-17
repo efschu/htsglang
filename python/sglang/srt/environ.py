@@ -961,6 +961,12 @@ class Envs:
     # than the time all writers of one page need, or a live partial is reaped
     # from under a stage that is still filling it.
     SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S = EnvFloat(3600.0)
+    # #720: size of the reusable, budget-REGISTERED read-buffer ring per pool.
+    # 0 (default) keeps today's per-read fresh pinned allocation, which the
+    # joint budget cannot see. A positive value declares capacity x page bytes
+    # to the registry at first use, so the read path's pinned footprint becomes
+    # a number the budget can refuse.
+    SGLANG_HICACHE_READ_BUFFERS = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

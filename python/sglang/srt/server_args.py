@@ -5564,6 +5564,26 @@ class ServerArgs:
             "--phase-flip-writeback.",
         ),
     ] = None
+    phase_flip_rebind_hicache: A[
+        bool,
+        Arg(
+            help="#719: move the HiCache pool bindings to the phase-active "
+            "pools at the cutover, so the device tier is usable in BOTH "
+            "phases instead of only the one that built it. Without this the "
+            "controller, the radix cache and the scheduler all name the boot "
+            "(PP) pool permanently, and #718 disarms device-tier I/O in the TP "
+            "phase because copying against the wrong pool is silent corruption "
+            "in both directions. The rebind is ALL THREE READERS OR NONE and "
+            "is verified by generation afterwards: a rebind one subsystem sees "
+            "and another does not is worse than no rebind, because every call "
+            "still succeeds against different memory. It REFUSES unless the "
+            "incoming phase has its own host pool of matching shape -- a host "
+            "pool is allocated FROM a device pool, so reusing the other "
+            "phase's would copy matching row ids at mismatched widths. "
+            "Requires --enable-phase-flip. Default off = the #718 disarm "
+            "stands and behaviour is byte-identical.",
+        ),
+    ] = False
     enable_vram_dial: A[
         bool,
         Arg(
@@ -7679,6 +7699,12 @@ class ServerArgs:
                     "--phase-flip-tp-vector requires --enable-phase-flip "
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
+                )
+            if self.phase_flip_rebind_hicache:
+                raise ValueError(
+                    "--phase-flip-rebind-hicache requires "
+                    "--enable-phase-flip: with one layout there is only one "
+                    "set of pools, so there is nothing to rebind between."
                 )
             if self.phase_flip_writeback:
                 raise ValueError(

@@ -1146,13 +1146,45 @@ class HiCacheFile(HiCacheStorage):
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
 
+    def _read_buffer_pool(self, pool_name: str, host_pool):
+        """#720: the reusable read target for this pool, or None (today's path).
+
+        Built lazily, once per registered pool, because the page size is the
+        pool's and is only known here. ``0`` -- the default -- keeps the
+        per-read fresh allocation exactly as it was.
+        """
+        capacity = int(envs.SGLANG_HICACHE_READ_BUFFERS.get() or 0)
+        if capacity <= 0:
+            return None
+        pools = getattr(self, "_read_buffers", None)
+        if pools is None:
+            pools = self._read_buffers = {}
+        pool = pools.get(pool_name)
+        if pool is None:
+            from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+
+            probe = host_pool.get_dummy_flat_data_page()
+            pool = ReadBufferPool(
+                name=f"HiCache read buffers [{pool_name}]",
+                flag="SGLANG_HICACHE_READ_BUFFERS",
+                capacity=capacity,
+                page_bytes=int(probe.numel()) * int(probe.element_size()),
+                factory=host_pool.get_dummy_flat_data_page,
+            )
+            pools[pool_name] = pool
+        return pool
+
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
+        from sglang.srt.mem_cache.read_buffer_pool import borrowed
+
         storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
-        if data_page is None:
-            return False
-        host_pool.set_from_flat_data_page(page_offset, data_page)
+        buffers = self._read_buffer_pool(pool_name, host_pool)
+        with borrowed(buffers, host_pool.get_dummy_flat_data_page) as target:
+            data_page = self.get(storage_key, target)
+            if data_page is None:
+                return False
+            host_pool.set_from_flat_data_page(page_offset, data_page)
         return True
 
     def _write_page(

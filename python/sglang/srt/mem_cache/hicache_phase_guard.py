@@ -78,12 +78,26 @@ def flip_routing_active() -> bool:
         return False
 
 
+def active_phase() -> str:
+    """The phase the model is computing in right now."""
+    return "tp" if flip_routing_active() else "pp"
+
+
 def device_tier_disarmed(direction: Optional[str] = None) -> bool:
     """True when device-tier HiCache I/O must not run right now.
 
+    The question is NOT "is the TP phase active" but "is the active phase the
+    one this cache's pools are bound to". Those are the same question until
+    #719's rebind is armed, and deliberately so: with no rebind the binding is
+    always the boot (PP) phase, so this reduces to the #718 predicate exactly.
+    Once a rebind moves the binding coherently, the tier is usable in the phase
+    it was moved to, and this returns False there.
+
     ``direction`` only labels the log line ("write" / "load").
     """
-    if not flip_routing_active():
+    from sglang.srt.mem_cache.hicache_phase_binding import bound_phase
+
+    if active_phase() == bound_phase():
         return False
     if direction is not None:
         warn_once(direction)

@@ -1619,6 +1619,29 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # sit between a failed completeness check and the exception.
         from sglang.srt.managers.phase_flip_output_trace import trace_cutover
 
+        # #719: move the HiCache pool bindings to the phase that is now active.
+        # Runs AFTER the stack swap, because the incoming pools are what it
+        # binds to -- the mirror of #703's writeback, which runs BEFORE
+        # anything moves because it reads the outgoing ones.
+        #
+        # Refusal is logged, not raised, for the reason the seam always gives:
+        # with requests parked a raise takes down an instance that was serving
+        # fine. A refused rebind is SAFE by construction -- the binding does not
+        # move, so #718 keeps device-tier I/O disarmed in this phase, which is
+        # exactly the state that held before this feature existed.
+        try:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                rebind_for_cutover,
+            )
+
+            rebind_for_cutover(scheduler, "tp" if tp_phase else "pp")
+        except Exception as e:
+            logger.error(
+                "%s #719 HiCache rebind refused (%s); device-tier I/O stays "
+                "disarmed for this phase and the flip continues.",
+                LOG_PREFIX,
+                e,
+            )
         trace_cutover(scheduler, direction)
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
