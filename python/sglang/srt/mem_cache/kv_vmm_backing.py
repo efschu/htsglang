@@ -337,6 +337,39 @@ def arena_census() -> Dict[int, Dict[str, int]]:
     return out
 
 
+#: The lever that makes #464 reachable from a boot. See
+#: :func:`resolve_coalesce_resume`.
+COALESCE_RESUME_ENV = "SGLANG_VMM_COALESCE_RESUME"
+
+
+def resolve_coalesce_resume(explicit: Optional[bool]) -> bool:
+    """Decide whether ``commit_range`` coalesces, honouring an explicit caller.
+
+    WHY THIS EXISTS. The coalescer shipped with a constructor flag and the
+    stated purpose "so the measurement can be taken". Nothing passed it: both
+    carrier arenas (``phase_flip_spill.py:597``, ``:927``) and the KV seam
+    owner (``memory_pool.py:2488``) construct without the argument, so the flag
+    was False in every real boot and the measurement it exists for could not be
+    taken. A switch whose actuator is unreachable is not a dark feature, it is
+    an absent one.
+
+    Resolved HERE, at the single place the flag is stored, rather than threaded
+    through every construction site: a site that has no opinion needs no edit
+    and cannot drift out of sync with the others.
+
+    An explicit argument WINS over the environment -- ambient state must not
+    overrule a caller that has decided. Only ``None`` (no opinion) consults the
+    lever.
+
+    Parsed locally rather than through ``utils.common.get_bool_env_var``
+    because this module deliberately imports nothing from ``sglang``; the
+    truthy set is kept identical to it.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return os.environ.get(COALESCE_RESUME_ENV, "").strip().lower() in ("1", "true")
+
+
 class VmmCoalesceRefused(RuntimeError):
     """A coalesce was REQUIRED by the caller and the region could not honour it."""
 
@@ -428,12 +461,12 @@ class KvVmmArena:
         reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
         commit_chunk_bytes: Optional[int] = None,
         retain_handles: bool = False,
-        coalesce_resume: bool = False,
+        coalesce_resume: Optional[bool] = None,
     ):
         # #464, DEFAULT OFF: the 40-85 ms band is unmeasured, so the flag
         # exists to make the measurement possible, not because the win is
         # assumed. Off reproduces the per-#330-chunk plan byte-for-byte.
-        self._coalesce_resume = bool(coalesce_resume)
+        self._coalesce_resume = resolve_coalesce_resume(coalesce_resume)
         self.device_id = int(device_id)
         # Unique per (process, arena instance): the stub .so lives in a host-shared
         # tempdir, so co-located engine processes must not build the same-named .so
