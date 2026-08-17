@@ -314,3 +314,103 @@ validated it), `PhasePoolModel`'s attention-layer divisor and #723 frontier
 completeness to be ported as an EXTENSION, never a parallel model. The four
 mechanical conflict resolutions from the aborted `fix/602-fill-side` merge are
 recorded there so the next attempt does not re-derive them.
+
+---
+
+# THIRD PASS — the three decisions executed (2026-08-17)
+
+## T1. #630: parse-time twin RESTORED, narrowed to match the runtime guard
+
+Decided: the runtime guard is the current truth (pp_sync desync UNROOTED, repro
+in flight), so the flip+HiCache boot IS legitimately refused today for
+storage-backed tiers.
+
+Restored in `server_args._handle_phase_flip()` with the runtime clause's exact
+condition -- `pp_size > 1` AND `enable_hierarchical_cache` AND a storage backend
+-- and its reason string, pointing at the twin. Refusing at parse costs a
+second; the runtime twin fires after a full weight load, which cost 11 minutes
+and a dead instance.
+
+The #703 comment that read "the #630 blocker is REMOVED, matching its runtime
+twin" is rewritten to the new truth WITH its provenance: `9da9dfd025` bounded
+the wait and never rooted the desync, and `test_hicache_bounded_waits_630.py`
+proves only that a bounded call raises on schedule against mocked Work objects.
+
+`test_v1_blockers_named` now names a storage backend, because the narrowed
+guard deliberately no longer refuses the device+host-local tier. That is the
+test asserting the guard as decided, not a test bent to fit code.
+
+`DESIGN_706_BOOT.md` gains **PRECONDITION 0 -- THIS BOOT IS BLOCKED TODAY**,
+with the measurement, the lift condition ("a test proves two REAL ranks
+rendezvous, not that a wait expires"), and what stays reachable meanwhile
+(single-stage flips, device+host-local tier at any stage count). The refused
+boot and the ticket describing it can no longer drift apart.
+
+**`server_args`: 1 failure -> 0.**
+
+## T2. #550: the determination, from the producers
+
+Every consumer reaches the registry through `check_and_register_pinned_post`
+except one: `weights_arena.py:428` (`_register_image_post`), and it registers
+BEFORE it allocates -- the allocation is at :439-460. So exec's stated
+invariant, "registration FOLLOWS allocation for every producer of a post", is
+literally inaccurate.
+
+It does not change the verdict, and the reason is the one that matters: the gap
+closes INSIDE the same call, so any LATER checker sees bytes already allocated.
+No producer leaves a registered-but-unallocated post standing on a success
+path, which is the condition the credit-back actually depends on.
+
+So the fixtures encoded a machine that cannot exist, and they are corrected on
+physics rather than on either lane's model. `available` is read LIVE: an
+allocated 30 GB post cannot coexist with a static 40 GB available, and 40 GB
+cannot survive allocating 20 GB. Both tests keep their exact intent -- a post
+must not be admitted on its own arithmetic; the second post must see the first
+-- with numbers a machine can be in (10 GB remaining; 40 then 20).
+
+**RESIDUAL, filed rather than buried:** on the `weights_arena` allocation
+FAILURE path the post stays registered with nothing allocated, and there the
+credit-back would under-charge. Narrow, real, owner #706/#695.
+
+**`mem_cache`: 2 failures -> 0.**
+
+## T3. Latecomers merged
+
+`feat/363-remainder` (DESIGN_363 §21, which was only a stub on the train) and
+`close/363-actuator-verdict` merged clean. `feat/ledger-vram-authority`
+(`756aa52b58`) was already an ancestor -- no-op, verified rather than assumed.
+
+Slot-3's `train/0818-desk-410-pinning` was NOT merged, per the decision: it is
+superseded by the running A+B reconciliation.
+
+## T4. Final gate — base `a157bf1889` vs `a6b2feb161`
+
+| suite | BASE | FINAL | delta |
+| --- | --- | --- | --- |
+| `mem_ledger` | 0 F / 444 P | **0 F** / 514 P | clean |
+| `server_args` | 0 F / 627 P | **0 F** / 671 P | clean (T1) |
+| `boot_matrix` | 0 F / 140 P | **0 F** / 159 P | clean |
+| `spec` | 13 F / 711 P | 13 F / 711 P | unchanged |
+| `entrypoints` | 4 F / 417 P / 3 E | 4 F / 450 P / 3 E | unchanged |
+| `mem_cache` | 940 F / 748 P | **0 F** / 1144 P | −940 (T2) |
+| `planner` | 2 F / 2494 P | 1 F / 2880 P | −1 improved |
+| `distributed` | 21 F / 2689 P | 27 F / 2769 P | +6 inherited |
+| `managers` | 9 F / 1587 P | 22 F / 2413 P | +13, see below |
+
+Six suites now have ZERO failures. The two remaining deltas:
+
+* `distributed` +6 — inherited via `reconcile/cluster-b-seam-model` from
+  `fix/701-ledger-wiring`, attributed by measurement in the first pass.
+* `managers` +13 — of which **19 of the 22 are the cluster-b inherited set**
+  (that branch checked out alone reports exactly 19). The remaining three
+  appear only in the FULL-SUITE run after the latecomers; the two named ones,
+  `test_regime_gate_tools.py::TestGateToolSmokes::test_the_gate_1_readout_smoke_passes`
+  and `::test_the_gate_2_replay_smoke_reproduces_the_f2_result`, **pass alone
+  (22/22) and pass under two different `-k` filters**, and the count is
+  deterministic at 22 across repeated runs. That is test-order pollution, not a
+  code regression — a follow-up for the #363 owner, named here so it is not
+  rediscovered as a mystery.
+
+**No unexplained failures remain.** Every non-zero suite is either identical to
+base, attributed by measurement to a contributing branch, or named as
+order-dependent with the evidence for that claim.
