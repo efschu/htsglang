@@ -1116,7 +1116,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
         # the field being absent — otherwise the draft worker takes the MTP branch below with
         # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
-        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[self.local_slot(layer_id)]`).
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         if self.is_draft_worker and model_has_mtp_layers:
@@ -1134,7 +1134,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-        self.num_effective_layers = self.end_layer - self.start_layer
+        # #pp-layer-set: end - start is the SPAN, which equals the COUNT only
+        # while a stage is a contiguous interval. Under SGLANG_PP_LAYER_SET a
+        # stage owns an arbitrary set -- e.g. the 8 full-attention layers of a
+        # 64-layer hybrid, spanning [3, 64) -- and the span would over-count
+        # them 61 to 8. This number feeds `layer_num=` for KV pool allocation
+        # (model_runner_kv_cache_mixin.py), so the span would size the pool
+        # 7.6x too large and the boot would fail on memory it never needed.
+        # Read from the SAME parser that built the layer list, rather than
+        # asking the model to propagate an attribute -- that would need an edit
+        # in every model file, and two places deriving ownership is how they
+        # start disagreeing.
+        from sglang.srt.distributed.utils import get_pp_layer_set
+
+        owned = get_pp_layer_set(model_num_layers, self.pp_rank, self.pp_size)
+        if owned is not None:
+            self.num_effective_layers = len(owned)
+        else:
+            self.num_effective_layers = self.end_layer - self.start_layer
 
         self.adjust_hybrid_swa_layers_for_pp()
 

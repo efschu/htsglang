@@ -119,6 +119,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     make_layers,
+    owned_layer_ids,
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
@@ -832,10 +833,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # token-sharded pool (owner rule) — fail fast without it.
                 # The NEXTN draft is exempt by design: its single-layer
                 # full-context pool is intentionally replicated (non-DCP).
-                if (
-                    not is_nextn
-                    and get_parallel().attn_dcp_size != self.attn_tp_size
-                ):
+                if not is_nextn and get_parallel().attn_dcp_size != self.attn_tp_size:
                     raise ValueError(
                         f"TP > num_kv_heads: layer {layer_id} has "
                         f"{self.total_num_kv_heads} kv heads for "
@@ -1480,7 +1478,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         aux_hidden_states = []
         # Pass through decoder layers
-        for layer_idx in range(self.start_layer, self.end_layer):
+        for layer_idx in owned_layer_ids(self.layers, self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx

@@ -116,12 +116,40 @@ class PPMissingLayer(torch.nn.Identity):
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.return_tuple = kwargs.get("return_tuple", False)
+        # Set ONLY for placeholders that sit inside [start_layer, end_layer),
+        # which happens only under non-contiguous ownership. See forward().
+        self.unowned_layer_id = kwargs.get("unowned_layer_id")
 
     def forward(self, *args, **kwargs):
         """
         Return the first arg from args or the first value from kwargs.
 
         Wraps the input in a tuple if `self.return_tuple` is True.
+
+        Being CALLED at all is normally impossible: a placeholder stands for a
+        layer this stage does not own, and loops run over the stage's own
+        layers, so placeholders sit outside the iterated interval. The
+        pass-through exists for the ends of that interval, not as a working
+        no-op in the middle of a forward pass.
+
+        Non-contiguous ownership (SGLANG_PP_LAYER_SET) is the first case where
+        a placeholder can land INSIDE the interval, and a caller iterating
+        `range(start_layer, end_layer)` instead of `owned_layer_ids(...)` will
+        invoke it. The pass-through is actively harmful there: it returns the
+        FIRST argument, so `hidden_states = layer(positions, hidden_states, ..)`
+        silently substitutes the positions tensor for the hidden states. Those
+        placeholders are armed at construction and refuse instead.
         """
+        if self.unowned_layer_id is not None:
+            raise RuntimeError(
+                f"PPMissingLayer for layer {self.unowned_layer_id} was called: "
+                "this stage does not own that layer, so something iterated the "
+                "SPAN between its first and last owned layer instead of its "
+                "owned layers. Iterate sglang.srt.utils.owned_layer_ids("
+                "self.layers, self.start_layer, self.end_layer) instead of "
+                "range(self.start_layer, self.end_layer). Passing through here "
+                "would return the first argument (typically `positions`) in "
+                "place of the hidden states."
+            )
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input

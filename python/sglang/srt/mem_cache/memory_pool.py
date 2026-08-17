@@ -554,9 +554,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
-                    "envelope_layout mamba is only supported on the CUDA path"
-                )
+                assert not _is_npu and not (
+                    _is_cpu and _cpu_has_amx_support
+                ), "envelope_layout mamba is only supported on the CUDA path"
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -1543,13 +1543,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         return None
                     fresh_pingpong_reqs.append(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(mamba_indices), (
-            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        )
+        assert len(select_index) == len(
+            mamba_indices
+        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
-                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-            )
+            assert len(select_index) == len(
+                mamba_ping_pong_track_buffers
+            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1573,7 +1573,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
@@ -1762,9 +1762,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], (
-                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
-                )
+                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1987,6 +1985,47 @@ def zero_kv_data_buffers(kvcache) -> int:
     return zeroed
 
 
+def mark_as_sub_pool(pool) -> None:
+    """Declare that `pool` is addressed in its OWN layer frame, not the global
+    PP frame, and drop any global ownership map it picked up.
+
+    `KVCache.__init__` attaches a map keyed by GLOBAL layer ids, which is right
+    for a pool the model addresses with global ids. A sub-pool is different: its
+    wrapper re-indexes first. `HybridLinearKVPool` maps a global id through
+    `_transfer_full_attention_id` into a DENSE full-attention index before
+    calling into `full_kv_pool`, so under SGLANG_PP_LAYER_SET the id arriving is
+    0..N-1 while the map holds e.g. {35: 0, 39: 1, ...} and every lookup misses.
+
+    Dropping the map makes the sub-pool's accessor degenerate to the plain
+    subtraction inside its own dense frame, which is what its buffers are laid
+    out for. On the contiguous path there is no map to drop and this is a no-op.
+    """
+    pool._local_slot_of = None
+
+
+def _owned_layers_for_pool():
+    """This stage's owned layer ids, or ``None`` on the contiguous path.
+
+    Reads the SAME parser that built the model's layer list, so ownership has
+    exactly one derivation. Returns None whenever the layer-set form is unused,
+    which is what makes every accessor below degenerate to the arithmetic it
+    replaces.
+    """
+    try:
+        from sglang.srt.distributed import get_pp_group
+        from sglang.srt.distributed.utils import get_pp_layer_set
+    except Exception:  # pragma: no cover - import shape varies in unit tests
+        return None
+    try:
+        group = get_pp_group()
+        num_layers = getattr(group, "num_hidden_layers", None)
+        if num_layers is None:
+            return None
+        return get_pp_layer_set(num_layers, group.rank_in_group, group.world_size)
+    except Exception:  # pragma: no cover - no process group in unit tests
+        return None
+
+
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
@@ -2015,6 +2054,28 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+
+        # NON-CONTIGUOUS OWNERSHIP: global layer id -> LOCAL buffer slot.
+        #
+        # Every per-layer buffer here is indexed by a stage-local slot, and the
+        # translation was written inline as `layer_id - self.start_layer` in
+        # dozens of places. That subtraction is correct only while a stage owns
+        # a contiguous RANGE. Under SGLANG_PP_LAYER_SET a stage owns a set --
+        # e.g. the full-attention layers {3, 7, 11, ...} of a hybrid model --
+        # and then layer 7's local slot is 1, while the subtraction says 4.
+        # Reading slot 4 of an 8-slot buffer is not a crash; it is another
+        # layer's KV, returned confidently.
+        #
+        # So the translation goes through ONE accessor, built once here. When
+        # ownership is contiguous the map is None and the accessor degenerates
+        # to exactly the old subtraction -- that is what keeps the default path
+        # byte-identical, and it is pinned.
+        self._local_slot_of: Optional[Dict[int, int]] = None
+        owned = _owned_layers_for_pool()
+        if owned is not None:
+            self._local_slot_of = {
+                layer: slot for slot, layer in enumerate(sorted(owned))
+            }
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -2030,6 +2091,27 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def local_slot(self, layer_id: int) -> int:
+        """Global layer id -> this stage's LOCAL buffer slot.
+
+        Contiguous ownership: identical to the ``layer_id - self.start_layer``
+        this replaces, by construction.
+
+        Set ownership: the RANK of ``layer_id`` among the sorted owned ids. A
+        layer this stage does not own is a caller bug, not a slot -- it is
+        REFUSED rather than translated, because the subtraction's failure mode
+        was to return a plausible index into ANOTHER layer's KV.
+        """
+        if self._local_slot_of is None:
+            return layer_id - self.start_layer
+        slot = self._local_slot_of.get(layer_id)
+        if slot is None:
+            raise KeyError(
+                f"layer {layer_id} is not owned by this stage (owns "
+                f"{sorted(self._local_slot_of)}); it has no local KV slot"
+            )
+        return slot
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -2179,9 +2261,7 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim
-            if v_head_dim is not None
-            else head_dim
+            else v_head_dim if v_head_dim is not None else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2886,26 +2966,26 @@ class MHATokenToKVPool(KVCache):
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[self.local_slot(layer_id)].view(self.dtype)
+        return self.k_buffer[self.local_slot(layer_id)]
 
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[self.local_slot(layer_id)].view(self.dtype)
+        return self.v_buffer[self.local_slot(layer_id)]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
@@ -2944,8 +3024,8 @@ class MHATokenToKVPool(KVCache):
 
         if dcp_kv_mask is not None:
             N, H, D = cache_k.shape
-            k_buf = self.k_buffer[layer_id - self.start_layer]
-            v_buf = self.v_buffer[layer_id - self.start_layer]
+            k_buf = self.k_buffer[self.local_slot(layer_id)]
+            v_buf = self.v_buffer[self.local_slot(layer_id)]
             # #355: the kernel addresses the buffer flat at ``loc * H * D``, so
             # its bound is the row count under exactly that stride -- taken from
             # the same helper the raw store_cache path uses so the two paths
@@ -2972,15 +3052,15 @@ class MHATokenToKVPool(KVCache):
 
         if self.use_hnd:
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
-            k_buf = self.k_buffer[layer_id - self.start_layer]
-            v_buf = self.v_buffer[layer_id - self.start_layer]
+            k_buf = self.k_buffer[self.local_slot(layer_id)]
+            v_buf = self.v_buffer[self.local_slot(layer_id)]
             pages = loc // self.page_size
             offs = loc % self.page_size
             k_buf[pages, :, offs, :] = cache_k
             v_buf[pages, :, offs, :] = cache_v
             return
 
-        self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+        self._store_kv_layer(self.local_slot(layer_id), loc, cache_k, cache_v)
 
     def _store_kv_layer(
         self,
@@ -3108,8 +3188,8 @@ class MHATokenToKVPool(KVCache):
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
             cache_v,
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[self.local_slot(layer_id)],
+            self.v_buffer[self.local_slot(layer_id)],
             loc_2d,
             commit_lens,
             row_dim=self.row_dim,
@@ -3151,9 +3231,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert self._kv_copy_config is not None, (
-            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
-        )
+        assert (
+            self._kv_copy_config is not None
+        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -3286,10 +3366,10 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         # Return the placeholder. The FA backend reads this before taking the
         # fa_skip_kv_cache branch (which does not use it); the placeholder shape
         # is (page_size, head_num, head_dim) so downstream .view() calls succeed.
-        return self.k_buffer[layer_id - self.start_layer]
+        return self.k_buffer[self.local_slot(layer_id)]
 
     def get_value_buffer(self, layer_id: int):
-        return self.v_buffer[layer_id - self.start_layer]
+        return self.v_buffer[self.local_slot(layer_id)]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -3358,10 +3438,10 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
-            cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(
+            cache_k_nope_fp4 = self.k_buffer[self.local_slot(layer_id)].view(
                 torch.uint8
             )
-            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
+            cache_k_nope_fp4_sf = self.k_scale_buffer[self.local_slot(layer_id)]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 BlockFP4KVQuantizeUtil,
@@ -3371,15 +3451,15 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
-        return self.k_buffer[layer_id - self.start_layer]
+        return self.k_buffer[self.local_slot(layer_id)]
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
-            cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(
+            cache_v_nope_fp4 = self.v_buffer[self.local_slot(layer_id)].view(
                 torch.uint8
             )
-            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
+            cache_v_nope_fp4_sf = self.v_scale_buffer[self.local_slot(layer_id)]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 BlockFP4KVQuantizeUtil,
@@ -3389,7 +3469,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
-        return self.v_buffer[layer_id - self.start_layer]
+        return self.v_buffer[self.local_slot(layer_id)]
 
     def set_kv_buffer(
         self,
@@ -3433,20 +3513,20 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_buffer[self.local_slot(layer_id)][loc] = cache_k
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
+            self.k_scale_buffer[self.local_slot(layer_id)][loc] = cache_k_fp4_sf
             with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                self.v_buffer[self.local_slot(layer_id)][loc] = cache_v
 
-                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+                self.v_scale_buffer[self.local_slot(layer_id)][loc] = cache_v_fp4_sf
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.k_buffer[self.local_slot(layer_id)][loc] = cache_k
+            self.v_buffer[self.local_slot(layer_id)][loc] = cache_v
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+            self.k_scale_buffer[self.local_slot(layer_id)][loc] = cache_k_fp4_sf
+            self.v_scale_buffer[self.local_slot(layer_id)][loc] = cache_v_fp4_sf
 
 
 class PageMajorMHATokenToKVPool(MHATokenToKVPool):
@@ -3713,6 +3793,9 @@ class HybridLinearKVPool(KVCache):
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
             )
+        # The sub-pool is addressed with the DENSE index below, not a global
+        # layer id, so it must not carry a global ownership map.
+        mark_as_sub_pool(self.full_kv_pool)
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
@@ -3876,7 +3959,7 @@ class HybridLinearKVPool(KVCache):
 
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
@@ -4082,22 +4165,22 @@ class MLATokenToKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            return self.kv_buffer[self.local_slot(layer_id)].view(self.dtype)
 
-        return self.kv_buffer[layer_id - self.start_layer]
+        return self.kv_buffer[self.local_slot(layer_id)]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer][
+            return self.kv_buffer[self.local_slot(layer_id)][
                 ..., : self.kv_lora_rank
             ].view(self.dtype)
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+        return self.kv_buffer[self.local_slot(layer_id)][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -4123,11 +4206,11 @@ class MLATokenToKVPool(KVCache):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+            self.kv_buffer[self.local_slot(layer_id)][loc] = cache_k.view(
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[self.local_slot(layer_id)][loc] = cache_k
 
     def _write_mla_kv_buffer(
         self,
@@ -4188,7 +4271,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
-            self.kv_buffer[layer_id - self.start_layer],
+            self.kv_buffer[self.local_slot(layer_id)],
             loc,
             cache_k_nope,
             cache_k_rope,
@@ -4299,13 +4382,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
         if self.store_dtype != self.dtype:
-            cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+            cache_k_nope_fp4 = self.kv_buffer[self.local_slot(layer_id)].view(
                 torch.uint8
             )
-            cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+            cache_k_nope_fp4_sf = self.kv_scale_buffer[self.local_slot(layer_id)]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 BlockFP4KVQuantizeUtil,
@@ -4316,7 +4399,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             return cache_k_nope_fp4_dequant
 
-        return self.kv_buffer[layer_id - self.start_layer]
+        return self.kv_buffer[self.local_slot(layer_id)]
 
     def set_kv_buffer(
         self,
@@ -4340,14 +4423,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
+            self.kv_buffer[self.local_slot(layer_id)][loc] = cache_k_fp4.view(
                 self.store_dtype
             )
-            self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
-                cache_k_fp4_sf.view(self.store_dtype)
+            self.kv_scale_buffer[self.local_slot(layer_id)][loc] = cache_k_fp4_sf.view(
+                self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[self.local_slot(layer_id)][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -4367,7 +4450,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[self.local_slot(layer_id)][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
@@ -4386,13 +4469,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
+                self.kv_buffer[self.local_slot(layer_id)],
                 loc,
                 cache_k_nope_fp4,
                 cache_k_rope_fp4,
             )
             set_mla_kv_scale_buffer_triton(
-                self.kv_scale_buffer[layer_id - self.start_layer],
+                self.kv_scale_buffer[self.local_slot(layer_id)],
                 loc,
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
@@ -4449,13 +4532,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert self.page_size % 16 == 0, (
-                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
-                )
+                assert (
+                    self.page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
             else:
-                assert self.page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
-                )
+                assert (
+                    self.page_size == 1
+                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         self._create_index_buffers()
@@ -4508,8 +4591,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
+        return self.index_k_with_scale_buffer[self.local_slot(layer_id)]
 
     def get_index_k_continuous(
         self,
@@ -4518,8 +4601,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
+        buf = self.index_k_with_scale_buffer[self.local_slot(layer_id)]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -4531,8 +4614,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
+        buf = self.index_k_with_scale_buffer[self.local_slot(layer_id)]
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -4557,8 +4640,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
                  k_scale: (seq_len, 4), uint8
         """
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
+        buf = self.index_k_with_scale_buffer[self.local_slot(layer_id)]
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -4575,7 +4658,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self.local_slot(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
@@ -4801,8 +4884,8 @@ class MHATokenToKOnlyPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[self.local_slot(layer_id)].view(self.dtype)
+        return self.k_buffer[self.local_slot(layer_id)]
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: LayerDoneCounter
@@ -4811,7 +4894,7 @@ class MHATokenToKOnlyPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
         return self._get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
@@ -4964,7 +5047,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def _wait_for_layer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self._wait_for_layer(layer_id)
