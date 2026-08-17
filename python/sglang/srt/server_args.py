@@ -5529,6 +5529,41 @@ class ServerArgs:
             "Default off = keys and bytes byte-identical to today.",
         ),
     ] = False
+    phase_flip_writeback: A[
+        bool,
+        Arg(
+            help="#703: push warm prefixes to the geometry-neutral store "
+            "BEFORE each phase flip, instead of hoping the normal write-back "
+            "policy already did. Nothing in the flip path touches HiCache "
+            "today: device rows ride through (the live row set is relocated by "
+            "row id), but the HOST tier is bound to the pool that BUILT it -- "
+            "the boot PP stack -- and in the TP phase that is not the live "
+            "pool, so the only way across the flip for a prefix is the disk "
+            "tier. Getting it there is not automatic: under "
+            "--hicache-write-policy write_back a prefix is staged only under "
+            "eviction pressure, and the host->storage stage is an asynchronous "
+            "queue that a flip neither forces nor waits for. This hook stages "
+            "the un-backed prefixes of the tree and WAITS for the storage "
+            "acknowledgements under a deadline "
+            "(--phase-flip-writeback-deadline-s), never unbounded: it runs "
+            "with requests parked, where an unbounded wait is a wedge. "
+            "REFUSES LOUDLY without --phase-flip-canonical-kv-page, because "
+            "pages keyed by the geometry of one phase cannot be read by the "
+            "other and the IO would buy nothing. Requires --enable-phase-flip. "
+            "Default off.",
+        ),
+    ] = False
+    phase_flip_writeback_deadline_s: A[
+        Optional[float],
+        Arg(
+            help="#703: hard bound on the flip-time writeback wait, in "
+            "seconds (default 2.0). Whatever is not acknowledged in time stays "
+            "in flight and is reported; the flip proceeds either way. A prefix "
+            "that misses the store costs a later cache miss, while a flip "
+            "stalled behind an unbounded drain costs the instance. Requires "
+            "--phase-flip-writeback.",
+        ),
+    ] = None
     enable_vram_dial: A[
         bool,
         Arg(
@@ -7645,6 +7680,11 @@ class ServerArgs:
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
                 )
+            if self.phase_flip_writeback:
+                raise ValueError(
+                    "--phase-flip-writeback requires --enable-phase-flip: "
+                    "with one layout there is no flip to write back before."
+                )
             if self.phase_flip_canonical_kv_page:
                 raise ValueError(
                     "--phase-flip-canonical-kv-page requires "
@@ -7828,6 +7868,28 @@ class ServerArgs:
                 )
         if blockers:
             raise ValueError(f"--enable-phase-flip V1 refuses: {', '.join(blockers)}.")
+        if self.phase_flip_writeback and not self.phase_flip_canonical_kv_page:
+            raise ValueError(
+                "--phase-flip-writeback requires "
+                "--phase-flip-canonical-kv-page: the writeback exists to get "
+                "a prefix into a store the OTHER phase can name, and without "
+                "the geometry-neutral format the pages it writes still carry "
+                "the tp/pp suffixes of the phase that wrote them. Refused "
+                "rather than run, because the cost -- IO at the flip seam, "
+                "with requests parked -- would be paid for a hit that cannot "
+                "happen."
+            )
+        if self.phase_flip_writeback_deadline_s is not None:
+            if not self.phase_flip_writeback:
+                raise ValueError(
+                    "--phase-flip-writeback-deadline-s requires "
+                    "--phase-flip-writeback; alone it bounds nothing."
+                )
+            if self.phase_flip_writeback_deadline_s <= 0:
+                raise ValueError(
+                    "--phase-flip-writeback-deadline-s must be > 0, got "
+                    f"{self.phase_flip_writeback_deadline_s}."
+                )
         if self.phase_flip_canonical_kv_page:
             # #706: the two conditions the whole-page protocol is defined on.
             # Both are checkable here, and both are silent corruption if left

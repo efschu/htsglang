@@ -89,5 +89,54 @@ class TestCanonicalKvPageArgs(CustomTestCase):
         self.assertFalse(args.phase_flip_canonical_kv_page)
 
 
+class TestFlipWritebackArgs(CustomTestCase):
+    """#703: the flip-time writeback gate.
+
+    The refusals exist so an operator who asked for retention across the flip
+    cannot silently get none: without the geometry-neutral format the pages the
+    hook writes still carry the geometry of the phase that wrote them, so the
+    IO would be spent at the flip seam for a hit that cannot happen.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(cls.parser)
+
+    def test_default_is_off(self):
+        parsed = self.parser.parse_args(["--model-path", "m"])
+        self.assertFalse(parsed.phase_flip_writeback)
+        self.assertIsNone(parsed.phase_flip_writeback_deadline_s)
+
+    def test_requires_enable_phase_flip(self):
+        args = ServerArgs(model_path="dummy", phase_flip_writeback=True)
+        with self.assertRaisesRegex(ValueError, "requires --enable-phase-flip"):
+            args._handle_phase_flip()
+
+    def test_requires_the_canonical_page(self):
+        args = flip_args(phase_flip_writeback=True)
+        with self.assertRaisesRegex(ValueError, "canonical-kv-page"):
+            args._handle_phase_flip()
+
+    def test_accepted_with_the_canonical_page(self):
+        args = flip_args(phase_flip_writeback=True, phase_flip_canonical_kv_page=True)
+        args._handle_phase_flip()  # no raise
+        self.assertTrue(args.phase_flip_writeback)
+
+    def test_deadline_alone_is_refused(self):
+        args = flip_args(phase_flip_writeback_deadline_s=2.0)
+        with self.assertRaisesRegex(ValueError, "requires"):
+            args._handle_phase_flip()
+
+    def test_non_positive_deadline_is_refused(self):
+        args = flip_args(
+            phase_flip_writeback=True,
+            phase_flip_canonical_kv_page=True,
+            phase_flip_writeback_deadline_s=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            args._handle_phase_flip()
+
+
 if __name__ == "__main__":
     unittest.main()

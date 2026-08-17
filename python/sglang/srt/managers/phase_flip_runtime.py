@@ -6225,6 +6225,36 @@ class PhaseFlipRuntime:
         # The aggregate cost was measured from outside the process; which
         # STAGE spends it was not, and the candidates have different fixes.
         seam_census.begin(direction, self._rank)
+        # #703: push warm prefixes to the geometry-neutral store BEFORE
+        # anything moves. Ordering is the whole content of the hook: the radix
+        # cache is bound to the pool that BUILT it (the boot PP stack's), so
+        # this is the last moment at which reading that pool reads live bytes.
+        # After the cutover the same copy would read a pool the model is no
+        # longer writing into.
+        #
+        # NEVER RAISES INTO THE FLIP. The configuration errors this hook cares
+        # about -- no storage tier, or a store without the #706 canonical
+        # format -- are refused at PARSE time by ServerArgs, where refusing is
+        # free. Here, with requests already parked, a raise climbs into the
+        # event loop and takes down an instance that was serving fine in its
+        # current phase, which is the lesson the bounds check below learned the
+        # expensive way. A prefix that misses the store costs a later cache
+        # miss; that is the cheaper failure, and it is logged, not thrown.
+        try:
+            from sglang.srt.mem_cache.hicache_flip_writeback import (
+                maybe_flip_writeback,
+            )
+
+            if maybe_flip_writeback(getattr(self, "_census_scheduler", None)):
+                seam_census.mark("flip_writeback")
+        except Exception as e:
+            logger.error(
+                "%s #703 flip-time writeback did not run (%s); the flip "
+                "continues and prefixes written in this phase will miss in "
+                "the next one.",
+                LOG_PREFIX,
+                e,
+            )
         slots = self._live_slots_fn()
         slots = torch.unique(slots.detach().to("cpu", torch.int64))
         tr: PhaseFlipTransition = build_phase_flip_transition(
