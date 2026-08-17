@@ -97,7 +97,14 @@ class TestSchedulerSuppliesTheMeasurement708(CustomTestCase):
         from sglang.srt.managers import scheduler as scheduler_mod
 
         src = inspect.getsource(scheduler_mod.Scheduler)
-        self.assertIn("kv_available_tokens=self._uniform_kv_available()", src)
+        # KEYED ON THE IDENTIFIER, NOT THE CALL FORM. The wiring was later
+        # made defensive (getattr(self, "_uniform_kv_available", ...)) so a
+        # scheduler STAND-IN without the probe degrades to "not measured"
+        # instead of raising -- and this pin, keyed on the literal call,
+        # broke on that edit. A pin must survive a legal refactor of the
+        # thing it pins, or it punishes the fix instead of the regression.
+        self.assertIn("kv_available_tokens=", src)
+        self.assertIn("_uniform_kv_available", src)
 
     def test_the_helper_uses_the_GROUP_MIN_accessor(self):
         """Not the local pool: PhasePolicyInputs fields are replicated by

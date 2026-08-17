@@ -118,6 +118,153 @@ LOG_PREFIX = "PHASE-POLICY"
 PHASE_PP = "pp"
 PHASE_TP = "tp"
 BOTH_BLOCKED = "BOTH BLOCKED"
+
+#: #677: the layout HOLD. Bounded, because an unbounded hold is a starvation
+#: bug wearing a fix's clothes.
+#:
+#: 8 rounds is derived, not round: a cutover costs ~2.6 s of seam (#690, seam
+#: total 2.56-2.59 s measured), and the scheduler's rounds under prefill run at
+#: roughly the chunk cadence, so 8 rounds bounds a hold at well under one seam's
+#: worth of held layout. Holding longer than it costs to leave is never worth it.
+LAYOUT_HOLD_MAX_ROUNDS: int = 8
+
+#: #677 mirror bound: rounds a RUNNING decode batch is guaranteed before a
+#: prefill pull may take the layout. 2 is the minimum that means "did not
+#: preempt mid-batch"; larger belongs to the economic comparison, not here.
+MIN_DECODE_ROUNDS: int = 2
+
+HOLD_FOR_UNSERVED = "HOLD: work pending in this layout"
+PULL_FOR_DEMAND = "PULL: work pending for the other layout"
+
+
+def next_hold_rounds(
+    prev_rounds: int, prev_phase: str, phase: str, pending: int
+) -> int:
+    """The hold counter's lifecycle, as a function so it can be pinned (#677).
+
+    ``layout_hold_verdict`` takes ``hold_rounds_so_far`` from its caller, and a
+    caller-maintained counter is exactly the kind of state that goes stale
+    silently. A counter carried across a phase change would make the FIRST hold
+    of the next episode start half-exhausted -- the layout would release early,
+    and the C2 fix would evaporate for the arrival that needed it most.
+
+    RESET ON EITHER BOUNDARY: a phase change (a new episode owns a fresh bound)
+    or the pending work reaching zero (the episode this bound was counting is
+    over). Otherwise advance by one.
+    """
+    if phase != prev_phase:
+        return 0
+    if int(pending) <= 0:
+        return 0
+    return max(0, int(prev_rounds)) + 1
+
+
+def layout_hold_verdict(
+    phase: str,
+    prefill_pending_tokens: int,
+    decode_waiting: int,
+    hold_rounds_so_far: int = 0,
+    max_hold_rounds: int = LAYOUT_HOLD_MAX_ROUNDS,
+    seam_funded: bool = True,
+    mid_flip: bool = False,
+    decode_serving: bool = False,
+    decode_rounds_so_far: int = 0,
+    min_decode_rounds: int = MIN_DECODE_ROUNDS,
+):
+    """``(allow_flip, reason)`` -- demand decides the layout, not the timer.
+
+    MEASURED PROBLEM (#713 quantisation table, 2026-08-17 06:19). Demand-PULL
+    already worked: C1 arrived 06:19:06.56 and was served by the tp_to_pp at
+    :09, one seam plus overhead. What failed was the step after -- the box
+    flipped BACK at :12, so C2, which arrived 06:19:09.71 just as PP began, was
+    not served until :15. The layout left on a timer while the prefill that
+    pulled it was still unserved, and TTFT quantised to whole cycles
+    (0.1 / 3.1 / 5.9 s, nothing between).
+
+    So the same arriving-tokens signal that PULLS a cutover must also HOLD it
+    until the work it pulled for is served. Demand overrides the timer in BOTH
+    directions; that symmetry is the rule, not two rules.
+
+    SAFETY, in precedence order:
+      * never mid-flip -- a cutover in progress owns the layout;
+      * never against an unfunded seam -- a pull that cannot pay is an abandon;
+      * BOUNDED BOTH WAYS -- see below.
+
+    THE BOTH-SIDES TIE. When prefill is unserved in PP *and* decode is waiting
+    for TP, the timer must not break it and neither may an unbounded hold: that
+    is one starvation direction traded for the other. The tie goes to the #677
+    economic comparison, backlog-weighted, and the hold is bounded by
+    ``max_hold_rounds`` so a decode queue can never be held out forever. The
+    mirror bound is that a pull may not preempt an unserved prefill while this
+    hold is live, which is exactly what the hold branch expresses.
+    """
+    pend = max(0, int(prefill_pending_tokens))
+    dec = max(0, int(decode_waiting))
+    held = max(0, int(hold_rounds_so_far))
+
+    if mid_flip:
+        return False, "no decision: a cutover is in progress and owns the layout"
+    if not seam_funded:
+        return False, "no flip: the seam is unfunded -- arming it would abandon"
+
+    if phase == "pp":
+        if pend <= 0:
+            return True, "no prefill pending in pp: the timer may have the layout"
+        if held >= max_hold_rounds:
+            return True, (
+                f"hold EXHAUSTED after {held} rounds with {pend} prefill tokens "
+                f"still pending and {dec} decode waiting: releasing so the "
+                f"decode side cannot be starved by an unbounded hold"
+            )
+        if dec > 0:
+            return False, (
+                f"{HOLD_FOR_UNSERVED}: BOTH SIDES have work ({pend} prefill "
+                f"tokens unserved here, {dec} decode waiting) -- held for the "
+                f"economic comparison, round {held + 1} of {max_hold_rounds}, "
+                f"bounded so neither side starves"
+            )
+        return False, (
+            f"{HOLD_FOR_UNSERVED}: {pend} prefill tokens pulled this layout and "
+            f"are still unserved; the timer does not get to take it away "
+            f"(round {held + 1} of {max_hold_rounds})"
+        )
+
+    if phase == "tp":
+        if pend <= 0:
+            return False, "no prefill pending: nothing pulls the layout out of tp"
+        # THE MIRROR, and without it this lever recreates the very defect it
+        # fixes. An unconditional pull on pend>0 means that after an EXHAUSTED
+        # release (pp->tp with prefill still pending) the next evaluation in TP
+        # sees pend>0 and pulls straight back -- decode loses the layout before
+        # serving anything, which is C2 with the phases swapped. Under sustained
+        # both-sides load the cycle degenerates to max_hold rounds of PP, ~0
+        # rounds of TP, and TWO seams per cycle: strictly worse than the timer
+        # it replaced. So the pull yields to a decode batch that is actually
+        # running, for a bounded minimum, and the both-sides tie goes to the
+        # economic comparison rather than to whoever asks last.
+        if decode_serving and int(decode_rounds_so_far) < int(min_decode_rounds):
+            return False, (
+                f"HOLD tp: {pend} prefill tokens wait, but a decode batch is "
+                f"RUNNING and has had {int(decode_rounds_so_far)} of "
+                f"{int(min_decode_rounds)} minimum rounds -- a pull here would "
+                f"preempt mid-batch and mirror the C2 defect; bounded, the pull "
+                f"proceeds once the minimum is met"
+            )
+        return True, (
+            f"{PULL_FOR_DEMAND}: {pend} prefill tokens are waiting for pp "
+            f"and cannot be served here"
+            + (
+                f" (decode had {int(decode_rounds_so_far)} rounds, minimum "
+                f"{int(min_decode_rounds)} met)"
+                if decode_serving
+                else ""
+            )
+        )
+
+    return False, f"unknown phase {phase!r}: no decision"
+
+
+
 PP_TO_TP = "pp_to_tp"
 #: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
 #: formation gate must recognise that decision and refuse to hold it, and a
@@ -1038,6 +1185,12 @@ class PhasePolicyState:
     #: is not accumulating. Stamped by ``observe_idle`` (the caller), because
     #: ``decide`` is pure and may not mutate state.
     formation_started_at: float = 0.0
+    #: #677 hold lifecycle. Carried on the STATE, and reset through
+    #: next_hold_rounds on every phase change / pend->0, because a
+    #: caller-maintained counter that goes stale would start the next
+    #: episode's first hold half-exhausted.
+    hold_rounds: int = 0
+    hold_phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -1133,6 +1286,62 @@ def decide(
     create an arm, and it never sees the tp_to_pp direction at all.
     """
     d = _decide_rules(cfg, state, inp)
+    # #677 HOLD, APPLIED AS A WRAPPER for the same reason #689 is: one place
+    # instead of the nine return sites inside the rules. It only ever converts
+    # an ARM into a wait -- it can never create one -- and its reason string is
+    # what the boot's acceptance is read from, so it must reach the log exactly
+    # as the rules' own reasons do.
+    # THE DECODE STARVATION CAP OUTRANKS THIS ABSOLUTELY. That SLO is the
+    # system's guarantee that PP can never pin the server, and my round bound
+    # is only a secondary backstop -- vetoing the cap would put a local timer
+    # above a global guarantee and reintroduce the pinning it prevents.
+    #
+    # THREE EXEMPTIONS IS A SHAPE, NOT A COINCIDENCE: idle-locked, drained and
+    # the starvation cap are all arms the RULES chose for reasons this lever
+    # cannot see. The lever only understands "prefill is unserved here", so it
+    # may only veto the arm that contradicts that -- the plain timer/economics
+    # exit. If a fourth exemption ever appears, invert this into an allowlist
+    # rather than adding it.
+    #
+    # THE DRAINED EXIT ALSO OUTRANKS THIS, on #669's economics. A residual
+    # ABOVE one chunk stays in PP -- which is what this hold wants anyway --
+    # but a SUB-CHUNK residual is finishing regardless, and holding the layout
+    # for it would spend a ~2.6 s seam to save a fraction of a chunk. #669
+    # moved the anti-pinning guarantee to the starvation cap precisely so the
+    # drain could exit cleanly; vetoing it here would re-pin the server in PP,
+    # which is the defect that contract was written to prevent.
+    #
+    # PP_TO_TP ONLY, exactly as #689's formation gate is. The rules arm for
+    # reasons this lever knows nothing about -- the idle return leg, the
+    # decode-stall SLO -- and a gate that vetoed every arm because MY rule did
+    # not recognise it would suppress all of them. The C2 defect is
+    # specifically "pp_to_tp took the layout while prefill was unserved", so
+    # that is the only arm this converts into a wait. It can never create one.
+    _r = d.reason or ""
+    if (
+        d.direction == PP_TO_TP
+        and not _r.startswith(IDLE_LOCKED)
+        and "DRAINED" not in _r
+        and "decode starvation cap" not in _r
+    ):
+        # #688 OUTRANKS #677 EXACTLY AS IT OUTRANKS #689, and for the same
+        # reason spelled out below for formation: the idle-locked arm fires
+        # only when the current layout can build NOTHING. Holding that layout
+        # to serve "pending work" is waiting inside a layout that cannot serve
+        # it -- the zero-GPU window #688 exists to remove. The deadlock escape
+        # is never held.
+        allow, hold_why = layout_hold_verdict(
+            phase=inp.phase,
+            prefill_pending_tokens=int(getattr(inp, "pending_prefill_tokens", 0) or 0),
+            decode_waiting=int(getattr(inp, "ready_carriers", 0) or 0),
+            hold_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
+            seam_funded=True,
+            mid_flip=False,
+            decode_serving=int(getattr(inp, "running_bs", 0) or 0) > 0,
+            decode_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
+        )
+        if not allow:
+            return PhasePolicyDecision(direction=None, reason=hold_why)
     if d.direction != PP_TO_TP:
         return d
     if (d.reason or "").startswith(IDLE_LOCKED):
@@ -1720,6 +1929,28 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     Split out from ``decide`` so the decision stays pure and so the clock is
     driven by observation rather than by the policy's own verdict.
     """
+    # #677 HOLD COUNTER, maintained HERE for the same reason the idle and
+    # formation clocks are: ``decide`` is pure and must not mutate, so a bound
+    # driven from inside the decision would never advance. Without this the
+    # 8-round bound was a comment-claimed invariant with no wiring -- the
+    # documented-but-inert class -- and every evaluation saw round 0 forever,
+    # so EXHAUSTED was unreachable and the SLO cap was silently the only
+    # backstop.
+    #
+    # FIRST SIGHT COUNTS AS ROUND ONE: `hold_phase` is empty before the first
+    # observation, and treating that as a phase CHANGE would spend round one
+    # resetting, so a hold would always be one round shorter than its bound
+    # claims. A genuine phase change still resets, which is the case the reset
+    # exists for.
+    _prev_hold_phase = getattr(state, "hold_phase", "") or inp.phase
+    state.hold_rounds = next_hold_rounds(
+        int(getattr(state, "hold_rounds", 0) or 0),
+        _prev_hold_phase,
+        inp.phase,
+        int(inp.pending_prefill_tokens or 0),
+    )
+    state.hold_phase = inp.phase
+
     idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
     if idle:
         if state.idle_since is None:
