@@ -153,3 +153,59 @@ def release_lockstep_sentinel(scheduler: Any, *, graceful: bool) -> Optional[str
             LOG_PREFIX,
         )
     return outcome
+
+
+def release_kv_session_offload_io(
+    scheduler: Any, *, graceful: bool, _manager: Any = "unset"
+) -> Optional[str]:
+    """Stop the ``kvso-dest-io`` thread before the interpreter exits (#673).
+
+    From the #673 background-thread inventory: that thread has no stop method
+    at all, and its body calls ``evt.synchronize()`` -- cudaEventSynchronize.
+    Unlike the process-group teardown above, which ships gated because it
+    touches barlink, this one is UNGATED: nothing about stopping a thread that
+    the component created and never joined belongs to another lane, and the
+    leak happens on every boot that uses kvso rather than only when a flag is
+    armed.
+
+    Carries the same three properties as ``release_distributed``: graceful path
+    only (on the exception path the device may be wedged), never raises (it
+    runs in a ``finally`` during shutdown), idempotent.
+
+    ``_manager`` is a test seam. The real lookup reads the module global rather
+    than ``get_kv_session_offload_manager()``, because that accessor ASSERTS
+    when kvso was never initialised -- which is the default boot, and a
+    teardown helper must not raise there.
+    """
+    if not graceful:
+        return None
+    manager = _manager
+    if manager == "unset":
+        try:
+            from sglang.srt.managers import kv_session_offload as _kvso
+
+            manager = getattr(_kvso, "_MANAGER", None)
+        except Exception as e:  # pragma: no cover - import shape
+            logger.warning("%s kv_session_offload unavailable: %s", LOG_PREFIX, e)
+            return None
+    if manager is None:
+        return None
+    try:
+        dest = getattr(manager, "_dest", None)
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s could not read the kvso destinations: %s", LOG_PREFIX, e)
+        return None
+    if dest is None:
+        return None
+    try:
+        outcome = dest.stop_worker()
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s stopping kvso-dest-io failed: %s", LOG_PREFIX, e)
+        return None
+    if outcome == "joined":
+        logger.info(
+            "%s kvso-dest-io joined before exit; it is no longer joinable when "
+            "the process tears down.",
+            LOG_PREFIX,
+        )
+    return outcome

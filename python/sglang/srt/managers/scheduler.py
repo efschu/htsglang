@@ -9582,6 +9582,20 @@ def run_scheduler_process(
             # careless edit to this block.
             release_lockstep_sentinel(scheduler, graceful=scheduler.gracefully_exit)
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
+            # #673: stop the kvso destination IO thread. It is created
+            # unconditionally in SpillDestinationController.__init__ and, until
+            # now, joined by nothing; its body calls cudaEventSynchronize, so
+            # at exit it is a joinable std::thread inside a CUDA call -- the
+            # same abort shape as the collectives above, but UNGATED, because
+            # stopping a thread this component owns belongs to no other lane.
+            # The join is bounded and detaches loudly on the deadline.
+            from sglang.srt.managers.scheduler_teardown import (
+                release_kv_session_offload_io,
+            )
+
+            release_kv_session_offload_io(
+                scheduler, graceful=scheduler.gracefully_exit
+            )
 
 
 # ---------------------------------------------------------------------------
