@@ -1,5 +1,23 @@
 """#411: a session as a FILE -- export here, import on another server or rig.
 
+STATUS ON THIS BRANCH (recorded 2026-08-17 by the #121 determination). This
+module has NO importer anywhere in ``python/`` or ``test/`` -- not a production
+caller, not even a test. It is the paused WIP that ``#411`` superseded with
+``managers/session_portable.py``, and that successor is NOT merged here; it
+lives on ``feat/411-portable-sessions``. So on this tree ``export_bundle`` /
+``import_bundle`` are reachable from nothing.
+
+This paragraph exists because the docstring above reads like a shipped
+feature, and a reader who finds ``export_bundle``/``import_bundle`` while
+looking for portable sessions would reasonably either wire this file or build
+a second one beside it. Both are wrong: the live migration path on this branch
+is ``POST /session_handover`` (#261, ``managers/session_handover.py``) plus the
+external ``hicache_migrate`` CLI, and the portable-bundle successor arrives
+with #411. Do not wire this module; take #411's, or take the handover path.
+
+The design below is still the design -- it is the reasoning that was ported
+forward, not stale thinking. Only its shipped-ness was overstated.
+
 #410's manifest is already the format core: content-only references, no
 geometry, versioned, deterministic. This module is the container around it --
 the manifest plus the bytes it points at, so the receiving rig needs nothing
