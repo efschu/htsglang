@@ -1186,6 +1186,37 @@ class KvBackingRelief:
             logger.warning("%s flip-pending probe failed: %s", LOG_PREFIX, e)
             return (-1, -1)
 
+    def _parked_ceiling(self) -> int:
+        """#748: the parked extent as an EXCLUSION SET, not a gate.
+
+        Returns the highest row id the flip has parked, which the rung must
+        keep mapped, or -1 when nothing is parked. ``-2`` means the extent is
+        UNKNOWN while a flip is armed -- the one case that still refuses
+        wholesale, because there is no boundary to name.
+
+        WHY THIS REPLACED A GATE. #744 refused the rung outright while a flip
+        was armed. That stopped the 21:18 eviction crash and also strangled the
+        flip's own funder: seam staging asks the rung to evict recomputable
+        prefix rows, which is what "KV capacity is the funder" means, so a
+        wholesale refusal produced 35 refused tp_to_pp flips and an IDLE-LOCK
+        with 407,622 tokens pending and nothing resident (#748, 21:46:32).
+
+        The extent is exactly the information needed to be selective: rows
+        INSIDE it are the ones the flip is about to pack and may not be
+        touched; every row above it is recomputable prefix and is precisely
+        what the funding wants. So the extent pins the ceiling instead of
+        closing the rung.
+        """
+        rows, top = self._flip_pending()
+        if rows < 0:
+            # UNKNOWN. Only refuses while a flip is actually armed; outside
+            # one there is nothing to protect. #746 (the exact arm-time
+            # snapshot) is what removes this last wholesale case.
+            return -2 if self._flip_armed() else -1
+        if rows == 0:
+            return -1
+        return int(top)
+
     def _flip_armed(self) -> bool:
         """True when a phase flip is armed on this rank (or unreadable)."""
         fn = getattr(self, "_flip_armed_fn", None)
@@ -1263,8 +1294,12 @@ class KvBackingRelief:
         # above the new cap was an illegal address, 24 log lines later. The
         # parked extent is consulted FIRST because it is the one state in
         # which the rest of this predicate is confidently wrong.
-        pending_rows, _ = self._flip_pending()
-        if pending_rows != 0:
+        # #748: one definition of "is something parked", shared with the
+        # exclusion ceiling. -1 means nothing is parked and the extent is
+        # irrelevant -- including an UNKNOWN probe outside a flip, which must
+        # not close the rung: there is nothing to protect when no flip is
+        # armed.
+        if self._parked_ceiling() != -1:
             return False
         split = getattr(self, "_last_live_split", None)
         if not split:
@@ -1287,17 +1322,21 @@ class KvBackingRelief:
         plain = self._floor_rows(max_live)
         if not self._evict_enabled():
             return plain, 0
-        # #744 second line, independent of the extent probe: while a flip is
-        # ARMED its requests are being quiesced, so every read of "what is
-        # resident" is in motion. Refuse for the duration. Gated on ARMED
-        # only -- outside a flip this rung stays fully live, which #688's
-        # funding depends on.
-        if self._flip_armed():
+        # #748: the parked extent EXCLUDES rows, it does not close the rung.
+        # An UNKNOWN extent under an armed flip is the one case with no
+        # boundary to name, so it still refuses.
+        parked = self._parked_ceiling()
+        if parked == -2:
             return plain, 0
         tree = self._tree_cache()
         if tree is None:
             return plain, 0
         req_max = self._resident_ceiling()
+        if parked >= 0:
+            # The parked rows pin the ceiling. Everything above them is
+            # recomputable prefix and stays evictable -- which is the funding
+            # the flip itself is waiting on.
+            req_max = max(req_max, parked)
         if req_max < 0:
             if not self._nothing_resident():
                 # Unknown resident half: refuse to price an eviction at all.
@@ -1343,13 +1382,17 @@ class KvBackingRelief:
         tree = self._tree_cache()
         if tree is None:
             return 0
-        # #744: same refusal on the collecting half. Both sides must agree on
-        # what an armed flip means, for the reason the comment below already
-        # gives about the branch: a disagreement becomes an illegal address.
-        if self._flip_armed():
+        # #748: both sides must agree on what the parked extent means, for the
+        # reason the comment below already gives about the branch -- a
+        # disagreement becomes an illegal address. Here that means the SAME
+        # exclusion ceiling, not the same wholesale refusal.
+        parked = self._parked_ceiling()
+        if parked == -2:
             return 0
         req_max = self._resident_ceiling()
-        if req_max < 0 and not self._nothing_resident():
+        if parked >= 0:
+            req_max = max(req_max, parked)
+        elif req_max < 0 and not self._nothing_resident():
             return 0
         # #717, THE HALF THE FIRST ATTEMPT MISSED. It opened PRICING on the
         # nothing-resident branch and left this refusal in place, so the rung

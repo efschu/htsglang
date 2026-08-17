@@ -112,17 +112,35 @@ class TestTheParkedExtentIsVisible(CustomTestCase):
         self.assertTrue(r._nothing_resident())
 
     def test_unknown_extent_blocks_rather_than_reads_empty(self):
-        """(-1, -1) is UNKNOWN. Unknown is never treated as empty."""
+        """(-1, -1) is UNKNOWN. Unknown is never treated as empty.
+
+        #748 narrowed WHEN this matters: an unknown extent blocks only while a
+        flip is armed, because outside one there is nothing parked to protect
+        and closing the rung there is what strangled the funder.
+        """
         r = _relief(
-            {"req_max": -1, "req_rows": 0}, pending=lambda: (-1, -1)
+            {"req_max": -1, "req_rows": 0},
+            pending=lambda: (-1, -1),
+            armed=lambda: True,
         )
         self.assertFalse(r._nothing_resident())
+        outside = _relief(
+            {"req_max": -1, "req_rows": 0},
+            pending=lambda: (-1, -1),
+            armed=lambda: False,
+        )
+        self.assertTrue(
+            outside._nothing_resident(),
+            "an unknown extent outside a flip must not close the rung",
+        )
 
     def test_a_raising_probe_is_unknown_not_empty(self):
         def _boom():
             raise RuntimeError("probe down")
 
-        r = _relief({"req_max": -1, "req_rows": 0}, pending=_boom)
+        r = _relief(
+            {"req_max": -1, "req_rows": 0}, pending=_boom, armed=lambda: True
+        )
         self.assertFalse(r._nothing_resident())
 
     def test_the_net_folds_the_parked_top_into_max_live_row(self):
@@ -186,23 +204,81 @@ class TestTheArmedGate(CustomTestCase):
         w.evictable_rows_above = self._w_orig
         w.evict_rows_above = self._e_orig
 
-    def test_armed_refuses_to_price(self):
-        r = _relief({"req_max": -1, "req_rows": 0}, armed=lambda: True)
+    def test_armed_with_a_parked_extent_STILL_FUNDS_above_it(self):
+        """#748 (a), THE SPECIMEN. The gate used to strangle the funder.
+
+        #744 refused the rung outright while a flip was armed. That stopped
+        the eviction crash and also stopped seam staging, which asks this rung
+        for exactly these rows -- 35 refused tp_to_pp flips and an IDLE-LOCK
+        with 407,622 tokens pending and nothing resident (21:46:32).
+
+        The parked extent is an EXCLUSION SET: rows above it are recomputable
+        prefix and are the funding. This test is RED on the unrefined gate.
+        """
+        r = _relief(
+            {"req_max": -1, "req_rows": 0},
+            armed=lambda: True,
+            pending=lambda: (PARKED_ROWS, PARKED_TOP),
+        )
         floor, won = r._evict_floor_rows(MAX_LIVE)
-        self.assertEqual(won, 0, "no eviction may be priced during a flip")
-        self.assertEqual(floor, r._floor_rows(MAX_LIVE))
+        self.assertGreater(
+            won, 0, "an armed flip must still be able to fund itself"
+        )
+        freed = r._lower_watermark_to(PARKED_TOP + 1)
+        self.assertGreater(freed, 0, "the funding eviction was not collected")
 
-    def test_armed_refuses_to_collect(self):
-        r = _relief({"req_max": -1, "req_rows": 0}, armed=lambda: True)
+    def test_the_parked_rows_themselves_are_still_protected(self):
+        """#748 (b). The crash protection must survive the refinement.
+
+        The ceiling handed to the evictor must not be below the parked extent,
+        so no row the flip is about to pack can be unmapped.
+        """
+        r = _relief(
+            {"req_max": -1, "req_rows": 0},
+            armed=lambda: True,
+            pending=lambda: (PARKED_ROWS, PARKED_TOP),
+        )
+        r._lower_watermark_to(EVICT_TARGET)
+        self.assertEqual(len(self.calls), 1)
+        self.assertGreaterEqual(
+            self.calls[0][1],
+            PARKED_TOP,
+            "the evictor was allowed to touch rows inside the parked extent",
+        )
+
+    def test_the_floor_never_drops_below_the_parked_extent(self):
+        r = _relief(
+            {"req_max": -1, "req_rows": 0},
+            armed=lambda: True,
+            pending=lambda: (PARKED_ROWS, PARKED_TOP),
+        )
+        floor, _ = r._evict_floor_rows(MAX_LIVE)
+        self.assertGreaterEqual(floor, r._floor_rows(PARKED_TOP))
+
+    def test_an_unknown_extent_under_an_armed_flip_still_refuses(self):
+        """The one wholesale case left, and it is documented as such.
+
+        With no extent there is no boundary to name, so there is no safe
+        subset to evict. #746 (the exact arm-time snapshot) is what removes
+        this last case.
+        """
+        r = _relief(
+            {"req_max": -1, "req_rows": 0},
+            armed=lambda: True,
+            pending=lambda: (-1, -1),
+        )
+        self.assertEqual(r._evict_floor_rows(MAX_LIVE)[1], 0)
         self.assertEqual(r._lower_watermark_to(EVICT_TARGET), 0)
-        self.assertEqual(self.calls, [], "nothing may be evicted while armed")
+        self.assertEqual(self.calls, [])
 
-    def test_a_raising_armed_probe_is_treated_as_armed(self):
-        def _boom():
-            raise RuntimeError("controller gone")
-
-        r = _relief({"req_max": -1, "req_rows": 0}, armed=_boom)
-        self.assertEqual(r._lower_watermark_to(EVICT_TARGET), 0)
+    def test_an_unknown_extent_OUTSIDE_a_flip_does_not_refuse(self):
+        """UNKNOWN must not close the rung when there is nothing to protect."""
+        r = _relief(
+            {"req_max": -1, "req_rows": 0},
+            armed=lambda: False,
+            pending=lambda: (-1, -1),
+        )
+        self.assertGreater(r._evict_floor_rows(MAX_LIVE)[1], 0)
 
     def test_THE_RUNG_IS_NOT_DEAD_OUTSIDE_FLIPS(self):
         """CAN-FAIL PROOF for line 2, and the one that guards #688.
