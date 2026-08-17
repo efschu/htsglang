@@ -76,6 +76,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.mem_cache import hicache_demotion as _demotion
+
 logger = logging.getLogger(__name__)
 
 
@@ -1323,9 +1325,9 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert node is self.root_node, (
-                    f"This request holds the node from another tree"
-                )
+                assert (
+                    node is self.root_node
+                ), f"This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1434,6 +1436,11 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _evict_backuped(self, node: TreeNode):
+        # #703: the insert-time ack writes storage once; a node whose storage
+        # write was refused then is never retried, and this demotion is where
+        # that is noticed. No-op when the node is already stored or the
+        # feature is off.
+        _demotion.demote_on_device_evict(self, node)
         device_indices = node.value
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
@@ -1510,6 +1517,11 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
+            # #703: last chance. evict_host frees the very bytes a storage
+            # write reads, and nothing else on this path persists them, so a
+            # prefix that never reached disk dies here. Enqueue-only and
+            # bounded; off by default.
+            _demotion.demote_before_host_evict(self, x)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = x.key.child_key(self.page_size)
@@ -1531,9 +1543,9 @@ class HiRadixCache(RadixCache):
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
-            assert node.backuped, (
-                "No backup available on evicted nodes, should not happen"
-            )
+            assert (
+                node.backuped
+            ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
