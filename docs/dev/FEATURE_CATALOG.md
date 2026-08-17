@@ -284,7 +284,13 @@ point-to-point traffic. A PP stage handoff is point-to-point
 (`send_tensor_dict`, `:2178`, on a `use_custom_allreduce=False` group `:3121`),
 so "no P2P" reasoning about PP crossings must NOT be read as "no direct
 transport" — and equally, BAR1 must not be dismissed for collective work.
-Consequence for #705's TP-decode family split: its baseline `ar_10kb_us`
+The measured BAR1 row's own citation is WRONG: `DESIGN_407:131` credits
+`EVAL_gdr_uebernahme.md:141`, which is a dmabuf-GPU-RDMA-over-RoCE document
+with zero matches for those numbers; the true source is
+`FEATURES_VS_UPSTREAM.md:1341` + commit `137e3a6c25`. BAR1 is also NOT a
+uniform win: on the fast x8 PAIR it loses 1-8 MiB, down to 0.81x
+(`FEATURES_VS_UPSTREAM.md:1349`), so 3-rank ratios must not be reused for a
+2-rank group. Consequence for #705's TP-decode family split: its baseline `ar_10kb_us`
 31.0–33.7 µs is an **NCCL** probe (`uneven_perf.py:1329-1330`), and re-scaling
 by the measured BAR1 ratio turns its +0.022…+0.152 ms margin NEGATIVE
 (−0.034…−0.356 ms) — a faster interconnect makes collective-REMOVAL worth

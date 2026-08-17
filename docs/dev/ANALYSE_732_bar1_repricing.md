@@ -197,3 +197,96 @@ layout before either half is collectable.
 
 No planner rule was changed by this document. Case (a) needs none; case (b)
 needs a text correction, which is made in its own verdict file.
+
+---
+
+# Amendment (same day): the measurement corpus, exhaustively searched
+
+A full sweep of the corpus landed after the first pass. It confirms the two
+verdicts and sharpens four things — one of which weakens my own case (b) a
+second time.
+
+## A. "No CUDA P2P" was FACTUALLY RIGHT. The inference from it was wrong.
+
+`/spinning/gpu-battery-results/2026-07-30_bar1/s01_p2p_reprobe/results/capability_matrix.json`
+reports `"can_access_peer": false` for **all six directed pairs**. Standard CUDA
+peer access really is off on this rig, and `d2d_bench.json`'s near-identical
+`direct` vs `staged` timings are the visible consequence.
+
+So the first clause of my sentence was true. The error was the second clause:
+**BAR1 does not go through CUDA P2P at all.** It maps the peer's aperture via
+dmabuf and writes into it, which is exactly why `can_access_peer: false` does
+not bound it. I read a true fact about one mechanism as a bound on another.
+
+## B. The magnitude argument was wrong too — and this is the bigger error
+
+`benchmark/bench_host_transport.py:12` records a MEASURED point-to-point
+ping-pong: **7.30 µs against NCCL's 37.41 µs at 20 KiB**. That is the
+`barlink_host` transport — host-staged, the very class my verdict assumed was
+prohibitively expensive.
+
+A PP crossing is one-way 10 KiB; the ping-pong is a 20 KiB round trip, so
+7.30 µs is a generous upper bound for one crossing. The 29 EXTRA crossings then
+cost:
+
+```
+29 x 7.30 us = 0.212 ms/token   ~=  0.7 % of a ~30 ms bs=1 round
+```
+
+**So "31 crossings vs 2, therefore foreclosed by the interconnect" does not
+survive its own arithmetic, even host-staged.** The 15.5x crossing-count ratio
+is real and is not the point: the per-crossing cost is small enough that the
+count does not foreclose anything.
+
+**Net effect on case (b): the conclusion still stands, but now on ONE ground
+only — barlink exposes no `send`/`recv`, so no direct transport carries a p2p
+crossing today.** It does not stand on cost. Both of my original supports —
+"no P2P" and "15.5x is prohibitive" — are withdrawn.
+
+The in-tree statement of the API absence is more explicit than my seam grep:
+`scripts/probe/barlink_vs_nccl.py` says outright that barlink "implementiert
+ausschliesslich Kollektive (all_reduce, broadcast, all_gather, reduce_scatter)
+und KEIN send/recv".
+
+## C. `DESIGN_407:131` miscites its own source
+
+That row cites `EVAL_gdr_uebernahme.md:141`. That document is about **dmabuf
+GPU-RDMA over RoCE** — a different transport — and contains none of the
+numbers: grepping it for `45.59`, `1.13`, `1.34`, `interleaved` returns **zero
+matches**. The real source is `FEATURES_VS_UPSTREAM.md:1341` plus commit
+`137e3a6c25`, which the same row also cites. The measurement is sound; the
+citation points at the wrong file. **Filed as a catalog/doc correction.**
+
+The same DESIGN_407 also claims `scripts/p2p_readiness/` "has never been run,
+no `results/` exists". It has: the results directory above is that run's output.
+**Second stale claim in the same document.**
+
+## D. A 2-rank weak spot the 3-rank ratios hide
+
+`FEATURES_VS_UPSTREAM.md:1349`: on the fast x8 **pair** the transport *loses*
+between 1 and 8 MiB, down to **0.81x**, with 2-rank ratios
+1.11/1.13/0.97/0.86/0.99 recorded as "unerklaert".
+
+This does not disturb §3: #705's TP-decode collectives are 3-rank on a TP=3
+group, so the 3-rank ratios are the right ones. But BAR1 is **not** a uniform
+win, and a future re-pricing on a 2-rank group must not reuse §3's numbers.
+
+## E. The p2p tooling exists and has never been run
+
+`scripts/probe/p2pproof.cu` is a raw CUDA point-to-point BAR1 probe that prints
+`P2PDATA` / `CANACCESS` lines. Searching the entire `/spinning` tree (~30
+worktrees) for both literals finds them **only inside the source file** — never
+as captured output. So the instrument for the one number this analysis lacks
+exists and has never been executed.
+
+That is a cheap window item, and it is now the second one filed here.
+
+## Filed, amended
+
+1. **BAR1 point-to-point seam** — the build that would reopen case (b) on cost
+   grounds. Unchanged.
+2. **Run `scripts/probe/p2pproof.cu`** — would give the first real BAR1 p2p
+   number. Window item, cheap; the probe is written.
+3. **A direct BAR1 `ar_10kb` row** — would replace §3's scaling. Window item.
+4. **`DESIGN_407:131` citation fix** and its stale `p2p_readiness` claim —
+   doc corrections, merge-train items.
