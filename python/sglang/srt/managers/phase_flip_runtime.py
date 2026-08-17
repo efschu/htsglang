@@ -5106,6 +5106,85 @@ class PhaseFlipRuntime:
         if torch.cuda.is_available():  # pragma: no cover - needs a device
             torch.cuda.empty_cache()
 
+    def _record_seam_peak(
+        self,
+        direction: str,
+        staging_bytes: int,
+        driver_free: int,
+        cached_free: int,
+    ) -> None:
+        """#677: attribute the seam draw AT ITS PEAK INSTANT, per component.
+
+        WHY HERE. This is the moment the flip's demand is weighed against
+        free VRAM -- the peak the arming floor is sized to survive. Anywhere
+        earlier the buffers do not exist yet; anywhere later the decision has
+        already been taken on a number nobody decomposed.
+
+        WHAT IT IS FOR. The arming floor is one scalar per rank (909 / 1006 /
+        1648 MiB on this rig, NOTE_677_floor_components.md) with no recorded
+        composition, so no part of it can be traded against anything: a
+        component that could live in host RAM cannot be identified, and one
+        that genuinely must stay resident cannot be defended. Splitting the
+        peak is the precondition for every per-component decision #702 and
+        #677 want to make.
+
+        ON THE #605 CHANNEL, not a new one. ``flight_recorder.mark`` already
+        carries the torch view, the NVML view and the boot id, and it is
+        append-only -- a rank that dies here still leaves its line. A second
+        channel would have to re-derive all of that and could disagree with
+        it.
+
+        NULLS, NEVER ZEROS, for components this layer cannot see. A zero here
+        would read as "this component costs nothing", which is the #606
+        defaulted-measurement defect; ``None`` reads as "not measured from
+        here", which is true and actionable. ``unattributed_bytes`` is the
+        residual the named terms do not explain and is the number that says
+        how far this instrument still has to go.
+
+        Cannot break a flip: the recorder no-ops unless its directory env is
+        set, and the whole body is guarded -- an instrument on the seam path
+        may cost a missing line, never a cutover.
+        """
+        try:
+            from sglang.srt.mem_ledger import flight_recorder
+
+            arena_tail = None
+            try:
+                arena_tail = int(self._arena_tail_bytes(direction))
+            except Exception:  # pragma: no cover - defensive
+                arena_tail = None
+
+            named = int(staging_bytes) + int(arena_tail or 0)
+            extra = {
+                "direction": str(direction),
+                "epoch": int(getattr(self, "_epoch", 0)),
+                # The staging peak: incoming + max(outgoing, local) over the
+                # WIDEST wave, per _staging_bytes.
+                "staging_bytes": int(staging_bytes),
+                # The refill destination: arena tail this direction commits.
+                "refill_destination_bytes": arena_tail,
+                # Graph capture workspace is a BOOT-time term under the
+                # restore-never-rebuild invariant (#677) and is not visible
+                # from this layer. Explicitly unmeasured rather than 0.
+                "graph_workspace_bytes": None,
+                "staging_reserve_bytes": int(self._staging_reserve_bytes),
+                "driver_free_bytes": int(driver_free),
+                "allocator_cached_free_bytes": int(cached_free),
+                "named_bytes": named,
+                # What the named terms do not explain. Signed on purpose: a
+                # NEGATIVE residual means the named terms over-count, which is
+                # a different defect from an unattributed remainder and must
+                # not be hidden by a max(0, ...).
+                "unattributed_bytes": int(staging_bytes) - named,
+            }
+            flight_recorder.mark(
+                "seam_peak",
+                rank=int(getattr(self, "_world_rank", 0) or 0),
+                extra=extra,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("%s seam-peak attribution skipped: %s", LOG_PREFIX, e)
+
     def _staging_affordable(
         self, staging_bytes: int, direction: str = ""
     ) -> Tuple[bool, str]:
@@ -5169,6 +5248,7 @@ class PhaseFlipRuntime:
         # has no way to quote the figure the refusal was about.
         self._last_staging_bytes = int(staging_bytes)
         driver_free, cached_free = probe()
+        self._record_seam_peak(direction, int(staging_bytes), driver_free, cached_free)
         from_driver = max(0, driver_free - reserve)
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
             before = driver_free

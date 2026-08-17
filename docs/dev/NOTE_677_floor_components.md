@@ -166,10 +166,62 @@ pricing a flip on intention rather than completion.
 The #690 `refill_highwater` mark (c92e78a288) is the pattern: one boundary,
 placed where the two things it separates have different fixes.
 
-## 6 — Proposed pin for §1
+## 6 — The pin for §1 (delivered)
 
-A red-first hermetic pin that a re-capture / JIT / arena-construction call
-occurring inside the cutover path FAILS. Design: assert the cutover path does
-not reach the graph capture entry points or arena construction, by spying those
-entry points and running a cutover with them armed to fail. Not yet written —
-named here so it is not lost.
+`test/registered/unit/managers/test_restore_never_rebuild_677.py`. A fence
+patches the BUILD entry points — `weights_arena.allocate_arena`,
+`weights_arena.pack_into_arena`, `torch.cuda.CUDAGraph` — to raise, and the
+REAL production mover `PhaseFlipStacks.refill` is run under it on both legs,
+including the checksum-mismatch restore arm (the one branch that touches the
+arena twice and is most likely to reach for a rebuild). `arena_refill` is
+deliberately absent from the fence: it is the copy the flip is supposed to
+perform, and a pin that fenced it would pass by forbidding the work.
+
+Can-fail arms: each entry point is shown to actually raise under the fence,
+and a planted mover that calls `allocate_arena` is detected.
+
+## 7 — The instrument for §5 (delivered)
+
+`PhaseFlipRuntime._record_seam_peak`, emitted on the #605 flight-recorder
+channel at `_staging_affordable` — the instant the flip's demand is weighed
+against free VRAM, which is the peak the floor is sized to survive. Earlier
+the buffers do not exist; later the decision is already taken.
+
+It carries `staging_bytes`, `refill_destination_bytes`, `graph_workspace_bytes`,
+the reserve, driver free, allocator cached free, and a SIGNED
+`unattributed_bytes` residual. Two deliberate choices, both pinned:
+unmeasured components are `None` and never `0` (a zero reads as "costs
+nothing" — the #606 defaulted-measurement defect), and the residual is signed,
+because a negative one means the named terms OVER-count, which is a different
+defect from an unattributed remainder and must not be hidden by `max(0, …)`.
+
+## 8 — The rank-2 anomaly: #685 refuted, arena growth is the live candidate
+
+**#685 is not it.** #685 (`0e50e486ab`, `f1774d7f65`) is an
+`UnboundLocalError: cannot access local variable 'cell'` startup crash — a
+use-before-bind in the cold seam-pricing branch. It has no arena-tail content,
+and no 1456 MiB figure appears anywhere in the records or source. The
+candidate is a misattribution and is refuted.
+
+**What does order the three ranks** is the arena growth each must commit,
+computed from the layout image sizes I measured in #690:
+
+| rank | card | PP image | TP image | growth to commit | seam draw | draw over rank 0 |
+|---|---|---:|---:|---:|---:|---:|
+| 0 | 5090 | 12619.6 | 9614.9 | **0** | 909 | 0 |
+| 1 | 3080 x4 | 9014.0 | 9614.9 | **600.9** | 1006 | +97 |
+| 2 | 3080 x8 | 7211.2 | 9614.9 | **2403.7** | 1648 | +739 |
+
+Rank 0's PP layout is the larger one, so it never grows; ranks 1 and 2 must
+grow the arena on the `pp_to_tp` leg, and rank 2 by four times as much as
+rank 1. The ordering matches the seam draws exactly, and this is the only
+per-rank term I can find that does.
+
+**Stated as a candidate, not a finding**, because the magnitudes do not follow
+a single coefficient: the excess over rank 0 is 16 % of the growth on rank 1
+and 31 % on rank 2. So arena growth explains the ORDER but not the size, and
+something else is co-varying.
+
+The instrument in §7 settles this without a dedicated experiment: it emits
+`refill_destination_bytes` from `_arena_tail_bytes` at the peak instant, which
+is precisely this quantity. The next reviewed boot reads it off.
