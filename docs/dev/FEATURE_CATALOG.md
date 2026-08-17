@@ -1263,6 +1263,56 @@ contract (`hibernate_dir` + weights/draft CPU/disk backup flags), and a
 118-name retired-env guard that refuses stale SGLANG_* variables loudly.
 
 ## 7. Collectives / transport
+**barlink p2p: HOST has it, BAR1 does not.** `barlink_host.send`/`recv`
+(`barlink_host.py:1100`, `:1120`) is a working point-to-point path with a
+per-pair slot, flags, per-peer sequence and bounded timeout. BAR1 has no
+equivalent: its three kernels are collectives and it owns no p2p kernel.
+`barlink_bar1_p2p.py` supplies the DESK half of that seam — directed-pair
+slot algebra, 256-byte flag lines, append-only layout (`off_p2p = -1` when
+absent), caller-side chunking, and refusals carrying their arithmetic —
+wired into nothing, so existing layouts stay byte-for-byte. CAPTURE: send is
+capturable (`put()` is a stream `memcpy_async`), recv is NOT (no device-side
+wait; a host spin in a capture raises `cudaErrorStreamCaptureUnsupported`),
+so a PP crossing over this seam is BREAKABLE and priced with #494's clock.
+`NOTE_732_bar1_p2p_seam.md`.
+**Transport binds per PEER LINK, not per communicator (#732).** `_select`
+(`barlink.py:554`) picks one transport per group, refined by op and size but
+never by peer. The measured BAR1 standing changes SIGN with edge width — it
+loses on the fast x8 pair (to 0.81x, 1-8 MiB) and wins everywhere on the x4
+pair (`FEATURES_VS_UPSTREAM.md:1349`) — so a rig whose crossings straddle that
+boundary cannot be served by one verdict. `barlink_peer_transport.py` resolves
+a directed pair -> transport map ONCE at world build, keyed by GPU UUID through
+the IdentityMap (never CUDA ordinals), default = NCCL on fast edges / BAR1 on
+x4. Width comes from the CURRENT link, not the max: max reports x16 for all
+three cards while the slots are x4/x8/x8, which would collapse every edge to
+"fast" and disable the feature on the one rig it exists for. Refusals RECORD
+rather than raise (`require_no_refusals()` is the explicit ask); absent the
+BAR1 p2p kernel every BAR1 edge degrades to NCCL with a WARNING per edge, and
+the fallback is marked UNMEASURED rather than carrying an invented delta
+(gap 8). A/B via `SGLANG_BARLINK_PEER_MAP` (rank-keyed, `all=` or `0>1=`);
+forcing an unavailable transport REFUSES instead of silently running the other
+arm. Wired into nothing. `NOTE_732_transport_selection.md`.
+**barlink is COLLECTIVE-ONLY, and that is load-bearing for placement (#732).**
+Its dispatch seams are `all_reduce` (`parallel_state.py:1100`),
+`reduce_scatter*` (`:1299`, `:1374`, `:1498`) and `all_to_all_single*`
+(`:1438`, `:1450`, `:1480`) — there is no `send`/`recv` on `barlink_bar1.py`.
+So BAR1 accelerates COLLECTIVES (measured 1.13/1.34/1.15/1.04/1.30x vs NCCL at
+20 KiB…16 MiB, `DESIGN_407_memory_tier_registry.md:131`) and carries no
+point-to-point traffic. A PP stage handoff is point-to-point
+(`send_tensor_dict`, `:2178`, on a `use_custom_allreduce=False` group `:3121`),
+so "no P2P" reasoning about PP crossings must NOT be read as "no direct
+transport" — and equally, BAR1 must not be dismissed for collective work.
+The measured BAR1 row's own citation is WRONG: `DESIGN_407:131` credits
+`EVAL_gdr_uebernahme.md:141`, which is a dmabuf-GPU-RDMA-over-RoCE document
+with zero matches for those numbers; the true source is
+`FEATURES_VS_UPSTREAM.md:1341` + commit `137e3a6c25`. BAR1 is also NOT a
+uniform win: on the fast x8 PAIR it loses 1-8 MiB, down to 0.81x
+(`FEATURES_VS_UPSTREAM.md:1349`), so 3-rank ratios must not be reused for a
+2-rank group. Consequence for #705's TP-decode family split: its baseline `ar_10kb_us`
+31.0–33.7 µs is an **NCCL** probe (`uneven_perf.py:1329-1330`), and re-scaling
+by the measured BAR1 ratio turns its +0.022…+0.152 ms margin NEGATIVE
+(−0.034…−0.356 ms) — a faster interconnect makes collective-REMOVAL worth
+less, so that refusal strengthens. `ANALYSE_732_bar1_repricing.md`.
 **barlink** (own vendor-neutral CCL): NCCL-parity device transport,
 cross-vendor byte-exact, UCX transport (chunk pipelining, dual worker), tuned
 all_gather ring, graph-capable direct mode — capture-safety is

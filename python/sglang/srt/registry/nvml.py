@@ -327,6 +327,78 @@ def memory_info_for_uuid(uuid: str) -> MemoryInfo:
     raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r}")
 
 
+@dataclass(frozen=True)
+class PcieLink:
+    """The PCIe slot a card sits in: negotiated lanes, and link generation."""
+
+    #: Lanes actually negotiated for the SLOT (``CurrPcieLinkWidth``).
+    width: int
+    #: Generation the link is CAPABLE of (``MaxPcieLinkGeneration``).
+    generation: int
+    #: True when ``width`` had to come from ``MaxPcieLinkWidth`` because the
+    #: current-link query was unavailable. Such a width describes the CARD,
+    #: not the slot, and consumers that switch on width should know.
+    width_from_max: bool = False
+
+
+def pcie_link_for_uuid(uuid: str) -> PcieLink | None:
+    """The PCIe link of one card, or ``None`` when it cannot be read (#736).
+
+    THE ONE AUTHORITY for this question. Two consumers ask it -- the
+    expert-offload link weights (``layers/moe/expert_offload.py``) and the
+    #732 per-peer transport binding
+    (``distributed/device_communicators/barlink_peer_transport.py``) -- and
+    they used to carry separate copies of the rule below. It lives here
+    because this is the IdentityMap's home and both consumers import DOWN into
+    it; the reverse (a transport reaching up into ``layers.moe``) would drag
+    the MoE package into world build.
+
+    WIDTH COMES FROM THE CURRENT LINK, GENERATION FROM THE MAXIMUM, and the
+    asymmetry is measured rather than stylistic.
+
+    ``nvmlDeviceGetMaxPcieLinkWidth`` reports what the CARD can do, not what
+    the SLOT gives it: on the reference rig it returns x16 for all three cards
+    while the slots are wired x4 / x8 / x8. Deriving width from it produces an
+    equal ratio for the offload weights and collapses every edge to "fast" for
+    the transport policy -- i.e. both features silently disabled on exactly
+    the box they exist for. ``CurrPcieLinkWidth`` reports 4 / 8 / 8 and is the
+    physical wiring.
+
+    Generation is the other way round. The current LINK STATE idles down (all
+    three cards report gen 1 at rest and would report 4 under load), so a
+    current-generation read taken at weight-load time describes the power
+    state rather than the slot. Only ratios matter to the callers and the
+    generation is uniform across a single board's slots, so the maximum is
+    both stable and sufficient.
+
+    The card is resolved through the IdentityMap by UUID and only then
+    converted to an NVML index. Never positionally: CUDA enumerates
+    FASTEST_FIRST and NVML in bus order, so a rank's CUDA ordinal is not its
+    NVML index on a mixed rig, and #392 is what happens when those are
+    conflated.
+    """
+    try:
+        card = identity_map().require(uuid)
+        with nvml_session() as pynvml:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(int(card.nvml_index))
+            generation = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle))
+            width, from_max = 0, False
+            try:
+                width = int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
+            except Exception:  # noqa: BLE001 - older binding: fall back below
+                width = 0
+            if width <= 0:
+                # Deliberate last resort, and known to over-report (see above).
+                # Flagged, so a consumer that switches on width can tell.
+                width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
+                from_max = True
+    except Exception:  # noqa: BLE001 - absent driver/binding is not an error
+        return None
+    if width <= 0:
+        return None
+    return PcieLink(width=width, generation=generation, width_from_max=from_max)
+
+
 def process_bytes_on_uuid(uuid: str) -> dict[int, int]:
     """``{pid: device bytes}`` for every compute process on that card.
 

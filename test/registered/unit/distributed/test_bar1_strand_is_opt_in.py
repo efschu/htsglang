@@ -39,6 +39,64 @@ register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 _REPO = Path(__file__).resolve().parents[4]
 _COMM = _REPO / "python" / "sglang" / "srt" / "distributed" / "device_communicators"
 
+#: The probe prints one module per line under this prefix, and the parser
+#: accepts NOTHING else (#736).
+#:
+#: The previous parser was ``set(proc.stdout.split())`` -- every whitespace
+#: token on stdout became a "module". On a heterogeneous rig the runtime emits
+#:
+#:     [... 18:52:39] WARNING [cuda.py:962] Detected different devices in the
+#:     system: NVIDIA GeForce RTX 3080, NVIDIA GeForce RTX 5090, NVIDIA
+#:     GeForce RTX 3080. Please make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+#:     to avoid unexpected behavior.
+#:
+#: on stdout, so words like ``Detected``, ``3080,`` and ``WARNING`` entered the
+#: set and the assertion ``== set()`` could never hold. The guard was red for a
+#: reason that had nothing to do with what it guards -- i.e. it protected
+#: nothing on the one rig it matters for, and a real regression would have been
+#: indistinguishable from the noise.
+#:
+#: The precise origin, which the parallel fix on the train pinned down: the
+#: import chain under test reaches ``sglang.srt.layers.quantization.
+#: marlin_utils``, whose module-level ``from vllm import _custom_ops as ops``
+#: (marlin_utils.py:41) initialises vllm's platform layer, and on a rig with
+#: cards of different names that logs to STDOUT.
+#:
+#: The #315 lesson: anchor the consumer regex to the structure of the line, not
+#: to "whatever the producer happened to print". ``^MODULE:`` at line start
+#: cannot be produced by prose.
+_MODULE_LINE = re.compile(r"^MODULE:(\S+)$", re.MULTILINE)
+
+#: Printed last by every probe. Two independent fixes for the stdout defect met
+#: in this merge and each covered a hole the other left, so the resolution
+#: keeps both halves rather than picking a side:
+#:
+#: * anchored per-line parsing (this branch) stops prose entering the set, but
+#:   returns an empty set when the probe never reported at all -- which would
+#:   pass the ``== set()`` assertions VACUOUSLY;
+#: * a mandatory marker (the train) makes a missing report a hard failure, but
+#:   still split() the payload line.
+#:
+#: Together: prose cannot get in, AND an empty answer is proved to be a real
+#: empty answer rather than a probe that died before printing.
+_DONE = "MODULES-DONE"
+
+
+def _probe_code(setup: str, needle: str) -> str:
+    """Source for a subprocess that reports loaded modules matching ``needle``.
+
+    One module per line, prefixed, so the parser never has to guess which part
+    of stdout was the answer.
+    """
+    return (
+        f"{setup}"
+        "import sys\n"
+        f"for _m in sorted(m for m in sys.modules if {needle!r} in m):\n"
+        "    print('MODULE:' + _m)\n"
+        f"print({_DONE!r})\n"
+    )
+
+
 def _clean_env():
     """The environment without any SGLANG_BARLINK* / bar1 knob."""
     env = {
@@ -50,18 +108,6 @@ def _clean_env():
     return env
 
 
-# The probe's answer is a single marked line. Reading the child's WHOLE stdout
-# instead used to work only by luck: the import chain under test reaches
-# `sglang.srt.layers.quantization.marlin_utils`, whose module-level
-# `from vllm import _custom_ops as ops` (marlin_utils.py:41) initialises vllm's
-# platform layer, and on a rig with cards of different names that logs
-# "Detected different devices in the system: ..." -- to stdout. Every word of
-# that warning landed in the module set and the comparison against `set()`
-# failed while the property under test held. The marker keeps foreign stdout
-# out of the answer without weakening it: the set compared below is still the
-# full list of matching `sys.modules` entries, and a missing marker is a hard
-# failure rather than a silently empty set.
-_MARK = "MODULES:"
 
 
 class TestNothingIsImported(CustomTestCase):
@@ -76,20 +122,22 @@ class TestNothingIsImported(CustomTestCase):
         self.assertEqual(
             proc.returncode, 0, msg=f"subprocess failed:\n{proc.stderr[-3000:]}"
         )
-        marked = [ln for ln in proc.stdout.splitlines() if ln.startswith(_MARK)]
+        # Proof of report first: a probe that died before printing must not
+        # look like "nothing was imported". See _DONE.
         self.assertEqual(
-            len(marked),
+            proc.stdout.count(_DONE),
             1,
-            msg=f"probe printed no {_MARK} line; stdout:\n{proc.stdout[-3000:]}",
+            msg=f"probe printed no {_DONE} line; stdout:\n{proc.stdout[-3000:]}",
         )
-        return set(marked[0][len(_MARK) :].split())
+        # Anchored, per line: stray stdout (warnings, banners, progress) cannot
+        # enter the set. See _MODULE_LINE.
+        return set(_MODULE_LINE.findall(proc.stdout))
 
     def test_distributed_import_does_not_pull_the_bar1_modules(self):
-        code = (
+        code = _probe_code(
             "import sglang.srt.distributed.parallel_state\n"
-            "import sglang.srt.distributed.device_communicators.barlink\n"
-            "import sys\n"
-            "print('MODULES:' + ' '.join(m for m in sys.modules if 'bar1' in m))\n"
+            "import sglang.srt.distributed.device_communicators.barlink\n",
+            "bar1",
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
 
@@ -104,27 +152,109 @@ class TestNothingIsImported(CustomTestCase):
         from inside ``bar1ep_available()`` / the dispatcher constructor,
         i.e. only once someone has chosen ``--moe-a2a-backend bar1ep``.
         """
-        code = (
+        code = _probe_code(
             "import sglang.srt.layers.moe.utils\n"
-            "import sglang.srt.layers.moe.token_dispatcher as td\n"
-            "import sys\n"
-            "print('MODULES:' + ' '.join(m for m in sys.modules "
-            "if 'barlink_bar1' in m))\n"
+            "import sglang.srt.layers.moe.token_dispatcher as td\n",
+            "barlink_bar1",
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
 
     def test_the_modules_are_importable_at_all(self):
         """Otherwise the two tests above would pass for the wrong reason."""
-        code = (
-            "import importlib, sys\n"
-            "for m in ('sglang.srt.distributed.device_communicators.barlink_bar1',"
+        code = _probe_code(
+            "import importlib\n"
+            "for _t in ('sglang.srt.distributed.device_communicators.barlink_bar1',"
             "'sglang.srt.layers.moe.token_dispatcher.bar1ep'):\n"
-            "    importlib.import_module(m)\n"
-            "print('MODULES:' + ' '.join(m for m in sys.modules if 'bar1' in m))\n"
+            "    importlib.import_module(_t)\n",
+            "bar1",
         )
         got = self._imports(code, _clean_env())
         self.assertTrue(any("barlink_bar1" in m for m in got))
         self.assertTrue(any("bar1ep" in m for m in got))
+
+
+class TestImportParserIsAnchored(CustomTestCase):
+    """#736: the guard above must fail for the right reason, and only that one.
+
+    Three angles. The first two are can-fail proofs of the fix; the third
+    proves the fix did not simply blind the guard, which is the obvious way to
+    make a red test green.
+    """
+
+    #: The exact line this rig emits, which is what made the guard falsely red.
+    RIG_WARNING = (
+        "[2026-08-17 18:52:39] WARNING [cuda.py:962] Detected different "
+        "devices in the system: NVIDIA GeForce RTX 3080, NVIDIA GeForce RTX "
+        "5090, NVIDIA GeForce RTX 3080. Please make sure to set "
+        "`CUDA_DEVICE_ORDER=PCI_BUS_ID` to avoid unexpected behavior."
+    )
+
+    def test_the_rig_warning_cannot_enter_the_import_set(self):
+        """Planted verbatim: prose on stdout contributes nothing."""
+        self.assertEqual(_MODULE_LINE.findall(self.RIG_WARNING), [])
+        self.assertEqual(_MODULE_LINE.findall(self.RIG_WARNING + "\n"), [])
+
+    def test_the_old_parser_would_have_failed_on_it(self):
+        """CAN-FAIL PROOF for the fix itself.
+
+        Reconstructs the previous implementation and shows it turning the
+        warning into 30-odd phantom "modules". Without this, a future cleanup
+        could revert to ``.split()`` and nothing would object on a rig that
+        happens to be quiet.
+        """
+        old = set(self.RIG_WARNING.split())
+        self.assertGreater(len(old), 20)
+        self.assertIn("WARNING", old)
+        self.assertIn("Detected", old)
+
+    def test_noise_around_a_real_module_line_is_stripped(self):
+        stdout = (
+            f"{self.RIG_WARNING}\n"
+            "MODULE:sglang.srt.distributed.device_communicators.barlink_bar1\n"
+            "some trailing banner text\n"
+        )
+        self.assertEqual(
+            _MODULE_LINE.findall(stdout),
+            ["sglang.srt.distributed.device_communicators.barlink_bar1"],
+        )
+
+    def test_a_module_name_embedded_in_prose_is_not_counted(self):
+        """Only a line that IS a report counts, not one that mentions one."""
+        for line in (
+            "note: MODULE:barlink_bar1 was mentioned",
+            "  MODULE:barlink_bar1",
+            "XMODULE:barlink_bar1",
+        ):
+            self.assertEqual(_MODULE_LINE.findall(line), [], msg=line)
+
+    def test_a_probe_that_never_reported_is_a_hard_failure(self):
+        """CAN-FAIL PROOF for the merged-in completion marker.
+
+        Anchored parsing alone answers ``set()`` for a probe that printed
+        nothing, which passes every ``== set()`` assertion in this file for the
+        wrong reason. The marker turns that into a failure. Without this test
+        the two halves of the merged fix could be separated again silently.
+        """
+        with self.assertRaises(AssertionError) as ctx:
+            TestNothingIsImported._imports(self, "pass\n", _clean_env())
+        self.assertIn(_DONE, str(ctx.exception))
+
+    def test_the_guard_still_reds_on_a_planted_transport_import(self):
+        """The anchor must not have made the guard unable to fail.
+
+        A subprocess that genuinely imports the transport is asserted to come
+        back NON-empty through the same parser the guard uses -- so the
+        ``== set()`` assertions above are load-bearing, not vacuous.
+        """
+        code = _probe_code(
+            "import sglang.srt.distributed.device_communicators.barlink_bar1\n",
+            "barlink_bar1",
+        )
+        got = TestNothingIsImported._imports(self, code, _clean_env())
+        self.assertTrue(
+            any("barlink_bar1" in m for m in got),
+            "parser must still see a real transport import",
+        )
 
 
 class TestMoeBackendDefaultUnchanged(CustomTestCase):
