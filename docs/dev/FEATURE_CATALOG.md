@@ -3443,6 +3443,37 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **stale-gate audit (new axis)** — `AUDIT_stale_gates.md`. Guards whose
+  JUSTIFICATION expired: a refusal that still says "blocked until X" after X
+  shipped. Distinct from `AUDIT_421` (is it wired?), `AUDIT_500` (how far does
+  it reach?), `AUDIT_505` (can it be silently wrong?) and `AUDIT_506`
+  (overflow / auth-reach / key-agreement / test-gate strength) — none of those
+  asks whether a guard's stated REASON is still true.
+  SWEPT `python/sglang/srt` (tests excluded): 181 candidate lines, 170
+  fork-owned. Result: the tree is HEALTHY on this axis — 0 DANGLING, 0 guards
+  needing a lift decision — and the rot is concentrated in the PLANNER'S
+  REJECTION REGISTER (`planner/rejected.py`), where 3 of 19 BLOCKED rows are
+  stale (`pp_with_spec` softened by #631's phase flip; `gguf_on_sm75` and
+  `gguf_moe_expert_offload` both still saying a guard is MISSING that now
+  exists — the most misleading direction, since it keeps a guarded path out of
+  the wizard's proposals).
+  MEASURED SUB-FINDING: the register cites a `file.py:line` in 4 rows and 3
+  have DRIFTED; the survivor points at a module-level constant while all three
+  failures point into `server_args.py`, which grew ~1300 lines this month. A
+  line number into a growing file is a decaying pointer — cite a SYMBOL or a
+  quoted string, as #625 already concluded once (`2872a398a8`).
+  A LIFT HAS THREE TWIN CLASSES, not two: parse-time guard, runtime guard, and
+  **the tests pinning either**. #703 moved its two code clauses together and
+  still left `test/registered/unit/server_args/test_phase_flip_args.py:88`
+  asserting the `#630` blocker it had removed — red on `train/0817-control`
+  since, verified failing at the untouched base.
+  ONE FIX PER SIDE, text-only: `phase_flip_runtime.py:1127` no longer
+  advertises a `#630` guard the function does not have; `server_args.py:2275`
+  no longer says park routing waits on `#236`, which landed.
+  METHOD NOTE worth reusing: "the ticket closed" is NOT "the thing the guard
+  waits for exists". One sweep row was rejected on exactly that — the barlink
+  NCCL-reference docstring is CORRECT that the measurement does not exist; only
+  its LOADER does.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an

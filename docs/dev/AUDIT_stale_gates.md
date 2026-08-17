@@ -140,6 +140,111 @@ safe than it is.
 | --- | --- | --- | --- |
 | V1 | `planner/key_solver.py:382` (`session_max`) | "Blocked on one prior question — whether the scheduler can bind a session to a replicated state pool (affinity)" | an open DESIGN question, not a delivered ticket; the entry declares itself "Not implemented — no number is produced here", so it is an honest reserved interface rather than a gate with an expired reason |
 
+## Part 2 — the tree-wide ticket-citing guards
+
+Swept `python/sglang/srt/` excluding the register and tests. **The headline is
+that the tree is healthy on this axis**: nearly every ticket-citing guard's
+reason still holds, and **no DANGLING guard was found anywhere** — every
+citation resolved to a real commit history or a checkable code artifact.
+
+### The one verified STALE-TEXT — fixed
+
+| # | file:line | said | true now |
+| --- | --- | --- | --- |
+| T1 | `server_args.py:2275` (help text) | park-tier routing happens at exhaustion sites "**once the #236 budget lands**" | #236 landed; `park_instead_of_demote` is live and called at `managers/kv_session_offload.py:3404`. Fixed: the conditional clause dropped, behaviour described as current |
+
+### A classification I REJECTED after checking it myself
+
+`distributed/device_communicators/barlink_path_rates.py:21` says "The pending
+NCCL/system-RAM reference. **The measurement does not exist yet**". The sweep
+classified this STALE-TEXT on the grounds that #278 closed and
+`load_nccl_reference` is implemented.
+
+**That is wrong, and the distinction is the whole point of this axis.** The
+LOADER existing is not the MEASUREMENT existing. `scripts/gpu_battery/
+s06_nccl_reference.{sh,py}` and `scripts/probe/nccl_reference.py` exist to
+PRODUCE the data; no data file does, and the consumer at
+`barlink_path_rates.py:448` explicitly handles that case — "rate source not
+available ... its paths stay PLACEHOLDER". So the docstring is **correct** and
+the row is STILL-VALID. Fixing it would have replaced a true statement with a
+false one.
+
+Recorded because it is the failure mode this sweep is most likely to commit:
+"the ticket closed" is not the same claim as "the thing the guard waits for
+exists".
+
+### THE SHARPEST FIND — a lifted gate still pinned by a RED test
+
+`test/registered/unit/server_args/test_phase_flip_args.py:88` asserts that
+`enable_hierarchical_cache=True` raises a `ValueError` matching **`"#630"`**.
+#703 stage 2 REMOVED that blocker. The test is therefore **failing on
+`train/0817-control` right now** — verified failing at the untouched base
+commit, so it is not this sweep's doing.
+
+This is the audit's own axis turned on the test suite, and it upgrades a lesson
+the #703 lift already knew. That lift was careful about TWINS: it moved the
+parse-time and runtime clauses together, because "fixing only the runtime
+clause is not enough ... both must move together or the flag is still
+unusable". **There was a third twin.** The test that pinned the gate did not
+move with them, so the lift left behind a red test asserting the presence of
+something it had just deliberately removed.
+
+NOT FIXED HERE: deleting or rewriting a test assertion is not behaviour-neutral
+for the suite, so it falls outside this sweep's one permitted write. Filed as
+its own item. The repair is small — drop the `#630` row from that loop and
+point at the same protection the code comments already name
+(`test_hicache_bounded_waits_630.py`) — but it is a decision about what the
+suite guarantees, not a text fix.
+
+**Generalised**: a lift has THREE twin classes, not two — parse-time guard,
+runtime guard, and the tests pinning either. This belongs in the lift-evidence
+bar below.
+
+### STILL-VALID — the substantive set
+
+Sampled from the sweep and spot-checked: the HiCache phase-rebind refusal
+(`mem_cache/hicache_phase_binding.py:142`, waiting on a phase-matched host pool
+that nothing in the tree ever sets), the #578 stage-table refusal
+(`managers/regime_classifier.py:671` — its text reads liftable in isolation, but
+#584's measurement canon fills what it can and this raise is the designed
+fallback for what it cannot), the #452 CUDA-graph MoE-offload refutation
+(`environ.py:1251`, reconfirmed by three later commits and never reversed), the
+KVSO/HiCache opt-in gate (`server_args.py:7435`, its contention measurement
+still outstanding with the boot-matrix arm that would produce it still
+present), and the topk>1-under-uneven-DCP refusal (`server_args.py:8719`),
+which matches the standing "do not re-attempt" record.
+
+### Two loose citations worth naming
+
+`layers/dcp/owner.py:127` and `layers/attention/triton_backend.py:432` both
+cite **"#76"**, and in neither case does the real #76 (an unrelated PD-disagg
+feature) match the claim. They are scale analogies written as if they were
+pointers. Not DANGLING — the guards themselves are valid and independently
+confirmed — but a reader following the citation lands somewhere unrelated,
+which is the same reader-misdirection cost as the drifted anchors above.
+
+### Counts, and an honest discrepancy
+
+| quantity | count |
+| --- | --- |
+| candidate lines (my union grep) | 181 |
+| fork-owned | 170 |
+| vendor/upstream (counted, not analysed) | 19 ticketed + a larger un-ticketed bucket |
+| STALE-TEXT found and fixed | 2 (S1 register docstring, T1 help text) |
+| STALE (register rows, not fixed here) | 3 (R1-R3) |
+| STALE-TEXT anchor drift (not fixed here) | 3 of 4 file:line citations |
+| LIFT-CANDIDATE requiring a lift decision | 0 |
+| DANGLING | 0 |
+| red test pinning a lifted gate | 1 |
+
+**The provenance count is where my number and the sweep's disagree, and I am
+not reconciling them by picking one.** I counted 21 provenance-shaped lines
+within my 181-line candidate union; the sweep counted 187 across the whole tree
+without that pre-filter. Different denominators, both defensible, neither
+checked against the other line by line. What both agree on is the shape: the
+large majority of `#NNN` mentions in this tree are settled narration, and only a
+handful are live conditions that could expire.
+
 ## What a lift would require
 
 For any LIFT-CANDIDATE, "the cited commit exists" is **not** sufficient
@@ -152,4 +257,8 @@ evidence. The #630 precedent sets the bar:
 3. every TWIN moved together — #703 had to lift the parse-time and runtime
    clauses in one step, because lifting only one left the flag unusable while
    appearing fixed;
-4. for anything on the serving path, a boot.
+4. for anything on the serving path, a boot;
+5. **the tests that pin the gate move with it.** #703 moved its parse-time and
+   runtime clauses together and still left `test_phase_flip_args.py:88`
+   asserting the removed blocker — red on the serving lineage ever since. Two
+   twins were not enough; there are three.
