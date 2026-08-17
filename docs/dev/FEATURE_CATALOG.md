@@ -1275,6 +1275,27 @@ capturable (`put()` is a stream `memcpy_async`), recv is NOT (no device-side
 wait; a host spin in a capture raises `cudaErrorStreamCaptureUnsupported`),
 so a PP crossing over this seam is BREAKABLE and priced with #494's clock.
 `NOTE_732_bar1_p2p_seam.md`.
+**The crossing schedule is ROUTED over the per-peer map (#735).**
+`pp_crossing_transport.py` is the junction: the schedule speaks ranks and
+layers, the transport map speaks device UUIDs and link widths, and this is the
+only place that knows both. `route_schedule()` attaches a binding to every
+crossing or refuses at ROUTING time (not at the first send, half a pass later);
+`RoutedLink` implements the schedule's `Link` protocol and dispatches per
+DIRECTED pair, so `send` resolves `self.rank -> dst` and `recv` resolves
+`src -> self.rank` -- direction is load-bearing on an asymmetric map. A missing
+backend refuses BY NAME rather than sending over whatever transport exists,
+which is exactly the per-communicator behaviour #732 removed.
+`per_pair_us_from_map()` prices a schedule from the SAME map that routes it, and
+OMITS any pair whose lane count has no measured row so `schedule_cost`'s
+documented `default_us` fallback still owns the gap -- never interpolated, never
+zeroed. Cross-validation: pricing the real family map through Slot-2's
+`schedule_cost` reproduces 24.68 ms/pass, the figure `NOTE_732_transport_
+selection.md` derived independently by hand. Still moves no bytes.
+`scripts/boot_735_step1.py` is the step-1 boot ticket: it DERIVES the layer set
+from the live planner (`derive_pp_layer_split`, which snaps boundaries onto the
+requested FA split) rather than transcribing DESIGN 9.1's two-stage example, and
+fires all three DESIGN 9.2 refusals without a GPU.
+
 **Transport binds per PEER LINK, not per communicator (#732).** `_select`
 (`barlink.py:554`) picks one transport per group, refined by op and size but
 never by peer. The measured BAR1 standing changes SIGN with edge width — it
