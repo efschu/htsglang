@@ -16,12 +16,29 @@ the result. It contains no boot: the boot goes on the window list.
 shape. That pool **has no builder**: `phase_pools_for`
 (`mem_cache/hicache_phase_binding.py:287`) reads
 `scheduler.phase_flip_host_pools[phase]`, and nothing in the tree writes it. So
-today the rebind refuses at every cutover -- by design, logged and never raised
--- and #718 keeps the device tier disarmed in the phase that did not build the
-binding.
+the rebind cannot succeed at any cutover: ARMED it refuses (by design, logged
+and never raised); UNARMED, which is the default and this recipe, it is a plain
+no-op. Either way #718 keeps the device tier disarmed in the phase that did not
+build the binding.
 
 That refusal is a safe state, not a broken one, and section 2 recommends
 booting in it.
+
+**DECIDED (2026-08-17): boot without the second pool.** The builder stays
+unwritten for this boot, and that is the recommendation, not a deferral for
+want of time -- it does not fit (1.3), and the cross-phase path does not need
+it (2.1). Whoever later wants the host tier to serve BOTH phases owns building
+`scheduler.phase_flip_host_pools[phase]` at boot AND re-running the pinned
+budget check first; until then this document's recipe is the whole ticket. With
+the builder absent, the recipe below is turnkey: section 5 is the run-card.
+
+One correction to the framing above, verified in code rather than designed:
+with `--phase-flip-rebind-hicache` OFF, the refusal is never even constructed.
+`rebind_for_cutover` (`hicache_phase_binding.py:304`) returns `None` on the
+flag check BEFORE calling `phase_pools_for`, so the recommended boot logs no
+`#719` line at all. The refusal text is only reachable if someone arms the
+flag. Section 5.4 states both expectations, because "an ERROR line that is
+expected" is exactly the kind of thing that stops a boot for no reason.
 
 ## 1. Host-RAM budget on this box
 
@@ -128,9 +145,12 @@ The first Flip+HiCache boot should NOT add the second pool. Reasons, in order:
   geometry-neutral, #703's flip-time writeback pushes warm prefixes there
   before the cutover, and both phases resolve the same content key. The host
   tier is staging; the disk tier is retention (DESIGN_706 C1a, user directive);
-* the safe states are already the DEFAULT states: `#719` unarmed refuses at the
-  cutover (logged, never raised), `#718` disarms the device tier in the phase
-  that did not build the binding. Nothing has to be remembered.
+* the safe states are already the DEFAULT states: `#719` unarmed does not
+  refuse at all -- `rebind_for_cutover` returns `None` on the flag check before
+  the refusal is constructed, so nothing is even logged -- and `#718` disarms
+  the device tier in the phase that did not build the binding. Nothing has to
+  be remembered. (Armed without a second pool it WOULD refuse at every cutover,
+  logged and never raised; that is 5.4 row 4, not this recipe.)
 
 So the first boot validates: canonical keys + GDN blob + disk retention +
 flip-time writeback, with the device/host tier serving the PP phase only.
@@ -288,3 +308,105 @@ What to check, and note that the obvious metric is broken:
 5. **`cache_hit_rate` reads 0.0 with real hits.** Known separate defect. Risk is
    an operator concluding the feature failed. Mitigation: acceptance counts hit
    LOG LINES, never that metric.
+
+## 5. Turnkey run-card (for the window list, after the speed boot)
+
+Sections 1-4 are the reasoning. This section is the ticket: it assumes nothing
+from the rest of the document and can be executed as written. It contains no
+boot -- it describes one.
+
+### 5.1 Preconditions (all four, before any process starts)
+
+| # | check | pass condition | if it fails |
+| --- | --- | --- | --- |
+| 1 | `free -g` available | `> 24.3 G` (the #721 floor) | do not start; the pinned budget refuses at attach, not at OOM |
+| 2 | serving line carries the flip | `--enable-phase-flip` boots today | the flip is the dependency, not this ticket -- see #722 (barlink) if it is flip-less |
+| 3 | disk L3 sized | `~100 GB` free at `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` | shrink the retention expectation, not the min-free floor |
+| 4 | GPU window held | gpu-arb claim, heartbeat running | this boot takes the cards |
+
+### 5.2 Flag set (add to the current serving line, verbatim)
+
+```
+  --enable-hierarchical-cache
+  --hicache-storage-backend file
+  --page-size 1
+  --phase-flip-canonical-kv-page
+  --phase-flip-writeback
+  --phase-flip-writeback-deadline-s 2.0
+  --hicache-size 5G
+```
+
+```
+  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<disk L3, ~100 GB>
+  SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES=8589934592
+  SGLANG_HICACHE_READ_BUFFERS=8
+  SGLANG_HICACHE_DEMOTE_ON_EVICT=<cap>
+```
+
+NOT set, deliberately: `--phase-flip-rebind-hicache`. See 5.4.
+
+`--hicache-size` must stay at or below the 5.37 GB remainder from 1.2. Do not
+raise it to 9 GB "because the tier wants it" -- the pinned budget will refuse
+at attach and the boot dies late instead of not starting.
+
+### 5.3 Ordered steps
+
+1. `free -g`, confirm precondition 1.
+2. Start. Wait for the pinned-budget line; it names every post.
+3. Confirm on EVERY rank: `#706 canonical KV page active: slots [a, b) of 16`
+   (plus `#706 canonical GDN blob active` on the hybrid checkpoint). Their
+   ABSENCE is a stop: the store is running with geometry-suffixed keys and
+   nothing after this point measures what the ticket claims.
+4. Warm request, then the identical request again, BEFORE any flip. Confirm a
+   within-phase hit (`#cached-token > 0`).
+5. Flip.
+6. Repeat the same prefix in the new phase. This is the acceptance (5.4).
+7. Hold at the first divergence. Do not re-flip to see if it clears.
+
+### 5.4 Pass/fail, by greppable log string
+
+The metric is the PREFILL LOG LINE, counted. `cache_hit_rate` reports 0.0
+despite real hits (known separate defect) -- it is not evidence here, in either
+direction.
+
+| # | grep | expected | verdict if not |
+| --- | --- | --- | --- |
+| 1 | `#706 canonical KV page active` | once per rank at ready | STOP -- keys are geometry-suffixed |
+| 2 | `#cached-token` on the post-flip repeat | `> 0` on a prefix written in the OTHER phase | cross-phase retention did not work; the finding is the deliverable |
+| 3 | post-flip continuation token-ids | identical to the unflipped A-vs-A reference | **the #718 corruption shape** -- a hit with different bytes is the one failure that matters |
+| 4 | `#719 HiCache rebind refused` | **ZERO occurrences** with the flag off | its presence means someone armed `--phase-flip-rebind-hicache`; see below |
+| 5 | `[#703 demote] dropping demotions` | absent under steady load | disk tier is not keeping up; raise the cap (a dropped demotion is a later miss, never corruption) |
+| 6 | `overflow_allocations` | zero with `READ_BUFFERS=8` | the #720 spike is back; raise the ring or accept knowingly |
+
+**On row 4, so no one holds the boot for it.** The refusal is
+logged-never-raised at the cutover (`phase_flip_runtime.py:1638`, a `try` that
+catches and continues), and it prints at **ERROR** level. Two cases, both
+verified in code:
+
+* flag OFF (this recipe): `rebind_for_cutover` returns `None` before the
+  refusal is constructed. **No `#719` line at all.** An occurrence means the
+  recipe was not followed.
+* flag ON without a second host pool: exactly **one ERROR per cutover**,
+  `#719 HiCache rebind refused (... the '<phase>' phase has no host pool ...)`,
+  and the flip continues normally. This is an EXPECTED error line. It means
+  "the feature is not on", not "the instance is damaged" -- do not abort on it.
+
+### 5.5 Abort conditions
+
+Stop the boot, keep the log, do not re-flip:
+
+* row 3 fails -- a cross-phase hit whose bytes differ. Nothing else is worth
+  measuring after that.
+* readiness stalls with NOTHING logged during warmup. That is the #630 wedge
+  signature (2.4); `_warn_first_disk_tier_arm` is the attribution anchor.
+* the pinned-budget line refuses. Shrink `--hicache-size`; never raise the
+  reserve to make it fit.
+
+### 5.6 What this boot does NOT settle
+
+* the second host pool, and therefore #719's rebind on real hardware (5.4 row
+  4 is a refusal, not an exercise);
+* the decode-bs 1.30 claim at queue 5-9, which is UNVALIDATED on metal. State
+  the measured decode bs at the same queue depth before and after. If it does
+  not move, the retention hypothesis is wrong for this traffic -- that is a
+  finding, not a failed boot.
