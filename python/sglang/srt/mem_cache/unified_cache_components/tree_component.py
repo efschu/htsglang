@@ -148,16 +148,19 @@ class TreeComponent(ABC):
     @abstractmethod
     def create_match_validator(
         self, match_device_only: bool = False
-    ) -> Callable[[UnifiedTreeNode], bool]:
-        """Return a per-match stateful predicate that decides whether a node
-        is a valid match boundary for this component.
+    ) -> Callable[[UnifiedTreeNode, int], bool]:
+        """Return a per-match stateful predicate ``(node, depth) -> bool``
+        that decides whether a node is a valid match boundary for this
+        component. ``depth`` is the node's absolute token position (matched
+        key tokens from root through the node, #747).
         Called once per match_prefix; the returned closure may carry state.
         When match_device_only is true, host-backed nodes must not be accepted
         as valid match boundaries.
         - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
-        - Mamba: returns True iff the node has mamba component data."""
+        - Mamba: returns True iff the node has mamba component data AND, with
+          --mamba-checkpoint-interval set, sits on the checkpoint grid."""
         ...
 
     def finalize_match_result(

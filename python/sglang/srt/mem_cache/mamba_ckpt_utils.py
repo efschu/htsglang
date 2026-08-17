@@ -38,6 +38,36 @@ def is_on_interval(pos: int, interval: Optional[int]) -> bool:
     return pos % interval == 0
 
 
+def is_resume_candidate(
+    depth: int,
+    interval: Optional[int],
+    has_device_value: bool,
+    has_host_value: bool = False,
+    device_only: bool = True,
+) -> bool:
+    """Is a node at absolute token position ``depth`` a valid mamba resume
+    anchor for the prefix match?
+
+    The compound rule both match walks apply (``mamba_radix_cache.py``'s
+    ``_match_prefix_helper`` and the unified component's match validators):
+    the node must CARRY a state, and with ``--mamba-checkpoint-interval`` set
+    it must SIT on the grid -- off-grid checkpoints (legacy entries, storage
+    written by a non-interval run, unaligned edge paths) would re-introduce
+    traffic-dependent resume points.
+
+    ``device_only=False`` additionally accepts a host-backed state
+    (``has_host_value``): under HiCache an evicted-but-backuped anchor is a
+    valid match that triggers ``load_back``. The grid applies to those
+    equally -- surviving on the host tier does not legalise an off-grid
+    position.
+
+    ``interval=None`` degenerates to the pure presence test, byte-identical
+    to the pre-#747 behaviour of both walks.
+    """
+    present = has_device_value or (not device_only and has_host_value)
+    return present and is_on_interval(depth, interval)
+
+
 def protect_deepest_anchors(
     interval: Optional[int], host_tier_present: bool = False
 ) -> bool:

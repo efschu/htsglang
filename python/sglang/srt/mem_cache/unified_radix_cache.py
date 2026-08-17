@@ -1139,13 +1139,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for comp in self._components_tuple
             )
 
-        def _all_valid(validators, node):
-            return all([v(node) for v in validators])
+        def _all_valid(validators, node, depth):
+            return all([v(node, depth) for v in validators])
 
-        def _update_best_if_valid(node):
+        def _update_best_if_valid(node, depth):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
-            matched = _all_valid(validators, node)
+            matched = _all_valid(validators, node, depth)
             if matched:
                 best_match_node = node
 
@@ -1154,10 +1154,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     best_match_device_value_len = len(value)
                     best_match_device_node = node
                 return
-            if _all_valid(device_validators, node):
+            if _all_valid(device_validators, node, depth):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
+        # #747: absolute token depth of `node`, accumulated over matched KEY
+        # tokens (evicted-but-backuped nodes included -- their tokens are part
+        # of the position even when their KV chunk is not in `value`). The
+        # mamba validator gates resume anchors on this depth being a
+        # --mamba-checkpoint-interval multiple; mirrors `cum_tokens` in
+        # MambaRadixCache._match_prefix_helper.
+        cum_tokens = 0
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
@@ -1170,13 +1177,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
-                _update_best_if_valid(node)
+                cum_tokens += prefix_len
+                _update_best_if_valid(node, cum_tokens)
                 break
 
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
-            _update_best_if_valid(node)
+            cum_tokens += prefix_len
+            _update_best_if_valid(node, cum_tokens)
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
