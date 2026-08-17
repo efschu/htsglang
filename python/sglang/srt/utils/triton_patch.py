@@ -35,16 +35,11 @@ triton.
 
 from __future__ import annotations
 
-import importlib.util
-import logging
-import sys
-import threading
-from typing import Any, Optional
+from typing import Any
 
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import post_import_hook
 
-_LOCK = threading.Lock()
-_FINDER: Optional[_TritonPatchFinder] = None
+_MODULE = "triton"
 
 
 def next_power_of_2(n: int) -> int:
@@ -57,87 +52,15 @@ def apply_patch(module: Any) -> None:
     setattr(module, "next_power_of_2", next_power_of_2)
 
 
-class _PatchingLoader:
-    """Wraps triton's real loader and patches the module after it executes.
-
-    Delegates everything else, so triton loads exactly as it would have; the
-    only difference is one attribute assignment appended to ``exec_module``.
-    """
-
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-
-    def create_module(self, spec):
-        return self._inner.create_module(spec)
-
-    def exec_module(self, module) -> None:
-        self._inner.exec_module(module)
-        apply_patch(module)
-
-    def __getattr__(self, item):
-        return getattr(self._inner, item)
-
-
-class _TritonPatchFinder:
-    """Claims ``triton`` once, to hand back a spec with a patching loader."""
-
-    def find_module(self, fullname, path=None):  # pragma: no cover - legacy API
-        return None
-
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname != "triton":
-            return None
-        # Resolve the REAL spec with this finder removed, or find_spec would
-        # ask us again and recurse. Re-inserted in the finally, so a failed
-        # resolution does not silently disarm the patch for the rest of the
-        # process.
-        with _LOCK:
-            try:
-                sys.meta_path.remove(self)
-            except ValueError:  # pragma: no cover - concurrent removal
-                return None
-            try:
-                spec = importlib.util.find_spec("triton")
-            except Exception as e:  # pragma: no cover - broken install
-                logger.warning("triton spec lookup failed: %s", e)
-                spec = None
-            finally:
-                sys.meta_path.insert(0, self)
-        if spec is None or spec.loader is None:
-            return None
-        spec.loader = _PatchingLoader(spec.loader)
-        return spec
-
-
 def install() -> None:
-    """Arm the patch. Idempotent, and cheap: it does not import triton.
-
-    If triton is ALREADY imported (another module got there first, or this is
-    a re-install), the patch is applied directly -- the guarantee is "patched
-    before any read", and a module already in ``sys.modules`` cannot be
-    patched by a future import.
-    """
-    global _FINDER
-    with _LOCK:
-        already = sys.modules.get("triton")
-        if already is not None:
-            apply_patch(already)
-        if _FINDER is None:
-            _FINDER = _TritonPatchFinder()
-            sys.meta_path.insert(0, _FINDER)
+    """Arm the patch. Idempotent, and cheap: it does not import triton."""
+    post_import_hook.install(_MODULE, apply_patch)
 
 
 def uninstall() -> None:
     """Test hook: remove the finder."""
-    global _FINDER
-    with _LOCK:
-        if _FINDER is not None:
-            try:
-                sys.meta_path.remove(_FINDER)
-            except ValueError:
-                pass
-            _FINDER = None
+    post_import_hook.uninstall(_MODULE)
 
 
 def is_armed() -> bool:
-    return _FINDER is not None and _FINDER in sys.meta_path
+    return post_import_hook.is_armed(_MODULE)

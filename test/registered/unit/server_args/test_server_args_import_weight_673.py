@@ -96,12 +96,15 @@ class TestServerArgsImportWeight(CustomTestCase):
             "pinned rather than trusted).",
         )
 
-    def test_torch_and_triton_are_not_server_args_fault(self):
-        """Attribution, asserting today's UNFIXED state deliberately.
+    def test_a_bare_import_sglang_no_longer_pulls_triton(self):
+        """LADDER RUNG CLIMBED. This rung used to assert that BOTH torch and
+        triton were present after ``import sglang`` -- the honest state at the
+        time, since the package root applied the transformers patches eagerly
+        and transformers reaches torch._dynamo -> triton.
 
-        Both are already present after a bare ``import sglang``. When the
-        package root is made lazy this test fails, which is the signal to
-        tighten the FLA test above into a full torch/triton pin.
+        The root now ARMS those patches instead (post-import hook), so triton
+        is gone from a bare import. torch remains: utils/common.py imports it
+        at module scope and uses it pervasively, which is structural.
         """
         answer = _probe(
             "import sys\n"
@@ -110,10 +113,10 @@ class TestServerArgsImportWeight(CustomTestCase):
         )
         self.assertEqual(
             answer,
-            "['torch', 'triton']",
-            "a bare `import sglang` no longer pulls torch and triton -- the "
-            "package root got lighter, so the FLA test above should now be "
-            "tightened to assert their absence after importing server_args too",
+            "['torch']",
+            "a bare `import sglang` pulled triton again -- the transformers "
+            "patches are supposed to be armed, not applied, so that a process "
+            "which never imports transformers never loads a kernel compiler",
         )
 
     def test_the_owner_of_the_torch_pull_is_named(self):

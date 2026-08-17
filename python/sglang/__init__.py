@@ -26,10 +26,16 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 del _platform
 del _sys
 
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
+# #237 root ticket: ARM the transformers compatibility patches instead of
+# applying them eagerly. Applying them meant importing transformers here, in
+# every process -- and transformers reaches torch._dynamo, which imports
+# triton. Arming installs a post-import hook, so the patches land inside
+# transformers' own import (before any caller can use it) and a process that
+# never imports transformers never pays for it.
+from sglang.srt.utils.hf_transformers_patches import arm as _arm_hf_patches
 
-_apply_hf_patches()
-del _apply_hf_patches
+_arm_hf_patches()
+del _arm_hf_patches
 
 # Frontend Language APIs
 from sglang.global_config import global_config

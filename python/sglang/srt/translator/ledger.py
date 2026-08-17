@@ -176,13 +176,35 @@ class AudioAsset:
         return None
 
     def tensors(self) -> List[object]:
-        """Parameters and buffers, in a stable order."""
+        """Every tensor the module actually holds, in a stable order.
+
+        ``state_dict()`` alone is NOT that set: it omits non-persistent buffers
+        by definition, which is the same omission #568 fixed on the park path.
+        Leaving them out here under-counted ``size_bytes()`` while ``park()``
+        went on to free them, so a parked module reported MORE freed bytes than
+        it was ever registered as holding -- and the register priced its victim
+        choices on the smaller number.
+
+        FAILURE DIRECTION, stated because it decides how urgent this is:
+        under-counting here is SAFE in the sense that the actuator delivers
+        more than promised (the mirror image of the #715 sin, not the sin
+        itself). What it costs is accuracy: the ladder can pass over a victim
+        that would in fact have sufficed. Over-counting would be the dangerous
+        direction, and this cannot over-count -- every tensor listed is one the
+        park really frees.
+        """
         if self.route is not None:
             return []
         module = self.module
         if not hasattr(module, "state_dict"):
             return []
-        return [t for _k, t in sorted(module.state_dict().items())]
+        out = [t for _k, t in sorted(module.state_dict().items())]
+        named_buffers = getattr(module, "named_buffers", None)
+        if named_buffers is None:
+            return out
+        persistent = set(module.state_dict())
+        out.extend(t for k, t in sorted(named_buffers()) if k not in persistent)
+        return out
 
     def size_bytes(self) -> int:
         if self.route is not None:
@@ -391,7 +413,8 @@ class AudioAssetLedger:
                 self._mark_parked(name, True)
                 logger.info(
                     "parked audio asset %s via its own route (%.1f MiB freed)",
-                    name, freed / (1 << 20),
+                    name,
+                    freed / (1 << 20),
                 )
                 return freed
 
@@ -456,8 +479,20 @@ class AudioAssetLedger:
             asset.parked_bytes = freed
             self._touch(name)
             self._mark_parked(name, True)
-            logger.info("parked audio asset %s (%.1f MiB freed)",
-                        name, freed / (1 << 20))
+            # The non-persistent count is logged because it is the number the
+            # #568 diagnosis was stated in ("19 inv_freq buffers") and it
+            # cannot be derived from the source: it is a property of the loaded
+            # model, not of the module definitions. Without it, confirming the
+            # fix on metal means guessing which submodules the checkpoint
+            # instantiated.
+            logger.info(
+                "parked audio asset %s (%.1f MiB freed, %d persistent + %d "
+                "non-persistent tensors carried)",
+                name,
+                freed / (1 << 20),
+                len(state),
+                len(nonpersistent),
+            )
             return freed
 
     def _to_host(self, tensor):
@@ -482,7 +517,8 @@ class AudioAssetLedger:
                 logger.warning(
                     "could not page-lock a %s host copy (%s); "
                     "falling back to pageable memory",
-                    tuple(detached.shape), exc,
+                    tuple(detached.shape),
+                    exc,
                 )
         return detached.to("cpu", copy=True)
 
@@ -508,16 +544,24 @@ class AudioAssetLedger:
                 self._mark_parked(name, False)
                 logger.info(
                     "restored audio asset %s via its own route in %.1f ms",
-                    name, elapsed_ms,
+                    name,
+                    elapsed_ms,
                 )
                 return elapsed_ms
 
-            if not asset._cpu_state:
+            if not asset._cpu_state and not asset._cpu_nonpersistent:
                 raise ParkError(
                     f"audio asset {name!r} is parked but holds no host copy; "
                     "the park was interrupted and the module is unrecoverable "
                     "in place -- reload it from the checkpoint"
                 )
+            # BOTH stores are checked, and the second one is why. A module
+            # whose entire state is non-persistent buffers -- a rotary cache is
+            # exactly that -- parks with an EMPTY _cpu_state and a full
+            # _cpu_nonpersistent. Testing only the first declared such a module
+            # unrecoverable while its bytes sat on the host, one attribute
+            # away: a park that succeeded, followed by a restore that refused,
+            # for the same omission #568 fixed on the park path.
 
             import torch
 
@@ -750,9 +794,7 @@ class AudioAssetLedger:
                     for a in sorted(self._assets.values(), key=lambda x: x.name)
                 ],
                 "resident_mib": round(
-                    sum(
-                        a.size_bytes() for a in self._assets.values() if not a.parked
-                    )
+                    sum(a.size_bytes() for a in self._assets.values() if not a.parked)
                     / (1 << 20),
                     2,
                 ),
