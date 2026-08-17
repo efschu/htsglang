@@ -569,6 +569,21 @@ class TestStateChangingRouteRatchet(unittest.TestCase):
         "/api/chat",
         "/api/generate",
         "/api/show",
+        # #335 KoboldCpp surface. Inference-shaped, so NORMAL is the correct
+        # resolution: these are exactly the routes an api-key-only deployment
+        # is meant to reach, and /api/v1/generate composes the same
+        # openai_serving_completion that /v1/completions does.
+        #
+        # /api/extra/abort is listed DELIBERATELY despite sounding like a
+        # management verb: it is an unconditional 501 that mutates nothing
+        # (a multi-tenant server has no "the" generation to abort), and a
+        # Kobold client calls it mid-conversation on the inference surface.
+        # If it ever grows real cancellation it must move to an explicit
+        # @auth_level, because cancelling someone else's request is exactly
+        # the reach #510 exists to bound.
+        "/api/extra/abort",
+        "/api/extra/generate/stream",
+        "/api/v1/generate",
         "/classify",
         "/close_session",
         "/detokenize",

@@ -79,6 +79,8 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaGenerateRequest,
     OllamaShowRequest,
 )
+from sglang.srt.entrypoints.kobold.protocol import KoboldGenerateRequest
+from sglang.srt.entrypoints.kobold.serving import KoboldServing
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.errors import (
     LaneUnavailable,
@@ -488,6 +490,12 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+    # #335: the Kobold surface COMPOSES openai_serving_completion (see its
+    # module docstring); it holds no tokenizer manager of its own precisely
+    # so it cannot grow a second serving path.
+    fast_api_app.state.kobold_serving = KoboldServing(
+        model_name=_global_state.tokenizer_manager.served_model_name
+    )
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
@@ -2680,6 +2688,45 @@ async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
     return await raw_request.app.state.ollama_serving.handle_generate(
         request, raw_request
     )
+
+
+# ---------------------------------------------------------------------------
+# KoboldCpp-compatible surface (#335). Thin translation onto the OpenAI
+# completion path -- see entrypoints/kobold/serving.py for why it composes
+# rather than parallels.
+# ---------------------------------------------------------------------------
+
+
+@app.post(os.environ.get("SGLANG_KOBOLD_GENERATE_ROUTE", "/api/v1/generate"))
+async def kobold_generate(request: KoboldGenerateRequest, raw_request: Request):
+    """KoboldCpp-compatible generation."""
+    return await raw_request.app.state.kobold_serving.handle_generate(
+        request, raw_request
+    )
+
+
+@app.get(os.environ.get("SGLANG_KOBOLD_MODEL_ROUTE", "/api/v1/model"))
+async def kobold_model(raw_request: Request):
+    """KoboldCpp-compatible current-model probe."""
+    return raw_request.app.state.kobold_serving.get_model()
+
+
+@app.get(os.environ.get("SGLANG_KOBOLD_VERSION_ROUTE", "/api/extra/version"))
+async def kobold_version(raw_request: Request):
+    """KoboldCpp-compatible version probe."""
+    return raw_request.app.state.kobold_serving.get_version()
+
+
+@app.post(os.environ.get("SGLANG_KOBOLD_STREAM_ROUTE", "/api/extra/generate/stream"))
+async def kobold_generate_stream(raw_request: Request):
+    """Refused by name: a half-faithful stream is worse than none."""
+    return raw_request.app.state.kobold_serving.refuse_stream()
+
+
+@app.post(os.environ.get("SGLANG_KOBOLD_ABORT_ROUTE", "/api/extra/abort"))
+async def kobold_abort(raw_request: Request):
+    """Refused by name: multi-tenant servers have no 'the' generation."""
+    return raw_request.app.state.kobold_serving.refuse_abort()
 
 
 @app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))

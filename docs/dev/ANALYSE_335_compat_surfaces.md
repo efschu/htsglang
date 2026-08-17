@@ -100,3 +100,74 @@ happy path.
 The three absent surfaces were verified absent by grep across
 `python/sglang/srt/`; that is an absence of implementation, and I did not look
 for a gate refusing them, because none is claimed to exist.
+
+---
+
+## 5. KoboldCpp — BUILT (2026-08-17), and it demonstrates the right shape
+
+`entrypoints/kobold/` + 30 pins. Prior-art gate first: no `kobold` hit in
+FEATURE_CATALOG, `docs/`, or `git log --all --grep` outside this note.
+
+Mounted and proven at the source, not assumed (§1's own standard):
+`http_server.py` registers `/api/v1/generate`, `/api/v1/model`,
+`/api/extra/version`, `/api/extra/generate/stream`, `/api/extra/abort`, and
+constructs `state.kobold_serving` beside the Ollama one.
+
+**It composes, and the pins hold that.** `handle_generate` translates into a
+`CompletionRequest` and calls `openai_serving_completion.handle_request` —
+there is no sampling, no template application and no tokenizer manager in this
+adapter. A source pin forbids `apply_chat_template`,
+`tokenizer_manager.generate_request` and `sampling_params` from appearing in
+the module at all, so "thin translation" is enforced rather than intended.
+
+**Two endpoints are refused rather than approximated**, which is the honest
+half of a compatibility surface:
+
+- **streaming** — Kobold streams via a polled `/api/extra/generate/check`
+  protocol. Emitting an OpenAI-shaped stream under a Kobold URL would parse
+  until it did not, mid-generation, with no error to read. A half-faithful
+  stream is worse than a 501, and the refusal names `/api/v1/generate` and
+  `/v1/completions`.
+- **abort** — Kobold aborts *the* current generation, which presumes one user.
+  This server is multi-tenant: there is no "the" generation and cancelling a
+  guessed one would stop a stranger's request.
+
+**`rep_pen` is the worked example of refuse-over-map.** Kobold's is a
+multiplicative repetition penalty; the OpenAI path offers `frequency_penalty`,
+an additive logit adjustment. No constant converts one into the other, so
+mapping them would sample differently than asked with nothing saying so.
+
+**Three findings came from my own pins**, which is what they are for: two
+refusals (`sampler_order`, `memory`) blocked without routing or explaining and
+were rewritten; and `CompletionRequest.max_tokens` defaults to **16**, so a
+Kobold client omitting `max_length` would have received a 16-token fragment.
+That default is now an explicit `DEFAULT_MAX_TOKENS` constant — choosing a
+number is an adapter's responsibility, hiding that it was chosen is not.
+
+## 6. What an Ollama compose-refactor would take (recorded, not built)
+
+So the structural finding in §2 does not evaporate.
+
+The Ollama front would have to stop calling `tokenizer_manager` and stop
+applying the chat template itself, and instead build a `ChatCompletionRequest`
+and hand it to `openai_serving_chat.handle_request` — the shape §5
+demonstrates. Concretely: `handle_chat` maps messages straight across (they
+are already OpenAI-shaped), `handle_generate` maps `prompt` onto a
+`CompletionRequest` exactly as the Kobold adapter does, and
+`_convert_options_to_sampling_params` disappears in favour of the OpenAI
+request's own fields.
+
+What that buys immediately: `format` becomes wirable (it is
+`response_format`), `think` becomes wirable (it is the reasoning toggle the
+Anthropic front already reaches via `chat_template_kwargs`), and both stop
+being refusals. What it costs is the risk of the refactor itself: the Ollama
+streaming response shape is Ollama's own NDJSON, so the streaming path must be
+re-translated from the OpenAI SSE stream rather than produced directly — the
+same faithfulness question §5 refused to guess at for Kobold, but with a shape
+that IS determinable because the adapter already emits it.
+
+Two things make it more than a rename: it is upstream-owned code, so the
+change wants to be defensible to upstream rather than a fork divergence; and
+its current behaviour is what existing Ollama clients have been served, so the
+refactor needs the contract tests from `test_ollama_no_silent_drops_335.py`
+extended to the happy path first, or it is a rewrite without a net.
