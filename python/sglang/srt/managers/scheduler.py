@@ -9562,6 +9562,17 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+            # #673: destroy the collectives before the interpreter does. Their
+            # C++ watchdog and heartbeat threads are joined by the process
+            # group's DESTRUCTOR; with the group never destroyed those
+            # std::threads are still joinable at teardown, and destroying a
+            # joinable std::thread calls std::terminate -- "terminate called
+            # without an active exception", after a clean drain, which is the
+            # #673 signature. Graceful path only and flag-gated: the destroy
+            # path runs barlink's close(), which is #722's machinery.
+            from sglang.srt.managers.scheduler_teardown import release_distributed
+
+            release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 
 # ---------------------------------------------------------------------------

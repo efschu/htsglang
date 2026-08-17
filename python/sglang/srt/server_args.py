@@ -5564,6 +5564,24 @@ class ServerArgs:
             "--phase-flip-writeback.",
         ),
     ] = None
+    scheduler_distributed_teardown: A[
+        bool,
+        Arg(
+            help="#673: destroy this scheduler's process groups on the graceful "
+            "shutdown path, instead of leaving them to the interpreter. torch "
+            "already reports the omission on every boot "
+            "(\"destroy_process_group() was not called before program exit\"), "
+            "and the cost is the #673 abort: ProcessGroupNCCL's watchdog and "
+            "heartbeat are C++ threads joined by the group's destructor, so "
+            "with the group never destroyed they are still joinable when the "
+            "process tears down -- and destroying a joinable std::thread calls "
+            "std::terminate, which is the observed \"terminate called without "
+            "an active exception\" after a CLEAN drain. Default off because "
+            "the destroy path also closes barlink (a POSIX shm segment and the "
+            "device-mapped abort word that spinning kernels read), which is "
+            "task #722's live machinery.",
+        ),
+    ] = False
     phase_flip_rebind_hicache: A[
         bool,
         Arg(
