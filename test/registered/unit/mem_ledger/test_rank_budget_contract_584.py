@@ -220,7 +220,6 @@ class TestTheKnownWrongTermsAreFiledNotFixed(unittest.TestCase):
     def test_every_filed_term_is_a_real_ledger_constant(self):
         """Guards against the queue outliving what it describes."""
         from sglang.srt.mem_ledger import engine
-
         from sglang.srt.mem_ledger.measured import CALIBRATION_QUEUE
 
         for term in CALIBRATION_QUEUE:
