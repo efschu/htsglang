@@ -114,6 +114,16 @@ ENV_WATCHDOG = "SGLANG_BARLINK_PEER_WATCHDOG"
 _DEFAULT_TIMEOUT_S = 120.0
 _DEFAULT_PROBE_S = 1.0
 
+#: #673: how long teardown waits for the watchdog before detaching it.
+#: DERIVED FROM THIS THREAD'S OWN CADENCE, not copied from the kvso-dest-io and
+#: dual-group-lane siblings: ``_run`` waits ``poll_interval_s()`` (10 ms by
+#: default) between passes, so a cooperative exit lands within about one tick
+#: plus one poll pass. 250 ms is ~25 ticks -- ample for the loop that exists,
+#: and 8x tighter than the 2 s the siblings use, which wait on a host tier
+#: write and a CUDA kernel launch respectively.
+WATCHDOG_JOIN_TIMEOUT_S: float = 0.25
+WATCHDOG_LOG_PREFIX = "[#673 barlink-watchdog]"
+
 #: Iterations of the bare predicate before the first clock read. Mirrors the
 #: HiCache bounded-collective fix: a wait that resolves in microseconds must
 #: not pay for a ``time.monotonic()``.
@@ -595,11 +605,61 @@ class PeerWatchdog:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = WATCHDOG_JOIN_TIMEOUT_S) -> str:
+        """Stop the watchdog and GIVE THE ABORT-WORD READ BACK (#673).
+
+        THE RE-ARM COMES FIRST, and it is not hygiene. This thread is the only
+        reader of a device transport's abort word once ``_arm_status_poll`` has
+        latched ``_abort_poll_active``, and that latch is one-way -- so a stop
+        without the re-arm leaves the word unread by anyone and
+        ``check_aborted`` answers "not aborted" forever. Clearing before the
+        join also closes the window: at no point is the reader gone while the
+        latch still claims it reads.
+
+        THE HANDLE IS CLEARED ONLY ON A REAL JOIN. The previous body did
+        ``thread, self._thread = self._thread, None`` BEFORE joining, so a
+        timed-out join left a live thread with no record of it and a second
+        stop reported success for a thread it had abandoned.
+
+        The deadline is derived from THIS loop's cadence, not copied from the
+        siblings: ``_run`` waits ``poll_interval_s()`` (10 ms by default)
+        between passes, so a cooperative exit is observed within roughly one
+        tick plus one poll pass. 250 ms is ~25 ticks -- an order of magnitude
+        above the cadence and far below the 2 s the kvso and lane workers use,
+        which wait on much slower things.
+
+        Never raises, idempotent.
+        """
         self._stop.set()
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=5.0)
+        try:
+            from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
+            barlink_abort_gate.rearm_inline_reads()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            logger.exception(
+                "%s could not re-arm the in-line abort reads; the guard may be "
+                "blind from here on",
+                WATCHDOG_LOG_PREFIX,
+            )
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._thread = None
+            return "already stopped"
+        thread.join(timeout=float(timeout_s))
+        if thread.is_alive():
+            logger.warning(
+                "%s barlink-peer-watchdog did not stop within %.3fs and is "
+                "being DETACHED deliberately. The in-line abort reads have "
+                "already been re-armed, so the guard is not blind -- but the "
+                "thread is still polling, and the transports it polls must not "
+                "be closed while that is true. The handle is KEPT so the leak "
+                "stays visible.",
+                WATCHDOG_LOG_PREFIX,
+                float(timeout_s),
+            )
+            return "detached"
+        self._thread = None
+        return "joined"
 
     def probe_once(self) -> List[PeerIdentity]:
         """One pass. Split out so the test drives it without a thread."""
@@ -669,6 +729,29 @@ def ensure_watchdog() -> Optional[PeerWatchdog]:
         else:
             return _watchdog
     return started.start()
+
+
+def stop_watchdog(timeout_s: float = WATCHDOG_JOIN_TIMEOUT_S) -> Optional[str]:
+    """Stop the process's watchdog if one is running (#673).
+
+    The counterpart ``ensure_watchdog`` never had. Returns the outcome, or
+    None when no watchdog was ever started -- which is the common case, since
+    the watchdog only exists where barlink liveness is on.
+
+    Never raises: it runs during teardown, and it is also called from
+    ``release_distributed`` as an ordering precondition, where an exception
+    would abort the teardown it exists to make safe.
+    """
+    global _watchdog
+    with _registry_lock:
+        watchdog = _watchdog
+    if watchdog is None:
+        return None
+    try:
+        return watchdog.stop(timeout_s)
+    except Exception:  # noqa: BLE001 - teardown must not raise
+        logger.exception("%s stopping the watchdog failed", WATCHDOG_LOG_PREFIX)
+        return None
 
 
 def install(cpu_group: Any) -> Optional[PeerTable]:

@@ -7,12 +7,42 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-try:
-    from torchcodec.decoders import VideoDecoder
+#: Which decoder backend is available, resolved ON FIRST USE.
+#:
+#: This used to be a module-level ``try: from torchcodec.decoders import
+#: VideoDecoder`` -- an import-time CAPABILITY PROBE, the same antipattern as
+#: FLA's device probe (#673). ``utils/common`` imports this module and the
+#: package root imports ``utils/common``, so every process on the box -- the
+#: tokenizer manager and the detokenizer included -- imported torchcodec to
+#: find out whether video decoding was available. torchcodec in turn reaches
+#: ``torch._dynamo`` (``torchcodec/_core/ops.py:44``), which imports triton.
+#: A video decoder, a graph compiler and a GPU kernel compiler, loaded to set
+#: one string that a text-only process never reads.
+_BACKEND_CACHE: str | None = None
 
-    _BACKEND = "torchcodec"
-except (ImportError, RuntimeError):
-    _BACKEND = "decord"
+
+def backend() -> str:
+    """``"torchcodec"`` when it imports, else ``"decord"``. Cached."""
+    global _BACKEND_CACHE
+    if _BACKEND_CACHE is None:
+        try:
+            from torchcodec.decoders import VideoDecoder  # noqa: F401
+
+            _BACKEND_CACHE = "torchcodec"
+        except (ImportError, RuntimeError):
+            _BACKEND_CACHE = "decord"
+    return _BACKEND_CACHE
+
+
+def __getattr__(name: str):
+    """Keep ``video_decoder._BACKEND`` working for existing readers.
+
+    PEP 562 module ``__getattr__``: the name still resolves, but resolving it
+    is what triggers the probe, so a process that never asks never pays.
+    """
+    if name == "_BACKEND":
+        return backend()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _cuda_backend_enabled: bool | None = None
@@ -52,11 +82,16 @@ class VideoDecoderWrapper:
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
-        if _BACKEND == "torchcodec":
+        if backend() == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
             self._tc_kwargs = kwargs
+            # Local import: the module-level one was the capability probe that
+            # dragged torchcodec (and torch._dynamo -> triton) into every
+            # process. backend() has already confirmed it imports.
+            from torchcodec.decoders import VideoDecoder
+
             try:
                 self._decoder = VideoDecoder(source, **kwargs)
             except RuntimeError:
@@ -88,7 +123,7 @@ class VideoDecoderWrapper:
 
     def __getitem__(self, idx):
         """Return single frame as numpy NHWC uint8."""
-        if _BACKEND == "torchcodec":
+        if backend() == "torchcodec":
             return self._decoder[idx].numpy()
         else:
             frame = self._decoder[idx]
@@ -96,14 +131,14 @@ class VideoDecoderWrapper:
 
     @property
     def avg_fps(self) -> float:
-        if _BACKEND == "torchcodec":
+        if backend() == "torchcodec":
             return self._decoder.metadata.average_fps
         else:
             return self._decoder.get_avg_fps()
 
     def get_frames_at(self, indices: list) -> np.ndarray:
         """Return frames at given indices as numpy array with shape (N, H, W, C)."""
-        if _BACKEND == "torchcodec":
+        if backend() == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
             return batch.data.numpy()
         else:
@@ -114,7 +149,7 @@ class VideoDecoderWrapper:
         import torch
 
         if (
-            _BACKEND == "torchcodec"
+            backend() == "torchcodec"
             and self._num_decode_threads != 1
             and len(indices) > 1
         ):
@@ -125,7 +160,7 @@ class VideoDecoderWrapper:
             if num_threads > 1:
                 return self._parallel_decode(indices, num_threads)
 
-        if _BACKEND == "torchcodec":
+        if backend() == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
             return batch.data.pin_memory()
         else:
@@ -143,6 +178,8 @@ class VideoDecoderWrapper:
         kwargs = self._tc_kwargs
 
         def _decode_chunk(chunk):
+            from torchcodec.decoders import VideoDecoder
+
             d = VideoDecoder(source, **kwargs)
             return d.get_frames_at(chunk).data
 

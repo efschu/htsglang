@@ -86,7 +86,8 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
+
+from sglang.srt.utils import triton_patch as _triton_patch
 from packaging import version as pkg_version
 from PIL import Image
 from torch import nn
@@ -98,7 +99,7 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper, backend
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -2079,7 +2080,7 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    if _BACKEND == "torchcodec":
+    if backend() == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
         try:
@@ -3723,7 +3724,15 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+# #673/#237: patch triton WHEN it is imported, instead of importing it here to
+# patch it. This module is reached by the package root, so the two lines this
+# replaces made the tokenizer manager and the detokenizer -- processes that must
+# never touch CUDA -- load a GPU kernel compiler to install an integer helper
+# they never call. The hook applies the override inside triton's own import, so
+# it lands before any of the 235 readers of triton.next_power_of_2 can see the
+# module. See utils/triton_patch.py for why "move it next to the first
+# consumer" is not available: with 235 readers there is no first consumer.
+_triton_patch.install()
 
 
 class EmptyContextManager:
@@ -4941,6 +4950,8 @@ class CachedKernel:
 
     def __init__(self, fn, key_fn=None):
         self.fn = fn
+        import triton  # local: see _triton_patch.install() above
+
         assert isinstance(fn, triton.runtime.jit.JITFunction)
 
         original_fn = fn.fn
