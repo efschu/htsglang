@@ -303,3 +303,55 @@ on record before anyone writes it; every number below is a placeholder.
 share the #677 arming-floor budget, and the flip's price is a separate
 decision with its own gate — see NOTE_677 §5 for why crediting on-demand
 capacity against a standing floor is not a small build.
+
+## 9. Cut 3 DELIVERED (2026-08-17) — the events actuate
+
+**What was wired vs priced-only, answered by grep before building:** nothing
+imported `coresidency_registry` outside its own module. So a tenant COLD event
+**did not actuate** — the bridge priced and no one called it. Same for HOT.
+
+**`managers/coresidency_policy.py`** is the caller, and it introduces **no new
+actuator**. Every move is an existing authority's own API:
+`vram_dial.apply_budget_request` (replicated grow/shrink, already enforces the
+floor, "rejections carry the exact floor arithmetic and change nothing"),
+`vram_dial.verify_pool_reached_capacity` (the read-back),
+`GdnSlotRuntime.unbind` (#364), and the Cut 1/2 bridge.
+
+### The two directions fail differently, and the code is shaped by that
+
+**COLD — shrink must not strand bytes.** Every source drawn on is recorded
+with what it was asked for and what it *reported* giving. A source that was
+asked and reported nothing is carried as **stranded** — never counted as zero,
+never dropped. Bytes that left one ledger and entered none are the shape that
+goes unnoticed for weeks. A delivered zero is an accounting; silence is not,
+and the two are distinguishable in the result.
+
+Per #694, totals come only from actuator reports — nothing increments a
+"reclaimed" figure from the plan.
+
+An unfundable ask **refuses and actuates nothing**, rather than drawing what
+is there. The refusal states that unavailable bytes did not count toward it.
+
+**HOT — grow must not exceed the floor**, and that is *not* enforced here on
+purpose: the dial enforces it. This module's duty is to not paper over the
+refusal, so a floor refusal is returned unchanged and is **never retried
+smaller** — a floor refusal is a statement about the rig, not a negotiation.
+
+**#217 shapes the hot path.** A restore that "came back" was measured at 23%
+of target. So a grow is followed by a read-back and the result reports what
+was **measured**, never what was requested. A caller asking "is the tenant
+warm again" reads `reached_bytes`. An absent read-back leaves it `None` —
+"not measured", distinct from "reached nothing" (#606). A read-back that
+raises **refuses**, because a tenant must not be reported warm on an
+unverified grow.
+
+Mutations: hiding stranding, and reporting the request instead of the
+measurement, fail 4 of 16.
+
+### Still priced-only
+
+The policy takes injected `release_fn` / `grow_fn` / `measure_fn`. Binding
+them to the live dial and slot runtime is the seam this stops at — it needs a
+scheduler and belongs with the live proof, not a desk fake. Live acceptance is
+filed in `/spinning/GPU_WINDOWS.md` (a NEW #553 ticket; there was none before
+— grepped).
