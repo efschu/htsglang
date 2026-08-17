@@ -488,8 +488,19 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.workbench_service = workbench_service
     workbench_service.start()
 
-    # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+    # #335: the Ollama surface now COMPOSES the OpenAI fronts instead of
+    # driving the tokenizer manager itself. That is what makes Ollama's
+    # `format` field reachable (it is `response_format`) rather than refused,
+    # and it removes the second sampling path the compat-surface family exists
+    # to avoid. context_len is passed as a VALUE because /api/show reports it;
+    # metadata is not a reason to hold a serving handle.
+    _model_config = getattr(_global_state.tokenizer_manager, "model_config", None)
+    fast_api_app.state.ollama_serving = OllamaServing(
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
+        model_name=_global_state.tokenizer_manager.served_model_name,
+        context_len=getattr(_model_config, "context_len", None),
+    )
     # #335: the Kobold surface COMPOSES openai_serving_completion (see its
     # module docstring); it holds no tokenizer manager of its own precisely
     # so it cannot grow a second serving path.

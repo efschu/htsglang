@@ -85,22 +85,25 @@ class TestAnHonourableRequestIsNotRefused(unittest.TestCase):
 
 
 class TestUnhonouredFieldsAreRefusedByName(unittest.TestCase):
-    def test_format_json_is_refused(self):
-        reasons = _serving().unsupported_reasons(_chat(format="json"))
-        self.assertEqual(len(reasons), 1)
-        self.assertIn("format", reasons[0])
+    def test_format_is_MAPPED_now_not_refused(self):
+        """This file's subject is fields that VANISH. ``format`` used to be
+        refused because the parallel path could not reach structured output;
+        composing made it reachable, so the honest pin is that it is mapped --
+        the same intent, against the new truth."""
+        self.assertEqual(_serving().unsupported_reasons(_chat(format="json")), [])
 
-    def test_the_format_refusal_names_the_working_alternative(self):
-        """A refusal that only blocks teaches nothing; this one routes."""
-        reasons = _serving().unsupported_reasons(_chat(format="json"))
-        self.assertIn("/v1/chat/completions", reasons[0])
-        self.assertIn("response_format", reasons[0])
+    def test_format_json_becomes_a_json_object_response_format(self):
+        self.assertEqual(_serving()._response_format("json"), {"type": "json_object"})
 
-    def test_a_json_schema_format_is_refused_too(self):
-        reasons = _serving().unsupported_reasons(
-            _chat(format={"type": "object", "properties": {}})
-        )
-        self.assertTrue(reasons)
+    def test_a_json_schema_format_is_wrapped_as_a_json_schema(self):
+        """Ollama passes the schema itself; OpenAI wants it wrapped and named.
+        ``strict`` is set because a caller who supplied a schema wants it
+        obeyed, not approximated."""
+        schema = {"type": "object", "properties": {}}
+        got = _serving()._response_format(schema)
+        self.assertEqual(got["type"], "json_schema")
+        self.assertEqual(got["json_schema"]["schema"], schema)
+        self.assertIs(got["json_schema"]["strict"], True)
 
     def test_think_is_refused(self):
         reasons = _serving().unsupported_reasons(_chat(think=True))
@@ -109,7 +112,7 @@ class TestUnhonouredFieldsAreRefusedByName(unittest.TestCase):
 
     def test_generate_is_gated_the_same_way(self):
         """Both handlers, or a client just moves to the ungated one."""
-        self.assertTrue(_serving().unsupported_reasons(_gen(format="json")))
+        self.assertTrue(_serving().unsupported_reasons(_gen(think=True)))
 
 
 class TestUnmappedOptionsAreRefusedNotDropped(unittest.TestCase):
@@ -154,17 +157,15 @@ class TestTheMappedSetMatchesTheConverter(unittest.TestCase):
     a refusal that names a supported option, or admits an unmapped one, is
     worse than none."""
 
-    def test_supported_options_equals_the_converters_mapping(self):
-        import inspect
-
-        src = inspect.getsource(OllamaServing._convert_options_to_sampling_params)
-        for name in OllamaServing.SUPPORTED_OPTIONS:
-            with self.subTest(option=name):
-                self.assertIn(
-                    f'"{name}"',
-                    src,
-                    "declared supported but not mapped by the converter",
-                )
+    def test_supported_options_equals_the_mapping_exactly(self):
+        """Stronger than the source scan this replaces: after the compose
+        rewrite the mapping IS a dict, so set equality can be asserted instead
+        of looking for a quoted name in a function body. Drift in either
+        direction now fails."""
+        self.assertEqual(
+            set(OllamaServing.SUPPORTED_OPTIONS),
+            set(OllamaServing.OPTION_MAP),
+        )
 
 
 class TestTheGuardRunsBeforeGeneration(unittest.TestCase):
@@ -178,10 +179,14 @@ class TestTheGuardRunsBeforeGeneration(unittest.TestCase):
             with self.subTest(handler=handler.__name__):
                 src = inspect.getsource(handler)
                 self.assertIn("unsupported_reasons", src)
+                # The generating call is now handle_request on the OpenAI
+                # front rather than a sampling_params construction; the pin's
+                # intent -- refuse before anything is generated -- is
+                # unchanged, only the marker for "generation starts here".
                 self.assertLess(
                     src.index("unsupported_reasons"),
-                    src.index("sampling_params"),
-                    "the refusal must precede sampling",
+                    src.index("handle_request"),
+                    "the refusal must precede generation",
                 )
 
 

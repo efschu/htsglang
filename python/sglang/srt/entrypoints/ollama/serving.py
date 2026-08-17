@@ -1,13 +1,47 @@
-"""
-Ollama-compatible API serving handlers.
+# SPDX-License-Identifier: Apache-2.0
+"""Ollama-compatible surface, COMPOSED over the OpenAI front (#335).
 
-This module provides handlers that convert Ollama API requests to SGLang's
-internal format and return Ollama-compatible responses.
+This module used to be a parallel serving path: it applied the chat template
+itself and drove ``tokenizer_manager`` directly, which is why
+``ANALYSE_335_compat_surfaces.md`` §2 had to REFUSE Ollama's ``format`` field
+rather than wire it -- the request never reached the machinery that implements
+structured output. It now translates into an OpenAI request and hands it to the
+OpenAI front, the shape the KoboldCpp (``ec44aa37ca``) and sdapi surfaces use.
+
+WHAT THE CHANGE BUYS, concretely and not as tidiness:
+
+* **``format`` works.** It is ``response_format``, and the OpenAI front owns
+  that. A refusal became a feature; the field a caller sets is now honoured
+  instead of explained.
+* **The chat template stops being applied twice-over by two owners.** The
+  OpenAI chat front applies it, so there is one place where a template bug can
+  live rather than two that must agree.
+* **Inherited correctness.** ``serving_base.handle_request`` already wraps
+  every streaming reply in the #344 client-disconnect guard
+  (``serving_base.py:119``). This adapter no longer builds its own.
+
+WHY WRAPPING THE GUARDED STREAM IS STILL SAFE, since it is the one thing about
+this refactor that could quietly regress: ``guard_generate_stream`` installs
+its watchdog ON THE RESPONSE'S ``body_iterator``
+(``liveness/stream.py:182`` -> ``guard_streaming_response``). This adapter
+consumes THAT iterator and re-emits NDJSON, so the watchdog is upstream of the
+translation, not bypassed by it: when the Ollama client stops reading, Starlette
+stops pulling this generator, which stops pulling the guarded iterator, and the
+watchdog releases the KV blocks exactly as before.
+
+WHAT DID NOT CHANGE, and is pinned in ``test_ollama_golden_shapes_335.py``
+(committed BEFORE this rewrite, deliberately): every response shape a client
+sees, the NDJSON delta semantics, the empty-prompt short circuit, the named
+refusals, and the 2048-token default.
 """
 
+from __future__ import annotations
+
+import json
+import logging
 import time
 from datetime import datetime, timezone
-from typing import AsyncIterator, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import orjson
 from fastapi import Request
@@ -21,77 +55,100 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaGenerateResponse,
     OllamaGenerateStreamResponse,
     OllamaMessage,
-    OllamaModelInfo,
     OllamaShowResponse,
     OllamaTagsResponse,
 )
-from sglang.srt.liveness import guard_generate_stream
-from sglang.srt.managers.io_struct import GenerateReqInput
+
+logger = logging.getLogger(__name__)
+
+#: Ollama clients expect longer replies than the OpenAI default (16) would
+#: give them. Kept from the parallel path deliberately: dropping it in this
+#: rewrite would truncate every reply, which is the KoboldCpp
+#: ``max_tokens``-defaults-to-16 lesson with a different number.
+DEFAULT_NUM_PREDICT = 2048
 
 
 class OllamaServing:
-    """Handler for Ollama-compatible API endpoints."""
+    """Translate Ollama's API onto the OpenAI front. Nothing else."""
 
-    def __init__(self, tokenizer_manager):
-        self.tokenizer_manager = tokenizer_manager
+    #: Fields declared by the protocol that this surface cannot honour. Each
+    #: is REFUSED by name rather than dropped -- a value that vanishes between
+    #: the request and the sampler is the #710 tool-arg-loss class.
+    #:
+    #: ``format`` is NO LONGER HERE: composing made it reachable, which is the
+    #: change this module exists for.
+    UNSUPPORTED_FIELDS: Dict[str, str] = {
+        "think": (
+            "reasoning control is not mapped by this surface. Use "
+            "/v1/chat/completions, whose chat_template_kwargs reaches the "
+            "model's own reasoning toggle"
+        ),
+    }
+
+    #: Declared, accepted, and knowingly without effect -- the honest third
+    #: category between mapped and refused.
+    INERT_FIELDS: Dict[str, str] = {
+        "keep_alive": (
+            "this server keeps the model resident for the process lifetime, "
+            "so the intent is already satisfied; stated rather than left "
+            "looking honoured by accident"
+        ),
+    }
+
+    #: Ollama option -> OpenAI request field. Every option outside this map is
+    #: refused, because mapping it approximately would sample differently than
+    #: the caller asked with nothing saying so.
+    OPTION_MAP: Dict[str, str] = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "num_predict": "max_tokens",
+        "stop": "stop",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "seed": "seed",
+    }
+
+    SUPPORTED_OPTIONS = frozenset(OPTION_MAP)
+
+    def __init__(
+        self,
+        openai_serving_chat,
+        openai_serving_completion,
+        model_name: str,
+        context_len: Optional[int] = None,
+    ):
+        # The OpenAI FRONTS, not the tokenizer manager. This adapter cannot
+        # reach the engine even if a later edit tried to: there is nothing
+        # here to reach it with.
+        #
+        # ``context_len`` is passed as a VALUE rather than read off a manager.
+        # /api/show has always reported it and a stub would be a regression,
+        # but reading it from the engine would put the coupling back that this
+        # rewrite exists to remove -- metadata is not a reason to hold a
+        # serving handle.
+        self._chat = openai_serving_chat
+        self._completion = openai_serving_completion
+        self._model_name = model_name
+        self._context_len = context_len
+
+    # -- helpers ---------------------------------------------------------
 
     def _get_timestamp(self) -> str:
-        """Get current timestamp in Ollama format."""
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    #: Ollama request fields this adapter ACCEPTS AND DOES NOT HONOUR.
-    #: #335/#710: a field the caller set that silently vanishes is the defect
-    #: class this codebase keeps paying for. Each entry says what the caller
-    #: would get instead, so a refusal teaches rather than merely blocks.
-    UNSUPPORTED_FIELDS = {
-        "format": (
-            "structured output (format=json / a JSON schema) is not wired on "
-            "the Ollama surface: this adapter drives the tokenizer manager "
-            "directly and does not reach the OpenAI front's response_format "
-            "machinery. Accepting it would return free-form text to a caller "
-            "that is about to json.loads() it. Use the OpenAI-compatible "
-            "/v1/chat/completions with response_format instead."
-        ),
-        "think": (
-            "the think field is not wired on the Ollama surface. Reasoning is "
-            "controlled by the server's --reasoning-parser and, on the "
-            "OpenAI/Anthropic fronts, by chat_template_kwargs. Accepting it "
-            "here would silently ignore an explicit request."
-        ),
-    }
+    @property
+    def model_name(self) -> str:
+        return self._model_name
 
-    #: Accepted and deliberately inert, with the reason. NOT a silent drop:
-    #: the caller's intent is satisfied, it just costs nothing here.
-    INERT_FIELDS = {
-        "keep_alive": (
-            "SGLang keeps the model resident for the process lifetime, so "
-            "keep_alive has nothing to schedule; accepted and ignored."
-        ),
-    }
+    # -- refusal ---------------------------------------------------------
 
-    #: Ollama options this adapter maps. Anything else in ``options`` is
-    #: refused by name rather than dropped -- a caller that set
-    #: repeat_penalty or num_ctx and got neither has been silently
-    #: overruled, and the output is wrong in a way nothing explains.
-    SUPPORTED_OPTIONS = (
-        "temperature",
-        "top_p",
-        "top_k",
-        "num_predict",
-        "stop",
-        "presence_penalty",
-        "frequency_penalty",
-        "seed",
-    )
-
-    def unsupported_reasons(self, request) -> list:
+    def unsupported_reasons(self, request) -> List[str]:
         """Named refusals for anything this adapter would otherwise drop.
 
-        Returns a list of human-readable strings, empty when the request is
-        fully honourable. Kept as a pure function of the request so it can be
-        pinned without a server.
+        A pure function of the request, so it is pinnable without a server.
         """
-        reasons = []
+        reasons: List[str] = []
         for field_name, why in self.UNSUPPORTED_FIELDS.items():
             if getattr(request, field_name, None) is not None:
                 reasons.append(f"{field_name!r}: {why}")
@@ -106,360 +163,332 @@ class OllamaServing:
             )
         return reasons
 
-    def _convert_options_to_sampling_params(self, options: dict = None) -> dict:
-        """Convert Ollama options to SGLang sampling params."""
-        sampling_params = {}
+    def _refusal(self, reasons: List[str]) -> ORJSONResponse:
+        return ORJSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    "this Ollama-compatible surface cannot honour part of "
+                    "the request, and will not answer as though it had: "
+                    + " | ".join(reasons)
+                )
+            },
+        )
 
-        if options:
-            # Map Ollama options to SGLang params
-            param_mapping = {
-                "temperature": "temperature",
-                "top_p": "top_p",
-                "top_k": "top_k",
-                "num_predict": "max_new_tokens",
-                "stop": "stop",
-                "presence_penalty": "presence_penalty",
-                "frequency_penalty": "frequency_penalty",
-                "seed": "seed",
+    # -- translation into OpenAI ----------------------------------------
+
+    def _response_format(self, fmt) -> Optional[Dict[str, Any]]:
+        """Ollama ``format`` -> OpenAI ``response_format``. THE WIN.
+
+        ``"json"`` is free-form JSON; a dict is a JSON SCHEMA, and Ollama
+        passes it as the schema itself rather than wrapped, so it is wrapped
+        here. A schema is given ``strict``: a caller who supplied a schema
+        wants it obeyed, not approximated.
+        """
+        if fmt is None:
+            return None
+        if fmt == "json":
+            return {"type": "json_object"}
+        if isinstance(fmt, dict):
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ollama_format",
+                    "schema": fmt,
+                    "strict": True,
+                },
             }
-            for ollama_param, sglang_param in param_mapping.items():
-                if ollama_param in options:
-                    sampling_params[sglang_param] = options[ollama_param]
+        return None
 
-        # Set a reasonable default for max_new_tokens if not specified
-        # Ollama users typically expect longer responses than SGLang's default (128)
-        if "max_new_tokens" not in sampling_params:
-            sampling_params["max_new_tokens"] = 2048
+    def _openai_fields(self, request) -> Dict[str, Any]:
+        """Mapped options + response_format, ready to splat into a request."""
+        fields: Dict[str, Any] = {}
+        options = getattr(request, "options", None) or {}
+        for ollama_key, openai_key in self.OPTION_MAP.items():
+            if ollama_key in options:
+                fields[openai_key] = options[ollama_key]
+        fields.setdefault("max_tokens", DEFAULT_NUM_PREDICT)
+        fmt = self._response_format(getattr(request, "format", None))
+        if fmt is not None:
+            fields["response_format"] = fmt
+        return fields
 
-        return sampling_params
+    # -- /api/chat -------------------------------------------------------
 
     async def handle_chat(
         self, request: OllamaChatRequest, raw_request: Request
-    ) -> Union[OllamaChatResponse, StreamingResponse]:
-        """Handle /api/chat endpoint."""
-        # #335: refuse BEFORE generating. A field that vanishes between the
-        # request and the sampler is the #710 tool-arg-loss class: the caller
-        # is silently overruled and the output is wrong in a way nothing
-        # explains. 400 with the reasons named beats a plausible wrong answer.
+    ) -> Union[OllamaChatResponse, StreamingResponse, ORJSONResponse]:
         reasons = self.unsupported_reasons(request)
         if reasons:
-            return ORJSONResponse(
-                status_code=400,
-                content={
-                    "error": (
-                        "this Ollama-compatible surface cannot honour part of "
-                        "the request, and will not answer as though it had: "
-                        + " | ".join(reasons)
-                    )
-                },
-            )
+            return self._refusal(reasons)
 
-        model_name = self.tokenizer_manager.served_model_name
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        # Convert messages to SGLang format
-        messages = [
-            {"role": msg.role, "content": msg.content} for msg in request.messages
-        ]
-
-        # Apply chat template using tokenizer
-        prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
+        # The messages are already OpenAI-shaped; no template is applied here,
+        # which is the whole point.
+        chat_request = ChatCompletionRequest(
+            model=self._model_name,
+            messages=[{"role": m.role, "content": m.content} for m in request.messages],
+            stream=bool(request.stream),
+            **self._openai_fields(request),
         )
 
-        # Convert options to sampling params
-        sampling_params = self._convert_options_to_sampling_params(request.options)
-
-        # Create SGLang request with input_ids
-        gen_request = GenerateReqInput(
-            input_ids=prompt_ids,
-            sampling_params=sampling_params,
-            stream=request.stream,
-        )
+        start = time.time_ns()
+        response = await self._chat.handle_request(chat_request, raw_request)
 
         if request.stream:
-            return await self._stream_chat_response(
-                gen_request, raw_request, model_name
-            )
-        else:
-            return await self._generate_chat_response(
-                gen_request, raw_request, model_name
-            )
+            return self._ndjson(self._chat_stream(response), response)
+        return self._chat_reply(response, start)
 
-    async def _generate_chat_response(
-        self, gen_request: GenerateReqInput, raw_request: Request, model_name: str
-    ) -> OllamaChatResponse:
-        """Generate non-streaming chat response."""
-        start_time = time.time_ns()
-
-        # Get response from tokenizer manager
-        response = await self.tokenizer_manager.generate_request(
-            gen_request, raw_request
-        ).__anext__()
-
-        end_time = time.time_ns()
-        total_duration = end_time - start_time
-
-        output_text = response.get("text", "")
-
+    def _chat_reply(self, response, start_ns: int):
+        if self._is_error(response):
+            return response
+        text, prompt_tokens, completion_tokens = self._read_chat(response)
         return OllamaChatResponse(
-            model=model_name,
+            model=self._model_name,
             created_at=self._get_timestamp(),
-            message=OllamaMessage(role="assistant", content=output_text),
+            message=OllamaMessage(role="assistant", content=text),
             done=True,
             done_reason="stop",
-            total_duration=total_duration,
-            prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
-            eval_count=response.get("meta_info", {}).get("completion_tokens", None),
+            total_duration=time.time_ns() - start_ns,
+            prompt_eval_count=prompt_tokens,
+            eval_count=completion_tokens,
         )
 
-    async def _stream_chat_response(
-        self, gen_request: GenerateReqInput, raw_request: Request, model_name: str
-    ) -> StreamingResponse:
-        """Generate streaming chat response."""
+    async def _chat_stream(self, response) -> AsyncIterator[bytes]:
+        async for delta, done in self._sse_deltas(response, chat=True):
+            payload = OllamaChatStreamResponse(
+                model=self._model_name,
+                created_at=self._get_timestamp(),
+                message=OllamaMessage(role="assistant", content="" if done else delta),
+                done=done,
+                done_reason="stop" if done else None,
+            )
+            yield orjson.dumps(payload.model_dump()) + b"\n"
 
-        async def generate_stream() -> AsyncIterator[bytes]:
-            previous_text = ""
-            async for chunk in self.tokenizer_manager.generate_request(
-                gen_request, raw_request
-            ):
-                text = chunk.get("text", "")
-                is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
-
-                # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
-                previous_text = text
-
-                if is_done:
-                    # Final chunk
-                    response = OllamaChatStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        message=OllamaMessage(role="assistant", content=""),
-                        done=True,
-                        done_reason="stop",
-                    )
-                else:
-                    response = OllamaChatStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        message=OllamaMessage(role="assistant", content=delta),
-                        done=False,
-                    )
-
-                yield orjson.dumps(response.model_dump()) + b"\n"
-
-        # #344: the Ollama routes never had any abort path -- no background
-        # task, no disconnect check -- so a client that walked away held KV
-        # blocks until the generation finished on its own.
-        return guard_generate_stream(
-            StreamingResponse(
-                generate_stream(),
-                media_type="application/x-ndjson",
-            ),
-            tokenizer_manager=self.tokenizer_manager,
-            obj=gen_request,
-        )
+    # -- /api/generate ---------------------------------------------------
 
     async def handle_generate(
         self, request: OllamaGenerateRequest, raw_request: Request
-    ) -> Union[OllamaGenerateResponse, StreamingResponse]:
-        """Handle /api/generate endpoint."""
-        # #335: refuse BEFORE generating. A field that vanishes between the
-        # request and the sampler is the #710 tool-arg-loss class: the caller
-        # is silently overruled and the output is wrong in a way nothing
-        # explains. 400 with the reasons named beats a plausible wrong answer.
+    ) -> Union[OllamaGenerateResponse, StreamingResponse, ORJSONResponse]:
         reasons = self.unsupported_reasons(request)
         if reasons:
-            return ORJSONResponse(
-                status_code=400,
-                content={
-                    "error": (
-                        "this Ollama-compatible surface cannot honour part of "
-                        "the request, and will not answer as though it had: "
-                        + " | ".join(reasons)
-                    )
-                },
-            )
+            return self._refusal(reasons)
 
-        model_name = self.tokenizer_manager.served_model_name
-
-        # Build prompt
         prompt = request.prompt
         if request.system:
             prompt = f"{request.system}\n\n{prompt}"
 
-        # Handle empty prompt - Ollama CLI sends empty requests on initialization
+        # The Ollama CLI sends an empty request on startup. Answering it with a
+        # real generation would burn a slot on every client launch, so it is
+        # short-circuited here exactly as the parallel path did.
         if not prompt or not prompt.strip():
-            empty_response = OllamaGenerateResponse(
-                model=model_name,
+            empty = OllamaGenerateResponse(
+                model=self._model_name,
                 created_at=self._get_timestamp(),
                 response="",
                 done=True,
                 done_reason="stop",
             )
             if request.stream:
-                # Return streaming response with done=True
-                async def empty_stream() -> AsyncIterator[bytes]:
-                    yield orjson.dumps(empty_response.model_dump()) + b"\n"
 
-                return StreamingResponse(
-                    empty_stream(),
-                    media_type="application/x-ndjson",
-                )
-            return empty_response
+                async def _empty() -> AsyncIterator[bytes]:
+                    yield orjson.dumps(empty.model_dump()) + b"\n"
 
-        # Convert options to sampling params
-        sampling_params = self._convert_options_to_sampling_params(request.options)
+                return StreamingResponse(_empty(), media_type="application/x-ndjson")
+            return empty
 
-        # Create SGLang request
-        gen_request = GenerateReqInput(
-            text=prompt,
-            sampling_params=sampling_params,
-            stream=request.stream,
+        from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+
+        completion_request = CompletionRequest(
+            model=self._model_name,
+            prompt=prompt,
+            stream=bool(request.stream),
+            **self._openai_fields(request),
+        )
+
+        start = time.time_ns()
+        response = await self._completion.handle_request(
+            completion_request, raw_request
         )
 
         if request.stream:
-            return await self._stream_generate_response(
-                gen_request, raw_request, model_name
-            )
-        else:
-            return await self._generate_generate_response(
-                gen_request, raw_request, model_name
-            )
+            return self._ndjson(self._generate_stream(response), response)
+        return self._generate_reply(response, start)
 
-    async def _generate_generate_response(
-        self, gen_request: GenerateReqInput, raw_request: Request, model_name: str
-    ) -> OllamaGenerateResponse:
-        """Generate non-streaming generate response."""
-        start_time = time.time_ns()
-
-        response = await self.tokenizer_manager.generate_request(
-            gen_request, raw_request
-        ).__anext__()
-
-        end_time = time.time_ns()
-        total_duration = end_time - start_time
-
-        output_text = response.get("text", "")
-
+    def _generate_reply(self, response, start_ns: int):
+        if self._is_error(response):
+            return response
+        text, prompt_tokens, completion_tokens = self._read_completion(response)
         return OllamaGenerateResponse(
-            model=model_name,
+            model=self._model_name,
             created_at=self._get_timestamp(),
-            response=output_text,
+            response=text,
             done=True,
             done_reason="stop",
-            total_duration=total_duration,
-            prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
-            eval_count=response.get("meta_info", {}).get("completion_tokens", None),
+            total_duration=time.time_ns() - start_ns,
+            prompt_eval_count=prompt_tokens,
+            eval_count=completion_tokens,
         )
 
-    async def _stream_generate_response(
-        self, gen_request: GenerateReqInput, raw_request: Request, model_name: str
-    ) -> StreamingResponse:
-        """Generate streaming generate response."""
+    async def _generate_stream(self, response) -> AsyncIterator[bytes]:
+        async for delta, done in self._sse_deltas(response, chat=False):
+            payload = OllamaGenerateStreamResponse(
+                model=self._model_name,
+                created_at=self._get_timestamp(),
+                response="" if done else delta,
+                done=done,
+                done_reason="stop" if done else None,
+            )
+            yield orjson.dumps(payload.model_dump()) + b"\n"
 
-        async def generate_stream() -> AsyncIterator[bytes]:
-            previous_text = ""
-            async for chunk in self.tokenizer_manager.generate_request(
-                gen_request, raw_request
-            ):
-                text = chunk.get("text", "")
-                is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
+    # -- OpenAI response reading ----------------------------------------
 
-                # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
-                previous_text = text
+    @staticmethod
+    def _is_error(response) -> bool:
+        """An error from the front is passed through UNCHANGED.
 
-                if is_done:
-                    response = OllamaGenerateStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        response="",
-                        done=True,
-                        done_reason="stop",
-                    )
-                else:
-                    response = OllamaGenerateStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        response=delta,
-                        done=False,
-                    )
+        Re-dressing it in an Ollama envelope would hide which layer refused,
+        and the OpenAI error already names its own cause.
+        """
+        return int(getattr(response, "status_code", 200) or 200) >= 400
 
-                yield orjson.dumps(response.model_dump()) + b"\n"
-
-        # #344: the Ollama routes never had any abort path -- no background
-        # task, no disconnect check -- so a client that walked away held KV
-        # blocks until the generation finished on its own.
-        return guard_generate_stream(
-            StreamingResponse(
-                generate_stream(),
-                media_type="application/x-ndjson",
-            ),
-            tokenizer_manager=self.tokenizer_manager,
-            obj=gen_request,
+    @staticmethod
+    def _usage(response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None, None
+        return getattr(usage, "prompt_tokens", None), getattr(
+            usage, "completion_tokens", None
         )
+
+    def _read_chat(self, response):
+        choices = getattr(response, "choices", None) or []
+        text = ""
+        if choices:
+            message = getattr(choices[0], "message", None)
+            text = getattr(message, "content", "") or ""
+        prompt_tokens, completion_tokens = self._usage(response)
+        return text, prompt_tokens, completion_tokens
+
+    def _read_completion(self, response):
+        choices = getattr(response, "choices", None) or []
+        text = getattr(choices[0], "text", "") if choices else ""
+        prompt_tokens, completion_tokens = self._usage(response)
+        return text or "", prompt_tokens, completion_tokens
+
+    async def _sse_deltas(self, response, *, chat: bool):
+        """Yield ``(delta, done)`` from an OpenAI SSE stream.
+
+        The OpenAI stream already carries DELTAS, so no running-text
+        subtraction is needed here -- unlike the parallel path, which received
+        cumulative text and had to difference it. One final ``("", True)`` is
+        emitted so the NDJSON always ends with Ollama's terminal object, even
+        if the upstream stream ends without ``[DONE]``.
+        """
+        iterator = getattr(response, "body_iterator", None)
+        if iterator is None:
+            yield "", True
+            return
+        buffer = ""
+        async for raw in iterator:
+            chunk = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if data == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(data)
+                except ValueError:
+                    # A malformed chunk must not take the stream down; the
+                    # terminal object below still closes it honestly.
+                    continue
+                for choice in payload.get("choices") or []:
+                    piece = (
+                        (choice.get("delta") or {}).get("content")
+                        if chat
+                        else choice.get("text")
+                    )
+                    if piece:
+                        yield piece, False
+        yield "", True
+
+    @staticmethod
+    def _ndjson(generator: AsyncIterator[bytes], source) -> StreamingResponse:
+        """Wrap the translated stream, keeping the guarded iterator upstream.
+
+        ``source`` is the response returned by the OpenAI front, whose
+        ``body_iterator`` already carries the #344 watchdog; ``generator``
+        consumes it. Returning a new StreamingResponse here does not bypass
+        that watchdog, it sits downstream of it.
+        """
+        return StreamingResponse(generator, media_type="application/x-ndjson")
+
+    # -- metadata --------------------------------------------------------
 
     def get_tags(self) -> OllamaTagsResponse:
-        """Handle /api/tags endpoint - list available models."""
-        model_name = self.tokenizer_manager.served_model_name
+        """/api/tags. Same payload the parallel path produced."""
+        from sglang.srt.entrypoints.ollama.protocol import OllamaModelInfo
 
-        model_info = OllamaModelInfo(
-            name=model_name,
-            model=model_name,
-            modified_at=self._get_timestamp(),
-            size=0,  # We don't track model size
-            digest="sha256:sglang0000000000000000000000000000000000000000000000000000000000",
-            details={
-                "format": "sglang",
-                "family": (
-                    model_name.split("/")[-1] if "/" in model_name else model_name
-                ),
-                "parameter_size": "unknown",
-            },
+        name = self._model_name
+        return OllamaTagsResponse(
+            models=[
+                OllamaModelInfo(
+                    name=name,
+                    model=name,
+                    modified_at=self._get_timestamp(),
+                    size=0,  # model size is not tracked
+                    digest=(
+                        "sha256:sglang00000000000000000000000000000000000000"
+                        "0000000000000000000000"
+                    ),
+                    details={
+                        "format": "sglang",
+                        "family": name.split("/")[-1] if "/" in name else name,
+                        "parameter_size": "unknown",
+                    },
+                )
+            ]
         )
 
-        return OllamaTagsResponse(models=[model_info])
-
     def get_show(self, model: str) -> OllamaShowResponse:
-        """Handle /api/show endpoint - show model information."""
-        model_config = self.tokenizer_manager.model_config
-
-        # Extract model family from model name
-        model_family = model.split("/")[-1] if "/" in model else model
-        # Remove common suffixes to get base family
-        for suffix in ["-Instruct", "-Chat", "-Base"]:
-            if model_family.endswith(suffix):
-                model_family = model_family[: -len(suffix)]
+        """/api/show. Same payload the parallel path produced."""
+        family = model.split("/")[-1] if "/" in model else model
+        for suffix in ("-Instruct", "-Chat", "-Base"):
+            if family.endswith(suffix):
+                family = family[: -len(suffix)]
                 break
-
-        # Build context length info
-        context_len = model_config.context_len if model_config else 4096
-
+        context_len = self._context_len if self._context_len else 4096
         return OllamaShowResponse(
-            license="",  # License info not available from SGLang
+            license="",
             modelfile=f"FROM {model}\nPARAMETER num_ctx {context_len}\n",
             parameters=f"num_ctx {context_len}",
-            template="",  # Template info not easily accessible
+            template="",
             modified_at=self._get_timestamp(),
             details={
                 "parent_model": "",
                 "format": "sglang",
-                "family": model_family,
-                "families": [model_family],
+                "family": family,
+                "families": [family],
                 "parameter_size": "unknown",
                 "quantization_level": "",
             },
             model_info={
-                "general.architecture": model_family,
+                "general.architecture": family,
                 "general.name": model,
                 "general.parameter_count": 0,
-                f"{model_family}.context_length": context_len,
-                f"{model_family}.block_count": 0,
-                f"{model_family}.embedding_length": 0,
-                f"{model_family}.attention.head_count": 0,
+                f"{family}.context_length": context_len,
+                f"{family}.block_count": 0,
+                f"{family}.embedding_length": 0,
+                f"{family}.attention.head_count": 0,
             },
             capabilities=["completion"],
         )
+
+    def inert_fields(self) -> Dict[str, str]:
+        return dict(self.INERT_FIELDS)

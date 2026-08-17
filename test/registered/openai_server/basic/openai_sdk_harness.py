@@ -260,7 +260,15 @@ def live_server(
     # and therefore covered by the same harness.
     from sglang.srt.entrypoints.ollama.serving import OllamaServing  # noqa: PLC0415
 
-    app.state.ollama_serving = OllamaServing(tm)
+    # #335: the Ollama surface COMPOSES the OpenAI fronts now, so the harness
+    # hands it those rather than the tokenizer manager -- the same wiring
+    # http_server does.
+    app.state.ollama_serving = OllamaServing(
+        app.state.openai_serving_chat,
+        app.state.openai_serving_completion,
+        model_name=getattr(tm, "served_model_name", "test-model"),
+        context_len=getattr(getattr(tm, "model_config", None), "context_len", None),
+    )
 
     # The production lifespan boots a tokenizer manager and a warmup thread;
     # this harness has already provided both halves it would build.

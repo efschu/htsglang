@@ -16,7 +16,7 @@ route registration is an advertised-but-unwired feature.
 | **OpenAI images** | **exists, wired** | `/v1/images/generations`, `/edits`, `/variations` |
 | **OpenAI audio** | **exists, wired** | `/v1/audio/speech`, `/v1/audio/transcriptions` |
 | **OpenAI files / fine-tuning** | exists, wired | `/v1/files*`, `/v1/fine_tuning/jobs*` |
-| **Ollama emulation** | **exists, wired, PARTIAL — and was silently dropping fields** | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`; `OllamaServing` mounted at `:327`. See §2. |
+| **Ollama emulation** | **exists, wired, COMPOSED (2026-08-17, §7)** | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`; now translates onto the OpenAI fronts. See §2 for the history and §7 for the rewrite. |
 | **ComfyUI node pack** | **ABSENT** | one prose mention in `planner/webui.py:6808`; no node pack, no routes |
 | **A1111 `sdapi`** | **ABSENT** | no hit anywhere under `python/sglang/srt/` |
 | **KoboldCpp** | **ABSENT** | no hit anywhere under `python/sglang/srt/` |
@@ -171,3 +171,70 @@ change wants to be defensible to upstream rather than a fork divergence; and
 its current behaviour is what existing Ollama clients have been served, so the
 refactor needs the contract tests from `test_ollama_no_silent_drops_335.py`
 extended to the happy path first, or it is a rewrite without a net.
+
+
+---
+
+## 7. The Ollama compose-refactor — BUILT
+
+§6 scoped this and did not build it. It is built now, and §6's own plan is what
+it followed: `handle_chat` maps the (already OpenAI-shaped) messages across and
+calls `openai_serving_chat.handle_request`; `handle_generate` maps `prompt` onto
+a `CompletionRequest` exactly as the Kobold adapter does;
+`_convert_options_to_sampling_params` is gone in favour of the OpenAI request's
+own fields.
+
+**The win §6 predicted, delivered:** `format` is `response_format` and is now
+HONOURED rather than refused -- `"json"` becomes `{"type": "json_object"}`, and
+a schema is wrapped as a named `json_schema` with `strict` set, because a caller
+who supplied a schema wants it obeyed rather than approximated. It is out of
+`UNSUPPORTED_FIELDS` and pinned reaching the front on BOTH the chat and generate
+paths.
+
+**`think` stays refused.** §6 said it "becomes wirable" via
+`chat_template_kwargs`. That is a claim about a mechanism I did not verify at
+code, so wiring it on that basis would be exactly the kind of plausible guess
+this surface family refuses elsewhere. The refusal now names the route
+(`/v1/chat/completions` and its `chat_template_kwargs`) instead of just
+blocking, and the wiring is left as its own cut with its own evidence.
+
+**The net came first, deliberately.** §6's warning was that the refactor "needs
+the contract tests extended to the happy path first, or it is a rewrite without
+a net". `test_ollama_golden_shapes_335.py` was written against the PARALLEL
+path and committed BEFORE the rewrite (`b0baecf94f`), so it could not be edited
+to fit the outcome. After the swap it passed with exactly TWO changes, both the
+intended one: `format` is no longer refused. Every other client-visible
+behaviour -- key sets, NDJSON delta semantics, `done` sequencing, the
+empty-prompt short circuit, the named refusals, the 2048-token default -- passed
+untouched.
+
+**The streaming question §6 raised, answered.** The Ollama NDJSON shape is now
+re-translated from the OpenAI SSE stream, and it turned out to be simpler than
+feared in one respect and needed care in another:
+
+* simpler: the OpenAI stream already carries DELTAS, so the running-text
+  subtraction the parallel path did (it received cumulative text) disappears;
+* care: `guard_generate_stream` installs the #344 watchdog on the response's
+  `body_iterator` (`liveness/stream.py:182`). This adapter consumes THAT
+  iterator, so the watchdog sits upstream of the translation rather than being
+  bypassed -- when the client stops reading, Starlette stops pulling this
+  generator, which stops pulling the guarded iterator, and the KV blocks are
+  released as before. Stated in the module, because "we wrapped a guarded
+  stream" is exactly the kind of thing that silently stops working.
+
+**Metadata was nearly a regression.** `/api/show` reports `context_len`, which
+the parallel path read off the tokenizer manager. A stub would have been a quiet
+capability loss, so it is passed in as a VALUE at construction: metadata is not
+a reason to hold a serving handle.
+
+**No dual path exists.** The module was replaced in place rather than added
+beside, so there is no window in which two implementations answer the same
+routes differently. Importer check: `http_server.py`, the two #335 test files,
+and `openai_sdk_harness.py` were the only constructors, and all four were moved
+to the new signature in this commit. `smart_router.py` never touched the
+serving internals.
+
+30 pins across the two files, 12 subtests. Can-fail proven on all three
+load-bearing properties: reintroducing a serving handle fails 1, dropping the
+`response_format` mapping fails 3, routing `/api/generate` through the CHAT
+front fails 7.

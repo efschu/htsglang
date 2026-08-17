@@ -60,52 +60,106 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-class _FakeMeta(dict):
-    pass
+class _Usage:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
 
 
-class _FakeTokenizerManager:
-    """The parallel path's dependency, at its real call shape."""
+class _ChatChoice:
+    def __init__(self, content):
+        self.message = type("M", (), {"content": content})()
 
-    served_model_name = "test-model"
 
-    def __init__(self, chunks: List[Dict[str, Any]]):
-        self._chunks = chunks
-        self.tokenizer = self
-        self.last_obj = None
+class _CompletionChoice:
+    def __init__(self, text):
+        self.text = text
 
-    # apply_chat_template is called by the parallel path; the composed path
-    # must NOT call it (the OpenAI chat front owns templating).
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
-        return [1, 2, 3]
 
-    def generate_request(self, obj, raw_request):
-        self.last_obj = obj
+class _OpenAIReply:
+    """A non-streaming reply from the OpenAI front, at its real read shape."""
 
+    status_code = 200
+
+    def __init__(self, choices, prompt_tokens, completion_tokens):
+        self.choices = choices
+        self.usage = _Usage(prompt_tokens, completion_tokens)
+
+
+class _SSEStream:
+    """A streaming reply: the guarded body_iterator the front returns."""
+
+    status_code = 200
+
+    def __init__(self, deltas, key):
+        self._deltas = deltas
+        self._key = key
+
+    @property
+    def body_iterator(self):
         async def _gen():
-            for c in self._chunks:
-                yield c
+            for d in self._deltas:
+                if self._key == "delta":
+                    payload = {"choices": [{"delta": {"content": d}}]}
+                else:
+                    payload = {"choices": [{"text": d}]}
+                yield ("data: " + json.dumps(payload) + "\n\n").encode()
+            yield b"data: [DONE]\n\n"
 
         return _gen()
 
 
-def _one_shot(text="hello", prompt_tokens=3, completion_tokens=2):
-    return [
-        {
-            "text": text,
-            "meta_info": {
-                "finish_reason": {"type": "stop"},
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-            },
-        }
-    ]
+class _FakeFront:
+    """One OpenAI front (chat or completion), recording what it was handed."""
+
+    def __init__(
+        self,
+        *,
+        text="hello",
+        prompt_tokens=3,
+        completion_tokens=2,
+        deltas=None,
+        chat=True
+    ):
+        self.text = text
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.deltas = deltas
+        self.chat = chat
+        self.last_request = None
+
+    async def handle_request(self, request, raw_request):
+        self.last_request = request
+        if getattr(request, "stream", False):
+            return _SSEStream(
+                self.deltas or [self.text], "delta" if self.chat else "text"
+            )
+        choice = _ChatChoice(self.text) if self.chat else _CompletionChoice(self.text)
+        return _OpenAIReply([choice], self.prompt_tokens, self.completion_tokens)
+
+
+def _fronts(**kw):
+    return _FakeFront(chat=True, **kw), _FakeFront(chat=False, **kw)
+
+
+def _serving_with(chat_front=None, completion_front=None):
+    from sglang.srt.entrypoints.ollama.serving import OllamaServing
+
+    return OllamaServing(
+        chat_front or _FakeFront(chat=True),
+        completion_front or _FakeFront(chat=False),
+        model_name="test-model",
+    )
 
 
 def _serving(chunks=None):
-    from sglang.srt.entrypoints.ollama.serving import OllamaServing
+    """Kept for call-site compatibility with the pre-rewrite corpus.
 
-    return OllamaServing(_FakeTokenizerManager(chunks or _one_shot()))
+    ``chunks`` used to be raw engine chunks; the composed path is driven by
+    the OpenAI fronts instead. The ASSERTIONS below are unchanged -- only what
+    stands behind them moved, which is exactly what this rewrite changed.
+    """
+    return _serving_with()
 
 
 def _body(response) -> Dict[str, Any]:
@@ -141,7 +195,9 @@ class TestChatNonStreaming(CustomTestCase):
 
     def test_the_message_is_an_assistant_message_with_the_text(self):
         r = _run(
-            _serving(_one_shot("hello there")).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, text="hello there")
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -171,7 +227,9 @@ class TestChatNonStreaming(CustomTestCase):
 
     def test_token_counts_are_reported(self):
         r = _run(
-            _serving(_one_shot(prompt_tokens=7, completion_tokens=11)).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, prompt_tokens=7, completion_tokens=11)
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -202,19 +260,11 @@ class TestChatStreaming(CustomTestCase):
     """NDJSON: deltas, then a final object. A client concatenates the deltas,
     so emitting cumulative text instead would duplicate the whole reply."""
 
-    def _chunks(self):
-        return [
-            {"text": "he", "meta_info": {}},
-            {"text": "hello", "meta_info": {}},
-            {
-                "text": "hello",
-                "meta_info": {"finish_reason": {"type": "stop"}},
-            },
-        ]
-
     def test_it_is_ndjson_one_object_per_line(self):
         r = _run(
-            _serving(self._chunks()).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, deltas=["he", "llo"])
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -229,7 +279,9 @@ class TestChatStreaming(CustomTestCase):
 
     def test_content_is_the_DELTA_not_the_running_text(self):
         r = _run(
-            _serving(self._chunks()).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, deltas=["he", "llo"])
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -243,7 +295,9 @@ class TestChatStreaming(CustomTestCase):
 
     def test_done_is_false_until_the_final_object(self):
         r = _run(
-            _serving(self._chunks()).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, deltas=["he", "llo"])
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -257,7 +311,9 @@ class TestChatStreaming(CustomTestCase):
 
     def test_stream_objects_carry_the_narrow_key_set(self):
         r = _run(
-            _serving(self._chunks()).handle_chat(
+            _serving_with(
+                chat_front=_FakeFront(chat=True, deltas=["he", "llo"])
+            ).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
@@ -273,7 +329,9 @@ class TestChatStreaming(CustomTestCase):
 class TestGenerate(CustomTestCase):
     def test_a_plain_prompt_answers_with_the_response_field(self):
         r = _run(
-            _serving(_one_shot("world")).handle_generate(
+            _serving_with(
+                completion_front=_FakeFront(chat=False, text="world")
+            ).handle_generate(
                 OllamaGenerateRequest(model="m", prompt="hello", stream=False), None
             )
         )
@@ -281,48 +339,44 @@ class TestGenerate(CustomTestCase):
 
     def test_system_is_prepended_to_the_prompt(self):
         """Behavioural, not cosmetic: it is what the model actually sees."""
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=False)
         _run(
-            OllamaServing(tm).handle_generate(
+            _serving_with(completion_front=front).handle_generate(
                 OllamaGenerateRequest(
                     model="m", prompt="hello", system="be terse", stream=False
                 ),
                 None,
             )
         )
-        self.assertEqual(tm.last_obj.text, "be terse\n\nhello")
+        self.assertEqual(front.last_request.prompt, "be terse\n\nhello")
 
     def test_an_empty_prompt_short_circuits_without_generating(self):
         """The Ollama CLI sends an empty request on startup. Answering it with
         a real generation would burn a slot on every client launch."""
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=False)
         r = _run(
-            OllamaServing(tm).handle_generate(
+            _serving_with(completion_front=front).handle_generate(
                 OllamaGenerateRequest(model="m", prompt="   ", stream=False), None
             )
         )
         body = _body(r)
         self.assertIs(body["done"], True)
         self.assertEqual(body["response"], "")
-        self.assertIsNone(tm.last_obj, "an empty prompt must not reach the engine")
+        self.assertIsNone(
+            front.last_request, "an empty prompt must not reach the engine"
+        )
 
     def test_the_empty_prompt_short_circuit_also_holds_when_streaming(self):
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=False)
         r = _run(
-            OllamaServing(tm).handle_generate(
+            _serving_with(completion_front=front).handle_generate(
                 OllamaGenerateRequest(model="m", prompt="", stream=True), None
             )
         )
         lines = _run(_collect_ndjson(r))
         self.assertEqual(len(lines), 1)
         self.assertIs(lines[0]["done"], True)
-        self.assertIsNone(tm.last_obj)
+        self.assertIsNone(front.last_request)
 
 
 class TestTheFourNamedRefusals(CustomTestCase):
@@ -342,10 +396,13 @@ class TestTheFourNamedRefusals(CustomTestCase):
             )
         )
 
-    def test_format_is_refused_today(self):
+    def test_format_is_NO_LONGER_refused_it_is_honoured(self):
+        """THE WIN, and the one golden assertion this rewrite is allowed to
+        change. Before composition the request never reached the machinery
+        that implements structured output, so the honest answer was a refusal.
+        It reaches it now."""
         r = self._chat(format="json")
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("format", _body(r)["error"])
+        self.assertEqual(_body(r)["done"], True)
 
     def test_think_is_refused(self):
         r = self._chat(think=True)
@@ -374,21 +431,19 @@ class TestTheFourNamedRefusals(CustomTestCase):
         self.assertEqual(_body(r)["done"], True)
 
     def test_a_refused_request_never_reaches_the_engine(self):
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=True)
         _run(
-            OllamaServing(tm).handle_chat(
+            _serving_with(chat_front=front).handle_chat(
                 OllamaChatRequest(
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
                     stream=False,
-                    format="json",
+                    think=True,
                 ),
                 None,
             )
         )
-        self.assertIsNone(tm.last_obj)
+        self.assertIsNone(front.last_request)
 
 
 class TestSamplingDefaults(CustomTestCase):
@@ -397,29 +452,25 @@ class TestSamplingDefaults(CustomTestCase):
     truncate every reply, which is the Kobold max_tokens=16 lesson."""
 
     def test_max_new_tokens_defaults_to_2048(self):
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=False)
         _run(
-            OllamaServing(tm).handle_generate(
+            _serving_with(completion_front=front).handle_generate(
                 OllamaGenerateRequest(model="m", prompt="hi", stream=False), None
             )
         )
-        self.assertEqual(tm.last_obj.sampling_params["max_new_tokens"], 2048)
+        self.assertEqual(front.last_request.max_tokens, 2048)
 
     def test_num_predict_overrides_the_default(self):
-        tm = _FakeTokenizerManager(_one_shot())
-        from sglang.srt.entrypoints.ollama.serving import OllamaServing
-
+        front = _FakeFront(chat=False)
         _run(
-            OllamaServing(tm).handle_generate(
+            _serving_with(completion_front=front).handle_generate(
                 OllamaGenerateRequest(
                     model="m", prompt="hi", stream=False, options={"num_predict": 17}
                 ),
                 None,
             )
         )
-        self.assertEqual(tm.last_obj.sampling_params["max_new_tokens"], 17)
+        self.assertEqual(front.last_request.max_tokens, 17)
 
 
 if __name__ == "__main__":

@@ -3443,6 +3443,43 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **Ollama compatibility surface (#335)** — `/api/chat`, `/api/generate`,
+  `/api/tags`, `/api/show`, COMPOSED over the OpenAI fronts. Upstream code
+  (`31d48d7f6f`) that this fork first hardened (`9b5a72f826`: four silently
+  dropped fields turned into named refusals) and then converted from a PARALLEL
+  SERVING PATH into a thin translation, the shape the KoboldCpp and sdapi
+  surfaces use.
+  ENTRY `entrypoints/ollama/serving.py` (`OllamaServing`), constructed at
+  `http_server.py:498` with the two OpenAI fronts and a `context_len` VALUE --
+  metadata is not a reason to hold a serving handle.
+  WHY IT MATTERED: as a parallel path it applied the chat template itself and
+  drove the tokenizer manager, so a request never reached the machinery that
+  implements structured output. That is why Ollama's `format` had to be
+  REFUSED. Composing made it reachable: `format` is `response_format`
+  (`"json"` -> `json_object`; a schema -> a named `json_schema` with `strict`,
+  because a caller who supplied a schema wants it obeyed, not approximated).
+  `think` REMAINS refused, with the route named: `chat_template_kwargs` is a
+  plausible mechanism that was not verified at code, and wiring on that basis
+  would be the guess this family refuses elsewhere.
+  GATES: a CODE-ONLY forbidden-vocabulary pin (`tokenizer_manager`,
+  `apply_chat_template`, `sampling_params`, `GenerateReqInput`,
+  `guard_generate_stream`) — comments and docstrings are stripped before the
+  scan, so the pin means "does not CALL these" and cannot be broken by
+  documenting the design accurately; plus the pre-existing refusal gate for
+  unmapped options.
+  THE NET, and the pattern worth copying: `test_ollama_golden_shapes_335.py`
+  pins every client-visible shape (key sets, NDJSON delta semantics, `done`
+  sequencing, the empty-prompt short circuit that keeps the Ollama CLI's
+  startup request off the engine, the 2048-token default) and was committed
+  BEFORE the rewrite (`b0baecf94f`) so it could not be edited to fit the
+  outcome. It passed after the swap with exactly two changes, both the intended
+  `format` one.
+  #344 NOTE: the client-disconnect watchdog is installed on the OpenAI
+  response's `body_iterator` (`liveness/stream.py:182`); this adapter consumes
+  that iterator, so the guard is upstream of the NDJSON translation rather than
+  bypassed by it.
+  NOT CLAIMED: no stock Ollama client has been pointed at a running server —
+  window item.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
