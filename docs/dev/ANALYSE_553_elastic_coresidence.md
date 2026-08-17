@@ -355,3 +355,99 @@ them to the live dial and slot runtime is the seam this stops at — it needs a
 scheduler and belongs with the live proof, not a desk fake. Live acceptance is
 filed in `/spinning/GPU_WINDOWS.md` (a NEW #553 ticket; there was none before
 — grepped).
+
+---
+
+## 10. Remainder determination (2026-08-17)
+
+### 10.1 What the delivered "Cut 3" actually is
+
+The commit titled `[#553] Cut 3` delivered the tenant hot/cold EVENT actuation
+(`coresidency_policy`). §3's Cut 3 is a different thing: "make #287's RELIEF
+rungs execute, and only those". The event layer touches no rung.
+
+Both are real work and neither is wrong; the numbering is. Recorded so the next
+reader does not tick off a cut that was never done. The planned Cut 3 is
+delivered by §10.3 below.
+
+### 10.2 Which actuation targets the event layer reaches, and in which direction
+
+Verified at code, not from the cut message.
+
+| target | COLD (shrink) | HOT (grow) |
+|---|---|---|
+| **KV pool** (#330 dial) | reached — `apply_budget_request` shrink | reached — `apply_budget_request` grow + `verify_pool_reached_capacity` read-back |
+| **GDN slots** (#364) | reached — `GdnSlotRuntime.unbind` | **NOT reached** — no rebind |
+| **Schnitte** (#287/#704 rungs) | **NOT reached** | **NOT reached** |
+
+Two named gaps:
+
+* **G1 — GDN slots are one-directional.** A cold event vacates a slot; a hot
+  event grows the KV pool and nothing rebinds the slot. A tenant that went cold
+  and came back gets its bytes and not its slot. `hot_event` takes `grow_fn`
+  and `measure_fn` and has no third hook. This is a real asymmetry, not an
+  oversight of mine to fix silently: rebinding needs the slot runtime's own
+  admission rules, and inventing them here would be the second-authority
+  defect. **Filed for the cut that owns slot policy.**
+* **G2 — the rungs were not reachable at all**, which is what §10.3 fixes.
+
+### 10.3 Planned Cut 3 DELIVERED — the relief rungs can now execute
+
+`managers/relief_rung_executor.py`. Grepping `RELIEF_FEATURES` across the tree
+had found exactly two consumers: the ladder that defines it and
+`planner/kv_ladder_table.py`, which checks membership. **Nothing mapped a
+chosen rung to the actuator of the feature it names**, so the ladder could rank
+and ascend and nothing would change -- a counter with no actuator.
+
+`apply_relief_rung(rung, actuators)` delegates to one injected actuator per
+feature and reports what that actuator returned, never what the plan intended
+(#694). The vocabulary comes from `RELIEF_FEATURES` rather than being restated,
+so the executor cannot grow a sixth feature the ladder cannot rank, nor leave a
+ranked one unreachable.
+
+Refusals are the design, because the failure being replaced is silence:
+
+* an unknown feature RAISES, naming the known ones;
+* a known feature whose actuator is not wired RAISES -- "nothing happened" must
+  not be indistinguishable from "it worked", or the ladder ascends believing
+  pressure was relieved and picks the next rung against an unchanged state;
+* a `geometry_flip` or `external` rung is refused. The plan said "relief rungs,
+  **and only those**", and this executor must not become the place a geometry
+  change quietly starts.
+
+Mutation-proven: making a missing actuator a no-op, and shrinking the
+vocabulary to one feature, each red exactly the test that asserts against it.
+
+### 10.4 Interactions, named
+
+* **#698 BOTH-BLOCKED** (`phase_policy.py:120`, `:1437`). The `admission_cap`
+  relief feature throttles inflow. Driven repeatedly by cold events it could
+  reach a cap where nothing can run -- exactly that wedge. This executor does
+  not clamp, and that is deliberate: the floor belongs to the actuator, the same
+  split `hot_event` already uses for the dial's floor ("a floor refusal is a
+  statement about the rig, not a negotiation"). **The obligation is on whoever
+  wires the admission actuator**, and it is stated here so it is not discovered
+  by hitting it.
+* **#684 recover() clamp** (`kv_backing_relief.py:1809`, "CLAMP TO WHAT THE
+  ACTUATOR CAN ACCEPT, NOT TO WHAT WE [want]"). The precedent this module's
+  reporting follows: the result carries the actuator's answer, so a caller
+  cannot read back its own request.
+* **#305 multi-model binding gap** (`registry/rungs.py:8`, the registry "does
+  not yet" carry what `DESIGN_305` asks). Co-residency is multi-tenant by
+  definition, so **Cut 4 (arbitration) depends on that binding**: deciding who
+  yields presupposes knowing which tenant a rung belongs to. Cut 4 is therefore
+  gated on #305, not merely on cuts 1-3.
+
+### 10.5 Remainder after this cut
+
+| item | state |
+|---|---|
+| Cut 2 second half — generic tenant mover factored out of `AudioAssetLedger` | desk-fundable, undelivered |
+| Cut 4 — arbitration policy | gated on **#305 binding** (§10.4) as well as cuts 1-3 |
+| Cut 5 — cross the graph wall | **rig-gated by its own text** ("LAST, and only with the rig") |
+| G1 — GDN slot rebind on hot | filed, needs the slot runtime's admission rules |
+| Binding `release_fn`/`grow_fn`/`measure_fn` to the live dial | **window item**, already filed by Cut 3 |
+
+**Window items, named rather than attempted:** the live binding of the event
+layer's injected callables, and Cut 5. Anything that resizes a live pool needs a
+scheduler and a boot; §9 already filed the live acceptance.
