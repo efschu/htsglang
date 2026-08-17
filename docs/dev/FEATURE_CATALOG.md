@@ -3443,6 +3443,46 @@ taxonomy and the global importance ladder.
   (`handover_id_for`), `:77` (`prefixes_conflict`).
   GATE: completeness validation at `:209` and `verify_import` at `:253` —
   an unverified import is not a supported path.
+- **world_roundtrip (#329 cut 2)** — the same five-phase vocabulary one tier
+  UP, at world scope: QUIESCE → SNAPSHOT → RESTORE → RESUME in one live
+  process with the member set held fixed. The missing half of #89's disk park,
+  which parks a live process and restores a *new* one.
+  ENTRY `managers/world_roundtrip.py:246` (`WorldRoundTrip`), `:295`
+  (`quiesce`), `:341` (`snapshot`), `:350` (`restore`), `:369` (`resume`),
+  `:380` (`abort`), `:194` (`validate_roundtrip_completeness`), `:129`
+  (`ASSET_CLASSES`), `:97` (`Trigger`), `:218` (`_Seams`).
+  GATES, four: completeness at `:194` (a required class missing from the
+  manifest is a refusal — an explicitly empty class is a fact and is
+  accepted); membership at `:295` and `:350` (a differing target member set is
+  REFUSED, naming both sets — RE-FORM is absent by construction, not disabled
+  by flag, because live communicator teardown is #329 cut 1 and unmeasured);
+  phase order at `:272`; trigger type at `:255` (`Trigger` has only
+  `OPERATOR`/`PLANNER` — DESIGN_329 §9 forbids a transient-failure reflex, so
+  the reflex is not expressible rather than merely discouraged).
+  ROLLBACK: with no RE-FORM nothing is destroyed, so `abort` is legal at every
+  phase up to RESUME — pinned, so an edit making a phase destructive breaks
+  the pin instead of voiding the guarantee.
+  DETERMINATION (`ANALYSE_329_cut2_phase_map.md`): **RESTORE is the only phase
+  with no in-process implementation.** `HibernateModelLoader.load_model`
+  (`model_loader/loader.py:2468`) rebuilds a NEW skeleton via
+  `_initialize_model` (`:2529`) and is selected at parse time
+  (`server_args.py:16097`) — cold-process shaped. GDN blob and buffer
+  restore already work in-process; per-session KV export/import and the
+  orchestrator were the other holes, the latter closed here.
+  CORRECTION ON RECORD, do not re-litigate: the #568 non-persistent-buffer fix
+  **does generalize**. It is a rule over the persistence property —
+  `translator/ledger.py:436` iterates `named_buffers()` and carries every
+  buffer `state_dict()` omits — and `weight_updater.py:361`
+  (`_export_static_state`) captures `named_buffers()` directly and never had
+  the bug. `NON_CHECKPOINT_NAME_PATTERNS = ("workspace",)`
+  (`phase_flip_boot.py:67`) is the WEIGHTS-ARENA exclusion and is not that
+  fix; citing it as evidence of non-generality is the error to avoid. The
+  "19 buffers" figure is uncorroborated (`ANALYSE_spill_matrix_20260804.md:263`
+  finds 2 statically, count runtime-logged).
+  NOT the `#286` offload register: `OFFLOAD_CLASSES` /
+  `AssetClassDescriptor` are the VRAM eviction-priority registry (see §17's
+  warning that "#286 offload register" names two modules); `ASSET_CLASSES`
+  here is a round-trip inventory with its own reasons.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
