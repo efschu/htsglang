@@ -701,10 +701,19 @@ class TestSchedulerSideHelpers(CustomTestCase):
         from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         self.assertEqual(flip_blocking_guards(self._fake_scheduler()), [])
+        # #703: the HiCache clause is REMOVED, in both of its copies. It was
+        # first narrowed to "is the DISK tier configured" and then dropped
+        # entirely, because the disk tier is the retention store the design
+        # needs and the wedge behind the guard (#630) is fixed and shipped
+        # (9da9dfd025 bounded collectives; see test_hicache_bounded_waits_630.py
+        # and test/registered/unit/managers/test_hicache_flip_guard_703.py).
+        # What stays gated is the KV key's pp suffix, which is a claim about
+        # bytes and belongs with #706's whole-page format -- not this list.
         sched = self._fake_scheduler()
         sched.server_args.enable_hierarchical_cache = True
-        guards = flip_blocking_guards(sched)
-        self.assertTrue(any("#630" in g for g in guards), guards)
+        self.assertEqual(flip_blocking_guards(sched), [])
+        sched.server_args.hicache_storage_backend = "file"
+        self.assertEqual(flip_blocking_guards(sched), [])
         sched = self._fake_scheduler(is_dual_group_lane=True)
         self.assertTrue(any("dual-group" in g for g in flip_blocking_guards(sched)))
 

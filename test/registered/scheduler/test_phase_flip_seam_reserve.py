@@ -230,3 +230,190 @@ def test_every_symbol_the_callers_import_exists():
     assert callable(m.measure_at_rest)
     assert callable(m.write_seam_reserve)
     assert callable(m.seam_allowed_tokens)
+
+
+# ---------------------------------------------------------------------------
+# #662: the reserve may SPEND slack above the corridor law, never MAKE it.
+#
+# The law has two halves -- "~1024 MiB free per card" AND "best-filled". A cut
+# taken below the measured position does not find memory; it converts KV pool
+# into free VRAM and holds it there for the life of the instance. Measured on
+# this rig 2026-08-15, one config, one boot pair:
+#
+#     t_m = 590000, have_m = 0 MiB spendable   ->  solved 486403
+#     at-rest free/card: 1139 / 1462 / 2279    ->  3153 / 4604 / 3977
+#
+# ~2 GiB per card, permanently, to guarantee a seam at an occupancy the
+# shrunken pool can no longer reach.
+#
+# Whether that trade is allowed is decided by WHAT A REFUSAL COSTS, which is a
+# consequence of the purity mode and not a knob of its own:
+#   * strict          -- a refused tp_to_pp means prefill never runs (boot E),
+#                        so the pool pays. Unchanged, and pinned above.
+#   * prefill_in_tp   -- the TP layout may do the prefill, so the refusal
+#                        costs one flip and the corridor law wins.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fatal_refusal_still_buys_the_guarantee_with_pool():
+    """The boot-E case, restated: when abandoning is fatal, the pool pays."""
+    need = 484 * MIB
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(need))
+    assert allowed == BOOT_G_T + (BOOT_G_HAVE - need) // CELL
+    assert allowed < BOOT_G_T
+
+
+def test_a_survivable_refusal_does_not_shrink_the_pool_below_the_law():
+    """The inversion. Same numbers, but the TP layout may do the prefill.
+
+    ``have_m`` is 8 MiB, i.e. 256 tokens' worth, so that much slack may be
+    spent and not one token more.
+    """
+    need = 484 * MIB
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(need), abandon_is_survivable=True)
+    spendable_tokens = BOOT_G_HAVE // CELL
+    assert allowed == BOOT_G_T - spendable_tokens
+    assert allowed > BOOT_G_T + (BOOT_G_HAVE - need) // CELL, (
+        "the survivable case must keep pool the fatal case gives away"
+    )
+
+
+def test_a_position_exactly_on_the_law_is_not_cut_at_all():
+    """The measured case from this rig: 0 MiB spendable above the law.
+
+    There is no slack to spend, so there is nothing to trade, and the id space
+    must not move. Before the fix this returned 486403 of 590000 and moved
+    every card ~2 GiB above the law.
+    """
+    allowed = sr.seam_allowed_tokens(
+        CELL, _reserve(484 * MIB, have=0), abandon_is_survivable=True
+    )
+    assert allowed == BOOT_G_T
+
+
+def test_a_funded_rank_is_still_never_cut_in_either_mode():
+    """A rank with room to spare keeps its pool whichever way refusal falls."""
+    for survivable in (False, True):
+        allowed = sr.seam_allowed_tokens(
+            CELL,
+            _reserve(455 * MIB, have=2000 * MIB),
+            abandon_is_survivable=survivable,
+        )
+        assert allowed > BOOT_G_T, survivable
+
+
+def test_the_budget_helper_carries_the_survivability_through():
+    # Large enough that the SEAM is the binding term in both modes; with a
+    # smaller budget both answers clamp to the budget and the test would pass
+    # without exercising anything.
+    budget = 23 * (1 << 30)
+    fatal, _ = sr.seam_adjusted_budget_bytes(budget, CELL, _reserve(484 * MIB))
+    survivable, _ = sr.seam_adjusted_budget_bytes(
+        budget, CELL, _reserve(484 * MIB), abandon_is_survivable=True
+    )
+    assert survivable > fatal, "the law-bounded cut must leave a larger budget"
+    assert survivable <= budget, "and must still never GROW the budget"
+
+
+# ---------------------------------------------------------------------------
+# #662: free VRAM is no longer the only thing that can pay for the seam.
+#
+# The KV relief rung returns unoccupied backing at the cutover and takes it
+# back afterwards, which is bytes arriving exactly when the commit needs them.
+# Counting only the free column is what made the pool shrink until enough VRAM
+# sat idle to cover the seam.
+#
+# The BOUND is the whole design: the rung may cover at most the seam's FIXED
+# floor (arena tail + draft restore), which are one-shot commits at the
+# cutover. The per-row slack is held across the whole wave walk and scales
+# with the pool this term would grow, so it stays charged.
+# ---------------------------------------------------------------------------
+
+
+class _PayingSched:
+    """A scheduler whose allocator/pool satisfy the rung's preconditions."""
+
+    class _Pool:
+        supports_backing_spans = True
+
+        def runtime_set_backing_rows(self, rows):
+            return 0
+
+    class _Alloc:
+        def get_kvcache(self):
+            return _PayingSched._Pool()
+
+    def __init__(self):
+        self.token_to_kv_pool_allocator = _PayingSched._Alloc()
+
+
+def test_a_boot_that_will_have_a_paying_rung_need_not_hold_the_fixed_floor(
+    monkeypatch,
+):
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    arena, fixed = 1456 * MIB, 139 * MIB
+    granted = sr._rung_fundable_for_seam(_PayingSched(), arena, fixed)
+    assert granted == arena + fixed, "the whole fixed floor, and not a byte more"
+
+
+def test_the_env_switch_is_the_can_fail_arm(monkeypatch):
+    """With the rung off, the reserve must charge what it always charged."""
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    monkeypatch.setenv("SGLANG_KV_BACKING_RELIEF", "0")
+    assert sr._rung_fundable_for_seam(_PayingSched(), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_a_chunkless_arena_cannot_promise_anything(monkeypatch):
+    import sglang.srt.managers.kv_backing_relief as kbr
+
+    monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
+    sched = _PayingSched()
+    sched.token_to_kv_pool_allocator.get_kvcache().__class__.supports_backing_spans = (
+        False
+    )
+    try:
+        assert sr._rung_fundable_for_seam(sched, 1456 * MIB, 139 * MIB) == 0
+    finally:
+        _PayingSched._Pool.supports_backing_spans = True
+
+
+def test_no_allocator_means_no_promise():
+    class _Bare:
+        pass
+
+    assert sr._rung_fundable_for_seam(_Bare(), 1456 * MIB, 139 * MIB) == 0
+
+
+def test_a_zero_floor_grants_nothing():
+    assert sr._rung_fundable_for_seam(_PayingSched(), 0, 0) == 0
+
+
+class _Rung:
+    def __init__(self, fundable):
+        self._fundable = fundable
+
+    def fundable_bytes(self):
+        if isinstance(self._fundable, Exception):
+            raise self._fundable
+        return self._fundable
+
+
+class _Sched:
+    def __init__(self, rung):
+        setattr(self, "phase_flip_kv_backing_relief", rung)
+
+
+def test_the_granted_fund_raises_the_allowed_id_space():
+    """The point of the term, as arithmetic: spendable goes up, so the cut
+    the reserve has to take goes down."""
+    need = 484 * MIB
+    without = sr.seam_allowed_tokens(CELL, _reserve(need, have=BOOT_G_HAVE))
+    with_rung = sr.seam_allowed_tokens(
+        CELL, _reserve(need, have=BOOT_G_HAVE + 400 * MIB)
+    )
+    assert with_rung > without
+    assert with_rung - without == (400 * MIB) // CELL

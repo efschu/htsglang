@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -253,7 +254,7 @@ def purity_from_server_args(server_args) -> PhasePurity:
         raw = os.environ.get(ENV_PURITY)
     purity = parse_purity(raw)
     logger.warning(
-        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP " "layout: %s",
+        "%s mode=%s -- decode in the PP layout: %s; prefill in the TP layout: %s",
         LOG_PREFIX,
         purity.describe(),
         (
@@ -283,6 +284,25 @@ def validate_purity_policy_pair(purity: PhasePurity, policy_cfg) -> None:
     window = float(getattr(policy_cfg, "pp_window_s", 0.0) or 0.0)
     if window > 0:
         return
+    # The SOLVED equivalent (#665-F1). What this guard actually requires is a
+    # BOUND on the PP residency, so that a phase which may not decode and
+    # cannot admit prefill still has an exit. The hand-set stopwatch was one
+    # way to supply it; a declared decode-stall SLO is another, and a better
+    # one -- it bounds the same residency in units of the thing being
+    # protected. Accept it, and only it: an SLO so tight that the solved cap
+    # collapses to zero is no bound at all and must still be refused.
+    slo = float(getattr(policy_cfg, "decode_stall_slo_s", 0.0) or 0.0)
+    if slo > 0:
+        seam = float(getattr(policy_cfg, "flip_cost_s", 0.0) or 0.0)
+        if slo - 2.0 * seam > 0:
+            return
+        raise PhasePurityError(
+            f"{LOG_PREFIX} purity={purity.describe()} has a decode stall SLO "
+            f"of {slo:g}s, but the measured seam is {seam:g}s each way, so the "
+            f"solved PP residency cap is {slo - 2 * seam:g}s -- not a bound, "
+            f"and the PP phase would have no exit. Declare an SLO above "
+            f"{2 * seam:g}s, or set SGLANG_PHASE_POLICY_PP_WINDOW_S > 0."
+        )
     raise PhasePurityError(
         f"{LOG_PREFIX} purity={purity.describe()} requires a positive "
         f"phase-policy PP window, but pp_window_s is {window!r}. Under "
@@ -290,8 +310,9 @@ def validate_purity_policy_pair(purity: PhasePurity, policy_cfg) -> None:
         f"admit its pending prefill (no free mamba/GDN slot, KV held by "
         f"paused decodes) has NO exit except the bounded window: the "
         f"load-triggered rule needs prefill to drain, and prefill cannot "
-        f"drain. Set SGLANG_PHASE_POLICY_PP_WINDOW_S > 0, or run "
-        f"--phase-flip-purity off."
+        f"drain. Declare SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (preferred: "
+        f"it bounds the residency in units of what is being protected), or set "
+        f"SGLANG_PHASE_POLICY_PP_WINDOW_S > 0, or run --phase-flip-purity off."
     )
 
 
@@ -308,6 +329,17 @@ def _active_phase(scheduler) -> Optional[str]:
 #: purpose: ``/health`` times out at 20 s and a refused round costs about 3 s
 #: on this rig, so a larger bound would open the valve after the instance has
 #: already stopped answering -- which is the state this exists to prevent.
+#:
+#: LEFT AT 4 DELIBERATELY, 2026-08-16. Lowering it to 1 was tried as a way to
+#: close the sub-10 s idle windows and is the WRONG FIX, which the suite says
+#: out loud: it reds
+#:   test_purity_stand_down_656 :: test_a_short_abandon_streak_is_not_a_stand_down
+#:   test_decode_slo_starvation_662 :: test_it_holds_with_NO_count_REACHING_ITS_BOUND
+#: Those are deliberate invariants -- a SHORT streak must not stand purity
+#: down -- and an idle window is not a licence to delete them. The valve is
+#: for a PERSISTENTLY unreachable layout; a single abandoned flip is a
+#: latency defect in the seam, and it is fixed where it is caused. See the
+#: gap decomposition before reaching for this constant again.
 ENV_STAND_DOWN_AFTER = "SGLANG_PHASE_PURITY_STAND_DOWN_AFTER"
 DEFAULT_STAND_DOWN_AFTER = 4
 
@@ -322,6 +354,137 @@ def stand_down_after() -> int:
     except ValueError:
         return DEFAULT_STAND_DOWN_AFTER
     return max(1, n)
+
+
+def _decode_slo_s(scheduler) -> float:
+    """The operator's decode-stall SLO in seconds, or 0.0 when unset."""
+    try:
+        cfg = getattr(scheduler, "phase_policy_cfg", None)
+        if cfg is None:
+            return 0.0
+        return max(0.0, float(getattr(cfg, "decode_stall_slo_s", 0.0) or 0.0))
+    except Exception:  # noqa: BLE001 - a safety valve must not raise
+        return 0.0
+
+
+def _group_starvation_signal(scheduler, work: str) -> bool:
+    """Has the GROUP failed to fund the flip this work class needs?
+
+    THE EVENT THE CLOCK IS STAMPED FROM, and the reason this function exists
+    at all. It replaces "this rank has a non-empty batch", which was measured
+    WRONG on metal 2026-08-15 in the only topology that matters here.
+
+    THE PREMISE THAT FAILED. The clock used to start when decode was blocked
+    in PP with ``running_bs > 0``, argued group-uniform because "phase, purity
+    and batch are identical on every rank at that point". That is true under
+    TP and FALSE UNDER PP. In a pipeline the HEAD holds the requests and the
+    downstream ranks do not see them until it forwards them -- and a head that
+    is holding decode never forwards. So PP1 and PP2 sat at ``running_bs = 0``,
+    ``_clear_decode_starving`` reset their clocks on every iteration, and only
+    rank 0 ever crossed the SLO.
+
+    WHAT THAT COST, exactly, on boot_slo_proof_r2.log: one
+    "RELAXING PURITY FOR DECODE" line, on PP0 alone, against two
+    "FLIP ABANDONED" lines on every rank. Rank 0 then admitted a decode batch
+    into the PP layout while its peers still refused decode, blocked in
+    ``_pp_commit_comm_work`` on a proxy-tensor send whose matching receives
+    nobody posted, while PP1 and PP2 blocked in ``recv_requests`` waiting for a
+    forward rank 0 could no longer make. All three ranks alive, all three cards
+    at 0% utilisation, and not one decode step ever ran. A safety valve that
+    deadlocks the instance it is meant to rescue is worse than the stall.
+
+    SO THE SIGNAL IS THE ONE THE GROUP ALREADY AGREES ON: the seam abandon
+    streak for the direction that starves this work class. It is incremented
+    from ``reduced_fit``, a collective MIN, so every rank advances it on the
+    same iteration -- which the same log confirms, two lines per rank, exactly.
+    No new collective is introduced; this reads a number the group already
+    reduced.
+
+    IT IS ALSO THE HONEST WORK SIGNAL. The streak only advances when the policy
+    ARMED the flip, and the policy arms the direction that serves decode
+    because decode is waiting. So "an empty batch is not starvation" still
+    holds, sourced from a quantity every rank can see rather than from one only
+    the head can.
+
+    BOTH GROUP-UNIFORM COUNTERS COUNT, for the reason
+    ``flip_unavailable_reason`` already reads both: the seam streak alone
+    CANNOT advance once the policy's backoff engages, because the policy then
+    declines the arm without entering the seam at all. Measured 2026-08-13
+    15:40-15:44Z: three group abandons armed the backoff, the abandon counter
+    froze at 3, and the policy went on logging "arm refused (7 in a row)" while
+    work sat unrunnable. A signal keyed only to the inner counter is a signal
+    the damping layer holds at zero.
+
+    A NON-ZERO COUNT IS NOT THE SAME AS A COUNT THAT REACHED ITS BOUND, and
+    that distinction is the whole point. The bounds (``stand_down_after``, the
+    abandon cap) are what the SLO exists to outlive; ONE refusal is merely
+    evidence that a funding failure is happening at all, which is exactly the
+    precondition the invariant is stated over. The clock still has to run out.
+    """
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    if rt is None:
+        return False
+    direction = _STARVED_BY.get(work)
+    if direction is None:
+        return False
+    try:
+        book = getattr(rt, "_seam_abandons_in_a_row", None) or {}
+        if int(book.get(direction, 0) or 0) > 0:
+            return True
+        state = getattr(scheduler, "phase_policy_state", None)
+        refusals = getattr(state, "arm_refusals", None) or {}
+        return int(refusals.get(direction, 0) or 0) > 0
+    except Exception:  # noqa: BLE001 - a safety valve must not raise
+        return False
+
+
+def _note_decode_starving(scheduler) -> None:
+    """Stamp the instant the GROUP first failed to fund decode's layout.
+
+    GROUP UNIFORMITY IS THE WHOLE PROPERTY HERE, and it is now sourced the way
+    this file's other two causes are: from a group-reduced counter. See
+    :func:`_group_starvation_signal` for the metal deadlock that proved a
+    per-rank batch reading cannot carry it.
+    """
+    if getattr(scheduler, "_decode_starved_since", None) is None:
+        scheduler._decode_starved_since = time.monotonic()
+
+
+def _clear_decode_starving(scheduler) -> None:
+    """Decode is moving (or has nothing to do): retire the clock."""
+    if getattr(scheduler, "_decode_starved_since", None) is not None:
+        scheduler._decode_starved_since = None
+
+
+def _decode_starved_beyond_slo(scheduler) -> Optional[str]:
+    """The SLO cause: decode held past the operator's bound by a FUNDING
+    failure rather than by a terminal one.
+
+    THE HOLE THIS CLOSES. The two existing causes are COUNTS -- a blocking
+    guard, or an abandon streak reaching its bound. The SLO is a TIME. Nothing
+    bridged them, so a funding failure that never accumulates the count could
+    hold decode for ever inside the bound: on 2026-08-15 the seam abandoned
+    repeatedly with the rate limiter pacing the retries, and the abandon-cap
+    guard was deliberately stood down while work was waiting, so neither count
+    arrived. That window was harmless only because the running batch was
+    empty. With decodes resident it is an unbounded stall.
+
+    So time is a cause in its own right: whatever the counts say, decodes are
+    never held past the SLO by a funding failure.
+    """
+    slo = _decode_slo_s(scheduler)
+    if slo <= 0.0:
+        return None
+    since = getattr(scheduler, "_decode_starved_since", None)
+    if since is None:
+        return None
+    waited = time.monotonic() - since
+    if waited < slo:
+        return None
+    return (
+        f"decode has been held {waited:.1f}s by an unfunded flip, past the "
+        f"{slo:g}s decode-stall SLO"
+    )
 
 
 def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
@@ -343,6 +506,13 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
     ``tp_to_pp`` starves prefill and says nothing about decode. Relaxing on
     the wrong one is how a safety valve becomes the normal path.
     """
+    # THE SLO IS A CAUSE, and it is checked FIRST because it is the only one
+    # with a bound the operator stated. The two below are counts; this is the
+    # promise that no count can outlive.
+    if work == "decode":
+        starved = _decode_starved_beyond_slo(scheduler)
+        if starved is not None:
+            return starved
     rt = getattr(scheduler, "phase_flip_runtime", None)
     if rt is None:
         return None
@@ -378,8 +548,25 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
         return (
             f"{direction} arm refused {refused} times consecutively (bound "
             f"{bound}); the layout {work} needs is not reachable"
+            f"{_last_abandon_detail(state, direction)}"
         )
     return None
+
+
+def _last_abandon_detail(state, direction: str) -> str:
+    """The shortfall that caused the stand-down, for the receipt.
+
+    NAMED, NOT COUNTED. "abandoned 1 time consecutively" tells an operator
+    that the valve opened and nothing about WHY, and the why is the number
+    that gets acted on: the 2026-08-16 idle windows were a 19 MiB shortfall
+    (staging 1614 MiB needed, 1595 MiB spendable), which is small enough that
+    the evict rung could have funded it outright. A receipt that carries the
+    figure is what makes that follow-up obvious instead of archaeological.
+    """
+    detail = (getattr(state, "arm_last_detail", None) or {}).get(direction)
+    if not detail:
+        return ""
+    return f". Last abandon: {detail}"
 
 
 def _relaxed(scheduler, work: str) -> bool:
@@ -407,8 +594,7 @@ def _relaxed(scheduler, work: str) -> bool:
         if getattr(scheduler, "_phase_purity_stood_down", None) is not None:
             scheduler._phase_purity_stood_down = None
             logger.warning(
-                "%s the flip is working again; the purity rule is back in "
-                "force for %s",
+                "%s the flip is working again; the purity rule is back in force for %s",
                 LOG_PREFIX,
                 work,
             )
@@ -432,7 +618,7 @@ def _relaxed(scheduler, work: str) -> bool:
     return True
 
 
-def prefill_blocked_here(scheduler) -> bool:
+def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
     """True when a prefill batch must NOT be built this iteration.
 
     Rank-uniform by construction, which is the load-bearing property: the
@@ -441,10 +627,79 @@ def prefill_blocked_here(scheduler) -> bool:
     would split the group across branches with mismatched collectives --
     the failure family documented at ``_update_uniform_pool_budget``.
     """
-    from sglang.srt.managers.phase_policy import PHASE_TP
+    from sglang.srt.managers.phase_policy import (
+        PHASE_TP,
+        prefill_suppressed_in_tp,
+    )
 
     if _active_phase(scheduler) != PHASE_TP:
         return False
+    # #677 HOT FIX 2: DRAIN MODE OUTRANKS THE PURITY MODE ON THIS ONE AXIS.
+    #
+    # Checked BEFORE `prefill_allowed_in_tp` on purpose. The deployed purity
+    # mode is prefill_in_tp -- the 2026-08-14 correction that let the policy's
+    # break-even N decide -- and that correction stands for its own workload.
+    # Drain mode is a different contract, chosen by the user for this one:
+    # prefill until empty, decode the bundle to completion, prefill again. A
+    # TP window entered to finish a bundle must not admit the work it was
+    # entered to escape, which is what "Prefill batch" lines inside TP were.
+    #
+    # Rank-uniform on the same argument as the rest of this function: the
+    # drain-mode flag is static boot config and the phase is replicated.
+    # The attribute is `phase_policy_cfg`. Named wrong once while writing
+    # this, which a getattr default turns into a feature that silently never
+    # fires -- the same shape as the #684 serving tick's NameError. Pinned by
+    # `test_the_purity_hook_reads_the_real_scheduler_attribute`.
+    policy = getattr(scheduler, "phase_policy_cfg", None)
+    # THE VALVE OUTRANKS DRAIN MODE. Measured 2026-08-16 07:02 on the boot
+    # that carried the first fix: tp_to_pp was DELAYED, not refused -- one
+    # rank withheld its entry-margin yield on a predicted sub-law trough,
+    # which is exempt from the stand-down cap, so the delay streak climbed to
+    # 17 with no exit while the box sat at bs 0, GPU 0%, 794179 tok pending.
+    #
+    # `flip_unavailable_reason` had the answer all along: it reads the seam's
+    # `_seam_abandons_in_a_row` (which delays DO advance) AND the policy's
+    # `arm_refusals`, against one bound. What broke was ORDER -- suppression
+    # was checked FIRST and returned True, so the valve never ran and the
+    # seam's own promise that "the purity valve lets the starved work class
+    # run meanwhile" was FALSE on metal. Asking the valve first makes that
+    # promise true, and both wedge shapes leave through the same door.
+    unavailable = None
+    if policy is not None and bool(getattr(policy, "drain_mode", False)):
+        try:
+            unavailable = flip_unavailable_reason(scheduler, "prefill")
+        except Exception:  # noqa: BLE001 - a guard never breaks the loop
+            unavailable = None
+    if policy is not None and prefill_suppressed_in_tp(
+        policy, PHASE_TP, flip_unavailable=bool(unavailable), running_bs=running_bs
+    ):
+        return True
+    # THE YIELD IS A RECEIPT-BEARING EVENT, and loud on purpose. Prefilling in
+    # the TP layout is what drain mode exists to forbid; it resumes only
+    # because an idle instance is worse. EDGE-TRIGGERED -- this runs every
+    # scheduler iteration, and a per-iteration line would bury the signal it
+    # exists to raise. Cleared on recovery, so a flapping rig logs each
+    # engagement rather than only the first in the process's life.
+    if unavailable:
+        if not getattr(scheduler, "_drain_yield_announced", False):
+            scheduler._drain_yield_announced = True
+            logger.warning(
+                "%s DRAIN-MODE SUPPRESSION YIELDED: %s. This TP layout resumes "
+                "PREFILLING -- the behaviour drain mode exists to forbid, taken "
+                "only because idling the instance with work waiting is worse. "
+                "THE SEAM COULD NOT BE ENTERED, and that is the defect this "
+                "line points at; the yield is the symptom. Clears on the first "
+                "flip that commits.",
+                LOG_PREFIX,
+                unavailable,
+            )
+    elif getattr(scheduler, "_drain_yield_announced", False):
+        scheduler._drain_yield_announced = False
+        logger.warning(
+            "%s the seam is reachable again; drain mode is back in force and "
+            "the TP layout has stopped prefilling.",
+            LOG_PREFIX,
+        )
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
     return not _relaxed(scheduler, "prefill")
@@ -455,9 +710,21 @@ def decode_blocked_here(scheduler, running_bs: int) -> bool:
     from sglang.srt.managers.phase_policy import PHASE_PP
 
     if _active_phase(scheduler) != PHASE_PP:
+        _clear_decode_starving(scheduler)
         return False
     if purity_of(scheduler).decode_allowed_in_pp(running_bs):
+        _clear_decode_starving(scheduler)
         return False
+    # THE CLOCK RUNS ONLY WHEN THERE IS DECODE TO HOLD, AND "THERE IS DECODE TO
+    # HOLD" MUST BE A GROUP FACT. It was ``running_bs > 0`` -- this rank's own
+    # batch -- and under PP only the head has one, so only the head ever
+    # crossed the SLO and the group half-relaxed into a deadlock. See
+    # _group_starvation_signal for the measurement. The signal is now the seam
+    # abandon streak, which every rank advances off the same collective MIN.
+    if _group_starvation_signal(scheduler, "decode"):
+        _note_decode_starving(scheduler)
+    else:
+        _clear_decode_starving(scheduler)
     return not _relaxed(scheduler, "decode")
 
 

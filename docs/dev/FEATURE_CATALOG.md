@@ -3649,3 +3649,165 @@ Honest absences, so nobody reads silence as coverage:
   check-every trio again against your own status word.
 - `label_transform` (§18.6) currently transforms exactly one field
   (priority). Its value is the choke-point property, not its coverage.
+
+---
+
+## 19. Retro-sweep backlog (2026-08-17) — mechanism facts that only lived in analyses/ledger
+
+Closes the ~3-week gap where mechanism-level findings reached `docs/dev/` and the
+operator ledger but never the catalog. **Lookup lines only.** Each carries a
+greppable mechanism name, an anchor, a status, and a task#.
+
+`VERIFIED` = I opened the source on this branch. `UNVERIFIED-LEDGER` = the
+source doc or ledger asserts it and I did not re-open the code — treat as a
+lead, not a fact. Anchors prefer SYMBOL names over line numbers: the #621 sweep
+found audit line-numbers had drifted, two of three into the wrong file.
+
+### 19.1 Verified on this branch
+
+* **`_handle_pp_layer_ratio` — a hand-written PP cut is NOT grid-coupled.**
+  Validates only `pp_size > 1`, `len == pp_size`, entries `>= 1`, and
+  `sum == declared_num_hidden_layers`. No full-attention-grid alignment, no
+  per-stage attention requirement. `server_args.py:15833+`. shipped. #485
+  — VERIFIED
+* **`derive_pp_layer_split` — a DERIVED PP cut IS grid-snapped, and refuses.**
+  Boundaries are targeted proportionally then snapped to land *after* a
+  full-attention layer ("a linear+full-attention model splits its KV after
+  FULL-ATTENTION layers"), and a hybrid stage that would end with ZERO
+  full-attention layers is REFUSED — never a silent even split (#202 lesson).
+  `distributed/utils.py:1545+`. shipped. #485 — VERIFIED.
+  **So the coupling depends on the entry point**: `--pp-layer-ratio` is free,
+  `--pp-stage-ratio` / `--pp-solve-cut` are snapped. Do not generalise either.
+* **`--pp-attn-stage-ratio` — decouples the family mix from the layer budget.**
+  `derive_pp_layer_split(scores, is_full_attention=kinds, attn_scores=...)`
+  gives the full-attention family its own vector: same layer budget, different
+  family mix; without it one vector couples both. The code's own log states
+  why: *"a hybrid's KV mass follows the full-attention count, not the layer
+  count."* `server_args.py:15795-15831`. shipped. #485 — VERIFIED
+* **`priority-cannot-buy-memory` — fast-lane priority orders, it does not free.**
+  Preemption victims are drawn ONLY from `running_batch.reqs`
+  (`schedule_policy.py:1626-1634`), and an in-flight chunked prefill advances
+  its chunk regardless (`chunked_req` / `inflight_middle_chunks`,
+  `scheduler.py:6349-6350`). Setting priority to 1e6 frees nothing. verdict.
+  #536 — VERIFIED
+* **`fast_lane_priority - 1` — #552 aging never outranks the fast tier.**
+  An aged heavy request is promoted BELOW the fast tier, deliberately; the
+  docstring says promoting one above "would only wedge the admission loop and
+  starve the fast lane". `schedule_policy.py:385-432`. shipped. #552 — VERIFIED
+* **`kv_cache_dtype` — there is no int8 KV dtype in this fork.**
+  Choices are exactly `auto | fp8_e5m2 | fp8_e4m3 | bf16 | bfloat16 | fp4_e2m1`.
+  `server_args.py:1026` (ANCHOR CORRECTION: ANALYSE_726 cites `:1008`, which is
+  the help text). dark / zero code. #489, #726 — VERIFIED
+* **`phase_flip_host_pools` — the #719 rebind refuses at EVERY cutover.**
+  Read at `mem_cache/hicache_phase_binding.py:287`, refusal message at `:296`;
+  a repo-wide grep of `python/sglang/srt/` finds **no assignment anywhere**, so
+  the mapping is never populated. Logged, not raised — easy to miss.
+  live defect. #719, #706 — VERIFIED
+* **`SGLANG_KVSO_RESUME` — defaults False, so a spilled MTP session never
+  returns to device.** `environ.py:380`
+  (`EnvBoolWithAlias(False, deprecated_name="KVSO_RESUME")`). Silent, unlike the
+  loud `KVSO_ALLOW_SPEC` boot refusal. dark hazard. #543 — VERIFIED
+* **`_publish_uniform_evict_floor` — group-MIN eviction floor against rank
+  divergence.** Publishes the group minimum of `available_size()` so eviction
+  decisions cannot diverge per rank and wedge BAR1.
+  `scheduler.py:4327`, `:4368`. shipped. #616g — VERIFIED
+* **counter-vs-actuator family register — DO NOT re-derive.** Five members,
+  safe shapes, and one pinned-unreachable suspect are recorded in
+  `DESIGN_679_admission_relief_ladder.md` §7. Cross-reference, do not duplicate
+  here. #679/#681/#684/#715/#694 — VERIFIED (authored 2026-08-17)
+* **`check_every` / `SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY` — NOT dead, but
+  path-dependent; default is 1, not 32.** Settles the former §19.3 conflict.
+  `check_every()` returns **1** when the env var is unset
+  (`barlink_abort_gate.py:189-197`), i.e. check every launch. Two consumers:
+  `barlink_bar1.py:5177` reaches it UNCONDITIONALLY (after the
+  `abort_check_enabled` / pending-launch gates), so the knob is LIVE on bar1;
+  `barlink_device.py:1562` sits in the in-line fallback path BELOW #517's
+  `_abort_poll_active` early return, so on the device transport it is bypassed
+  entirely whenever the watchdog feeds the flag.
+  **Both ledger readings were partially right and neither was complete**: "dead
+  since #517" is true of the DEVICE path only (that is what phase 2 made cheap),
+  while bar1 never got that treatment. `NOTE_517` treated `..._EVERY` as arm B3
+  expected to buy nothing on top of the staged read — "buys nothing measurable"
+  is not "the consumer was removed". The #431 utilisation figure predates #517.
+  **The production boot recipe does NOT set it** (absent from
+  `startkommandos-rig.md`), so there is no dead knob misleading the next
+  operator. verdict. #431/#517/#599/#600 — VERIFIED
+  *Same bar1-vs-device asymmetry as the #673 finding that bar1's
+  `check_aborted` never consults `_abort_poll_active` — converged twice.*
+* **`kv_cache_dtype` has no int8 — #726 must CREATE the surface, not find it.**
+  Cross-reference for the INT8-KV IMMA-QK builder: the dtype surface does not
+  exist (choices at `server_args.py:1026`), the fp8 KV scale path is hard-coded
+  per-tensor, and the one per-group-scale precedent (`MHATokenToKVPoolFP4`)
+  dequantises eagerly before any backend sees it — copying it yields VRAM
+  savings but NOT the bandwidth savings an int8-KV lane exists for. Budget the
+  dtype plumbing as new work. dark / zero code. #489, #726 — VERIFIED (anchor),
+  UNVERIFIED-LEDGER (the FP4 precedent's eager dequant, from ANALYSE_726)
+* **`PhaseFlipStacks.refill` — rung-change cost is CONSTANT in distance.**
+  There is no cross-rank weight mover (`REACH_NO_WEIGHT_MOVER`,
+  `regime_stages.py:100`); the actuator is a whole-arena host->device memcpy, so
+  crossing one rung costs the same as crossing twelve (~1575 ms on measured
+  links). Ladder rungs are destinations, not stations. verdict. #704a — VERIFIED
+
+### 19.2 UNVERIFIED-LEDGER — leads, not facts
+
+Recorded so they are not re-derived from scratch; **open the code before acting.**
+
+* **`causal_conv1d_triton` int32 offset overflow** — 15+ sites doing int32
+  token-axis offset arithmetic; overflows at long context into silently wrong
+  rows, no crash. Upstream #33665 casts to `tl.int64` first.
+  `causal_conv1d_triton.py:93-94` (+14). exposed/unfixed, HIGH — UNVERIFIED-LEDGER
+* **`MixedLayoutError` / `ReadBufferPool` do not exist** — a prior brief's
+  premise; the real same-backend guard is `hiradix_cache.py:544-568`.
+  retracted premise. #545 — UNVERIFIED-LEDGER
+* **`max_req_input_len`** — hard cap `min(context_len-1, max_token_pool_size-1)`
+  INDEPENDENT of `--context-length`. `tp_worker.py:484-494`. shipped. #543
+* **`retract_decode` is unreachable from the admission path** — it lives in
+  `update_running_batch`, which runs AFTER `get_new_batch_prefill`; the
+  last-resort relief rung cannot fire during admission. `scheduler.py:5089`
+  vs `:5137`. verdict/gap. #679
+* **split-batch divergence rule** — under uneven DCP any value feeding a branch
+  or loop bound must be group-reduced, never rank-local. BINDING. #679/#603/#583
+* **`wired_relief_features()` returns empty on the production flag set** — the
+  #287 KV pressure ladder logs flips with `"no actuator declared"`; a validator
+  grepping only for "FLIP" reports working relief that does not exist.
+  `kv_ladder_auto.py:85-109`. code gap. #287/#363
+* **`RESTORE, NEVER REBUILD`** — a flip may pay COPY time, never BUILD time;
+  fenced by `test_restore_never_rebuild_677.py`. invariant. #677
+* **WARM rung mispriced ~2 orders of magnitude** — `registry/rungs.py:93-95`
+  charges 3-6 s graph recapture where a parked, already-captured stage costs a
+  40-85 ms VMM restore. defect in shipped code. #584-R9
+* **`bundled_profile()` silently loaded rig-1 VRAM numbers on any machine** —
+  survived 82 tests; fixed by required-arg + fingerprint gating.
+  `registry.py:248`. retracted/fixed, cautionary. #407
+* **`--speculative-draft-gpu` is CUDA-indexed** — deriving it from nvidia-smi
+  output silently places the draft head on the wrong card, no error.
+  `server_args.py:7274-7276`. hazard. (device-order trap, cf. §11)
+* **`--enable-deterministic-inference` costs +1664 MiB/rank unaccounted** —
+  ledger reads the env var before the backend rewrites it. `engine.py:293`. #515
+* **`is_generation` is process-global** — structurally blocks >1 multimodal
+  class per process. blocker. #333
+* **NCCL communicators cannot shrink/grow in place** — elastic membership is
+  QUIESCE→SNAPSHOT→RE-FORM→RESTORE→RESUME; reject in-place proposals on sight.
+  design only. #329
+* **"The roofline never ranks splits; measured points do."** BINDING. #216/#264
+* **Sequence-parallel (Ulysses/Ring) diffusion is ruled out on this rig** — SP
+  comms ~50x PipeFusion on PHB/no-P2P; not deployable at any share vector.
+  BINDING. #409
+* **GDN recurrent state cannot spill** — only KV spills on session offload;
+  architectural constraint, not a missing feature. BINDING. #363
+* **`preserve_thinking` is required for cache-hit reproducibility** — without
+  it the common prefix collapses 21/21 -> 10/21 tokens across turns; this is why
+  community chat templates were rejected. verdict. #542
+* **striped spill declined; non-reconstructible state must NEVER be striped** —
+  all tiers sit behind the one link the data must leave over. BINDING. #423
+
+### 19.3 Conflicting — (empty; the EVERY=32 conflict was settled 2026-08-17, see §19.1)
+
+### 19.4 Stale cross-reference found while sweeping
+
+* `ANALYSE_spill_matrix_20260804.md` §S1 said kvso and HiCache are mutually
+  exclusive. **FIXED 2026-08-17** in that doc (§S1 and the H15 matrix row both
+  marked SUPERSEDED, original text kept so the change is legible). The catalog
+  was correct throughout: #550 made it OPT-IN via `KVSO_ALLOW_HICACHE`
+  (`server_args.py:7502` — ANCHOR CORRECTION, the gate is not at :7385-7395),
+  with disjoint key spaces and one joint host-RAM budget guard.

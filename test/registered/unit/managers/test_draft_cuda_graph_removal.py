@@ -146,9 +146,7 @@ class TheWorkerThisRigActuallyRuns(unittest.TestCase):
 
     def _fake(self, server_args):
         calls = []
-        w = eagle_worker_v2.EagleDraftWorker.__new__(
-            eagle_worker_v2.EagleDraftWorker
-        )
+        w = eagle_worker_v2.EagleDraftWorker.__new__(eagle_worker_v2.EagleDraftWorker)
         w.server_args = server_args
         w._spec_solo_active = False
         w._spec_solo_is_host = True
@@ -181,18 +179,25 @@ class TheWorkerThisRigActuallyRuns(unittest.TestCase):
         where they live.
         """
         w, calls = self._fake(_args(disable_draft_cuda_graph=True))
-        with mock.patch.object(
-            eagle_worker_v2, "speculative_moe_backend_context",
-            lambda: contextlib.nullcontext(),
-        ), mock.patch.object(
-            eagle_worker_v2, "speculative_moe_a2a_backend_context",
-            lambda: contextlib.nullcontext(),
-        ), mock.patch.object(
-            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: True
+        with (
+            mock.patch.object(
+                eagle_worker_v2,
+                "speculative_moe_backend_context",
+                lambda: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                eagle_worker_v2,
+                "speculative_moe_a2a_backend_context",
+                lambda: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: True
+            ),
         ):
             w.init_cuda_graphs()
         self.assertNotIn(
-            "prefill", [c[0] for c in calls],
+            "prefill",
+            [c[0] for c in calls],
             "the draft prefill graph was captured despite the flag "
             "(check_cuda_graph_backend is forced True here so that this "
             "assertion can actually fail)",
@@ -203,14 +208,20 @@ class TheWorkerThisRigActuallyRuns(unittest.TestCase):
     def test_without_the_flag_the_override_still_captures(self):
         """Can-fail proof in the other direction: the default is untouched."""
         w, calls = self._fake(_args())
-        with mock.patch.object(
-            eagle_worker_v2, "speculative_moe_backend_context",
-            lambda: contextlib.nullcontext(),
-        ), mock.patch.object(
-            eagle_worker_v2, "speculative_moe_a2a_backend_context",
-            lambda: contextlib.nullcontext(),
-        ), mock.patch.object(
-            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: False
+        with (
+            mock.patch.object(
+                eagle_worker_v2,
+                "speculative_moe_backend_context",
+                lambda: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                eagle_worker_v2,
+                "speculative_moe_a2a_backend_context",
+                lambda: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: False
+            ),
         ):
             w.init_cuda_graphs()
         self.assertIn("draft", [c[0] for c in calls])
@@ -240,9 +251,7 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
             return "mindspore"
 
     def _fake(self, server_args):
-        w = eagle_worker_v2.EagleDraftWorker.__new__(
-            eagle_worker_v2.EagleDraftWorker
-        )
+        w = eagle_worker_v2.EagleDraftWorker.__new__(eagle_worker_v2.EagleDraftWorker)
         w.server_args = server_args
         w._spec_solo_active = False
         w._spec_solo_is_host = True
@@ -258,8 +267,10 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
         ):
             w._capture_cuda_graphs()
         self.assertEqual(
-            args.reads, [], "re-capture fell through the gate; a flip would "
-            "restore the draft graphs the boot asked to remove"
+            args.reads,
+            [],
+            "re-capture fell through the gate; a flip would "
+            "restore the draft graphs the boot asked to remove",
         )
         # The terminal state must match the shadow-rank path's: both
         # runners nulled, so every later `is None` check reads correctly.
@@ -314,11 +325,13 @@ class TheEagerRunnerMustStillExist(unittest.TestCase):
 
         r = self._runner(True)
         sentinel = object()
-        with mock.patch.object(
-            mr, "EagerRunner", lambda _self: sentinel
-        ), mock.patch.object(
-            mr.GraphSharedOutput, "create_for_model_runner",
-            staticmethod(lambda _self: "shared"),
+        with (
+            mock.patch.object(mr, "EagerRunner", lambda _self: sentinel),
+            mock.patch.object(
+                mr.GraphSharedOutput,
+                "create_for_model_runner",
+                staticmethod(lambda _self: "shared"),
+            ),
         ):
             r.init_cuda_graphs()
 
@@ -341,7 +354,8 @@ class TheEagerRunnerMustStillExist(unittest.TestCase):
         """
         r = self._runner(False)
         with mock.patch.object(
-            type(r), "_harmonize_cuda_graph_plan",
+            type(r),
+            "_harmonize_cuda_graph_plan",
             lambda _self: (_ for _ in ()).throw(RuntimeError("went past")),
         ):
             with self.assertRaisesRegex(RuntimeError, "went past"):

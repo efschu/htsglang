@@ -550,7 +550,7 @@ class VmmDraftWeightCarrier:
                 len(shared),
                 sum(v[0] for v in shared.values()) / _MIB,
                 ", ".join(
-                    f"{n} ({own/_MIB:.0f} MiB of a {st/_MIB:.0f} MiB storage)"
+                    f"{n} ({own / _MIB:.0f} MiB of a {st / _MIB:.0f} MiB storage)"
                     for n, (own, st) in biggest
                 ),
             )
@@ -832,7 +832,7 @@ def install_draft_weight_carrier(
     try:
         guaranteed = parse_purity(purity).decode_forbidden_in_pp
     except PhasePurityError:
-        # An unparseable mode is not a guarantee. Server-args validation is the
+        # An unparsable mode is not a guarantee. Server-args validation is the
         # place that reports WHY it is malformed; this guard must still fail in
         # its OWN currency, because callers catch PhaseFlipSpillError -- letting
         # a PhasePurityError through here changes the exception type a caller
@@ -1261,25 +1261,208 @@ def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
 def _cached_relief_estimate(device_index: int) -> int:
     """Bytes the tiers BELOW the KV rung could still return, on this rank.
 
-    On this rig that is torch's caching allocator, which holds 1028-1426 MiB
-    per card at idle. It is an UPPER bound on what ``empty_cache`` really
+    TAKEN, THEN MEASURED -- no longer estimated. This used to return
+    ``reserved - allocated``, an UPPER bound on what ``empty_cache`` really
     hands back (the allocator keeps whole segments it is still carving from),
-    and the overestimate is deliberate: it understates the KV ask, and
-    under-shrinking is retried while over-shrinking costs admission capacity
-    that bought nothing.
+    and the overestimate was deliberate on the argument that "under-shrinking
+    is retried while over-shrinking costs admission capacity that bought
+    nothing".
+
+    THAT ARGUMENT IS FALSIFIED. Under-shrinking is not retried: eight refusals
+    latch the direction "unfundable" and the instance holds in TP with tens of
+    thousands of tokens pending at 1000-1600 tok/s where the PP layout does
+    4000-7000. The rung's own trace had already recorded the mechanism -- the
+    deficit was NEGATIVE on 100 % of arms across two acceptance runs, and
+    dropping this term alone flipped every one of them positive by 260-832
+    MiB. An overstated subtraction is why the only rung that can pay real
+    bytes declined every single time it was asked.
+
+    So the cheap tier is RECLAIMED HERE, before the rung is asked, and the ask
+    is then sized against what the driver actually has. The reclaimed bytes
+    land in the driver's free column, which the rung probes directly, so this
+    function returns 0: subtracting them a second time is the double-count
+    that caused the defect. Reclaiming here rather than after the verdict is
+    the same reordering the guard already applies to this tier for the same
+    reason.
     """
     try:
         import torch
 
-        reserved = int(torch.cuda.memory_reserved(device_index))
-        allocated = int(torch.cuda.memory_allocated(device_index))
-        return max(0, reserved - allocated)
+        before = int(torch.cuda.mem_get_info(device_index)[0])
+        torch.cuda.empty_cache()
+        after = int(torch.cuda.mem_get_info(device_index)[0])
+        returned = max(0, after - before)
+        if returned:
+            logger.info(
+                "%s cheap tier taken before the KV ask: %.0f MiB returned to "
+                "the driver, so the rung sizes against real free memory "
+                "instead of an upper bound on this tier",
+                LOG_PREFIX,
+                returned / (1024 * 1024),
+            )
+        # Already in the free column the rung probes. Counting it again is the
+        # subtraction that made the rung decline on every arm.
+        return 0
     except Exception:
         return 0
 
 
-#: The only leg on which the KV rung may shrink. See the driver's docstring.
+#: The leg on which the KV rung shrinks WITHOUT QUESTION. See the driver's
+#: docstring.
 KV_RELIEF_DIRECTION = "pp_to_tp"
+
+#: #662: may the rung ALSO fund the ``tp_to_pp`` leg?
+#:
+#: It must, or that leg has no funder at all. Measured on metal 2026-08-15,
+#: max-KV vector, corridor at its law: every tp_to_pp arm abandoned with
+#: "seam entry margin short: want 2194 MiB, free 2892 -> 3098 MiB, reclaimed
+#: 206 MiB from [allocator-cache]" -- 206 MiB of torch cache against a
+#: 2194 MiB ask, because the exclusion below set ``relief = None`` and
+#: allocator-cache is the only other tier that pays. Eight such abandons
+#: install the "seam unfundable" guard and THE INSTANCE NEVER ENTERS THE
+#: PREFILL LAYOUT AGAIN -- which is exactly the reported defect: long
+#: prompts prefilled at TP speed because the stack could not leave TP.
+#:
+#: The original exclusion's reasoning is sound about COST and wrong about
+#: necessity. It says a shrink here "would be undone within the same flip"
+#: by the post-cutover ``recover_kv_backing``. True -- and that undo is the
+#: price of the flip happening at all. A cuMemCreate on the recovery path is
+#: strictly better than a phase the instance can never reach.
+#:
+#: THE POOL IS INACTIVE AT THIS POINT, which is what makes it safe. The gate
+#: runs BEFORE the cutover, so during the TP phase the PP layout's pool is
+#: holding nothing and its backing is spendable -- the same argument the
+#: pp_to_tp leg already makes about the TP phase. On this rig the pp_to_tp
+#: leg had already left it at 413910 rows against a floor of 635, so the
+#: bytes the tp_to_pp seam needed were sitting there unbacked-by-anything
+#: and simply unreachable.
+#:
+#: 0 restores the shipped one-leg behaviour exactly, as a VALUE of the same
+#: term rather than a second code path.
+ENV_FUND_TP_TO_PP = "SGLANG_SEAM_FUND_TP_TO_PP"
+
+
+def _may_fund_tp_to_pp() -> bool:
+    return os.environ.get(ENV_FUND_TP_TO_PP, "1") not in ("0", "false", "False")
+
+
+#: #662-F4: WHICH SEAM DIRECTIONS MUST BE TREATED AS UNFUNDABLE.
+#:
+#: A FAULT INJECTION, and the only one in this file. It exists because the
+#: decode-stall SLO valve added in 1d1dbf9dba cannot be reached on metal by
+#: any honest configuration. The invariant it guards -- decodes are never held
+#: past the SLO by a funding failure -- needs the instance to be IN the PP
+#: layout, with a decode resident, while ``pp_to_tp`` cannot be funded. Every
+#: lever tried on 2026-08-15 made BOTH directions unfundable at once, so the
+#: instance never entered PP and the shape under test never occurred:
+#:
+#:   rung disabled globally -> pp_to_tp funded from the allocator cache
+#:                             anyway, and (because ``refusal_is_fatal`` opens
+#:                             the host tier for exactly this leg) from system
+#:                             RAM as well. Six flips DONE, nothing held.
+#:   arming floor raised    -> tp_to_pp was blocked with it, the instance
+#:                             rested in TP, and decode was never held at all.
+#:
+#: That is the catch-22 this term ends, and the property it needed is
+#: DIRECTION. With ``pp_to_tp`` named here, tp_to_pp still funds and the
+#: instance enters PP the ordinary way; the return leg then refuses, decode is
+#: held, and the SLO is the only thing left that can free it.
+#:
+#: WHAT IT DOES NOT DO, stated because a proof is worth only the mechanism it
+#: exercises. It does not simulate a card with no memory: the ladder still
+#: runs and still spends. It overrides the VERDICT the gate reached, at the
+#: single point where that verdict becomes the group's, so everything
+#: downstream is the real abandon path -- the same ``too_small`` vote, the
+#: same unanimous MIN, the same FLIP ABANDONED log, the same per-direction
+#: refusal hold and backoff. What is injected is the refusal; what is proven
+#: is what the system does with one.
+#:
+#: NOT A SERVING SETTING. Unset is the default and changes nothing.
+ENV_SEAM_UNFUNDABLE = "SGLANG_SEAM_UNFUNDABLE_DIRECTIONS"
+
+#: Resolved sets, keyed by the raw value, so the parse happens once per
+#: distinct setting rather than once per seam.
+_UNFUNDABLE_CACHE: dict = {}
+
+
+def _parse_unfundable(raw: str) -> frozenset:
+    """The named directions, or an EMPTY set on anything unrecognised.
+
+    AN UNPARSABLE VALUE INJECTS NOTHING, and does not raise. This term is
+    read on the seam's no-return path, where ``_abandon_parked_flip`` states
+    the law: a raise from inside a cutover climbs into the event loop and
+    takes the instance down. Refusing to guess is the gate's own currency --
+    it declines to object -- and the ERROR below is what stops that being
+    silent. An operator who mistypes a direction gets a healthy instance and
+    a log line saying the injection is not armed, which is the failure a
+    proof boot can notice; the alternative fails the whole instance to
+    protect a diagnostic.
+    """
+    from sglang.srt.managers.phase_policy import PP_TO_TP, TP_TO_PP
+
+    known = {PP_TO_TP, TP_TO_PP}
+    names = {part.strip() for part in str(raw).split(",")}
+    names.discard("")
+    unknown = sorted(names - known)
+    if unknown:
+        logger.error(
+            "%s %s names %s, which is not a flip direction; the unfundable "
+            "injection is NOT armed. Valid directions are %s.",
+            LOG_PREFIX,
+            ENV_SEAM_UNFUNDABLE,
+            ", ".join(repr(u) for u in unknown),
+            ", ".join(sorted(known)),
+        )
+        return frozenset()
+    return frozenset(names)
+
+
+def unfundable_seam_directions() -> frozenset:
+    """The configured set, announced ONCE when it is non-empty.
+
+    The announcement is not decoration. This corpus has shipped seven terms
+    that were present and inert, and a fault injection is the worst possible
+    place for that: an unarmed injection makes a flip that funded normally
+    look like the proof of a valve that never fired. So an armed injection
+    says so in the boot log, by name.
+    """
+    raw = os.environ.get(ENV_SEAM_UNFUNDABLE, "")
+    if not raw.strip():
+        return frozenset()
+    if raw not in _UNFUNDABLE_CACHE:
+        resolved = _parse_unfundable(raw)
+        _UNFUNDABLE_CACHE[raw] = resolved
+        if resolved:
+            logger.warning(
+                "%s [#662-F4 UNFUNDABLE-SEAM] ARMED for %s: every flip in "
+                "%s direction will be refused by the group as if no tier "
+                "could pay for it. This is a fault injection for the "
+                "decode-stall SLO proof and must not be set on an instance "
+                "that is meant to serve.",
+                LOG_PREFIX,
+                ", ".join(sorted(resolved)),
+                "that" if len(resolved) == 1 else "either",
+            )
+    return _UNFUNDABLE_CACHE[raw]
+
+
+def seam_unfundable_objection(direction: str) -> Optional[str]:
+    """The injected objection for ``direction``, or None.
+
+    Returns a string in the same currency as the corridor gate's own refusal
+    -- one clause naming why the seam may not enter -- so it joins
+    ``too_small`` and votes exactly like a refusal the gate reached itself.
+    It deliberately does NOT carry ``SEAM_MARGIN_DELAY_TAG``: a margin delay
+    is a bounded wait the seam retries out of, while what is being injected
+    is a funding failure, and calling it a delay would prove the wrong thing.
+    """
+    if str(direction) not in unfundable_seam_directions():
+        return None
+    return (
+        f"{direction} is configured unfundable by {ENV_SEAM_UNFUNDABLE} "
+        f"(fault injection for the decode-stall SLO proof), so the group "
+        f"refuses this seam whatever the ladder returned"
+    )
 
 
 def collective_kv_backing_relief(
@@ -1364,7 +1547,7 @@ def collective_kv_backing_relief(
     # cannot silently disable it, which is exactly how the recovery came to be
     # rank-local in the first place.
     cap_relief = relief
-    if str(direction) != KV_RELIEF_DIRECTION:
+    if str(direction) != KV_RELIEF_DIRECTION and not _may_fund_tp_to_pp():
         # ONE LEG ONLY, and the asymmetry is structural rather than cautious.
         #
         # The scheduler's KV pool is the PP LAYOUT'S pool. Capping it on the
@@ -1594,6 +1777,47 @@ def _late_bound_draft_provider(scheduler: Any):
     return free_up_to
 
 
+def _measured_seam_draw_mib(scheduler: Any, server_args: Any) -> int:
+    """This rank's MEASURED seam draw in MiB, or 0 when none is on record.
+
+    The seam reserve already measures and persists exactly this: the arena
+    tail the cutover must re-commit plus the drafter's restore, both one-shot
+    draws that happen while the seam runs. The gate's arming floor is defined
+    as the law plus that draw, so reading it here is not a new measurement --
+    it is the existing one finally reaching the number it was written for.
+
+    Zero on anything unreadable: a cold boot with no record, no runtime, no
+    rank. Zero leaves the shipped 512 MiB allowance in force, which is the
+    previous behaviour exactly and the safe direction for a term that can only
+    RAISE the floor.
+    """
+    try:
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        runtime = getattr(scheduler, "phase_flip_runtime", None)
+        rank = getattr(runtime, "_rank", None)
+        if rank is None or server_args is None:
+            return 0
+        reserve = seam.read_seam_reserve(server_args, int(rank))
+        if reserve is None or not reserve.active:
+            return 0
+        # #678: THE DRAW OF ONE LEG, not the sum of two cross-leg maxima.
+        # total_fixed_bytes adds the arena tail (committed only on tp_to_pp)
+        # to the drafter's restore (committed only on pp_to_tp) and so prices
+        # a commit no seam makes -- 1595 MiB on this rig's rank 2 against a
+        # worst leg of 1456. The sizer reads the same accessor, so the gate
+        # and the pool cannot disagree about the number.
+        return int(reserve.arming_draw_bytes()) // (1 << 20)
+    except Exception as e:  # noqa: BLE001 - sizing must not raise
+        logger.warning(
+            "%s could not read this rank's measured seam draw (%s); the gate "
+            "arms on the shipped allowance instead",
+            LOG_PREFIX,
+            e,
+        )
+        return 0
+
+
 def get_corridor_guard(scheduler: Any):
     """The rank's spill-before-alloc gate (#656 items 15a/15b/16), built once.
 
@@ -1648,7 +1872,34 @@ def get_corridor_guard(scheduler: Any):
         server_args, "phase_flip_corridor_floor_mib", None
     )
     law_mib = cg.corridor_law_mib()
-    floor_mib = int(configured) if configured else cg.arming_floor_mib(law_mib=law_mib)
+    # #662: THE RESERVE IS A MEASURED DRAW WHERE ONE EXISTS, and this rig has
+    # one. `arming_floor_mib`'s own docstring says the reserve is "the MEASURED
+    # draw a seam makes while it runs, where a measurement exists; the default
+    # is the shipped allowance" -- but nothing was passing the measurement, so
+    # the default 512 MiB was used on every boot that had a seam record sitting
+    # on disk with the real number in it.
+    #
+    # Measured here 2026-08-15: the seam's own record puts the fixed draw at
+    # 954 MiB on rank1 and 1595 MiB on rank2 (arena tail plus draft restore),
+    # against a gate arming at 1024 + 512 = 1536. The gap between 1536 and
+    # 1024 + 954 is exactly where the breach lived -- gpu0 reached 935 MiB at
+    # the `weights_refill` stage while every allocation had cleared the gate.
+    # That is the failure the threshold-pair log line below predicts in words
+    # and the corridor audit predicts in its own text ("the arming floor is
+    # the number to re-derive").
+    #
+    # HIGHEST WINS, never lowest. A raised arming floor makes the gate work
+    # EARLIER and can only over-reclaim; a floor below the real draw launders
+    # breaches as passed checks. So a configured value may raise the derived
+    # one and may not lower it.
+    measured_draw_mib = _measured_seam_draw_mib(scheduler, server_args)
+    derived_mib = cg.arming_floor_mib(
+        seam_entry_reserve_mib=max(
+            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, measured_draw_mib
+        ),
+        law_mib=law_mib,
+    )
+    floor_mib = max(int(configured) if configured else 0, derived_mib)
     cg.check_threshold_pair(floor_mib, law_mib)
     logger.warning(
         "%s THRESHOLD PAIR on device %d: corridor LAW %d MiB (the verdict, "
@@ -1664,7 +1915,16 @@ def get_corridor_guard(scheduler: Any):
         law_mib,
         floor_mib,
         floor_mib - law_mib,
-        f" (set by {CORRIDOR_FLOOR_ENV})" if configured else " (derived)",
+        (
+            f" (set by {CORRIDOR_FLOOR_ENV})"
+            if configured and int(configured) >= derived_mib
+            else (
+                f" (derived from this rank's MEASURED seam draw of "
+                f"{measured_draw_mib} MiB)"
+                if measured_draw_mib
+                else " (derived)"
+            )
+        ),
     )
     guard = cg.CorridorGuard(
         int(device_index),

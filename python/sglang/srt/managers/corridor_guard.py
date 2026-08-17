@@ -196,6 +196,46 @@ def corridor_law_bytes() -> int:
     return corridor_law_mib() * _MIB
 
 
+#: THE CORRIDOR IS A BAND, NOT A POINT (user relaxation, 2026-08-15).
+#:
+#: The law was stated as "~1024 MiB free per card, best-filled", and both
+#: halves were being read as an exact target: a sample at 1000 MiB counted as
+#: a breach and a card resting at 2500 MiB counted as over-filled. Neither
+#: reading is what the number is for. The operator's relaxation makes the
+#: tolerance explicit at +-20 %, which is what lets the boot-time gate and the
+#: planner solve be simple: a solve that has to land on a point has no
+#: feasible region, and one that has to land in a band does.
+#:
+#: The centre stays the target -- the self-correcting margin pulls back to it,
+#: because a mechanism that aims at the edge of its own tolerance has none.
+#: The FLOOR is the verdict: below it is a breach, and nothing inside the band
+#: is. Measured consequence on this rig: the cutover transient at the
+#: `weights_refill` stage bottomed at 895-935 MiB on gpu0, which is inside the
+#: band, so that class stops being chased.
+CORRIDOR_BAND_FRACTION = 0.20
+
+
+def corridor_band_floor_mib() -> int:
+    """Below this is a breach. The law minus its tolerance."""
+    law = corridor_law_mib()
+    return int(law - law * CORRIDOR_BAND_FRACTION)
+
+
+def corridor_band_ceiling_mib() -> int:
+    """Above this at REST is over-filled: VRAM buying no tokens.
+
+    The second half of "best-filled", and the one a boot-time gate needs in
+    order to refuse a configuration that leaves gibibytes idle.
+    """
+    law = corridor_law_mib()
+    return int(law + law * CORRIDOR_BAND_FRACTION)
+
+
+def corridor_band_mib():
+    """``(floor, centre, ceiling)`` -- the whole band in one read."""
+    return corridor_band_floor_mib(), corridor_law_mib(), corridor_band_ceiling_mib()
+
+
 def arming_floor_mib(
     seam_entry_reserve_mib: int = DEFAULT_SEAM_ENTRY_RESERVE_MIB,
     law_mib: int = CORRIDOR_LAW_MIB,
@@ -207,8 +247,17 @@ def arming_floor_mib(
     Deriving it means an operator cannot raise one number and leave the
     other behind, which is the failure this function exists to make
     impossible.
+
+    BUILT ON THE BAND FLOOR, not the centre. The gate exists to keep the
+    worst instant out of breach, and breach is now defined at
+    :func:`corridor_band_floor_mib`. Arming from the centre instead would
+    reserve the band's whole tolerance on top of the seam's draw on every
+    card, for every boot -- roughly 205 MiB per rank here -- which is pool
+    given up to protect a threshold that is not the verdict. The centre is
+    what the self-correcting margin aims at; the floor is what the gate
+    defends.
     """
-    return int(law_mib) + max(0, int(seam_entry_reserve_mib))
+    return corridor_band_floor_mib() + max(0, int(seam_entry_reserve_mib))
 
 
 def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> None:
@@ -219,7 +268,7 @@ def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> No
     laundering a breach as a passed check, which is the one thing its own
     refusal message says it must never do.
     """
-    if int(arming_mib) < int(law_mib):
+    if int(arming_mib) < corridor_band_floor_mib():
         raise ValueError(
             f"corridor arming floor {arming_mib} MiB is BELOW the corridor "
             f"law {law_mib} MiB. The gate would clear allocations the law "
@@ -396,6 +445,10 @@ class GuardResult:
     reclaimed: int
     used_providers: Tuple[str, ...]
     detail: str = ""
+    #: The verdict HELD but the residual sits under the corridor law. Carried
+    #: so the caller can WARN (user decision 2026-08-16: the law is advisory
+    #: at seam entry, and a dip has to be sayable to be warned about).
+    law_breached: bool = False
 
     @property
     def reclaimed_mib(self) -> float:
@@ -552,6 +605,7 @@ class CorridorGuard:
         reason: str = "",
         raise_on_refusal: bool = False,
         refusal_is_fatal: bool = False,
+        must_reclaim: bool = False,
     ) -> GuardResult:
         """Make ``want_bytes`` allocatable without breaching the floor.
 
@@ -579,7 +633,14 @@ class CorridorGuard:
         # allocation that is ABOUT to happen, which is the entire difference
         # between this and a threshold observer: after the fact, a breach has
         # already been recorded by a 100 ms sampler and cannot be undone.
-        if free_before - want >= self.floor_bytes:
+        # #689: THIS BRANCH IS WHERE THE FALSE SUCCESS RETURNED. Telling a
+        # caller "no reclaim needed" is correct for an allocator about to
+        # allocate `want`, and misleading for one that already accounted the
+        # free column and needs this ladder to RELEASE more -- the 12:29 seam
+        # asks returned here three times, ok=True, having freed nothing, while
+        # spendable sat at 609 against a need of 788. Under must_reclaim the
+        # ladder actually runs and the verdict is the measured delta.
+        if free_before - want >= self.floor_bytes and not must_reclaim:
             return GuardResult(
                 True, free_before, free_before, want, 0, (), "no reclaim needed"
             )
@@ -588,6 +649,15 @@ class CorridorGuard:
         # Free to the UPPER watermark, not merely to the floor, so the next
         # few allocations do not each pay a spill.
         target = self.floor_bytes + self.delta_bytes + want
+        if must_reclaim:
+            # #689 THE TARGET IS RELATIVE UNDER must_reclaim. The ladder spends
+            # only against a DEFICIT (`deficit = target - free_now`), so with
+            # 1428 MiB free and a 178 MiB ask there is no deficit and it
+            # correctly spends nothing -- which is why the 12:29 asks freed
+            # zero. A caller that already accounted the free column is asking
+            # for `want` MORE bytes, so the target has to be measured from
+            # where the column stands now, not from the floor.
+            target = max(target, free_before + want)
         # Item 16: read the fleet ONCE, before spending. Re-reading it after
         # each provider would let a rebalance that just filled a peer card
         # close the host gate mid-ladder on the strength of its own effect,
@@ -607,19 +677,81 @@ class CorridorGuard:
         )
 
         self.reclaimed_total += reclaimed
-        # Judged against the LAW, not the arming watermark: see __init__.
-        ok = (free_now - want) >= self.law_floor_bytes
+        # USER DECISION 2026-08-16: THE LAW IS ADVISORY HERE, OOM IS NOT.
+        #
+        # This line used to read `ok = (free_now - want) >= law_floor_bytes`,
+        # and that single comparison produced the 06:47:48 wedge: PP1's want
+        # of 2163 MiB FIT inside 2456 MiB free, but the 293 MiB residual sat
+        # under the law, so the seam was refused 76 times in a row while
+        # 727004 tokens waited on an idle GPU. It protected a few hundred MiB
+        # of headroom by stopping the machine.
+        #
+        # The ~1024 line exists because the planner was not filling VRAM well
+        # enough. It is a FILL-QUALITY target and it remains the planner's
+        # job; it was never a safety device, and it may not block, delay or
+        # refuse anything on its own. What it still does is SPEAK: a dip is
+        # carried out on the verdict and warned about by the caller.
+        #
+        # WHAT STAYS HARD is the only thing that was ever unsurvivable -- an
+        # allocation larger than free. That is not a corridor dip, it is an
+        # OOM, and softening it would trade a warning for a dead worker.
+        ok = free_now >= want
+        law_breached = ok and (free_now - want) < self.law_floor_bytes
         if not ok:
             self.refuse_count += 1
-        if host_blocked and not ok:
+        # COUNTED WHEN IT MATTERED, and "mattered" is no longer the same as
+        # "refused". Since the law stopped gating (2026-08-16), a withheld
+        # host tier usually ends in a verdict that HOLDS but dips under the
+        # law -- item 16's decision is exactly as consequential as before, so
+        # a counter keyed on refusal alone would silently stop recording it.
+        if host_blocked and (not ok or law_breached):
             self.host_blocked_count += 1
         detail = (
-            f"want {want/_MIB:.0f} MiB, free {free_before/_MIB:.0f} -> "
-            f"{free_now/_MIB:.0f} MiB, reclaimed {reclaimed/_MIB:.0f} MiB "
+            f"want {want / _MIB:.0f} MiB, free {free_before / _MIB:.0f} -> "
+            f"{free_now / _MIB:.0f} MiB, reclaimed {reclaimed / _MIB:.0f} MiB "
             f"from [{', '.join(used) or 'nothing'}], arming floor "
-            f"{self.floor_bytes/_MIB:.0f} MiB, corridor law "
+            f"{self.floor_bytes / _MIB:.0f} MiB, corridor law "
             f"{self.law_floor_mib} MiB" + (f" ({reason})" if reason else "")
         )
+        # #689 A RECLAIM ASK IS JUDGED BY WHAT MOVED.
+        #
+        # ``free_now >= want`` asks "is want allocatable", which is exactly
+        # right for an allocator about to allocate it -- every existing caller
+        # is one, so their verdict is untouched and must_reclaim defaults off.
+        #
+        # It is the WRONG question for a caller that already accounted the
+        # memory and needs this ladder to FREE more. Measured 2026-08-16
+        # 12:29, three consecutive seam asks on the binding rank:
+        #     asked the corridor guard for 178 MiB (pp_to_tp): ok=True,
+        #     spendable now 609 MiB against a need of 788 MiB
+        # 609 never moved. With 1428 MiB of driver-free, "are 178 MiB free"
+        # was trivially true while the ladder reclaimed nothing, so the seam
+        # was told it was funded and abandoned anyway. A success that is true
+        # of the world before the call is not a report about the call.
+        #
+        # It also propagates: fundable_width's pre-arm picture is built from
+        # what this returns, so an optimistic guard forms a window the seam
+        # cannot carry and moves the failure later, into an abandon.
+        if must_reclaim and ok and reclaimed < want:
+            ok = False
+            # THE MESSAGE MUST NOT QUOTE TERMS IT DID NOT JUDGE. The default
+            # verdict weighs free against the floor; this one does not weigh
+            # them at all, and a refusal that recites "free 2518, arming floor
+            # 1536, corridor law 1024" next to "want 6" reads as an inversion
+            # -- it was reported as one. Under must_reclaim the ONLY quantities
+            # in the verdict are asked-vs-reclaimed, so those are the only ones
+            # stated, with the reason the free column is irrelevant here.
+            detail = (
+                f"want {want / _MIB:.0f} MiB INCREMENTAL, reclaimed "
+                f"{reclaimed / _MIB:.0f} MiB from "
+                f"[{', '.join(used) if used else 'nothing'}] "
+                f"({reason}). REFUSED under must_reclaim, which judges the "
+                f"DELTA and nothing else: the caller has already accounted the "
+                f"free column and is asking this ladder to RELEASE more, so "
+                f"free memory it did not release cannot fund the ask and is "
+                f"not weighed. Providers available: "
+                f"{', '.join(self.providers) or 'none'}"
+            )
         if host_forced and used_host:
             detail += (
                 "; host tier admitted on an UNLEVEL fleet because refusal "
@@ -643,7 +775,21 @@ class CorridorGuard:
             clause = describe_water_fill(column)
             if clause:
                 detail += f". {clause}"
-        if ok:
+        if ok and law_breached:
+            self.law_dip_count = getattr(self, "law_dip_count", 0) + 1
+            logger.warning(
+                "%s CANNOT FULLY HOLD THE CORRIDOR FLOOR through this seam "
+                "entry on device %d: predicted trough %d MiB below the %d MiB "
+                "law. PROCEEDING -- the law is a fill-quality target, not a "
+                "gate (user decision 2026-08-16), and the allocation itself "
+                "fits, so this is a dip and not an OOM. %s",
+                LOG_PREFIX,
+                self.device_index,
+                (self.law_floor_bytes - (free_now - want)) / _MIB,
+                self.law_floor_mib,
+                detail,
+            )
+        elif ok:
             logger.info(
                 "%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail
             )
@@ -660,7 +806,14 @@ class CorridorGuard:
             if raise_on_refusal:
                 raise CorridorBreachRefused(f"{LOG_PREFIX} {detail}")
         return GuardResult(
-            ok, free_before, free_now, want, reclaimed, tuple(used), detail
+            ok,
+            free_before,
+            free_now,
+            want,
+            reclaimed,
+            tuple(used),
+            detail,
+            law_breached=law_breached,
         )
 
     # -- the ladder, shared by the gate and the lender ---------------------
@@ -827,13 +980,13 @@ class CorridorGuard:
         # lend with any memory ANOTHER process released between the two
         # probes. It over-reports in the permissive direction.
         detail = (
-            f"lent {measured/_MIB:.0f} MiB of a {bound/_MIB:.0f} MiB "
-            f"water-fill bound, free {free_before/_MIB:.0f} -> "
-            f"{free_now/_MIB:.0f} MiB, from [{', '.join(used) or 'nothing'}], "
+            f"lent {measured / _MIB:.0f} MiB of a {bound / _MIB:.0f} MiB "
+            f"water-fill bound, free {free_before / _MIB:.0f} -> "
+            f"{free_now / _MIB:.0f} MiB, from [{', '.join(used) or 'nothing'}], "
             f"column {[int(f // _MIB) for f in column]} MiB, spread "
             f"{free_spread_mib(column)} MiB"
             + (
-                f" (providers claimed {claimed/_MIB:.0f} MiB)"
+                f" (providers claimed {claimed / _MIB:.0f} MiB)"
                 if claimed != measured
                 else ""
             )

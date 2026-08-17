@@ -616,6 +616,7 @@ class PrefillAdder:
         prefill_spill_regions: int = 0,
         prefill_spill_region_tokens: int = 0,
         prefill_spill_deep: bool = False,
+        fundable_extend_floor: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -645,6 +646,31 @@ class PrefillAdder:
         # the identical decision (no divergent prefill batch -> no forward
         # desync). 0 on the default path -> byte-identical.
         self.dcp_avail_deficit = dcp_avail_deficit
+        # #681: what the GROUP can actually fund this iteration, or None when
+        # nothing was published (single rank, or pools that agree -> the
+        # default path, where this is inert by construction).
+        #
+        # WHY THE NEW-REQUEST PATH NEEDS ITS OWN CEILING. #679 taught the
+        # CHUNKED gate to park on `fundable_extend_tokens`, which reads the
+        # group MIN via `uniform_avail_for_evict`. `rem_total_tokens` below
+        # never learned that lesson: it reads THIS RANK's availability, so a
+        # rank roomier than the binding one admits work the group cannot pay
+        # and the batch dies in `alloc_for_extend` (2026-08-16 01:46:10, all
+        # three ranks). It is also a rank-local BRANCH upstream of a
+        # collective, which splits the group into different batch shapes --
+        # a hang rather than a stall, the family #583/#603/#616g/#639 paid for.
+        #
+        # A CEILING, NOT A SUBSTITUTE. `rem_total_tokens` also subtracts
+        # reservations this floor knows nothing about (the running batch's
+        # hold, mamba gap, page overhead). Replacing the local term with the
+        # floor would talk a rank that is ITSELF short back UP. The budget is
+        # therefore the MIN of the two, and both spend down the same
+        # `rem_total_token_offset` -- a floor consulted per request without
+        # that shared accounting is not a bound at all, since every request in
+        # the round would compare itself against the same untouched pool.
+        self.fundable_extend_floor = (
+            None if fundable_extend_floor is None else int(fundable_extend_floor)
+        )
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -803,10 +829,21 @@ class PrefillAdder:
             )
         # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
         # the budget to the binding rank's available_size -> rank-uniform.
-        return (
+        local_budget = (
             available_and_evictable
             - self.rem_total_token_offset
             - self.dcp_avail_deficit
+        )
+        # #681: cap by what the GROUP can fund. The floor is already the
+        # group MIN (`uniform_avail_for_evict`), so `dcp_avail_deficit` -- the
+        # other mechanism for pinning a local number to the binding rank -- is
+        # deliberately NOT subtracted a second time here. `rem_total_token_offset`
+        # IS, so the floor is spent down by this round's admissions exactly as
+        # the local term is. None -> no reduce published -> untouched.
+        if self.fundable_extend_floor is None:
+            return local_budget
+        return min(
+            local_budget, self.fundable_extend_floor - self.rem_total_token_offset
         )
 
     @property
@@ -1162,7 +1199,58 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
                     return req
-                _rem_tokens = self.rem_chunk_tokens
+                # #679: DO NOT SCHEDULE A CHUNK THE POOL CANNOT FUND.
+                #
+                # Overriding a zero budget with ``rem_chunk_tokens`` is what
+                # killed the instance at 23:41:01. The budget said nothing was
+                # available, this line admitted a 512-token chunk anyway,
+                # ``alloc_token_slots`` found available 0 / evictable 0, its
+                # only relief (evict_from_tree_cache) was a no-op with nothing
+                # evictable, and the hard RuntimeError took all three ranks
+                # down together. The override exists for a real reason -- a
+                # chunked request that leaves this function unhandled leaks --
+                # but "admit it anyway" is not the only way to keep it.
+                #
+                # PARKING IS ALREADY A FIRST-CLASS STATE. The hybrid-SWA branch
+                # above returns the request unmodified, and the scheduler
+                # documents the result at the chunked-request stash: a parked
+                # chunk "leaves extend_range.end == len(prefix_indices), so
+                # there is nothing new to cache and stashing would be a no-op".
+                # So the request stays the chunked request, is retried next
+                # round, and nothing leaks -- the same contract, without the
+                # allocation that cannot succeed.
+                #
+                # THE PREDICATE IS GROUP-UNIFORM. ``fundable_extend_tokens``
+                # reads the published availability floor rather than this
+                # rank's own, so every rank parks on the same iteration.
+                # Deciding this from a rank-local size would split the group
+                # across different batches, which is a hang rather than a
+                # stall.
+                from sglang.srt.mem_cache.common import (
+                    chunk_tokens_the_pool_can_fund,
+                    fundable_extend_tokens,
+                )
+
+                fundable = fundable_extend_tokens(self.tree_cache)
+                grant = chunk_tokens_the_pool_can_fund(
+                    fundable, self.page_size, self.rem_chunk_tokens
+                )
+                if grant <= 0:
+                    req.set_extend_range(
+                        len(req.prefix_indices), len(req.prefix_indices)
+                    )
+                    logger.warning(
+                        "chunked prefill PARKED: the pool can fund %d tokens, "
+                        "below one page (%d). The request keeps its place and "
+                        "is retried when memory frees; admitting it here is "
+                        "what took the instance down on 2026-08-15.",
+                        fundable,
+                        self.page_size,
+                    )
+                    return req
+                # Fundable, but only just: take what the pool can actually
+                # give rather than the nominal chunk size.
+                _rem_tokens = grant
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices

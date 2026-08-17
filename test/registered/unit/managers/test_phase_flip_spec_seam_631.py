@@ -278,9 +278,7 @@ def test_can_fail_seam_built_on_the_resident_harvest_leaves_the_crash_live():
     # reach misses it entirely.
     running2 = real_batch(["r2"], spec_info=None)
     last2 = real_batch(["l2"], spec_info=draft_input(bs=1))
-    sched2 = scheduler_at_cutover(
-        running2, last_batch=last2, running_mbs=[running2]
-    )
+    sched2 = scheduler_at_cutover(running2, last_batch=last2, running_mbs=[running2])
     for batch in harvest_resident_batches(sched2):
         batch.spec_info = None
     assert last2.spec_info is not None, "narrow reach must miss last_batch"

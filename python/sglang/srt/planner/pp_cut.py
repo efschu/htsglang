@@ -85,8 +85,11 @@ builds those numbers from ``PerfCostModel`` lives in ``pp_cut_adapter.py``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+import os
+import re
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "LAYER_FAMILY_ATTENTION",
@@ -201,6 +204,17 @@ class RankResources:
     #: measured value; left at zero the verdict is a residency verdict again
     #: and says nothing about runnability.
     seam_staging_mib: float = 0.0
+
+    #: #602: what the NEXTN / draft runner actually costs this rank, NET of
+    #: the measured inter-runner overlap credit. See
+    #: :func:`draft_residency_from_flight`, which is where this should come
+    #: from -- the raw ``weights_draft`` post is the WRONG number and charging
+    #: it prices the running configuration as infeasible.
+    #:
+    #: ``None`` means NOT MEASURED, which is not the same as zero and is
+    #: refused by ``PPCutInputs`` whenever a draft runner is declared present.
+    #: Zero is reserved for "this deployment has no draft runner".
+    draft_residency_mib: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.attn_bw_gbs <= 0.0:
@@ -394,10 +408,34 @@ class PPCutInputs:
     #: Free VRAM that must remain on every card. The rig's standing corridor.
     corridor_mib: float = 1024.0
 
+    #: #602: does this deployment run a NEXTN / draft runner? Declaring it
+    #: makes ``RankResources.draft_residency_mib`` MANDATORY on every rank.
+    #:
+    #: THE FLAG EXISTS SO ABSENCE CANNOT BE MISTAKEN FOR ZERO (#606). Both
+    #: readings are legitimate -- a deployment may genuinely have no draft
+    #: runner -- and they are numerically identical, so only the caller can
+    #: separate them. Leaving the term unset while a draft runner is in fact
+    #: resident is what produced a solver that priced 18 GiB of weights at
+    #: nothing; requiring the declaration turns that into a refusal at
+    #: construction instead of a confident wrong answer at the end.
+    draft_runner_present: bool = False
+
     def __post_init__(self) -> None:
         n = len(self.layer_families)
         if n == 0:
             raise ValueError("PPCutInputs: layer_families is empty.")
+        if self.draft_runner_present:
+            missing = [r.label for r in self.ranks if r.draft_residency_mib is None]
+            if missing:
+                raise ValueError(
+                    "PPCutInputs: draft_runner_present=True but "
+                    f"draft_residency_mib is not measured on rank(s) {missing}. "
+                    "Supply it from draft_residency_from_flight() -- the NET "
+                    "figure, weights_draft minus the inter-runner overlap "
+                    "credit. Defaulting it to zero here would price a resident "
+                    "draft runner at nothing, which is the calibration defect "
+                    "this flag exists to prevent."
+                )
         bad = sorted(
             set(self.layer_families) - {LAYER_FAMILY_ATTENTION, LAYER_FAMILY_LINEAR}
         )
@@ -490,6 +528,23 @@ class StageCost:
     #: supplied and the gate cannot say which state it describes -- which is
     #: exactly the ambiguity law 31 was written about.
     transient_load_state: Optional[str] = None
+    #: #602: the cut-invariant residency that is ALWAYS resident -- CUDA
+    #: context, NCCL, workspace, graph capture, boot tail. Split out of
+    #: ``transient_mib``, which used to carry their SUM.
+    #:
+    #: WHY THE SPLIT EXISTS. The two are charged by different questions. This
+    #: one is occupied at rest, so the live pool sizer charges it and any
+    #: sizer-equivalent prediction must too. ``transient_mib`` is a PEAK the
+    #: sizer never sees, because in this regime the worst load state is a SEAM
+    #: and the pool is sized before any seam has run. Summed into one field,
+    #: no consumer could charge one without the other, and the pool prediction
+    #: came out 23 % under a measured boot.
+    fixed_overhead_mib: float = 0.0
+    #: #602: the draft runner's NET residency on this rank, its own post so a
+    #: future mismatch names the term that moved rather than hiding inside
+    #: ``transient_mib``. Cut-INVARIANT on this deployment: the draft model's
+    #: placement follows its own vector, not ``pp_layer_ratio``.
+    draft_mib: float = 0.0
 
     @property
     def total_seconds(self) -> float:
@@ -503,6 +558,8 @@ class StageCost:
             + self.state_mib
             + self.kv_mib
             + self.transient_mib
+            + self.fixed_overhead_mib
+            + self.draft_mib
         )
 
     @property
@@ -594,9 +651,11 @@ def layer_families_from_config(
                 f"{len(explicit)} entries but num_hidden_layers is {n}."
             )
         return tuple(
-            LAYER_FAMILY_ATTENTION
-            if str(t) == LAYER_FAMILY_ATTENTION
-            else LAYER_FAMILY_LINEAR
+            (
+                LAYER_FAMILY_ATTENTION
+                if str(t) == LAYER_FAMILY_ATTENTION
+                else LAYER_FAMILY_LINEAR
+            )
             for t in explicit
         )
 
@@ -763,9 +822,13 @@ def _price_stage(
         # alongside weights and KV, so they are charged together here. The
         # transient charged is the WORST measured load state (law 31): a cut
         # that only fits in the gentlest state it will serve does not fit.
-        transient_mib=rank.worst_transient_mib + rank.fixed_overhead_mib,
+        # #602: NOT summed any more. The peak and the at-rest overhead are
+        # charged by different questions; see StageCost.fixed_overhead_mib.
+        transient_mib=rank.worst_transient_mib,
+        fixed_overhead_mib=rank.fixed_overhead_mib,
         transient_load_state=rank.governing_load_state,
         seam_staging_mib=rank.seam_staging_mib,
+        draft_mib=float(rank.draft_residency_mib or 0.0),
         # The corridor is subtracted here, once, so every downstream
         # comparison is against usable bytes.
         budget_mib=rank.budget_mib - inputs.corridor_mib,
@@ -1139,3 +1202,1287 @@ def validate_pp_cut(
         candidates_considered=k,
     )
     return solution, tuple(violations)
+
+
+# ---------------------------------------------------------------------------
+# #602 term 2: solve the cut for the KV FLOOR
+# ---------------------------------------------------------------------------
+#
+# Under a pipeline the KV token count is necessarily UNIFORM across stages: a
+# request's tokens occupy KV on every stage, each in its own layers. So
+# `model_runner_kv_cache_mixin.py` min-reduces the per-stage capacities into one
+# world value, and every stage above that minimum strands its surplus. Measured
+# on the 2026-08-16 boot: 78362 tokens stranded on PP0 and 55255 on PP2, about
+# 1.4 GiB that no post holds and no rank can spend.
+#
+# THAT SURPLUS IS NOT RECLAIMABLE WHERE IT SITS. It can only be converted by
+# moving LAYERS: give the roomy stage more of them and the binding stage's
+# per-token cost falls, so the world minimum rises. Hence a second objective
+# over the same contiguous search space.
+#
+# WHY NOT REUSE solve_pp_cut's SECOND PASS. That pass maximizes the tightest
+# `runnable_headroom_mib`. Headroom is not capacity: each stage converts MiB
+# into tokens at a rate set by its OWN attention-layer count, so the cut that
+# leaves the most MiB on the tightest card is not the cut that lets the pipeline
+# address the most tokens. The two objectives genuinely differ and this one is
+# the fill-side question.
+
+
+@dataclasses.dataclass(frozen=True)
+class KvFloorSolution:
+    """The cut that maximizes the world KV floor, with its justification."""
+
+    counts: Tuple[int, ...]
+    bounds: Tuple[int, ...]
+    attention_counts: Tuple[int, ...]
+    stages: Tuple[StageCost, ...]
+    #: min_r(capacity_r) -- the token count the pipeline can actually address.
+    floor_tokens: float
+    #: Per-stage capacity, same order as ``stages``.
+    stage_tokens: Tuple[float, ...]
+    feasible: bool
+    refusals: Tuple[str, ...] = ()
+    candidates_considered: int = 0
+
+    def as_layer_ratio(self) -> List[int]:
+        return list(self.counts)
+
+    def summary(self) -> str:
+        if not self.feasible:
+            return "KV-floor cut: INFEASIBLE\n  " + "\n  ".join(self.refusals)
+        rows = "\n".join(
+            f"  stage {i} {c.rank}: layers {c.n_layers} (attn {c.n_attention}), "
+            f"capacity {t:.0f} tokens, runnable headroom "
+            f"{c.runnable_headroom_mib:.0f} MiB"
+            for i, (c, t) in enumerate(zip(self.stages, self.stage_tokens))
+        )
+        return (
+            f"KV-floor cut {list(self.counts)}: world floor "
+            f"{self.floor_tokens:.0f} tokens\n{rows}"
+        )
+
+
+def _bounds_from_counts(counts: Sequence[int]) -> List[int]:
+    out, acc = [], 0
+    for c in counts:
+        acc += int(c)
+        out.append(acc)
+    return out
+
+
+def stage_kv_capacity(inputs: PPCutInputs, cost: StageCost) -> Optional[float]:
+    """Tokens this stage could hold, or ``None`` when it holds none.
+
+    Inverts the pricing rather than re-deriving it: ``kv_mib`` was priced at
+    ``inputs.arena_tokens``, so the per-token cost is exact and any future
+    change to the arena model (the TP-share ``max()``, a new family) is picked
+    up here for free instead of drifting in a second copy.
+
+    ``runnable_headroom_mib + kv_mib`` is what the stage could spend on KV once
+    the corridor, the transient, the fixed overhead and the seam staging are all
+    funded -- the hard constraints stay hard and are simply not part of the
+    spendable pot.
+
+    ``None`` for a stage with no full-attention layer: its KV pool is empty, so
+    its capacity is unbounded and it would win every maximin while contributing
+    no KV at all. That is the same refusal ``solve_pp_cut`` already makes.
+    """
+    arena = float(inputs.arena_tokens)
+    if arena <= 0.0 or cost.kv_mib <= 0.0:
+        return None
+    spendable = cost.runnable_headroom_mib + cost.kv_mib
+    if spendable <= 0.0:
+        return None
+    return spendable * arena / cost.kv_mib
+
+
+def stage_kv_capacities(
+    counts: Sequence[int], inputs: PPCutInputs
+) -> Tuple[Optional[float], ...]:
+    """Per-stage capacity for an ARBITRARY cut -- the incumbent included.
+
+    An optimiser that cannot score the cut it proposes to replace cannot be
+    shown to beat it, so this is public and takes plain layer counts.
+    """
+    if len(counts) != inputs.pp_size:
+        raise ValueError(
+            f"stage_kv_capacities: {len(counts)} counts for {inputs.pp_size} stages."
+        )
+    if sum(int(c) for c in counts) != inputs.n_layers:
+        raise ValueError(
+            f"stage_kv_capacities: counts {list(counts)} cover "
+            f"{sum(int(c) for c in counts)} layers, model has "
+            f"{inputs.n_layers}."
+        )
+    pref_attn = _prefix_attention(inputs.layer_families)
+    bounds = _bounds_from_counts(counts)
+    starts = [0] + bounds[:-1]
+    out: List[Optional[float]] = []
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        out.append(stage_kv_capacity(inputs, cost))
+    return tuple(out)
+
+
+def world_kv_floor(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r(capacity_r)`` for a given cut, or ``None`` if inadmissible.
+
+    ``None`` rather than 0.0 or -inf: a cut that cannot fund the corridor and
+    the seam has no capacity to report, and returning a number would let a
+    caller rank it against cuts that can.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    floor = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if not cost.feasible:
+            return None
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_kv_capacity(inputs, cost)
+        if cap is None:
+            return None
+        floor = min(floor, cap)
+    return None if floor is math.inf else floor
+
+
+def solve_pp_cut_for_kv_floor(
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> KvFloorSolution:
+    """Exactly maximize ``min_r(capacity_r)`` over contiguous cuts.
+
+    One maximin dynamic program over stage boundaries, the same shape as
+    ``solve_pp_cut``'s second pass and exactly solvable for the same reason:
+    the objective is a single aggregate (a minimum) over per-stage values that
+    depend only on ``(stage, start, end)``.
+
+    Infeasible input does not fall back to an even split (the #202 lesson): it
+    returns ``feasible=False`` with a named reason per rank.
+
+    TWO MODELLING LIMITS, NAMED RATHER THAN GUESSED:
+
+    * The NEXTN / draft head is not modelled anywhere in this module, so a
+      deployment that places a draft head on one stage pays bytes this solve
+      does not see. On the flip-target layout that placement is a real term.
+    * ``seam_staging_mib`` is a per-rank SCALAR here, but the live seam reserve
+      is ``fixed + per-token`` (measured 227 MiB + 2360.1 B/token on rank 0),
+      and the per-token part scales with the very arena this function solves
+      for. Feeding a scalar measured at one arena size makes this a solve at
+      that operating point, not a fixed point. Solving the fixed point needs a
+      seam model this module does not have; until then, re-measure the scalar
+      at the arena the solve proposes and re-run.
+    """
+    n = inputs.n_layers
+    k = inputs.pp_size
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < n
+
+    cache: Dict[Tuple[int, int, int], StageCost] = {}
+
+    def price(stage: int, start: int, end: int) -> StageCost:
+        key = (stage, start, end)
+        got = cache.get(key)
+        if got is None:
+            got = _price_stage(inputs, stage, start, end, pref_attn)
+            cache[key] = got
+        return got
+
+    def value(stage: int, start: int, end: int) -> Optional[float]:
+        cost = price(stage, start, end)
+        if not cost.feasible:
+            return None
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        return stage_kv_capacity(inputs, cost)
+
+    considered = 0
+    best: List[List[float]] = [[-math.inf] * (n + 1) for _ in range(k + 1)]
+    choice: List[List[int]] = [[-1] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = math.inf
+    for s in range(1, k + 1):
+        hi = n - (k - s)
+        for b in range(s, hi + 1):
+            row = best[s - 1]
+            acc, arg = -math.inf, -1
+            for prev in range(s - 1, b):
+                base = row[prev]
+                if base == -math.inf:
+                    continue
+                considered += 1
+                cand = value(s - 1, prev, b)
+                if cand is None:
+                    continue
+                val = base if base < cand else cand
+                # Deterministic tie-break: the earliest boundary wins, so the
+                # same inputs always yield the same cut.
+                if val > acc:
+                    acc, arg = val, prev
+            best[s][b] = acc
+            choice[s][b] = arg
+
+    if best[k][n] == -math.inf:
+        fallback = _infeasible(inputs, pref_attn, hybrid, considered)
+        return KvFloorSolution(
+            counts=fallback.counts,
+            bounds=fallback.bounds,
+            attention_counts=fallback.attention_counts,
+            stages=fallback.stages,
+            floor_tokens=0.0,
+            stage_tokens=(),
+            feasible=False,
+            refusals=fallback.refusals,
+            candidates_considered=considered,
+        )
+
+    bounds_rev: List[int] = []
+    b = n
+    for s in range(k, 0, -1):
+        bounds_rev.append(b)
+        b = choice[s][b]
+    bounds = tuple(reversed(bounds_rev))
+    starts = (0,) + bounds[:-1]
+    stages = tuple(price(i, starts[i], bounds[i]) for i in range(k))
+    caps = tuple(float(stage_kv_capacity(inputs, c) or 0.0) for c in stages)
+    return KvFloorSolution(
+        counts=tuple(s.n_layers for s in stages),
+        bounds=bounds,
+        attention_counts=tuple(s.n_attention for s in stages),
+        stages=stages,
+        floor_tokens=min(caps),
+        stage_tokens=caps,
+        feasible=True,
+        refusals=(),
+        candidates_considered=considered,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #602: the draft runner's residency, measured from the flight recorder
+# ---------------------------------------------------------------------------
+
+
+class DraftResidencyUnavailable(RuntimeError):
+    """The recorder holds no draft posts for this boot.
+
+    Raised instead of returning zero. Zero is a REAL value in this model --
+    it means the deployment has no draft runner -- so substituting it for "not
+    measured" would let an uncalibrated solve present itself as calibrated.
+    That is the #606 getattr lesson applied to a number instead of an
+    attribute: a defensive default that hides its own trigger.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class DraftResidency:
+    """What the NEXTN / draft runner costs one rank, and where that was read.
+
+    ``weights_draft_mib`` is what the draft runner ALLOCATED.
+    ``overlap_credit_mib`` is what the process RELEASED between the two
+    runners (the recorder's ``inter_runner_gap``, sign-flipped to a credit).
+
+    THE NET IS THE ONLY FIGURE THE SOLVER MAY USE. Charging the gross weights
+    prices the reference rig's RUNNING configuration as infeasible -- 10796
+    MiB of draft weights against an 18800 MiB budget that also carries the
+    target model -- because the two runners do not both occupy the card at
+    once. The gross number is kept beside the net one so a reader can see the
+    size of the correction rather than being handed a small number to trust.
+    """
+
+    pid: int
+    card_uuid: str
+    boot_id: str
+    source: str
+    weights_draft_mib: float
+    overlap_credit_mib: float
+
+    @property
+    def net_mib(self) -> float:
+        return self.weights_draft_mib - self.overlap_credit_mib
+
+
+#: Recorder transitions this term is differenced from, keyed as
+#: ``(closing phase, draft_worker)`` exactly as the fill-side report names
+#: posts. Kept next to the reader so the two cannot drift into naming the same
+#: bytes differently.
+_DRAFT_WEIGHT_KEY = ("weights_loaded", True)
+_INTER_RUNNER_GAP_KEY = ("pre_weight_load", True)
+
+
+def draft_residency_from_flight(
+    directory: str, *, boot: Optional[str] = None
+) -> Dict[int, DraftResidency]:
+    """Measure each process's draft-runner residency from the flight recorder.
+
+    Returns ``{pid: DraftResidency}`` for ONE boot (the latest by default),
+    grouped by pid rather than by rank for the reason
+    ``flight_recorder.read_marks`` documents: under ``--tp-size 1 --pp-size 3``
+    all three processes file their marks under TP rank 0, so keying on the rank
+    field merges three cards into one timeline.
+
+    Raises :class:`DraftResidencyUnavailable` when the directory holds no marks
+    or the boot has no draft posts at all -- never a zero-filled result.
+    """
+    try:
+        from sglang.srt.mem_ledger import flight_recorder
+    except ImportError as exc:  # pragma: no cover - packaging accident
+        raise DraftResidencyUnavailable(
+            f"flight recorder module is not importable: {exc}"
+        ) from exc
+
+    try:
+        by_pid = flight_recorder.read_marks(directory, boot=boot)
+    except Exception as exc:
+        raise DraftResidencyUnavailable(
+            f"could not read flight marks from {directory!r}: {exc}"
+        ) from exc
+
+    if not by_pid:
+        raise DraftResidencyUnavailable(
+            f"no flight marks under {directory!r}"
+            + (f" for boot {boot!r}" if boot else "")
+            + ". The draft residency cannot be defaulted; arm the recorder on "
+            "a boot of this configuration and re-read."
+        )
+
+    out: Dict[int, DraftResidency] = {}
+    for pid, marks in by_pid.items():
+        ordered = sorted(marks, key=lambda m: m.get("monotonic") or 0.0)
+        weights = 0.0
+        gap = 0.0
+        seen_draft = False
+        for prev, cur in zip(ordered, ordered[1:]):
+            flag = (cur.get("extra") or {}).get("draft_worker")
+            flag = None if flag is None else bool(flag)
+            key = (str(cur.get("phase")), flag)
+            delta = (
+                int(cur.get("nvml_self_bytes") or 0)
+                - int(prev.get("nvml_self_bytes") or 0)
+            ) / MIB
+            if key == _DRAFT_WEIGHT_KEY:
+                weights += delta
+                seen_draft = True
+            elif key == _INTER_RUNNER_GAP_KEY:
+                gap += delta
+                seen_draft = True
+        if not seen_draft:
+            continue
+        uuids = [m.get("card_uuid") for m in ordered if m.get("card_uuid")]
+        boots = [m.get("boot_id") for m in ordered if m.get("boot_id")]
+        out[int(pid)] = DraftResidency(
+            pid=int(pid),
+            card_uuid=str(sorted(uuids)[0]) if uuids else "?",
+            boot_id=str(boots[0]) if boots else "?",
+            source=str(directory),
+            weights_draft_mib=weights,
+            # Sign-flipped: the recorder writes the release as negative, and a
+            # credit that reads positive is the one a caller can subtract
+            # without having to remember which way the sign ran.
+            overlap_credit_mib=-gap,
+        )
+
+    if not out:
+        raise DraftResidencyUnavailable(
+            f"the boot under {directory!r} has no draft-runner posts. If this "
+            "deployment genuinely runs no draft runner, say so with "
+            "draft_runner_present=False rather than reading a zero out of a "
+            "recorder that never saw one."
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# #602: the seam is a FIXED POINT, because it flips the cut
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class KvFloorFixedPoint:
+    """A KV-floor solve whose seam demand is consistent with its own arena."""
+
+    solution: KvFloorSolution
+    seam_staging_mib: Tuple[float, ...]
+    iterations: int
+    converged: bool
+
+
+def solve_pp_cut_for_kv_floor_at_seam_fixed_point(
+    inputs: PPCutInputs,
+    *,
+    seam_fixed_mib: Sequence[float],
+    seam_slope_bytes_per_token: Sequence[float],
+    tolerance_tokens: float = 50.0,
+    max_iterations: int = 40,
+) -> KvFloorFixedPoint:
+    """Solve the cut with the seam priced at the arena the solve itself implies.
+
+    WHY THIS IS NOT OPTIONAL, MEASURED RATHER THAN ASSUMED. The seam reserve is
+    ``fixed + slope * tokens`` (rank 0: 227 MiB + 2360.1 B/token), so pricing it
+    at the CURRENT arena while solving for a LARGER one understates it on
+    exactly the stage the solve wants to load. On the reference rig that is not
+    a rounding difference, it changes the ANSWER:
+
+        seam priced at the live arena (471638)   ->  cut [31, 16, 17]
+        seam priced at its own fixed point       ->  cut [30, 17, 17]
+
+    A one-shot solve therefore returns a cut that is optimal for a seam demand
+    the cut itself invalidates. The iteration below re-prices the seam at each
+    candidate arena until the arena stops moving, which is the only operating
+    point at which the answer is self-consistent.
+
+    NON-CONVERGENCE IS REPORTED, NOT SMOOTHED. ``converged=False`` comes back
+    with the last iterate rather than an exception so a caller can see what it
+    was oscillating between, but the flag must be checked: an unconverged fixed
+    point is a cut whose seam demand does not match its own arena, which is the
+    defect this function exists to remove.
+    """
+    if (
+        len(seam_fixed_mib) != inputs.pp_size
+        or len(seam_slope_bytes_per_token) != inputs.pp_size
+    ):
+        raise ValueError(
+            "solve_pp_cut_for_kv_floor_at_seam_fixed_point: seam terms must "
+            f"cover all {inputs.pp_size} stages."
+        )
+
+    def _with_seam(tokens: float) -> PPCutInputs:
+        seam = tuple(
+            float(f) + float(s) * float(tokens) / MIB
+            for f, s in zip(seam_fixed_mib, seam_slope_bytes_per_token)
+        )
+        ranks = tuple(
+            dataclasses.replace(r, seam_staging_mib=seam[i])
+            for i, r in enumerate(inputs.ranks)
+        )
+        return dataclasses.replace(inputs, ranks=ranks)
+
+    tokens = float(inputs.arena_tokens)
+    solution = None
+    seam_used: Tuple[float, ...] = ()
+    for it in range(1, max_iterations + 1):
+        scoped = _with_seam(tokens)
+        seam_used = tuple(r.seam_staging_mib for r in scoped.ranks)
+        solution = solve_pp_cut_for_kv_floor(scoped)
+        if not solution.feasible:
+            return KvFloorFixedPoint(solution, seam_used, it, False)
+        if abs(solution.floor_tokens - tokens) <= tolerance_tokens:
+            return KvFloorFixedPoint(solution, seam_used, it, True)
+        tokens = solution.floor_tokens
+    return KvFloorFixedPoint(solution, seam_used, max_iterations, False)
+
+
+def world_kv_floor_at_seam_fixed_point(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    seam_fixed_mib: Sequence[float],
+    seam_slope_bytes_per_token: Sequence[float],
+    tolerance_tokens: float = 50.0,
+    max_iterations: int = 40,
+) -> Optional[float]:
+    """The same fixed point for a GIVEN cut, so the incumbent is scored on the
+    same terms as the candidate. Comparing a fixed-point solve against a
+    one-shot incumbent would credit the new cut with the correction."""
+    tokens = float(inputs.arena_tokens)
+    floor: Optional[float] = None
+    for _ in range(max_iterations):
+        seam = tuple(
+            float(f) + float(s) * tokens / MIB
+            for f, s in zip(seam_fixed_mib, seam_slope_bytes_per_token)
+        )
+        ranks = tuple(
+            dataclasses.replace(r, seam_staging_mib=seam[i])
+            for i, r in enumerate(inputs.ranks)
+        )
+        floor = world_kv_floor(counts, dataclasses.replace(inputs, ranks=ranks))
+        if floor is None:
+            return None
+        if abs(floor - tokens) <= tolerance_tokens:
+            return floor
+        tokens = floor
+    return floor
+
+
+# ---------------------------------------------------------------------------
+# #602: the remaining residency terms, measured from the flight recorder
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasuredResidency:
+    """One rank's cut-invariant overhead and its OBSERVED transient draw.
+
+    ``fixed_overhead_mib`` is an at-rest quantity and the boot marks settle it
+    exactly: what is resident at ``boot_complete`` that is not weights, not the
+    KV pool and not the draft runner -- CUDA context, the NCCL init, the
+    attention workspace, graph capture, the boot tail.
+
+    ``observed_transient_mib`` is NOT settled by the recorder and the name says
+    so. It is the peak draw over the serving window the recorder happened to
+    cover, which on a short window is far gentler than the worst state the
+    deployment will serve (law 31: 742 MiB observed here against 1989-3148 MiB
+    on a 22-minute soak). ``covers_worst_load_state`` is therefore always False
+    from this reader: only a soak-length window could justify True, and nothing
+    in the marks proves the window was one. Charge
+    ``max(observed, worst known)`` -- a gate that gets cheaper by looking at a
+    shorter window is the C1 defect this field is shaped to prevent.
+    """
+
+    pid: int
+    card_uuid: str
+    boot_id: str
+    source: str
+    fixed_overhead_mib: float
+    observed_transient_mib: float
+    serving_samples: int
+    serving_window_seconds: float
+    covers_worst_load_state: bool = False
+
+
+def residency_terms_from_flight(
+    directory: str, *, boot: Optional[str] = None
+) -> Dict[int, MeasuredResidency]:
+    """Measure per-rank fixed overhead and observed transient, by pid.
+
+    Raises :class:`DraftResidencyUnavailable` when the boot marks, the
+    ``boot_complete`` mark, or the serving marks are missing. None of the three
+    may be defaulted: zero overhead and zero transient are both meaningful
+    values, so producing them from an absent measurement is the #606 defect.
+    """
+    try:
+        from sglang.srt.mem_ledger import flight_recorder
+    except ImportError as exc:  # pragma: no cover - packaging accident
+        raise DraftResidencyUnavailable(
+            f"flight recorder module is not importable: {exc}"
+        ) from exc
+
+    try:
+        boot_by_pid = flight_recorder.read_marks(directory, boot=boot)
+    except Exception as exc:
+        raise DraftResidencyUnavailable(
+            f"could not read flight marks from {directory!r}: {exc}"
+        ) from exc
+    if not boot_by_pid:
+        raise DraftResidencyUnavailable(f"no flight marks under {directory!r}")
+
+    try:
+        serving_by_pid = flight_recorder.read_serving_marks(directory, boot=boot)
+    except Exception:
+        serving_by_pid = {}
+
+    out: Dict[int, MeasuredResidency] = {}
+    for pid, marks in boot_by_pid.items():
+        ordered = sorted(marks, key=lambda m: m.get("monotonic") or 0.0)
+        complete = [m for m in ordered if str(m.get("phase")) == "boot_complete"]
+        if not complete:
+            raise DraftResidencyUnavailable(
+                f"pid {pid} under {directory!r} has no boot_complete mark, so "
+                "its at-rest residency is not established. The overhead cannot "
+                "be differenced from an unfinished boot."
+            )
+        at_rest = int(complete[-1].get("nvml_self_bytes") or 0) / MIB
+
+        sums: Dict[Tuple[str, Optional[bool]], float] = {}
+        for prev, cur in zip(ordered, ordered[1:]):
+            flag = (cur.get("extra") or {}).get("draft_worker")
+            flag = None if flag is None else bool(flag)
+            delta = (
+                int(cur.get("nvml_self_bytes") or 0)
+                - int(prev.get("nvml_self_bytes") or 0)
+            ) / MIB
+            key = (str(cur.get("phase")), flag)
+            sums[key] = sums.get(key, 0.0) + delta
+
+        weights_target = sums.get(("weights_loaded", False), 0.0)
+        kv_target = sums.get(("kv_pool_sized", False), 0.0)
+        weights_draft = sums.get(_DRAFT_WEIGHT_KEY, 0.0)
+        gap = sums.get(_INTER_RUNNER_GAP_KEY, 0.0)
+        net_draft = weights_draft + gap
+        # The draft runner's own KV motion (``kv_pool_sized`` with draft=True,
+        # -740 MiB on rank 1 of the reference boot) is deliberately NOT
+        # subtracted: the cost model prices only the TARGET KV arena, so a term
+        # removed here would be represented nowhere and the reconstruction
+        # would sit 740 MiB high on that rank. Letting the overhead absorb it
+        # keeps the identity
+        #     at_rest = weights + kv + net_draft + overhead
+        # exact against what the model can actually price.
+        overhead = at_rest - weights_target - kv_target - net_draft
+
+        serving = serving_by_pid.get(pid) or []
+        if not serving:
+            raise DraftResidencyUnavailable(
+                f"pid {pid} under {directory!r} has no serving marks, so no "
+                "transient draw was observed at all. Zero would be a claim "
+                "that nothing is drawn; arm the serving recorder and re-read."
+            )
+        s_ordered = sorted(serving, key=lambda m: m.get("monotonic") or 0.0)
+        peak = max(int(m.get("nvml_self_bytes") or 0) for m in s_ordered) / MIB
+        span = float(s_ordered[-1].get("monotonic") or 0.0) - float(
+            s_ordered[0].get("monotonic") or 0.0
+        )
+
+        uuids = [m.get("card_uuid") for m in ordered if m.get("card_uuid")]
+        boots = [m.get("boot_id") for m in ordered if m.get("boot_id")]
+        out[int(pid)] = MeasuredResidency(
+            pid=int(pid),
+            card_uuid=str(sorted(uuids)[0]) if uuids else "?",
+            boot_id=str(boots[0]) if boots else "?",
+            source=str(directory),
+            fixed_overhead_mib=overhead,
+            observed_transient_mib=max(0.0, peak - at_rest),
+            serving_samples=len(s_ordered),
+            serving_window_seconds=span,
+            # Never True from a reader: nothing in the marks proves the window
+            # covered the worst state the deployment will serve.
+            covers_worst_load_state=False,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# #602: the weight terms, measured from the checkpoint
+# ---------------------------------------------------------------------------
+
+#: Bytes per element, by safetensors dtype tag.
+_SAFETENSORS_DTYPE_BYTES: Dict[str, int] = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckpointWeightTerms:
+    """Per-family layer weights and the non-layer payloads, from the headers.
+
+    Read from the safetensors HEADERS only -- no payload is touched, so this is
+    instant and needs no accelerator. `PPCutInputs` already instructs callers to
+    measure these rather than derive them from the config's parameter formulas,
+    because the formula-derived attention layer was 30 MiB per layer wrong on
+    the reference checkpoint and the error is CUT-SHAPED.
+
+    ``replicated_weight_bytes`` is the payload every stage carries: on the
+    reference checkpoint a vision tower and an MTP head. Adding those two is
+    what closes the per-stage weight identity against the recorder to 0.1 %;
+    modelling them as first-stage-only leaves stages 1 and 2 short by exactly
+    their size, which is how they were found.
+    """
+
+    source: str
+    n_layers: int
+    attention_layer_indices: Tuple[int, ...]
+    attn_layer_weight_bytes: float
+    linear_layer_weight_bytes: float
+    embedding_weight_bytes: float
+    lm_head_weight_bytes: float
+    replicated_weight_bytes: float
+    replicated_breakdown: Dict[str, float]
+
+
+def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
+    """Measure the weight terms `PPCutInputs` needs from a safetensors dir.
+
+    Raises :class:`DraftResidencyUnavailable` when the directory holds no
+    safetensors shards or no transformer layers -- never a zero-filled result,
+    for the same reason the residency readers refuse: zero non-layer weight is
+    a real value (tied embeddings, no vision tower) and must not stand in for
+    "not measured".
+    """
+    import glob as _glob
+    import struct as _struct
+
+    shards = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not shards:
+        raise DraftResidencyUnavailable(
+            f"no *.safetensors under {model_path!r}; the weight terms cannot "
+            "be defaulted."
+        )
+
+    sizes: Dict[str, float] = {}
+    for shard in shards:
+        try:
+            with open(shard, "rb") as fh:
+                (header_len,) = _struct.unpack("<Q", fh.read(8))
+                header = json.loads(fh.read(header_len))
+        except Exception as exc:
+            raise DraftResidencyUnavailable(
+                f"could not read the safetensors header of {shard!r}: {exc}"
+            ) from exc
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            elements = 1
+            for dim in meta.get("shape", []):
+                elements *= int(dim)
+            sizes[name] = float(elements) * _SAFETENSORS_DTYPE_BYTES.get(
+                str(meta.get("dtype")), 2
+            )
+
+    layer_bytes: Dict[int, float] = {}
+    layer_family: Dict[int, str] = {}
+    embedding = lm_head = 0.0
+    replicated: Dict[str, float] = {}
+    layer_re = re.compile(r"layers\.(\d+)\.")
+    for name, size in sizes.items():
+        if name.startswith("mtp"):
+            replicated["mtp"] = replicated.get("mtp", 0.0) + size
+            continue
+        if ".visual." in name or name.startswith("model.visual"):
+            replicated["visual"] = replicated.get("visual", 0.0) + size
+            continue
+        if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+            lm_head += size
+            continue
+        if "embed_tokens" in name:
+            embedding += size
+            continue
+        found = layer_re.search(name)
+        if found is None:
+            continue
+        index = int(found.group(1))
+        layer_bytes[index] = layer_bytes.get(index, 0.0) + size
+        if ".self_attn." in name:
+            layer_family[index] = LAYER_FAMILY_ATTENTION
+        elif index not in layer_family:
+            layer_family[index] = LAYER_FAMILY_LINEAR
+
+    if not layer_bytes:
+        raise DraftResidencyUnavailable(
+            f"{model_path!r} holds safetensors but no transformer layers; the "
+            "per-family weights cannot be measured from it."
+        )
+
+    attn_idx = tuple(
+        sorted(i for i in layer_bytes if layer_family.get(i) == LAYER_FAMILY_ATTENTION)
+    )
+    lin_idx = [i for i in layer_bytes if layer_family.get(i) != LAYER_FAMILY_ATTENTION]
+    attn_mean = (
+        sum(layer_bytes[i] for i in attn_idx) / len(attn_idx) if attn_idx else 0.0
+    )
+    lin_mean = sum(layer_bytes[i] for i in lin_idx) / len(lin_idx) if lin_idx else 0.0
+    return CheckpointWeightTerms(
+        source=str(model_path),
+        n_layers=len(layer_bytes),
+        attention_layer_indices=attn_idx,
+        attn_layer_weight_bytes=attn_mean,
+        linear_layer_weight_bytes=lin_mean,
+        embedding_weight_bytes=embedding,
+        lm_head_weight_bytes=lm_head,
+        replicated_weight_bytes=sum(replicated.values()),
+        replicated_breakdown=dict(replicated),
+    )
+
+
+# ---------------------------------------------------------------------------
+# #685 desk half: where the rank-0 seam slope's 5.6x comes from
+# ---------------------------------------------------------------------------
+
+
+def seam_slope_bytes_per_token(
+    flip_tp_vector: Sequence[float],
+    attention_counts: Sequence[int],
+    kv_bytes_per_token_per_attn_layer: float,
+    n_attention_total: int,
+    baseline_bytes_per_token: Sequence[float] = (),
+) -> Tuple[float, ...]:
+    """Desk-side alias of :func:`managers.seam_slope.derive_seam_slope_bytes_per_token`.
+
+    #685. The derivation lives in ``srt/managers/seam_slope.py`` -- a
+    dependency-free module the funding path can read without importing a
+    solver -- and this is the name the planner already calls it by. Delegating
+    rather than keeping a second copy is the point: two implementations of a
+    formula that moves in whole-layer steps would drift, and the whole finding
+    is that the vector is NOT a constant.
+
+    See that module for the mechanism (the incoming leg of
+    ``phase_flip_runtime._staging_bytes``), for why rank 0's 5.6x is one
+    received layer rather than a pathology, and for why a frozen vector cannot
+    be carried across cuts.
+    """
+    from sglang.srt.managers.seam_slope import derive_seam_slope_bytes_per_token
+
+    return derive_seam_slope_bytes_per_token(
+        flip_tp_vector,
+        attention_counts,
+        kv_bytes_per_token_per_attn_layer,
+        n_attention_total,
+        baseline_bytes_per_token,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #602: the SIZER-equivalent pool, kept apart from the corridor-safe floor
+# ---------------------------------------------------------------------------
+#
+# TWO QUESTIONS, ~29 % APART ON THIS RIG, AND THEY WERE ONE NUMBER.
+#
+#   world_kv_floor        "the largest pool that stays corridor-safe while a
+#                          cutover is in flight" -- funds the WORST measured
+#                          load transient (law 31).
+#   world_predicted_pool  "the pool the live sizer will actually produce" --
+#                          funds no load transient at all, because the sizer
+#                          runs BEFORE any seam has ever run and therefore
+#                          never sees one.
+#
+# In F4-r4's census regime the worst load state is a SEAM on every rank
+# (SEAM_TP_TO_PP 2168 MiB on rank 0; SEAM_PP_TO_TP 700 / 932 on ranks 1 / 2),
+# two to three times the prefill-triggered scalars. Holding the corridor-safe
+# floor to a measured pool therefore read -23.3 % and a metal arm was correctly
+# refused on it. The defect was the comparison, not a constant.
+#
+# EVERYTHING ELSE STAYS CHARGED BY BOTH. The corridor, the weights, the draft
+# residency, the cut-invariant overhead and the seam RESERVE (which is held at
+# rest, so the sizer does charge it) bind both numbers. Only the load-transient
+# PEAK separates them.
+
+
+def stage_costs(counts: Sequence[int], inputs: PPCutInputs) -> Tuple[StageCost, ...]:
+    """Priced stages for an arbitrary cut -- the incumbent included."""
+    if len(counts) != inputs.pp_size:
+        raise ValueError(
+            f"stage_costs: {len(counts)} counts for {inputs.pp_size} stages."
+        )
+    if sum(int(c) for c in counts) != inputs.n_layers:
+        raise ValueError(
+            f"stage_costs: counts {list(counts)} cover "
+            f"{sum(int(c) for c in counts)} layers, model has {inputs.n_layers}."
+        )
+    pref_attn = _prefix_attention(inputs.layer_families)
+    bounds = _bounds_from_counts(counts)
+    starts = [0] + bounds[:-1]
+    return tuple(
+        _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        for i in range(inputs.pp_size)
+    )
+
+
+def stage_pool_capacity(inputs: PPCutInputs, cost: StageCost) -> Optional[float]:
+    """Tokens the SIZER would give this stage: the corridor-safe capacity with
+    the worst-load transient added back.
+
+    ``stage_kv_capacity`` subtracts that peak; the sizer never does. Adding it
+    back here -- rather than re-deriving the whole spendable pot -- keeps the
+    two functions provably one term apart, which is the property the tests
+    pin.
+    """
+    safe = stage_kv_capacity(inputs, cost)
+    if safe is None:
+        return None
+    arena = float(inputs.arena_tokens)
+    if arena <= 0.0 or cost.kv_mib <= 0.0:
+        return None
+    return safe + float(cost.transient_mib) * arena / cost.kv_mib
+
+
+def stage_pool_capacities(
+    counts: Sequence[int], inputs: PPCutInputs
+) -> Tuple[Optional[float], ...]:
+    return tuple(
+        stage_pool_capacity(inputs, cost) for cost in stage_costs(counts, inputs)
+    )
+
+
+def world_predicted_pool(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r`` of the sizer-equivalent capacity -- the number a MEASURED pool
+    may be compared against.
+
+    This is the only output of this module that belongs in a gate against a
+    boot's ``max_total_num_tokens``. ``world_kv_floor`` answers a corridor
+    question and will read far below a measured pool wherever the worst load
+    state is a seam; that is not an error in either number.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    best = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_pool_capacity(inputs, cost)
+        if cap is None:
+            return None
+        best = min(best, cap)
+    return None if best is math.inf else best
+
+
+def world_corridor_safe_floor(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Optional[float]:
+    """``min_r`` of the corridor-safe capacity -- the SCORING counterpart of
+    :func:`world_predicted_pool`, gated identically so the two can be compared.
+
+    NOT the same function as :func:`world_kv_floor`, and the difference is the
+    reason this exists. ``world_kv_floor`` additionally refuses a stage whose
+    ``runnable_headroom_mib`` is negative AT THE INPUT ARENA, which is correct
+    for the solver -- a cut that does not fit the arena being searched is not a
+    candidate -- and wrong for scoring an incumbent: a MEASURED arena is
+    already full by construction, so headroom sits at ~0 and any model error
+    of either sign flips it to "infeasible" and the capacity, which is
+    perfectly well defined and smaller, cannot be reported at all.
+
+    So the solver keeps its gate and scoring gets a function without it. The
+    only term separating this from ``world_predicted_pool`` is then the
+    worst-load transient, which is exactly the property the tests pin.
+    """
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < inputs.n_layers
+    bounds = _bounds_from_counts(counts)
+    if len(counts) != inputs.pp_size or bounds[-1] != inputs.n_layers:
+        return None
+    if any(int(c) < 1 for c in counts):
+        return None
+    starts = [0] + bounds[:-1]
+    best = math.inf
+    for i in range(inputs.pp_size):
+        cost = _price_stage(inputs, i, starts[i], bounds[i], pref_attn)
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            return None
+        cap = stage_kv_capacity(inputs, cost)
+        if cap is None:
+            return None
+        best = min(best, cap)
+    return None if best is math.inf else best
+
+
+# ---------------------------------------------------------------------------
+# #702 -- the PREFILL-SPEED objective.
+#
+# The #602 solve above answers "which cut maximises the KV pool". That is a
+# capacity question, and on the censused regime it correctly withdrew the cut.
+# The question the user actually asked -- "more prefill on the 5090" -- is a
+# TIME question, and these two objectives do not agree. Both are exported so
+# the trade is decided on numbers rather than on which solver was run.
+#
+# Two time objectives, also not equivalent to each other:
+#   SERIAL     sum_r  stage_ms_r   -- today's non-pipelined prefill cost.
+#   PIPELINED  max_r  stage_ms_r   -- once stages overlap, the slowest stage
+#                                     is the throughput bound.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefillTiming:
+    """Per-stage prefill cost model: ``fixed_ms[r] + ms_per_layer[r] * n_r``.
+
+    CALIBRATION LIMIT, stated because it is load-bearing: a single measured cut
+    gives ONE (layer-count, time) point per rank. That cannot separate the
+    per-layer slope from a fixed per-stage cost -- both fit the point exactly.
+    ``fixed_ms`` therefore defaults to all-zero, which is the OPTIMISTIC end of
+    the family: it credits a reallocation with the full per-layer saving. A
+    second measured cut per rank would pin the intercept; until one exists,
+    every speedup produced here is an upper bound, not a prediction.
+    """
+
+    ms_per_layer: Tuple[float, ...]
+    fixed_ms: Tuple[float, ...]
+
+    def stage_ms(self, counts: Sequence[int]) -> Tuple[float, ...]:
+        if len(counts) != len(self.ms_per_layer):
+            raise ValueError(
+                f"counts has {len(counts)} stages but the timing model has "
+                f"{len(self.ms_per_layer)}."
+            )
+        return tuple(
+            f + m * float(n)
+            for f, m, n in zip(self.fixed_ms, self.ms_per_layer, counts)
+        )
+
+
+def prefill_timing_from_measurement(
+    counts: Sequence[int],
+    stage_ms: Sequence[float],
+    fixed_fraction: float = 0.0,
+) -> PrefillTiming:
+    """Calibrate from one measured cut.
+
+    ``fixed_fraction`` is the share of each measured stage time attributed to
+    fixed per-stage cost rather than to layers. It is a SENSITIVITY DIAL, not a
+    measurement: any value in [0, 1) reproduces the calibration point exactly
+    (see ``PrefillTiming``), and larger values shrink the modelled benefit of
+    moving layers between ranks.
+    """
+    if len(counts) != len(stage_ms):
+        raise ValueError(
+            f"counts ({len(counts)}) and stage_ms ({len(stage_ms)}) disagree "
+            "on the number of stages."
+        )
+    if not 0.0 <= fixed_fraction < 1.0:
+        raise ValueError(f"fixed_fraction must be in [0, 1), got {fixed_fraction}.")
+    slopes: List[float] = []
+    fixed: List[float] = []
+    for r, (n, ms) in enumerate(zip(counts, stage_ms)):
+        if int(n) <= 0:
+            raise ValueError(
+                f"stage {r} holds zero layers in the calibration cut, so its "
+                "measured time cannot be turned into a per-layer cost "
+                "(division by zero)."
+            )
+        f = fixed_fraction * float(ms)
+        fixed.append(f)
+        slopes.append((float(ms) - f) / float(n))
+    return PrefillTiming(ms_per_layer=tuple(slopes), fixed_ms=tuple(fixed))
+
+
+def _check_total(counts: Sequence[int], total_layers: Optional[int]) -> None:
+    if total_layers is not None and int(sum(counts)) != int(total_layers):
+        raise ValueError(
+            f"stage counts {tuple(counts)} sum to {int(sum(counts))}, not the "
+            f"declared total of {int(total_layers)} layers."
+        )
+
+
+def serial_prefill_ms(
+    counts: Sequence[int],
+    timing: PrefillTiming,
+    total_layers: Optional[int] = None,
+) -> float:
+    """Non-pipelined prefill cost: the SUM over stages."""
+    _check_total(counts, total_layers)
+    return float(sum(timing.stage_ms(counts)))
+
+
+def pipelined_prefill_ms(
+    counts: Sequence[int],
+    timing: PrefillTiming,
+    total_layers: Optional[int] = None,
+) -> float:
+    """Pipelined prefill bound: the MAX over stages (the slowest stage)."""
+    _check_total(counts, total_layers)
+    return float(max(timing.stage_ms(counts)))
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefillCutCandidate:
+    counts: Tuple[int, ...]
+    serial_ms: float
+    pipelined_ms: float
+    serial_speedup: float
+    pipelined_speedup: float
+    pool_tokens: Optional[float]
+
+
+def _enumerate_cuts(
+    total_layers: int, stages: int, min_per_stage: int
+) -> List[Tuple[int, ...]]:
+    out: List[Tuple[int, ...]] = []
+
+    def rec(remaining: int, left: int, acc: Tuple[int, ...]) -> None:
+        if left == 1:
+            if remaining >= min_per_stage:
+                out.append(acc + (remaining,))
+            return
+        # Leave at least min_per_stage for each of the remaining stages.
+        hi = remaining - min_per_stage * (left - 1)
+        for n in range(min_per_stage, hi + 1):
+            rec(remaining - n, left - 1, acc + (n,))
+
+    rec(int(total_layers), int(stages), ())
+    return out
+
+
+def solve_pp_cut_for_prefill_speed(
+    total_layers: int,
+    timing: PrefillTiming,
+    incumbent: Sequence[int],
+    max_rank0_layers: int,
+    min_layers_per_stage: int = 1,
+    pool_fn: Optional[Callable[[Sequence[int]], Optional[float]]] = None,
+    top: Optional[int] = None,
+) -> List[PrefillCutCandidate]:
+    """Enumerate feasible cuts and price each on BOTH time objectives.
+
+    ``max_rank0_layers`` is a hard VRAM constraint, not a preference: rank0's
+    weights plus arena must fit its budget, and a cut above the cap is
+    arithmetic that ignores it.
+
+    ``pool_fn`` supplies the capacity cost of a cut, in tokens. It is injected
+    rather than computed here so this solver stays free of ``PPCutInputs``; when
+    it is absent, ``pool_tokens`` is ``None`` and NO pool number is invented.
+    Every candidate carries both speedups and the pool cost so the trade is
+    decided on numbers.
+    """
+    stages = len(incumbent)
+    _check_total(incumbent, total_layers)
+    base_serial = serial_prefill_ms(incumbent, timing)
+    base_pipelined = pipelined_prefill_ms(incumbent, timing)
+    cands: List[PrefillCutCandidate] = []
+    for counts in _enumerate_cuts(total_layers, stages, min_layers_per_stage):
+        if counts[0] > int(max_rank0_layers):
+            continue
+        s = serial_prefill_ms(counts, timing)
+        p = pipelined_prefill_ms(counts, timing)
+        cands.append(
+            PrefillCutCandidate(
+                counts=counts,
+                serial_ms=s,
+                pipelined_ms=p,
+                serial_speedup=base_serial / s,
+                pipelined_speedup=base_pipelined / p,
+                pool_tokens=(None if pool_fn is None else pool_fn(counts)),
+            )
+        )
+    cands.sort(key=lambda c: c.serial_ms)
+    return cands if top is None else cands[: int(top)]
+
+
+# ---------------------------------------------------------------------------
+# #702 revision -- CO-SOLVING the KV/mamba token vector with the layer cut.
+#
+# Revision 1 of this objective reported a "pool cost" per candidate while
+# holding the KV token vector PINNED. That is single-family optimization and
+# the #485 phase-matrix doctrine forbids it: the vector is not a constant of
+# the problem, it is a second free variable that moves WITH the cut.
+#
+# The mechanics that make it move: a layer relocated to rank0 frees exactly its
+# weight bytes on the rank it left. Those bytes are immediately available to the
+# uneven-DCP / rank-kv-ratio machinery, which relocates the displaced KV share
+# onto them (the #320 capacity-matched pattern -- prefill 10,1,1 against a kv
+# vector 2,11,10). Rank0's VRAM cap therefore bounds rank0's SHARE of the token
+# split; it does not bound the world pool.
+#
+# Consequence, and it is exact rather than approximate: total VRAM is fixed and
+# the same 64 layers of weights exist wherever they sit, so total free bytes are
+# invariant under the cut. Under DCP the KV is token-sharded -- a rank holds the
+# full layer stack for its share of tokens -- so a token of world capacity costs
+# the same total bytes on any cut. The world pool is CONSERVED, and the only
+# honest residual is second-order: seam/staging in both directions and the
+# TP-phase vector redistribution, which are itemized rather than lumped.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldMemory:
+    """Per-rank memory facts needed to co-solve the token vector."""
+
+    vram_mib: Tuple[float, ...]
+    nonlayer_weight_mib: Tuple[float, ...]
+    weight_mib_per_layer: float
+    kv_mib_per_token_per_layer: float
+
+
+@dataclasses.dataclass(frozen=True)
+class CoSolvedCut:
+    counts: Tuple[int, ...]
+    serial_ms: float
+    pipelined_ms: float
+    serial_speedup: float
+    pipelined_speedup: float
+    kv_token_vector: Tuple[float, ...]
+    world_pool_tokens: float
+    world_pool_delta: float
+    second_order: Dict[str, float]
+
+
+def _free_mib(counts: Sequence[int], world: WorldMemory) -> List[float]:
+    free: List[float] = []
+    for r, n in enumerate(counts):
+        f = (
+            float(world.vram_mib[r])
+            - float(world.nonlayer_weight_mib[r])
+            - float(world.weight_mib_per_layer) * float(n)
+        )
+        if f < 0.0:
+            raise ValueError(
+                f"cut {tuple(counts)} is infeasible on rank{r}: "
+                f"{n} layers need "
+                f"{float(world.weight_mib_per_layer) * float(n):,.1f} MiB of "
+                f"weights plus {float(world.nonlayer_weight_mib[r]):,.1f} MiB "
+                f"non-layer against {float(world.vram_mib[r]):,.1f} MiB of "
+                f"VRAM, i.e. {-f:,.1f} MiB short. This is a weight overflow, "
+                "not a small pool."
+            )
+        free.append(f)
+    return free
+
+
+def _world_pool(
+    counts: Sequence[int],
+    world: WorldMemory,
+    overhead: Mapping[str, float],
+) -> Tuple[float, Tuple[float, ...]]:
+    """Return (world_pool_tokens, per-rank token vector).
+
+    Token-sharded (DCP): a rank holds the full layer stack for its SHARE of the
+    tokens, so one token costs ``kv_mib_per_token_per_layer * total_layers``
+    wherever it lands. That is what makes the world pool cut-invariant.
+    """
+    total_layers = int(sum(counts))
+    per_token = float(world.kv_mib_per_token_per_layer) * float(total_layers)
+    free = _free_mib(counts, world)
+    raw = [f / per_token for f in free]
+    pool = (sum(free) - float(sum(overhead.values()))) / per_token
+    scale = 1.0 if sum(raw) == 0 else pool / sum(raw)
+    return pool, tuple(x * scale for x in raw)
+
+
+def cosolve_prefill_cut(
+    counts: Sequence[int],
+    world: WorldMemory,
+    timing: PrefillTiming,
+    incumbent: Sequence[int] = (28, 20, 16),
+    overhead_fn: Optional[Callable[[Sequence[int]], Mapping[str, float]]] = None,
+) -> CoSolvedCut:
+    """Price one cut on time AND on a co-solved KV/mamba token vector.
+
+    ``overhead_fn`` returns the itemized second-order MiB terms for a cut
+    (seam/staging both directions, TP-phase redistribution). It is injected so
+    this solver invents no memory number it has not been given; absent it, the
+    residual is zero and the conservation result stands unqualified.
+    """
+    counts = tuple(int(n) for n in counts)
+    ov = dict(overhead_fn(counts)) if overhead_fn is not None else {}
+    base_ov = dict(overhead_fn(incumbent)) if overhead_fn is not None else {}
+    pool, vector = _world_pool(counts, world, ov)
+    base_pool, _ = _world_pool(incumbent, world, base_ov)
+    s = serial_prefill_ms(counts, timing)
+    p = pipelined_prefill_ms(counts, timing)
+    return CoSolvedCut(
+        counts=counts,
+        serial_ms=s,
+        pipelined_ms=p,
+        serial_speedup=serial_prefill_ms(incumbent, timing) / s,
+        pipelined_speedup=pipelined_prefill_ms(incumbent, timing) / p,
+        kv_token_vector=vector,
+        world_pool_tokens=pool,
+        world_pool_delta=pool - base_pool,
+        second_order=ov,
+    )

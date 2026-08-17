@@ -48,6 +48,12 @@ def _make_req(
     req.positional_embed_overrides = None
     req.extra_key = None
     req.mamba_pool_idx = None
+    # #679 follow-up: this helper builds a Req with __new__, so every field the
+    # class gained since it was written must be restated here or the first
+    # accessor raises. Default taken from Req.__init__ (schedule_batch.py:759),
+    # not invented -- a stub that guesses a default is a test that passes for
+    # the wrong reason.
+    req.kv_spill_state = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
 
@@ -94,6 +100,15 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
         regime_controller="off",
         gdn_state_set_ladder=None,
         enable_vram_dial=False,
+        # #679 follow-up: the SAME trap this block was written for, one
+        # actuator further on. An unpinned flag is TRUTHY here, so the
+        # prologue entered _phase_flip_on_round, which lazy-BUILDS a
+        # PhaseFlipRuntime from a Scheduler that has none of the state a
+        # build needs -- AttributeError on phase_flip_runtime, and three
+        # tests in this file red ever since the flip gained that hook.
+        # This gate has nothing to do with phase flips; pin it off with the
+        # rest rather than teach the stub to build a runtime it never uses.
+        enable_phase_flip=False,
     )
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True

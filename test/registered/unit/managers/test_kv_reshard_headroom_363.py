@@ -144,13 +144,23 @@ def _make_pools(n_ranks, vectors, num_slots, layers=2, heads=2, dim=4, seed=3):
     rows_needed = [reshard_ceiling_rows(num_slots, vectors, r) for r in range(n_ranks)]
     slots = torch.arange(num_slots, dtype=torch.int64)
     live = slots[torch.randperm(num_slots)[: int(num_slots * 0.8)]].sort().values
-    gk = [torch.randn(num_slots, heads, dim, dtype=torch.bfloat16) for _ in range(layers)]
-    gv = [torch.randn(num_slots, heads, dim, dtype=torch.bfloat16) for _ in range(layers)]
+    gk = [
+        torch.randn(num_slots, heads, dim, dtype=torch.bfloat16) for _ in range(layers)
+    ]
+    gv = [
+        torch.randn(num_slots, heads, dim, dtype=torch.bfloat16) for _ in range(layers)
+    ]
     pools, views = [], []
     owners = owner_of(live, old)
     for r in range(n_ranks):
-        kb = [torch.zeros(rows_needed[r], heads, dim, dtype=torch.bfloat16) for _ in range(layers)]
-        vb = [torch.zeros(rows_needed[r], heads, dim, dtype=torch.bfloat16) for _ in range(layers)]
+        kb = [
+            torch.zeros(rows_needed[r], heads, dim, dtype=torch.bfloat16)
+            for _ in range(layers)
+        ]
+        vb = [
+            torch.zeros(rows_needed[r], heads, dim, dtype=torch.bfloat16)
+            for _ in range(layers)
+        ]
         mine = live[owners == r]
         rows = rows_of(mine, old, r)
         for layer in range(layers):
@@ -162,9 +172,7 @@ def _make_pools(n_ranks, vectors, num_slots, layers=2, heads=2, dim=4, seed=3):
 
 
 def _snapshot(pools):
-    return [
-        ([k.clone() for k in kb], [v.clone() for v in vb]) for kb, vb in pools
-    ]
+    return [([k.clone() for k in kb], [v.clone() for v in vb]) for kb, vb in pools]
 
 
 def _pools_unchanged(pools, snap):
@@ -205,8 +213,13 @@ class _Fleet:
                     live_slots_fn=lambda live=self.live: live,
                     ready_fn=lambda: True,
                     cutover_fn=lambda vec, r=r: self.cutovers[r].append(tuple(vec)),
-                    free_bytes_fn=(None if fb is None else (lambda fb=fb: fb())
-                                   if callable(fb) else (lambda fb=fb: fb)),
+                    free_bytes_fn=(
+                        None
+                        if fb is None
+                        else (lambda fb=fb: fb())
+                        if callable(fb)
+                        else (lambda fb=fb: fb)
+                    ),
                 )
             )
         self.rounds = rounds
@@ -403,7 +416,8 @@ class TestTheCorridorFloorIsNotSpendable(unittest.TestCase):
         d = f.runtimes[0].last_headroom
         self.assertEqual(d["corridor_floor_bytes"], FLOOR)
         self.assertEqual(
-            d["margin_bytes"], d["free_bytes"] - d["corridor_floor_bytes"] - d["peak_bytes"]
+            d["margin_bytes"],
+            d["free_bytes"] - d["corridor_floor_bytes"] - d["peak_bytes"],
         )
         for term in ("staged", "packed", "largest_peer_pack", "recv", "peak"):
             self.assertIn(term, d["terms"])

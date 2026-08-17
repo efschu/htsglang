@@ -424,9 +424,7 @@ def test_cooldown_prevents_a_second_empty_cache_in_the_same_instant():
     card = FakeCard(free_mib=900, hoard_mib=4000)
     clock = {"t": 0.0}
     scheduler = FakeScheduler(FakeReporter(qkv=0, ffn=0))
-    gate = PrefillAdmissionGate(
-        scheduler, cooldown_s=0.25, clock=lambda: clock["t"]
-    )
+    gate = PrefillAdmissionGate(scheduler, cooldown_s=0.25, clock=lambda: clock["t"])
     guard = build_guard(card)
     gate._guard = lambda: guard  # noqa: SLF001
     gate.before_admission(512)
@@ -452,7 +450,11 @@ def test_an_exhausted_ladder_is_recorded_and_does_not_raise():
     card = FakeCard(free_mib=600, hoard_mib=0)
     gate, _ = build_gate(card)
     verdict = gate.before_admission(512)
-    assert verdict is not None and verdict.ok is False
+    # Post-2026-08-16 the 512 MiB chunk FITS in 600 MiB free, so the verdict
+    # holds; what is exhausted is the ladder's ability to restore the law,
+    # which now comes back as a dip rather than a refusal. The counter this
+    # test exists for is unchanged.
+    assert verdict is not None and verdict.law_breached is True
     assert gate.short == 1
     # The caller admits anyway. The gate returns evidence, not a decision.
 

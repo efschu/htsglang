@@ -112,9 +112,7 @@ def build(library=None, candidates=(SOLVED,)):
 
 def test_without_a_library_the_578_refusal_still_fires():
     with pytest.raises(RegimeError) as exc:
-        build_stage_table(
-            booted=BOOTED, candidates=[SOLVED], declared_vectors=DECLARED
-        )
+        build_stage_table(booted=BOOTED, candidates=[SOLVED], declared_vectors=DECLARED)
     assert "#578" in str(exc.value)
     assert "measurement pass" in str(exc.value)
 
@@ -168,7 +166,10 @@ def test_the_refusal_is_visible_in_the_summary():
     [
         ({"rig_key": "1:GPU-zzz"}, "DIFFERENT card set"),
         ({"model_key": "/models/other"}, "checkpoint"),
-        ({"flip_samples": 0, "flip_cost_s": 0.0}, "HAS a measurement and it is refused"),
+        (
+            {"flip_samples": 0, "flip_cost_s": 0.0},
+            "HAS a measurement and it is refused",
+        ),
         ({"gain_pct": 1.0, "band_pct": 1.4}, "does not clear its own band"),
     ],
 )
@@ -194,7 +195,10 @@ def test_apply_measurements_passes_an_already_measured_stage_through_untouched()
         flip_cost_s=0.3,
     )
     kept, refusals = apply_measurements(
-        [measured], measurements=StageMeasurementLibrary([]), rig_key=RIG, model_key=MODEL
+        [measured],
+        measurements=StageMeasurementLibrary([]),
+        rig_key=RIG,
+        model_key=MODEL,
     )
     assert kept == [measured] and refusals == []
 

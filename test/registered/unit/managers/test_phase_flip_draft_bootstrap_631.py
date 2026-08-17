@@ -30,6 +30,7 @@ import types
 import pytest
 import torch
 
+from sglang.srt.managers.phase_flip_resident_carry import ResidentCarryError
 from sglang.srt.managers.phase_flip_draft_bootstrap import (
     BOOTSTRAP_ATTR,
     DraftBootstrapError,
@@ -56,9 +57,7 @@ class FakeKVPool:
     def __init__(self, layer_num=1, start_layer=0, alias_value=False):
         self.layer_num = layer_num
         self.start_layer = start_layer
-        self._k = [
-            torch.full((N_SLOTS, 4), float(7 + i)) for i in range(layer_num)
-        ]
+        self._k = [torch.full((N_SLOTS, 4), float(7 + i)) for i in range(layer_num)]
         self._v = (
             self._k
             if alias_value
@@ -89,9 +88,7 @@ class FakeBatch:
         # it. Defaults to each request's last output token, which is what
         # the two clocks look like when they AGREE.
         if input_ids is None:
-            input_ids = [
-                (r.output_ids or r.origin_input_ids)[-1] for r in self.reqs
-            ]
+            input_ids = [(r.output_ids or r.origin_input_ids)[-1] for r in self.reqs]
         self.input_ids = torch.tensor(input_ids, dtype=torch.int64)
 
 
@@ -157,9 +154,7 @@ def test_can_fail_committed_slots_would_overrun_on_req_seqlen():
     """
     sched, _ = make_scheduler()
     batch = make_batch()
-    seqlens = [
-        len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs
-    ]
+    seqlens = [len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs]
     assert seqlens == [4, 4]
     overrun = [
         sched.req_to_token_pool.req_to_token[r.req_pool_idx, :n].tolist()
@@ -627,3 +622,64 @@ def test_each_output_holder_is_named_separately():
     assert _output_reasons(FakePpScheduler(last_rank_comm_queue=[1])) == [
         "last_rank_comm_queue is not empty"
     ]
+
+
+# --------------------------------------------------------------------- #
+# #682: the SECOND copy of the resident ceiling, on the arming leg
+# --------------------------------------------------------------------- #
+#
+# `harvest_resident_batches` is not the only place that asserts a bound on
+# the resident set: this function checks its own input, deliberately, because
+# `committed_slots` allocates one tensor per request and "a consumer that can
+# be ruined by an implausible input checks that input itself". Correct -- but
+# it inherited the same too-tight bound, so repairing only the carry would
+# have moved the 02:07 crash one function later, on the very configuration
+# that produced it (the flip is PP->TP with NEXTN, so this leg runs).
+#
+# The scheduler suspends the running-request cap while a chunked prefill is in
+# flight (see IN_FLIGHT_CHUNKED_ALLOWANCE), so cap + 1 is the true bound here
+# too, and cap + 2 must still refuse.
+
+
+def test_the_chunked_prefill_excursion_arms_instead_of_raising():
+    """RED before the fix: ResidentCarryError on the arming leg."""
+    sched, _ = make_scheduler()
+    sched.max_running_requests = 1  # this batch carries cap + the in-flight chunk
+    batch = make_batch()
+    report = arm_draft_bootstrap(sched, batch, sched.draft_worker)
+    assert report["armed"] is True
+    assert report["reqs"] == 2
+
+
+def test_a_resident_set_two_above_the_cap_still_refuses_to_arm():
+    """The guard's lethal-half purpose survives the widening."""
+    sched, _ = make_scheduler()
+    sched.max_running_requests = 1
+    batch = FakeBatch(
+        [
+            FakeReq("a", 0, [11, 12, 13], [14]),
+            FakeReq("b", 1, [21, 22], [23, 24]),
+            FakeReq("c", 2, [31, 32], [33, 34]),
+        ],
+        seq_lens=[3, 4, 4],
+    )
+    with pytest.raises(ResidentCarryError) as excinfo:
+        arm_draft_bootstrap(sched, batch, sched.draft_worker)
+    msg = str(excinfo.value)
+    assert "3" in msg
+    assert "max_running_requests=1" in msg, "the configured cap must stay visible"
+
+
+def test_the_two_ceilings_agree():
+    """One allowance, imported by both, so they cannot drift apart.
+
+    The 02:07 crash was one guard asserting a bound the scheduler did not
+    hold. Two guards asserting two different bounds is the same defect with
+    a longer fuse.
+    """
+    from sglang.srt.managers import phase_flip_draft_bootstrap as bootstrap
+    from sglang.srt.managers.phase_flip_resident_carry import (
+        IN_FLIGHT_CHUNKED_ALLOWANCE,
+    )
+
+    assert bootstrap.IN_FLIGHT_CHUNKED_ALLOWANCE is IN_FLIGHT_CHUNKED_ALLOWANCE

@@ -89,7 +89,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,17 @@ _UNBOUNDED_ROWS = 1 << 40
 #: Rows this rung refuses to give up ON TOP of the live high-water mark, so a
 #: shrink leaves a pool that can still ADMIT. See :meth:`KvBackingRelief._floor_rows`.
 KV_ADMISSION_RESERVE_ENV = "SGLANG_KV_ADMISSION_RESERVE_ROWS"
+
+#: #662: may this rung lower the high-water mark by EVICTING recomputable
+#: prefix cache, rather than only releasing the slack above it?
+#:
+#: Defaults ON, because with it OFF the seam can only be funded by VRAM held
+#: free at rest -- which is the corridor-law breach this flag exists to end.
+#: It is kept as a flag purely so the CAN-FAIL PROOF is runnable on metal: at
+#: 0 the guard must refuse a flip from a corridor-filled pool, and at 1 the
+#: same flip must clear. A relief mechanism that has never been observed to
+#: change an outcome is indistinguishable from one that is never reached.
+KV_RADIX_EVICT_ENV = "SGLANG_KV_RADIX_EVICT_RELIEF"
 
 #: One chunked prefill on the shipped configuration (``chunked_prefill_size``
 #: 512), which is the exact allocation that raised when the floor reserved
@@ -528,10 +539,40 @@ class KvBackingRelief:
         buffers: int = 0,
         law_floor_bytes: int = 1024 * 1024 * 1024,
         admission_reserve_rows: int = DEFAULT_ADMISSION_RESERVE_ROWS,
+        tree_cache_fn: Optional[Callable[[], Any]] = None,
+        pool_fn: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._pool = pool
+        #: THE ID-SPACE OWNER, and it never moves. The scheduler holds ONE
+        #: allocator for the life of the process -- a single id space is what
+        #: makes a row identifiable across the flip at all -- so the cap, the
+        #: reservation and everything the collective cap agreement reads stay
+        #: anchored on the pool this object was built with, whatever pool the
+        #: backing calls are currently acting on.
+        self._id_space_pool = pool
+        #: #662: WHICH POOL HOLDS THE PAGES RIGHT NOW. The flip has two
+        #: layouts and two arenas, and only one of them is backed at a time.
+        #: Resolved per call rather than captured, for the reason the tree
+        #: cache is: a reference taken once is a reference to whichever layout
+        #: happened to be active when this object was built, and on the
+        #: tp_to_pp leg that is the EMPTY one. See :meth:`_rebind`.
+        self._pool_fn = pool_fn
+        #: Per-pool backing state, keyed by pool identity. Geometry, the boot
+        #: reservation and the exhaustion marker are all facts about ONE
+        #: arena and must not follow the rung across a rebind.
+        self._pool_state: dict = {}
         self._alloc = allocator
         self._live_slots_fn = live_slots_fn
+        #: #662: the id-targeted evictor that lowers ``max_live`` itself.
+        #: Without it this rung can only release backing NO row occupies --
+        #: the slack above the high-water mark -- which is precisely why the
+        #: seam had to be funded from VRAM held free at rest. Resolved per
+        #: call rather than captured: the tree cache is rebuilt on a flush,
+        #: and a stale reference would evict into a tree nobody reads.
+        self._tree_cache_fn = tree_cache_fn
+        #: Rows given up to the watermark actuator, cumulative, for the log.
+        self.evicted_rows_total = 0
+        self.evict_count = 0
         self._bytes_per_row = int(bytes_per_row)
         #: Number of arena buffers (2 x layer_num). The release granularity is
         #: one commit chunk in EACH of them, not one chunk overall.
@@ -554,10 +595,28 @@ class KvBackingRelief:
         #: overwritten by a second one, so a two-step relief still recovers to
         #: the boot reservation rather than to the intermediate step.
         self._rows_at_boot: Optional[int] = None
-        #: Set when a shrink returned no driver bytes. One such attempt is
-        #: evidence about the ARENA, not about this moment, so repeating it
-        #: can only cost time and risk -- and on metal it cost 2.5 GiB.
-        self._exhausted = False
+        #: THE BACKING LEVEL AT WHICH A SHRINK RETURNED NO DRIVER BYTES, or
+        #: None while this rank is willing to be asked. Read through the
+        #: :attr:`_exhausted` property, which compares it against the CURRENT
+        #: level -- so exhaustion expires the moment the backing moves.
+        #:
+        #: #662-F4: THIS USED TO BE A BOOL, AND IT LATCHED FOR THE LIFE OF THE
+        #: PROCESS. Measured on metal 2026-08-15: one shrink of a pool the
+        #: phase flip had already emptied returned zero bytes (it could not
+        #: have returned anything -- see :meth:`_current_rows`), the flag
+        #: latched, and from that instant the rung declined every ask on BOTH
+        #: legs while reporting ``slack=170368`` rows. The tp_to_pp seam then
+        #: abandoned nine times for want of ~500 MiB and the instance never
+        #: reached the prefill layout again.
+        #:
+        #: One shrink at one backing level is evidence about THAT level. It is
+        #: not evidence about the next one, and the cost of treating it as
+        #: permanent is the entire prefill layout. A retry is cheap now that a
+        #: failed shrink is never undone (:meth:`_shrink_to`): it engages a cap
+        #: and calls the dial in the SHRINK direction, which never allocates.
+        self._exhausted_at_rows: Optional[int] = None
+        #: The target whose shrink returned nothing. A DEEPER ask re-arms.
+        self._exhausted_target_rows: Optional[int] = None
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
@@ -571,6 +630,207 @@ class KvBackingRelief:
         self._trace_all = os.environ.get(KV_RELIEF_TRACE_ENV, "") == "1"
 
     # -- plumbing --------------------------------------------------------
+
+    def _rebind(self) -> None:
+        """Point the backing calls at the layout that actually holds pages.
+
+        THE RUNG WAS BOUND TO ONE POOL AND THE FLIP HAS TWO. The scheduler's
+        pool is the PP layout's, so on the pp_to_tp leg the rung is looking at
+        the source -- backed, with slack above the live set, able to pay. On
+        the tp_to_pp leg the SAME pool is the destination, and the seam emptied
+        it a phase ago: no extents, nothing to release, and every proposal it
+        makes is arithmetic over memory that is not there. That is why the leg
+        into the prefill layout had no funder even after the exclusion in
+        ``collective_kv_backing_relief`` was lifted.
+
+        The money on that leg is in the TP layout's pool: it is the SOURCE, it
+        is fully backed, and the rows above its live high-water mark hold
+        nothing. Releasing them early hands the gate exactly the bytes it is
+        about to refuse for -- and the seam was going to release that whole
+        layout at the cutover anyway, so this is the same memory arriving in
+        time to be useful rather than one gate too late.
+
+        WHAT DOES NOT MOVE: the cap and the id space. Both layouts index the
+        same allocator, so a target is a row id and means the same thing in
+        either pool; :meth:`_reservation_rows` and everything the collective
+        cap agreement reads stay on ``_id_space_pool``. Only geometry, the
+        boot reservation and the exhaustion marker are per-arena, and those
+        are carried in ``_pool_state``.
+        """
+        if self._pool_fn is None:
+            return
+        try:
+            pool = self._pool_fn()
+        except Exception as e:
+            logger.warning(
+                "%s could not resolve the active layout's pool (%s); staying "
+                "on the pool this rung was built with",
+                LOG_PREFIX,
+                e,
+            )
+            return
+        if pool is None or pool is self._pool:
+            return
+        # Park the state of the pool we are leaving.
+        self._pool_state[id(self._pool)] = {
+            "bytes_per_row": self._bytes_per_row,
+            "buffers": self._buffers,
+            "rows_at_boot": self._rows_at_boot,
+            "exhausted_at_rows": self._exhausted_at_rows,
+            "exhausted_target_rows": getattr(self, "_exhausted_target_rows", None),
+            "pool": self._pool,
+        }
+        state = self._pool_state.get(id(pool))
+        if state is None:
+            row_bytes, n_buffers = row_geometry(pool)
+            state = {
+                "bytes_per_row": int(row_bytes),
+                "buffers": int(n_buffers),
+                "rows_at_boot": None,
+                "exhausted_at_rows": None,
+                "pool": pool,
+            }
+            logger.info(
+                "%s now funding from the ACTIVE layout's pool on device %s: "
+                "%d B/row over %d arena buffers. The pool this rung was built "
+                "with is the other layout's and is unbacked while that layout "
+                "is inactive, so a proposal against it would be arithmetic "
+                "over memory that is not mapped.",
+                LOG_PREFIX,
+                self._device_index,
+                int(row_bytes),
+                int(n_buffers),
+            )
+        self._pool = pool
+        self._bytes_per_row = int(state["bytes_per_row"])
+        self._buffers = int(state["buffers"])
+        self._rows_at_boot = state["rows_at_boot"]
+        self._exhausted_at_rows = state["exhausted_at_rows"]
+        self._exhausted_target_rows = state.get("exhausted_target_rows")
+
+    @property
+    def _exhausted(self) -> bool:
+        """Is this rank declining to be asked RIGHT NOW?
+
+        True only while the backing still stands exactly where the failed
+        shrink left it. Any movement -- a recovery, a grow, the phase flip
+        restoring this layout -- re-arms the rung, because the arena that
+        could not pay at one level is a different proposition at another.
+        """
+        if self._exhausted_at_rows is None:
+            return False
+        # Read the level FIRST: ``_current_rows`` retires the marker when it
+        # sees an emptied layout, so the marker must be re-read afterwards
+        # rather than captured across the call.
+        current = int(self._current_rows())
+        marker = self._exhausted_at_rows
+        return marker is not None and current == int(marker)
+
+    def _declines_target(self, target: int) -> bool:
+        """Is this rank still declining, GIVEN what is being asked of it?
+
+        Exhaustion holds only while the ask is no deeper than the one that
+        failed. A target at least one release granularity below the failed one
+        is a different question and gets a different answer -- which is what
+        stops the marker from being a deadlock (see :meth:`_mark_exhausted`).
+        """
+        if not self._exhausted:
+            return False
+        failed = getattr(self, "_exhausted_target_rows", None)
+        if failed is None:
+            return True
+        granularity = max(1, self._min_release_rows())
+        if int(target) <= int(failed) - granularity:
+            # Deeper than the ask that failed: a different question, because
+            # release is extent-granular.
+            return False
+        # SLACK OVERRIDES THE MARKER, and this is the rule the original brief
+        # asked for and I twice failed to implement: "never per process, when
+        # slack >> need".
+        #
+        # Keying on the target alone refuses every SHALLOWER ask after a deep
+        # one failed -- and the asks that follow are always shallower, because
+        # the deficit only ever asks for what it needs. Measured 12:26:41: PP1
+        # held 112,126 rows of slack above its floor, priced a real +1009 MiB
+        # deficit, and still declined, because a deep shrink had failed
+        # earlier from a different level. Several GiB sat releasable behind a
+        # marker.
+        #
+        # One failed shrink is weak evidence and this is where it stops being
+        # decisive: when the slack in front of the rung dwarfs what is being
+        # asked for, the cost of trying is one cap and one dial call that
+        # cannot allocate, and the cost of not trying is the prefill layout.
+        chunked = self._min_release_rows()
+        if chunked <= 0:
+            # No commit chunk means no extent can clear at ANY depth, so slack
+            # is not evidence of anything and the marker stands. (Such a pool
+            # is disqualified from the rung entirely at construction; this is
+            # the belt.)
+            return True
+        current = self._current_rows()
+        slack = max(0, current - int(target))
+        return slack < 2 * chunked
+
+    @_exhausted.setter
+    def _exhausted(self, value: bool) -> None:
+        """Keep the boolean spelling, now meaning "exhausted AT THIS LEVEL".
+
+        Setting True latches against the backing as it stands right now, so
+        the statement stays true exactly as long as the evidence for it does.
+        """
+        if value:
+            self._mark_exhausted()
+        else:
+            self._exhausted_at_rows = None
+
+    def last_proposal_summary(self) -> str:
+        """One line describing this rung's most recent decision, or why none.
+
+        For the caller that REFUSES: at that moment the reader needs to know
+        whether the rung declined, abstained, or was never reached, and those
+        three have very different fixes. Returns a sentence rather than a
+        dict, because it is going straight into a refusal message.
+        """
+        t = getattr(self, "_last_proposal_terms", None)
+        if t is None:
+            return (
+                "the KV rung produced NO proposal this round -- it was not "
+                "reached, which is a different defect from declining"
+            )
+        verdict = (
+            f"SHRINK to {t['desire']}" if t["desire"] < t["current"] else "no change"
+        )
+        why = t["skipped"] or (
+            "the cheaper tier covered the gap"
+            if t["deficit"] <= 0
+            else "KV capacity is the funder"
+        )
+        return (
+            f"KV rung: current={t['current']} rows, floor={t['floor_rows']}, "
+            f"slack={max(0, t['current'] - t['floor_rows'])}, deficit="
+            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why})"
+        )
+
+    def _mark_exhausted(self, target: Optional[int] = None) -> None:
+        """Record the level AND the target at which the arena returned nothing.
+
+        BOTH, because the level alone is self-locking. A shrink that releases
+        nothing leaves the physical level exactly where it was, so a marker
+        keyed only to the level marks the level the rung is stuck at -- and the
+        only thing that could move it is a successful shrink, which the marker
+        now prevents. Measured on this rig 2026-08-15: a shrink to 94955 rows
+        returned no driver bytes at 12:16:00, and 47 seconds later the rung was
+        still declining with 72981 rows of slack in front of it, at the same
+        level, for ever.
+
+        The target is what makes the evidence falsifiable. "A shrink to X
+        returned nothing" says nothing about a shrink to something deeper than
+        X -- release is extent-granular, so a deeper ask clears extents a
+        shallower one could not touch. That is the same argument the granularity
+        rounding in :meth:`free_up_to` already makes.
+        """
+        self._exhausted_at_rows = int(self._current_rows())
+        self._exhausted_target_rows = None if target is None else int(target)
 
     def _free_bytes(self) -> int:
         if self._probe is not None:
@@ -598,11 +858,131 @@ class KvBackingRelief:
         its argument in BOTH directions, so that was a grow:
         ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY``, from inside relief,
         on the card that needed relieving.
+
+        #662-F4: AND ``full_pool_backed_rows`` IS NOT PHYSICAL EITHER. Its name
+        promises a measurement; it returns ``full_kv_pool.size``, a CONFIGURED
+        row count. That was harmless while the #330 dial was the only thing
+        moving the backing, because the dial writes ``size`` on every step. The
+        phase flip does not: ``release_backing`` / ``restore_backing`` unmap and
+        remap this pool's pages and say so in their own comment -- "SIZING IS
+        NOT TOUCHED". So for the whole of the TP phase the PP layout's pool
+        holds NO committed extents while ``size`` still reports its pre-flip
+        count.
+
+        Measured on metal 2026-08-15, tp_to_pp gate, all three ranks:
+
+            KV-BACKING proposal ... rows current=407051 floor=1157
+              (max_live=644 + admission reserve 512, slack=405894)
+            KV-BACKING shrink to 222081 rows reported 0 MiB but the driver's
+              free column did not move
+
+        Those 405894 rows of "slack" did not exist. The pool had been emptied
+        by the pp_to_tp cutover eighteen seconds earlier, so the shrink could
+        not have returned a byte -- and the zero it returned was then read as
+        evidence that the ARENA was exhausted, which latched the rung off for
+        the rest of the process (see :attr:`_exhausted_at_rows`).
+
+        So ask the arena. ``backed_bytes`` is the number the boot's own
+        exclusive-backing pin asserts on, and it cannot report backing that is
+        not mapped.
         """
-        rows = getattr(self._pool, "full_pool_backed_rows", None)
-        if rows is None:
-            return int(getattr(self._pool, "size", 0))
-        return int(rows)
+        backed = self._physical_backed_rows()
+        if backed is None:
+            rows = getattr(self._pool, "full_pool_backed_rows", None)
+            backed = (
+                int(rows) if rows is not None else int(getattr(self._pool, "size", 0))
+            )
+        if backed <= 0:
+            # SEEING AN EMPTY LAYOUT RETIRES THE EXHAUSTION MARKER, and this
+            # is the one place every caller passes through, which is why the
+            # invalidation lives here rather than in the property.
+            #
+            # A layout the flip has emptied carries no evidence about an
+            # arena: its extents went back to the driver, and the pages that
+            # return on the next restore are different handles. Worse, the
+            # level it comes back at can equal the level the failed shrink
+            # left behind -- so a marker compared only by level would survive
+            # a whole phase and go on declining. That is the process-lifetime
+            # latch wearing a level-shaped disguise, and it is the defect this
+            # work exists to remove.
+            self._exhausted_at_rows = None
+        return backed
+
+    def _physical_backed_rows(self) -> Optional[int]:
+        """Rows the ARENA has committed, or None when it cannot be measured.
+
+        Release is extent-granular, so this can exceed the exact row span by
+        less than one commit chunk per buffer. That overshoot is bounded and
+        in the safe direction: it never invents backing that is not there,
+        which is the only error mode that matters here.
+
+        None -- never 0 -- when the pool does not expose the reading, so a pool
+        that never flips keeps exactly its previous behaviour.
+        """
+        if self._bytes_per_row <= 0:
+            return None
+        # THE MINIMUM ACROSS BUFFERS, not the average, and the difference is
+        # the whole point. ``backed_bytes`` is a SUM, so dividing it by the
+        # all-buffers per-row size gives an AVERAGE depth -- true only when the
+        # backing is uniform, which the waved seam guarantees it is not.
+        # ``decommit_range`` frees extents lying wholly above the keep point
+        # PER BUFFER, so a target derived from the average sits above the
+        # shallowest buffer's watermark and the shrink returns nothing while
+        # looking like a large one.
+        #
+        # Measured 2026-08-15, the 2048-chunk boot: read 591872 from the
+        # average, asked for 320217 and 352067, got 0 MiB nine times. The six
+        # shrinks that PAID were the ones whose target was below every buffer
+        # (73345 from 149504). Same defect class as reading the configured
+        # size, one level down: a number that is not what the shrink acts on.
+        uniform = getattr(self._pool, "uniform_backed_rows", None)
+        if uniform is not None:
+            try:
+                rows = int(uniform)
+            except (TypeError, ValueError):
+                rows = -1
+            if rows >= 0:
+                return rows
+        raw = getattr(self._pool, "backed_bytes", None)
+        if raw is None:
+            return None
+        try:
+            backed = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if backed < 0:
+            return None
+        return backed // self._bytes_per_row
+
+    def _reserved_rows(self) -> Optional[int]:
+        """The arena's immutable row ceiling, or None when unreadable (#684).
+
+        None -- never 0 -- when the pool exposes no reservation, so a pool
+        without an arena keeps exactly its previous behaviour and the clamp
+        simply does not engage. 0 from the pool means the same thing: no
+        arena, hence nothing to clamp against, NOT a ceiling of zero.
+
+        NOT :meth:`_reservation_rows`, and the two must not be conflated. That
+        one is the ALLOCATOR's id space, read from the id-space owner, and it
+        feeds ``exposed_rows`` and the collective cap agreement. This one is
+        the ARENA's VA span on whichever layout the backing calls currently
+        point at -- the bound ``_check_final`` enforces on a grow.
+
+        RANK-LOCAL BY NATURE, and that is why reading it needs no collective.
+        A reservation is one card's VA span; under uneven TP the ranks hold
+        different ones (190596 / 136140 / 108912 on the 2026-08-16 boot), so
+        there is no group number here to agree on. What recovery changes is
+        this rank's own physical backing, and the module's collective -- the
+        cap agreement -- is on the SHRINK target, which is unchanged.
+        """
+        raw = getattr(self._pool, "reserved_backing_rows", None)
+        if raw is None:
+            return None
+        try:
+            rows = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return rows if rows > 0 else None
 
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
@@ -708,6 +1088,125 @@ class KvBackingRelief:
         )
         return int(math.ceil(floor / page) * page)
 
+    # -- #662: the watermark actuator -------------------------------------
+
+    def _evict_enabled(self) -> bool:
+        return os.environ.get(KV_RADIX_EVICT_ENV, "1") not in ("0", "false", "False")
+
+    def _tree_cache(self):
+        if self._tree_cache_fn is None:
+            return None
+        try:
+            return self._tree_cache_fn()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s tree cache unavailable: %s", LOG_PREFIX, e)
+            return None
+
+    def _resident_ceiling(self) -> int:
+        """Highest row a RESIDENT REQUEST pins, or -1 when none/unknown.
+
+        This is the half of the live set eviction cannot touch, and it is
+        therefore the true floor of the watermark. Read from the live-set
+        function's side channel (``last_split``), which the flip's own
+        enumeration already populates -- see build_flip_live_slots_fn.
+
+        AN UNREADABLE SPLIT RETURNS -1 AND THE CALLER MUST TREAT THAT AS
+        "DO NOT EVICT". Defaulting an unknown resident ceiling to 0 would
+        say "every row is evictable", which is the one wrong answer that
+        unmaps memory a live request is reading.
+        """
+        split = getattr(self, "_last_live_split", None)
+        if not split:
+            return -1
+        try:
+            return int(split.get("req_max", -1))
+        except Exception:  # pragma: no cover - defensive
+            return -1
+
+    def _evict_floor_rows(self, max_live: int) -> Tuple[int, int]:
+        """``(floor_rows, evictable_rows)`` if the mark were lowered.
+
+        The pair the proposal needs: how low this rank could cap once the
+        recomputable half of the live set is given up, and what that would
+        cost in rows. When eviction is unavailable, or the ceiling is
+        already pinned by resident requests, this degrades EXACTLY to
+        ``_floor_rows(max_live)`` with zero cost -- so a rank that cannot
+        evict proposes precisely what it proposed before this existed.
+        """
+        plain = self._floor_rows(max_live)
+        if not self._evict_enabled():
+            return plain, 0
+        tree = self._tree_cache()
+        if tree is None:
+            return plain, 0
+        req_max = self._resident_ceiling()
+        if req_max < 0:
+            # Unknown resident half: refuse to price an eviction at all.
+            return plain, 0
+        if req_max >= int(max_live):
+            # The mark is pinned by work in flight; nothing to win here.
+            return plain, 0
+        floor = self._floor_rows(req_max)
+        if floor >= plain:
+            return plain, 0
+        try:
+            from sglang.srt.managers.kv_radix_watermark import evictable_rows_above
+
+            rows, _nodes = evictable_rows_above(tree, max(0, floor - 1))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s could not price the watermark rung: %s", LOG_PREFIX, e)
+            return plain, 0
+        if rows <= 0:
+            return plain, 0
+        return floor, int(rows)
+
+    def _lower_watermark_to(self, target: int) -> int:
+        """Evict every recomputable row at or above ``target``. Rows freed.
+
+        Called on the SHRINK path only, immediately before the cap, so the
+        rows the cap is about to withhold are genuinely unoccupied by the
+        time it withholds them.
+        """
+        if not self._evict_enabled():
+            return 0
+        tree = self._tree_cache()
+        if tree is None:
+            return 0
+        req_max = self._resident_ceiling()
+        if req_max < 0:
+            return 0
+        try:
+            from sglang.srt.managers.kv_radix_watermark import evict_rows_above
+
+            # A cap of ``target`` rows admits ids strictly below ``target``,
+            # so the last id that may survive is ``target - 1``.
+            freed = int(
+                evict_rows_above(
+                    tree, max(0, int(target) - 1), resident_ceiling=req_max
+                )
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s watermark eviction failed: %s", LOG_PREFIX, e)
+            return 0
+        if freed > 0:
+            self.evicted_rows_total += freed
+            self.evict_count += 1
+            logger.info(
+                "%s EVICTED %d recomputable row(s) to bring the high-water "
+                "mark below %d on device %d (resident ceiling %d, %.1f MiB of "
+                "prefix cache given up, %d row(s) over %d seam(s) so far). "
+                "This is the seam's fund: content, not empty VRAM.",
+                LOG_PREFIX,
+                freed,
+                int(target),
+                self._device_index,
+                req_max,
+                freed * self._bytes_per_row / _MIB,
+                self.evicted_rows_total,
+                self.evict_count,
+            )
+        return freed
+
     def fundable_bytes(self) -> int:
         """Bytes this rank could return WITHOUT crossing its admission floor.
 
@@ -719,6 +1218,7 @@ class KvBackingRelief:
         Pure: it reads the live set and the backing and computes. It is on the
         gate's unconditional path, so it must not touch residency.
         """
+        self._rebind()
         if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
@@ -727,7 +1227,13 @@ class KvBackingRelief:
         current = self._current_rows()
         if current <= 0:
             return 0
-        return max(0, current - self._floor_rows(max_live)) * self._bytes_per_row
+        # #662: quote the floor this rank could actually REACH, which
+        # includes the recomputable half of the live set. Quoting the plain
+        # floor here while the shrink path can go lower would understate the
+        # rung to its only caller, and an honest bound is the whole purpose
+        # of this method.
+        floor, _evictable = self._evict_floor_rows(max_live)
+        return max(0, current - floor) * self._bytes_per_row
 
     # -- the collective decision -----------------------------------------
 
@@ -757,6 +1263,7 @@ class KvBackingRelief:
         recoverable (the guard refuses, the flip is retried next round) while
         over-shrinking costs admission capacity that bought nothing.
         """
+        self._rebind()
         if not self._supported():
             return self._abstain(
                 "the pool has no runtime_set_backing_rows entry point, so this "
@@ -784,7 +1291,16 @@ class KvBackingRelief:
                 "FAULT"
             )
         self._clear_abstain()
-        floor_rows = self._floor_rows(max_live)
+        # #662: THE FLOOR IS NOW A CHOICE, NOT A READING. Without the
+        # watermark actuator the floor is wherever the cache happens to
+        # have left its highest id, and on a corridor-filled pool that is
+        # at or above ``current`` -- the rung then reports "no slack above
+        # the live set" and funds nothing, which is exactly why the seam
+        # had to be paid for in VRAM held free at rest. With it, the floor
+        # is the RESIDENT half of the live set, and the difference is
+        # recomputable prefix cache this rung may spend.
+        floor_rows, evictable_rows = self._evict_floor_rows(max_live)
+        self._last_evictable_rows = int(evictable_rows)
         desire = current
         # Hoisted so the diagnostic below can report the terms on the path
         # where the rung declines, which is the ONLY path it has ever taken.
@@ -797,17 +1313,20 @@ class KvBackingRelief:
         # worse than one that states none, because the next reader stops
         # looking.
         skipped = ""
-        if self._exhausted:
-            skipped = (
-                "this rank's arena is EXHAUSTED (a previous shrink returned no "
-                "driver bytes), so it stops asking; the deficit is not computed"
-            )
-        elif floor_rows >= current:
+        if floor_rows >= current:
             skipped = (
                 f"no slack above the live set: floor_rows {floor_rows} >= "
                 f"current {current}, so there is nothing this rung may give up"
             )
-        if floor_rows < current and not self._exhausted:
+        # THE DEFICIT IS COMPUTED BEFORE EXHAUSTION IS CONSULTED, and the order
+        # is the fix. Exhaustion used to short-circuit here, which meant the
+        # rung could not tell how DEEP an ask it was refusing -- and since a
+        # shrink that releases nothing leaves the level unchanged, the marker
+        # keyed to that level could never expire. Measured: 47 s of declining
+        # with 72981 rows of slack in front of it, at a level nothing could
+        # move. Pricing first costs one free-memory probe and makes the refusal
+        # answerable: a target deeper than the one that failed is new evidence.
+        if floor_rows < current:
             free_now = self._free_bytes()
             need = int(floor_bytes) + int(delta_bytes) + max(0, int(want_bytes))
             deficit = need - free_now - max(0, int(cheap_relief_bytes))
@@ -819,6 +1338,15 @@ class KvBackingRelief:
                 page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
                 desire = max(floor_rows, current - rows)
                 desire = int(math.ceil(desire / page) * page)
+                if self._declines_target(desire):
+                    failed = getattr(self, "_exhausted_target_rows", None)
+                    skipped = (
+                        "this rank's arena returned no driver bytes at a "
+                        f"shrink to {failed}, and this ask ({desire}) is not "
+                        "deeper than that by a release granularity, so it is "
+                        "the same question and gets the same answer"
+                    )
+                    desire = current
         self._trace_proposal(
             current=current,
             floor_rows=floor_rows,
@@ -928,6 +1456,16 @@ class KvBackingRelief:
         sign = 1 if t["deficit"] > 0 else 0
         edge = sign != self._last_deficit_sign
         self._last_deficit_sign = sign
+        # RETAINED EVEN WHEN NOT LOGGED, so a REFUSAL can print the terms.
+        #
+        # The edge trigger keeps a steady state quiet, which is right, but a
+        # refusal is not an edge -- and at a refusal the silence is exactly
+        # the ambiguity this method's own docstring warns about. Measured the
+        # hard way on 2026-08-15: the seam was refused by 59 MiB, this rung
+        # had emitted nothing for five minutes, and I read that as "the rung
+        # was never consulted" and went looking for a missing call. It was
+        # consulted every gate and had simply declined quietly.
+        self._last_proposal_terms = dict(t)
         if not (edge or self._trace_all):
             return
         logger.info(
@@ -974,6 +1512,7 @@ class KvBackingRelief:
         A rank that pays nothing and caps anyway loses admission capacity for
         no bytes; a rank that pays nothing and stays uncapped loses the group.
         """
+        self._rebind()
         if target_rows is None:
             return 0
         target = int(target_rows)
@@ -994,6 +1533,7 @@ class KvBackingRelief:
         target comes from :func:`collective_kv_target` instead, because a
         capacity may not be decided locally.
         """
+        self._rebind()
         if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
@@ -1001,7 +1541,7 @@ class KvBackingRelief:
             return 0
         current = self._current_rows()
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
-        floor = self._floor_rows(max_live)
+        floor, _evictable = self._evict_floor_rows(max_live)
         rows_wanted = int(math.ceil(max(0, int(nbytes)) / self._bytes_per_row))
         # RELEASE IS EXTENT-GRANULAR, PER BUFFER, AND THAT IS COARSE.
         #
@@ -1031,6 +1571,14 @@ class KvBackingRelief:
         before = self._free_bytes()
         if self._rows_at_boot is None:
             self._rows_at_boot = current
+        # #662: EVICT FIRST, AND ONLY THEN CAP. The rows this cap is about
+        # to withhold must be unoccupied by the time it withholds them, and
+        # on a corridor-filled pool they are occupied by recomputable prefix
+        # cache. Evicting here rather than in the caller keeps the whole
+        # order -- evict, cap, unmap -- in one place, because it is the
+        # ORDER that is the safety property and splitting it across two
+        # modules is how it would come apart.
+        self._lower_watermark_to(target)
         # ORDER IS THE SAFETY PROPERTY: cap FIRST, unmap SECOND. Reversed,
         # there is a window in which the allocator may hand out an id whose
         # pages have already gone back to the driver.
@@ -1078,7 +1626,7 @@ class KvBackingRelief:
             asked = int(current) - int(target)
             granularity = self._min_release_rows()
             if granularity <= 0 or asked >= granularity:
-                self._exhausted = True
+                self._mark_exhausted(target)
             logger.warning(
                 "%s shrink to %d rows reported %.0f MiB but the driver's free "
                 "column did not move, so this pool cannot pay: the arena has "
@@ -1132,6 +1680,7 @@ class KvBackingRelief:
         Lifting the cap before the memory exists would re-admit ids that are
         still unmapped, which is the very fault the cap prevents.
         """
+        self._rebind()
         if self._rows_at_boot is None:
             return 0
         boot_rows = int(self._rows_at_boot)
@@ -1144,6 +1693,46 @@ class KvBackingRelief:
                 rows = min(boot_rows, was + max(0, affordable))
                 page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
                 rows = int(rows // page * page)
+            # #684: CLAMP TO WHAT THE ACTUATOR CAN ACCEPT, NOT TO WHAT WE
+            # REMEMBER. The reservation is fixed at construction from the
+            # pool's size AT THAT MOMENT and never moves again, while `size`
+            # itself is mutable -- the #330 dial writes it on every step. So a
+            # target derived from a remembered row count can sit above the
+            # ceiling, and `_check_final` refuses it identically every time:
+            # measured 59 times in 20 minutes on three ranks, 02:15:24 to
+            # 02:35:26, `recovery to 270646 rows failed: ... reserved=190596`.
+            #
+            # Recovery is what LIFTS the cap, so those 59 refusals meant the
+            # cap never lifted, the pool stayed shrunk, and every later
+            # `free_up_to` found the backing already at its target and claimed
+            # 0 MiB -- which the shrink path then reported as an exhausted
+            # ARENA. One unsatisfiable number, and the corridor guard's only
+            # rung above the allocator cache was dead for the whole boot.
+            #
+            # DERIVATION IS NOT TRUSTED; THE BOUND IS ASKED. This is the same
+            # correction as #681 and #682: validate against what the actuator
+            # can pay rather than against the count that proposed it. The
+            # clamp is therefore deliberately not conditional on knowing WHY
+            # the remembered number is stale.
+            ceiling = self._reserved_rows()
+            if ceiling is not None and rows > ceiling:
+                logger.warning(
+                    "%s recovery target %d rows exceeds the pool's immutable "
+                    "reservation of %d; clamping and correcting the remembered "
+                    "boot row count, which was stale (#684).",
+                    LOG_PREFIX,
+                    rows,
+                    ceiling,
+                )
+                rows = int(ceiling // page * page) if page > 0 else int(ceiling)
+                # AND CORRECT THE MEMORY, or the clamp only converts a loud
+                # failure into a quiet one: `_rows_at_boot` would still name an
+                # impossible level and every later recovery would re-clamp to
+                # the same place while believing it had further to go. The
+                # pool's ceiling is what it can hold, so that is what "fully
+                # recovered" means for this arena.
+                self._rows_at_boot = max(int(rows), int(was))
+                boot_rows = self._rows_at_boot
             if rows <= was:
                 logger.warning(
                     "%s recovery deferred: %d MiB free leaves nothing above "
@@ -1190,7 +1779,7 @@ class KvBackingRelief:
             )
         else:
             self._rows_at_boot = None
-            self._exhausted = False
+            self._exhausted_at_rows = None
         self.recover_count += 1
         return max(0, now - was)
 
@@ -1198,8 +1787,16 @@ class KvBackingRelief:
 
     def _reservation_rows(self) -> int:
         """Rows the allocator's id space spans -- the reservation, not the
-        backing. This is what an UNCAPPED allocator will hand out."""
-        return int(getattr(self._pool, "size", 0) or self._current_rows())
+        backing. This is what an UNCAPPED allocator will hand out.
+
+        READ FROM THE ID-SPACE OWNER, never from whichever layout the backing
+        calls are currently pointed at. This number feeds ``exposed_rows``,
+        which feeds the collective cap agreement, and the two layouts have
+        different row counts -- letting it follow a rebind would make the
+        group's agreed id space depend on which phase each rank happened to be
+        in, which is the capacity desync that wedged this instance once
+        already (HANDOFF_675 1a)."""
+        return int(getattr(self._id_space_pool, "size", 0) or self._current_rows())
 
     def exposed_rows(self) -> int:
         """The highest row id this rank's allocator may hand out.
@@ -1225,6 +1822,7 @@ class KvBackingRelief:
         value across ranks, and that minimum has to come from a public reading
         rather than from a private one the caller reaches around for.
         """
+        self._rebind()
         return int(self._current_rows())
 
     def level_recovery_to(self, target: int) -> int:
@@ -1246,7 +1844,7 @@ class KvBackingRelief:
         if self._rows_at_boot is None and target < self._reservation_rows():
             # Remember what this rank is entitled to before capping below it.
             self._rows_at_boot = self._reservation_rows()
-            self._exhausted = False
+            self._exhausted_at_rows = None
         return int(self.reconcile_to(target))
 
     def normalize_free_lists(self) -> None:
@@ -1374,7 +1972,7 @@ class KvBackingRelief:
         self._cap.sort_free_lists()
         if self._rows_at_boot is not None and level >= ceiling:
             self._rows_at_boot = None
-            self._exhausted = False
+            self._exhausted_at_rows = None
         after = self.exposed_rows()
         if after != before:
             logger.info(
@@ -1436,6 +2034,42 @@ def _bytes_per_row(pool: Any) -> int:
         per_row = max(1, int(getattr(desc, "tokens_per_row", 1) or 1))
         total += row_bytes // per_row
     return int(total)
+
+
+def rung_can_pay(scheduler: Any) -> bool:
+    """Will this boot have a KV rung able to return bytes at the seam?
+
+    THE SAME DISQUALIFIERS :func:`kv_backing_provider` APPLIES, asked without
+    building anything. The seam reserve has to price the rung while sizing the
+    pool, and at that point the relief object does not exist yet -- it is
+    installed at the first corridor gate, which is later than both the pool
+    sizing and the seam measurement. Re-deriving the conditions there would be
+    a second source of truth for "can this rung pay", and the two would drift;
+    this is the one place they are written.
+
+    A predicate, never an amount. What the rung may cover is decided by the
+    caller and bounded there.
+    """
+    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "1") not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return False
+    get_kvcache = getattr(allocator, "get_kvcache", None)
+    pool = get_kvcache() if callable(get_kvcache) else None
+    if pool is None or not callable(getattr(pool, "runtime_set_backing_rows", None)):
+        return False
+    if not bool(getattr(pool, "supports_backing_spans", False)):
+        # A chunkless arena cannot return anything to the driver, so a pool
+        # sized as if it could would be sized on a promise nothing keeps.
+        return False
+    row_bytes, _buffers = row_geometry(pool)
+    return row_bytes > 0
 
 
 def kv_backing_provider(
@@ -1531,7 +2165,49 @@ def kv_backing_provider(
         buffers=n_buffers,
         law_floor_bytes=law_floor_bytes,
         admission_reserve_rows=_admission_reserve_rows(scheduler),
+        # #662: RESOLVED PER CALL, NEVER CAPTURED. The tree cache object is
+        # replaced on a flush (flush_cache builds a new one), and a rung
+        # holding the old reference would evict into a tree the scheduler no
+        # longer reads -- freeing rows the allocator still believes are
+        # cached. Reading it through the scheduler each time is the only
+        # form that cannot go stale.
+        tree_cache_fn=lambda: getattr(scheduler, "tree_cache", None),
+        # #662-F4: and the POOL is resolved per call for the same reason, with
+        # a sharper edge. The scheduler's pool is the PP layout's; during the
+        # TP phase the seam has released it and it holds no pages at all. A
+        # rung captured on it can only ever fund the pp_to_tp leg.
+        pool_fn=lambda: _active_layout_pool(scheduler, pool),
     )
+
+
+def _active_layout_pool(scheduler: Any, fallback: Any):
+    """The KV pool of the layout that is RESIDENT right now.
+
+    The flip's two layouts are two pools with two arenas and only one is
+    backed at a time. ``scheduler.phase_flip_active_stack`` says which, and it
+    is set at the cutover, so it is already correct by the time the next gate
+    runs.
+
+    Falls back to the scheduler's own pool whenever the answer is not
+    unambiguous -- no stacks installed, an unrecognised phase, a missing
+    worker. That reproduces the previous behaviour exactly, which is the right
+    direction for a resolution that decides where memory gets unmapped.
+    """
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    if stacks is None:
+        return fallback
+    phase = getattr(scheduler, "phase_flip_active_stack", None)
+    if str(phase) != "tp":
+        # PP resident (or unknown): the scheduler's own pool IS that layout's.
+        return fallback
+    worker = getattr(stacks, "tp_worker", None)
+    runner = getattr(worker, "model_runner", None) if worker is not None else None
+    tp_pool = getattr(runner, "token_to_kv_pool", None) if runner is not None else None
+    if tp_pool is None or not callable(
+        getattr(tp_pool, "runtime_set_backing_rows", None)
+    ):
+        return fallback
+    return tp_pool
 
 
 def _admission_reserve_rows(scheduler: Any) -> int:

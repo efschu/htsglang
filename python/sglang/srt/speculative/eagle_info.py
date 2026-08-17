@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
@@ -41,6 +41,69 @@ class EagleVerifyInput(SpecInput):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        self._enforce_draft_token_dtype()
+
+    #: Announced once per offending dtype, so a conversion that keeps the
+    #: instance alive still names the path that violated the contract.
+    _draft_token_dtype_announced: ClassVar[set] = set()
+
+    def _enforce_draft_token_dtype(self) -> None:
+        """``draft_token`` IS the kernel's ``candidates``. It must be int64.
+
+        #680, and it killed all three ranks at 00:25:07 nineteen minutes into a
+        boot under five-lane load:
+
+            RuntimeError: Expected 'candidates' to be of type long (torch.int64)
+            tree_speculative_sampling_target_only <- eagle_sample <- verify
+
+        ``eagle_sample`` builds ``candidates`` as
+        ``verify_input.draft_token.reshape(bs, draft_token_num)``, so whatever
+        dtype this field carries is the dtype the kernel is handed. This class
+        already states the contract in its own default --
+        ``torch.empty((0,), dtype=torch.long)`` -- but a default is not an
+        invariant, and one construction path did not honour it.
+
+        THE PATH: ``_build_trivial_verify_input`` passes ``bonus_tokens``
+        straight through as ``draft_token``, and ``bonus_tokens`` is built
+        ``torch.int32`` on both of its branches (eagle_worker_v2, the
+        ``fill_bonus_tokens_func`` output and the empty-batch case). int32 is
+        CORRECT for its other consumers -- it is an *input* to
+        ``build_tree_kernel_efficient`` on the ordinary path, never the
+        candidates tensor -- so the dtype is not wrong at its source; it is
+        wrong at this door.
+
+        WHY THE TRIVIAL PATH IS THE PRESSURE PATH: it is taken when drafting is
+        disabled at high batch size, or on a phase-flip draft bootstrap. Both
+        are load states. The ordinary path takes ``draft_token`` from
+        ``build_tree_kernel_efficient``, which already returns int64, which is
+        why this never fired until an instance survived long enough at 0.97
+        pool usage to keep taking the trivial path.
+
+        LATENT, NOT INTRODUCED. The int32 dates to upstream #24724
+        (2026-05-08); #679's park merely let the instance live long enough to
+        reach it, having previously died at the allocator first.
+
+        CONVERT, DO NOT RAISE. A serving instance must degrade rather than die
+        -- the whole subject of #679 -- and the conversion is a no-op on every
+        path that already complies. It is announced once per offending dtype so
+        the violating path stays visible instead of being silently papered
+        over: a fix that hides its own trigger is how this returns.
+        """
+        tok = self.draft_token
+        if tok is None or tok.dtype == torch.int64:
+            return
+        key = str(tok.dtype)
+        if key not in EagleVerifyInput._draft_token_dtype_announced:
+            EagleVerifyInput._draft_token_dtype_announced.add(key)
+            logger.warning(
+                "EagleVerifyInput.draft_token arrived as %s; it is the "
+                "kernel's `candidates` and must be int64, so it is being "
+                "converted. This is #680: the construction path that built it "
+                "does not honour the field's contract, and the conversion "
+                "keeps the instance alive rather than making it correct.",
+                tok.dtype,
+            )
+        self.draft_token = tok.to(torch.int64)
 
     @property
     def max_tree_depth(self) -> int:

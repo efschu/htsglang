@@ -112,9 +112,7 @@ class TheBudgetHonoursDfHeadroomFirst(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
-            cap = park_filesystem_capacity(
-                d, budget_bytes=1 * GB, df_headroom_bytes=0
-            )
+            cap = park_filesystem_capacity(d, budget_bytes=1 * GB, df_headroom_bytes=0)
         self.assertEqual(cap.total.require("total"), 1 * GB)
         self.assertIn("configured park budget", cap.total.source)
 

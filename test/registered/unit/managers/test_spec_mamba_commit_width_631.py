@@ -91,7 +91,5 @@ def test_unequal_accept_lengths_do_not_by_themselves_break_it():
     w = 4
     accept_index = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]])
     for lens in ([4, 1, 1], [1, 4, 2], [2, 2, 4]):
-        steps = last_correct_step_indices(
-            accept_index, torch.tensor(lens), w
-        )
+        steps = last_correct_step_indices(accept_index, torch.tensor(lens), w)
         assert steps.tolist() == [x - 1 for x in lens]

@@ -205,6 +205,46 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def flush_free_group(self) -> int:
+        """Apply staged frees NOW, without closing the group. Returns pages.
+
+        #681 third root. While a group is open ``free`` stages into
+        ``free_group``, so the pages are in neither ``free_pages`` nor
+        ``release_pages`` and ``available_size`` cannot see them. An eviction
+        landing inside that window (``free_group_begin`` is called from the
+        event loop, batch_result_processor.py:92 and :741) therefore COUNTS
+        tokens it has freed while the pool stays unable to hand them out: the
+        2026-08-16 13:58 crash reported 512 evicted, 392 available, and no
+        under-delivery note, because by the tree's books the eviction had
+        delivered.
+
+        WHY APPLYING EARLY IS SAFE, which is the whole question this method
+        turns on. ``free_group_end`` is pure BATCHING -- one ``torch.cat`` and
+        one ``_notify_free`` instead of many. It defers nothing for safety:
+        there is no in-flight reference to wait on and no graph-replay barrier,
+        and the same iteration applies these very pages a few lines later
+        regardless. Flushing moves that application earlier; it does not make
+        anything reachable that was not already about to be.
+
+        WITHOUT CLOSING, deliberately. The caller owns the window and will call
+        ``free_group_end`` itself. Ending it here would silently stop batching
+        the caller's remaining frees and turn its own end-call into a no-op it
+        never asked for. So the flag is restored and only the staged list is
+        consumed -- which also makes the caller's later end-call safe rather
+        than a double free, because there is nothing left to apply.
+        """
+        if self.is_not_in_free_group or not self.free_group:
+            return 0
+        staged, self.free_group = self.free_group, []
+        applied = int(sum(int(chunk.numel()) for chunk in staged))
+        self.is_not_in_free_group = True
+        try:
+            self.free(torch.cat(staged))
+        finally:
+            # The window belongs to whoever opened it.
+            self.is_not_in_free_group = False
+        return applied
+
     def merge_and_sort_free(self):
         self._merge_and_sort_free_unbiased()
         # The sort undoes the partition, and it runs from inside the alloc

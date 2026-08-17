@@ -106,9 +106,7 @@ class TestLiveSlotsWithoutAPoolSlot(CustomTestCase):
         self.assertEqual(build_flip_live_slots_fn(sched)().tolist(), [0, 1])
 
     def test_every_request_unallocated_yields_an_empty_int64_tensor(self):
-        sched = _scheduler(
-            [_req("x", 4, None), _req("y", 7, None)], tree_values=None
-        )
+        sched = _scheduler([_req("x", 4, None), _req("y", 7, None)], tree_values=None)
         live = build_flip_live_slots_fn(sched)()
         self.assertEqual(live.numel(), 0)
         self.assertEqual(live.dtype, torch.int64)

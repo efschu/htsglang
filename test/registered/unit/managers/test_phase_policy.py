@@ -188,15 +188,35 @@ def test_pp_with_a_worthwhile_prefill_backlog_stays_in_pp():
 def test_batching_small_residual_prefill_does_not_pin_the_server_in_pp():
     """Continuous arrivals must not trap decode in the prefill layout.
 
-    Falsifier for an ``== 0`` drain rule: under batching the queue may
-    never reach exactly zero, and decoding in PP means decoding with no
-    speculation and no decode CUDA graphs.
+    CONTRACT CHANGED 2026-08-15 (#669). This used to assert that a residual
+    just under the ENTRY break-even N leaves PP immediately. That was wrong,
+    and it is what made the instance exit at ~10k pending and prefill the
+    remainder in TP at a third of the rate. N prices entry; once in PP the
+    return seam is due either way, so it cancels and what is left is R/r_pp
+    against R/r_tp -- leaving early loses for every R > 0.
+
+    The residual therefore STAYS in PP now. What still may not happen is
+    pinning, and that guarantee moved to the decode-starvation cap: a
+    sub-chunk residual drains and exits, and anything larger is bounded by the
+    SLO instead of by an entry threshold that never described this direction.
     """
-    c = cfg()
+    c = cfg(pp_exit_tokens=512, decode_stall_slo_s=45.0, flip_cost_s=5.918)
     st = PhasePolicyState()
-    d = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2))
-    assert d.direction == PP_TO_TP
-    assert "decoding" in d.reason
+    st.phase_since = 1000.0
+
+    # A residual well above one chunk is finished here, not carried to TP.
+    held = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2, now=1005.0))
+    assert held.direction is None, held.reason
+
+    # Drained below one chunk -> leave, and say so.
+    drained = decide(c, st, inp(PHASE_PP, pending=100, running=2, now=1005.0))
+    assert drained.direction == PP_TO_TP
+    assert "DRAINED" in drained.reason and "exit condition: drained" in drained.reason
+
+    # And it can still never pin: the starvation cap ends it regardless.
+    capped = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2, now=1040.0))
+    assert capped.direction == PP_TO_TP
+    assert "decode starvation cap" in capped.reason
 
 
 # -- falsifier 3: in-flight safety --------------------------------------------
@@ -548,9 +568,7 @@ def test_a_chunked_prefill_is_visible_to_the_policy():
     # acting on it. Both halves are pinned: the freshly-entered case below
     # must be held by the FLOOR (proving the prompt was seen), and the aged
     # case must arm.
-    s = _sched(
-        queue=[], running=1, chunked=_StubChunked(N + 5000, 1000), aged_s=60.0
-    )
+    s = _sched(queue=[], running=1, chunked=_StubChunked(N + 5000, 1000), aged_s=60.0)
     req = s.maybe_arm_phase_policy()
     assert isinstance(req, PhaseFlipReqInput), (
         "an admitted-but-uncomputed prompt larger than N must move the "
@@ -769,9 +787,7 @@ def test_only_the_zmq_intake_rank_injects():
         SchedulerRequestReceiver,
     )
 
-    sentinel = PhaseFlipReqInput(
-        direction=TP_TO_PP, source="policy", internal=True
-    )
+    sentinel = PhaseFlipReqInput(direction=TP_TO_PP, source="policy", internal=True)
 
     def run(pp_rank, pulled):
         calls = []
@@ -811,13 +827,9 @@ def test_only_the_zmq_intake_rank_injects():
                 mock.patch.object(
                     cls, "_broadcast_reqs_across_ranks", lambda self, r: r
                 ),
-                mock.patch.object(
-                    cls, "unwrap_pickle_wrapper", lambda self, r: None
-                ),
+                mock.patch.object(cls, "unwrap_pickle_wrapper", lambda self, r: None),
                 mock.patch.object(cls, "_apply_mm_receiver", lambda self, r: r),
-                mock.patch.object(
-                    cls, "_finalize_shm_features", lambda self, r: None
-                ),
+                mock.patch.object(cls, "_finalize_shm_features", lambda self, r: None),
             ):
                 st.enter_context(p)
             return recv.recv_requests(), calls
@@ -1086,9 +1098,7 @@ def test_stale_markers_from_an_earlier_boot_never_open_the_gate(tmp_path):
     fresh = PhaseFlipPresence(
         n_ranks=3, rank=0, directory=str(tmp_path), instance="boot-15"
     )
-    assert fresh.all_present(0) is False, (
-        "the gate opened on an earlier boot's markers"
-    )
+    assert fresh.all_present(0) is False, "the gate opened on an earlier boot's markers"
     assert fresh.missing(0) == [0, 1, 2]
 
 
@@ -1301,9 +1311,7 @@ def test_armed_forward_path_services_and_issues_no_new_forward():
     and reaps this rank's send only once the downstream's counter proves
     it consumed. No new forward is issued, because an armed rank admits no
     new work."""
-    s, fwd, sends, processed, commits = _fwd_harness(
-        track_commits=True, armed=True
-    )
+    s, fwd, sends, processed, commits = _fwd_harness(track_commits=True, armed=True)
     fwd([])
     assert commits == [], (
         "the armed path performed a BLOCKING commit; that is the exact "
@@ -1326,9 +1334,7 @@ def test_unarmed_forward_path_is_unchanged():
     """BACKWARD COMPATIBILITY. Without an armed flip the path must keep
     its exact shape: the ordinary top-of-pass commit, then the async
     forward."""
-    s, fwd, sends, processed, commits = _fwd_harness(
-        track_commits=True, armed=False
-    )
+    s, fwd, sends, processed, commits = _fwd_harness(track_commits=True, armed=False)
     fwd(["req"])
     assert commits == ["top-of-pass"]
     assert sends == [(True, ["req"])]
@@ -1506,6 +1512,7 @@ def test_can_fail_a_non_quiescent_rank_does_not_announce(tmp_path):
     r = _onround_stub(
         presence, ready=lambda: False, clock=lambda: now["t"], deadline=5.0
     )
+
     # The clock advances only when something SLEEPS, i.e. only if this rank
     # wrongly entered the spin. That keeps the mutation (announce without
     # quiescence) terminating on the pre-entry bound and FAILING the
@@ -1868,7 +1875,10 @@ def test_the_policy_does_not_arm_a_flip_that_cannot_become_ready():
     PhaseFlipRuntime.arm would risk diverging epochs (corpse H).
     """
     s = _sched(
-        phase=PHASE_PP, queue=[], running=2, spec_algo="EAGLE",
+        phase=PHASE_PP,
+        queue=[],
+        running=2,
+        spec_algo="EAGLE",
     )
     assert s.maybe_arm_phase_policy() is None
 
@@ -1886,8 +1896,11 @@ def test_the_idle_return_leg_is_untouched_by_the_decline():
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     s = _sched(
-        phase=PHASE_TP, queue=[_StubReq(N + 1000)], running=1,
-        spec_algo="EAGLE", aged_s=60.0,
+        phase=PHASE_TP,
+        queue=[_StubReq(N + 1000)],
+        running=1,
+        spec_algo="EAGLE",
+        aged_s=60.0,
     )
     req = s.maybe_arm_phase_policy()
     assert isinstance(req, PhaseFlipReqInput)
@@ -1935,5 +1948,3 @@ def test_the_idle_return_leg_is_untouched_by_the_decline():
 # like a message-loss bug and is not one. Do not re-derive it from the
 # symptom. What the armed intake rule actually removes is not the messages
 # -- it is the PASS CLOCK, and that is where the search went next.
-
-

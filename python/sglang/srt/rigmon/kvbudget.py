@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional
 __all__ = [
     "BudgetFile",
     "CACHE_DIR",
+    "is_budget_file",
     "list_budget_files",
     "describe_budget",
     "reset_budget",
@@ -72,16 +73,49 @@ class BudgetFile:
         return d
 
 
+_BUDGET_PREFIX = "kv_budget-"
+_BUDGET_SUFFIX = ".json"
+
+
+def is_budget_file(name: str) -> bool:
+    """Is ``name`` a TOKEN-VECTOR budget file, and not a sub-artifact?
+
+    #697. A budget file is ``kv_budget-<digest>.json`` with nothing between the
+    digest and the suffix. Other artifacts are keyed off the SAME digest and
+    carry a further ``-``: the phase-flip seam records are
+    ``kv_budget-<digest>-seam-rank<N>.json``.
+
+    That distinction is not cosmetic, it is a difference in lifecycle. The
+    budget file is per-boot and is MEANT to be cleared so an A/B arm
+    re-measures. The seam records are the two-boot protocol's memory, and
+    clearing them does not make the next boot re-measure -- it makes it size
+    with no measurement at all, which is a cold boot taking an oversized pin.
+
+    SELECTED BY SHAPE RATHER THAN BY NAME, deliberately. Excluding "-seam-"
+    specifically would fix today's artifact and miss the next one; requiring
+    the digest to be the whole stem excludes every
+    ``kv_budget-<digest>-<anything>.json`` without having to know it exists.
+    The digest is a hash, so it never contains a ``-`` itself.
+    """
+    if not (name.startswith(_BUDGET_PREFIX) and name.endswith(_BUDGET_SUFFIX)):
+        return False
+    stem = name[len(_BUDGET_PREFIX) : -len(_BUDGET_SUFFIX)]
+    return bool(stem) and "-" not in stem
+
+
 def list_budget_files(cache_dir: str = CACHE_DIR) -> List[str]:
+    """Token-vector budget files only -- see :func:`is_budget_file`.
+
+    #697: this used to select on prefix+suffix alone, which also matched the
+    seam records. ``planner.runner.neutralise_kv_budget`` resets everything
+    this returns before every boot, so the over-reach deleted the seam
+    measurements three times on 2026-08-16, once mid-soak.
+    """
     try:
         names = sorted(os.listdir(cache_dir))
     except OSError:
         return []
-    return [
-        os.path.join(cache_dir, n)
-        for n in names
-        if n.startswith("kv_budget-") and n.endswith(".json")
-    ]
+    return [os.path.join(cache_dir, n) for n in names if is_budget_file(n)]
 
 
 def _f(d: Dict[str, Any], key: str) -> Optional[float]:
@@ -115,7 +149,9 @@ def describe_budget(path: str, now: Optional[float] = None) -> BudgetFile:
 
     comps = data.get("components") or []
     out.ranks = len(comps)
-    tokens = {c.get("max_total_num_tokens") for c in comps if c.get("max_total_num_tokens")}
+    tokens = {
+        c.get("max_total_num_tokens") for c in comps if c.get("max_total_num_tokens")
+    }
     if len(tokens) == 1:
         out.max_total_num_tokens = int(next(iter(tokens)))
     elif tokens:
@@ -190,6 +226,22 @@ def reset_budget(path: str, backup: bool = True) -> Dict[str, Any]:
     """
     if not os.path.isfile(path):
         return {"removed": False, "reason": f"no such file: {path}"}
+    if not is_budget_file(os.path.basename(path)):
+        # #697 SECOND LOCK. The lister no longer offers these, but a caller
+        # can still hand one over, and the cost of being wrong here is a cold
+        # boot rather than a re-measurement. Refusing is cheap; the seam
+        # records have their own lifecycle and nothing in this module owns it.
+        return {
+            "removed": False,
+            "path": path,
+            "reason": (
+                f"{os.path.basename(path)} is not a token-vector budget file. "
+                "Files keyed off the same digest with a further '-' (the "
+                "phase-flip seam records, kv_budget-<digest>-seam-rank<N>.json) "
+                "belong to the two-boot protocol: clearing one does not make "
+                "the next boot re-measure, it makes it size cold."
+            ),
+        }
     backup_path = None
     if backup:
         backup_path = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"

@@ -127,8 +127,7 @@ class TestProfileFailureIsGroupUniform(CustomTestCase):
         barrier = threading.Barrier(_N)
         out: dict = {}
         threads = [
-            threading.Thread(target=_run, args=(r, barrier, out))
-            for r in range(_N)
+            threading.Thread(target=_run, args=(r, barrier, out)) for r in range(_N)
         ]
         for t in threads:
             t.start()

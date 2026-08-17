@@ -513,6 +513,179 @@ class DefectMResidentSetGuard(unittest.TestCase):
         self.assertEqual(harvest_resident_batches(sched), [held])
 
 
+class TheChunkedPrefillExcursionIsLegal(unittest.TestCase):
+    """#682: the guard refused a state the scheduler creates ON PURPOSE.
+
+    MEASURED 2026-08-16 02:07:22, all three ranks, mid-cutover:
+
+        PHASE-FLIP POOL CENSUS pre-cutover pp_to_tp: ...
+            cur_slot_reqs=5 resident_reqs=5 resident_slots=[0, 1, 2]
+        PHASE-FLIP-CARRY carried 5 resident request(s) ... into the tp phase
+        ResidentCarryError: running_batch claims 5 resident request(s),
+            above max_running_requests=4
+
+    with ``--max-running-requests 4``. The carry had already succeeded
+    twice; the raise came from ``resident_req_identity``'s re-harvest.
+
+    THE FIFTH RESIDENT IS NOT A DEFECT. ``Scheduler._get_new_batch_prefill_raw``
+    bypasses the running-request cap whenever a chunked prefill is in
+    flight, and its comment names the reason:
+
+        # Ignore the check if self.chunked_req is not None.
+        # In PP case, chunked requests (or dllm requests) can start in one
+        # microbatch and end in another microbatch, so the
+        # max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked requests to be added,
+        # otherwise, there will be a memory leak.
+
+        if (self.get_num_allocatable_reqs(running_bs) <= 0
+            and self.chunked_req is None
+            and not self.enable_priority_preemption):
+            running_batch.batch_is_full = True
+
+    So the scheduler maintains ``max_running_requests + 1``, not
+    ``max_running_requests``, and the guard asserted the wrong bound. The
+    competing explanation -- that admission simply over-admitted -- is
+    excluded by ``AdmissionLimiter``'s own contract: the ceiling "is what
+    the pools were built for and can never be exceeded".
+
+    The #679 park is what made this reachable rather than theoretical: a
+    parked chunk keeps its place instead of retiring, so the excursion
+    stops being one round long and is still standing when a flip cuts over.
+
+    THE ALLOWANCE IS A CONSTANT, DELIBERATELY, AND THAT IS THE
+    GROUP-UNIFORMITY ARGUMENT -- see
+    ``test_the_verdict_does_not_depend_on_this_rank_s_pipeline_position``.
+    """
+
+    @staticmethod
+    def _sched(n_resident, chunked=False, ceiling=4):
+        sched = _PPStub(1)
+        sched.max_running_requests = ceiling
+        held = _FakeBatch([_req(str(i), i) for i in range(n_resident)])
+        sched.running_mbs = [held]
+        sched.running_batch = held
+        sched.chunked_req = (
+            SimpleNamespace(rid="chunk", req_pool_idx=None) if chunked else None
+        )
+        return sched, held
+
+    def test_the_cap_plus_the_in_flight_chunk_is_carried(self):
+        """RED before the fix: ResidentCarryError on the 5th resident."""
+        sched, held = self._sched(5, chunked=True)
+        self.assertEqual(harvest_resident_batches(sched), [held])
+
+    def test_the_cap_itself_is_still_carried(self):
+        sched, held = self._sched(4, chunked=False)
+        self.assertEqual(harvest_resident_batches(sched), [held])
+
+    def test_a_sixth_resident_still_raises(self):
+        """The guard's PURPOSE survives: one excursion is legal, two is not.
+
+        Without this the fix could degenerate into removing the ceiling,
+        which is the defect-M hole reopened -- that is the failure that
+        OOM-killed rank 0 with one tensor per claimed request.
+        """
+        sched, _ = self._sched(6, chunked=True)
+        with self.assertRaises(ResidentCarryError) as ctx:
+            harvest_resident_batches(sched)
+        msg = str(ctx.exception)
+        self.assertIn("6", msg)
+        # running_mbs[0] is harvested before running_batch (which aliases it),
+        # so the slot array is what the message names.
+        self.assertIn("running_mbs[0]", msg, "the offending SLOT must be named")
+
+    def test_the_absurd_length_is_still_refused(self):
+        """Defect M's real shape is orders of magnitude out, not one out."""
+        sched = _PPStub(1)
+        sched.max_running_requests = 4
+        sched.chunked_req = SimpleNamespace(rid="chunk", req_pool_idx=None)
+        sched.running_mbs = [_FakeBatch([_req(str(i), i) for i in range(5000)])]
+        with self.assertRaises(ResidentCarryError) as ctx:
+            harvest_resident_batches(sched)
+        self.assertIn("5000", str(ctx.exception))
+
+    def test_the_verdict_does_not_depend_on_this_rank_s_pipeline_position(self):
+        """GROUP-UNIFORMITY, and it is why the allowance is unconditional.
+
+        ``scheduler.chunked_req`` is per-rank scheduler state. Under PP the
+        ranks sit at different pipeline positions, so at one cutover
+        instant a peer can hold it while this rank has just cleared it.
+        Gating the allowance on it would make the SAME resident set legal
+        on one rank and fatal on another -- a rank-local census divergence,
+        which is the hang class the park guard already paid for.
+
+        So the ceiling is derived from ``max_running_requests`` alone,
+        which ``Scheduler.init_admission_limiter`` documents as "uniform
+        across ranks by construction: every input to `ceiling` is
+        min-reduced before it gets here". Same input on every rank, same
+        verdict, no collective added.
+        """
+        for chunked in (True, False):
+            with self.subTest(chunked_req_set=chunked):
+                sched, held = self._sched(5, chunked=chunked)
+                self.assertEqual(harvest_resident_batches(sched), [held])
+
+    def test_the_error_names_the_effective_ceiling_not_the_raw_cap(self):
+        """An operator comparing the message to --max-running-requests must
+        not read an off-by-one as the bug."""
+        sched, _ = self._sched(6, chunked=True)
+        with self.assertRaises(ResidentCarryError) as ctx:
+            harvest_resident_batches(sched)
+        msg = str(ctx.exception)
+        self.assertIn("5", msg, "the effective ceiling must be visible")
+        self.assertIn(
+            "max_running_requests=4", msg, "the configured cap must stay visible"
+        )
+
+    def test_the_excursion_is_reported_with_the_chunked_state(self):
+        """The receipt that can falsify the attribution on the next boot.
+
+        The fifth resident being the in-flight chunked prefill is established
+        by elimination, not observation. A line that says ``chunked_req=CLEAR``
+        while the allowance is being spent would mean the elimination has a
+        hole -- so the state has to be IN the line, not assumed by it.
+        """
+        sched, _ = self._sched(5, chunked=True)
+        with self.assertLogs(
+            "sglang.srt.managers.phase_flip_resident_carry", level="INFO"
+        ) as captured:
+            harvest_resident_batches(sched)
+        line = "\n".join(captured.output)
+        self.assertIn("chunked_req=SET", line)
+        self.assertIn("max_running_requests=4", line)
+
+        sched, _ = self._sched(5, chunked=False)
+        with self.assertLogs(
+            "sglang.srt.managers.phase_flip_resident_carry", level="INFO"
+        ) as captured:
+            harvest_resident_batches(sched)
+        self.assertIn("chunked_req=CLEAR", "\n".join(captured.output))
+
+    def test_the_receipt_is_not_emitted_at_or_below_the_cap(self):
+        """A line on every ordinary harvest would be noise, and noise is how
+        the #681 receipt nearly went unread."""
+        sched, _ = self._sched(4, chunked=True)
+        with self.assertNoLogs(
+            "sglang.srt.managers.phase_flip_resident_carry", level="INFO"
+        ):
+            harvest_resident_batches(sched)
+
+    def test_a_ceiling_of_one_still_admits_its_chunk(self):
+        """The allowance is additive, not proportional.
+
+        ``--max-running-requests 1`` is a real single-stream configuration
+        and its chunked prefill is exactly the case the scheduler's bypass
+        exists for; a ceiling that rounded the allowance away would refuse
+        the most common shape it was written for.
+        """
+        sched, held = self._sched(2, chunked=True, ceiling=1)
+        self.assertEqual(harvest_resident_batches(sched), [held])
+        sched, _ = self._sched(3, chunked=True, ceiling=1)
+        with self.assertRaises(ResidentCarryError):
+            harvest_resident_batches(sched)
+
+
 if __name__ == "__main__":
     unittest.main()
 

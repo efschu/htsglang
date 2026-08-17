@@ -347,7 +347,9 @@ class SharedStorageIsNotSpillableTest(unittest.TestCase):
         self.assertTrue(torch.equal(model.borrowed.data, want))
 
     def test_the_payload_excludes_the_shared_bytes(self):
-        plain = spill.VmmDraftWeightCarrier(_DraftModel(layers=4), 0, arena=_FakeArena())
+        plain = spill.VmmDraftWeightCarrier(
+            _DraftModel(layers=4), 0, arena=_FakeArena()
+        )
         shared = spill.VmmDraftWeightCarrier(
             self._model_with_a_shared_param(), 0, arena=_FakeArena()
         )
@@ -394,9 +396,7 @@ class AffordabilityGatePricesTheRestoreTest(unittest.TestCase):
         worker, carrier = self._spilled_worker()
         carrier.spill()
         stub, rt = self._runtime_stub(worker)
-        self.assertEqual(
-            stub._draft_restore_bytes(rt.PP_TO_TP), carrier.payload_bytes
-        )
+        self.assertEqual(stub._draft_restore_bytes(rt.PP_TO_TP), carrier.payload_bytes)
 
     def test_tp_to_pp_is_free(self):
         # Nothing is restored on the leg that spills; charging it would

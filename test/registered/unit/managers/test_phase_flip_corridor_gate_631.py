@@ -172,8 +172,18 @@ class TheGateIsActuallyConsultedTest(unittest.TestCase):
     """The failure mode this whole file exists for: a gate nobody calls."""
 
     def test_execute_calls_the_gate(self):
+        """#662-F4 put ONE frame between them, so BOTH links are pinned.
+
+        ``_execute`` now consults ``_seam_funding_verdict``, which is the gate
+        plus the per-direction unfundable injection. Pinning only the outer
+        call would let the inner one be dropped and still pass -- which is
+        exactly the "a gate nobody calls" failure this file exists for, one
+        level down.
+        """
         src = inspect.getsource(PhaseFlipRuntime._execute)
-        self.assertIn("_corridor_gate", src)
+        self.assertIn("_seam_funding_verdict", src)
+        wrapper = inspect.getsource(PhaseFlipRuntime._seam_funding_verdict)
+        self.assertIn("_corridor_gate", wrapper)
 
     def test_the_refusal_is_folded_into_too_small(self):
         src = inspect.getsource(PhaseFlipRuntime._execute)
@@ -185,7 +195,7 @@ class TheGateIsActuallyConsultedTest(unittest.TestCase):
         # cheaper check refuses flips the gate could have funded.
         src = inspect.getsource(PhaseFlipRuntime._execute)
         self.assertLess(
-            src.index("_corridor_gate"),
+            src.index("_seam_funding_verdict"),
             src.index("_staging_affordable"),
         )
 
@@ -237,7 +247,9 @@ class TheProviderBindsLateTest(unittest.TestCase):
         s.phase_flip_spill_ladder._weights = _Carrier()
         self.assertEqual(provider(1 << 30), int(286.0 * MIB))
 
-    def test_an_already_spilled_carrier_yields_nothing_rather_than_double_counting(self):
+    def test_an_already_spilled_carrier_yields_nothing_rather_than_double_counting(
+        self,
+    ):
         class _Carrier:
             spilled = True
 
@@ -250,9 +262,7 @@ class TheProviderBindsLateTest(unittest.TestCase):
         class _S:
             phase_flip_spill_ladder = _Ladder()
 
-        self.assertEqual(
-            phase_flip_spill._late_bound_draft_provider(_S())(1 << 30), 0
-        )
+        self.assertEqual(phase_flip_spill._late_bound_draft_provider(_S())(1 << 30), 0)
 
 
 class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
@@ -280,7 +290,17 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
         self.assertTrue(r.ok, r.detail)
         self.assertEqual(g.refuse_count, 0)
 
-    def test_the_law_still_refuses_what_the_law_forbids(self):
+    def test_the_law_now_warns_where_it_used_to_refuse(self):
+        """SUPERSEDED BY THE USER DECISION 2026-08-16, and kept pointing at
+        the same numbers so the change of policy is legible rather than
+        silently deleted.
+
+        900 MiB out of 1100 free leaves 200, under the 1024 law. This used to
+        REFUSE. It now proceeds and reports the dip, because the law is a
+        fill-quality target rather than a gate -- refusing here is what idled
+        the box at 06:47:48 with 727004 tokens waiting. The allocation fits;
+        only an allocation LARGER than free is still refused.
+        """
         from sglang.srt.managers import corridor_guard as cg
 
         free = [1100 * MIB]
@@ -291,7 +311,11 @@ class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
             probe=lambda: free[0],
             fleet_probe=lambda: list(free),
         )
-        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.ok)
+        self.assertTrue(r.law_breached)
+        # The boundary the decision did NOT move.
+        self.assertFalse(g.ensure_headroom(5000 * MIB).ok)
 
     def test_by_default_the_two_floors_coincide(self):
         from sglang.srt.managers import corridor_guard as cg
@@ -532,6 +556,48 @@ class TheGuardDoesNotCarryTheKvRungInItsLadderTest(unittest.TestCase):
             "guard's ladder: a capacity may not be decided rank-locally",
         )
         self.assertIn("collective_kv_backing_relief", src)
+
+
+class TheRungReportsAZeroTest(unittest.TestCase):
+    """A rung that returns nothing must still say so.
+
+    THE MORNING THIS COST. On 2026-08-16 the seam was refused 76 times from
+    06:47:48 with no KV relief line anywhere in the log, because the relief
+    was logged only under `if kv_freed > 0`. "The rung returned 0" and "the
+    rung never ran" were therefore indistinguishable, and the guard's own
+    "reclaimed 0 MiB from [nothing]" got read as the rung being exhausted.
+
+    IT NEVER SAID THAT. That string is the GUARD LADDER's provider list, and
+    the ladder has exactly two providers -- allocator-cache and draft-weights.
+    No KV provider is registered with the guard at all, deliberately: the cap
+    is a group decision and the ladder is rank-local. The rung's bytes arrive
+    as `kv_freed` BEFORE the guard probes, so they can never appear in that
+    list no matter how much the rung paid.
+
+    Pinned by source assertion, the same way this file already pins the rung's
+    wiring, because the branch is a log inside a long collective method that
+    cannot be reached without a live group.
+    """
+
+    def test_the_gate_logs_the_rung_even_when_it_pays_nothing(self):
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_flip_runtime
+
+        src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
+        self.assertIn("returned NOTHING before the gate", src)
+        # And it must not be reachable only through the success branch.
+        self.assertIn("if kv_freed > 0:", src)
+        self.assertIn("else:", src)
+
+    def test_the_zero_line_names_the_guard_confusion_it_exists_to_end(self):
+        """Without this clause the next reader repeats the misdiagnosis."""
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_flip_runtime
+
+        src = _inspect.getsource(phase_flip_runtime.PhaseFlipRuntime._corridor_gate)
+        self.assertIn("no KV provider is registered with", src)
 
 
 if __name__ == "__main__":

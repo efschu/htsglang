@@ -111,6 +111,7 @@ def test_a_chunk_budget_below_the_alignment_refuses_every_long_request():
     guarding something real rather than an imagined failure. A gate whose
     failure mode was never executed is a gate nobody can trust.
     """
+
     def _admitted(align):
         """Did the request make it onto can_run_list?
 

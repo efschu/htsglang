@@ -956,6 +956,34 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # #706: age at which an orphaned canonical partial page/blob (.part706 and
+    # its .slots706 marker) is reaped at attach. Must stay comfortably longer
+    # than the time all writers of one page need, or a live partial is reaped
+    # from under a stage that is still filling it.
+    SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S = EnvFloat(3600.0)
+    # #720: size of the reusable, budget-REGISTERED read-buffer ring per pool.
+    # 0 (default) keeps today's per-read fresh pinned allocation, which the
+    # joint budget cannot see. A positive value declares capacity x page bytes
+    # to the registry at first use, so the read path's pinned footprint becomes
+    # a number the budget can refuse.
+    SGLANG_HICACHE_READ_BUFFERS = EnvInt(0)
+    # #558: free-space floor, in bytes, below which the #706 canonical write
+    # protocol refuses rather than risking ENOSPC in the middle of a
+    # multi-writer page assembly. 0 (default) keeps today's behaviour, where
+    # the only protection is the LRU evictor's watermark -- which is disabled
+    # unless --hicache-storage-backend-extra-config sets a cap or a min-free.
+    SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES = EnvInt(0)
+    # #410 slice 2: ceiling on bytes pinned by conversation checkpoints. Pinned
+    # bytes are bytes eviction can never reclaim, so a checkpoint whose pins
+    # would cross this is REFUSED with the numbers rather than quietly turning
+    # the cache into a pin museum. 0 = no ceiling.
+    SGLANG_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
+    # #703: cap on OUTSTANDING eviction-time demotions to the disk tier, and
+    # the on/off switch (0 = off, today's behaviour). Eviction runs under
+    # memory pressure, so demotion enqueues onto the existing backup queue and
+    # DROPS beyond this cap rather than queueing without limit -- a dropped
+    # demotion is a later miss, never corruption.
+    SGLANG_HICACHE_DEMOTE_ON_EVICT = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
