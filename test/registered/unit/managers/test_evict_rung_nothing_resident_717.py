@@ -112,5 +112,76 @@ class TestNothingResidentIsNotUnknown717(CustomTestCase):
         self.assertFalse(_relief({})._nothing_resident())
 
 
+class TestBothSidesAgreeOnTheBranch717(CustomTestCase):
+    """The half the first attempt missed, and the reason it crashed.
+
+    ``_evict_floor_rows`` and ``_lower_watermark_to`` both key on
+    ``_resident_ceiling() < 0``. c4e557963e taught the PRICING side that
+    nothing-resident is priceable and left the EVICTION side refusing it, so
+    the rung priced a target it then declined to collect: nothing was
+    evicted, and the cap engaged over a full live set.
+
+    A disagreement between these two is not a lost optimisation, it is an
+    illegal address. These pins hold them to the same reading.
+    """
+
+    def setUp(self):
+        import sglang.srt.managers.kv_radix_watermark as w
+
+        self._orig_evict = w.evict_rows_above
+        self.calls = []
+
+        def _spy(tree, target_row, *, resident_ceiling=-1):
+            self.calls.append((int(target_row), int(resident_ceiling)))
+            return 4096
+
+        w.evict_rows_above = _spy
+
+    def tearDown(self):
+        import sglang.srt.managers.kv_radix_watermark as w
+
+        w.evict_rows_above = self._orig_evict
+
+    def _armed(self, split):
+        r = _relief(split)
+        r.evicted_rows_total = 0
+        r.evict_count = 0
+        r._device = 0
+        r._device_index = 0
+        r._bytes_per_row = 1024
+        return r
+
+    def test_nothing_resident_actually_evicts(self):
+        """The eviction must RUN on the branch pricing just opened."""
+        r = self._armed({"req_max": -1, "req_rows": 0})
+
+        freed = r._lower_watermark_to(1000)
+
+        self.assertGreater(freed, 0, "the priced eviction was never collected")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(
+            self.calls[0][1],
+            -1,
+            "no resident row pins anything, so nothing may be withheld from "
+            "the eviction on that grounds",
+        )
+
+    def test_unreadable_split_evicts_nothing(self):
+        """CAN-FAIL, and the one that matters: the conservative branch must
+        survive for its real case. A fix that simply dropped the guard would
+        pass the test above and fail this one -- and that unmaps live rows."""
+        for split in (None, {}, {"req_max": -1}):
+            with self.subTest(split=split):
+                self.calls.clear()
+                r = self._armed(split)
+
+                freed = r._lower_watermark_to(1000)
+
+                self.assertEqual(freed, 0)
+                self.assertEqual(
+                    self.calls, [], "nothing may be evicted on an unknown split"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

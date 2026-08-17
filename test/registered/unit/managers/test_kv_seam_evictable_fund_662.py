@@ -147,7 +147,26 @@ def _corridor_filled_rig(card_free_mib=1024):
     tree = _Tree(RESIDENT_CEILING + 1, TREE_CEILING)
 
     def live_slots():
-        return torch.arange(1, TREE_CEILING + 1, dtype=torch.int64)
+        # #717: THE LIVE SET FOLLOWS THE EVICTION, as it does in production.
+        #
+        # This closure used to return a constant, so the rig reported the
+        # same live set before and after an eviction. Production does not:
+        # ``build_flip_live_slots_fn`` enumerates
+        # ``scheduler.tree_cache.all_values_flatten()`` UNION the parked
+        # requests' rows (phase_flip_runtime.py:777-790), so rows the tree
+        # has given up stop being live the moment it gives them up.
+        #
+        # The constant made this double disagree with production about the
+        # one fact ``_shrink_to`` now checks before it caps -- whether the
+        # eviction actually delivered the mark -- and a double that cannot
+        # represent a failed eviction cannot show that the cap respects one.
+        # Resident rows (1..RESIDENT_CEILING) are never freed here, matching
+        # the rung's refusal to touch the resident half.
+        freed = set(tree.freed)
+        return torch.tensor(
+            [row for row in range(1, TREE_CEILING + 1) if row not in freed],
+            dtype=torch.int64,
+        )
 
     # The side channel the flip's own enumeration publishes: who pins the
     # ceiling. Without it the rung must assume the whole live set is
@@ -231,7 +250,39 @@ class SeamFundIsEvictableContentTest(unittest.TestCase):
 
         got = relief.free_up_to(2_000 * MIB)
 
-        self.assertGreaterEqual(got, 2_000 * MIB, "the ask must be covered")
+        # #717: THE ASK IS NOT FULLY FUNDABLE, AND IT NEVER HONESTLY WAS.
+        #
+        # This assertion read ``>= 2_000 * MIB`` until the floor invariant
+        # went in. Covering the whole ask means capping at 8000 rows, and
+        # ``_lower_watermark_to(8000)`` evicts only rows ABOVE 7999 -- so the
+        # cap landed with live rows immediately beneath it and ZERO
+        # allocatable ids above them. That is precisely the state
+        # ``_floor_rows`` documents as the C20 residual and that was measured
+        # on metal as ``Available full tokens: 0`` inside the scheduler loop.
+        # The old number was reachable only by capping into the admission
+        # reserve, so the pin was recording a violation as a success.
+        #
+        # What is genuinely fundable is the shrink that still leaves the
+        # reserve free above the surviving live rows. The gap between the two
+        # is recoverable, but only by evicting DEEPER than the cap (down to
+        # target - margin - reserve) so the reserve lands on free ids -- a
+        # change to what the eviction is asked for, not to what the cap is
+        # allowed to do, and out of scope here.
+        self.assertGreater(got, 1_500 * MIB, "the fundable half must be spent")
+        self.assertLess(
+            got,
+            2_000 * MIB,
+            "covering the full ask would cap into the admission reserve",
+        )
+        capped_to = pool.size
+        highest_live = max(
+            row for row in range(1, TREE_CEILING + 1) if row not in set(tree.freed)
+        )
+        self.assertGreaterEqual(
+            capped_to,
+            highest_live + 1 + RESERVE,
+            "the cap must leave the reserve free above the highest live row",
+        )
         self.assertEqual(
             got,
             card.free - free_before,
