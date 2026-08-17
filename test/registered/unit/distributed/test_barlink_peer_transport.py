@@ -38,6 +38,7 @@ pynvml itself are injected.
 import logging
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
@@ -52,12 +53,29 @@ from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
 )
 from sglang.srt.registry import nvml as registry_nvml
 from sglang.srt.registry.nvml import DeviceInfo
+
+# Imported at module scope on purpose. Pulling this in from inside a test body
+# re-triggers a torch autotune-artifact registration under CustomTestCase's
+# retry ("Artifact of type=autotune already registered"), which surfaces as an
+# unrelated retry-exhausted error. Once, at collection, is safe.
+from sglang.srt.layers.moe import expert_offload as _expert_offload
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MIB = 1024**2
+
+_REPO = Path(__file__).resolve().parents[4]
+_TRANSPORT_SRC = (
+    _REPO
+    / "python"
+    / "sglang"
+    / "srt"
+    / "distributed"
+    / "device_communicators"
+    / "barlink_peer_transport.py"
+)
 
 UUID_3080_X4 = "GPU-aaaaaaaa-0000-0000-0000-000000000001"
 UUID_5090 = "GPU-bbbbbbbb-0000-0000-0000-000000000002"
@@ -95,11 +113,18 @@ class _FakePynvml:
 
     NVMLError = Exception
 
+    #: Every card on the reference board reports the same max generation, so
+    #: the ratio the offload consumer derives is carried entirely by width.
+    GENERATION = 4
+
     def __init__(self, devices, *, curr=CURR_WIDTH, max_width=MAX_WIDTH, curr_raises=False):
         self._devices = [_Handle(d.uuid, d.name) for d in devices]
         self._curr = curr
         self._max = max_width
         self._curr_raises = curr_raises
+
+    def nvmlDeviceGetMaxPcieLinkGeneration(self, handle):
+        return self.GENERATION
 
     def nvmlInit(self):
         return None
@@ -218,6 +243,71 @@ class CanonTests(_RigCase):
             {"pynvml": _FakePynvml(_nvml_bus_order(), curr_raises=True)},
         ):
             self.assertEqual(lanes_by_uuid_via_nvml(UUID_3080_X4), 16)
+
+    def test_a_max_derived_width_is_flagged_as_such(self):
+        """A width describing the CARD must be distinguishable from the slot."""
+        with patch.dict(
+            sys.modules,
+            {"pynvml": _FakePynvml(_nvml_bus_order(), curr_raises=True)},
+        ):
+            link = registry_nvml.pcie_link_for_uuid(UUID_3080_X4)
+        self.assertTrue(link.width_from_max)
+        self.assertFalse(registry_nvml.pcie_link_for_uuid(UUID_3080_X4).width_from_max)
+
+
+class ConsolidationTests(_RigCase):
+    """#736b: one canon, two consumers, and they must not drift apart.
+
+    The rule used to be spelled out in ``expert_offload.py`` and again in
+    ``barlink_peer_transport.py``. It now lives in ``registry/nvml.py`` and
+    both import DOWN into it -- the reverse would drag ``layers.moe`` into
+    world build. These tests are what makes a re-divergence visible.
+    """
+
+    def test_the_registry_is_the_authority_and_reports_the_slots(self):
+        got = {u: registry_nvml.pcie_link_for_uuid(u).width for u in CURR_WIDTH}
+        self.assertEqual(got, {UUID_3080_X4: 4, UUID_5090: 8, UUID_3080_X8: 8})
+
+    def test_both_consumers_read_the_same_width(self):
+        """The drift pin. Offload GB/s and transport lanes share one source."""
+        lane = _expert_offload._PCIE_LANE_GBPS[_FakePynvml.GENERATION]
+        for uuid, expect in CURR_WIDTH.items():
+            self.assertEqual(lanes_by_uuid_via_nvml(uuid), expect)
+            self.assertAlmostEqual(
+                _expert_offload._pcie_link_gbps_by_uuid(uuid), lane * expect, places=6
+            )
+
+    def test_neither_consumer_queries_nvml_itself(self):
+        """CAN-FAIL PROOF for the consolidation.
+
+        With the single authority stubbed out, BOTH consumers must go dark. If
+        either still answers, it kept a private NVML path and the canon has
+        already forked.
+        """
+        with patch.object(registry_nvml, "pcie_link_for_uuid", lambda uuid: None):
+            self.assertIsNone(lanes_by_uuid_via_nvml(UUID_5090))
+            self.assertIsNone(_expert_offload._pcie_link_gbps_by_uuid(UUID_5090))
+
+    def test_transport_does_not_import_layers_moe(self):
+        """The dependency direction the consolidation exists to protect.
+
+        Parsed, not grepped: this module's own prose names ``layers.moe`` while
+        explaining why it must not import it, so a substring check would pass
+        or fail for the wrong reason. Only real import statements count.
+        """
+        import ast
+
+        src = _TRANSPORT_SRC.read_text()
+        imported = set()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Import):
+                imported.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        self.assertTrue(imported, "parser must actually find imports")
+        offenders = [m for m in imported if "layers.moe" in m or "expert_offload" in m]
+        self.assertEqual(offenders, [], f"world build must not pull moe: {offenders}")
+        self.assertIn("sglang.srt.registry.nvml", imported)
 
 
 # ===========================================================================

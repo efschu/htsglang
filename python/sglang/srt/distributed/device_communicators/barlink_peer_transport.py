@@ -89,46 +89,31 @@ class PeerTransportRefused(RuntimeError):
 def lanes_by_uuid_via_nvml(uuid: str) -> Optional[int]:
     """Negotiated PCIe lane count for the SLOT this card sits in, or ``None``.
 
-    WIDTH COMES FROM THE CURRENT LINK, NOT THE MAXIMUM, and the asymmetry is
-    measured rather than stylistic. ``nvmlDeviceGetMaxPcieLinkWidth`` reports
-    what the CARD can do, not what the SLOT gives it: on the reference rig it
-    returns x16 for all three cards while the slots are wired x4 / x8 / x8.
-    Deriving from it collapses every edge to "fast" and silently disables this
-    whole feature on exactly the box it exists for.
-    ``nvmlDeviceGetCurrPcieLinkWidth`` reports 4 / 8 / 8 and is the physical
-    wiring.
+    Thin delegate to ``registry.nvml.pcie_link_for_uuid``, which is the ONE
+    authority for this question (#736) and carries the canon in full: WIDTH
+    FROM THE CURRENT LINK, GENERATION FROM THE MAXIMUM, resolved through the
+    IdentityMap by UUID and never positionally. Read it there before changing
+    anything here.
 
-    This canon is not invented here. It is the rule established at
-    ``layers/moe/expert_offload.py:842`` (``_pcie_link_gbps_by_uuid``) for the
-    expert-offload link weights, together with its #392 rationale. That
-    function is private to another lineage and pulling ``layers.moe`` into
-    world build would be the wrong dependency direction, so the canon is
-    restated here and pinned by
-    ``test_barlink_peer_transport.py::CanonTests``. Consolidating both onto a
-    single helper in ``registry/nvml.py`` is filed, not done here.
+    The one line worth repeating at the call site, because it is what this
+    policy turns on: ``MaxPcieLinkWidth`` reports x16 for all three cards on
+    the reference rig while the slots are wired x4 / x8 / x8, so a max-derived
+    width collapses every edge to "fast" and silently disables this feature on
+    exactly the box it exists for.
 
-    Unlike that function this one returns LANES, not GB/s: the policy below
-    switches on physical width, and folding in a generation constant would
-    turn an exact integer into an estimate for no gain.
+    Only LANES are taken. The policy below switches on physical width, and
+    folding in the generation constant would turn an exact integer into an
+    estimate for no gain -- that conversion belongs to the consumer that wants
+    GB/s (the expert-offload link weights), not here.
+
+    A width that had to fall back to the card maximum is still returned rather
+    than suppressed: an over-reported width picks NCCL, which is never
+    catastrophically wrong, only unoptimised.
     """
-    try:
-        from sglang.srt.registry.nvml import identity_map, nvml_session
+    from sglang.srt.registry.nvml import pcie_link_for_uuid
 
-        card = identity_map().require(uuid)
-        with nvml_session() as pynvml:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(int(card.nvml_index))
-            try:
-                width = int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
-            except Exception:  # noqa: BLE001 - older binding: fall back below
-                width = 0
-            if width <= 0:
-                # Deliberate last resort, and known to over-report (see above).
-                # Better than None: an over-reported width picks NCCL, which is
-                # never catastrophically wrong, only unoptimised.
-                width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
-    except Exception:  # noqa: BLE001 - absent driver/binding is not an error
-        return None
-    return width if width > 0 else None
+    link = pcie_link_for_uuid(uuid)
+    return None if link is None else link.width
 
 
 # ---------------------------------------------------------------------------
