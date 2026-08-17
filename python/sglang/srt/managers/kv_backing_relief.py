@@ -1210,8 +1210,9 @@ class KvBackingRelief:
         rows, top = self._flip_pending()
         if rows < 0:
             # UNKNOWN. Only refuses while a flip is actually armed; outside
-            # one there is nothing to protect. #746 (the exact arm-time
-            # snapshot) is what removes this last wholesale case.
+            # one there is nothing to protect. #746 confined this case to a
+            # flip whose ARM-TIME extent measurement itself failed -- the
+            # snapshot otherwise exists from arm to exit.
             return -2 if self._flip_armed() else -1
         if rows == 0:
             return -1
@@ -2455,15 +2456,31 @@ def kv_backing_provider(
     def _flip_pending():
         """#744 line 1: ``(rows, max_row_id)`` the flip has parked.
 
-        Consulted only while a flip is armed, which is what makes the sticky
-        value on ``live_fn`` safe: outside a flip this answers "nothing
-        parked" unconditionally, so the rung stays fully live and #688's
-        funding path is untouched. While armed and with no enumeration on
-        record yet, the honest answer is UNKNOWN -- which blocks.
+        #746: answered from the controller's ARM-TIME SNAPSHOT
+        (``PhaseFlipRuntime.parked_extent``), which is exact -- "the rows
+        this flip will pack" is fixed at arm, where the flip measures it.
+        The sticky last-enumeration value this replaced was stale by
+        construction and absent for a flip that armed before any
+        enumeration ran.
+
+        Outside a flip this answers "nothing parked" unconditionally, so
+        the rung stays fully live and #688's funding path is untouched.
+        While armed with no readable snapshot (the arm-time measurement
+        failed), the honest answer is UNKNOWN -- which #748's exclusion
+        ceiling turns into its one remaining wholesale refusal.
         """
         if not _flip_armed():
             return (0, -1)
-        return getattr(live_fn, "last_req_extent", None) or (-1, -1)
+        rt = getattr(scheduler, "phase_flip_runtime", None)
+        snap = None
+        if rt is not None:
+            try:
+                snap = rt.parked_extent()
+            except Exception:  # noqa: BLE001 - unreadable is UNKNOWN, not empty
+                snap = None
+        if snap is None:
+            return (-1, -1)
+        return (int(snap[0]), int(snap[1]))
 
     return KvBackingRelief(
         pool,

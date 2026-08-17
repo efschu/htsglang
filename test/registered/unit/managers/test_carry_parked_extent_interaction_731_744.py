@@ -73,16 +73,29 @@ def _scheduler(*, carried, queued):
 
 
 def _enumerate(sched):
-    """Run the flip's live-slot function; return (rows, max, extent)."""
-    from sglang.srt.managers.phase_flip_runtime import build_flip_live_slots_fn
+    """Run the flip's live-slot function; return (rows, max, extent).
+
+    #746 replaced #744's sticky last-enumeration value with an ARM-TIME
+    SNAPSHOT on the controller. The extent element here is that snapshot,
+    taken through the real ``_snapshot_parked_extent`` against the same
+    enumeration -- the production channel, not a paraphrase -- so this
+    file keeps pinning the #731 interaction against whatever the rung
+    actually reads.
+    """
+    from sglang.srt.managers.phase_flip_runtime import (
+        PhaseFlipRuntime,
+        build_flip_live_slots_fn,
+    )
 
     fn = build_flip_live_slots_fn(sched)
-    fn()
+    rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+    rt._live_slots_fn = fn
+    extent = rt._snapshot_parked_extent()  # runs the enumeration itself
     split = fn.last_split
     return (
         int(split["req_rows"]),
         int(split["req_max"]),
-        getattr(fn, "last_req_extent", None),
+        extent,
     )
 
 
@@ -100,7 +113,9 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
         rows, top, extent = _enumerate(_scheduler(carried=self.req, queued=[self.req]))
         self.assertEqual(rows, SEQLEN, "the carried request must contribute its rows")
         self.assertGreater(top, 0)
-        self.assertEqual(extent, (SEQLEN, top), "#744's sticky extent must be set")
+        self.assertEqual(
+            extent, (SEQLEN, top), "#746's arm-time snapshot must see the rows"
+        )
 
     def test_the_extent_is_identical_before_and_after_the_consume(self):
         """THE INTERACTION. #731 removes the queue entry; #744 must not care."""

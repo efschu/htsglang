@@ -59,3 +59,35 @@ Do not use this as a reason to drop the armed gate. The two lines are
 deliberately independent because the failure mode is a silent eviction followed
 by a delayed fault — nothing between the two says anything is wrong, so a
 single mechanism has no second chance.
+
+## Built (fix/746-arm-time-snapshot)
+
+`arm()` measures the extent through the flip's own live-slot enumeration at
+the arm instant (`_snapshot_parked_extent`) and stores it on the controller;
+`parked_extent()` serves it gated on `_pending`, and every exit -- the commit
+and all four abandon paths -- clears it. The rung's `_flip_pending` probe
+reads that snapshot; the sticky last-enumeration channel is removed at writer
+and reader both. #748's exclusion ceiling and its UNKNOWN-while-armed
+wholesale refusal stand untouched; UNKNOWN is now confined to a flip whose
+arm-time measurement itself failed.
+
+Acceptance status:
+
+- arm-before-enumeration reports the real extent: BUILT, driven through the
+  real `arm()` in `test_flip_arm_snapshot_746.py` (idle arm = exact
+  `(0, -1)`, populated arm = exact rows/top);
+- cleared on BOTH exits: BUILT, behaviorally for the three hermetically
+  callable abandons plus an AST pin that every `_pending = None` site clears
+  the snapshot, plus the accessor's own `_pending` gate as second defence;
+- `test_evict_rung_flip_park_744.py` green unchanged, including
+  `test_THE_RUNG_IS_NOT_DEAD_OUTSIDE_FLIPS`.
+
+Mutation matrix (production code mutated, suite must go red): N1 arm does
+not snapshot -> 2 failed; N2 accessor ungated -> 1; N3 commit does not clear
+-> 1; N4 abandons do not clear -> 6; N5 snapshot survives flip (M5 analog,
+N2+N3+N4) -> 8; N6 measurement failure read as empty -> 2; N7 rung reads
+missing snapshot as empty -> 1. All killed.
+
+Not desk-provable: a metal flip arming with the snapshot while the rung
+funds the seam from rows above the parked ceiling (the #748 unstrangle,
+now exact). Rides the review boot / a later window arm.

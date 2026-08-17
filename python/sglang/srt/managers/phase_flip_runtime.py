@@ -880,19 +880,13 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             # to know the other's plumbing.
             _live.last_split = split
             scheduler.flip_live_split = split
-            # #744: REMEMBER THE LAST ENUMERATION THAT SAW REQUESTS. A flip
-            # quiesces its requests before packing them, so by the time the
-            # KV rung asks, this same function reports req_rows=0 -- which is
-            # indistinguishable from an idle box and is what let the rung
-            # evict 127,731 rows the flip was about to read (ANALYSE_741).
-            # The rung consults this ONLY while a flip is armed, so a stale
-            # value cannot outlive the flip and cannot leave the rung dead
-            # outside one.
-            if int(split["req_rows"]) > 0:
-                _live.last_req_extent = (
-                    int(split["req_rows"]),
-                    int(split["req_max"]),
-                )
+            # #744 kept a sticky "last enumeration that saw requests" here
+            # for the KV rung to consult while a flip was armed. #746
+            # replaced that channel: the rung now reads the exact extent the
+            # controller snapshots at ARM (``PhaseFlipRuntime.parked_
+            # extent``), which cannot be stale and exists even when no
+            # enumeration ran before the flip armed. The split above remains
+            # the snapshot's measurement source.
         except Exception as e:  # pragma: no cover - an instrument, never a gate
             logger.warning("%s live-split instrument failed: %s", LOG_PREFIX, e)
             _live.last_split = None
@@ -2620,6 +2614,14 @@ class PhaseFlipRuntime:
         self._park_deadline_s = float(park_deadline_s)
         #: Clock reading of the moment this rank armed, or None when idle.
         self._armed_at: Optional[float] = None
+        #: #746: ``(req_rows, req_max)`` measured by ``arm()`` at the arm
+        #: instant -- the exact extent this flip will pack -- or None when no
+        #: flip is armed or the arm-time measurement failed. Cleared at EVERY
+        #: exit (commit and all abandon paths): a snapshot that outlives its
+        #: flip pins the rung permanently, the M5 failure mode #744's
+        #: mutation matrix refuses. Read through ``parked_extent()``, never
+        #: directly.
+        self._parked_extent: Optional[Tuple[int, int]] = None
         #: Flips abandoned because the park deadline expired. A counter, so
         #: "this never happens in practice" stops being an assumption.
         self.park_deadline_aborts = 0
@@ -3150,6 +3152,17 @@ class PhaseFlipRuntime:
         # the deadline bounds how long the requests are held, and they are
         # held from the moment this rank starts withholding work.
         self._armed_at = self._clock()
+        # #746: measure the parked extent NOW. The requests quiesce after
+        # arming, so this is the last instant the resident set is both
+        # enumerable and final -- "the rows this flip will pack" is fixed
+        # here. The KV rung reads this snapshot instead of remembering the
+        # last enumeration that happened to see requests (which answered
+        # UNKNOWN for a flip that armed before any enumeration ran, and
+        # answered stale for a resident set that changed since). Taken ONCE
+        # per arm, deliberately not re-taken at the park-clock re-base: by
+        # then the requests are quiescing and an enumeration reports the
+        # req_rows=0 blindness #744 exists to defeat.
+        self._parked_extent = self._snapshot_parked_extent()
         # #631 J: census AT ARM. The pre/post-cutover pair proved the move
         # and the cutover innocent (identical unaccounted set on both
         # sides), and a no-flip control boot stayed clean, so the page goes
@@ -3504,6 +3517,55 @@ class PhaseFlipRuntime:
                 self._sleep(self._presence_poll_interval_s)
                 continue
             return True
+
+    def _snapshot_parked_extent(self) -> Optional[Tuple[int, int]]:
+        """#746: ``(req_rows, req_max)`` of the resident set, measured NOW.
+
+        Runs the flip's own live-slot enumeration and reads its request half
+        from the split side channel it populates. Called by ``arm()`` at the
+        arm instant; the result is the exact extent this flip will pack,
+        because parking begins at arming and quiescence only removes requests
+        from the enumerable structures, never adds them.
+
+        ``None`` means the measurement FAILED, and the #744 axiom carries
+        over unchanged: UNKNOWN IS NOT EMPTY. A None snapshot leaves the KV
+        rung's probe answering ``(-1, -1)`` while this flip is armed, which
+        #748's ``_parked_ceiling`` turns into its wholesale refusal -- the
+        conservative reading, now confined to a failed measurement instead of
+        covering every flip that armed before an enumeration ran.
+        """
+        fn = getattr(self, "_live_slots_fn", None)
+        if fn is None:
+            return None
+        try:
+            fn()
+            split = getattr(fn, "last_split", None)
+            if not split:
+                return None
+            return (int(split["req_rows"]), int(split["req_max"]))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "%s arm-time parked-extent snapshot failed (%s); the KV rung "
+                "will treat this flip's extent as UNKNOWN and refuse to "
+                "shrink for its duration",
+                LOG_PREFIX,
+                e,
+            )
+            return None
+
+    def parked_extent(self) -> Optional[Tuple[int, int]]:
+        """#746: the extent snapshot of the CURRENTLY armed flip, else None.
+
+        Gated on ``_pending`` -- the one authority for arming, same as
+        ``is_armed`` -- so a snapshot can never be read once its flip has
+        exited, even if an exit path forgot to clear it. That is the second
+        of two defences against the M5 failure mode (a stale value pinning
+        the rung permanently); the first is that every exit path clears the
+        attribute.
+        """
+        if self._pending is None:
+            return None
+        return self._parked_extent
 
     def is_armed(self) -> bool:
         """#631: is a flip armed on this rank right now?
@@ -3884,6 +3946,7 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.presence_timeouts += 1
         logger.error(
@@ -3948,6 +4011,7 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.join_deadline_aborts += 1
         logger.error(
@@ -3980,6 +4044,7 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.park_deadline_aborts += 1
         logger.error(
@@ -6747,6 +6812,7 @@ class PhaseFlipRuntime:
             )
             self._pending = None
             self._armed_at = None
+            self._parked_extent = None  # #746: cleared on EVERY exit
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
             # short of staging room is not read as a pool-sizing problem.
@@ -7177,6 +7243,10 @@ class PhaseFlipRuntime:
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
         self._armed_at = None
+        # #746: the commit is an exit too -- the packed rows are moved, the
+        # extent has no referent, and a surviving snapshot would pin the
+        # rung into the next phase for ever (the M5 failure mode).
+        self._parked_extent = None
         self._epoch += 1
         self.completed += 1
         total_ms = (self._clock() - t0) * 1000.0
