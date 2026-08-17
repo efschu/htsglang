@@ -1125,7 +1125,16 @@ def _warn_first_disk_tier_arm(server_args) -> None:
 
 def flip_blocking_guards(scheduler) -> List[str]:
     """Features that refuse flip arming (DESIGN_631 3.7). Mirrors the
-    #297 Stage-A guard shape, plus the #630 PP x disk-HiCache wedge."""
+    #297 Stage-A guard shape.
+
+    NOT the #630 PP x disk-HiCache wedge: this docstring advertised it until
+    the stale-gate sweep, but #703 stage 2 REMOVED that clause (see the
+    comment below it) once 9da9dfd025 fixed the wedge's root and
+    test_hicache_bounded_waits_630.py became the active protection. A
+    docstring that lists a guard the function does not have sends the next
+    reader looking for code that is not there -- and, worse, could persuade
+    someone the combination is still refused when it is served.
+    """
     guards: List[str] = []
     server_args = scheduler.server_args
     try:
