@@ -77,6 +77,17 @@ def release_distributed(scheduler: Any, *, graceful: bool) -> Optional[str]:
     server_args = getattr(scheduler, "server_args", None)
     if not distributed_teardown_enabled(server_args):
         return None
+    # #673 ORDERING, ENFORCED HERE RATHER THAN BY CALL ORDER. The barlink peer
+    # watchdog polls every registered transport's abort word on a ~10 ms
+    # cadence. Destroying the groups -- which closes barlink_comm on the way --
+    # while that thread is mid-poll is its own abort, so it is stopped and
+    # JOINED first, and stopping it re-arms the in-line reads so the guard is
+    # handed back rather than removed.
+    #
+    # Inside the destroy rather than only earlier in the scheduler's finally,
+    # because the two are one careless reorder apart. Idempotent, so the
+    # explicit earlier call does not make this a second stop.
+    release_barlink_watchdog(scheduler, graceful=True)
     try:
         from sglang.srt.distributed import parallel_state
     except Exception as e:  # pragma: no cover - import shape, not behaviour
@@ -104,3 +115,49 @@ def release_distributed(scheduler: Any, *, graceful: bool) -> Optional[str]:
             " + ".join(done),
         )
     return " + ".join(done) if done else None
+
+
+def release_barlink_watchdog(scheduler: Any, *, graceful: bool) -> Optional[str]:
+    """Stop the barlink peer watchdog before exit (#673 Option B).
+
+    ALWAYS-STOP, no gate. A stop caller has no reason to be opt-in, and the
+    process-group destroy's flag must not leak into it: the watchdog thread is
+    leaked on every boot that has barlink liveness on, whether or not that
+    destroy is armed.
+
+    Stopping it also RE-ARMS the transports' in-line abort reads -- see
+    ``PeerWatchdog.stop``. That is what makes stopping safe at all: this thread
+    is the only reader of a device transport's abort word once #517 phase 2 has
+    latched it, so a stop without the re-arm would trade a leaked thread for a
+    blind abort guard. The in-line read it restores is the pre-#517
+    per-collective device read, paid only after the stop -- i.e. during
+    teardown, never during serving.
+
+    Also called from ``release_distributed`` as an ordering precondition.
+    Graceful path only, never raises, idempotent.
+    """
+    if not graceful:
+        return None
+    try:
+        from sglang.srt.distributed.device_communicators import (
+            barlink_liveness as _bl,
+        )
+
+        outcome = _bl.stop_watchdog()
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s stopping the barlink watchdog failed: %s", LOG_PREFIX, e)
+        return None
+    if outcome == "joined":
+        logger.info(
+            "%s barlink peer watchdog joined before exit; the in-line abort "
+            "reads are re-armed, so the guard is intact.",
+            LOG_PREFIX,
+        )
+    elif outcome == "detached":
+        logger.warning(
+            "%s the barlink peer watchdog could NOT be joined. The in-line "
+            "reads are re-armed so the guard is not blind, but the thread is "
+            "still polling and its transports must not be closed yet.",
+            LOG_PREFIX,
+        )
+    return outcome

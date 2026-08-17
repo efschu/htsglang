@@ -124,13 +124,46 @@ dual-group-lane method was fixed before its caller.
 
 ---
 
-## Status
+## RESOLVED 2026-08-17 — blocker cleared by Option B, caller now safe
 
-`barlink-peer-watchdog` remains **open and unfixed**, and it stays the
+**Option B was built; the named blocker is gone.** Stopping the watchdog now
+calls `barlink_abort_gate.rearm_inline_reads()`, which clears
+`_abort_poll_active` on every registered transport **before** the join, so
+`check_aborted` falls back to the pre-#517 in-line device read. The abort word
+itself is untouched — sticky, unwritten, uncleared; only *who reads it*
+changes, back to the reader it had before #517 phase 2. There is no window in
+which the reader has gone while the latch still claims it reads, and a test
+pins that by having the worker record the latch at the moment it observes the
+stop event. With the read handed back, the stop caller is safe, and it is
+wired: always-stop, no gate, bounded join (250 ms, derived from this loop's own
+~10 ms poll cadence rather than copied from the 2 s siblings), loud
+handle-keeping detach, and the stop-before-destroy ordering enforced inside
+`release_distributed` itself rather than by call order.
+
+**One scope correction to this document.** Above I wrote that the watchdog is
+the only reader of "every device transport's" abort word. That is true of the
+`barlink_device` family and **not** of `barlink_bar1`:
+`BarlinkBar1Transport.check_aborted` (`barlink_bar1.py:5122`) never consults
+`_abort_poll_active` — it always reads through `_read_status_for_check`
+(`:4889`) — so bar1 was never blind. The latch there only short-circuits the
+watchdog's own poll. The re-arm covers both anyway (clearing a latch whose only
+effect is on a thread that is going away costs nothing), and a test pins the
+asymmetry so a future edit cannot quietly make bar1 depend on the latch too.
+
+Option A stays rejected: it hangs off the default-off destroy path and would
+leave default boots leaking forever.
+
+## Status (superseded — kept for the record)
+
+`barlink-peer-watchdog` was **open and unfixed** at the time of writing, and it stays the
 highest-value item in the #673 inventory on cadence (~10 ms CUDA D2H poll, not
 opt-in). It is no longer merely "parked with #722" — it now has a named
 blocker: **the stop caller cannot be added safely until the abort-word read
 has somewhere else to go.**
 
-#673 family: 4 of 6 abort-shaped items desk-addressed, 2 filed, none validated
-on metal.
+#673 family: **5 of 6** abort-shaped items desk-addressed (process groups
+gated, kvso-dest-io, dual-group-lane, lockstep-sentinel, barlink-peer-watchdog),
+**1 filed with no action** (the vendored mooncake/mori/nixl transfer workers,
+which have no stop mechanism to wire and are PD-only). None validated on metal:
+the abort is intermittent per process, so a single clean boot proves nothing —
+the fixes ride along on future teardown-armed boots.

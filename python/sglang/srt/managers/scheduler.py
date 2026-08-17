@@ -9570,8 +9570,18 @@ def run_scheduler_process(
             # without an active exception", after a clean drain, which is the
             # #673 signature. Graceful path only and flag-gated: the destroy
             # path runs barlink's close(), which is #722's machinery.
-            from sglang.srt.managers.scheduler_teardown import release_distributed
+            from sglang.srt.managers.scheduler_teardown import (
+                release_barlink_watchdog,
+                release_distributed,
+            )
 
+            # #673: the barlink peer watchdog polls every transport's abort
+            # word every ~10 ms. Stopping it hands the read back to the
+            # transports (the in-line pre-#517 read) instead of removing it,
+            # and it must be down BEFORE anything destroys or closes what it
+            # polls -- release_distributed repeats the call internally, because
+            # this ordering must survive a careless edit to this block.
+            release_barlink_watchdog(scheduler, graceful=scheduler.gracefully_exit)
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 
