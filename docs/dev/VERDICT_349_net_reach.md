@@ -2,17 +2,28 @@
 
 Date: 2026-08-17. Hermetic (`CUDA_VISIBLE_DEVICES=""`), no boots.
 
-**Verdict: the net is ARMED but its REACH is 16 days behind the product.**
+**Verdict: MOSTLY armed, with two real disarms found and fixed -- and a reach
+that is 16 days behind the product.**
 
-The harness is healthy -- it imports, runs, and its unit tests are green. What
-has moved is the world it points at. The net covers the cross it was built for
-and is structurally blind to the phase-flip world that arrived after it, which
-is where this week's crashes lived.
+The harness itself is healthy: it imports, runs card-less, and its unit tests
+are green. The arm definitions are in far better shape than feared -- no
+renamed flags, no removed flags, no dead env switches, no missing model paths.
 
-That is a different failure than the one this determination was sent to look
-for. The feared shape was #380-class rot: arms quietly matching nothing while
-reporting green. The audit did not find a disarmed net. It found a net aimed
-at last month's target.
+But the audit did find rot, in both directions the class allows:
+
+1. **A false RED.** `reject_dcp_crossalgo` has been failing every sweep for
+   over two weeks on a marker the refusal never prints -- an arm that cannot
+   pass is as disarmed as one that cannot fail, because it trains readers to
+   ignore the net's reds.
+2. **A false GREEN, net-wide.** The `graphs` axis was confirmed from the DRAFT
+   worker's capture line on all 15 boot arms; the TARGET model's graphs have
+   never once been observed. A target-side fallback to eager would have gone
+   green.
+
+Both are fixed and pinned here. The third finding is not rot but range: the
+net is structurally blind to the phase-flip world that arrived after it, which
+is where this week's crashes lived. That part cannot be fixed at the desk --
+it needs boots, and it is filed.
 
 ## (a) When did it last actually run, and against what?
 
@@ -50,11 +61,116 @@ model no longer served.
 
 ## (b) Which arms are stale at today's HEAD?
 
-See the per-arm audit table below (`ARM AUDIT`). Summary of the sort:
+All 20 arms were audited flag-by-flag, env-by-env, marker-by-marker against
+HEAD. The sort:
 
-- VALID -- flags, envs and markers all resolve at HEAD
-- STALE-FIXABLE -- something no longer resolves, intent still testable
-- OBSOLETE-BY-DESIGN -- the world the arm boots no longer exists by design
+| verdict | count | arms |
+|---|---|---|
+| VALID | 17 | A, B, C, D, E, G, H, I, J, K, M, N, O, and the four sound reject arms |
+| STALE-FIXABLE | 2 | `reject_dcp_crossalgo` (fixed here), `P_hicache_nospill_control` (comments only, fixed here) |
+| BLOCKED, not stale | 1 | `L_video_cotenancy` -- filed, see below |
+| OBSOLETE-BY-DESIGN | 0 | -- |
+
+**Nothing the feared shape predicted was found.** Every CLI flag across all 20
+arms still exists as a real `server_args.py` field -- no renames, no removals.
+All eight env vars have live readers -- no dead switches. The one model path
+(`DFLASH_DRAFT_MODEL`) exists on disk. The two centralised spill-marker
+literals are still emitted verbatim. On the #382/#315 axes the net is clean.
+
+### The one genuinely disarmed arm: `reject_dcp_crossalgo`
+
+`reject_markers` demanded the literal `"--speculative-cross-algorithm"`. The
+guard that actually fires words its refusal as prose --
+
+> `--draft-kv-layout dcp is not supported together with cross-algorithm
+> speculative serving: the active draft rung changes at runtime...`
+
+-- and never prints the flag spelling. `first_refusal` requires ALL markers in
+ONE refusal, so the arm reported **FAIL on every sweep**. It is right there in
+the 2026-08-01 record: *"refused, but with an unexpected error rather than the
+named guard"*. It has been red for over two weeks while the server refused for
+exactly the right reason.
+
+This is the disarm, in the direction that is easy to miss. A false RED is not
+a stricter net -- it is a net people stop reading, which `arms.py`'s own
+docstring already says about the deleted draft-extend refusal: *"A net that
+keeps asserting a deleted refusal reports a defect every run and teaches
+everyone to stop reading it."* The net grew the very defect it warns about.
+
+**Fixed**: the marker is now `"cross-algorithm speculative serving"`, a
+substring the refusal actually contains.
+
+**Pinned, and this is the durable part**: a meta-test now asserts that every
+reject arm's markers appear in a `raise` message in `server_args.py`, parsed
+out by AST. Written first as a whole-file substring check, it PASSED while the
+broken arm was still broken -- every flag spelling occurs in `server_args.py`
+as its own argparse definition. The check has to look where the words are
+EMITTED, not merely where they exist. It cannot prove a guard fires (that half
+goes red loudly on the next sweep); it pins the half that rots silently.
+
+### `L_video_cotenancy`: blocked, deliberately left red
+
+`LANE_RANK_MIB = "19000,15000,15000"` is the exact vector
+`_validate_dual_group_lane_card_budget` was built to reject -- the guard's own
+docstring names arm L as its reason. The arm cannot boot on this rig: ~35.9
+GiB required against a ~32.1 GiB card, and the arm's own comment already
+carries that arithmetic and the conclusion that shrinking the vector does not
+help (14.8 GiB of lane complement leaves rank 0 no serving KV).
+
+**Not fixed, on purpose.** The tempting move is a `blocked_on` field so the
+sweep reports BLOCKED instead of FAIL. That was considered and rejected: a
+skip mechanism is itself a way to disarm an arm silently, which is the thing
+this determination exists to catch. A visible red with a documented cause is
+safer than a green-looking skip. Filed instead, with its dep named by the arm:
+the GGUF vehicle of the 4.11 recipe, or the two-card lane of EVAL_272 slice
+C/D.
+
+### `P_hicache_nospill_control`: three drifted pointers, no functional defect
+
+Cited `kv_session_offload.py:1588-1589`, `server_args.py:6762`,
+`kv_session_offload.py:2395`; real locations at HEAD are `:1788`, `:7308`,
+`:2690-2692`. Comments only -- the arm behaves as described. Corrected.
+
+### Net-wide: the `graphs` axis was never actually observed
+
+Not an arm defect -- a defect in the shared resolver, and the most consequential
+finding of the audit.
+
+`report_effective` resolved `graphs` with
+`r"Capture (draft )?(decode|extend|prefill) CUDA graph"`, while
+`model_runner.py:3907` builds the line as
+`role = "draft" if self.is_draft_worker else "target"`. The alternation covered
+the DRAFT role and missed the TARGET role entirely -- and missed the `verify`
+phase too. A real 2026-08-01 arm log carries exactly this:
+
+```
+Capture draft decode CUDA graph begin      <- matched
+Capture draft extend CUDA graph begin      <- matched
+Capture target verify CUDA graph begin     <- matched nothing (x3)
+```
+
+Every boot arm runs with speculation, so the draft line was always present and
+`graphs` always resolved True **on the strength of the draft model alone**. The
+matrix has never once observed whether the TARGET model captured its graphs. A
+boot where target capture silently fell back to eager while draft capture
+succeeded reported `graphs=True` and went green -- a FALSE GREEN, worse than
+the STOP an always-absent marker usually yields, because `BASE_EXPECT` means
+"full CUDA graphs, not eager" about the SERVED model.
+
+Confirmed against real data rather than inferred: the three arms that PASSed on
+2026-08-01 all carry `"graphs": true` in `summary.json`; the eight `null`s are
+arms whose boot died before any capture, not the regex.
+
+**Fixed**: `graphs` is now resolved from the target line only
+(`(?:target )?(?:decode|extend|prefill|verify)`), with a roleless line read as
+target so pre-role-prefix artifacts stay readable. Draft capture is no longer
+treated as evidence about the target.
+
+Why CI never caught it: all three existing fixtures used
+`"Capture draft decode CUDA graph begin."` and nothing else, so the suite only
+ever exercised the accidentally-matching branch. Those three fixtures now carry
+both roles, as a real spec boot prints them; a new test pins that a draft-only
+log resolves `None`, never `True`.
 
 ## (c) Do the coherence gates cover the new failure surface?
 

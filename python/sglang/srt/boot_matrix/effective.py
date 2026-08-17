@@ -214,8 +214,23 @@ def report_effective(log_text: str) -> EffectiveConfig:
 
     # graphs: the capture-begin line is printed for every captured phase. Eager
     # runs never print it; a disabled-graph run prints the disable notice.
+    #
+    # ONLY THE TARGET WORKER'S LINE COUNTS. model_runner.py:3907 builds the
+    # role as `"draft" if self.is_draft_worker else "target"`, so a spec boot
+    # prints BOTH roles. The previous pattern covered `(draft )?` and neither
+    # the `target` role nor the `verify` phase, which meant every boot arm --
+    # all of which run with speculation -- confirmed `graphs=True` from the
+    # DRAFT model alone, and the matrix never once observed whether the TARGET
+    # model captured. A target capture that silently fell back to eager while
+    # the draft captured went green. `BASE_EXPECT["graphs"]` is a claim about
+    # the SERVED model, so draft evidence is not evidence for it.
+    #
+    # A roleless line is a pre-role-prefix log; those were target captures, so
+    # historical artifacts stay readable.
     graphs: Optional[bool] = None
-    if re.search(r"Capture (draft )?(decode|extend|prefill) CUDA graph", log_text):
+    if re.search(
+        r"Capture (?:target )?(?:decode|extend|prefill|verify) CUDA graph", log_text
+    ):
         graphs = True
     elif re.search(r"Disable(d)? cuda graph|disable_cuda_graph=True", log_text):
         graphs = False

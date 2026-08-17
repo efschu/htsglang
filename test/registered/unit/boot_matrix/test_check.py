@@ -39,7 +39,12 @@ def _args_dump(**over):
 _ENGAGED = (
     "[2026-08-01 00:00:01 TP0] Uneven-DCP token sizing: rank 0 (vector [30, 17, 17])."
 )
-_GRAPHS = "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin."
+# Both roles, as a real spec boot prints them. `graphs` is resolved from the
+# TARGET line only (#349).
+_GRAPHS = (
+    "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin.\n"
+    "[2026-08-01 00:00:06 TP0] Capture target verify CUDA graph begin."
+)
 #: #614: an offload arm now also has a LOAD precondition -- it must show that a
 #: spill actually fired, or the run is VOID rather than PASS. These fixtures
 #: exercise the DECLARED-vs-RESOLVED half of the check, so their synthetic logs

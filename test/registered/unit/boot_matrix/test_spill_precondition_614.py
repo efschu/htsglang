@@ -73,7 +73,12 @@ def _args_dump(**over):
 _ENGAGED = (
     "[2026-08-01 00:00:01 TP0] Uneven-DCP token sizing: rank 0 (vector [30, 17, 17])."
 )
-_GRAPHS = "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin."
+# Both roles, as a real spec boot prints them. `graphs` is resolved from the
+# TARGET line only (#349).
+_GRAPHS = (
+    "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin.\n"
+    "[2026-08-01 00:00:06 TP0] Capture target verify CUDA graph begin."
+)
 #: A real spill line, copied from the format string at
 #: ``managers/kv_session_offload.py:3865`` with the placeholders filled in.
 _SPILL_LINE = (
