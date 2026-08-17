@@ -91,6 +91,15 @@ class _WedgedWork:
         if timeout is None:
             threading.Event().wait()
             return True
+        # #734: A TIMEOUT RAISES **AT** ITS DEADLINE. Raising instantly made
+        # this stub indistinguishable from a dead peer, and the dead-peer
+        # discriminator (elapsed well inside the bound => transport failure,
+        # not expiry) correctly classified it as one. Sleeping the bound is
+        # what a real expiring wait does, and it keeps this test exercising
+        # the path it was written for.
+        import time as _t
+
+        _t.sleep(float(timeout.total_seconds()) if hasattr(timeout, "total_seconds") else float(timeout))
         raise RuntimeError("gloo: wait timeout (stub)")
 
 

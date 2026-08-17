@@ -70,6 +70,11 @@ class _FakeWork:
         # handed a deadline to `wait()` -- the polling that turned out to be
         # the #630 livelock, since `is_completed()` reports while `wait()`
         # drives. See test_pp_sync_rendezvous_630.py.
+        # #734: a timeout raises AT its deadline; raising instantly reads as
+        # a dead peer to the discriminator, which is a different defect.
+        import time as _t
+
+        _t.sleep(float(timeout.total_seconds()) if hasattr(timeout, "total_seconds") else float(timeout))
         raise RuntimeError("gloo: wait timeout (stub)")
 
 

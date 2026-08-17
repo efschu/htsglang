@@ -3025,53 +3025,70 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _count_ready_acks(self, ack_queue, label: str) -> int:
         """How many leading entries of `ack_queue` this rank may drain now.
 
-        The transfer queues are RANK-LOCAL and differ in LENGTH, not just in
-        completion timing: `write_backup` gives up on a purely rank-local
-        condition -- the host pool cannot free room for this node
-        (:1786-1793), or the recursive "parent must be backed up first"
-        invariant already failed on this rank (:1765-1769) -- and under uneven
-        TP the ranks' host pools differ by construction. A rank that backs
-        nothing up therefore keeps an EMPTY ack queue forever.
+        RANK-LOCAL SINCE #737. This used to MIN-reduce a ready count across the
+        group, and that reduction was the deadlock: it sat inside
+        `check_hicache_events` -> `_get_new_batch_prefill_raw`, i.e. inside the
+        PER-MICROBATCH path of a pipeline, and a pipeline keeps its stages at
+        DIFFERENT offsets by construction. Measured 2026-08-17: PP0/PP1 inside
+        this drain while PP2 was blocked in `_pp_recv_proxy_tensors` waiting for
+        data PP1 would only send after leaving the collective PP1 could not
+        leave without PP2. A circular wait between adjacent stages -- the #633
+        shape, one level up, with a collective in place of a handler.
 
-        Every rank must still enter the all_reduce, or the NCCL op sequence
-        desyncs and TP > 1 deadlocks. But a rank with an empty queue must not
-        drag the reduction to zero: a MIN over "how many of MY acks are ready"
-        conflates "nothing to drain" with "not finished yet", so one idle rank
-        froze the write-through drain on ALL ranks. Every pin then lives
-        forever, and since a write-through pin also makes a mamba checkpoint
-        unevictable, `protected` ratchets one per cached checkpoint until the
-        state pool is gone -- the #581 exhaustion, observed live as
-        `ack_write == wt_mamba_pins == ongoing_wt == protected` climbing
-        together on the backing-up ranks while the idle rank sat at 0.
+        WHAT THE OLD REDUCTION PROVIDED, and where each part went:
 
-        A rank that HAS a queue still throttles the others to its own
-        progress, so the ranks never run further apart than the slowest live
-        transfer.
+        * OP-SEQUENCE UNIFORMITY ("every rank must enter, or NCCL desyncs").
+          That concerned the TP all_reduce, which `_all_reduce` ran only on
+          `pp_rank == 0`. With no reduction there is no op to keep in sequence.
+        * THE EMPTY-QUEUE SENTINEL, which existed because a MIN conflates
+          "nothing to drain" with "not finished yet" -- one idle rank froze the
+          drain on ALL ranks and `protected` ratcheted until the state pool died
+          (#581). Rank-local counting removes that failure mode by construction:
+          an idle rank cannot freeze a peer that no longer waits on it.
+        * THE THROTTLE ("ranks never run further apart than the slowest live
+          transfer"). This was PACING, not correctness, and it is the one thing
+          genuinely lost. It is deliberately NOT replaced by a bound here; see
+          the drain-depth line below for why, and the filed pacing task.
+
+        WHAT NOW OWNS CORRECTNESS -- do not resurrect the collective for it.
+        The cross-rank hazard was publishing a shared content key whose bytes
+        are incomplete on some stage. That is bounded per PAGE by #706's
+        completeness marker (`canonical_kv_page.py`, `PageCompleteness`):
+        production is layer-sharded while storage is token-sharded, so a page's
+        slots arrive from several PP stages and `is_complete()` gates use.
+        Ranks arbitrarily far apart in ack processing therefore yield an
+        INCOMPLETE page, which reads as a MISS -- never as wrong bytes. Ack
+        lockstep was never what made this safe.
+
+        Everything this function now touches is this rank's own: `ack_queue`,
+        and downstream `_finish_write_through_ack` popping this rank's
+        `ongoing_write_through` and `dec_lock_ref`-ing this rank's own node.
         """
         ready = 0
-        if self.pp_rank == 0:
-            for _, finish_event, _ack_list in ack_queue:
-                if not finish_event.query():
-                    break
-                ready += 1
-            contribution = ready if ack_queue else self._NO_ACK_CONSTRAINT
-        else:
-            # Overwritten by the PP broadcast inside `_all_reduce`.
-            contribution = 0
+        for _, finish_event, _ack_list in ack_queue:
+            if not finish_event.query():
+                break
+            ready += 1
 
-        finish_count_tensor = torch.tensor(contribution, dtype=torch.int, device="cpu")
-        self._all_reduce(
-            finish_count_tensor,
-            torch.distributed.ReduceOp.MIN,
-            label=label,
-        )
-        finish_count = int(finish_count_tensor.item())
-
-        # Never pop more than this rank actually has: the reduction comes back
-        # as the sentinel when no rank holds a queue.
-        if self.pp_rank == 0:
-            return min(finish_count, ready)
-        return min(finish_count, len(ack_queue))
+        # #737 OBSERVABILITY, deliberately not a bound. The throttle that used
+        # to fall out of the MIN is gone (see the docstring), and its loss shows
+        # up as a FAST rank running ahead in host-tier pressure. No backpressure
+        # limit is shipped here: a bound chosen without an operating point is
+        # the #505c class of shipped-number-without-evidence. This line is what
+        # makes the first real specimen attributable when it appears.
+        if ready and self._drain_depth_every:
+            now = time.perf_counter()
+            if now - getattr(self, "_drain_depth_at", 0.0) >= self._drain_depth_every:
+                self._drain_depth_at = now
+                logger.info(
+                    "#737 drain depth [%s]: pp_rank=%s ready=%d pending=%d "
+                    "(rank-local; no group agreement is taken here)",
+                    label,
+                    self.pp_rank,
+                    ready,
+                    len(ack_queue) - ready,
+                )
+        return ready
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
@@ -3184,6 +3201,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ticks; 0 (default) leaves every traced path unentered.
         """
         self._pin_trace_every = int(envs.SGLANG_MAMBA_PIN_TRACE.get())
+        # #737: seconds between drain-depth lines, 0 = off. Rate-limited rather
+        # than per-drain because the point is to catch a SUSTAINED divergence in
+        # host-tier pressure between ranks, not to narrate healthy rounds.
+        self._drain_depth_every = 30.0
+        self._drain_depth_at = 0.0
         self._pin_trace_ticks = 0
         self._pin_trace_site = "?"
         self._pin_trace_ops: Counter = Counter()
