@@ -337,8 +337,21 @@ def harvest_resident_batches(scheduler) -> List:
     return out
 
 
-def duplicate_resident_reqs(batches: Sequence) -> List[str]:
-    """Requests reachable through MORE THAN ONE of these batches.
+def duplicate_resident_reqs(batches: Sequence, waiting_queue: Sequence = ()) -> List[str]:
+    """Requests reachable through MORE THAN ONE of these batches, or ALSO QUEUED.
+
+    TWO SPECIMENS, and the second is why the universe grew.
+
+    #731, 2026-08-17: a cutover left a request RESIDENT AND QUEUED. This
+    function could not see it -- it compared batches against each other and
+    never consulted ``waiting_queue`` -- so the duplication was silent while
+    ``_pending_prefill_tokens`` billed the same prompt twice (51,369 ->
+    102,307 tokens, ~2x) and the inflated backlog drove six cutovers that
+    served nothing. A guard whose universe excludes half the places a request
+    can live reports "no duplicates" and means "none of the kind I look for".
+    ``waiting_queue`` is optional so existing callers keep working, and the
+    resident-vs-queued class is reported with a ``queued:`` prefix so the two
+    shapes stay distinguishable at the call site.
 
     MEASURED ON METAL, 2026-08-09 04:55:43Z, and it falsified the
     assumption this used to assert. The first version of the carry RAISED
@@ -362,6 +375,9 @@ def duplicate_resident_reqs(batches: Sequence) -> List[str]:
             if id(req) in seen:
                 dups.append(str(getattr(req, "rid", "?")))
             seen.add(id(req))
+    for req in waiting_queue or ():
+        if id(req) in seen:
+            dups.append(f"queued:{getattr(req, 'rid', '?')}")
     return dups
 
 
@@ -670,15 +686,61 @@ def install_resident_set(scheduler, batches: Sequence, to_tp: bool) -> Optional[
             scheduler.running_batch = merged
         scheduler.last_mbs = [None] * len(slots or [])
         scheduler.last_batch = None
+    consumed = _consume_carried_from_waiting_queue(scheduler, merged)
     if merged is not None:
         logger.warning(
             "%s carried %d resident request(s) across the cutover into the "
-            "%s phase",
+            "%s phase%s",
             LOG_PREFIX,
             len(_reqs_of(merged)),
             "tp" if to_tp else "pp",
+            f" ({consumed} also removed from the waiting queue)" if consumed else "",
         )
     return merged
+
+
+def _consume_carried_from_waiting_queue(scheduler, merged) -> int:
+    """Take out of the queue what the carry just made resident. Never raises.
+
+    THE DEFECT THIS CLOSES (#731). The carry re-homes requests into
+    ``running_batch``/``running_mbs[0]`` and used to leave ``waiting_queue``
+    untouched, so a request queued at cutover time ended up existing TWICE --
+    once resident and invisible to the policy as runnable, once queued and
+    counted. ``_pending_prefill_tokens`` sums the waiting queue and the
+    resident set without excluding their intersection, so the same prompt was
+    billed twice: measured 2026-08-17, 51,369 -> 102,307 tokens across one
+    cutover, within rounding of exactly 2x.
+
+    The inflated backlog then drove the flip policy past its threshold, which
+    is why that boot showed six cutovers and served nothing. THE FLIP CHURN WAS
+    A SYMPTOM, not a defect of its own -- do not "fix" it separately.
+
+    OWNERSHIP IN ONE PLACE: after a cutover the carried request is RESIDENT, and
+    the resident set owns it. The queue must not also claim it.
+
+    Two edges, both deliberate:
+    * a request that is ONLY queued (never resident) is untouched -- this
+      removes exactly what it re-homed, nothing else;
+    * running it twice removes nothing the second time, so a carry over an
+      already-consumed queue is a no-op rather than a corruption.
+    """
+    if merged is None:
+        return 0
+    try:
+        queue = getattr(scheduler, "waiting_queue", None)
+        if not queue:
+            return 0
+        carried = {id(req) for req in _reqs_of(merged)}
+        if not carried:
+            return 0
+        kept = [req for req in queue if id(req) not in carried]
+        removed = len(queue) - len(kept)
+        if removed:
+            scheduler.waiting_queue = kept
+        return removed
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not kill a cutover
+        logger.warning("%s could not consume carried queue entries: %s", LOG_PREFIX, exc)
+        return 0
 
 
 def reseed_decode_input_relay(scheduler) -> int:
