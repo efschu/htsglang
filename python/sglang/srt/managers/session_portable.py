@@ -63,6 +63,7 @@ does NOT cover.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -85,6 +86,7 @@ __all__ = [
 BUNDLE_FORMAT_VERSION = 1
 
 MANIFEST_MEMBER = "manifest.json"
+DIGESTS_MEMBER = "digests.json"
 BUNDLE_MEMBER = "bundle.json"
 PAGE_PREFIX = "pages/"
 
@@ -166,6 +168,13 @@ def export_bundle(
             f"checkpoint (#410 slice 2) or re-fetch the pages, then export."
         )
 
+    # HARVESTED from the paused #411 WIP (0dc48c92d8), which had per-payload
+    # digests this module lacked. A bundle crosses machines: a truncated or
+    # corrupted transfer must be caught here, not discovered as a wrong
+    # session later. Content-addressed keys do NOT give this for free -- the
+    # key names what the bytes SHOULD be, and nothing re-checks that they are.
+    digests = {key: hashlib.sha256(blob).hexdigest() for key, blob in payloads}
+
     summary = {
         "bundle_format_version": BUNDLE_FORMAT_VERSION,
         "page_count": len(payloads),
@@ -179,6 +188,7 @@ def export_bundle(
             # be able to gate on it without streaming past the payloads.
             _add_bytes(tar, MANIFEST_MEMBER, json.dumps(manifest, sort_keys=True).encode())
             _add_bytes(tar, BUNDLE_MEMBER, json.dumps(summary, sort_keys=True).encode())
+            _add_bytes(tar, DIGESTS_MEMBER, json.dumps(digests, sort_keys=True).encode())
             for page_hash, blob in payloads:
                 _add_bytes(tar, f"{PAGE_PREFIX}{page_hash}", blob)
         os.replace(tmp_path, path)
@@ -304,4 +314,30 @@ def import_bundle(
             if handle is None:  # pragma: no cover - directory entry
                 continue
             pages[member.name[len(PAGE_PREFIX) :]] = handle.read()
+
+        digests = {}
+        try:
+            handle = tar.extractfile(DIGESTS_MEMBER)
+            if handle is not None:
+                digests = json.loads(handle.read().decode())
+        except KeyError:
+            digests = {}
+
+    # Integrity AFTER extraction and BEFORE returning: a corrupted payload
+    # must not reach a caller that would seed from it. Absent digests are
+    # tolerated (a bundle from an older writer), and that tolerance is
+    # deliberate rather than silent -- an older bundle is readable, it simply
+    # carries no integrity claim to check.
+    corrupt = [
+        key
+        for key, want in digests.items()
+        if key in pages and hashlib.sha256(pages[key]).hexdigest() != want
+    ]
+    if corrupt:
+        raise PortableSessionError(
+            f"import refused: {len(corrupt)} payload(s) failed their digest "
+            f"(first: {corrupt[0]!r}). The bundle was truncated or corrupted "
+            f"in transfer; seeding from it would produce a wrong session, not "
+            f"a failed one."
+        )
     return manifest, pages

@@ -205,3 +205,77 @@ rather than failing.
 Unchanged: this is still the file layer. Handing `(manifest, pages)` to the
 live seeding path is the next cut, and cross-rig proof remains the filed
 window item.
+
+---
+
+# CUT 3 — the seeding wire, and what the paused WIP was worth
+
+## The predecessor: harvested in one place, superseded in another
+
+`0dc48c92d8` ("#411 WIP: session bundle container, PAUSED mid-slice") is my own
+earlier attempt, on a branch this base does not carry. It built
+`mem_cache/session_bundle.py` — the same feature I rebuilt as
+`managers/session_portable.py` without knowing it existed. Checking it was the
+prior-art gate working on my own output.
+
+**HARVESTED: per-payload digests.** The WIP had `_digest`, `verify_bundle` and
+typed `BundleTruncated` / `BundleIntegrityError`. My version had no integrity
+check at all. Content-addressing does NOT give this for free: the key names
+what the bytes *should* be and nothing re-checks that they are, so a truncated
+or corrupted transfer would have seeded a wrong session rather than failing.
+`export_bundle` now writes a `digests.json` member and `import_bundle` verifies
+it after extraction and before returning. Absent digests are tolerated (an
+older bundle is readable, it simply carries no integrity claim) and that
+tolerance is stated rather than silent.
+
+**SUPERSEDED: `CompatKey`.** The WIP carried its own compatibility key
+(`model_identity`, `num_attn_layers`, `kv_cell_bytes`, `page_size`, `mamba`)
+documented "No geometry". That is a THIRD authority for a rule
+`verify_restore` already owns — and it encodes the same "no geometry" reading
+I retracted in C4. Explicitly superseded, not merged.
+
+One thing in it is worth remembering rather than adopting: `num_attn_layers`
+and `kv_cell_bytes` are exactly the axes the identity hash does NOT cover
+(#726's layout gap). Adding them is a change to the compatibility key itself,
+which is a design decision for the key's owner, not something a container
+should smuggle in.
+
+## The wire
+
+`SessionCheckpointRuntime.import_bundle_and_seed` composes the lifecycle
+branch/rewind already use — `_preconditions` → gate → `controller.branch_from`
+→ ledger — rather than a parallel path. A second seeding path would be a
+second place for the mid-generation rule, the TP=1 limit and the page_head
+refusal to be got wrong.
+
+**ORDER IS THE GUARANTEE.** Every refusal precedes `branch_from`, the only
+step that creates a session, so a failure anywhere leaves nothing to roll back
+— not "a rollback that works", but no state to roll back. The M7-style
+ordering mutation (seed before the store verification) turns that pin red.
+
+**Two verifications, and the second is not redundant.** The bundle's own gate
+runs against its member names; `verify_restore` then runs against the STORE.
+Between those moments the blobs move. Passing the first proves the bundle is
+complete; passing the second proves this rank can actually read what it was
+handed. A store that silently took nothing fails the second and seeds nothing.
+
+**Store writes before the gate are not session state.** They are
+content-addressed cache entries — harmless if the import then refuses, and
+what makes the store-backed verification possible at all. The mid-generation
+check runs *before* them, because a refusal that has already spent store IO is
+a worse refusal.
+
+## The C1 direction is now a standing falsifier
+
+A hybrid bundle whose mamba blob is missing refuses at the gate and never
+seeds. That is the failure Cut 1 would have shipped — KV pages travelling
+without the recurrent state, the destination silently re-prefilling, a wrong
+session rather than a slow one. It is pinned as a falsifier that stays, not as
+a one-off regression test.
+
+## Unchanged
+
+Slice 2 (pinning) is still absent on this base — re-checked, `pin_ledger.py`
+does not exist — so an imported bundle's checkpoint is not pinned on seed and
+the dangling-reference note stands. Cross-rig proof remains the filed window
+item; nothing here has crossed a machine.

@@ -842,6 +842,102 @@ class SessionCheckpointRuntime:
 
     # -- branch -------------------------------------------------------------
 
+    def import_bundle_and_seed(
+        self,
+        bundle_path: str,
+        *,
+        new_session_id: Optional[str] = None,
+        store_put_fn: Optional[Callable[[str, bytes], None]] = None,
+    ) -> Tuple[str, str]:
+        """#411 Cut 3: seed a session from a portable bundle. Returns
+        ``(new_session_id, detail)``.
+
+        THE SAME ENTRY branch/rewind use, deliberately not a parallel one:
+        ``_preconditions`` -> gate -> ``controller.branch_from`` -> ``_pin``
+        -> ``ledger.derive``. A second seeding path would be a second place
+        for the mid-generation rule, the TP=1 limit and the page_head refusal
+        to be got wrong.
+
+        ORDER IS THE GUARANTEE. Every refusal happens BEFORE
+        ``branch_from``, which is the only step that creates a session. So a
+        failure anywhere in this method leaves NO partial session -- there is
+        nothing to roll back, because nothing was seeded. Blobs written to the
+        store before the gate are content-addressed cache entries, not session
+        state: they are harmless if the import then refuses, and they are what
+        makes the store-backed verification possible at all.
+
+        The bundle's own gate (identity, manifest version, blob presence, the
+        #212 GDN clause, geometry) runs in ``session_portable.import_bundle``
+        against the bundle's member names. It is re-run here through
+        ``verify_restore`` against the STORE, because between those two
+        moments the blobs move: passing the first proves the bundle is
+        complete, passing the second proves this rank can actually read what
+        it was handed.
+        """
+        from sglang.srt.managers.session_portable import import_bundle
+
+        tree = self._preconditions()
+
+        # 1. Gate the file. Refuses before any payload is extracted.
+        manifest, blobs = import_bundle(
+            bundle_path,
+            local_identity=self._identity(),
+            local_geometry=self._local_geometry(),
+        )
+
+        # 2. Mid-generation target: refuse by default (#410's rule). Checked
+        # before anything is written, because a refusal that has already
+        # spent store IO is a worse refusal.
+        session_id = (manifest.get("checkpoint") or {}).get("session_id") or ""
+        if session_id:
+            conflict = self._in_flight_conflict(session_id)
+            if conflict is not None:
+                raise SessionCheckpointError(
+                    f"session {session_id!r} has request {conflict} in flight; "
+                    f"importing into a mid-generation session is refused. Wait "
+                    f"for it to finish, or import into a new session."
+                )
+
+        # 3. Materialise the payloads into this rank's store.
+        if store_put_fn is not None:
+            for key, payload in blobs.items():
+                store_put_fn(key, payload)
+
+        # 4. The SAME verification the branch path runs, now against the
+        # store rather than the bundle.
+        ok, message = verify_restore(
+            manifest,
+            backend_exists_fn(tree),
+            self._identity(),
+            self._local_geometry(),
+        )
+        if not ok:
+            raise SessionCheckpointError(
+                f"imported bundle did not verify against this rank's store: "
+                f"{message}"
+            )
+
+        controller = getattr(self.scheduler, "session_controller", None)
+        if controller is None:
+            raise SessionCheckpointError(
+                "this scheduler has no session controller; seeding an "
+                "imported session needs server-side sessions (/open_session)"
+            )
+
+        # 5. ONLY NOW is anything created.
+        seeded = controller.branch_from(
+            parent_session_id=session_id,
+            checkpoint_tokens=list(manifest.get("token_ids") or []),
+            new_session_id=new_session_id,
+        )
+        logger.info(
+            "SESSION-CHECKPOINT imported %s -> session %s: %s",
+            bundle_path,
+            seeded,
+            message,
+        )
+        return seeded, message
+
     def _branch_output(self, recv_req) -> SessionCheckpointReqOutput:
         from sglang.srt.managers.io_struct import SessionCheckpointReqOutput
 
