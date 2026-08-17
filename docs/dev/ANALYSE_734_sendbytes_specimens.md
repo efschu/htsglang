@@ -10,24 +10,38 @@ is this note.
 
 ## 0. Verdict up front
 
-**The TCPStore-cycling hypothesis does not hold, and it is refused on
-structure rather than on absence of evidence.** The store port cannot collide
-across boots because it is drawn fresh from the free-port pool on every boot
-and then explicitly waited on. Section 2 gives the file:line.
+**None of the three specimens is a boot-cycling failure.** All three are
+phase (d) POST-READY SERVING crashes. The servers had been live and serving
+for roughly 2 minutes, 1 minute (past a real `200 OK`), and 11 minutes
+respectively before dying. A crash eleven minutes into serving cannot be a
+rendezvous collision with a predecessor, so the premise of the task's framing
+does not survive contact with the logs.
 
-**There are at least TWO roots, not one.** The specimens split on the host
-ledger: one dies inside a kernel OOM event to the second, another dies with
-103 GiB available. A single-root story cannot cover both.
+**The TCPStore-cycling hypothesis therefore fails twice over** — once on
+structure (section 2: the store port is drawn fresh from the free pool every
+boot) and once on evidence (section 3: no specimen died at rendezvous, and no
+specimen shows a colliding predecessor).
 
-**`sendBytes` is a tombstone, not a cause.** In every specimen on record —
-including the two that predate this task — the sequence is: a peer PROCESS
-disappears, and the survivors then fail writing to it. Chasing the socket is
-chasing the corpse's last word.
+**THREE specimens, TWO roots.**
 
-The one real defect found in the boot path is unrelated to the store port and
-is stated in section 4: `wait_host_release.sh` already computes the number of
-surviving schedulers and then throws the number away.
+| # | when | root | phase | uptime |
+|---|---|---|---|---|
+| 1 | 2026-08-17 18:23:43 | host-memory OOM event | (d) post-ready | ~2 min |
+| 2 | 2026-08-17 19:31:45 rank2 | barlink-BAR1 CUDA illegal memory access | (d) post-ready | ~1 min |
+| 3 | 2026-08-05 20:59:42 rank2 | barlink-BAR1 spin-kernel abort path | (d) post-ready | ~11 min |
 
+Specimens 2 and 3 share a family, across **different models and different
+parallelism** (3 is pure `tp_size=3, pp_size=1` on Qwen3.6; 2 is `pp_size=3` on
+Qwen3.8). That makes barlink-BAR1 the recurring root, not a one-off.
+
+**`sendBytes` is a tombstone, not a cause.** In all three it fires from
+`ProcessGroupNCCL::HeartbeatMonitor::runLoop()` SECONDS AFTER another rank has
+already died. Chasing the socket is chasing the corpse's last word.
+
+**Correction to my own fix recommendation, made before the logs were read:**
+the `wait_host_release` gap in section 4 is real, but it closes a LATENT hole
+and fixes **zero of the three specimens**. It must not be shipped as "the #734
+fix". Section 5 says so plainly.
 
 ## 1. Prior art — this symptom has been seen twice, and both times it was secondary
 
@@ -89,51 +103,107 @@ failure mode this path structurally cannot have. Section 4 has the check that
 IS missing.
 
 
-## 3. The specimens split — evidence of at least two roots
+## 3. The three specimens
 
-`/var/log/syslog` is the only OOM source readable from this session; `dmesg`
-returns `read kernel buffer failed: Operation not permitted` and
-`journalctl -k` returns "No entries". **So kernel-level OOM detail is
-UNAVAILABLE here, not absent** — every statement below rests on the systemd
-unit lines in syslog, which report only that the OOM killer fired and which
-unit lost a process.
+Boot-phase classification and root traces from a full read of the three logs.
+Every one is phase **(d) post-ready serving**.
 
-### Specimen A — 18:23:43: inside a kernel OOM event, to the second
+A note on what the logs do NOT contain: a targeted search of all three files
+for `Address already in use`, `EADDRINUSE`, `stale`, `orphan`, `still alive`,
+`SIGKILL`/`SIGTERM` teardown language returned **zero real matches** (the single
+`stale` hit in specimen 3 is a substring inside the `server_args` dump). There
+is no colliding-predecessor evidence in any specimen.
 
-    /var/log/syslog:1789
-    2026-08-17T18:23:43.842677 CT999 systemd[1]:
-      claude.service: A process of this unit has been killed by the OOM killer.
+### Specimen 1 — 2026-08-17 18:23:43 — host-memory OOM
 
-The specimen timestamp is not near this event, it IS this second. The unit
-named is `claude.service` (agent processes), and the serving tree is launched
-via `setsid` outside systemd, so a kill inside it produces no unit line at all
-— absence of an sglang line is therefore not evidence the serving tree
-survived. What the line does establish is that the machine was in a kernel OOM
-event at the instant of the crash.
+`/spinning/evidence-665-f1/CRASH_restore_706450.log` (1538 lines; a
+byte-identical copy is at `boot_bundle.log.20260817T182532Z`).
 
-The same signature repeats at `18:39:05` (syslog) against `e66bde7834`'s
-measurement at `18:39:07` — F4-r4 described that boot as "killed by an external
-process exit", which is what an OOM kill of a peer looks like from inside a
-survivor. A third OOM event sits at `18:45:30`.
+    L1433  [rank2] recvValue failed on SocketImpl(fd=72,
+           addr=[localhost]:38710, remote=[::ffff:0.0.0.0]:38409):
+           Connection reset by peer                       18:23:43.962302
+    L1516  Exception raised from sendBytes at ...c10d/Utils.hpp:653
+    tail   No live scheduler processes found; skipping py-spy
 
-### Specimen B — 19:31:45 rank2: NOT memory
+Proximate frame: a **gloo** `all_reduce` inside
+`Scheduler._update_uniform_pool_budget` -> `work.wait()` raising
+`Connection closed by peer` (gloo `pair.cc:547`). Rank 0 — the TCPStore host —
+went silent first; ranks 1/2 then lost gloo, then lost the store.
 
-    [HOST-LEDGER 92552585cc/post] 19:32:24Z posts=0.0 avail=103 headroom=97.0
+**The timing is the finding.** `/var/log/syslog:1789` records
 
-39 seconds after the specimen the host had **103 GiB available, 97 GiB of
-headroom**. There is no OOM line anywhere in the 19:3x window. Whatever killed
-this one, host-memory pressure did not.
+    2026-08-17T18:23:43.842677  claude.service:
+      A process of this unit has been killed by the OOM killer.
 
-The boot log for it is `boot_bundle.log.20260817T193224Z` (9.5 MB, mtime
-19:31).
+and rank2's first store failure is at `18:23:43.962302`. **120 milliseconds
+later.** The machine was inside a kernel OOM event at the instant rank 0 went
+quiet.
 
-### Consequence
+Store port **38409**, PID **706450**, `pp_size=3`,
+`nccl_port=None`, `dist_init_addr=None`. Healthy decode loop logged
+continuously 18:21:22 -> 18:23:39, i.e. ~2 minutes of live serving first.
 
-One root cannot produce both A and B. Specimen A belongs to the host-RAM
-family the two 631 handoffs already describe. Specimen B needs its own
-classification against `#580` (gloo mismatch) or `#673`/`#693`
-(teardown-terminate) — see section 6 for what is still open.
+The same OOM signature repeats at `18:39:05` — two seconds before
+`e66bde7834`'s own measurement at `18:39:07`, which F4-r4 described as "a boot
+killed by an external process exit". That is what an OOM kill of a peer looks
+like from inside a survivor. A third OOM event sits at `18:45:30`.
 
+### Specimen 2 — 2026-08-17 19:31:45 rank2 — barlink-BAR1 CUDA fault
+
+`/spinning/evidence-665-f1/boot_bundle.log.20260817T193224Z` (50874 lines).
+
+    L50862 [rank2] sendBytes failed on SocketImpl(fd=71,
+           addr=[localhost]:46108, remote=[::ffff:0.0.0.0]:35019):
+           Broken pipe                                    19:31:45.560596
+
+Root, on **rank 0**, during a live `tp_to_pp` PHASE FLIP: four repeated
+`torch.AcceleratorError: CUDA error: an illegal memory access was encountered`
+in `barlink_bar1.py poll_status_word` (via `barlink_abort_gate.py:351`),
+immediately followed by the same fault on the flip payload path:
+
+    phase_flip_runtime.py:6926 _execute
+      -> _pack_outgoing (:6286)
+        -> kv_reshard.py:359 _checksum
+          -> weights_arena.py:127 uint8_checksum   (torch.stack(parts).sum())
+
+Ranks 1/2 began cascading at 19:30:41 and spun for ~65 s; the requested
+19:31:45 line is near the END of that cascade, not its start.
+
+**This specimen is emphatically not memory.** `[HOST-LEDGER 92552585cc/post]
+19:32:24Z posts=0.0 avail=103 headroom=97.0` — 103 GiB available 39 seconds
+later, and no OOM line anywhere in the 19:3x window.
+
+Store port **35019**, PID **910785**. `The server is fired up and ready to
+roll!` at 19:29:24, a served `POST /v1/messages ... 200 OK` immediately before
+the fault.
+
+### Specimen 3 — 2026-08-05 20:59:42 rank2 — barlink-BAR1 abort path
+
+`/spinning/CRASH_20260805_boot9_2059.log` (1220 lines) — top-level
+`/spinning`, NOT in the evidence dir. Established as the earliest occurrence by
+a date-descending survey of `Utils.hpp:653` across the evidence tree; every
+earlier file checked returned zero.
+
+    L826  [rank2] sendBytes failed on SocketImpl(fd=63,
+          addr=[localhost]:36750, remote=[localhost]:36521): Broken pipe
+    L827  Exception raised from sendBytes at ...c10d/Utils.hpp:653
+
+Root: `Bar1CollectiveAborted: barlink-BAR1 rank 1/3 group tp:0: a spin kernel
+took its abort path, observed at all_reduce`, from
+`barlink_bar1.py:4561 check_aborted` via `barlink.py:919 _after_transport` ->
+`all_reduce` -> `tensor_model_parallel_all_reduce` -> model forward
+(`qwen2_moe.py:292 down_proj`). Ranks 0 and 1 raise `Bar1CollectiveAborted`
+directly and exit before they can log a store failure; only rank 2 survives long
+enough to produce the `sendBytes` line.
+
+Different configuration entirely: **`tp_size=3, pp_size=1`** (pure TP) on
+**Qwen3.6-27B-INT8-W8A8**, against specimens 1-2's `pp_size=3` Qwen3.8. Store
+port **36521**, PID **48566**. Ready at 20:48:33, fault at 20:59:38 — **~11
+minutes** of live serving.
+
+That a different model on a different parallelism produces the same barlink-BAR1
+family is what makes specimens 2 and 3 a recurring root rather than two
+accidents.
 
 ## 4. The real hole in the boot path — a computed counter nobody gates on
 
@@ -171,49 +241,76 @@ liveness (computed, discarded).
 
 ## 5. Fix shape — NOT built, pending ack
 
-Recommended, and deliberately smaller than the filed candidate:
+**First, the correction.** Before reading the logs I recommended gating
+`wait_host_release` on the surviving-scheduler count. Section 4's hole is real
+and worth closing, but now that all three specimens are known to be post-ready
+serving crashes, that change **fixes none of them**. It closes a latent
+boot-race hole. Shipping it under the #734 banner would let the ticket close
+while all three roots stayed live — which is the failure mode this note exists
+to prevent. Two separate items:
 
-**Gate on the counter that already exists.** In `wait_host_release.sh`, make
-the clear-to-boot condition require `S -eq 0` as well as `A -ge NEED`:
+### 5a. The #734 roots
+
+**Specimens 2 and 3 (barlink-BAR1) are the priority**: two incidents twelve
+days apart, on different models and different parallelism, in the same
+subsystem. The concrete lead from specimen 2 is a CUDA illegal memory access
+reached twice — first in `barlink_bar1.py poll_status_word` via
+`barlink_abort_gate.py:351`, then on the phase-flip payload path through
+`kv_reshard.py:359 _checksum` -> `weights_arena.py:127 uint8_checksum`. Whether
+the abort gate's poll is a victim of an earlier corruption or its cause is not
+established here, and the ordering in the log (gate first, payload second)
+does not settle it: the gate polls continuously, so it would see any
+pre-existing fault first regardless.
+
+Specimen 3's `Bar1CollectiveAborted` ("a spin kernel took its abort path") is
+the same subsystem reporting an abort rather than faulting outright. Whether
+these are one defect or two is the first question for whoever takes it.
+
+**Specimen 1 (host-memory OOM)** belongs to the RAM family already being worked
+under #737/#738 and needs no separate fix here — the 120 ms correlation is
+strong, but which process the killer took is not established (section 6), so
+this note classifies it rather than closing it.
+
+### 5b. The latent boot-race hole (separate ticket, not #734)
+
+In `wait_host_release.sh`, make the clear-to-boot condition require `S -eq 0`
+as well as `A -ge NEED`:
 
     [ "$A" -ge "$NEED" ] && [ "$S" -eq 0 ] && { echo "... clear to boot"; exit 0; }
 
-and report `S` in the timeout branch as the reason. This closes the
-"predecessor still alive" window for every resource it holds at once — host
-RAM, GPU memory, and its store socket — without adding a bespoke port probe
-for a collision that section 2 shows cannot occur.
+reporting `S` in the timeout branch as the reason. This closes the
+predecessor-still-alive window for host RAM, GPU memory and the store socket at
+once, without a bespoke port probe. Two cautions for the owner:
 
-Two cautions on that one-liner, both of which the owner should decide:
+1. `grep -c "sglang::schedul"` reads `ps -eo comm`, truncated at 15 characters.
+   `sglang::schedul` is exactly 15, so the match is correct today and is one
+   rename away from silently counting zero. A miscounting gate that reports
+   "clear" is worse than no gate. Pin it with a test, or match the full cmdline.
+2. Requiring zero turns a soft wait into a hard one. If a scheduler ever fails
+   to exit, boots stop rather than race. That is the right direction, but it
+   must fail with the PIDs named rather than timing out anonymously.
 
-1. `grep -c "sglang::schedul"` reads `ps -eo comm`, which truncates at 15
-   characters; `sglang::schedul` is exactly 15, so the match is right today but
-   is one rename away from silently counting zero. A miscounting gate that
-   reports "clear" is worse than no gate. Pin it with a test, or match on
-   `-f`/full cmdline instead.
-2. Requiring `S -eq 0` turns a soft wait into a hard one. If a scheduler ever
-   fails to exit, boots stop rather than race. That is the correct direction —
-   but it must fail with the PIDs named, not by timing out anonymously.
-
-**Not recommended:** extending the gate to the store port. It guards a failure
-mode this path cannot have (section 2), and it would encode the refuted
-hypothesis into the boot wrapper where the next reader would trust it.
-
-**Specimen B is not addressed by any of this** and must not be closed by it.
+**Not recommended in either item:** extending any gate to the store port. It
+guards a mode this path cannot have (section 2) and no specimen exhibits, and
+it would encode the refuted hypothesis where the next reader would trust it.
 
 
 ## 6. What is still open
 
-- **Specimen B's root.** Not memory. Needs the boot-phase classification from
-  `boot_bundle.log.20260817T193224Z` and a decision against `#580` /
-  `#673`/`#693`. Filed, not answered here.
-- **The third specimen.** The task named "one earlier". The 18:39:05 and
-  18:45:30 OOM events are candidates, and 18:39 is already tied to
-  `e66bde7834`'s measurement — but tying a timestamp to a specimen is not the
-  same as reading its log, and I have not done the second.
-- **Kernel OOM detail** is unreadable from this session (`dmesg` denied,
-  `journalctl -k` empty). Which PROCESS the OOM killer took at 18:23:43 is
-  therefore not established — only that it fired. If that matters to the fix,
-  it needs a session that can read the kernel buffer.
-- **Whether specimen A's serving tree was the victim at all** follows from the
-  same gap. The correlation is to the second and the prior art is consistent,
-  but "the OOM killer fired at that instant" is not "it took this rank".
+- **The barlink-BAR1 root** (specimens 2 and 3). Classified, not solved. One
+  defect or two is unanswered.
+- **Which process the OOM killer took at 18:23:43.** `dmesg` is
+  permission-denied from this session and `journalctl -k` returns "No entries",
+  so kernel OOM detail is **unavailable here, not absent**. The systemd line
+  names `claude.service`; the serving tree runs under `setsid` outside systemd,
+  so a kill inside it produces no unit line and the absence of an sglang line is
+  not evidence it survived. The 120 ms gap is strong correlation, not proof of
+  which victim.
+- **Whether specimen 1's gloo disconnect has a cause other than the OOM.** The
+  proximate frame is `_update_uniform_pool_budget`; I did not rule out that the
+  collective itself is implicated rather than merely being where the survivors
+  were standing.
+- **The task's framing.** "Rapid boot cycling" does not describe any of the
+  three. If there IS a boot-cycling specimen, it is not among these, and the
+  search that found these three (a `Utils.hpp:653` survey across the evidence
+  tree, earliest hit 2026-08-05) did not surface one.
