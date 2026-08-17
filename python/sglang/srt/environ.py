@@ -643,6 +643,16 @@ class Envs:
     # CPU transports synchronize with the host and therefore require
     # --disable-cuda-graph.
     SGLANG_BARLINK_TRANSPORT = EnvStr("device")
+    # #732 per-peer transport override, for A/B against the default per-link
+    # policy (NCCL on fast edges where BAR1 is measured to lose, BAR1 on x4
+    # edges where it wins). Comma separated, keys are RANKS -- never CUDA
+    # ordinals: "all=nccl_sendrecv", "0>1=bar1_p2p", or both, with an explicit
+    # pair beating "all". Unset -> the default policy, which on a tree without
+    # a BAR1 p2p kernel degrades every BAR1 edge to NCCL and says so loudly.
+    # Forcing bar1_p2p while that kernel is absent REFUSES rather than
+    # degrading: a silent fallback would answer a different A/B than the one
+    # asked. See barlink_peer_transport.py.
+    SGLANG_BARLINK_PEER_MAP = EnvStr(None)
     # #279 path dispatcher (skeleton): size/load-aware path choice with
     # saturation overflow. Default off; even when on, decisions fall back to
     # the status-quo #240 class choice until measured rate tables are loaded
