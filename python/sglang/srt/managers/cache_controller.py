@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -815,6 +816,13 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
+        # #718: this controller is bound to the pool it was BUILT with. While
+        # the flip routes to its TP stack, that is not the pool the model
+        # writes into, so this copy would persist another row's bytes under a
+        # content-addressed key. Refuse: a prefix that is not staged is a miss
+        # later, which is the cheap failure.
+        if device_tier_disarmed("write"):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -900,6 +908,12 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
+        # #718: the mirror hazard. This copy would fill rows in the bound (PP)
+        # pool while the model reads the flip stack's, and the tree would
+        # report the prefix resident -- so attention would read rows nobody
+        # filled. Refuse: a prefetch that does not land is a miss now.
+        if device_tier_disarmed("load"):
+            return None
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
