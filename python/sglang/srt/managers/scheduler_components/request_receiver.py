@@ -66,7 +66,7 @@ class SchedulerRequestReceiver:
     # #631: returns a PhaseFlipReqInput when the automatic phase policy
     # wants a flip, else None. Optional and defaulted so every existing
     # construction is unchanged and the default path costs one compare.
-    phase_policy_hook: Optional[Callable[[], Any]] = None
+    phase_policy_hook: Optional[Callable[..., Any]] = None
     # #631: the single owner of this rank's request-chain receive stream
     # (PpChainReceiver), installed only when the phase flip is enabled.
     # None restores the direct point_to_point_pyobj call, i.e. the exact
@@ -124,7 +124,14 @@ class SchedulerRequestReceiver:
             and recv_reqs is not None
             and self.phase_policy_hook is not None
         ):
-            policy_req = self.phase_policy_hook()
+            # #713: hand the policy the batch it is riding in. It evaluates
+            # BEFORE these requests are queued (scheduler.py:4089), so without
+            # them it asks "is there prefill work?" of a queue that has not
+            # been told yet, reads 0, and declines the flip toward the very
+            # work that woke it -- measured at 31.64 s TTFT for a ten-token
+            # prompt on an idle box. The ordering itself is load-bearing
+            # (DELIVERY-BEFORE-BLOCK) and is deliberately NOT changed here.
+            policy_req = self.phase_policy_hook(recv_reqs)
             if policy_req is not None:
                 recv_reqs.append(policy_req)
 

@@ -101,3 +101,65 @@ def test_the_lump_label_still_names_all_three_parts():
         "prefill activation reserve",
     ):
         assert part in MAMBA_BUDGET_POST
+
+
+# ---------------------------------------------------------------------------
+# Regression: the decomposition must not silently disable the ceiling hint.
+#
+# budget_exhausted_message derives its --max-running-requests-ceiling advice by
+# summing the posts whose name is MAMBA_BUDGET_POST. Once the post is emitted
+# as three named parts that sum matches nothing, so the hint vanished from the
+# refusal message exactly when components were populated -- i.e. on the boots
+# that have the instrument. A defect I introduced; caught in pre-boot review.
+# ---------------------------------------------------------------------------
+
+
+def test_the_post_total_survives_decomposition():
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        mamba_post_total_gb,
+    )
+
+    lumped = [(MAMBA_BUDGET_POST, 0.895)]
+    decomposed = decompose_mamba_budget_post(
+        total_gb=0.895,
+        components={
+            "speculative intermediate state": 0.620,
+            "prefill activation reserve": 0.050,
+        },
+    )
+    assert mamba_post_total_gb(lumped) == pytest.approx(0.895, rel=1e-12)
+    assert mamba_post_total_gb(decomposed) == pytest.approx(0.895, rel=1e-12)
+
+
+def test_unrelated_posts_are_not_counted_into_the_post_total():
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        mamba_post_total_gb,
+    )
+
+    posts = [
+        ("weights + runtime state", 15.688),
+        ("mamba state pool", 0.225),
+        ("speculative intermediate state", 0.620),
+        ("prefill activation reserve", 0.050),
+        ("GGUF dequant scratch", 0.0),
+    ]
+    assert mamba_post_total_gb(posts) == pytest.approx(0.895, rel=1e-12)
+
+
+def test_the_part_names_match_what_the_decomposition_emits():
+    """Keeps the two lists from drifting apart, which is how the hint broke."""
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        MAMBA_POST_PART_NAMES,
+    )
+
+    emitted = {
+        name
+        for name, _ in decompose_mamba_budget_post(
+            total_gb=1.0,
+            components={
+                "speculative intermediate state": 0.5,
+                "prefill activation reserve": 0.1,
+            },
+        )
+    }
+    assert emitted == set(MAMBA_POST_PART_NAMES)

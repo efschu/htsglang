@@ -991,7 +991,18 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, depth = stack.pop()
                 nodes += 1
                 max_depth = max(max_depth, depth)
-                n = len(getattr(node, "value", ()) or ())
+                # `node.value` is a TENSOR. `tensor or ()` evaluates
+                # bool(tensor), which RAISES for any multi-element tensor --
+                # so this reporter died on the second real node it touched.
+                # Measured 2026-08-17 02:18:09, on all three ranks, inside the
+                # crash this walk exists to explain:
+                #   RADIX SHAPE: walk failed after 3 nodes (RuntimeError(
+                #   'Boolean value of Tensor with more than one value is
+                #   ambiguous')). Partial: tokens=1, locked_nodes=1.
+                # A diagnostic that only works on an empty tree is not a
+                # diagnostic. Length is asked for directly, never via truthiness.
+                val = getattr(node, "value", None)
+                n = 0 if val is None else len(val)
                 tokens += n
                 mv = getattr(node, "mamba_value", None)
                 if mv is not None:

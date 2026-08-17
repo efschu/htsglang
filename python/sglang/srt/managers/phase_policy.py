@@ -1085,6 +1085,26 @@ class PhasePolicyInputs:
     #: there is nothing left to accumulate and the window opens at once.
     queue_nonempty: bool = False
 
+    #: #708: KV rows available, RANK-UNIFORM, so the BOTH-BLOCKED decline can
+    #: NAME its binding resource from a measurement instead of asserting it.
+    #:
+    #: The decline used to state "the binding resource is KV" unconditionally.
+    #: It happened to be right on all three live specimens (19,004 avail vs
+    #: 97,922 pending; 107,881 vs 160,514; 7,085 vs 217,048 -- available well
+    #: under pending every time), but a claim that cannot come out the other
+    #: way is not a diagnosis, and it would have said exactly the same thing
+    #: with a pool standing empty.
+    #:
+    #: MUST BE THE GROUP MIN, not this rank's own pool. Every field here is
+    #: replicated by contract, and under uneven DCP the local availability
+    #: differs per rank -- feeding a local value in would make the decline text
+    #: (and any rule keyed on it) rank-dependent, which is the #616g divergence
+    #: this codebase already pays to avoid. `uniform_avail_for_evict` is the
+    #: existing accessor for exactly this quantity.
+    #:
+    #: None = not measured. The decline then says so rather than guessing.
+    kv_available_tokens: Optional[int] = None
+
 
 @dataclass(frozen=True)
 class PhasePolicyDecision:
@@ -1390,12 +1410,35 @@ def _decide_from_load(
         # the binding resource is KV, and the action that unblocks a side is
         # freeing it. Declining here is what routes the caller to the evict
         # rung instead of to a cutover.
+        # #708: NAME THE BINDING RESOURCE FROM THE MEASUREMENT, not from a
+        # hardcoded string. The routing conclusion below is unchanged and does
+        # not depend on which resource binds -- when the target cannot admit
+        # either, changing layout cannot help, so this is never a flip. What
+        # changes is the diagnosis handed to whoever reads the line: it now
+        # says what it measured, and admits when it measured nothing.
+        avail = inp.kv_available_tokens
+        if avail is None:
+            binding = (
+                "the binding resource was NOT MEASURED here (no rank-uniform "
+                "KV availability was supplied), so this line does not name one"
+            )
+        elif avail < inp.pending_prefill_tokens:
+            binding = (
+                f"the binding resource is KV ({avail} rows available against "
+                f"{inp.pending_prefill_tokens} pending)"
+            )
+        else:
+            binding = (
+                f"KV is NOT the binding resource ({avail} rows available "
+                f"against {inp.pending_prefill_tokens} pending) -- look at the "
+                f"state-slot bound (mamba/GDN slots) before blaming the pool"
+            )
         return _no(
             f"{BOTH_BLOCKED}: nothing can run in the {inp.phase} layout and the "
             f"target cannot admit either ({inp.running_bs} req resident, "
-            f"{inp.pending_prefill_tokens} tok pending) -- the binding "
-            f"resource is KV, not the layout, so this is an evict trigger and "
-            f"NOT a flip. Flipping here is the 10:24 ping-pong."
+            f"{inp.pending_prefill_tokens} tok pending) -- {binding}, so this "
+            f"is an evict trigger and NOT a flip. Flipping here is the 10:24 "
+            f"ping-pong."
         )
 
     if inp.nothing_can_run and inp.target_can_admit:
