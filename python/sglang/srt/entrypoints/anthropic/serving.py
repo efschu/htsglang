@@ -16,6 +16,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from sglang.srt.environ import envs
 from sglang.srt.entrypoints.anthropic.protocol import (
     KNOWN_CONTENT_BLOCK_TAGS,
     AnthropicContentBlock,
@@ -254,7 +255,7 @@ def _anthropic_tool_use_id(backend_id: Optional[str]) -> str:
     if backend_id.startswith("toolu_"):
         return backend_id
     if backend_id.startswith("call_"):
-        return f"toolu_{backend_id[len('call_'):]}"
+        return f"toolu_{backend_id[len('call_') :]}"
     return f"toolu_{backend_id}"
 
 
@@ -802,17 +803,47 @@ class AnthropicServing:
                 )
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+        # ``reasoning_effort`` knob.
+        #
+        # ``xhigh`` USED TO COLLAPSE TO ``max`` here, and that was backwards for
+        # the family this fork serves. ``reasoning_effort`` is injected into the
+        # chat-template kwargs (``openai/serving_chat.py:175``), so the value
+        # reaches the template verbatim -- and every Qwen3.8 checkpoint on this
+        # box accepts exactly ``('xhigh', 'medium', 'low')`` and calls
+        # ``raise_exception`` on anything else, which surfaces as HTTP 500. So a
+        # client asking for the tier the model DOES support had its request
+        # rewritten into one the model rejects, while the same tier was
+        # reachable by omitting the field (the template defaults to ``xhigh``).
+        # The value now passes through unchanged and ``xhigh`` is accepted by
+        # our own schema, which already carries ``max`` as a comparable
+        # extension.
+        #
+        # The collapse survives as an OPT-IN for a deployment whose template
+        # names its top tier ``max`` instead, and it says so in the log rather
+        # than rewriting a request silently.
+        #
         # ``task_budget`` is a soft hint forwarded as a custom param so the
         # model can see it without it becoming a hard cap (``max_tokens``
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
             if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
+                effort = oc.effort
+                if effort == "xhigh":
+                    target = (
+                        envs.SGLANG_ANTHROPIC_XHIGH_EFFORT.get() or "xhigh"
+                    ).strip()
+                    if target != "xhigh":
+                        logger.info(
+                            "Anthropic output_config.effort 'xhigh' collapsed to "
+                            "%r by SGLANG_ANTHROPIC_XHIGH_EFFORT. The default is "
+                            "to pass 'xhigh' through; a template that does not "
+                            "accept %r will reject this request.",
+                            target,
+                            target,
+                        )
+                        effort = target
+                chat_request.reasoning_effort = effort
             if oc.task_budget is not None:
                 # Custom params are silently ignored by backends that
                 # don't recognise them; logging it makes the propagation

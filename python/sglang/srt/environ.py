@@ -278,6 +278,13 @@ class Envs:
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
+    # #540: what the Anthropic front sends downstream for output_config.effort
+    # == "xhigh". Default "xhigh" = pass the client's value through unchanged,
+    # which is what the Qwen3.8 family's chat template accepts ('xhigh',
+    # 'medium', 'low' -- anything else raises). Set to "max" to restore the
+    # pre-fix collapse for a deployment whose template names its top tier
+    # "max" instead; the collapse is then logged by name.
+    SGLANG_ANTHROPIC_XHIGH_EFFORT = EnvStr("xhigh")
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
