@@ -1794,5 +1794,80 @@ class TestDetectInlineSystemSupport(unittest.TestCase):
         self.assertFalse(detect_inline_system_support(""))
 
 
+class TestOutputConfigEffortMapping(unittest.TestCase):
+    """#540: the effort knob, and the trap it hides on the deployed model.
+
+    Operational fact this pins against (Qwen3.8 through the local router): an
+    EXPLICIT reasoning effort of ``high``/``max`` answers HTTP 500, while the
+    intended default is reached BY OMITTING the field. The Anthropic front
+    collapses ``xhigh`` onto ``max``, so a client sending the safest-sounding
+    Anthropic value lands on exactly the value that 500s.
+
+    None of that is this converter's bug -- it maps a documented field onto a
+    documented field. What these cases hold still is the part that is ours:
+    omission must stay omission (nothing may start defaulting an effort), and
+    attaching a thinking budget must not acquire one as a side effect. Either
+    regression would turn a working request into a 500 with no local test
+    going red.
+    """
+
+    def _serving(self):
+        return AnthropicServing(_FakeOpenAIServingChat())
+
+    def _request(self, **overrides):
+        data = {
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        data.update(overrides)
+        return AnthropicMessagesRequest.model_validate(data)
+
+    def test_omitting_effort_sends_no_reasoning_effort(self):
+        """The only path that does not 500 on the deployed model."""
+        chat = self._serving()._convert_to_chat_completion_request(self._request())
+        self.assertIsNone(getattr(chat, "reasoning_effort", None))
+
+    def test_an_output_config_without_effort_still_sends_none(self):
+        """Present-but-empty output_config must not become an effort either."""
+        req = self._request(
+            output_config={"task_budget": {"total": 100, "type": "tokens"}}
+        )
+        chat = self._serving()._convert_to_chat_completion_request(req)
+        self.assertIsNone(getattr(chat, "reasoning_effort", None))
+
+    def test_xhigh_collapses_to_max(self):
+        """The documented mapping -- and the trap: ``max`` is the value that
+        answers 500 on Qwen3.8. Pinned so the collapse is a decision on the
+        record rather than a surprise at the router."""
+        req = self._request(output_config={"effort": "xhigh"})
+        chat = self._serving()._convert_to_chat_completion_request(req)
+        self.assertEqual(chat.reasoning_effort, "max")
+
+    def test_other_efforts_pass_through_unchanged(self):
+        for effort in ("low", "medium", "high", "max"):
+            with self.subTest(effort=effort):
+                req = self._request(output_config={"effort": effort})
+                chat = self._serving()._convert_to_chat_completion_request(req)
+                self.assertEqual(chat.reasoning_effort, effort)
+
+    def test_a_thinking_budget_does_not_acquire_an_effort(self):
+        """The #540 no-collision property: enforcing a budget must not set the
+        knob that 500s. A budget and an effort are independent requests."""
+        req = self._request(
+            thinking={"type": "enabled", "budget_tokens": 2048},
+        )
+        chat = self._serving()._convert_to_chat_completion_request(req)
+        self.assertIsNone(getattr(chat, "reasoning_effort", None))
+
+    def test_a_budget_with_an_explicit_effort_keeps_both_independent(self):
+        req = self._request(
+            thinking={"type": "enabled", "budget_tokens": 2048},
+            output_config={"effort": "low"},
+        )
+        chat = self._serving()._convert_to_chat_completion_request(req)
+        self.assertEqual(chat.reasoning_effort, "low")
+
+
 if __name__ == "__main__":
     unittest.main()
