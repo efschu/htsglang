@@ -90,7 +90,7 @@ import os
 import struct
 import time
 from collections.abc import Sequence
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -824,6 +824,7 @@ def write_extents(
     payload: torch.Tensor,
     *,
     fsync: bool = True,
+    space_check: Optional[Callable[[int], None]] = None,
 ) -> ExtentWriteResult:
     """Deposit one window's bytes into the canonical blob at ``final_path``.
 
@@ -845,6 +846,10 @@ def write_extents(
         return ExtentWriteResult(
             completed=False, already_complete=True, coverage=((0, window.total_bytes),)
         )
+
+    if space_check is not None:
+        # Before the part file is created, so a refusal leaves nothing behind.
+        space_check(window.total_bytes)
 
     part = part_path(final_path)
     marker = marker_path(final_path)
@@ -926,9 +931,16 @@ def write_slice(
     payload: torch.Tensor,
     *,
     fsync: bool = True,
+    space_check: Optional[Callable[[int], None]] = None,
 ) -> SliceWriteResult:
     """The KV page's view of ``write_extents``: slots instead of byte ranges."""
-    outcome = write_extents(final_path, window.as_extents(), payload, fsync=fsync)
+    outcome = write_extents(
+        final_path,
+        window.as_extents(),
+        payload,
+        fsync=fsync,
+        space_check=space_check,
+    )
     return SliceWriteResult(
         completed=outcome.completed,
         already_complete=outcome.already_complete,
@@ -1031,3 +1043,60 @@ def recorded_coverage(
             return _decode_marker(f.read(), int(total_bytes))
     except FileNotFoundError:
         return None
+
+
+class OutOfSpace(OSError):
+    """Refused before writing: the filesystem is too close to full."""
+
+
+# statvfs is a syscall per call; the answer moves slowly compared to page
+# writes, so it is cached per directory for this long.
+_SPACE_PROBE_INTERVAL_S = 2.0
+_SPACE_CACHE: dict = {}
+
+
+def free_bytes(root_dir: str, *, now: Callable[[], float] = time.monotonic) -> int:
+    """Free bytes on the filesystem holding ``root_dir``, TTL-cached."""
+    cached = _SPACE_CACHE.get(root_dir)
+    stamp = now()
+    if cached is not None and stamp - cached[0] < _SPACE_PROBE_INTERVAL_S:
+        return cached[1]
+    st = os.statvfs(root_dir)
+    value = int(st.f_bavail) * int(st.f_frsize)
+    _SPACE_CACHE[root_dir] = (stamp, value)
+    return value
+
+
+def reset_space_cache() -> None:
+    """Test hook: forget the cached statvfs answers."""
+    _SPACE_CACHE.clear()
+
+
+def ensure_space(root_dir: str, need_bytes: int, floor_bytes: int) -> None:
+    """Refuse a canonical write that would take the filesystem below the floor.
+
+    THE CASE THIS EXISTS FOR is specific to this protocol. A page is published
+    by rename after its last byte lands, so a disk that fills mid-write leaves a
+    ``.part706`` -- invisible, reaped by TTL, harmless. But the protocol also
+    ftruncates a page to FULL WIDTH on creation while only writing this rank's
+    slice, so a store can be far closer to full than its file sizes suggest,
+    and the failure lands in the middle of a multi-writer assembly where the
+    other stages have already spent their IO. Refusing at the door costs one
+    cached statvfs; discovering it at pwrite costs the page and everyone's
+    work on it.
+
+    Deliberately NOT the LRU evictor's watermark: that one is disabled
+    entirely unless a cap or a min-free is configured (``_eviction_configured``),
+    which is the default, so on a default store nothing stands between this
+    protocol and ENOSPC.
+    """
+    if floor_bytes <= 0:
+        return
+    available = free_bytes(root_dir)
+    if available - int(need_bytes) < int(floor_bytes):
+        raise OutOfSpace(
+            f"refusing a {need_bytes}-byte canonical write: {available} bytes "
+            f"free on {root_dir!r} would fall below the {floor_bytes}-byte "
+            "floor. The store is a cache -- a refused write costs a later miss, "
+            "while filling the filesystem costs whatever else lives on it."
+        )

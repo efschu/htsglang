@@ -505,6 +505,43 @@ def page_shard(stem: str) -> str:
     return _SHARD_FALLBACK
 
 
+class MixedLayoutError(RuntimeError):
+    """The same page stem exists in BOTH the flat and the sharded layout."""
+
+
+def audit_layout(root_dir: str, *, limit: int = 8) -> list:
+    """Stems present in BOTH layouts. Empty list when the store is coherent.
+
+    Sharding (#558) is a READ-THROUGH migration: new writes are sharded, old
+    flat files keep serving hits, and nothing moves. That is safe exactly while
+    a stem lives in one place or the other. If a stem exists in both,
+    ``_existing_path`` silently prefers the sharded one -- and the two files can
+    differ, because the flat one was written under whatever geometry and format
+    the store had at the time. A silent preference between two candidate pages
+    for one content-addressed key is the failure this refuses.
+
+    Only the top-level ``.bin`` files are enumerated (the legacy layout), and
+    each is checked against its shard. A store that never had a flat layout
+    costs one scandir of a directory holding only shard directories.
+    """
+    duplicates = []
+    try:
+        with os.scandir(root_dir) as it:
+            entries = list(it)
+    except FileNotFoundError:
+        return duplicates
+    for entry in entries:
+        if entry.is_dir() or not entry.name.endswith(".bin"):
+            continue
+        stem = entry.name[:-4]
+        sharded = os.path.join(root_dir, page_shard(stem), entry.name)
+        if os.path.exists(sharded):
+            duplicates.append(stem)
+            if len(duplicates) >= limit:
+                break
+    return duplicates
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -596,6 +633,22 @@ class HiCacheFile(HiCacheStorage):
         # to one makedirs per shard instead of one per page.
         self._known_shards: set[str] = set()
 
+        # #558: a stem in BOTH layouts means two candidate pages for one
+        # content-addressed key, and the read path would silently prefer one.
+        # Checked once, at attach, and refused loudly rather than resolved.
+        duplicates = audit_layout(self.file_path)
+        if duplicates:
+            raise MixedLayoutError(
+                f"HiCacheFile store {self.file_path!r} holds the same page in "
+                f"both the flat and the sharded layout: {duplicates}. The read "
+                "path prefers the sharded copy, but the two files can differ -- "
+                "the flat one predates sharding and may predate the current key "
+                "format entirely. Resolve it deliberately (delete the legacy "
+                "copies, or run the offline migration) rather than letting a "
+                "content-addressed key resolve to whichever file the lookup "
+                "order happens to find first."
+            )
+
         # #706: orphaned partials are invisible to readers AND untracked by the
         # LRU evictor (it walks .bin only), so nothing else would ever reap a
         # page whose remaining writers never arrived. One sweep at attach, by
@@ -603,6 +656,12 @@ class HiCacheFile(HiCacheStorage):
         # something a live writer might still be filling.
         self._partial_ttl_s = float(
             envs.SGLANG_HICACHE_CANONICAL_PARTIAL_TTL_S.get() or 3600.0
+        )
+        # #558: the free-space floor the canonical protocol refuses below. The
+        # LRU evictor's watermark does not cover this: it is disabled entirely
+        # unless a cap or a min-free is configured, which is the default.
+        self._space_floor_bytes = int(
+            envs.SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES.get() or 0
         )
         if self.canonical_kv_page is not None or self.canonical_mamba_blob is not None:
             from sglang.srt.mem_cache.canonical_page_store import sweep_partials
@@ -846,6 +905,12 @@ class HiCacheFile(HiCacheStorage):
             ):
                 self.metadata_cache.add(stem)
 
+    def _canonical_space_check(self, need_bytes: int) -> None:
+        """Refuse a canonical write that would take the store below the floor."""
+        from sglang.srt.mem_cache.canonical_page_store import ensure_space
+
+        ensure_space(self.file_path, need_bytes, self._space_floor_bytes)
+
     def _canonical_window(self, key: str):
         """The canonical window serving this key, or None for the normal path.
 
@@ -919,7 +984,9 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
             self._ensure_shard_dir(tensor_path)
-            result = write_extents(tensor_path, window, value)
+            result = write_extents(
+                tensor_path, window, value, space_check=self._canonical_space_check
+            )
             self._evictor.commit(suffixed)
             if (
                 result.completed or result.already_complete

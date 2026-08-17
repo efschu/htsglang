@@ -967,6 +967,12 @@ class Envs:
     # to the registry at first use, so the read path's pinned footprint becomes
     # a number the budget can refuse.
     SGLANG_HICACHE_READ_BUFFERS = EnvInt(0)
+    # #558: free-space floor, in bytes, below which the #706 canonical write
+    # protocol refuses rather than risking ENOSPC in the middle of a
+    # multi-writer page assembly. 0 (default) keeps today's behaviour, where
+    # the only protection is the LRU evictor's watermark -- which is disabled
+    # unless --hicache-storage-backend-extra-config sets a cap or a min-free.
+    SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
