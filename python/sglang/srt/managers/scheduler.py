@@ -423,7 +423,7 @@ def default_pp_micro_batch_size(
     return max(int(max_running_requests) // max(int(pp_size), 1), 1)
 
 
-def _arriving_prefill_tokens(inflight) -> int:
+def _arriving_prefill_tokens(inflight, _already_queued=None) -> int:
     """#713: prompt tokens that have ARRIVED but are not yet on the queue.
 
     ``inflight`` is the raw ``recv_reqs`` list. It is heterogeneous -- abort
@@ -446,6 +446,15 @@ def _arriving_prefill_tokens(inflight) -> int:
         return 0
     total = 0
     for item in inflight:
+        # #731 hardening: the docstring above asserts these have "ARRIVED but
+        # are not yet on the queue", and nothing enforced it. The only
+        # inflight-bearing call site runs pre-queue, so the invariant holds
+        # today -- but an asserted-never-checked invariant is exactly how the
+        # resident-vs-queued double count stayed silent, so it is checked now
+        # rather than trusted. A request already queued is priced by the queue
+        # term and must not be counted again here.
+        if _already_queued is not None and id(item) in _already_queued:
+            continue
         for field in ("input_ids", "origin_input_ids"):
             try:
                 ids = getattr(item, field, None)
@@ -8699,13 +8708,35 @@ class Scheduler(
         Evaluated on the request-origin rank only (see
         maybe_arm_phase_policy), so this needs no cross-rank replication.
         """
-        pending = sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        queued = list(self.waiting_queue)
+        pending = sum(len(req.origin_input_ids) for req in queued)
+        # #731: THE TERMS BELOW MUST NOT RE-BILL WHAT THE QUEUE ALREADY DID.
+        #
+        # The resident term further down and this one are two different sets,
+        # and nothing kept a request out of both. A cutover could leave one
+        # request resident AND queued (the carry re-homed it without consuming
+        # the queue entry), and the same prompt was then counted twice:
+        # measured 2026-08-17, 51,369 -> 102,307 tokens across one cutover,
+        # within rounding of exactly 2x. The inflated backlog drove the flip
+        # policy past its threshold -- six cutovers, nothing served.
+        #
+        # The state fix is in the carry (it now consumes the queue entry). This
+        # is the counter's half: even if some other path re-introduces the
+        # overlap, the number stays honest.
+        #
+        # DE-DUPLICATION IS AT THE INTERSECTION ONLY, deliberately. A blanket
+        # "count each rid once anywhere" would also swallow a FUTURE legitimate
+        # double-booking -- a request genuinely holding budget in two places is
+        # a real state that a future reader may need to see, and hiding it
+        # behind a global dedup would make that class silent the way this one
+        # was. So exactly one overlap is excluded, and only this one.
+        _queued_ids = {id(req) for req in queued}
         chunked = getattr(self, "chunked_req", None)
         if chunked is not None:
             rng = getattr(chunked, "extend_range", None)
             filled = int(rng.end) if rng is not None else 0
             pending += max(0, len(chunked.origin_input_ids) - filled)
-        pending += _arriving_prefill_tokens(inflight)
+        pending += _arriving_prefill_tokens(inflight, _queued_ids)
         # #713 (a): RESIDENT-BUT-UNPREFILLED. The three terms above see a
         # request in the waiting queue, in the chunked slot, or in the recv
         # batch -- and NOWHERE ELSE. A request that has been ADMITTED has left
@@ -8732,6 +8763,8 @@ class Scheduler(
             for req in list(getattr(running, "reqs", None) or ()):
                 if chunked is not None and req is chunked:
                     continue  # already priced by the chunked term above
+                if id(req) in _queued_ids:
+                    continue  # #731: the waiting-queue term already billed it
                 rng = getattr(req, "extend_range", None)
                 if rng is None:
                     continue

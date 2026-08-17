@@ -1831,10 +1831,48 @@ def _decide_from_load(
                 None if state.phase_since is None else inp.now - state.phase_since
             )
             bundle = max(state.bundle_at_phase_entry, 0)
+            elapsed = 0.0 if in_phase is None else in_phase
+            if bundle == 0:
+                # #730: ZERO WORK MUST NOT READ AS ALL WORK.
+                #
+                # This branch used to emit "decode bundle complete: 0 reqs
+                # decoded ... exit condition: decode drained" -- the same
+                # sentence a genuinely drained bundle produces, differing only
+                # by a number nobody reads as a verdict. Measured 2026-08-17
+                # 14:48:22: the tp phase was entered with NOTHING decoding,
+                # sat 183.6 s, and left claiming completion while 13,777 tok of
+                # prefill waited. Six such cycles in one boot, and the warmup
+                # generation never reached a first token.
+                #
+                # `bundle_at_phase_entry` is `running_bs` AT ENTRY (:2093), so
+                # 0 here means the bundle was never resident -- there was no
+                # work to drain and nothing was accomplished by the visit.
+                # Leaving is still right (a decode layout with nothing to
+                # decode should yield to prefill); what was wrong is calling it
+                # completion.
+                #
+                # The #699 admission-wedge detector fired 17 times on this same
+                # boot and recorded "no phase-policy corroboration seen". This
+                # line is that corroboration: an empty decode phase beside a
+                # non-empty backlog is a symptom of work that cannot be
+                # admitted, and it now says so where the operator is already
+                # looking.
+                return PhasePolicyDecision(
+                    TP_TO_PP,
+                    f"decode phase ran EMPTY: no bundle was ever resident "
+                    f"(entered with 0 decoding, {elapsed:.1f} s ago) while "
+                    f"{inp.pending_prefill_tokens} tok of prefill waited. "
+                    f"NOTHING WAS DRAINED -- this is not a completed bundle, "
+                    f"it is a decode window that had no work to do. If this "
+                    f"repeats with a non-empty backlog, the defect is upstream "
+                    f"in ADMISSION, not in the layout: work is queued that "
+                    f"nothing is making runnable (#731, and see the #699 "
+                    f"admission-wedge line for queued-vs-running)",
+                )
             return PhasePolicyDecision(
                 TP_TO_PP,
-                f"decode bundle complete: {bundle} reqs decoded in "
-                f"{0.0 if in_phase is None else in_phase:.1f} s "
+                f"decode bundle complete: {bundle} req bundle drained in "
+                f"{elapsed:.1f} s "
                 f"({inp.pending_prefill_tokens} tok prefill waiting) -- exit "
                 f"condition: decode drained",
             )
