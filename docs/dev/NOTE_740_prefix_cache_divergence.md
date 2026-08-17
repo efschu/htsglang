@@ -109,6 +109,33 @@ Suggested next probe, cheap and read-only: correlate hit/miss against
 `max_mamba_cache_size` by raising it on a TEST boot and re-measuring the same
 121-request shape. If hits track the slot count, the cause is established.
 
+## 4a. CORRECTION to section 4, from the #745 gate
+
+Section 4 said the mechanism was "no resident state at that position". **That
+is wrong as stated, and it is my claim to retract.**
+
+`MambaRadixCache` already implements resume-from-nearest-checkpoint:
+`_match_prefix_helper` tracks the deepest node on the matched path that still
+carries a state (`mamba_radix_cache.py:1513-1517`), and
+`_match_post_processor` truncates the returned KV prefix to exactly that point
+(`:1685`, `value = value[:best_value_len]`) and COWs the state into a fresh
+slot (`:1611-1654`). The tail is then re-prefilled. So a prefix hit is NOT
+discarded for lack of a state at the exact position — it falls back to the
+nearest checkpoint at-or-below and replays the remainder.
+
+A full re-prefill therefore requires that NO node on the matched path carries a
+state at all (the root never does). The corrected mechanism is **checkpoint
+EVICTION, not checkpoint absence**: the mamba pool holds
+`max_mamba_cache_size = 12` slots total, shared between the running requests
+and every retained tree checkpoint, under LRU (`evict_mamba`, `:1090`). With
+`max_running_requests = 4` and many concurrent agent sessions, the retained
+checkpoints are evicted long before the next turn of the same session arrives.
+
+This does not change section 4's conclusion — it is still serving-side, still
+hybrid-specific, and still not the adapter — but it names the cause more
+precisely, and it changes the fix: the states need somewhere to LIVE beyond 12
+VRAM slots, which is exactly what #745 proposes.
+
 ## 5. Honest scope
 
 * The system block and tool schemas were STUBBED with a fixed string, identical
