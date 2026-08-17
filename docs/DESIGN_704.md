@@ -2203,3 +2203,102 @@ Slice 1 is deliberately the cheapest metal-provable cut: a rung pair inside the
 attention plateau, so it proves the mover and the hysteresis **without moving a
 single KV byte** — the two mechanisms that everything else depends on, isolated
 from the one that is hardest to get right.
+
+## §4.2h — R6 reconciliation with the #635/#646 neighbours (post-4fdefe8404)
+
+4fdefe8404's commit message flagged the neighbour work as unreachable from
+this branch. **That flag was wrong and is withdrawn.** The miss was a search
+error: I grepped the decorated forms `[#646]`/`[#635]`, while the subjects
+use `#646:` and `(#635)`. Canon entry: **grep ticket numbers bare, then filter
+the noise** — never narrow by adding decoration. (Bare `--grep=646` returns 80
+hits here, mostly `(#18646)` PR-number substring collisions. The noise is what
+tempted the decoration; filtering is the answer, not a tighter pattern.)
+
+### Verdict 1 — `7fd2b566b2` "R6 verdict (#635)": **COMPLEMENTARY, not duplicate**
+
+It is a **different R6**. That commit's R6 is a risk-register item in
+`docs/dev/DESIGN_625.md` about the PD **handover** — moving KV between two
+engines — and it was already superseded there ("New R7 replaces R6"). This
+R6 is a #704b slice about pool **allocation** inside one engine. Two
+registers, one letter-number. It IS an ancestor of this branch, so I could
+have read it; the delineation is real, the excuse was not.
+
+They meet on one object, the token-sharded pool: #635 says how bytes ARRIVE
+into one (`BaseKVSender.send_metadata` owned_ordinals, `base/conn.py:186-204`;
+decode-side owner rule `decode.py:1103-1125`), this slice says how one is
+SIZED.
+
+### The defect that meeting point exposed
+
+The built door's ownership is a **residue band**: `layers/dcp/owner.py:406-436`
+assigns slot `L` to a rank iff `(L % cp_S)` is in `[cp_lo, cp_hi)`, so the
+realized share is exactly `(cp_hi - cp_lo) / cp_S` — a rational with
+denominator `cp_S`, never a free real.
+
+`plan_decoupled` accepted **any float in (0, 1]** and never checked it. A pool
+sized off that grid is sized for a token count the rank is never handed, and
+the mismatch is **silent**: the compact write `loc = block * cp_ratio + (off -
+cp_lo)` indexes an allocation that was never made that long. Under-size and it
+writes past its end; over-size and the rows are dead.
+
+This is not hypothetical, and the cleanest evidence is that it contradicts
+**my own** earlier work: `planner/decoupled_kv.py:270-273` already states the
+`ratio_r / S` constraint in its `quantize_shares` docstring. The new module
+was written without honouring a rule I had already written down — a
+self-consistency failure, not a missing external fact.
+
+Fix: `period` is now **required** at arming (`plan_decoupled`, `plan_for_rank`),
+and `validate_share_realizable` **refuses** an off-grid share rather than
+rounding it — rounding would hide that the caller skipped `quantize_shares`.
+`realized_share(period, lo, hi)` reads the share off the owner rule's own
+expression so the planner is not a third copy of it.
+
+### Verdict 2 — `b851df7626` (#646): **COMPLEMENTARY; the defect is NOT recreated, the rule is adopted**
+
+Note first: #646 is **NOT an ancestor of this branch** (it lives on
+`feat/dual-group-631` only; `num_target_kv_buffers` greps empty here). So the
+fix is not in this tree.
+
+#646's defect was a flat list that stopped being one section once the draft
+pool was appended, after which a boundary recovered by halving mispaired
+source V buffers with destination K buffers — silently, no exception on the
+mispaired path. This module consumes a **different** list (the model's
+attention layer ids, `model_runner_kv_cache_mixin.py:2496-2500`, which the
+draft pool does not enter), so it does not inherit that defect.
+
+The rule is adopted anyway, because the armed path shards by token share
+whatever it is handed: an appended section would be sized as target layers and
+**split across ranks**, when #646 established such a section is owned WHOLE by
+the last PP stage. `_validate_target_section` refuses a repeating or
+non-increasing list by name. Armed path only — the unarmed path must not
+acquire a new way to fail, and a test pins that it did not.
+
+### Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`)
+
+- `test_decoupled_kv_pool_plan_704b.py`: **23 passed** (13 -> 23).
+- Can-fail by breakage: neutering `validate_share_realizable` +
+  `_validate_target_section` turns **exactly 5** tests red
+  (`..._share_OFF_the_owner_rule_grid...`, `..._names_the_grid_it_wanted`,
+  `..._REFUSED_not_rounded`, `..._SECOND_SECTION_appended...`,
+  `..._concatenated_layer_list...`); restoring returns 23.
+- Same period, different verdict: share `0.135` is accepted at `period=1000`
+  (135/1000) and refused at `period=3`. The period decides, not the share's
+  plausibility.
+- Wider run under `/spinning/htsglang-gpu/.venv/bin/python3`: **2836 passed,
+  123 skipped, 157 subtests**, 2 pre-existing failures unrelated to this work
+  (see below).
+
+### Two environment/branch facts found while validating
+
+1. **System `python3` can no longer collect 67 of these suites**
+   (`ModuleNotFoundError: datasets`, plus `chess`). The venv at
+   `/spinning/htsglang-gpu/.venv/bin/python3` still has them. Any "green" run
+   on bare `python3` after this drift is a collection error, not a pass.
+2. **A drifted evidence pin, pre-existing at HEAD**, verified by removing my
+   diff and re-running: `planner/rejected.py:361` cites
+   `server_args.py:16240-16245 (assert)`, but that region is now
+   `_handle_tokenizer_batching`. The pinned assert moved to
+   `server_args.py:13693-13694` and changed shape (`view.disable_overlap_
+   schedule`, not `self.`). Two reds in
+   `test/registered/unit/planner/test_rejected_evidence_pins.py`. Not mine and
+   not fixed here — the register belongs to another strand.
