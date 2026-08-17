@@ -103,6 +103,35 @@ sm86  : PENDING
 sm120 : PENDING
 ```
 
+### 1a — RUN IT WITH THE TURNKEY RUNNER, not by hand
+
+`bench/398/run_398_gate_a.py` executes sections 0, 1 and 1b end to end and
+writes `report.json` plus a `TICKET_BLOCK.md` ready to paste into the PENDING
+blocks below. It claims no window and boots no server.
+
+```bash
+# hermetic, any time, no GPU -- proves the harness itself still works
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD/python \
+  $V/bin/python bench/398/run_398_gate_a.py --self-test
+
+# inside a claimed window (claim canon: /spinning/gpu-arb/, see
+# evidence-qwen38/claim_window.sh -- heartbeat staleness AND no launch_server
+# mid-startup; this script deliberately does not claim for you)
+PYTHONPATH=$PWD/python $V/bin/python bench/398/run_398_gate_a.py --run \
+  --out /spinning/gpu-battery-results/<date>_398_gate_a
+```
+
+Exit 0 = every gate green, 1 = a gate failed, 2 = could not run (no card, no
+wheel, or an arch missing — "could not run" is never reported as a pass).
+
+It encodes the three hazards that have already bitten this ticket: the #519
+falsifier expectation (below), the `import sgl_kernel`-before-probe ordering
+that once aborted the interpreter, and card selection by REAL compute
+capability through the NVML IdentityMap rather than by ordinal. Its
+`--self-test` is pinned by
+`test/registered/unit/quantization/test_gate_a_runner_398.py` so it cannot rot
+between now and the window.
+
 ### 1b — Gate A': the falsifier, on the real wheel
 
 Hermetically the flip is already executed
