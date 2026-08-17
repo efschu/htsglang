@@ -2084,7 +2084,14 @@ def _per_family_formats(qc: dict) -> Dict[str, str]:
                 per_family.setdefault(family, []).append(key)
 
     groups = qc.get("config_groups")
-    if not per_family and isinstance(groups, dict) and len(groups) > 1:
+    if not per_family and isinstance(groups, dict) and groups:
+        # #485 item 1: NOT `len(groups) > 1` any more. A single-group config
+        # can still describe a split, because the split may live in `ignore`
+        # rather than in a second group -- which is the serving checkpoint's
+        # exact shape. Restricting this to multi-group configs made a
+        # one-group-plus-ignore checkpoint report no families at all, so the
+        # BF16-resident ones were invisible and #324 scored them on the
+        # checkpoint-wide quantized lane.
         for group in groups.values():
             key = _ct_group_format(group or {})
             if key is None:
@@ -2094,8 +2101,28 @@ def _per_family_formats(qc: dict) -> Dict[str, str]:
                 if family is not None:
                     per_family.setdefault(family, []).append(key)
 
+    # #485 item 1: a family the quantizer was told to SKIP is bf16-resident,
+    # and that is a fact about the checkpoint exactly as much as a declared
+    # scheme is. Only GEMM families count: `re:.*norm.*` and `re:.*conv1d.*`
+    # map to no family, so ignoring them is not a divergence and must not
+    # manufacture one.
+    for entry in qc.get("ignore") or []:
+        family = gemm_family_of_module(str(entry))
+        if family is not None:
+            per_family.setdefault(family, []).append("bf16")
+
     resolved = {}
     for family, keys in per_family.items():
+        # A family carrying BOTH bf16 and quantized evidence is genuinely
+        # MIXED -- `attn_gdn` spans `self_attn` and `linear_attn`, and a
+        # checkpoint may quantize one and ignore the other. `_dominant` would
+        # pick by CONFIG-ENTRY count, which bears no relation to how many
+        # LAYERS carry each, so it would invent the answer. Such a family is
+        # left out rather than given a fabricated key; resolving it needs the
+        # per-layer census (#371).
+        distinct = set(keys)
+        if "bf16" in distinct and len(distinct) > 1:
+            continue
         key = _dominant(keys)
         if key is not None:
             resolved[family] = key
