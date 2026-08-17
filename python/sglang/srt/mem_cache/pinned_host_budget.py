@@ -223,12 +223,26 @@ def check_and_register_pinned_post(
     # absent from `available`. The true marginal cost of that boot was the 5.24
     # GB tier, which fits in 23.23 GB with 18 GB to spare.
     #
-    # Crediting is sound only because registration FOLLOWS allocation for every
-    # producer of a post: `check_and_register_pinned_post` registers after its
-    # own check (so the post being weighed now is correctly NOT credited), and
-    # the weight images register after `_alloc_host_image` returns. A post that
-    # was registered BEFORE its allocation would be over-credited here, so a
-    # future producer that reserves ahead of allocating must not use this path.
+    # THE PRECONDITION, CORRECTED (#550). An earlier version of this comment
+    # said crediting is sound "because registration FOLLOWS allocation for every
+    # producer". That is FALSE and was a misreading: `_register_image_post`
+    # declares the post BEFORE `_alloc_host_image` allocates
+    # (weights_arena.py:458 vs :476), deliberately, so the registry refuses an
+    # over-commitment at the DECLARATION rather than discovering it at the
+    # allocation.
+    #
+    # What actually makes the credit sound is weaker and sufficient: by the time
+    # a LATER post is weighed, the EARLIER posts' allocations have COMPLETED, so
+    # their bytes are already absent from `available`. That is what was measured
+    # -- MemAvailable 33.62 GB while the schedulers held 86.51 GB resident.
+    #
+    # The real hazard is therefore a post that is registered and then NEVER
+    # allocates: it would be credited back without ever having been resident,
+    # and the next admission would be charged too little -- the registry waving
+    # through the over-commitment it exists to refuse. #550 closes exactly that
+    # window by taking the post back when the allocation raises
+    # (`_unregister_image_post`). A future producer that can leave a post
+    # registered with no allocation behind it must do the same.
     #
     # Other ranks' pins are correctly still charged: they are absent from
     # `available` and absent from `others`, which is this process's registry
