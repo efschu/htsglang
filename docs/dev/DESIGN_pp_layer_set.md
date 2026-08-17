@@ -127,21 +127,25 @@ conv_kernel−1)`):
 | **per layer per slot** | **3.117 MiB** | 817 152 × 4 B |
 | **48 layers per slot** | **149.6 MiB** | the full plan concentrates ALL GDN state on the 5090 |
 
-Against the 5090 headroom the spec computed (**4738 MiB** free after GDN
-weights, #727 int8 vocab, arming floor 1728 and corridor 1024):
+Against the 5090 headroom the spec computed (free after GDN weights, #727 int8
+vocab, arming floor 1728 and corridor 1024). The spec's **4738 MiB** was taken
+against the NOMINAL 32768 MiB total; the card's live NVML total is **32607
+MiB**, so the real figure is **4577 MiB**. The width-canon lesson applies to
+totals as well as to widths — use what NVML reports, not the sticker:
 
-| graph pool | slots (fp32, 48 layers) |
-| --- | --- |
-| 0 MiB | 31 |
-| 1024 MiB | **24** |
-| 1536 MiB | **21** |
+| graph pool | slots (fp32, 48 layers) | on the nominal total |
+| --- | --- | --- |
+| 0 MiB | 30 | (31) |
+| 1024 MiB | **23** | (24) |
+| 1536 MiB | **20** | (21) |
 
 **And without #727 the plan pinches hard.** On bf16 vocab the free figure is
-2313 MiB, giving **~8 slots** at a 1 GiB graph pool. That moves #727 from
-"load-bearing" to **required**, now with a number behind the word.
+2313 MiB nominal / **2152 MiB** on the NVML total, giving **~7 slots** at a
+1 GiB graph pool. That moves #727 from "load-bearing" to **required**, now with
+a number behind the word.
 
 **Headline, stated loudly as asked: at fp32 state — which this checkpoint
-explicitly selects — the full plan supports roughly 21–24 concurrent mamba
+explicitly selects — the full plan supports roughly 20–23 concurrent mamba
 slots on the 5090.** That is the same order as the rig's existing
 `--max-mamba-cache-size` settings, so it does not KILL the plan, but it leaves
 little margin, and it is **2× the concentration of today's contiguous layout**,
@@ -160,10 +164,20 @@ ownership change in layer order, with a **per-pair slot** so a transport can
 match a send to its recv without a global sequence number.
 
 **31 is now executable rather than asserted.** The suite computes it from the
-actual map: 16 crossings leave the GDN card, 15 return, and the missing 32nd is
-the terminal layer, whose output goes to the head. A contiguous map through the
-same function still yields `pp_size - 1`, which is the falsifier — the 31 has
-to come from non-contiguity and not from the function counting something else.
+actual map: 16 crossings leave the GDN card, 15 return. A contiguous map through
+the same function still yields `pp_size - 1`, which is the falsifier — the 31
+has to come from non-contiguity and not from the function counting something
+else.
+
+**Reconciled with DESIGN_family_fullplan.md: the two counts are 31 and 32, and
+both are right about different things.** 31 is the INTER-LAYER crossing count,
+which is what this schedule emits and what a transport must match sends to. 32
+is the full-forward MOVEMENT count, because `DESIGN_family_fullplan.md` §2.1
+places `lm_head` on the 5090, so the terminal layer's output crosses back to the
+head as well. Wherever a cost figure in either document is derived from 31, the
+transport term is understated by one movement, i.e. by **~3 %**; that is below
+the resolution of every verdict those figures support, so the numbers are left
+as printed rather than re-derived, and this is the note saying so.
 
 **Slot-3's corrections are baked in.** Cost is priced PER LINK
 (`schedule_cost`), because the rig's edges differ and a schedule's cost depends
@@ -417,7 +431,8 @@ wrong, not the layout.
 
     SGLANG_PP_LAYER_SET="0-2,4-6,...;3,7,11,..."   # GDN vs FA, per §4
 
-*Acceptance:* the 31 crossings of §5 observed on the wire, and generated text
+*Acceptance:* the 31 inter-layer crossings of §5 observed on the
+wire (32 movements including the terminal output to `lm_head`), and generated text
 matching the contiguous baseline for the same seed.
 
 ### 9.2 Refusals that SHOULD fire, and are part of acceptance
