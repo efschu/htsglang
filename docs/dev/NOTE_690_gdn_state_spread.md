@@ -1,114 +1,140 @@
-# #690 successor — the per-rank gdn_state spread is a WAIT, not serialization
+# #690 successor — the per-rank flip spread is an H2D COPY on a narrow PCIe link
 
-Desk analysis. **Verdict: there is no serialization point to remove. The moves
-are already concurrent; the spread is a rendezvous wait, and it is inverted —
-the rank with the LONGEST span is the one that arrived EARLIEST.** The
-critical path is one consistent straggler, and it is the same rank every flip.
+Supersedes the first revision of this note in full. The first revision read
+the `gdn_state->weights_refill` segment as the GDN state exchange and
+concluded the spread was a rendezvous wait with rank 2 arriving last. Both
+halves of that were wrong. The retraction is section 0; it is kept rather
+than edited away because the mistake is reusable.
 
----
+## 0 — RETRACTION of revision 1
 
-## 0 — Naming correction
+**What I claimed.** That the worst census segment measured the GDN state
+move, that its per-rank spread was wait rather than work, and that rank 2
+was the late arrival on an inverted rendezvous.
 
-The capture calls the step `draft_state`. **No such label exists in the code.**
-The pre-cutover movers are labelled at `phase_flip_runtime.py:1843-1846`:
+**Why it was wrong.** Census marks are taken *after* each pre-cutover mover
+returns (`phase_flip_runtime.py:6553-6558`):
 
 ```python
-pre_cutover_fns=_labelled_movers(
-    (_build_gdn_leg(scheduler), "gdn_state"),
-    (stacks.refill, "weights_refill"),
-)
+for fn in self._pre_cutover_fns:
+    fn(direction)
+    seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
 ```
 
-The step is `gdn_state`, and the census reports the interval
-`gdn_state->weights_refill`. Everything below is about that interval.
+So the segment labelled `gdn_state->weights_refill` runs from *the moment
+the GDN leg finished* to *the moment the refill finished*. It is the
+**weights refill**, not the GDN move. I read a segment name as the thing it
+started at instead of the thing it ended at.
 
-## 1 — Code: where the ordering could be, and why it is not there
+`PhaseFlipStacks.refill` (`phase_flip_boot.py:361`) is, in its own
+docstring, "one contiguous H2D refill of the arena with the TARGET phase's
+image". A host-to-device copy is **rank-local**. There is no collective in
+that segment, so there is no rendezvous, so the wait/work framing that
+revision 1 was built on had nothing to attach to.
 
-`_build_gdn_leg` → `gdn_flip_mover.build_gdn_flip_mover`; the work is
-`GdnFlipMover.move()` (`gdn_flip_mover.py:467-556`):
+**The generalisable error.** Revision 1's method was sound — find the
+collective, reason about arrival order — and it was applied to a segment
+that contains no collective. Reading the interval's *endpoints* is a
+precondition for reasoning about its contents, and naming a segment after
+its opening mark makes that precondition easy to skip. This is the same
+family as "arithmetic on the wrong side of a barrier" from the previous
+round: the analysis was fine, the boundary was misplaced.
 
-1. **pack all outgoing** — a dict comprehension over peers, rank-local compute;
-2. **`self._exchange(outgoing, incoming)`** — the only group step;
-3. **verify** per peer — rank-local;
-4. **write** own leg, then each peer's — rank-local.
+**What survives revision 1.** Two observations, both independent of the
+mechanism: the per-rank totals agree within 0.7% while the worst segment
+differs 1.80x, and the per-rank ranges do not overlap across 14 flips, so
+the effect is structural rather than load-dependent. The corrected reading
+below explains both better than the original did.
 
-The exchange is `_dist_exchange(flip_tp.device_group, device)`
-(`kv_reshard.py:939-984`), and it is **one `batch_isend_irecv` batch**: every
-irecv posted in ascending peer order, then every isend, then all works polled
-through `bounded_collective`.
+## 1 — What the segment actually measures
 
-So, against the brief's three candidates:
+`refill` on either direction is: commit the arena high-water, then one
+`arena_refill` H2D of the target layout's host image. On `PP_TO_TP` the
+target is the **TP** image, and under uneven TP each rank holds a shard of
+the same total, so **every rank copies the same number of bytes**:
 
-* **rank-by-rank serial moves?** No — one batch, all peers at once.
-* **host staging?** No — device-native by design, "the payloads never leave the
-  GPUs".
-* **one lock?** No lock exists on this path.
+| rank | PP image (MiB) | TP image (MiB) | high-water | commit grows? |
+|---|---:|---:|---|---|
+| 0 | 12619.6 | 9614.9 | PP (12619.6) | no |
+| 1 | 9014.0 | 9614.9 | TP (9614.9) | yes |
+| 2 | 7211.2 | 9614.9 | TP (9614.9) | yes |
 
-**There is no serialization point to name**, which is the finding: the fix shape
-the brief anticipated (concurrent per-rank moves) is already the implementation.
+The copy itself is 9614.9 MiB on all three. Equal bytes, unequal time — so
+the spread is neither work volume nor wait. It is throughput.
 
-## 2 — The retained logs, and what they actually show
+## 2 — Rank to card, from the NVML canon
 
-The 51-flip lines have NOT rotated out. 36 census lines survive (14 flips x 3
-ranks + partials), format:
+Taken from the recorded census (`census-602/census_pp*.json`), not assumed,
+and cross-referenced against `nvidia-smi` UUIDs. **Rank index is not
+physical index** — the #82 device-order trap holds here:
 
-    [#631 seam-census] timing pp_to_tp rank 2: 2470.0 ms across 390 segment(s),
-    worst 'gdn_state->weights_refill' 974.2 ms
+| rank | GPU UUID | physical idx | card | PCIe width (cur/max) |
+|---|---|---:|---|---|
+| 0 | 31d7ef41 | 1 | RTX 5090 | 8 / 16 |
+| 1 | 5c648f96 | **0** | RTX 3080 | **4** / 16 |
+| 2 | 62dbbae1 | 2 | RTX 3080 | 8 / 16 |
 
-| rank | flips | total ms (mean) | segments | gdn span min..max | mean |
-|---|---:|---:|---:|---:|---:|
-| 0 | 14 | 3134.3 | 433 | 1303.9 .. 1349.3 | 1327.1 |
-| 1 | 14 | 3112.6 | 400 | 1780.8 .. 2049.6 | **1903.0** |
-| 2 | 14 | 3127.9 | 384 | 974.2 .. 1173.1 | **1057.0** |
+## 3 — The numbers line up with link width
 
-Two facts settle the mechanism:
+Mean refill span over 14 pp_to_tp flips, against the constant 9614.9 MiB:
 
-**(a) The totals are equal within 0.7 %** (3112.6 / 3127.9 / 3134.3) while the
-gdn spans differ by **1.80x**. Equal totals with unequal sub-spans is wait
-being redistributed, not work being imbalanced — nobody is doing more.
+| rank | card | link | refill (ms) | effective H2D |
+|---|---|---:|---:|---:|
+| 1 | 3080 | x4 | 1903.0 | 4.93 GB/s |
+| 0 | 5090 | x8 | 1327.1 | 7.08 GB/s |
+| 2 | 3080 | x8 | 1057.0 | 8.88 GB/s |
 
-**(b) The ranges do not overlap at all.** rank2 max (1173.1) < rank0 min
-(1303.9) < rank1 min (1780.8). Per-rank variance is small (rank0 +-1.7 %), so
-this is **structural and load-INdependent**, answering the brief's question
-directly: it is always the same rank, not load-dependent.
+The ordering is exactly the link-width ordering, and 4.93 GB/s is where a
+PCIe 4.0 x4 link lands in practice. The x4-vs-x8 time ratio is 1.80x
+against a pure-link prediction of 2.00x.
 
-**The spread is inverted.** At a rendezvous the earliest arriver waits longest,
-so the LONGEST span marks the earliest arrival. rank 1 (1903 ms) arrives first
-and waits; **rank 2 (1057 ms) arrives LAST and is the critical path**. The other
-two burn roughly 270 and 850 ms per flip waiting for it.
+**The coordinator's hypothesis was right about the mechanism and wrong
+about the rank**: it is the x4 3080, but that card is **rank 1**, not rank
+2. Rank 2 is the *fastest* of the three, not the straggler. My revision 1
+put the same rank in the same wrong place by a different route.
 
-Note rank 2 holds the FEWEST GDN layers (12, against 21 and 15) and the fewest
-segments (384), yet it is consistently last — so the delay is not GDN work
-volume. Naming what makes rank 2 late is the open question, and it is upstream
-of this interval.
+**What is not explained.** Two x8 cards differ 7.08 vs 8.88 GB/s, and the
+faster one is the 3080. The 1.80x-vs-2.00x shortfall is the same size as a
+fixed per-flip cost sitting inside the segment alongside the copy. Both
+gaps are consistent with the arena commit being non-trivial and unequal —
+note that rank 0 is the one rank whose commit does *not* grow. That is a
+candidate, not a finding, and it is precisely what the new mark separates.
 
-## 3 — The 21x figure
+## 4 — Consequence for the flip's critical path
 
-Within a single flip the spread here is **1.80x mean, 2.1x at the extremes** —
-not 21x. The 8.9-963.3 ms range in Capture-A spans flips of very different
-sizes, so a ratio taken across it mixes flip magnitude with rank skew. The
-within-flip number is the one that bears on serialization, and it is ~2x.
+Per-rank totals are equal within 0.7% while rank 1's refill is ~846 ms
+longer than rank 2's. Equal totals with an unequal segment means the
+difference is absorbed at a later group step — the cutover. So rank 1's
+refill is **on the critical path**, and roughly 27% of the ~3.1 s flip is
+attributable to one card sitting in an x4 slot.
 
-## 4 — Proposed direction, with the risk stated
+That makes the first question a physical one (can that card move to a wider
+slot) before it is a software one. No code change is proposed here.
 
-**Do not parallelise the move.** It is already one batched exchange; adding
-concurrency there buys nothing and risks the deterministic peer ordering that
-makes the batch safe (the same order on every rank is what keeps
-`batch_isend_irecv` from deadlocking).
+## 5 — The instrument added
 
-**The claimable quantity is bounded by rank 2's excess, not by others' wait.**
-The flip's duration is the critical path, so recovering rank 1's 850 ms of
-waiting is impossible without making rank 2 arrive earlier. Any proposal framed
-as "reclaim the waiting ranks' time" is arithmetic on the wrong side of a
-barrier.
+One census mark, `refill_highwater`, in
+`PhaseFlipStacks._commit_refill_high_water` — a single site that fires on
+both flip directions, splitting the refill leg into commit and copy. It is
+marked outside the carrier guard so a no-carrier rank reports a zero-width
+step rather than dropping the boundary and silently changing what its
+remaining bar means.
 
-**Next step is measurement, not code:** the census already segments the flip
-(384-438 segments per rank). The same instrument can attribute *within* the
-`gdn_state->weights_refill` interval and say what rank 2 spends its extra time
-on before the exchange. That is one added mark, not a redesign — and it should
-be reviewed here before landing, per the brief.
+It confirms or refutes section 3's residual: if the commit is near zero on
+all ranks, the copy is purely link-bound and the 5090's shortfall needs
+another explanation; if the commit is large on ranks 1 and 2, the
+"different bytes" reading of the two x8 cards is wrong and the growth is
+the cost.
 
-## 5 — What this note does not do
+Pins: `test/registered/unit/managers/test_refill_highwater_mark_690.py`
+(8 pins; red-first, 5 of 8 fail without the mark). The #631 no-return-path
+contract is re-pinned at the new call site rather than inherited by
+argument, since this is the first census call on the `phase_flip_boot`
+side.
 
-No sizer or runtime change, per the brief. The mark proposal above is written
-as a proposal; nothing is wired.
+## 6 — What this note does not do
+
+It does not measure the commit/copy split — that needs the next boot with
+the mark in place. It does not explain the two x8 cards' difference. It
+does not revisit the GDN move, which on this evidence was never the
+segment in question and remains unmeasured.
