@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -585,6 +587,84 @@ def admission_wedge_verdict(
             "broader than that path"
         )
     )
+
+
+#: #699 wiring: how often the admission-wedge watchdog polls scheduler state.
+#: Half the alarm threshold, matching the existing forward_ct watchdog's own
+#: poll-vs-timeout ratio (see WatchdogRaw._watchdog_once), so the alarm is
+#: never more than one poll interval late.
+ADMISSION_WEDGE_POLL_SECONDS: float = ADMISSION_WEDGE_SECONDS / 2
+
+
+def check_admission_wedge_once(
+    scheduler: Scheduler,
+    now: Optional[float] = None,
+    log_on_alarm: bool = False,
+) -> Tuple[bool, str]:
+    """One admission-wedge check against live scheduler state (#699 wiring).
+
+    Reads exactly the three numbers ``admission_wedge_verdict`` needs off the
+    scheduler: ``len(waiting_queue)``, ``len(running_batch.reqs)``, and the
+    age of ``last_first_token_progress_time`` -- the clock a request's first
+    committed output token stamps (see
+    ``SchedulerBatchResultProcessor.process_batch_result_prefill``), never a
+    forward-pass counter. That distinction is the entire point of #699:
+    forward_ct and cur_batch_for_debug both read healthy during the measured
+    wedge, so a clock keyed to either would stay blind to it too.
+
+    During scheduler startup (``is_initializing``) the progress clock has not
+    been seeded by any real request yet, so polling would read a false age;
+    this returns silent instead.
+    """
+    if scheduler.is_initializing:
+        return False, "scheduler is initializing: admission-wedge check skipped"
+
+    now = now if now is not None else time.perf_counter()
+    queued = len(scheduler.waiting_queue)
+    running = len(scheduler.running_batch.reqs)
+    age = now - scheduler.last_first_token_progress_time
+
+    alarm, verdict_detail = admission_wedge_verdict(queued, running, age)
+    detail = (
+        f"queue age {age:.1f}s since last first-token progress "
+        f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
+        f"{verdict_detail}"
+    )
+    if alarm and log_on_alarm:
+        logger.error(detail)
+    return alarm, detail
+
+
+def create_admission_wedge_watchdog(
+    scheduler: Scheduler,
+    poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
+) -> threading.Thread:
+    """#699: log-only admission-wedge watchdog, wired to the real progress clock.
+
+    Deliberately NOT a ``WatchdogRaw``: that class's signal is forward_ct
+    staleness, which #699 (commit 9c686ca936) proved blind to this exact
+    wedge shape -- chunked prefill keeps forward_ct advancing for tens of
+    seconds while zero requests reach a first token. This thread instead
+    polls ``check_admission_wedge_once``, which reads queue/running counts
+    and the first-token-progress clock.
+
+    Log-only in this slice, by design: there is no SIGQUIT path here. Restart
+    policy on a confirmed wedge is a separate decision with its own review.
+    """
+
+    def _loop() -> None:
+        while True:
+            time.sleep(poll_interval)
+            try:
+                check_admission_wedge_once(scheduler, log_on_alarm=True)
+            except Exception as e:  # noqa: BLE001 - a watchdog must not die
+                logger.error(f"admission-wedge watchdog check failed: {e}")
+
+    t = threading.Thread(
+        target=_loop, daemon=True, name="admission-wedge-watchdog"
+    )
+    t.start()
+    return t
 
 
 def create_scheduler_watchdog(

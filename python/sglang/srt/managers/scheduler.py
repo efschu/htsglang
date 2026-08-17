@@ -221,6 +221,7 @@ from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlus
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
+    create_admission_wedge_watchdog,
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
@@ -1648,6 +1649,13 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        # #699: the admission-wedge clock. Seeded to "now" so an idle box at
+        # boot reads as "no progress yet since start" rather than a false
+        # infinite age; stamped again only when a request's first output
+        # token is committed (see note_first_token_progress /
+        # SchedulerBatchResultProcessor.process_batch_result_prefill), never
+        # on a forward pass -- that is the exact signal #699 proved blind.
+        self.last_first_token_progress_time: float = time.perf_counter()
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -1763,11 +1771,32 @@ class Scheduler(
                 self, watchdog_timeout=x, soft=True
             )
 
+    def note_first_token_progress(self, ts: Optional[float] = None) -> None:
+        """#699: stamp the moment ANY request reached its first output token.
+
+        This is the clock the admission-wedge detector reads (queue age vs
+        progress), never forward_ct: chunked prefill can advance forward_ct
+        for tens of seconds while zero requests progress, which is exactly
+        the wedge shape #699 exists to catch. Call this ONLY at the instant a
+        request's first output token is committed
+        (SchedulerBatchResultProcessor.process_batch_result_prefill), never
+        from a forward pass alone.
+        """
+        self.last_first_token_progress_time = (
+            ts if ts is not None else time.perf_counter()
+        )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
+
+        # #699: log-only admission-wedge watchdog, wired to the real
+        # first-token-progress clock above (queue age vs progress -- see
+        # invariant_checker.create_admission_wedge_watchdog for why this is
+        # not the same signal as the forward_ct watchdog just started).
+        self.admission_wedge_watchdog = create_admission_wedge_watchdog(self)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -3609,6 +3638,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
             kv_session_offload=self.kv_session_offload,
+            record_first_token_progress=self.note_first_token_progress,
         )
 
     def init_req_max_new_tokens(self, req):
