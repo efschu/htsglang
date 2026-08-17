@@ -194,6 +194,27 @@ class PeerTransportMap:
                 f"{len(self._by_pair)} pairs at world build"
             ) from None
 
+    def for_ranks(self, src_rank: int, dst_rank: int) -> PeerBinding:
+        """The binding for one DIRECTED pair, addressed by RANK.
+
+        The PP crossing schedule speaks ranks (``Crossing.src``/``dst``) while
+        this map keys on UUID, so the junction needs one of the two to convert.
+        It happens here, once, against the world list this map was built from
+        -- rather than in the schedule, which must not learn about device
+        identity at all.
+
+        Same contract as :meth:`for_pair`: an unknown pair raises instead of
+        defaulting.
+        """
+        for b in self._by_pair.values():
+            if b.src_rank == src_rank and b.dst_rank == dst_rank:
+                return b
+        raise KeyError(
+            f"no transport binding for directed rank pair {src_rank} -> "
+            f"{dst_rank}; the map covers ranks "
+            f"{sorted({b.src_rank for b in self._by_pair.values()})}"
+        )
+
     def degraded(self) -> Tuple[PeerBinding, ...]:
         return tuple(b for b in self._by_pair.values() if b.degraded and not b.refused)
 
