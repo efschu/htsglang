@@ -302,6 +302,210 @@ def verify_import(
 
 
 # ---------------------------------------------------------------------------
+# Snapshot: the reusable half
+#
+# #410 (server-side checkpoints) is the same export with a different
+# destination -- a storage TIER instead of a peer group -- so the snapshot
+# lives here as module-level functions rather than inside the handover
+# runtime. There is exactly ONE session serialization in the fork; a second
+# one would be a second thing to keep byte-correct, and the #212 GDN gate
+# below is the reason that matters.
+# ---------------------------------------------------------------------------
+
+
+def storage_preconditions(scheduler):
+    """The tree, if this server can serialize a session at all."""
+    tree = scheduler.tree_cache
+    if not getattr(tree, "enable_storage", False):
+        raise SessionHandoverError(
+            "hierarchical cache with a storage backend is required "
+            "(--enable-hierarchical-cache --hicache-storage-backend file)"
+        )
+    if scheduler.server_args.hicache_storage_backend != "file":
+        raise SessionHandoverError(
+            "session handover supports the 'file' storage backend only "
+            "(the same limit the offline flow carries)"
+        )
+    return tree
+
+
+def backend_exists_fn(tree) -> Callable[[str], bool]:
+    backend = tree.cache_controller.storage_backend
+    return lambda key: bool(backend.exists(key))
+
+
+def drain_storage(tree, deadline_s: float) -> None:
+    """Bounded drain of the write-through and storage-backup pipelines
+    (#259/#312 discipline: a deadline, then a loud error -- and the caller
+    rolls the park back, never a wedged session)."""
+    controller = tree.cache_controller
+    deadline = time.monotonic() + max(1.0, float(deadline_s))
+    while time.monotonic() < deadline:
+        tree.writing_check()
+        tree.drain_storage_control_queues()
+        if (
+            len(tree.ongoing_write_through) == 0
+            and len(tree.ongoing_backup) == 0
+            and controller.backup_queue.qsize() == 0
+            and controller.ack_backup_queue.qsize() == 0
+        ):
+            return
+        time.sleep(0.02)
+    raise SessionHandoverError(
+        "storage drain did not complete within "
+        f"{deadline_s:.1f}s: ongoing_write={len(tree.ongoing_write_through)} "
+        f"ongoing_backup={len(tree.ongoing_backup)} "
+        f"backup_queue={controller.backup_queue.qsize()} "
+        f"ack_backup_queue={controller.ack_backup_queue.qsize()} -- "
+        "export rolled back; retry with a larger deadline_s"
+    )
+
+
+def match_prefix_result(tree, token_ids: Sequence[int]):
+    """``tree.match_prefix`` with the sequence-type discipline applied.
+
+    The ``array("q")`` conversion is load-bearing: ``RadixKey.match`` asserts
+    both sides carry the SAME sequence type, and every key already in the tree
+    was built from the scheduler's ``array("q")`` fill ids. A plain JSON list
+    off the control plane would abort the match with a bare AssertionError
+    instead of matching the prefix. Every control-plane caller goes through
+    this function so the rule lives in one place.
+
+    Returns the raw result, including a PARTIAL match -- #410's branch
+    accounting needs to know how much of a checkpoint the tree still holds,
+    which is not an error condition there.
+    """
+    from array import array
+
+    from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    return tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", token_ids))))
+
+
+def match_session_chain(tree, token_ids: Sequence[int]) -> List:
+    """The radix chain root -> leaf that holds ``token_ids``, or a refusal.
+
+    Shared by the handover snapshot and by #410's checkpoint export, which
+    need the FULL prefix resident: a snapshot carries what the tree holds and
+    nothing less.
+    """
+    result = match_prefix_result(tree, token_ids)
+    matched = len(result.device_indices) + (result.host_hit_length or 0)
+    if matched < len(token_ids):
+        raise SessionHandoverError(
+            f"only {matched} of {len(token_ids)} tokens are resident in "
+            "the radix tree; a snapshot carries what the tree holds, "
+            "nothing less -- refusing a partial session. (For a hybrid "
+            "GDN model the resumable length is the deepest GDN "
+            "checkpoint; snapshot at that boundary.)"
+        )
+
+    chain = []
+    node = result.last_host_node
+    while node is not tree.root_node and node is not None:
+        chain.append(node)
+        node = node.parent
+    chain.reverse()
+    if not chain:
+        raise SessionHandoverError("prefix matched no radix node")
+    return chain
+
+
+def export_session_snapshot(
+    scheduler,
+    tree,
+    *,
+    snapshot_id: str,
+    token_ids: Sequence[int],
+    identity_hash: str,
+    deadline_s: float,
+) -> Dict:
+    """Flush one session's KV pages AND its GDN blob to the store, then emit
+    the manifest that names every blob.
+
+    This is the whole of #261's SNAPSHOT phase, callable by anything that
+    needs a session on stable storage. ``snapshot_id`` lands in the
+    manifest's ``handover_id`` field: the field is the snapshot's identity,
+    and #410 checkpoints reuse the same content-addressed derivation
+    (:func:`handover_id_for`) rather than adding a parallel id space.
+    """
+    token_ids = list(token_ids)
+    chain = match_session_chain(tree, token_ids)
+
+    # SNAPSHOT: force host backup for nodes that never crossed the
+    # write-through threshold; storage backup follows automatically on
+    # the ack (write-through -> _finish_write_through_ack ->
+    # write_backup_storage). Already host-backed nodes are pushed to
+    # storage directly -- the store is content-addressed, so re-writing
+    # an existing key is a no-op-equivalent, never a corruption.
+    for n in chain:
+        if not n.backuped:
+            if n.evicted:
+                raise SessionHandoverError(
+                    f"radix node {n.id} is device-evicted but not "
+                    "host-backed; this cannot happen under write_through "
+                    "-- refusing to guess the state"
+                )
+            tree.write_backup(n)
+        else:
+            tree.write_backup_storage(n)
+    drain_storage(tree, deadline_s)
+
+    kv_keys: List[str] = []
+    for n in chain:
+        if not n.hash_value:
+            raise SessionHandoverError(
+                f"radix node {n.id} carries no page hashes after the "
+                "drain; storage keying is incomplete -- export refused"
+            )
+        kv_keys.extend(n.hash_value)
+    if len(kv_keys) != len(token_ids):
+        raise SessionHandoverError(
+            f"page-hash count ({len(kv_keys)}) != token count "
+            f"({len(token_ids)}) at page_size == 1 -- bigram/page "
+            "alignment mismatch, refusing to guess the mapping"
+        )
+
+    # ONE source for "does this model carry recurrent state": the
+    # BasePrefixCache capability, which every tree implements. Sniffing a
+    # concrete class's helper (``mamba_archive_transfers`` lives only on
+    # HiMambaRadixCache) silently reports False on the UnifiedRadixCache
+    # that --enable-hierarchical-cache actually builds for a hybrid SSM
+    # model -- and a False here disables the #212 gate on BOTH sides, so
+    # the recurrent state never travels and the destination re-prefills a
+    # WRONG session. That is the exact failure this gate exists to catch.
+    hybrid_gdn = bool(tree.supports_mamba())
+    mamba_key = f"{kv_keys[-1]}.mamba" if hybrid_gdn else None
+
+    exists = backend_exists_fn(tree)
+    controller = tree.cache_controller
+    draft_keys = (
+        [k for k in (f"{h}.draft" for h in kv_keys) if exists(k)]
+        if getattr(controller, "has_draft", False)
+        else []
+    )
+
+    args = scheduler.server_args
+    storage_config = getattr(controller, "storage_config", None)
+    manifest = build_manifest(
+        handover_id=snapshot_id,
+        model_identity_hash=identity_hash,
+        token_ids=token_ids,
+        kv_keys=kv_keys,
+        mamba_key=mamba_key,
+        hybrid_gdn=hybrid_gdn,
+        draft_keys=draft_keys,
+        tp_size=args.tp_size,
+        tp_rank=0,
+        dcp_owner_mode=bool(getattr(storage_config, "dcp_owner_mode", False)),
+        page_size=args.page_size,
+    )
+    validate_manifest_completeness(manifest, exists)
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # Scheduler adapter
 # ---------------------------------------------------------------------------
 
@@ -337,15 +541,13 @@ class SessionHandoverRuntime:
 
     # -- control dispatch ----------------------------------------------------
 
-    def handle(self, recv_req: "SessionHandoverReqInput") -> "SessionHandoverReqOutput":
+    def handle(self, recv_req: SessionHandoverReqInput) -> SessionHandoverReqOutput:
         from sglang.srt.managers.io_struct import SessionHandoverReqOutput
 
         try:
             action = recv_req.action
             if action == "export":
-                manifest = self._export(
-                    recv_req.token_ids or [], recv_req.deadline_s
-                )
+                manifest = self._export(recv_req.token_ids or [], recv_req.deadline_s)
                 return SessionHandoverReqOutput(
                     success=True,
                     message=f"exported handover {manifest['handover_id']}",
@@ -383,18 +585,7 @@ class SessionHandoverRuntime:
     # -- shared bits ----------------------------------------------------------
 
     def _storage_preconditions(self):
-        tree = self.scheduler.tree_cache
-        if not getattr(tree, "enable_storage", False):
-            raise SessionHandoverError(
-                "hierarchical cache with a storage backend is required "
-                "(--enable-hierarchical-cache --hicache-storage-backend file)"
-            )
-        if self.scheduler.server_args.hicache_storage_backend != "file":
-            raise SessionHandoverError(
-                "session handover supports the 'file' storage backend only "
-                "(the same limit the offline flow carries)"
-            )
-        return tree
+        return storage_preconditions(self.scheduler)
 
     def _identity(self) -> str:
         if self._identity_hash is None:
@@ -408,8 +599,7 @@ class SessionHandoverRuntime:
         return self._identity_hash
 
     def _backend_exists(self, tree) -> Callable[[str], bool]:
-        backend = tree.cache_controller.storage_backend
-        return lambda key: bool(backend.exists(key))
+        return backend_exists_fn(tree)
 
     # -- export (QUIESCE + SNAPSHOT) ------------------------------------------
 
@@ -478,135 +668,17 @@ class SessionHandoverRuntime:
         return manifest
 
     def _snapshot(self, tree, record, token_ids, deadline_s: float) -> Dict:
-        from array import array
-
-        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-
-        # RadixKey.match asserts both sides carry the SAME sequence type, and
-        # every key already in the tree was built from the scheduler's
-        # array("q") fill ids. token_ids arrives over the control plane as a
-        # plain JSON list, so it must be converted here -- a list would abort
-        # the match with a bare AssertionError instead of matching the prefix.
-        result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-        )
-        matched = len(result.device_indices) + (result.host_hit_length or 0)
-        if matched < len(token_ids):
-            raise SessionHandoverError(
-                f"only {matched} of {len(token_ids)} tokens are resident in "
-                "the radix tree; a handover carries what the tree holds, "
-                "nothing less -- refusing a partial session. (For a hybrid "
-                "GDN model the resumable length is the deepest GDN "
-                "checkpoint; hand over at that boundary.)"
-            )
-
-        # Chain root -> leaf.
-        chain = []
-        node = result.last_host_node
-        while node is not tree.root_node and node is not None:
-            chain.append(node)
-            node = node.parent
-        chain.reverse()
-        if not chain:
-            raise SessionHandoverError("prefix matched no radix node")
-
-        # SNAPSHOT: force host backup for nodes that never crossed the
-        # write-through threshold; storage backup follows automatically on
-        # the ack (write-through -> _finish_write_through_ack ->
-        # write_backup_storage). Already host-backed nodes are pushed to
-        # storage directly -- the store is content-addressed, so re-writing
-        # an existing key is a no-op-equivalent, never a corruption.
-        for n in chain:
-            if not n.backuped:
-                if n.evicted:
-                    raise SessionHandoverError(
-                        f"radix node {n.id} is device-evicted but not "
-                        "host-backed; this cannot happen under write_through "
-                        "-- refusing to guess the state"
-                    )
-                tree.write_backup(n)
-            else:
-                tree.write_backup_storage(n)
-        self._drain_storage(tree, deadline_s)
-
-        kv_keys: List[str] = []
-        for n in chain:
-            if not n.hash_value:
-                raise SessionHandoverError(
-                    f"radix node {n.id} carries no page hashes after the "
-                    "drain; storage keying is incomplete -- export refused"
-                )
-            kv_keys.extend(n.hash_value)
-        if len(kv_keys) != len(token_ids):
-            raise SessionHandoverError(
-                f"page-hash count ({len(kv_keys)}) != token count "
-                f"({len(token_ids)}) at page_size == 1 -- bigram/page "
-                "alignment mismatch, refusing to guess the mapping"
-            )
-
-        # ONE source for "does this model carry recurrent state": the
-        # BasePrefixCache capability, which every tree implements. Sniffing a
-        # concrete class's helper (``mamba_archive_transfers`` lives only on
-        # HiMambaRadixCache) silently reports False on the UnifiedRadixCache
-        # that --enable-hierarchical-cache actually builds for a hybrid SSM
-        # model -- and a False here disables the #212 gate on BOTH sides, so
-        # the recurrent state never travels and the destination re-prefills a
-        # WRONG session. That is the exact failure this gate exists to catch.
-        hybrid_gdn = bool(tree.supports_mamba())
-        mamba_key = f"{kv_keys[-1]}.mamba" if hybrid_gdn else None
-
-        exists = self._backend_exists(tree)
-        controller = tree.cache_controller
-        draft_keys = (
-            [k for k in (f"{h}.draft" for h in kv_keys) if exists(k)]
-            if getattr(controller, "has_draft", False)
-            else []
-        )
-
-        args = self.scheduler.server_args
-        storage_config = getattr(controller, "storage_config", None)
-        manifest = build_manifest(
-            handover_id=record.handover_id,
-            model_identity_hash=self._identity(),
+        return export_session_snapshot(
+            self.scheduler,
+            tree,
+            snapshot_id=record.handover_id,
             token_ids=token_ids,
-            kv_keys=kv_keys,
-            mamba_key=mamba_key,
-            hybrid_gdn=hybrid_gdn,
-            draft_keys=draft_keys,
-            tp_size=args.tp_size,
-            tp_rank=0,
-            dcp_owner_mode=bool(getattr(storage_config, "dcp_owner_mode", False)),
-            page_size=args.page_size,
+            identity_hash=self._identity(),
+            deadline_s=deadline_s,
         )
-        validate_manifest_completeness(manifest, exists)
-        return manifest
 
     def _drain_storage(self, tree, deadline_s: float) -> None:
-        """Bounded drain of the write-through and storage-backup pipelines
-        (#259/#312 discipline: a deadline, then a loud error -- and the
-        caller rolls the park back, never a wedged session)."""
-        controller = tree.cache_controller
-        deadline = time.monotonic() + max(1.0, float(deadline_s))
-        while time.monotonic() < deadline:
-            tree.writing_check()
-            tree.drain_storage_control_queues()
-            if (
-                len(tree.ongoing_write_through) == 0
-                and len(tree.ongoing_backup) == 0
-                and controller.backup_queue.qsize() == 0
-                and controller.ack_backup_queue.qsize() == 0
-            ):
-                return
-            time.sleep(0.02)
-        raise SessionHandoverError(
-            "storage drain did not complete within "
-            f"{deadline_s:.1f}s: ongoing_write={len(tree.ongoing_write_through)} "
-            f"ongoing_backup={len(tree.ongoing_backup)} "
-            f"backup_queue={controller.backup_queue.qsize()} "
-            f"ack_backup_queue={controller.ack_backup_queue.qsize()} -- "
-            "export rolled back; retry with a larger deadline_s"
-        )
+        drain_storage(tree, deadline_s)
 
     # -- destination side (RESTORE gate) --------------------------------------
 

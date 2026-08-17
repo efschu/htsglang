@@ -161,6 +161,10 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionCheckpointReqInput,
+    SessionCheckpointReqOutput,
+    SessionHandoverReqInput,
+    SessionHandoverReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -582,6 +586,10 @@ class Scheduler(
         # admission hook in handle_generate_request is a no-op while this
         # is None or while no handover is active.
         self.session_handover_runtime = None
+        # #410 session checkpoint runtime: None on every default path;
+        # built lazily on the first /session/... control request, and
+        # only when --enable-session-checkpoints is set.
+        self.session_checkpoint_runtime = None
         # #330 VRAM dial / KV capacity runtime: None on every default path;
         # built lazily on the first scheduler iteration when
         # --enable-vram-dial is set.
@@ -2183,6 +2191,7 @@ class Scheduler(
                 (KvReshardReqInput, self.handle_kv_reshard),
                 (PhaseFlipReqInput, self.handle_phase_flip),
                 (SessionHandoverReqInput, self.handle_session_handover),
+                (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -8002,6 +8011,23 @@ class Scheduler(
 
             self.session_handover_runtime = SessionHandoverRuntime(self)
         return self.session_handover_runtime.handle(recv_req)
+
+    def handle_session_checkpoint(
+        self, recv_req: SessionCheckpointReqInput
+    ) -> SessionCheckpointReqOutput:
+        """#410 control plane: session checkpoint / branch / rewind.
+
+        Runs on the scheduler thread between iterations, so the snapshot,
+        the lock reference and the session splice are all atomic with
+        respect to the radix tree. Rank-local; no collective is issued.
+        """
+        if self.session_checkpoint_runtime is None:
+            from sglang.srt.managers.session_checkpoint import (
+                SessionCheckpointRuntime,
+            )
+
+            self.session_checkpoint_runtime = SessionCheckpointRuntime(self)
+        return self.session_checkpoint_runtime.handle(recv_req)
 
     def handle_kv_reshard(self, recv_req: KvReshardReqInput) -> KvReshardReqOutput:
         """#297 control plane: arm a phase-boundary KV reshard.

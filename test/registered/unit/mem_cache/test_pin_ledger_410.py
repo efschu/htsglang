@@ -32,7 +32,14 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_page_store import sweep_partials
+try:
+    from sglang.srt.mem_cache.canonical_page_store import sweep_partials
+except ImportError:  # canonical_page_store is not in this lineage (#411 recon)
+    # The pinned-partial protection is an integration with the canonical page
+    # store, which the adopted #410 lineage does not carry. Skipped rather than
+    # deleted so it lights up by itself the day that store is ported, instead
+    # of being a gap nobody remembers to re-test.
+    sweep_partials = None
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.pin_ledger import (
     PinBudgetExceeded,
@@ -256,6 +263,7 @@ class TestSweeperRespectsPins(CustomTestCase):
         os.utime(path, (stamp, stamp))
         return path
 
+    @unittest.skipIf(sweep_partials is None, "canonical_page_store not in this lineage")
     def test_a_pinned_pages_partial_is_not_reaped(self):
         """Age cannot tell an abandoned partial from one a checkpoint is
         waiting on; a pin can."""
@@ -270,6 +278,7 @@ class TestSweeperRespectsPins(CustomTestCase):
         self.assertTrue(os.path.exists(pinned))
         self.assertFalse(os.path.exists(loose))
 
+    @unittest.skipIf(sweep_partials is None, "canonical_page_store not in this lineage")
     def test_without_pins_the_sweeper_is_unchanged(self):
         loose = self._old_partial("bb_loose")
         self.assertEqual(sweep_partials(self.root, older_than_s=3600), 1)

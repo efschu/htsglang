@@ -149,6 +149,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
+    SessionCheckpointReqInput,
+    SessionHandoverReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
@@ -1274,6 +1276,97 @@ async def session_handover(
     except Exception as e:
         return _create_error_response(e)
     body = {"success": ret.success, "message": ret.message}
+    if ret.manifest_json:
+        body["manifest"] = json.loads(ret.manifest_json)
+    return ORJSONResponse(
+        body, status_code=200 if ret.success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.api_route("/session/{session_id}/checkpoint", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_checkpoint_create(
+    session_id: str,
+    obj: Annotated[Optional[SessionCheckpointReqInput], Body()] = None,
+    request: Request = None,
+):
+    """#410: freeze this session -- KV pages AND GDN/Mamba state -- and return
+    a checkpoint id it can later be branched or rewound to WITHOUT
+    re-prefilling. The snapshot is #261's; the tier it lands on comes from the
+    #407 memory-tier registry (VRAM -> RAM -> Disk by age, provenance
+    labelled, named refusal when nothing is admissible). Ids are
+    content-addressed, so checkpointing an unchanged prefix is idempotent."""
+    return await _session_checkpoint_call(
+        obj, action="checkpoint", session_id=session_id
+    )
+
+
+@app.api_route("/session/{session_id}/branch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_checkpoint_branch(
+    session_id: str,
+    obj: Annotated[Optional[SessionCheckpointReqInput], Body()] = None,
+    request: Request = None,
+):
+    """#410: open a NEW session that continues from ``checkpoint_id``. Nothing
+    is copied -- the branch shares the checkpoint's radix nodes and the tree
+    splits where it diverges. The response reports the page-sharing
+    accounting."""
+    return await _session_checkpoint_call(obj, action="branch", session_id=session_id)
+
+
+@app.api_route("/session/{session_id}/rewind", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_checkpoint_rewind(
+    session_id: str,
+    obj: Annotated[Optional[SessionCheckpointReqInput], Body()] = None,
+    request: Request = None,
+):
+    """#410: move this session's continuation point back to ``checkpoint_id``.
+    Refused while the session has a request in flight. The tokens beyond the
+    checkpoint stay in the radix tree as ordinary cached pages."""
+    return await _session_checkpoint_call(obj, action="rewind", session_id=session_id)
+
+
+@app.api_route("/session/{session_id}/checkpoints", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_checkpoint_list(session_id: str, request: Request = None):
+    """#410: the checkpoints taken of this session, oldest first."""
+    return await _session_checkpoint_call(None, action="list", session_id=session_id)
+
+
+async def _session_checkpoint_call(
+    obj: Optional[SessionCheckpointReqInput], *, action: str, session_id: str
+):
+    """One call shape for every #410 route. The path parameter is the session
+    id -- a body that disagrees with the URL is refused rather than silently
+    preferring one of them."""
+    obj = obj if obj is not None else SessionCheckpointReqInput(action=action)
+    if obj.session_id and obj.session_id != session_id:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": (
+                    f"body session_id {obj.session_id!r} disagrees with the URL "
+                    f"{session_id!r}; refusing to guess which one was meant"
+                ),
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    obj.action = action
+    obj.session_id = session_id
+    try:
+        ret = await _global_state.tokenizer_manager.session_checkpoint(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    body = {
+        "success": ret.success,
+        "message": ret.message,
+        "checkpoint_id": ret.checkpoint_id,
+        "session_id": ret.session_id,
+    }
+    if ret.info:
+        body["info"] = ret.info
     if ret.manifest_json:
         body["manifest"] = json.loads(ret.manifest_json)
     return ORJSONResponse(

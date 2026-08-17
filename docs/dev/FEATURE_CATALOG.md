@@ -1010,6 +1010,15 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   positive `MemTierIsNowWiredTest`, which pins the module-scope import and
   pins that a priced target is a `TierId` and not one of the three
   hand-written `PARK_TARGETS` strings.
+  provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
+  (audit #421 + #410): exactly ONE production consumer — #410's session
+  checkpoints, through `memtier/consumers.py` (`checkpoint_tier_targets`, the
+  write-path selection helper, memtier cut 3 credit). "All consumers pick
+  targets from it" remains the TARGET rule: the PRE-EXISTING offload/spill
+  paths (#286 register, #394 cold tier) still carry their own target lists,
+  and migrating them is cuts 4/5. The #421 pin test
+  (`test_unwired_features_421.py`) no longer asserts "zero consumers"; it pins
+  the #410 CALL SITE, so an unreached registry cannot come back unnoticed.
   Slice 1b (#407 / directive #434) made it hardware-general:
   `TierRegistry.for_machine()` fingerprints the box from NVML UUIDs (#397
   canon), applies a stored profile ONLY at the scope its hardware match
@@ -1179,6 +1188,46 @@ checks manifest version, model identity and blob presence only (:266-292); a
 booted TP>1 destination simply misses the blobs and is told to run the offline
 manifest-scoped umsharder for its geometry first, live handover does not do
 that reshape in-process.
+
+**Server-side conversation checkpoints, branching and rewind** (#410) reuse
+that same export: a checkpoint IS a handover snapshot whose destination is a
+storage TIER instead of a peer group, so there is exactly ONE session
+serialization in the fork (the versioned #261 manifest, additively extended
+with a `checkpoint` envelope; the task ledger also names it as #411's
+portable-session format). `POST /session/{id}/checkpoint` freezes KV pages AND
+the GDN blob (#212 gate inherited, keyed on `supports_mamba()`);
+`/session/{id}/branch` opens a new session from it and `/session/{id}/rewind`
+moves an existing one back, both WITHOUT re-prefilling. Branching copies
+nothing — the radix tree already shares a common prefix and splits at the
+divergence point, so #410 adds only the `inc_lock_ref` pin there, and the
+reported accounting asserts `copied_pages == 0`.
+**TWO TIERS OF PIN, and they are not interchangeable.** `inc_lock_ref` protects
+the radix chain IN MEMORY for the life of the process; the referenced pages
+still sit in the HiCache file store as ordinary LRU entries, so a checkpoint
+with only that pin survives radix eviction and does NOT survive file-tier
+eviction or a restart. `take_file_tier_pins`
+(`managers/session_checkpoint.py`) takes the second tier through the #410 pin
+ledger (`mem_cache/pin_ledger.py`, honoured by `LRUFileEvictor`), and raises
+`PinCoverageIncomplete` naming the references it could not pin -- answering "are
+this checkpoint's pages on the file tier at all" at CHECKPOINT time rather than
+letting the shortfall surface at the branch. A checkpoint placed by #407 on
+vram/host has no file tier and is logged as unprotected, not refused.
+The file evictor charges **ALLOCATED** bytes (`max(st_blocks*512, st_size)`),
+the same unit the pin ledger charges, so `reclaimable = used - pinned` is a
+coherent subtraction; `stats()` reports `accounting_overshoot_bytes` if the two
+ever diverge again. The tier comes from the #407 registry
+(VRAM → RAM → Disk by age/durability, provenance-labelled, named refusal when
+nothing is admissible). Restore is #261's `verify_import` (#241 identity) plus
+a geometry gate; cross-geometry is a NAMED refusal pointing at the offline
+umsharder, never a silent conversion. Same v1 limits as #261: TP=1/PP=1,
+`page_size == 1`, `file` backend; plus `--hicache-mem-layout page_head`
+refused by name, because its host write-back is the `lf_ph` route that
+segfaults (#441a) and a checkpoint writes a whole session through it.
+Behind `--enable-session-checkpoints`
+(default off). BOOT-PENDING: the byte gate in
+`docs/dev/DESIGN_410_session_checkpoints.md` §8 (resume trajectory vs
+never-paused reference, branch-then-continue vs fresh-prefill,
+parent-untouched) has NOT been run — nothing in #410 has executed on a GPU.
 
 Also wired on the tip but easy to miss (audit #421): the regime-controller
 gate machinery, KV-pressure rung-dependency refusals, the hibernate flag
@@ -2839,6 +2888,9 @@ an ASR intelligibility round trip, and shortening the first synthesized unit
 open-weight model does DE<->ES with speaker preservation (Hibiki fr->en only,
 StreamSpeech X->en, Seamless fixed synthetic voice, Qwen3-Omni three preset
 voices) — so the cascade is the only architecture meeting the requirement.
+scheduling, admission throttle, prefill delayer; training tenant + idle
+workbench (ledger + pause rung); `/session_handover`; `/kv_reshard`;
+`/session/{id}/checkpoint|branch|rewind|checkpoints` (#410).
 
 ## 14. Dashboard
 Guided config wizard whose refusals each cite their source and which never emits

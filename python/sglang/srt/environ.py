@@ -952,6 +952,9 @@ class Envs:
     # surviving rank raises HiCacheCollectiveTimeoutError instead. <= 0 restores
     # the unbounded blocking wait.
     SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S = EnvFloat(600.0)
+    # #410: the pin budget, 0 = unbounded. Read once when the store builds
+    # its PinLedger; a checkpoint that would cross it is refused by name.
+    SGLANG_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

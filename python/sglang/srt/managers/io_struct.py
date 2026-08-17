@@ -1500,6 +1500,49 @@ class SessionHandoverReqOutput(BaseReq, kw_only=True):
     manifest_json: Optional[str] = None
 
 
+class SessionCheckpointReqInput(BaseReq, kw_only=True):
+    """#410: server-side conversation checkpoints, branching and rewind.
+
+    A checkpoint freezes a session's KV pages AND its GDN/Mamba state through
+    the #261 snapshot, writing them to a memory tier the #407 registry picks.
+    Branch and rewind then restore from it WITHOUT re-prefilling.
+
+    ``action`` is one of:
+    - ``checkpoint``: snapshot ``session_id`` (or the explicit ``token_ids``
+      prefix of it) and return the checkpoint id. Ids are content-addressed,
+      so checkpointing an unchanged prefix twice is idempotent.
+    - ``branch``: open a NEW session (``new_session_id``, or a generated one)
+      that continues from ``checkpoint_id``. The shared prefix is not copied;
+      the radix tree splits where the branch diverges.
+    - ``rewind``: move ``session_id``'s continuation point back to
+      ``checkpoint_id``. Refused while the session has a request in flight.
+    - ``list``: the checkpoints of ``session_id``, or all of them.
+    - ``drop``: forget ``checkpoint_id``; refused while sessions derive
+      from it.
+
+    ``durable`` makes the checkpoint ``PERSISTENCE_REQUIRED``, so only a tier
+    that survives process exit may hold it.
+    """
+
+    action: str
+    session_id: Optional[str] = None
+    checkpoint_id: Optional[str] = None
+    new_session_id: Optional[str] = None
+    token_ids: Optional[List[int]] = None
+    label: Optional[str] = None
+    durable: bool = False
+    deadline_s: float = 30.0
+
+
+class SessionCheckpointReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    checkpoint_id: Optional[str] = None
+    session_id: Optional[str] = None
+    manifest_json: Optional[str] = None
+    info: Optional[dict] = None
+
+
 class VramBudgetReqInput(BaseReq, kw_only=True):
     """#330: dial one card's VRAM budget at runtime, or query the dial state.
 

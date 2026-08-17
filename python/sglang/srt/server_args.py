@@ -5624,6 +5624,42 @@ class ServerArgs:
             "stands and behaviour is byte-identical.",
         ),
     ] = False
+    enable_session_checkpoints: A[
+        bool,
+        Arg(
+            help="Server-side conversation checkpoints (#410): POST "
+            "/session/{id}/checkpoint freezes a session's KV pages AND its "
+            "GDN/Mamba state, and /session/{id}/branch and "
+            "/session/{id}/rewind restore from it WITHOUT re-prefilling. The "
+            "snapshot is #261's live-handover export (one session "
+            "serialization in this fork, versioned manifest); the tier it "
+            "lands on comes from the #407 memory-tier registry. Requires "
+            "--enable-hierarchical-cache with --hicache-storage-backend file, "
+            "page_size 1, and a TP=1 / PP=1 server -- a TP>1 checkpoint needs "
+            "the per-rank manifest merging named as #261's follow-up and is "
+            "refused by name. Default: off; the control routes then refuse "
+            "and nothing else in the server changes.",
+        ),
+    ] = False
+    session_checkpoint_vram_max_age_s: A[
+        float,
+        Arg(
+            help="#410 tier demotion: beyond this age a session checkpoint "
+            "stops competing for device VRAM and the #407 registry is asked "
+            "for host/filesystem tiers only. Policy, not a measurement. Only "
+            "read when --enable-session-checkpoints is set.",
+        ),
+    ] = 60.0
+    session_checkpoint_host_max_age_s: A[
+        float,
+        Arg(
+            help="#410 tier demotion: beyond this age a session checkpoint "
+            "must rest on a tier that survives process exit (payload class "
+            "PERSISTENCE_REQUIRED), so host RAM stops being admissible. "
+            "Policy, not a measurement. Only read when "
+            "--enable-session-checkpoints is set.",
+        ),
+    ] = 900.0
     enable_vram_dial: A[
         bool,
         Arg(
@@ -6403,6 +6439,9 @@ class ServerArgs:
         # water marks and the asymmetric windows at argument time (a typo
         # fails the boot, not the first pressure boundary).
         self._handle_kv_pressure_ladder()
+
+        # #410 session checkpoints: HiCache dependency and age ladder.
+        self._handle_session_checkpoints()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -8157,6 +8196,65 @@ class ServerArgs:
             raise ValueError(
                 f"--admission-release-hysteresis must be >= 1, got "
                 f"{self.admission_release_hysteresis}."
+            )
+
+    def _handle_session_checkpoints(self):
+        """#410: fail fast on an unusable session-checkpoint configuration.
+
+        The runtime repeats every one of these as a named refusal on the
+        control route, because a server can be reconfigured after boot;
+        failing here means a misconfigured launch never reaches the point
+        where a user believes their conversation was checkpointed and finds
+        out later that it was not. With the flag unset nothing in this
+        method runs and no other argument changes meaning."""
+        if not self.enable_session_checkpoints:
+            return
+        if not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-session-checkpoints requires "
+                "--enable-hierarchical-cache: a checkpoint is written "
+                "through the HiCache store."
+            )
+        if self.hicache_storage_backend != "file":
+            raise ValueError(
+                "--enable-session-checkpoints requires "
+                "--hicache-storage-backend file (got "
+                f"{self.hicache_storage_backend!r}); the same limit the "
+                "#261 handover flow carries."
+            )
+        if self.hicache_mem_layout == "page_head":
+            # #441a: page_head's host write-back dispatches to
+            # transfer_kv_all_layer_lf_ph, which segfaults. A checkpoint
+            # writes a whole session to the host tier, so it would take that
+            # route for every page rather than occasionally.
+            raise ValueError(
+                "--enable-session-checkpoints is incompatible with "
+                "--hicache-mem-layout page_head: its host write-back takes "
+                "the transfer_kv_all_layer_lf_ph route, which segfaults "
+                "(#441a). Use page_first / page_first_direct (direct IO "
+                "reaches transfer_kv_all_layer_direct_lf_pf, #436) or "
+                "layer_first."
+            )
+        for name in (
+            "session_checkpoint_vram_max_age_s",
+            "session_checkpoint_host_max_age_s",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} must be >= 0, got "
+                    f"{getattr(self, name)}."
+                )
+        if (
+            self.session_checkpoint_host_max_age_s
+            < self.session_checkpoint_vram_max_age_s
+        ):
+            raise ValueError(
+                "--session-checkpoint-host-max-age-s "
+                f"({self.session_checkpoint_host_max_age_s}) must be >= "
+                "--session-checkpoint-vram-max-age-s "
+                f"({self.session_checkpoint_vram_max_age_s}): the ladder "
+                "demotes VRAM -> RAM -> disk, so the host threshold "
+                "cannot come first."
             )
 
     def _handle_kv_pressure_ladder(self):

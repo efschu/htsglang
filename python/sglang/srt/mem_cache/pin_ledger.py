@@ -78,6 +78,13 @@ class PinResult:
     stems: tuple[str, ...]
     bytes_added: int
     bytes_shared: int  # already pinned by another checkpoint
+    #: References the CALLER asked to pin that were not pinned, because their
+    #: file was not there when the sizes were taken (``stems_with_sizes``
+    #: drops those deliberately -- see its docstring). Empty on the normal
+    #: path. Carried here so a caller can compare what it asked for against
+    #: what it got; without it a partial pin is indistinguishable from a whole
+    #: one, and the shortfall only shows up at the branch that needed it.
+    unpinned: tuple[str, ...] = ()
 
 
 class PinLedger:

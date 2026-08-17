@@ -727,6 +727,17 @@ class HiCacheFile(HiCacheStorage):
         # they share the configured byte budget; under MLA / dcp owner mode only
         # rank 0 writes, so it gets the whole budget.
         writer_count = 1 if is_mla_model else max(1, tp_size)
+        # #410: the pin ledger, built BEFORE the evictor because the evictor
+        # must never run a single pass without it -- a checkpoint's pages are
+        # protected from the first eviction or the protection is a promise with
+        # a hole in it. Durable, because a checkpoint outlives the process.
+        from sglang.srt.mem_cache.pin_ledger import PinLedger
+
+        self.pins = PinLedger(
+            self.file_path,
+            budget_bytes=int(envs.SGLANG_HICACHE_PIN_BUDGET_BYTES.get() or 0),
+        )
+        self.pins.load()
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -741,6 +752,60 @@ class HiCacheFile(HiCacheStorage):
             iter_existing=self._iter_existing_files,
             pins=self.pins,
         )
+
+    def _pin_path(self, stem: str) -> str:
+        """Where ``stem`` lives in THIS lineage's flat layout.
+
+        RE-PORTED for this lineage (#410 reconciliation onto the 0817 train).
+        The reconciliation wrote this as a flat join because the branch it came
+        from had no sharding. THIS store shards (#558), so a flat join names a
+        path it never writes: `pin_checkpoint` would drop every stem as
+        "missing" and pin nothing while reporting success, and a test that
+        removes `_pin_path(stem)` gets FileNotFoundError.
+
+        The property the reconciliation actually asked for is preserved, and it
+        is the one that matters: the ledger must stat EXACTLY what the evictor
+        unlinks. Both now resolve through ``_existing_path`` -- sharded, else
+        legacy flat, else the path it would be written to -- so there is one
+        join, whatever the layout.
+        """
+        return self._existing_path(stem)
+
+
+    def pin_checkpoint(self, checkpoint_id: str, keys: List[str]):
+        """Pin every store object a checkpoint references (#410 slice 2).
+
+        Translates CONTENT keys -- what a manifest holds -- into the suffixed
+        stems the evictor indexes, so the manifest never has to know the
+        store's key layout and the ledger never has to guess a size.
+
+        Reports what it could NOT pin. ``stems_with_sizes`` drops a stem whose
+        file is gone, which is right for the budget and invisible to the
+        caller; recording it here, where the CONTENT key is still known, is
+        what lets a create refuse by name instead of leaving the shortfall to
+        surface at the branch.
+        """
+        import dataclasses
+
+        from sglang.srt.mem_cache.pin_ledger import stems_with_sizes
+
+        pairs = []
+        missing: List[str] = []
+        for key in keys:
+            stem = self._get_suffixed_key(key)
+            path = self._pin_path(stem)
+            pairs.append((stem, path))
+            if not os.path.exists(path):
+                missing.append(key)
+        result = self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+        return dataclasses.replace(result, unpinned=tuple(missing))
+
+    def unpin_checkpoint(self, checkpoint_id: str) -> int:
+        """Release a checkpoint's pins, returning the bytes actually freed."""
+        return self.pins.unpin(checkpoint_id)
+
+    def pin_stats(self) -> dict:
+        return self.pins.ledger()
 
     # Longest filename most Linux filesystems accept, in bytes.
     _NAME_MAX = 255
@@ -922,27 +987,8 @@ class HiCacheFile(HiCacheStorage):
             ):
                 self.metadata_cache.add(stem)
 
-    def pin_checkpoint(self, checkpoint_id: str, keys: List[str]):
-        """Pin every store object a checkpoint references (#410 slice 2).
 
-        Translates CONTENT keys -- what a manifest holds -- into the suffixed
-        stems the evictor indexes, so the manifest never has to know the
-        store's key layout and the ledger never has to guess a size.
-        """
-        from sglang.srt.mem_cache.pin_ledger import stems_with_sizes
 
-        pairs = []
-        for key in keys:
-            stem = self._get_suffixed_key(key)
-            pairs.append((stem, self._existing_path(stem)))
-        return self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
-
-    def unpin_checkpoint(self, checkpoint_id: str) -> int:
-        """Release a checkpoint's pins, returning the bytes actually freed."""
-        return self.pins.unpin(checkpoint_id)
-
-    def pin_stats(self) -> dict:
-        return self.pins.ledger()
 
     def _canonical_space_check(self, need_bytes: int) -> None:
         """Refuse a canonical write that would take the store below the floor."""

@@ -269,6 +269,55 @@ class TestDrafterParkHasNoCaller(CustomTestCase):
 # pinned here: the OTHER consumers (expert offload, the #394 cold tier, the
 # rest of the #286 park-target ladder) still carry their own target lists.
 # One consumer is not the reconciliation.
+# #421 finding F6 -- "the memtier registry has zero production consumers" --
+# was FIXED by #410 (server-side session checkpoints), which resolves its
+# checkpoint tier through ``memtier.consumers.checkpoint_tier_targets`` on a
+# real control request. The inverted pin that asserted the absence is
+# therefore retired, and replaced below by the POSITIVE pin that keeps the
+# call site from quietly disappearing again -- the same substitution the #394
+# cold tier made when it was wired.
+#
+# The catalog rule ("all new spill/offload consumers must pick targets from
+# it") is still not enforced for the PRE-EXISTING consumers: the #286 offload
+# register and the #394 cold tier both still carry their own target lists,
+# and migrating them is memtier cuts 4 and 5. That remains an open item in
+# ``docs/dev/AUDIT_421_UNWIRED.md``; what changed is only that the rule now
+# has one consumer honouring it instead of none.
+
+
+class TestMemTierRegistryHasItsFirstConsumer(CustomTestCase):
+    """#407 memory-tier registry: #410 picks its checkpoint tier from it.
+
+    Pins the CALL SITE, not the module: a refactor that leaves
+    ``consumers.py`` importable but unreached would restore F6 without
+    failing any other test in the suite, which is exactly how the #197 escape
+    hatch and the #394 apportionment stayed invisible.
+    """
+
+    CONSUMER_MODULE = "sglang.srt.memtier.consumers"
+    EXPECTED_CALLER = "python/sglang/srt/managers/session_checkpoint.py"
+
+    def test_the_checkpoint_runtime_imports_the_consumer_shim(self):
+        importers = _production_importers_of(self.CONSUMER_MODULE, exclude_package=True)
+        self.assertTrue(
+            any(hit.startswith(self.EXPECTED_CALLER) for hit in importers),
+            "#410's checkpoint runtime no longer imports "
+            f"{self.CONSUMER_MODULE}. If the tier selection moved, move this "
+            "pin with it; do NOT delete it -- an unreached registry is #421 "
+            f"finding F6 all over again. Importers found: {importers}",
+        )
+
+    def test_the_checkpoint_runtime_calls_the_selection_helper(self):
+        callers = _production_callers_of(
+            "checkpoint_tier_targets",
+            defining_rel_paths=("python/sglang/srt/memtier/consumers.py",),
+        )
+        self.assertTrue(
+            any(hit.startswith(self.EXPECTED_CALLER) for hit in callers),
+            "nothing in production calls checkpoint_tier_targets any more; "
+            "the #410 checkpoint would then be placing bytes without asking "
+            f"the registry. Callers found: {callers}",
+        )
 
 
 if __name__ == "__main__":

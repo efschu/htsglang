@@ -113,6 +113,11 @@ class LRUFileEvictor:
         self._write_stopped = False
         self._last_free_probe = 0.0
         self._refused_since_stop = 0
+        # #410: the pin ledger, or None. None is the default and every code
+        # path below is written so that a store without one behaves exactly as
+        # it did before pins existed -- this is a protection added to the
+        # evictor, not a change to how it evicts.
+        self._pins = pins
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -261,6 +266,16 @@ class LRUFileEvictor:
             "reclaimable_bytes": max(
                 0,
                 self._total_bytes - (self._pins.pinned_bytes() if self._pins else 0),
+            ),
+            # #411 reconciliation: the overshoot the two accountings could
+            # produce, reported rather than clamped away. It is 0 on this tree
+            # because the evictor and the pin ledger now share ONE unit --
+            # both charge `_allocated_size` -- but a non-zero value here means
+            # they have diverged again, and a silent max(0, ...) would make an
+            # incoherent ledger look like a full store.
+            "accounting_overshoot_bytes": max(
+                0,
+                (self._pins.pinned_bytes() if self._pins else 0) - self._total_bytes,
             ),
         }
 
@@ -436,8 +451,13 @@ class LRUFileEvictor:
     def commit(self, suffixed_key: str) -> None:
         """Mark a reserved write as durably on disk (clears its in-flight flag).
 
-        The reservation was an estimate; the file now exists, so replace it with
-        the allocation the filesystem actually made.
+        RECONCILE HERE, because ``reserve`` could only estimate. A reservation
+        is taken before the file exists, so it charges the payload length --
+        the only number available then. Once the write has landed the
+        filesystem's own answer is available, and on a filesystem that
+        allocates in blocks it is larger: a 64-byte page occupies 512 bytes on
+        ZFS. Correcting at commit is what keeps ``_total_bytes`` in allocated
+        units without making ``reserve`` stat a file that is not there yet.
         """
         if not self._eviction_enabled:
             return
@@ -445,14 +465,14 @@ class LRUFileEvictor:
         try:
             actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
         except OSError:
-            pass
+            pass  # gone or unreadable; keep the reservation's estimate
         with self._lock:
             self._pending_writes.discard(suffixed_key)
-            if actual is not None and suffixed_key in self._lru:
-                reserved = self._lru[suffixed_key]
-                if actual != reserved:
+            if actual is not None:
+                prev = self._lru.get(suffixed_key)
+                if prev is not None and prev != actual:
                     self._lru[suffixed_key] = actual
-                    self._total_bytes += actual - reserved
+                    self._total_bytes += actual - prev
 
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
@@ -472,7 +492,9 @@ class LRUFileEvictor:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)
                 return
-        # Untracked file: stat without holding the lock.
+        # Untracked file: stat without holding the lock. Charged at its
+        # ALLOCATED cost like every other entry -- adopting it at apparent
+        # length would reintroduce the undercount one file at a time.
         try:
             size = self._allocated_size(os.stat(tensor_path))
         except OSError:
@@ -630,6 +652,12 @@ class LRUFileEvictor:
             self._lru[stem] = size
             self._total_bytes += size
 
+    def _path_for_stem(self, stem: str) -> str:
+        """The file this stem names. One join, so the evictor, the
+        accounting and the pin ledger all stat the same path."""
+        return os.path.join(self.file_path, f"{stem}.bin")
+
+
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.
 
@@ -651,13 +679,19 @@ class LRUFileEvictor:
             self._lru[evict_stem] = evict_size
             return "skipped", 0
         if self._pins is not None and self._pins.is_pinned(evict_stem):
-            # #410: a conversation checkpoint references this page. The same
-            # skip-and-repin step an in-flight write gets, deliberately: it
-            # reuses the bounded skip budget in _evict_while, so a store whose
-            # entries are ALL pinned cannot spin -- it exhausts its attempts and
-            # the caller learns the space is not there rather than looping.
+            # #410: a pinned page belongs to a conversation checkpoint that
+            # paid to keep it. Same skip-and-repin an in-flight write gets, and
+            # deliberately so: a store whose entries are ALL pinned cannot spin
+            # here -- it exhausts the caller's attempts and the caller learns
+            # the space is not there, rather than looping forever.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
+        # The INJECTED resolver, not a flat join: this backend hands the
+        # evictor `path_for_stem=self._existing_path`, which knows the sharded
+        # layout. A flat join here misses the file, `os.remove` fails, the
+        # entry leaves the LRU and the bytes stay on disk -- the cap silently
+        # stops holding. Line 466 already stats through the same resolver;
+        # these two must not disagree.
         tensor_path = self._path_for_stem(evict_stem)
         try:
             os.remove(tensor_path)
