@@ -347,13 +347,45 @@ prove the reach and tell us what the node pack would need to do differently).
 The decision is the user's; this section exists so it can be made on the shape
 of the work rather than on the name.
 
-### The adjacent gap the brief asked about
+### The adjacent gap the brief asked about — SETTLED
 
-**OpenAI embeddings on a generative-only checkpoint: NOT ESTABLISHED.** The
-route is mounted (`http_server.py:2168`) and forwards to
-`openai_serving_embedding.handle_request`. I did not find a named refusal for
-"this checkpoint cannot embed" in `serving_embedding.py`, but I only grepped it
-— I did not trace the path to its failure mode, and an absence claim needs the
-file:line of the gate that refuses. So this is a CANDIDATE gap, not a finding,
-and it is cheap to settle: one hermetic test asking a generation-only server
-for an embedding and reading what comes back.
+**Outcome: no gate, and the request failed LOUDLY BUT WRONGLY.** Not the
+silent-falseness class -- no garbage vector was ever returned -- but a caller
+asking a generative deployment for an embedding received an **HTTP 500 with a
+stack trace**, which says "this server is broken" when the truth is "this
+checkpoint does not do embeddings". Those provoke very different next actions.
+
+The chain, at code:
+
+* `ModelConfig.is_generation` (`configs/model_config.py:540`, derived by
+  `is_generation_model` at `:2010`) is the authority, and it was ALREADY
+  reachable at the front as `tokenizer_manager.is_generation` -- the HTTP layer
+  reads it at `http_server.py:979` and `:2911`. Nothing had to be invented,
+  which is what the brief asked for.
+* `OpenAIServingEmbedding._validate_request`
+  (`entrypoints/openai/serving_embedding.py:68`) checked encoding format and
+  input shape and **nothing about capability**.
+* `ModelRunner` sets `get_embedding=True` **only when the model is not a
+  generation model** (`model_executor/model_runner.py:4033-4034`), so a
+  generative checkpoint never produces one.
+* `_build_embedding_response` then subscripts it BARE --
+  `ret_item["embedding"]` (`serving_embedding.py:309`) -- while
+  `_handle_non_streaming_request` catches only `ValueError` (`:286`). The
+  resulting `KeyError` is uncaught. **That line pair is the deciding
+  evidence.**
+
+**Fixed** with a named refusal at the front, placed FIRST in `_validate_request`
+-- before the input checks, deliberately: telling someone their input is empty,
+when no input of any shape could have worked, sends them to fix the one thing
+that was never the problem. The refusal names the capability, not the input,
+and routes (`--is-embedding`, `server_args.py:887`).
+
+One pin guards the failure mode from getting WORSE: if
+`ret_item["embedding"]` ever becomes a `.get()` with a default, the 500 turns
+into a silently-empty vector -- the silent-falseness class -- and this gate
+becomes the only thing between a caller and a plausible wrong answer. The test
+asserts the bare subscript is still there, so that change cannot pass
+unnoticed.
+
+With this, **#335's desk surface is exhausted**: every surface in §1 is either
+built, composed, scoped with a recommendation, or settled.

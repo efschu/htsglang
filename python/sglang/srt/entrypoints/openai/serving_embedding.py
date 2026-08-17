@@ -66,7 +66,36 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         return "embd-"
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
-        """Validate that the input is not empty or whitespace only."""
+        """Validate the request against the loaded model and its own shape."""
+        # #335: CAPABILITY FIRST, before anything about the input.
+        #
+        # A generative checkpoint cannot embed. ModelRunner only sets
+        # ``get_embedding`` when the model is NOT a generation model
+        # (model_runner.py:4033), so the result carries no "embedding" key,
+        # and _build_embedding_response subscripts it bare (:309) while the
+        # caller catches only ValueError (:286). The caller therefore received
+        # an HTTP 500 and a stack trace for a request that was simply not
+        # supported -- and a 500 says "this server is broken" when the truth is
+        # "this checkpoint does not do embeddings". Those provoke very
+        # different next actions from whoever is on the other end.
+        #
+        # The authority is not invented here: ``is_generation`` comes from
+        # ModelConfig (configs/model_config.py:540) and the HTTP layer already
+        # reads it off the tokenizer manager (http_server.py:979).
+        #
+        # It runs BEFORE the input checks deliberately: telling someone their
+        # input is empty, when no input of any shape could have worked, sends
+        # them to fix the one thing that was never the problem.
+        if getattr(self.tokenizer_manager, "is_generation", False):
+            return (
+                "This server is running a GENERATIVE checkpoint, which cannot "
+                "produce embeddings: the model does not compute a pooled "
+                "representation, so there is no vector to return and this "
+                "request cannot be served by any input. Start the server with "
+                "--is-embedding to serve a CausalLM as an embedding model, or "
+                "point embedding traffic at a deployment that runs one."
+            )
+
         if request.encoding_format not in _SUPPORTED_ENCODING_FORMATS:
             # Rejecting beats silently returning floats for a caller that asked
             # for base64: a client that decodes the answer would get garbage,

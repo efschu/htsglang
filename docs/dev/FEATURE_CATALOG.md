@@ -3511,11 +3511,21 @@ taxonomy and the global importance ladder.
   `/sdapi/v1` surface using existing A1111-speaking nodes, so the surface built
   this week may already serve most of that population. Revisit if a concrete
   request appears, or after the sdapi window item shows real clients working.
-  ADJACENT, NOT ESTABLISHED: whether `/v1/embeddings` names a refusal on a
-  generative-only checkpoint. The route is mounted (`http_server.py:2168`); I
-  grepped `serving_embedding.py` and found no named refusal, but did not trace
-  the path, and an absence claim needs the refusing gate's file:line. Candidate
-  gap, settleable by one hermetic test.
+  ADJACENT, SETTLED: `/v1/embeddings` on a GENERATIVE checkpoint had no gate
+  and failed as an HTTP 500 with a stack trace. `ModelRunner` sets
+  `get_embedding=True` only when the model is NOT a generation model
+  (`model_runner.py:4033`), so no `"embedding"` key exists;
+  `_build_embedding_response` subscripts it bare (`serving_embedding.py:309`)
+  while the handler catches only `ValueError` (`:286`), so the `KeyError` was
+  uncaught. Now REFUSED BY NAME at `_validate_request`
+  (`serving_embedding.py:68`), FIRST -- before the input checks, so a caller is
+  not sent to fix an input that could never have worked -- using the existing
+  authority `tokenizer_manager.is_generation` (`ModelConfig`,
+  `model_config.py:540`; already read at `http_server.py:979`), routing to
+  `--is-embedding` (`server_args.py:887`). A pin asserts the bare subscript
+  REMAINS: turning it into a `.get()` default would convert a 500 into a
+  silently-empty vector, i.e. the worse class, and this gate would then be the
+  only thing between a caller and a plausible wrong answer.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
