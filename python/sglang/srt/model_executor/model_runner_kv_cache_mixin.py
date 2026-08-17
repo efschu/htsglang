@@ -2973,6 +2973,90 @@ class ModelRunnerKVCacheMixin:
         )
         return rows
 
+    def _decoupled_kv_pool_override(
+        self: ModelRunner, all_attn_layer_ids, default_size: int
+    ):
+        """#704b B1: swap layer-ownership sizing for token-share sizing.
+
+        Returns ``(layer_ids_or_None, size)``. ``None`` means "unchanged" and
+        is returned for every rank on every path unless B1 is explicitly
+        enabled, so the default build is byte-identical -- the caller keeps its
+        own expression rather than receiving a reconstructed copy of it, which
+        is what makes "unchanged" mean unchanged instead of "recomputed the
+        same way".
+
+        Enabled by ``SGLANG_DECOUPLED_KV=1``. B1 has no CLI surface yet by
+        decision (the flag is module-level, dcp_size was deliberately NOT
+        overloaded), so the build gate is an env var rather than a server arg
+        that would have to be threaded through a shared parse path.
+        """
+        from sglang.srt.utils import get_bool_env_var
+
+        if not get_bool_env_var("SGLANG_DECOUPLED_KV"):
+            return None, default_size
+
+        from sglang.srt.distributed.utils import (
+            cp_token_split_factor,
+            get_cp_token_ratios,
+        )
+        from sglang.srt.mem_cache.decoupled_kv_arming import record_pool_plan
+        from sglang.srt.mem_cache.decoupled_kv_pool_plan import (
+            plan_for_rank,
+            pool_build_args,
+        )
+
+        _S = cp_token_split_factor(self.dcp_size)
+        _ratios = get_cp_token_ratios()
+        _ratio_r = int(_ratios[get_parallel().attn_dcp_rank])
+        plan = plan_for_rank(
+            list(all_attn_layer_ids),
+            self.start_layer,
+            self.end_layer,
+            self.max_total_num_tokens,
+            # Per-layer cell bytes are not needed for the two build arguments;
+            # the plan carries them only for the world-conservation check, so
+            # a placeholder here would silently corrupt that check. Pass the
+            # real per-token-per-layer cell instead.
+            self._decoupled_kv_cell_bytes(),
+            armed=True,
+            share=_ratio_r / _S,
+            period=_S,
+        )
+        # Record what was BUILT, so arming can be checked against reality.
+        record_pool_plan(plan)
+        layer_ids, size = pool_build_args(plan)
+        logger.info(
+            "#704b B1 decoupled KV pool: %d attention layers (all), %d rows "
+            "for token share %d/%d on dcp_rank %d (stage-local would have been "
+            "%d layers x %d rows)",
+            len(layer_ids),
+            size,
+            _ratio_r,
+            _S,
+            get_parallel().attn_dcp_rank,
+            sum(1 for i in all_attn_layer_ids if self.start_layer <= i < self.end_layer),
+            default_size,
+        )
+        return list(layer_ids), size
+
+    def _decoupled_kv_cell_bytes(self: ModelRunner) -> int:
+        """KV bytes per token per full-attention layer, FROM CONFIG.
+
+        K and V, this rank's kv heads, head_dim, element size -- the same
+        quantities and the same idiom as ``pool_configurator._compute_cell_size``
+        (``:315-331``), deliberately not a fitted constant: fitting this against
+        an observed pool is how #704 previously arrived at a 2x-wrong cell that
+        a compensating fudge hid.
+        """
+        import torch
+
+        return (
+            2
+            * self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            * self.model_config.head_dim
+            * torch._utils._element_size(self.kv_cache_dtype)
+        )
+
     def _swa_hybrid_dcp_lane(self: ModelRunner) -> bool:
         """Is this rank serving SWA-hybrid uneven DCP? (#96, Stage B)
 
@@ -3910,9 +3994,15 @@ class ModelRunnerKVCacheMixin:
                         _dial_initial_rows,
                         _dial_chunk >> 20,
                     )
+                # #704b B1: token-share sizing instead of layer-ownership
+                # sizing. Returns (None, _dial_reserve) unless explicitly
+                # enabled, so the default build below is untouched.
+                _b1_ids, _b1_size = self._decoupled_kv_pool_override(
+                    config.full_attention_layer_ids, _dial_reserve
+                )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
-                    size=_dial_reserve,
+                    size=_b1_size,
                     dtype=self.kv_cache_dtype,
                     head_num=_hybrid_kv_head_num,
                     head_dim=self.model_config.head_dim,
@@ -3921,7 +4011,9 @@ class ModelRunnerKVCacheMixin:
                     # (secondary-runner gates) but runs the FULL model: it
                     # needs every full-attention layer's kv pool.
                     full_attention_layer_ids=(
-                        [0]
+                        _b1_ids
+                        if _b1_ids is not None
+                        else [0]
                         # A dual-group lane TARGET and the #631 phase-flip
                         # TP stack are draft-gated secondary runners that
                         # run the FULL model: every full-attention layer.

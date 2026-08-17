@@ -1,9 +1,10 @@
 """#704b R6: size the KV pool by TOKEN share, not by layer ownership.
 
 Today a PP stage's attention pool is dimensioned by which layers it OWNS.
-``model_runner_kv_cache_mixin.py:2496-2500`` filters the model's attention
-layer ids to ``[start_layer, end_layer)`` before the pool is built, so a rank
-has no row-space for a layer whose weights it does not hold:
+``model_runner_kv_cache_mixin.py:3929-3934`` filters the model's attention
+layer ids to ``[start_layer, end_layer)`` at the ``HybridLinearKVPool``
+construction (``:3913``) before the pool is built, so a rank has no row-space
+for a layer whose weights it does not hold:
 
     stage-local:  own_attn_layers  x  ALL tokens
 
@@ -70,6 +71,11 @@ class KvPoolPlan:
     layer_ids: tuple[int, ...]
     tokens: int
     cell_bytes_per_layer: int
+    # Owner-rule period this plan's row count was ceiled against, DECOUPLED
+    # only. Carried so world conservation can derive the ceil's slack instead
+    # of being told it -- a slack passed in by the caller is a slack that gets
+    # widened until the check passes.
+    period: int | None = None
 
     @property
     def bytes_total(self) -> int:
@@ -89,8 +95,16 @@ def plan_stage_local(
 ) -> KvPoolPlan:
     """Today's shape, reproduced exactly.
 
-    Mirrors the filter at ``model_runner_kv_cache_mixin.py:2496-2500`` so the
+    Mirrors the filter at ``model_runner_kv_cache_mixin.py:3929-3934`` so the
     unarmed path can be pinned byte-identical rather than merely "similar".
+
+    CORRECTION (arming slice): this docstring first cited ``:2496-2500``. That
+    site is real but sits in ``_init_unified_mamba_pools`` (``:2467``), which
+    ``_init_pools`` only reaches under ``--enable-unified-memory``
+    (``:3194-3200``) -- a path THIS deployment does not take. The filter that
+    governs our hybrid-mamba config is the classic-path one cited above. The
+    logic is the same shape in both, so the model was right; the citation
+    pointed at a path the byte-identity claim was never tested against.
     """
     ids = tuple(i for i in all_attn_layer_ids if int(start_layer) <= i < int(end_layer))
     return KvPoolPlan(STAGE_LOCAL, ids, int(max_total_tokens), int(cell_bytes_per_layer))
@@ -219,13 +233,35 @@ def plan_decoupled(
     ids = tuple(int(i) for i in all_attn_layer_ids)
     if not ids:
         raise KvPoolPlanError("no attention layers: there is no KV pool to plan.")
-    tokens = round(float(share) * int(max_total_tokens))
+    # Row count comes from the SHIPPED rule, not from a second one here.
+    #
+    # ``layers/dcp/owner.py:155-181`` dcp_compact_pool_rows is already the
+    # sizing actuator on this path: the classic hybrid-mamba build calls it at
+    # ``model_runner_kv_cache_mixin.py:3765-3767``, and its own docstring says
+    # the rule is stated once because "a sizing rule whose off-by-one has
+    # already cost a debugging round must not exist twice".
+    #
+    # This module had made it exist twice, and with the WRONG rounding:
+    # ``round(share * C)`` can round DOWN, while the shipped rule ceils to a
+    # whole owner block -- ``(C // cp_S + 1) * cp_ratio``. That ceil is not
+    # cosmetic. Flooring let slots in a trailing partial block scatter out of
+    # bounds (async illegal memory access, found by the kv-session-offload S1
+    # test at --max-total-tokens 3000 on cp_S=64). A planner that hands the
+    # build a floored row count re-creates exactly that bug at the seam.
+    #
+    # ``ratio_r`` is the rank's whole-slot band width; validate_share_realizable
+    # above has already guaranteed ``share * period`` is integral, so this is a
+    # conversion, not a rounding decision.
+    from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+    ratio_r = round(float(share) * int(period))
+    tokens = dcp_compact_pool_rows(int(max_total_tokens), int(period), ratio_r)
     if tokens <= 0:
         raise KvPoolPlanError(
             f"share {share} of {max_total_tokens} tokens rounds to zero rows; "
             "refusing to build a pool that can hold nothing."
         )
-    return KvPoolPlan(DECOUPLED, ids, tokens, int(cell_bytes_per_layer))
+    return KvPoolPlan(DECOUPLED, ids, tokens, int(cell_bytes_per_layer), int(period))
 
 
 def plan_for_rank(
@@ -277,6 +313,20 @@ def plan_for_rank(
     )
 
 
+def pool_build_args(plan: KvPoolPlan) -> tuple:
+    """The two arguments the build site actually takes: ``(layer_ids, size)``.
+
+    ``model_runner_kv_cache_mixin.py:3913`` constructs ``HybridLinearKVPool``
+    with ``full_attention_layer_ids=`` (the filtered list, ``:3929-3934``) and
+    ``size=`` (``_hybrid_pool_size``, ``:3765-3767``). Those are the only two
+    dimensions decoupling moves, so this returns exactly them and nothing
+    else: a build helper that returned a whole kwargs blob would invite
+    carrying unrelated arguments through a path that has no business owning
+    them.
+    """
+    return tuple(plan.layer_ids), int(plan.tokens)
+
+
 def validate_plan(plan: KvPoolPlan, all_attn_layer_ids: Sequence[int]) -> None:
     """Fail loudly on a pool that cannot serve the mode it claims.
 
@@ -315,10 +365,27 @@ def validate_world_conservation(
             "ranks disagree about the KV cell width; the world total is not "
             "comparable and one of them is mis-configured."
         )
-    want = len(tuple(all_attn_layer_ids)) * int(max_total_tokens) * int(cell)
+    layers = len(tuple(all_attn_layer_ids))
+    want = layers * int(max_total_tokens) * int(cell)
     got = sum(p.bytes_total for p in plans)
-    # One row per rank of rounding slack on the share split.
-    slack = len(plans) * len(tuple(all_attn_layer_ids)) * int(cell)
+    # One row per rank of rounding slack on the share split, PLUS the ceil.
+    #
+    # dcp_compact_pool_rows ceils to a whole owner block, so a rank can exceed
+    # its exact share by up to ratio_r rows: (C // S + 1) * ratio_r - C *
+    # ratio_r / S = ratio_r * (1 - (C mod S) / S), which is at most ratio_r.
+    # Summed over ranks that is at most sum(ratio_r) = S = period rows. The
+    # bound is DERIVED from the period the plans were built against, so it
+    # cannot be quietly widened to make a real discrepancy pass.
+    slack = len(plans) * layers * int(cell)
+    periods = {p.period for p in plans if p.period is not None}
+    if len(periods) > 1:
+        raise KvPoolPlanError(
+            f"ranks disagree about the owner-rule period {sorted(periods)}; "
+            "they are not sharding the same token space and the world total "
+            "is not comparable."
+        )
+    if periods:
+        slack += periods.pop() * layers * int(cell)
     if abs(got - want) > slack:
         raise KvPoolPlanError(
             f"world KV total is {got:,} bytes against {want:,} expected "

@@ -65,7 +65,16 @@ def test_armed_holds_every_attention_layer_and_only_its_token_share():
         p = _decoupled(rank)
         assert p.mode == DECOUPLED
         assert p.layer_ids == ATTN, "every rank holds ALL attention layers"
-        assert p.tokens == round(SHARES[rank] * T)
+        # The SHIPPED rule, not a second one: dcp_compact_pool_rows ceils to
+        # a whole owner block (owner.py:155-181). round(share * T) would floor
+        # here, which is the off-by-one that already cost an out-of-bounds
+        # scatter.
+        from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+        assert p.tokens == dcp_compact_pool_rows(
+            T, PERIOD, round(SHARES[rank] * PERIOD)
+        )
+        assert p.tokens >= round(SHARES[rank] * T)
         assert p.bytes_total == 16 * p.tokens * CELL
 
 
@@ -132,8 +141,12 @@ def test_degenerate_shares_are_refused():
         plan_for_rank(ATTN, 0, 28, T, CELL, armed=True, share=0.0, period=PERIOD)
     with pytest.raises(KvPoolPlanError, match="not in"):
         plan_for_rank(ATTN, 0, 28, T, CELL, armed=True, share=1.5, period=PERIOD)
-    with pytest.raises(KvPoolPlanError, match="rounds to zero"):
-        plan_for_rank(ATTN, 0, 28, 10, CELL, armed=True, share=1e-6, period=1_000_000)
+    # A zero-row pool is now UNREACHABLE by construction rather than caught:
+    # the ceil hands out at least one whole owner block, so even a 1/1000000
+    # share of 10 tokens gets a row. Kept as a pin because the refusal it
+    # replaces was load-bearing before the sizing rule changed.
+    tiny = plan_for_rank(ATTN, 0, 28, 10, CELL, armed=True, share=1e-6, period=1_000_000)
+    assert tiny.tokens >= 1
 
 
 def test_layer_extents_use_the_GLOBAL_slot_index():
@@ -175,8 +188,8 @@ def test_a_foreign_geometry_plans_the_same_way():
     """No rig constants: different depth, interval, cell and shares."""
     attn = tuple(i for i in range(24) if (i + 1) % 2 == 0)  # 12 layers
     p = plan_for_rank(attn, 0, 12, 1000, 4096, armed=True, share=0.25, period=4)
-    assert p.layer_ids == attn and p.tokens == 250
-    assert p.bytes_total == 12 * 250 * 4096
+    assert p.layer_ids == attn and p.tokens == (1000 // 4 + 1) * 1
+    assert p.bytes_total == 12 * p.tokens * 4096
 
 
 # --- reconciliation with the neighbour commits (see module REVIEW note) -------

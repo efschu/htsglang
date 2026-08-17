@@ -2302,3 +2302,150 @@ acquire a new way to fail, and a test pins that it did not.
    schedule`, not `self.`). Two reds in
    `test/registered/unit/planner/test_rejected_evidence_pins.py`. Not mine and
    not fixed here — the register belongs to another strand.
+
+## §4.2i — #704b arming slice (build + arm + route)
+
+### The scope correction that mattered most: (c) was framed wrong
+
+The task framed (c) as "the attention path reads `get_decoupled_kv_group` when
+armed — the 16 attn layers' KV ops route through the B1 group". **The
+attention KV ops do not route through any group at all.** `get_kv_buffer` /
+`set_kv_buffer` are LOCAL memory operations on this rank's pool; a repo-wide
+grep for group accessors inside `forward_extend` / `forward_decode` /
+`set_kv_buffer` / `get_kv_buffer` and in `radix_attention.py`,
+`base_attn_backend.py`, `forward_context.py` returns nothing.
+
+The group enters one level up, at the **cross-rank LSE merge**:
+`cp_lse_ag_out_ar_mha_uneven` (`layers/dcp/comm.py:231`), which takes its
+`cp_group` as a PARAMETER. The callers supply it —
+`flashinfer_backend.py:5634` (and `:2478`, `:5684`, `:5747`, `:5863`) and
+`triton_backend.py:2311` — as `group = get_parallel().dcp_group`.
+
+So B1 needed **no new call site**. `runtime_context.py:392-394` resolves
+`dcp_group` through `_v()` (`:240-242`), which calls the getter on EVERY
+access rather than caching, and `parallel_state.get_dcp_group()` already
+carries the B1 branch (`:2744`). The chain is live end to end, and what the
+slice owed was a TEST of the resolution rather than a wiring change. That test
+pins the uncached property specifically: if `dcp_group` ever starts caching,
+arming would silently stop taking effect after the first read.
+
+There is also **no choke point** for KV access — ~15 attention-backend files
+call `set_kv_buffer`/`get_kv_buffer` inline. Any design that needed to
+intercept every KV access would have had to touch all of them. It does not,
+because ownership is expressed in the POOL SHAPE and the MERGE GROUP, not at
+the access sites.
+
+### (a) The build now consumes the plan — and R6's anchor was wrong
+
+R6 cited `model_runner_kv_cache_mixin.py:2496-2500` as the ownership filter.
+That site is real but lives in `_init_unified_mamba_pools` (`:2467`), which
+`_init_pools` reaches ONLY under `--enable-unified-memory` (`:3194-3200`) — a
+path this deployment does not take. The filter that governs our hybrid-mamba
+config is the classic-path one at `:3929-3934`, inside the
+`HybridLinearKVPool` construction (`:3913`). Same logic, wrong citation, and
+the byte-identity claim had therefore never been stated against the path it
+would actually be tested on. Corrected in the module docstring.
+
+Wiring: `_decoupled_kv_pool_override(all_attn_layer_ids, default_size)`
+returns `(None, default_size)` unless `SGLANG_DECOUPLED_KV=1`. `None` means
+"unchanged", and the call site keeps ITS OWN expression in the else-branch
+rather than receiving a reconstructed copy — which is what makes the unarmed
+path unchanged rather than "recomputed the same way". Gate is an env var
+because B1 deliberately has no CLI surface (`dcp_size` was explicitly not
+overloaded, and `server_args.py` has no decoupled-kv flag).
+
+### R6 had duplicated a shipped sizing rule, with the wrong rounding
+
+`plan_decoupled` computed `round(share * C)`. The shipped rule is
+`dcp_compact_pool_rows` (`layers/dcp/owner.py:155-181`), already called by
+this very build path at `:3765-3767`, and its docstring states the rule is
+written once because "a sizing rule whose off-by-one has already cost a
+debugging round must not exist twice". R6 had made it exist twice AND rounded
+the wrong way: the shipped rule CEILS to a whole owner block, and flooring is
+what let trailing-partial-block slots scatter out of bounds (async illegal
+memory access, found by the kv-session-offload S1 test at
+`--max-total-tokens 3000` on `cp_S=64`). A planner handing the build a floored
+row count re-creates exactly that bug at the seam.
+
+`plan_decoupled` now delegates to `dcp_compact_pool_rows`. Consequences taken
+rather than papered over: the plan carries the `period` it ceiled against, and
+world conservation derives the ceil's slack from it (at most `period` rows
+across the world) instead of being handed a slack that could be widened until
+it passed. A zero-row pool also became UNREACHABLE rather than caught, since
+the ceil always yields at least one whole block.
+
+### (b) The arming point
+
+`phase_flip_runtime.py` step 1, alongside `_ps.set_phase_flip_tp_active(
+tp_phase)` (`:1196`) inside `_cutover` (`:1160`, built by
+`build_production_flip_cutover` `:1147`). That slot is after the group-wide
+quiesce (`on_round` consensus `:3066`, hold `:3121-3126`, execute `:3128`) and
+after the physical KV wave-move, but BEFORE any group handle is re-derived
+(`:1224`) or any collective runs on the new layout.
+
+B1 is a PP-PREFILL mechanism, so `arm_for_cutover` arms going into PP and
+DISARMS going into TP. It does not rely on the flip route out-ranking B1 in
+`get_dcp_group`: precedence is the net, disarming is the contract. Relying on
+branch order is how a later reorder becomes silent capture.
+
+### (e) The red-first case, and the guard shape
+
+The dangerous state is armed routing over a stage-local pool. Under decoupled
+routing a rank may be asked for ANY attention layer; a stage-local pool has no
+rows for the layers it does not own, so
+`HybridLinearKVPool._transfer_full_attention_id` (`memory_pool.py:3855-3859`)
+misses the mapping or — where the id happens to exist — returns another
+layer's rows. Wrong output, no error.
+
+`record_pool_plan` records what the build ACTUALLY built (not what someone
+intended — an intention cannot be compared against reality), and
+`arm_decoupled_kv` refuses to arm unless that plan is DECOUPLED and covers the
+full attention set. Deliberate asymmetry: DISarming is never refused, because
+requiring a healthy pool in order to stop using it turns the recovery path
+into a second failure.
+
+Separately, `set_decoupled_kv_active` now REFUSES to arm without an
+initialized group, matching `set_phase_flip_tp_active`
+(`parallel_state.py:2670-2687`) instead of the silently-no-oping
+`set_dcp_spill_active`. That precedent names the failure class exactly: "a
+silent no-op all-reduce, the exact corruption class this routing exists to
+prevent". The routing fall-through stays as defence in depth for a state the
+setter now makes unreachable.
+
+### Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`, venv interpreter)
+
+- 58 passed across the three B1/R6 suites (was 40 before this slice).
+- Can-fail by breakage: neutering `assert_pool_supports_arming` and the
+  `set_decoupled_kv_active` group check turns **exactly 6** tests red, and
+  restoring returns 58.
+- Regression, measured against a real baseline rather than assumed: with the
+  diff removed, `test/registered/unit/mem_cache` is 944 failed / 835 passed
+  and `test/registered/unit/distributed` is 21 failed / 2706 passed. With the
+  diff: **944 / 853** and **21 / 2706** — same failures, +18 passes, zero new
+  reds. `planner` 2805 passed, `model_executor` clean.
+- Those 965 pre-existing reds are the hermetic-mode consequence
+  ("No accelerator (CUDA, XPU, ...) is available", `utils/common.py:1322`),
+  NOT a repo defect and NOT caused here. A hermetic run of these directories
+  can only ever be read as a delta against that baseline.
+
+### BOOT DEPENDENCIES (nothing below is proven without a reviewed boot)
+
+1. **`phase_flip_runtime.py` is NOT wired.** `arm_for_cutover` exists and is
+   tested, but no call was inserted at `:1196`. Reason: this worktree's copy
+   (6666 lines, `[#690]`) is BEHIND the deploy tree's (6984 lines, `[#717]`,
+   ~355 diff lines apart), and the deploy tree has no B1 symbols at all. A
+   call inserted against the stale revision is likely to be discarded on
+   merge. The insertion point is documented in the function's docstring;
+   inserting it is a boot-window task for whoever owns that file.
+2. **`SGLANG_DECOUPLED_KV=1` has never been booted.** The build override is
+   unit-tested inert-when-off and correct-when-on, but no pool has been
+   allocated from it on a GPU.
+3. **The share vector at boot is unverified.** `_decoupled_kv_pool_override`
+   reads `get_cp_token_ratios()` / `cp_token_split_factor(dcp_size)`. Whether
+   those are populated at the moment `_init_pools` runs is a boot fact, not a
+   desk fact.
+4. **The LSE merge has never run over B1.** The resolution chain is pinned by
+   test; the collective itself has not been executed on the decoupled group.
+5. **Pool/group world agreement is unchecked at boot.** B1's manifest check
+   covers the group; nothing yet cross-checks that every rank recorded a plan
+   with the same period and layer set.
