@@ -295,10 +295,10 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
-    # Derselbe Dispatch-Vertrag wie deepep, Transport ueber den
-    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_BARLINK=1
-    # und SGLANG_BARLINK_TRANSPORT=bar1|matrix; ohne das meldet sich die
-    # Auswahl mit Grund ab, statt still auf etwas anderes auszuweichen.
+    # Same dispatch contract as deepep, transport over the BAR1 direct path
+    # (token_dispatcher/bar1ep.py). Requires SGLANG_BARLINK=1 and
+    # SGLANG_BARLINK_TRANSPORT=bar1|matrix; without those the selection
+    # refuses by name instead of quietly falling back to something else.
     "bar1ep",
     "mooncake",
     "nixl",
@@ -2469,9 +2469,13 @@ class ServerArgs:
             "instead of booting with a 'short by N MiB' warning. Requires a "
             "cached hardware calibration: run `python -m "
             "sglang.srt.mem_ledger.probe` once per rig (card set, driver and "
-            "torch build key the cache).",
+            "torch build key the cache). DEFAULT ON: the ledger is the VRAM "
+            "authority, and the inherited heuristic runs only where the "
+            "ledger explicitly declares a term unresolvable -- which it says "
+            "by name in the log rather than substituting a hand value. Pass "
+            "--enable-vram-ledger false to size from the heuristic alone.",
         ),
-    ] = False
+    ] = True
     rank_perf_loose_ctx_percent: A[
         float,
         Arg(
@@ -12246,6 +12250,68 @@ class ServerArgs:
     #: appears per process rather than once per GPU per call.
     _full_demand_refusal_named = False
 
+    def _ledger_reserve_mib(self, gpu_mem) -> Optional[float]:
+        """The ledger's non-KV reserve for this boot, or ``None`` to fall back.
+
+        This is the seam that makes the ledger the authority on the DEFAULT
+        sizing path. Before it, ``enable_vram_ledger`` only reached the
+        uneven-TP branch (``--rank-gpu-id`` + ``--rank-tp-ratio auto``), so a
+        plain boot -- including this fork's reference launch command -- was
+        sized entirely by the inherited heuristic no matter what the flag said.
+
+        ``None`` is returned for exactly three reasons, and every one of them
+        is already announced by name before we get here:
+
+        * the flag is off, so nothing was promised;
+        * ``gpu_mem`` is unknown, so there is no card to price against;
+        * :meth:`ledger_full_demand_per_gpu` REFUSED -- some term is neither
+          measured nor bounded. It logs which term, once per process, and
+          returns None rather than a partial sum. That refusal is the whole
+          reason this returns an Optional instead of a number.
+
+        THE BINDING CARD, not the average. Cards differ, one fraction is
+        applied to all of them, and a fraction that fits the roomiest card OOMs
+        the tightest. So the reserve is the MAXIMUM demand across cards -- the
+        reading that cannot under-charge. A rig whose cards differ sharply pays
+        for that here, visibly, instead of discovering it in graph capture.
+        """
+        if not self.vram_ledger_enabled() or gpu_mem is None:
+            return None
+        try:
+            demand = self.ledger_full_demand_per_gpu(gpu_mem)
+        except Exception as e:  # pragma: no cover - NVML/config availability
+            logger.warning(
+                "mem_ledger: the full-demand lookup raised (%s); falling back "
+                "to the inherited mem_fraction_static heuristic for this boot.",
+                e,
+            )
+            return None
+        if not demand:
+            # Already named by ledger_full_demand_per_gpu's own refusal log.
+            return None
+        binding = max(demand.values())
+        if binding >= gpu_mem:
+            # Not this function's refusal to make: the boot contract raises
+            # LedgerOvercommit with the itemization where that is checked. Here
+            # a non-positive residual would only produce a nonsense fraction,
+            # so hand back to the inherited path and let the contract speak.
+            logger.warning(
+                "mem_ledger: priced non-KV demand %d MiB meets or exceeds the "
+                "%d MiB card; falling back to the inherited heuristic for "
+                "mem_fraction_static.",
+                int(binding),
+                int(gpu_mem),
+            )
+            return None
+        logger.info(
+            "mem_ledger: sizing mem_fraction_static from the ledger -- "
+            "non-KV demand %d MiB on the binding card of %d MiB (per-card: %s).",
+            int(binding),
+            int(gpu_mem),
+            ", ".join(f"gpu{g}={m}" for g, m in sorted(demand.items())),
+        )
+        return float(binding)
+
     def ledger_full_demand_per_gpu(self, gpu_mem=None) -> Optional[Dict[int, int]]:
         """``{gpu id: full non-KV demand MiB}`` from the card ledgers, or None.
 
@@ -12991,7 +13057,27 @@ class ServerArgs:
             )
 
         if self.mem_fraction_static is None:
-            if self.post_capture_kv_sizing_planned():
+            # THE LEDGER DECIDES; THE HEURISTIC IS ITS FALLBACK.
+            #
+            # Standing order: the ledger is the VRAM authority and hand-set
+            # numbers do not decide. This is the site that decided -- the
+            # inherited 512 + tokens*1.5 + tp*pp/8*1024 catch-all below, which
+            # the 2026-08-05 window falsified (it books 3968 MiB where the
+            # binding card had 1766 free).
+            #
+            # Only the SOURCE of reserved_mem moves. The fraction is still
+            # formed by the one formula below, and the multimodal adjustment
+            # still applies, because the ledger changes where the number comes
+            # from, not how a budget is formed.
+            #
+            # There are exactly two paths and no third: the ledger answers, or
+            # the ledger explicitly declares a term unresolvable and says so by
+            # name in a log (ledger_full_demand_per_gpu refuses rather than
+            # returning a partial sum) and the inherited block runs.
+            ledger_reserve = self._ledger_reserve_mib(gpu_mem)
+            if ledger_reserve is not None:
+                reserved_mem = ledger_reserve
+            elif self.post_capture_kv_sizing_planned():
                 # Post-capture sizing measures free memory after graph capture, so
                 # skip the graph/activation reserve; keep only the floor + parallel slack.
                 reserved_mem = 512

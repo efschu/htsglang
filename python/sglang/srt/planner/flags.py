@@ -3329,8 +3329,9 @@ class ProfileStore:
 # model-family reasoning + tool-call parser.
 #
 # User standing order 2026-08-03: --reasoning-parser and --tool-call-parser are
-# STANDARD boot settings, not tuning knobs -- "damit man die modelle auch
-# nutzen kann". Without them a reasoning checkpoint's chain-of-thought lands in
+# STANDARD boot settings, not tuning knobs -- so that the models can actually
+# be USED (the user's wording, translated). Without them a reasoning
+# checkpoint's chain-of-thought lands in
 # `content` as raw `</think>` text and a tool call arrives as a JSON-looking
 # STRING instead of a structured `tool_calls` entry, so every agentic client
 # silently degrades while the server reports HTTP 200.

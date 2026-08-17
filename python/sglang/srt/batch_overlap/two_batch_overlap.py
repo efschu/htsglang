@@ -1075,9 +1075,9 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_bar1ep():
-            # VOR dem deepep-Zweig: is_deepep() sagt fuer bar1ep absichtlich
-            # True (es ist derselbe Dispatch-Vertrag), aber gebaut wird hier
-            # ein Objekt, und dafuer zaehlt die Bibliothek.
+            # BEFORE the deepep branch: is_deepep() deliberately answers True
+            # for bar1ep (it is the same dispatch CONTRACT), but what is built
+            # here is an OBJECT, and for that the library is what counts.
             from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
                 Bar1EPDispatcher,
             )

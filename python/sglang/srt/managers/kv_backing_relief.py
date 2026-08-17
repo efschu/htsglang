@@ -13,9 +13,12 @@
 # ==============================================================================
 """#656 spec item 12: KV residency follows the load, so KV is a relief provider.
 
-    "ES GIBT KEIN FESTES MAX KV: KV selbst ist Spill-Klasse in den System-RAM
-     ... im VRAM liegt zu jedem Zeitpunkt GENAU das, was gerade dort liegen
-     muss, der Rest im System-RAM."
+    "THERE IS NO FIXED MAX KV: KV is itself a spill class into system RAM
+     ... what sits in VRAM at any moment is EXACTLY what has to be there right
+     then, the rest in system RAM."
+
+(Translated from the user's German; the original wording is in the commit that
+introduced this module.)
 
 WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT
 ---------------------------------------------

@@ -211,6 +211,13 @@ class PreflightSpec:
     #: Ports that must NEVER be touched or probed destructively. 30099 is the
     #: local router -- law: never killed from an agent session.
     protected_ports: Tuple[int, ...] = (30099,)
+    #: Refuse the boot when this rig has no cached VRAM-ledger calibration.
+    #: DEFAULT FALSE, deliberately: the ledger is the sizing authority and is
+    #: on by default, but an unpriced term makes it fall back to the inherited
+    #: heuristic and SAY SO rather than fail, so a fresh rig still boots. A
+    #: rig that wants the exact numbers guaranteed sets this to true and gets
+    #: a named refusal instead of a quiet fallback.
+    require_vram_calibration: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -418,7 +425,9 @@ def _build(raw: dict, source: str) -> StackConfig:
         card_busy_mib=int(pf.get("card_busy_mib", 512)),
         check_ports=tuple(int(x) for x in pf.get("check_ports", ())),
         protected_ports=tuple(int(x)
-                              for x in pf.get("protected_ports", (30099,))))
+                              for x in pf.get("protected_ports", (30099,))),
+        require_vram_calibration=bool(
+            pf.get("require_vram_calibration", False)))
 
     for port in preflight.check_ports:
         if port in preflight.protected_ports:

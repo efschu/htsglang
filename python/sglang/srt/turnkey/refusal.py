@@ -49,6 +49,7 @@ __all__ = [
     "REFUSE_PLAN_STALE",
     "REFUSE_PLAN_UNSOLVABLE",
     "REFUSE_LOG_PATH_SHARED",
+    "REFUSE_VRAM_CALIBRATION_MISSING",
 ]
 
 # --- the vocabulary -------------------------------------------------------
@@ -99,6 +100,14 @@ REFUSE_PLAN_UNSOLVABLE = "REFUSE_PLAN_UNSOLVABLE"
 #: either. Each instance owns its own log path.
 REFUSE_LOG_PATH_SHARED = "REFUSE_LOG_PATH_SHARED"
 
+#: This rig has no cached VRAM-ledger calibration, and the config asked to be
+#: refused rather than sized by the inherited heuristic. Opt-in
+#: (``preflight.require_vram_calibration``): the ledger already falls back
+#: safely and names the unpriced term in the log, so a fresh rig boots. This
+#: name exists for the operator who wants the exact numbers guaranteed and
+#: would rather not boot than boot on the catch-all.
+REFUSE_VRAM_CALIBRATION_MISSING = "vram_calibration_missing"
+
 NAMES = (
     REFUSE_CONFIG_UNPARSABLE,
     REFUSE_CONFIG_INCOMPLETE,
@@ -116,6 +125,7 @@ NAMES = (
     REFUSE_PLAN_STALE,
     REFUSE_PLAN_UNSOLVABLE,
     REFUSE_LOG_PATH_SHARED,
+    REFUSE_VRAM_CALIBRATION_MISSING,
 )
 
 

@@ -81,6 +81,12 @@ def _tokens_for(mib: float) -> float:
 
 def make_args(**kwargs) -> ServerArgs:
     """``model_path='dummy'`` short-circuits ``__post_init__``."""
+    # This file exercises the LEGACY --rank-auto-reserve-mib path, which is
+    # mutually exclusive with the VRAM ledger -- and the ledger is now ON by
+    # default (it is the VRAM authority). Opt out explicitly so each case
+    # states which reserve path it is testing instead of colliding with a
+    # default it never mentioned.
+    kwargs.setdefault("enable_vram_ledger", False)
     return ServerArgs(model_path="dummy", **kwargs)
 
 

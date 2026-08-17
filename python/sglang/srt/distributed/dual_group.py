@@ -14,7 +14,7 @@
 """Dual-group runtime (#121): two overlapping TP groups over ONE weight set.
 
 The setting is one process that carries a rank of the large group (BIG, the
-serving Verband) and, on the SAME card and out of the SAME weight bytes, a
+serving federation) and, on the SAME card and out of the SAME weight bytes, a
 second self-sufficient group (FAST, the PD lane) that can prefill on its own.
 
 The property that makes this pay is NESTING. Take BIG = TP=3 with
@@ -587,7 +587,7 @@ def local_row_reduce(parts):
     deliberately NOT identical to a monolithic GEMM over the full k axis, nor
     to an N-rank reduction for N != len(parts): float addition is not
     associative and the accumulation order differs. Whoever compares the lane
-    against the Verband has to state that tolerance up front.
+    against the federation has to state that tolerance up front.
     """
     if not parts:
         raise ValueError("local_row_reduce: no parts.")
