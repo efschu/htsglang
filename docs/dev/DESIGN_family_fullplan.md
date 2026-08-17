@@ -48,10 +48,20 @@ Execution order per token is `A A A X | A A A X | …` (A = 5090, X = an FA card
   is the final layer and its output goes to the head, not back into a GDN
   block = **15**
 
-**Total 31 crossings per token per forward.** The figure in the #732 material is
-correct as stated; I re-derived it from the layer map rather than adopting it,
-and the "29 extra" phrasing elsewhere is the same schedule counted against a
-2-crossing PP baseline.
+**Total 31 INTER-LAYER crossings per token per forward.** The figure in the #732
+material is correct as stated; I re-derived it from the layer map rather than
+adopting it, and the "29 extra" phrasing elsewhere is the same schedule counted
+against a 2-crossing PP baseline.
+
+**But 31 is not the movement count, and the bullet above is careless.** It says
+layer 63's output "goes to the head, not back into a GDN block" — and §2.1 puts
+`lm_head` on the 5090, so that output crosses back too. The full-forward
+MOVEMENT count is therefore **32**. Both numbers are kept because both are used:
+31 is what the crossing schedule emits and what a transport matches sends to
+(`DESIGN_pp_layer_set.md` §5); 32 is what a wire trace of a whole forward will
+show. Every cost figure below derived from 31 understates the transport term by
+one movement, i.e. **~3 %** — below the resolution of the verdicts they support,
+so they are left as printed rather than re-derived.
 
 ---
 
@@ -60,7 +70,7 @@ and the "29 extra" phrasing elsewhere is the same schedule counted against a
 Per-layer weights are the MEASURED values from the safetensors index cited by
 `9c25330131`: **FA 355.1 MiB, GDN 476.1 MiB**.
 
-### 2.1 The 5090 (32768 MiB) — and #727 is load-bearing
+### 2.1 The 5090 (32607 MiB NVML) — and #727 is load-bearing
 
 Embed and lm_head are **untied** (`tie_word_embeddings false`), so both must be
 placed, and at `248320 × 5120` each they are large:
@@ -72,12 +82,20 @@ placed, and at `248320 × 5120` each they are large:
 
 48 GDN layers = **22 852.8 MiB**. With the head tensors on the same card:
 
+Against the card's LIVE NVML total of **32 607 MiB**, not the nominal 32 768 —
+the width-canon lesson applies to totals as well as widths, and the 161 MiB
+difference moves the mamba-slot ceiling by a whole slot at every graph-pool
+size (`DESIGN_pp_layer_set.md` §4):
+
 | vocab dtype | weights total | free | after arming floor 1728 + corridor 1024 |
 | --- | --- | --- | --- |
-| **int8 (#727)** | 25 278 MiB | 7490 MiB | **4738 MiB** |
-| bf16 | 27 703 MiB | 5065 MiB | **2313 MiB** |
+| **int8 (#727)** | 25 278 MiB | 7329 MiB | **4577 MiB** |
+| bf16 | 27 703 MiB | 4904 MiB | **2152 MiB** |
 
-**#727 roughly doubles the working headroom on the 5090** (4738 vs 2313 MiB),
+(The nominal-total figures this spec first printed were 7490/4738 and
+5065/2313.)
+
+**#727 roughly doubles the working headroom on the 5090** (4577 vs 2152 MiB),
 and that headroom is what must cover GDN state + graph pool. Both #727
 artifacts exist (`3f8996a1a6` requant + read method, `5745a545d6` lm_head), so
 this is a placement decision, not a build. **The full plan should be specified
@@ -85,7 +103,7 @@ as requiring #727's int8 vocab**; on bf16 it is not obviously fundable.
 
 **INFERRED / OPEN — the number this spec cannot supply.** GDN state for all 48
 layers lands on the 5090 (state lives with its layer). I have no measured
-per-layer GDN state size, so I cannot say whether 4738 MiB covers state + graph
+per-layer GDN state size, so I cannot say whether 4577 MiB covers state + graph
 pool at the target concurrency. **That is the first number a build must
 produce**, and it is the plan's real capacity question — not the weights, which
 fit comfortably.
@@ -100,8 +118,19 @@ fit comfortably.
 | 3080 w/ floor 2467 | 2841 | 17 639 | **14 148 MiB** |
 
 Compare the contiguous memory arm now booting: its 3080 stages carry
-**10 066 / 9590 MiB** of weights. The full plan leaves roughly **5× more room
-for KV on the small cards**, which is the entire point — and it is the only
+**10 066 / 9590 MiB** of weights, leaving **7565 / 6989 MiB** for KV after the
+same floor and corridor.
+
+**RETRACTED: this spec claimed "roughly 5× more room for KV on the small
+cards". It does not reproduce.** Against the contiguous arm's own 3080s the
+ratio is 14 790 / 7565 = **1.96×** and 14 790 / 6989 = **2.12×**, i.e. **~2×**;
+against the 5090's 4577 MiB it is **~3.2×** (the adopted `NOTE_735_arithmetic_check.md` prints 3.1× there because it used the nominal-total 4738 MiB; same ratio, corrected denominator). The 5× has a derivation path — it
+is 14 790 / 2841 = **5.21×**, this card's KV room divided by its OWN weights —
+but that is a different statement from "more room than the contiguous arm", and
+substituting one for the other is the error. Real arithmetic, wrong pair.
+
+**~2× more KV room on the small cards** is the corrected figure, and it is
+still the entire point — it is also the only
 layout that achieves the KV-away-from-the-5090 half, because (as the boot
 package established) *any* contiguous 35-layer block carries 8–9 of the 16 FA
 layers and therefore RAISES the 5090's KV share to ~50 %.
@@ -120,7 +149,7 @@ verify loop. Not settled here; flagged as a placement decision the build owes.
 | requirement | value | derivation |
 | --- | --- | --- |
 | payload per crossing | **10 240 B = 10 KiB** at bs=1 | `hidden_size 5120` × 2 B (bf16 activation). Exact, not approximate |
-| crossings per token | **31** (16 out, 15 back) | §1.3 |
+| crossings per token | **31** inter-layer (16 out, 15 back); **32** movements incl. terminal -> head | §1.3 |
 | direction split | 16 × 5090→3080, 15 × 3080→5090 | §1.3 |
 | cost budget | ~**7.3 µs per crossing**, **~0.227 ms/token** for 31 | from #732's amendment (29 crossings ≈ 0.212 ms); the per-crossing figure is my division, the 0.212 is cited |
 | metadata | small per-crossing header | **INFERRED** — not sized here |
