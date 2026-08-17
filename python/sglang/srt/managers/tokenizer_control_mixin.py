@@ -367,8 +367,71 @@ class TokenizerControlMixin:
         )
 
         all_success, all_message = FanOutCommunicator.merge_results(results)
+
+        # #545 PARTIAL ROLLBACK. A mixed fan-out result leaves the group
+        # HALF-ATTACHED: some ranks have storage threads running and a backend
+        # bound, others do not. That is precisely the state the detach contract
+        # exists to prevent, and reporting a clean failure over it tells the
+        # operator the opposite of what is true.
+        #
+        # So the terminal state is all-attached or all-detached, never mixed:
+        # on a mixed result, detach the group. The rollback is a FAN-OUT to
+        # every rank rather than only the ones that succeeded, because detach
+        # is idempotent by construction on both cache classes -- it asks the
+        # controller to clean up even when enable_storage is already False,
+        # exactly so leftover state from a partial attach is swept -- and
+        # targeting a subset would need rank-addressed sends the communicator
+        # does not offer.
+        #
+        # COLLECTIVE-FREE, which is the constraint that makes it safe here: the
+        # detach path drains its control queues with local (None) limits and
+        # never enters an all_reduce, so a rank whose peers have already left a
+        # collective cannot hang on it.
+        #
+        # The verdict is NEVER flipped to success. Rollback only changes what
+        # the message can tell you.
+        if not all_success:
+            attached_ranks = sorted(r.rank for r in results if r.success)
+            if attached_ranks:
+                logger.warning(
+                    "Attach failed on part of the group; rolling back the "
+                    "ranks that succeeded (%s) so the group is not left "
+                    "half-attached.",
+                    attached_ranks,
+                )
+                rollback_note = ""
+                try:
+                    rollback = await self.detach_hicache_storage_communicator(
+                        DetachHiCacheStorageReqInput()
+                    )
+                    stranded = sorted(r.rank for r in rollback if not r.success)
+                    if stranded:
+                        # NAMED, not summarised: an operator has to know which
+                        # processes still hold a backend, and "rollback partly
+                        # failed" is not actionable.
+                        rollback_note = (
+                            f" ROLLBACK INCOMPLETE: ranks {stranded} are still "
+                            f"attached and must be detached manually."
+                        )
+                        logger.error(
+                            "HiCache attach rollback failed on ranks %s; the "
+                            "group is left inconsistent.",
+                            stranded,
+                        )
+                    else:
+                        rollback_note = (
+                            f" Rolled back the ranks that had attached "
+                            f"({attached_ranks}); the group is fully detached."
+                        )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.exception("HiCache attach rollback raised.")
+                    rollback_note = (
+                        f" ROLLBACK FAILED ({e}); ranks {attached_ranks} may "
+                        f"still be attached and must be detached manually."
+                    )
+                all_message = f"{all_message}{rollback_note}"
+
         out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
-        # TODO: partial rollback if failed
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
             hicache_fields = {"hicache_storage_backend": hicache_storage_backend}

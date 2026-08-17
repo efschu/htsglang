@@ -188,9 +188,61 @@ tests, sibling to the resize file rather than merged into it (that file owns
 the resize authority; one authority per behaviour). Red-first: restoring the
 stubs fails 15 of 16.
 
-**Still open, and NOT addressed here:** the ENOSPC injection test from §5(2),
-and `tokenizer_control_mixin.py:370`'s own `# TODO: partial rollback if
-failed` — if some ranks attach and others do not, nothing rolls back. The
-fan-out merges results into one verdict, so the caller learns it failed, but
-the group can be left inconsistent. That is a real gap and it predates this
-change.
+~~Still open: the ENOSPC injection test from §5(2), and
+`tokenizer_control_mixin.py:370`'s `# TODO: partial rollback if failed`.~~
+**Both closed — see §8 and §9.**
+
+## 8 — Partial rollback (closes the pre-existing TODO)
+
+A mixed fan-out result left the group **half-attached**: some ranks running
+storage threads with a backend bound, others not — exactly the state the
+detach contract exists to prevent, reported as a clean failure.
+
+Now the terminal state is all-attached or all-detached, never mixed. On a
+mixed result the coordinator detaches the group and, if that rollback fails
+anywhere, **names the stranded ranks** instead of reporting a clean failure.
+
+Three things this needed:
+
+- **A rank on the reply.** `FanOutCommunicator.handle_recv` appends results in
+  **arrival order**, so list position does not identify a rank — "ranks 0 and
+  2 are stranded" was literally unsayable. `AttachHiCacheStorageReqOutput` and
+  `DetachHiCacheStorageReqOutput` now carry `rank` (flat world rank,
+  `pp_rank * tp_size + tp_rank`), stamped in a **wrapper** so every return
+  path gets it; stamping at each `return` would let a later-added path ship
+  unstamped.
+- **A group detach, not a targeted one.** Detach is idempotent by
+  construction — it asks the controller to clean up even when
+  `enable_storage` is already False, precisely to sweep partial-attach
+  leftovers — and the communicator offers no rank-addressed send.
+- **Collective-free**, per §7's own rule: the detach path drains with local
+  (`None`) limits and enters no all_reduce, so a rank whose peers have already
+  left a collective cannot hang on it.
+
+The verdict is never flipped to success; rollback only changes what the
+message can tell you. Pins:
+`test/registered/unit/managers/test_attach_partial_rollback_545.py` (9).
+Mutation: dropping the rollback fails 4.
+
+## 9 — ENOSPC injection (closes §5(2))
+
+`test/registered/unit/mem_cache/test_hicache_enospc_545.py`, 11 pins against a
+real `HiCacheFile` over a real tmpdir with the failing syscall patched. The
+*technique* of the canonical store's three-site injection is reused; none of
+its code is, since that lives on an unmerged train branch.
+
+Pinned: a write hitting ENOSPC returns False **and the key is genuinely not
+readable** (False is only honest if the page really is absent); no torn page is
+ever visible, because the page appears only at `os.replace` — a failure before
+it leaves the final path absent and a failure at it leaves prior content
+intact; the watermark **refuses at the door** when a cap is configured rather
+than failing mid-write with the IO already spent; and the tier still works
+afterwards.
+
+**One pin had to be rebuilt to be honest.** The reservation-leak check first
+asserted that a later write still fits after five failed ones. That could not
+fail: with a cap in force the evictor simply **evicts** to admit, so a leaked
+reservation causes extra eviction rather than a refusal — the pin passed with
+`abort` removed. It now asserts on `_total_bytes` directly, which is what
+distinguishes released from leaked. Mutation (removing `abort` and the tmp
+cleanup) now fails 2; before the rebuild it failed 1.
