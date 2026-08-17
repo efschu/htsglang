@@ -40,9 +40,10 @@ RESOLUTION_TIME
 
 FILED_VIOLATION
     The call runs AFTER resolution, on a live ServerArgs the engine is already
-    using. These are real, they are debt, and they are recorded here rather
-    than quietly folded into the allowed set, so that reading this file tells
-    you the ratchet is carrying known debt and exactly how much.
+    using. These are real and they are debt. The kind is retained with an empty
+    set: both violations this ratchet originally caught have since been routed
+    through ``ServerArgs.override()`` (see ``_FIXED_VIOLATIONS``), so anything
+    appearing here again is NEW, not inherited.
 
 Adding a new mutation anywhere -- including in a file already listed -- fails
 this test. Removing one also fails it, asking you to lower the pin and lock in
@@ -129,34 +130,25 @@ _PINNED: Dict[str, Tuple[int, str, str]] = {
         "server_args.py:6240 -> _handle_uneven_tp -> server_args.py:10517. "
         "Resolution-time.",
     ),
-    "srt/mem_cache/gdn_slot_ladder.py": (
-        1,
-        FILED_VIOLATION,
-        "DEBT. setattr(server_args, '_gdn_profiled_state_slots', ...) at :288, "
-        "in remember_profiled_state_slots (:259). Introduced by 7a7742d9ee "
-        "'[#631] Make the state-slot cap and the flip compose'. Runs POST "
-        "resolution, during ModelRunner KV profiling "
-        "(model_runner_kv_cache_mixin.py:2157). Two aggravating facts: the "
-        "same caller uses server_args.override(...) about thirty lines "
-        "earlier, so the sanctioned path was in view; and the attribute is "
-        "underscore-prefixed BY DESIGN to slip past the __setattr__ strict "
-        "guard (gdn_slot_ladder.py:250-255 says so outright). This is also "
-        "the one site that entered while this test stood red. Not rewritten "
-        "here: it is a serving-path change that wants a boot to validate, "
-        "which this hermetic cut cannot give it.",
-    ),
-    "srt/model_executor/dual_group_lane.py": (
-        1,
-        FILED_VIOLATION,
-        "DEBT. dual_group_lane_eager = True at :5495, in build_dual_group_lanes "
-        "(:5454). Introduced by df08e51baa '#274 Familien-Slice 2'. Runs POST "
-        "resolution on scheduler.server_args, inside Scheduler.__init__ "
-        "(managers/scheduler.py:802) -- the live object the engine serves on. "
-        "override('dual_group_lane.eager', dual_group_lane_eager=True) is the "
-        "shape this wants. Not rewritten here for the same reason as above: "
-        "no boot in a hermetic cut.",
-    ),
 }
+
+#: Both post-resolution violations this ratchet caught are FIXED, not excused.
+#: Kept as a record because the pins above are a count and a count forgets:
+#:
+#: * ``srt/mem_cache/gdn_slot_ladder.py:288`` (7a7742d9ee) -- wrote
+#:   ``_gdn_profiled_state_slots`` during ModelRunner KV profiling. The
+#:   underscore was deliberate guard evasion (``server_args.py:17437`` exempts
+#:   private names). Now ``gdn_profiled_state_slots``, written through
+#:   ``override()``: the evasion route is closed, not merely unused.
+#: * ``srt/model_executor/dual_group_lane.py:5495`` (df08e51baa) -- wrote
+#:   ``dual_group_lane_eager`` on the live ``scheduler.server_args``. Now
+#:   ``override("dual_group_lane.spans_cards", ...)``.
+#:
+#: If a FILED_VIOLATION entry ever reappears above, it is a new one.
+_FIXED_VIOLATIONS = (
+    "srt/mem_cache/gdn_slot_ladder.py",
+    "srt/model_executor/dual_group_lane.py",
+)
 
 
 def _counts_by_file() -> Dict[str, int]:
@@ -233,24 +225,31 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 self.assertIn("__post_init__", why)
                 self.assertIn("server_args.py:", why)
 
-    def test_filed_violations_are_visible_as_debt(self):
-        """These are recorded, not excused. If this list ever empties, delete
-        the concept -- do not let it quietly refill."""
-        filed = {
-            rel: entry[0]
-            for rel, entry in _PINNED.items()
-            if entry[1] == FILED_VIOLATION
-        }
+    def test_no_post_resolution_violation_is_outstanding(self):
+        """Both violations this ratchet caught are fixed. A FILED_VIOLATION
+        reappearing here is a NEW one and must be read as such."""
+        filed = sorted(
+            rel for rel, entry in _PINNED.items() if entry[1] == FILED_VIOLATION
+        )
         self.assertEqual(
             filed,
-            {
-                "srt/mem_cache/gdn_slot_ladder.py": 1,
-                "srt/model_executor/dual_group_lane.py": 1,
-            },
-            "the filed post-resolution violations changed; that is either "
-            "progress worth lowering the pin for, or a new violation that "
-            "needs its own item -- neither should pass silently",
+            [],
+            "a post-resolution server_args mutation is outstanding again; "
+            "route it through ServerArgs.override(source, ...)",
         )
+
+    def test_the_fixed_violations_stayed_fixed(self):
+        """The pin above is a count, and a count forgets which sites were
+        cleaned. These two must not reacquire a bare mutation."""
+        found = _counts_by_file()
+        for rel in _FIXED_VIOLATIONS:
+            with self.subTest(file=rel):
+                self.assertNotIn(
+                    rel,
+                    found,
+                    f"{rel} was cleaned of a post-resolution mutation and has "
+                    f"one again",
+                )
 
     def test_every_pinned_file_still_exists(self):
         """Guards against a pin outliving the file it describes."""

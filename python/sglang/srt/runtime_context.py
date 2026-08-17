@@ -466,6 +466,11 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # Latch for the once-per-process barlink async MLP-AR overlap announcement
+    # (``layers.moe.utils.barlink_mlp_ar_overlap_comm``). It lives here rather
+    # than as a module global so a test can reset it with the group's own
+    # ``override()`` instead of reaching into another module's namespace.
+    barlink_overlap_announced: bool = False
 
 
 @dataclasses.dataclass

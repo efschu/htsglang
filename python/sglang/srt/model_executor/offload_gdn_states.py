@@ -381,9 +381,9 @@ def _maybe_attach_ladder_from_server_args(max_sets: int) -> None:
     if reg is None:
         return
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        args = get_global_server_args()
+        args = get_server_args()
     except Exception:
         return
     spec = getattr(args, "gdn_state_set_ladder", None)

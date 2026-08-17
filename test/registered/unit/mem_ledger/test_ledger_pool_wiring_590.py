@@ -24,6 +24,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+
+def _reset_refusal_latch():
+    """Reset the once-per-process refusal latch on the LIVE ServerArgs class.
+
+    Not ``ServerArgs._ledger_reserve_refusal_named = False``. That name was
+    bound at import time (pytest collection, before any test runs), and
+    ``test/registered/unit/server_args/test_server_args.py:1256`` calls
+    ``importlib.reload`` on ``sglang.srt.server_args`` to rebuild the
+    env-gated choice lists. A reload re-executes the module body and installs
+    a BRAND NEW ``ServerArgs`` class object in the module dict, so from then on
+    this file's imported name points at an orphan: ``setUp`` would reset a
+    latch nobody reads, while ``runtime_reserve_mib`` -- whose ``__globals__``
+    IS that module dict -- reads and writes the latch on the new class. The
+    test then saw zero warnings and failed, but only when the reloading file
+    ran first, which is what made it look like flakiness.
+
+    Reloading is not undoable (a second reload makes a third class), so the
+    fix belongs on this side: resolve the class the way the production code
+    does, through the live module attribute.
+    """
+    import sglang.srt.server_args as _live
+
+    _live.ServerArgs._ledger_reserve_refusal_named = False
+
+
 HEURISTIC_MIB = 3968.0
 CARD = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
 ACTIVATION_MODULE = "sglang.srt.mem_ledger.activation"
@@ -148,7 +173,7 @@ class LedgerModules:
 
 class TestReserveBindsToTheLedger(unittest.TestCase):
     def setUp(self):
-        ServerArgs._ledger_reserve_refusal_named = False
+        _reset_refusal_latch()
 
     def test_bind_proof_the_pool_moves_with_the_ledger_number(self):
         """THE bind proof: two different footprints, two different reserves.
@@ -192,7 +217,7 @@ class TestReserveBindsToTheLedger(unittest.TestCase):
 
 class TestRefusalIsNamedNotSilent(unittest.TestCase):
     def setUp(self):
-        ServerArgs._ledger_reserve_refusal_named = False
+        _reset_refusal_latch()
 
     def test_ledger_present_but_refusing_is_named_and_falls_back(self):
         """Reachable refusal path: loud, attributed, still bootable."""
@@ -219,7 +244,7 @@ class TestLegacyPathsAreByteIdentical(unittest.TestCase):
     """The production tree today has no mem_ledger at all."""
 
     def setUp(self):
-        ServerArgs._ledger_reserve_refusal_named = False
+        _reset_refusal_latch()
 
     def test_no_ledger_module_is_silent_heuristic(self):
         stub = _Stub()
@@ -246,7 +271,7 @@ class TestPerGpuDemandCarriesTheIdentity(unittest.TestCase):
     """reserve_demand_per_gpu is the pool-sizing entry point."""
 
     def setUp(self):
-        ServerArgs._ledger_reserve_refusal_named = False
+        _reset_refusal_latch()
 
     def test_each_gpu_is_priced_with_its_own_card(self):
         per_card = {

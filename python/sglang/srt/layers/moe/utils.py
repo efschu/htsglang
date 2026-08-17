@@ -467,9 +467,6 @@ def should_skip_mlp_all_reduce() -> bool:
 _BARLINK_UCX_OVERLAP = bool(int(os.environ.get("SGLANG_BARLINK_UCX_OVERLAP", "0")))
 
 
-_barlink_overlap_announced = False
-
-
 def barlink_mlp_ar_overlap_comm():
     """The TP group's barlink communicator, iff async MLP-AR overlap is active.
 
@@ -485,9 +482,9 @@ def barlink_mlp_ar_overlap_comm():
         # Announce ONCE, so a measurement run can prove the overlap path is
         # live rather than silently dormant -- "no difference" is only a
         # result if the path demonstrably ran.
-        global _barlink_overlap_announced
-        if not _barlink_overlap_announced:
-            _barlink_overlap_announced = True
+        moe = get_flags().moe
+        if not moe.barlink_overlap_announced:
+            moe.barlink_overlap_announced = True
             logger.info(
                 "barlink: async MLP-AR overlap ACTIVE "
                 "(SGLANG_BARLINK_UCX_OVERLAP=1, issue at down_proj, "
