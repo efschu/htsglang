@@ -118,6 +118,153 @@ LOG_PREFIX = "PHASE-POLICY"
 PHASE_PP = "pp"
 PHASE_TP = "tp"
 BOTH_BLOCKED = "BOTH BLOCKED"
+
+#: #677: the layout HOLD. Bounded, because an unbounded hold is a starvation
+#: bug wearing a fix's clothes.
+#:
+#: 8 rounds is derived, not round: a cutover costs ~2.6 s of seam (#690, seam
+#: total 2.56-2.59 s measured), and the scheduler's rounds under prefill run at
+#: roughly the chunk cadence, so 8 rounds bounds a hold at well under one seam's
+#: worth of held layout. Holding longer than it costs to leave is never worth it.
+LAYOUT_HOLD_MAX_ROUNDS: int = 8
+
+#: #677 mirror bound: rounds a RUNNING decode batch is guaranteed before a
+#: prefill pull may take the layout. 2 is the minimum that means "did not
+#: preempt mid-batch"; larger belongs to the economic comparison, not here.
+MIN_DECODE_ROUNDS: int = 2
+
+HOLD_FOR_UNSERVED = "HOLD: work pending in this layout"
+PULL_FOR_DEMAND = "PULL: work pending for the other layout"
+
+
+def next_hold_rounds(
+    prev_rounds: int, prev_phase: str, phase: str, pending: int
+) -> int:
+    """The hold counter's lifecycle, as a function so it can be pinned (#677).
+
+    ``layout_hold_verdict`` takes ``hold_rounds_so_far`` from its caller, and a
+    caller-maintained counter is exactly the kind of state that goes stale
+    silently. A counter carried across a phase change would make the FIRST hold
+    of the next episode start half-exhausted -- the layout would release early,
+    and the C2 fix would evaporate for the arrival that needed it most.
+
+    RESET ON EITHER BOUNDARY: a phase change (a new episode owns a fresh bound)
+    or the pending work reaching zero (the episode this bound was counting is
+    over). Otherwise advance by one.
+    """
+    if phase != prev_phase:
+        return 0
+    if int(pending) <= 0:
+        return 0
+    return max(0, int(prev_rounds)) + 1
+
+
+def layout_hold_verdict(
+    phase: str,
+    prefill_pending_tokens: int,
+    decode_waiting: int,
+    hold_rounds_so_far: int = 0,
+    max_hold_rounds: int = LAYOUT_HOLD_MAX_ROUNDS,
+    seam_funded: bool = True,
+    mid_flip: bool = False,
+    decode_serving: bool = False,
+    decode_rounds_so_far: int = 0,
+    min_decode_rounds: int = MIN_DECODE_ROUNDS,
+):
+    """``(allow_flip, reason)`` -- demand decides the layout, not the timer.
+
+    MEASURED PROBLEM (#713 quantisation table, 2026-08-17 06:19). Demand-PULL
+    already worked: C1 arrived 06:19:06.56 and was served by the tp_to_pp at
+    :09, one seam plus overhead. What failed was the step after -- the box
+    flipped BACK at :12, so C2, which arrived 06:19:09.71 just as PP began, was
+    not served until :15. The layout left on a timer while the prefill that
+    pulled it was still unserved, and TTFT quantised to whole cycles
+    (0.1 / 3.1 / 5.9 s, nothing between).
+
+    So the same arriving-tokens signal that PULLS a cutover must also HOLD it
+    until the work it pulled for is served. Demand overrides the timer in BOTH
+    directions; that symmetry is the rule, not two rules.
+
+    SAFETY, in precedence order:
+      * never mid-flip -- a cutover in progress owns the layout;
+      * never against an unfunded seam -- a pull that cannot pay is an abandon;
+      * BOUNDED BOTH WAYS -- see below.
+
+    THE BOTH-SIDES TIE. When prefill is unserved in PP *and* decode is waiting
+    for TP, the timer must not break it and neither may an unbounded hold: that
+    is one starvation direction traded for the other. The tie goes to the #677
+    economic comparison, backlog-weighted, and the hold is bounded by
+    ``max_hold_rounds`` so a decode queue can never be held out forever. The
+    mirror bound is that a pull may not preempt an unserved prefill while this
+    hold is live, which is exactly what the hold branch expresses.
+    """
+    pend = max(0, int(prefill_pending_tokens))
+    dec = max(0, int(decode_waiting))
+    held = max(0, int(hold_rounds_so_far))
+
+    if mid_flip:
+        return False, "no decision: a cutover is in progress and owns the layout"
+    if not seam_funded:
+        return False, "no flip: the seam is unfunded -- arming it would abandon"
+
+    if phase == "pp":
+        if pend <= 0:
+            return True, "no prefill pending in pp: the timer may have the layout"
+        if held >= max_hold_rounds:
+            return True, (
+                f"hold EXHAUSTED after {held} rounds with {pend} prefill tokens "
+                f"still pending and {dec} decode waiting: releasing so the "
+                f"decode side cannot be starved by an unbounded hold"
+            )
+        if dec > 0:
+            return False, (
+                f"{HOLD_FOR_UNSERVED}: BOTH SIDES have work ({pend} prefill "
+                f"tokens unserved here, {dec} decode waiting) -- held for the "
+                f"economic comparison, round {held + 1} of {max_hold_rounds}, "
+                f"bounded so neither side starves"
+            )
+        return False, (
+            f"{HOLD_FOR_UNSERVED}: {pend} prefill tokens pulled this layout and "
+            f"are still unserved; the timer does not get to take it away "
+            f"(round {held + 1} of {max_hold_rounds})"
+        )
+
+    if phase == "tp":
+        if pend <= 0:
+            return False, "no prefill pending: nothing pulls the layout out of tp"
+        # THE MIRROR, and without it this lever recreates the very defect it
+        # fixes. An unconditional pull on pend>0 means that after an EXHAUSTED
+        # release (pp->tp with prefill still pending) the next evaluation in TP
+        # sees pend>0 and pulls straight back -- decode loses the layout before
+        # serving anything, which is C2 with the phases swapped. Under sustained
+        # both-sides load the cycle degenerates to max_hold rounds of PP, ~0
+        # rounds of TP, and TWO seams per cycle: strictly worse than the timer
+        # it replaced. So the pull yields to a decode batch that is actually
+        # running, for a bounded minimum, and the both-sides tie goes to the
+        # economic comparison rather than to whoever asks last.
+        if decode_serving and int(decode_rounds_so_far) < int(min_decode_rounds):
+            return False, (
+                f"HOLD tp: {pend} prefill tokens wait, but a decode batch is "
+                f"RUNNING and has had {int(decode_rounds_so_far)} of "
+                f"{int(min_decode_rounds)} minimum rounds -- a pull here would "
+                f"preempt mid-batch and mirror the C2 defect; bounded, the pull "
+                f"proceeds once the minimum is met"
+            )
+        return True, (
+            f"{PULL_FOR_DEMAND}: {pend} prefill tokens are waiting for pp "
+            f"and cannot be served here"
+            + (
+                f" (decode had {int(decode_rounds_so_far)} rounds, minimum "
+                f"{int(min_decode_rounds)} met)"
+                if decode_serving
+                else ""
+            )
+        )
+
+    return False, f"unknown phase {phase!r}: no decision"
+
+
+
 PP_TO_TP = "pp_to_tp"
 #: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
 #: formation gate must recognise that decision and refuse to hold it, and a
@@ -406,6 +553,14 @@ DEFAULT_REFUSAL_DEGRADE_AFTER = 8
 # one round trip: a server that flips, and is allowed to flip straight back,
 # spends more wall clock moving KV than serving.
 DEFAULT_MIN_DWELL_S = 10.0
+# The post-cutover settle for the IDLE-LOCKED branch. A just-entered layout is
+# empty until its carried work is re-admitted, and reading that emptiness as
+# "this layout cannot run anything" is what produced the 2026-08-17 flip
+# ping-pong (runs to 72 arms / 299 s). Derived from the measured transient --
+# cutover to first built batch over 162 cutovers, 84.7 % within 2 s -- and
+# capped at ``min_dwell_s`` where it is used, so the fast escape can never
+# become slower than the ordinary dwell path. See PhasePolicyConfig.
+DEFAULT_IDLE_LOCKED_SETTLE_S = 2.0
 # The idle return is the OTHER half of resting in PP, and it has to be
 # fast to be worth anything. The serving cycle is: prefill in PP -> flip
 # to TP so the draft/verify of speculation runs where the decode CUDA
@@ -828,6 +983,26 @@ class PhasePolicyConfig:
     enabled: bool = False
     flip_tokens: int = 0
     min_dwell_s: float = DEFAULT_MIN_DWELL_S
+    #: How long a just-entered layout is given to form a batch before the
+    #: IDLE-LOCKED branch may declare it unable to run. 0 disables the guard
+    #: and restores the oscillating behaviour exactly.
+    #:
+    #: DERIVED, NOT CHOSEN. Measured over 162 cutovers in the 16 boot rotations
+    #: of 2026-08-17, the delay from ``cutover complete`` to the first batch the
+    #: new layout builds is: 0 s for 66 of 150, 1 s for 34, 2 s for 27, 3 s for
+    #: 12, then a thin tail to 6 s (one outlier at 30 s). 2.0 s covers 84.7 % of
+    #: those transients.
+    #:
+    #: THE P95 (4 s) IS DELIBERATELY NOT USED. It exceeds the 3 s ``min_dwell_s``
+    #: this rig boots with, and a settle above the dwell would make the fast
+    #: escape slower than the ordinary path it exists to bypass -- so the tail
+    #: is left uncovered on purpose, and the use site caps the value at
+    #: ``min_dwell_s`` regardless of what is configured here.
+    #:
+    #: Log stamps are second-resolution, so this distribution cannot resolve
+    #: below 1 s and the value is a bound rather than an optimum. Stated here
+    #: rather than implied, because the number looks more precise than it is.
+    idle_locked_settle_s: float = DEFAULT_IDLE_LOCKED_SETTLE_S
     idle_dwell_s: float = DEFAULT_IDLE_DWELL_S
     rest_state: str = REST_DECODE
     #: Fairness bound; 0 disables it and restores the pure load-triggered
@@ -1038,6 +1213,12 @@ class PhasePolicyState:
     #: is not accumulating. Stamped by ``observe_idle`` (the caller), because
     #: ``decide`` is pure and may not mutate state.
     formation_started_at: float = 0.0
+    #: #677 hold lifecycle. Carried on the STATE, and reset through
+    #: next_hold_rounds on every phase change / pend->0, because a
+    #: caller-maintained counter that goes stale would start the next
+    #: episode's first hold half-exhausted.
+    hold_rounds: int = 0
+    hold_phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -1068,11 +1249,15 @@ class PhasePolicyInputs:
 
     #: The OTHER layout can build at least one of those classes.
     #:
-    #: This is what makes the arm ONE-SIDED and therefore non-oscillating by
-    #: construction, with no timer floor: the flip is armed only when the
-    #: current layout provably cannot run anything AND the target provably
-    #: can, so after the flip the target runs by premise and the same
-    #: condition cannot immediately hold again in the new layout.
+    #: THIS FIELD DOES NOT MAKE THE ARM NON-OSCILLATING. It used to be
+    #: documented as doing exactly that -- "so after the flip the target runs by
+    #: premise and the same condition cannot immediately hold again in the new
+    #: layout" -- and that claim was falsified on metal on 2026-08-17 by
+    #: alternating runs of up to 72 arms over 299 s. One-sidedness holds at the
+    #: instant of evaluation and says nothing about the next layout's first
+    #: round, which is empty by construction until its carried work is
+    #: re-admitted. What bounds the oscillation is the post-cutover settle in
+    #: ``decide``; this field is only the admissibility half of the test.
     target_can_admit: bool = False
 
     #: #689: completed carriers waiting for a decode window. NOT running_bs --
@@ -1133,6 +1318,62 @@ def decide(
     create an arm, and it never sees the tp_to_pp direction at all.
     """
     d = _decide_rules(cfg, state, inp)
+    # #677 HOLD, APPLIED AS A WRAPPER for the same reason #689 is: one place
+    # instead of the nine return sites inside the rules. It only ever converts
+    # an ARM into a wait -- it can never create one -- and its reason string is
+    # what the boot's acceptance is read from, so it must reach the log exactly
+    # as the rules' own reasons do.
+    # THE DECODE STARVATION CAP OUTRANKS THIS ABSOLUTELY. That SLO is the
+    # system's guarantee that PP can never pin the server, and my round bound
+    # is only a secondary backstop -- vetoing the cap would put a local timer
+    # above a global guarantee and reintroduce the pinning it prevents.
+    #
+    # THREE EXEMPTIONS IS A SHAPE, NOT A COINCIDENCE: idle-locked, drained and
+    # the starvation cap are all arms the RULES chose for reasons this lever
+    # cannot see. The lever only understands "prefill is unserved here", so it
+    # may only veto the arm that contradicts that -- the plain timer/economics
+    # exit. If a fourth exemption ever appears, invert this into an allowlist
+    # rather than adding it.
+    #
+    # THE DRAINED EXIT ALSO OUTRANKS THIS, on #669's economics. A residual
+    # ABOVE one chunk stays in PP -- which is what this hold wants anyway --
+    # but a SUB-CHUNK residual is finishing regardless, and holding the layout
+    # for it would spend a ~2.6 s seam to save a fraction of a chunk. #669
+    # moved the anti-pinning guarantee to the starvation cap precisely so the
+    # drain could exit cleanly; vetoing it here would re-pin the server in PP,
+    # which is the defect that contract was written to prevent.
+    #
+    # PP_TO_TP ONLY, exactly as #689's formation gate is. The rules arm for
+    # reasons this lever knows nothing about -- the idle return leg, the
+    # decode-stall SLO -- and a gate that vetoed every arm because MY rule did
+    # not recognise it would suppress all of them. The C2 defect is
+    # specifically "pp_to_tp took the layout while prefill was unserved", so
+    # that is the only arm this converts into a wait. It can never create one.
+    _r = d.reason or ""
+    if (
+        d.direction == PP_TO_TP
+        and not _r.startswith(IDLE_LOCKED)
+        and "DRAINED" not in _r
+        and "decode starvation cap" not in _r
+    ):
+        # #688 OUTRANKS #677 EXACTLY AS IT OUTRANKS #689, and for the same
+        # reason spelled out below for formation: the idle-locked arm fires
+        # only when the current layout can build NOTHING. Holding that layout
+        # to serve "pending work" is waiting inside a layout that cannot serve
+        # it -- the zero-GPU window #688 exists to remove. The deadlock escape
+        # is never held.
+        allow, hold_why = layout_hold_verdict(
+            phase=inp.phase,
+            prefill_pending_tokens=int(getattr(inp, "pending_prefill_tokens", 0) or 0),
+            decode_waiting=int(getattr(inp, "ready_carriers", 0) or 0),
+            hold_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
+            seam_funded=True,
+            mid_flip=False,
+            decode_serving=int(getattr(inp, "running_bs", 0) or 0) > 0,
+            decode_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
+        )
+        if not allow:
+            return PhasePolicyDecision(direction=None, reason=hold_why)
     if d.direction != PP_TO_TP:
         return d
     if (d.reason or "").startswith(IDLE_LOCKED):
@@ -1391,13 +1632,46 @@ def _decide_from_load(
     # observation. So the arm is event-driven off that failure and carries no
     # interval of its own.
     #
-    # IT CANNOT OSCILLATE, and not because a damper stops it. The condition is
-    # ONE-SIDED: it requires that the current layout can build nothing AND
-    # that the target can build something. After the flip the target runs by
-    # premise, so the same condition is false there. Bypassing the dwell is
-    # therefore safe in exactly this branch and nowhere else -- which is why
-    # it is written here, above the dwell, rather than as an exception inside
-    # it.
+    # IT OSCILLATED. The claim that stood here -- "IT CANNOT OSCILLATE, and not
+    # because a damper stops it ... after the flip the target runs by premise,
+    # so the same condition is false there" -- was FALSE ON METAL, and it is
+    # rewritten rather than deleted so the fix is read next to the reasoning it
+    # replaces.
+    #
+    # The premise fails on WHEN it is evaluated, not on what it says. "The
+    # target runs by premise" is a statement about the target once it is
+    # running; this branch is reached on the FIRST round after a cutover, while
+    # the just-entered layout is still empty and its carried work not yet
+    # re-admitted. Scheduler._idle_locked_inputs is gated on
+    # ``_round_built_nothing``, which a layout that has only just been entered
+    # satisfies trivially. So the new layout is observed in its empty transient,
+    # certified as unable to run, and armed straight back -- with the one damper
+    # that would have stopped it deliberately bypassed.
+    #
+    # Measured, 16 rotations of 2026-08-17: alternating runs of 72 arms / 299 s,
+    # 12 / 31 s, 10 / 27 s twice. The unit of user-visible delay is one whole
+    # cutover (median 2864 ms tp_to_pp, 2772 ms pp_to_tp over 486 flips), which
+    # is where the quantised 0.1 / 3.1 / 5.9 s TTFT levels in the #713 tables
+    # came from: how many cutovers a request sat through.
+    #
+    # THE INVARIANT THIS BRANCH NOW ENFORCES, in place of the false one:
+    #
+    #   A layout may be declared unable to run only after it has HAD THE
+    #   CHANCE to run. An emptiness observed within ``idle_locked_settle_s``
+    #   of entering the layout is a transient, not a verdict.
+    #
+    # That is the whole guard. It does not restore the dwell -- an idle lock
+    # that develops later still escapes immediately, which is #688's purpose
+    # and the reason this branch exists at all.
+    #
+    # FAILURE DIRECTION, stated because a guard that only helps is a guard
+    # nobody bounded: a GENUINE idle lock that forms within the settle of a
+    # cutover is now delayed, by at most the settle. That is the cost. It is
+    # bounded three ways -- the settle is capped below ``min_dwell_s`` at the
+    # use site, so this branch can never be slower than the ordinary dwell path
+    # it exists to bypass; the 180 s decode-stall cap remains the backstop that
+    # released the 09:42:39 specimen; and the settle is only consulted right
+    # after a cutover, which is the only place the transient exists.
     if inp.nothing_can_run and not inp.target_can_admit:
         # BOTH SIDES BLOCKED IS AN EVICT PROBLEM, NOT A LAYOUT PROBLEM.
         #
@@ -1428,10 +1702,17 @@ def _decide_from_load(
                 f"{inp.pending_prefill_tokens} pending)"
             )
         else:
+            # #712 RETRACTED. This line used to redirect the reader to "the
+            # state-slot bound (mamba/GDN slots)". That was never a measurement
+            # -- it was a hypothesis written into the redirect text, then read
+            # back out of the log and filed as a finding, and #712 was closed as
+            # unfounded on that evidence. A diagnostic must not name a cause it
+            # has not measured, so this branch now reports only what it knows:
+            # KV is not it.
             binding = (
                 f"KV is NOT the binding resource ({avail} rows available "
-                f"against {inp.pending_prefill_tokens} pending) -- look at the "
-                f"state-slot bound (mamba/GDN slots) before blaming the pool"
+                f"against {inp.pending_prefill_tokens} pending) -- this line "
+                f"does not name the one that is"
             )
         return _no(
             f"{BOTH_BLOCKED}: nothing can run in the {inp.phase} layout and the "
@@ -1442,6 +1723,36 @@ def _decide_from_load(
         )
 
     if inp.nothing_can_run and inp.target_can_admit:
+        # POST-CUTOVER SETTLE. See the block comment above for why the
+        # "cannot oscillate" argument failed and what invariant replaces it.
+        #
+        # CAPPED AT ``min_dwell_s`` STRUCTURALLY, not by choosing a small
+        # default and trusting operators. This branch exists to be FASTER than
+        # the dwell path; a settle above the dwell would invert that, so the cap
+        # is applied here where the value is used rather than left as advice.
+        #
+        # ``phase_since`` and not ``last_flip_at``: the first is when THIS
+        # layout was entered (maintained by observe_idle from the OBSERVED
+        # phase, so a manual POST /phase_flip restarts it too), the second is an
+        # arm stamp that is 0 until the policy itself has armed once. A guard
+        # keyed on the arm stamp would not fire for a manually flipped instance,
+        # which is precisely a case that reaches this branch.
+        #
+        # None means the phase was never observed. That degrades to the
+        # PRE-GUARD behaviour rather than to an infinite settle: an unobserved
+        # phase must not be able to pin the escape shut.
+        settle_s = min(cfg.idle_locked_settle_s, cfg.min_dwell_s)
+        entered = state.phase_since
+        if settle_s > 0 and entered is not None:
+            in_phase = inp.now - entered
+            if in_phase < settle_s:
+                return _no(
+                    f"{IDLE_LOCKED} settle: {in_phase:.1f}s in the {inp.phase} "
+                    f"layout < {settle_s:g}s -- an emptiness this soon after "
+                    f"entering a layout is a transient, not a verdict, and "
+                    f"arming on it is the ping-pong ({inp.running_bs} req "
+                    f"resident, {inp.pending_prefill_tokens} tok pending)"
+                )
         direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
         return PhasePolicyDecision(
             direction,
@@ -1720,6 +2031,28 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     Split out from ``decide`` so the decision stays pure and so the clock is
     driven by observation rather than by the policy's own verdict.
     """
+    # #677 HOLD COUNTER, maintained HERE for the same reason the idle and
+    # formation clocks are: ``decide`` is pure and must not mutate, so a bound
+    # driven from inside the decision would never advance. Without this the
+    # 8-round bound was a comment-claimed invariant with no wiring -- the
+    # documented-but-inert class -- and every evaluation saw round 0 forever,
+    # so EXHAUSTED was unreachable and the SLO cap was silently the only
+    # backstop.
+    #
+    # FIRST SIGHT COUNTS AS ROUND ONE: `hold_phase` is empty before the first
+    # observation, and treating that as a phase CHANGE would spend round one
+    # resetting, so a hold would always be one round shorter than its bound
+    # claims. A genuine phase change still resets, which is the case the reset
+    # exists for.
+    _prev_hold_phase = getattr(state, "hold_phase", "") or inp.phase
+    state.hold_rounds = next_hold_rounds(
+        int(getattr(state, "hold_rounds", 0) or 0),
+        _prev_hold_phase,
+        inp.phase,
+        int(inp.pending_prefill_tokens or 0),
+    )
+    state.hold_phase = inp.phase
+
     idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
     if idle:
         if state.idle_since is None:
