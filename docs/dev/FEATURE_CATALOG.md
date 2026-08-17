@@ -3580,6 +3580,19 @@ taxonomy and the global importance ladder.
   GATE: none. Read `EffectiveConfig` before trusting an arm's declared
   configuration — #340 published a wrong verdict from a harness environment
   that silently carried `SGLANG_UNEVEN_DCP=1`.
+  PROVENANCE: a run writes `provenance.json` (head, branch, dirty, arm
+  roster) into its out-dir BEFORE the first boot — `sweep.py`
+  `collect_provenance` / `write_provenance`. Added by the #349 determination,
+  which could only establish the last real sweep's tree from `git log` and
+  directory mtimes. A verdict set with no tree identity cannot answer the
+  only question a standing net is ever asked.
+  REACH, as determined 2026-08-17: the net covers the spec × DCP × offload ×
+  dual-lane × video-cotenancy cross. It is structurally BLIND to the
+  phase-flip world — no arm sets any of the 33 `SGLANG_*FLIP/SEAM/REGIME`
+  switches, so `kvso_flip_contract.restore_permitted` (`:268`) takes its
+  no-phase-means-always-permitted branch in every arm and the wrong-phase
+  restore guard is unreachable under the matrix. See
+  `VERDICT_349_net_reach.md`.
 - **stage measurement canon (#584 second half)** — the persisted per-stage
   measurement the #363 stage table promotes a SOLVED candidate from: measured
   gain over the reference stage, the band that gain was taken against, and the
