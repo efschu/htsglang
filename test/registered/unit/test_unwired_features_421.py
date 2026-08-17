@@ -174,6 +174,61 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
         )
 
 
+class TestDrafterParkHasNoCaller(CustomTestCase):
+    """#309 (c): the drafter PARK half is unwired too, and the docs omit it.
+
+    Added by the #309 remainder determination (2026-08-17). The two pins above
+    cover the attach/detach DECISION layer; this covers the other half a reader
+    would assume exists, because #286 declares ``drafter_heads`` as an offload
+    asset class (``model_executor/offload_register.py:115``) and
+    ``dual_group_lane.py:1915-1932`` registers a lane's drafter head into it.
+
+    That registration is real code, so a reader checking only for a descriptor
+    concludes the park path is live. It is not, for two independent reasons
+    beyond the default-off ``SGLANG_OFFLOAD_REGISTER`` flag:
+
+    * no movement payload is bound -- the registration site says so itself
+      ("No payload bind yet ... binding a TensorPayload here would be refused
+      by the backend"), so nothing could move even if park were called;
+    * ``rung1_evict`` is the ONLY function that parks a ``drafter_heads`` item,
+      and nothing calls it; ``AdaptiveGraphStateMover``, the class that would
+      move the pages, is never instantiated outside its own definition.
+
+    #286's own commit states it: "DESK-ONLY -- no page has ever moved."
+    TASK_309_RUNTIME_DRAFT.md's honest remainder names the #286 register as
+    where freed state must be tagged, but does not record that the register's
+    own park path has never run -- so the destination reads as available. That
+    is the gap this pin closes: prose can go stale, a reachability assertion
+    cannot.
+    """
+
+    _DEFINER = "python/sglang/srt/model_executor/short_term_offload_register.py"
+
+    def test_nothing_calls_the_only_function_that_parks_a_drafter(self):
+        callers = _production_callers_of(
+            "rung1_evict", defining_rel_paths=(self._DEFINER,)
+        )
+        self.assertEqual(
+            callers,
+            [],
+            "GOOD NEWS: the RUNG-1 eviction that parks a drafter head is now "
+            f"reached from production ({callers}). #309 (c) is no longer "
+            "desk-only -- delete this pin and replace it with a wiring test.",
+        )
+
+    def test_the_page_mover_is_never_instantiated_in_production(self):
+        callers = _production_callers_of(
+            "AdaptiveGraphStateMover", defining_rel_paths=(self._DEFINER,)
+        )
+        self.assertEqual(
+            callers,
+            [],
+            "GOOD NEWS: the adaptive graph-state mover is constructed in "
+            f"production ({callers}). #286's 'no page has ever moved' no "
+            "longer holds -- delete this pin and re-check the #309 (c) verdict.",
+        )
+
+
 # RETIRED PIN -- #421 F4 is FIXED (task #394 slice 2).
 #
 # ``TestColdTierShmIsUnreachable`` asserted that

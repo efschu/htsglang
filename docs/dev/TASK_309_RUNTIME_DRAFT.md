@@ -178,3 +178,86 @@ One TP=3 uneven-DCP boot per arm, all with full CUDA graphs.
 5. The rung vocabulary covers `nextn` and `dflash`. EAGLE3/STANDALONE/NGRAM are
    spellable as families but have no arm-set representation; adding them means
    extending `ArmSet`, and the refusal is currently "unknown drafter family".
+
+---
+
+## Remainder determination (2026-08-17)
+
+Asked: what of #309 is delivered, and what is genuinely open? Five questions,
+each answered at code. The short version: **this document was accurate when
+written and nothing has been wired since.** One thing it understates is
+recorded below, and one of its findings is now machine-checked instead of prose.
+
+### D.1 The five answers
+
+| # | question | verdict | evidence |
+| --- | --- | --- | --- |
+| a | runtime SWITCH between resident drafts | **DELIVERED, live** | #156's `cross_algo_worker` is imported by production (`speculative/spec_info.py`, `adaptive_spec_params.py`, `managers/kv_session_offload.py`); `SWITCHING_MODES = ("schedule","auto","policy")` at `cross_algo_utils.py:135` |
+| b | runtime ADD (load a draft into a running server) | **DOES NOT EXIST** | `maybe_init_draft_worker` is defined at `scheduler.py:1205` and called from exactly ONE site, `scheduler.py:1350`, inside `__init__`. With no boot-time spec, `self.draft_worker = None` for the process lifetime (`scheduler.py:1205-1207`) |
+| c | runtime REMOVE / park | **DESK-ONLY** | descriptor at `offload_register.py:115`, registration at `dual_group_lane.py:1915-1932` behind default-off `SGLANG_OFFLOAD_REGISTER` and with NO payload bound; `rung1_evict` (the only parker) has zero production callers; `AdaptiveGraphStateMover` is never instantiated outside its definition |
+| d | manual selection per API | **DOES NOT EXIST** | no route among `http_server.py`'s 74 matches `spec|draft`; the surface is proposed in this doc and deliberately unwired |
+| e | per-request task routing | **DOES NOT EXIST** | no `task_tag`/draft/spec field in `io_struct.GenerateReqInput`, `sampling_params`, or `openai/protocol.py` |
+
+The switch in (a) is selected through the spec config's `force` field, i.e. at
+BOOT. So even the one delivered capability is not runtime-selectable, which is
+the honest reading of "#309 is an Aufsatz on #156": the switching engine exists,
+the runtime control surface over it does not.
+
+### D.2 What this document understates
+
+Honest-remainder item 1 says the freed state "must be tagged in the #286
+offload register". True, but it reads as though that register is a working
+destination. It is not: #286's own commit says **"DESK-ONLY -- no page has ever
+moved"**, and the registration site itself states "No payload bind yet ...
+binding a TensorPayload here would be refused by the backend"
+(`dual_group_lane.py:1933-1937`). So detach/park is not merely missing its
+caller — its executor has never run either. Both halves of the lifecycle are
+desk-only, not just attach.
+
+### D.3 What was built, and what deliberately was not
+
+**Built:** a reachability pin, `TestDrafterParkHasNoCaller` in
+`test/registered/unit/test_unwired_features_421.py`, asserting that nothing
+calls `rung1_evict` and that `AdaptiveGraphStateMover` is never constructed in
+production. It sits beside the two existing #309 pins (#421 finding F3) and
+follows their convention: when it fails, that is the good outcome — delete the
+pin, do not widen it. Proven can-fail by planting a production caller, which
+reddens both cases; removed, both go green.
+
+**Deliberately NOT built: the API surface.** The brief's guess was an endpoint
+over #156's switch plus #286's park, with named refusals for the cold-add path.
+That would ship a knob whose two write operations cannot execute — attach has
+no executor (D.1 b), park has never moved a page (D.1 c) — leaving only a
+read-only status route and a switch-mode setter whose mode is consumed at boot.
+This document already made that call, in prose that has not aged:
+
+> "an endpoint that returns 'accepted' and never executes ... is worse than no
+> endpoint."
+
+Overturning a considered prior decision needs new evidence, and the
+determination produced the opposite: it confirmed the executor gap on both
+halves. Adding a sixth pure decision layer with no caller would repeat the
+exact failure this fork has now found five times in a week (the #410 pin ledger
+with no caller, the #699 verdict nobody polled, the #703 counters nobody read,
+the #363 arm that never became a move, and #309's own F3 pin).
+
+### D.4 Proposed scope rewrite
+
+#309's decision layer is complete and its remainder is a single GPU-side
+ticket, not five independent features. The dependency order is forced:
+
+1. **The executor** (attach: load draft weights into a running server through
+   the memory-saver/suspend machinery; detach: return VRAM through a #286 route
+   that has actually moved a page). Everything else is blocked on this.
+2. **The scheduler placement** — `step()` at the #364 between-tick boundary.
+   This is a compose, not a new mechanism: the boundary is live at
+   `scheduler.py:5437` and already carries the #364 ladder and, at `:5455`, the
+   #363 observer. A third resident is the cheap part.
+3. **Then** the endpoints and the per-request `task_tag`, in that order.
+
+Recommendation: rewrite #309 as "runtime drafter EXECUTOR (GPU)" with the
+decision layer marked done, rather than leaving a five-part feature task open
+against work that is one blocked dependency. If instead the goal is only to
+expose what already works, that is a different and much smaller task —
+"runtime selection of the #156 switch mode" — and it should be filed under its
+own number so it is not confused with add/remove.
