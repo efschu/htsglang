@@ -144,3 +144,110 @@ It does not verify the resume path's internals — only that it exists, is
 gated, and is documented as unobserved. It measures nothing. And §3's open
 question (FIFO order once a resumed session is back in a live spec batch)
 stands unanswered by design rather than by omission.
+
+---
+
+# CORRECTIONS to §0-§3, and the one thing that was actually broken
+
+A delegated code map, checked against the source myself, corrects three claims
+above. Two are my misreadings; the third turns out to be a real defect that I
+had recorded as "NOT ESTABLISHED".
+
+## C1 — "It is not refused" was WRONG: there IS a boot gate
+
+`server_args.py:7260-7272`: `--enable-kv-session-offload` together with any
+`--speculative-algorithm` raises unless `KVSO_ALLOW_SPEC=1`. So the
+combination *is* refused by default — opt-in via an **env var**, not a flag.
+
+The substance of §0 survives (the comment at that very site says "spill,
+restore, on-device resume and draft backfill all exist and are exercised", and
+"WHY THE GATE STAYS … the combination has a named unobserved case"), but
+"not refused" was the wrong word for a `raise`.
+
+There is a second, runtime refusal I also missed: the **host-finish guard**
+(`kv_session_offload.py:4877-4883`) — with spec active and
+`resume_under_spec_enabled()` false, `_maybe_restore_flow` returns early, so a
+spilled session is never restored and decodes on host to completion. That is
+the operative "resume does not compose with spec" today.
+
+## C2 — The residency bundle does NOT carry gdn_state or draft_kv
+
+§1 said the bundle carries `("gdn_state", …)` and `("draft_kv", …)`. It does
+not. `bundle_spillable_sizes` (`kv_session_offload.py:112-126`) returns
+**`[("kv", kv)]`** and nothing else; the other two appear only in its docstring
+as what "a GDN tier adds … **without touching the ordering logic**" — i.e.
+future work. I read a forward-looking docstring as present tense.
+
+What is actually true:
+
+- **GDN/Mamba state is NEVER spilled** — "GDN/Mamba state stays resident".
+  Only `slot.last_hidden` is captured, precisely because "GDN forbids a target
+  re-forward".
+- **Draft KV does travel**, but via separate `SpillSlot` attributes rather than
+  the bundle: `draft_kv_k`/`draft_kv_v` (pinned-CPU snapshot) and, under
+  `--kv-session-offload-spec-in-tick`, `draft_dev_k`/`draft_dev_v` which never
+  leave the GPU.
+
+So §1's conclusion — that the code carries the draft share rather than
+discarding it — stands; the mechanism I named for it was wrong.
+
+## C3 — Spec ALGORITHM state is not captured at all (open gap)
+
+Adaptive-k, cross-algo bandit state and acceptance history have no `SpillSlot`
+field and are not referenced from `kv_session_offload.py`. A resume rebuilds
+`spec_info` from `last_hidden`/`tick_hiddens` only. For an adaptive or
+bandit-driven configuration the controller state does not survive a spill.
+
+Not fixed here, and not obviously a bug — a bandit that resets on resume is
+degraded, not wrong — but it is unrecorded anywhere else, so it is recorded
+here.
+
+## C4 — FCFS: the starvation was REAL and UNBOUNDED. Now bounded.
+
+§3 filed this as NOT ESTABLISHED. It is established, and it was a defect.
+
+`_maybe_restore_flow` deferred a spilled session's restore while **any**
+fast-lane request sat in the waiting queue, with a good reason (restoring into
+fast-lane pressure only re-triggers the spill, one full D2H+H2D per cycle) —
+but the deferral called `slot.hysteresis.reset()` and returned. No progress
+accumulated, so under continuous fast-lane traffic an older spilled session
+**never restored**. "Fast beats FCFS" was acting as an indefinite hold rather
+than a tie-break.
+
+**Fixed**, with the precedent already in tree: the scheduler solves this exact
+shape for the other lane via `fast_lane_heavy_aging_ms`, which promotes a
+long-waiting heavy request ahead of the fast tier for one admission. This is
+that rule in the units this loop has — iterations, not milliseconds.
+
+- `RestoreHysteresis.defer()` zeroes the streak exactly as `reset()` did **and
+  counts**; past `DEFAULT_RESTORE_DEFER_LIMIT` (100) the call site falls
+  through and the restore is considered, with a warning naming the count.
+- `clear_deferrals()` runs only on an actual restore (`_finalize_restore`), and
+  deliberately NOT from `reset()` — a deferral clearing the count would make
+  the bound unreachable, which is the bug itself wearing a fix.
+- `defer_limit <= 0` restores the pre-#552 behaviour exactly, so the change is
+  reversible without a revert, and the count stays observable even when
+  disabled.
+
+**Failure direction:** when the bound fires, one restore happens while a fast
+request waits, and that request may pay a re-spill. Bounded to one restore per
+aged-out session, and it fires only in the pathological case.
+
+Pins: `test/registered/unit/test_kvso_restore_starvation_552.py` (16).
+Mutations: restoring the bare `reset()` fails 3; and for the committed-only
+property, making the spec-overlap snapshot restore from `kv_allocated_len`
+(draft-touched) instead of `true_L` fails 2 of the EXISTING pins
+(`test_spill_snapshot_spec_overlap_frees_only_draft_overhang`,
+`test_spill_snapshot_declines_when_true_length_lags_committed`) — that property
+was already pinned, so I mutated against those rather than writing a second
+authority for it.
+
+## C5 — Committed-only, precisely
+
+The boundary is not plain `kv_committed_len` under overlap. `spill_snapshot`
+(`:1485-1520`) uses `true_L`, the post-verify published length, with
+`free_from=true_L` so only the never-accepted draft overhang
+`[true_L, kv_allocated_len)` is discarded. `kv_committed_len` itself is bumped
+only in the deferred result processor
+(`batch_result_processor.py:632-634`, `+= num_accept_tokens`), which is why the
+plain counter is stale at spill time under overlap.
