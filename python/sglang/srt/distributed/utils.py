@@ -15,7 +15,7 @@ import pickle
 import time
 from collections import deque
 from contextlib import contextmanager
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore
@@ -312,9 +312,9 @@ def weightless_head_counts(total: int, world_size: int) -> list:
     head rank only)."""
     head_rank = _WEIGHTLESS_KV_HEAD_RANK
     assert head_rank is not None, "weightless_head_counts() with fast lane off"
-    assert 0 <= head_rank < world_size, (
-        f"weightless head_rank {head_rank} out of range for world {world_size}"
-    )
+    assert (
+        0 <= head_rank < world_size
+    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
     return [total if r == head_rank else 0 for r in range(world_size)]
 
 
@@ -1501,6 +1501,128 @@ def split_tensor_along_last_dim(
         return tuple(chunk.contiguous() for chunk in tensor_list)
 
     return tensor_list
+
+
+#: Per-stage explicit LAYER SETS, as an alternative to the contiguous
+#: ``SGLANG_PP_LAYER_PARTITION`` counts. Stages are separated by ``;`` and each
+#: stage is a comma list of ranges and singletons:
+#:
+#:     SGLANG_PP_LAYER_SET="0-2,4-6,8-10;3,7,11"
+#:
+#: Why this exists: a stage has always been an INTERVAL here
+#: (``start = sum(partitions[:pp_rank])`` below), so a family placement that
+#: puts, say, every linear-attention layer on one card and the interleaved
+#: full-attention layers on others is not expressible at all. That is an
+#: ADDRESSING limit, independent of any transport.
+#:
+#: The count form is untouched and remains the default: with this variable
+#: unset, every code path below is byte-identical to what it was.
+PP_LAYER_SET_ENV = "SGLANG_PP_LAYER_SET"
+
+
+class PPLayerSetError(ValueError):
+    """A layer-set map that cannot be used. Always names the offending layers."""
+
+
+def _parse_layer_spec(spec: str) -> List[int]:
+    """One stage's ``0-2,4,7-9`` into a sorted list. Duplicates are kept so the
+    caller can report them rather than silently absorbing them."""
+    out: List[int] = []
+    for piece in spec.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            lo_s, _, hi_s = piece.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError as err:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: {piece!r} is not a range of integers"
+                ) from err
+            if hi < lo:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: range {piece!r} runs backwards"
+                )
+            out.extend(range(lo, hi + 1))
+        else:
+            try:
+                out.append(int(piece))
+            except ValueError as err:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: {piece!r} is not an integer layer id"
+                ) from err
+    return out
+
+
+def parse_pp_layer_sets(
+    raw: str, num_hidden_layers: int, pp_size: int
+) -> List[FrozenSet[int]]:
+    """Parse and VALIDATE the per-stage layer sets.
+
+    The validation is the point. A partition that is merely "probably right"
+    produces a model where some layer is computed twice or never, and both are
+    silent: a duplicated layer just costs time, and a missing one is a
+    placeholder pass-through that returns its input unchanged. So every failure
+    below names the exact layers involved.
+    """
+    stages = [seg for seg in raw.split(";")]
+    if len(stages) != pp_size:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: {len(stages)} stage(s) given but pp_size is "
+            f"{pp_size}. Separate stages with ';'."
+        )
+    parsed = [_parse_layer_spec(seg) for seg in stages]
+
+    seen: Dict[int, int] = {}
+    duplicated: Dict[int, List[int]] = {}
+    for rank, layers in enumerate(parsed):
+        for layer in layers:
+            if layer in seen:
+                duplicated.setdefault(layer, [seen[layer]]).append(rank)
+            else:
+                seen[layer] = rank
+    if duplicated:
+        detail = "; ".join(
+            f"layer {layer} on stages {sorted(set(ranks))}"
+            for layer, ranks in sorted(duplicated.items())
+        )
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: a layer may be owned by exactly one stage, "
+            f"but {detail}. A duplicated layer is computed twice and nothing "
+            f"downstream would say so."
+        )
+
+    out_of_range = sorted(l for l in seen if l < 0 or l >= num_hidden_layers)
+    if out_of_range:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: layer(s) {out_of_range} are outside "
+            f"[0, {num_hidden_layers})."
+        )
+
+    missing = sorted(set(range(num_hidden_layers)) - set(seen))
+    if missing:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: layer(s) {missing} are owned by no stage. "
+            f"An unowned layer is a pass-through placeholder at run time, so "
+            f"the model would answer with that layer silently skipped."
+        )
+
+    return [frozenset(layers) for layers in parsed]
+
+
+def get_pp_layer_set(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> Optional[FrozenSet[int]]:
+    """This stage's owned layer ids, or ``None`` when the set form is unused.
+
+    ``None`` is the default and means "ask ``get_pp_indices``" -- it is what
+    keeps the contiguous path byte-identical.
+    """
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        return None
+    return parse_pp_layer_sets(raw, num_hidden_layers, pp_size)[pp_rank]
 
 
 def get_pp_indices(

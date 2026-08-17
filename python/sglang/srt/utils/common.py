@@ -86,8 +86,6 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-
-from sglang.srt.utils import triton_patch as _triton_patch
 from packaging import version as pkg_version
 from PIL import Image
 from torch import nn
@@ -99,6 +97,7 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import triton_patch as _triton_patch
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper, backend
 
 if TYPE_CHECKING:
@@ -1978,10 +1977,57 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.distributed.utils import get_pp_layer_set
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
+
+    # NON-CONTIGUOUS OWNERSHIP (family placement). A stage has always been an
+    # INTERVAL here, which is why a layout like "every linear-attention layer
+    # on this card, the interleaved full-attention layers elsewhere" could not
+    # be expressed at all. When SGLANG_PP_LAYER_SET is set, ownership is an
+    # explicit SET instead.
+    #
+    # The structure already supported this and that is the whole reason it is
+    # cheap: the list below is FULL LENGTH either way, with PPMissingLayer
+    # (a torch.nn.Identity pass-through) standing in for layers this stage does
+    # not own. Placeholders interleaved in the middle are the same object as
+    # placeholders at the ends.
+    #
+    # ``start_layer``/``end_layer`` are still returned, as the FIRST and
+    # one-past-LAST owned layer, because that is what their consumers use them
+    # for (e.g. "am I the first layer on this stage"). A consumer that instead
+    # treats the pair as a contiguous RANGE is wrong under this mode; those are
+    # audited separately and the ones that cannot be fixed mechanically are
+    # filed rather than silently carried.
+    owned = (
+        get_pp_layer_set(num_hidden_layers, pp_rank, pp_size)
+        if pp_rank is not None and pp_size is not None
+        else None
+    )
+    if owned is not None:
+        if not owned:
+            raise ValueError(
+                f"SGLANG_PP_LAYER_SET gives stage {pp_rank} no layers at all; "
+                f"an empty stage cannot be built."
+            )
+        modules = torch.nn.ModuleList(
+            [
+                (
+                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    if idx in owned
+                    else PPMissingLayer(return_tuple=return_tuple)
+                )
+                for idx in range(num_hidden_layers)
+            ]
+        )
+        # Published for in-model consumers that need membership rather than
+        # the span. model_runner does NOT read this -- it calls the same parser
+        # directly, so ownership has exactly one derivation.
+        modules.owned_layers = frozenset(owned)
+        return modules, min(owned), max(owned) + 1
+
     start_layer, end_layer = (
         get_pp_indices(
             num_hidden_layers,
