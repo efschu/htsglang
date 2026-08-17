@@ -238,8 +238,23 @@ the GDN blob (#212 gate inherited, keyed on `supports_mamba()`);
 `/session/{id}/branch` opens a new session from it and `/session/{id}/rewind`
 moves an existing one back, both WITHOUT re-prefilling. Branching copies
 nothing — the radix tree already shares a common prefix and splits at the
-divergence point, so #410 adds only the `inc_lock_ref` pin, and the reported
-accounting asserts `copied_pages == 0`. The tier comes from the #407 registry
+divergence point, so #410 adds only the `inc_lock_ref` pin there, and the
+reported accounting asserts `copied_pages == 0`.
+**TWO TIERS OF PIN, and they are not interchangeable.** `inc_lock_ref` protects
+the radix chain IN MEMORY for the life of the process; the referenced pages
+still sit in the HiCache file store as ordinary LRU entries, so a checkpoint
+with only that pin survives radix eviction and does NOT survive file-tier
+eviction or a restart. `take_file_tier_pins`
+(`managers/session_checkpoint.py`) takes the second tier through the #410 pin
+ledger (`mem_cache/pin_ledger.py`, honoured by `LRUFileEvictor`), and raises
+`PinCoverageIncomplete` naming the references it could not pin -- answering "are
+this checkpoint's pages on the file tier at all" at CHECKPOINT time rather than
+letting the shortfall surface at the branch. A checkpoint placed by #407 on
+vram/host has no file tier and is logged as unprotected, not refused.
+The file evictor charges **ALLOCATED** bytes (`max(st_blocks*512, st_size)`),
+the same unit the pin ledger charges, so `reclaimable = used - pinned` is a
+coherent subtraction; `stats()` reports `accounting_overshoot_bytes` if the two
+ever diverge again. The tier comes from the #407 registry
 (VRAM → RAM → Disk by age/durability, provenance-labelled, named refusal when
 nothing is admissible). Restore is #261's `verify_import` (#241 identity) plus
 a geometry gate; cross-geometry is a NAMED refusal pointing at the offline

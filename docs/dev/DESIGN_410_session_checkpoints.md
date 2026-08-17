@@ -214,3 +214,73 @@ Also to be captured in the same boot: the checkpoint's wall time and the
   streaming path builds. #410's rewind is the first caller to take the copy
   path on a streaming session, which is where it surfaced; the concatenation
   is now type-preserving (`session_controller.py:36`).
+
+---
+
+# Addendum, 2026-08-17: pinning tiers, accounting, and the reconciliation
+
+This section is the surviving record of a second #410 implementation that was
+developed in parallel and is NOT being merged. See
+`VERDICT_411_two_410_formats.md` for how the duplication happened and
+`NOTE_411_reconciliation_port.md` for the port. The findings below came from
+that lineage and are kept because they are true of this one.
+
+## The pin tiers are two, and only one existed here
+
+`SessionCheckpointRuntime._pin` takes `tree.inc_lock_ref(node)`: the radix
+chain, in memory, for the life of the process.
+
+**An A checkpoint survives radix eviction and does not survive file-tier
+eviction.** The pages it references live in the HiCache file store as ordinary
+LRU entries; nothing stopped the evictor reclaiming them and nothing survived a
+restart. `take_file_tier_pins` now takes that second tier through the pin ledger
+(`mem_cache/pin_ledger.py`), which `LRUFileEvictor` honours by skipping pinned
+stems.
+
+## Coverage is a refusal, not a statistic
+
+`stems_with_sizes` drops a stem whose file is absent. That is right for the
+budget -- charging for protection nobody gets is the #715 error -- and silent to
+the caller. So a checkpoint could pin four of six pages and report success,
+with the other two evicted and the failure surfacing at the BRANCH.
+
+`PinCoverageIncomplete` moves that refusal to checkpoint time and names the
+references. Pins are taken BEFORE the ledger record exists: a checkpoint that
+cannot be protected must not become a record promising a branch whose pages are
+already reclaimable.
+
+A checkpoint the #407 registry places on vram or host has no file tier at all.
+That is logged as unprotected, never raised -- refusing a placement the tier
+policy chose would be this layer overruling the one whose decision it is.
+
+## The evictor charges ALLOCATED bytes
+
+A filesystem charges the blocks it allocated, not the length the file reports:
+on this rig's ZFS a 64-byte page occupies 512. The pin ledger charges allocated
+bytes, so while the evictor charged apparent ones `reclaimable = used - pinned`
+subtracted two different units and could go negative. Both now charge allocated;
+`stats()` exposes `accounting_overshoot_bytes` so a future divergence is visible
+rather than clamped away.
+
+`reserve` still estimates from the payload length -- the file does not exist
+yet -- and `commit` reconciles against the filesystem's own answer.
+
+## Interface note for the per-session KV export/import consumer
+
+Slot-2 is building a per-session KV export/import slice against this module's
+INTERFACE without modifying it. The seam it should wire to is
+`world_roundtrip`'s `write_snapshot` / `read_snapshot` pair, mapped per session
+onto `export_session_snapshot` -- the same #261 serialization this module
+already uses, so an exported session and a checkpoint are the same bytes.
+
+If #411 needs to change that interface, the change belongs to this lineage and
+will be recorded here first, so that consumer is never chasing a moving seam.
+
+## Merge-train note
+
+Do not merge the parallel lineage's `mem_cache/session_manifest.py` or
+`mem_cache/session_checkpoint.py`: they are a second format for the same
+feature. Its unique contribution -- the pin ledger and the coverage refusal --
+is already ported here. Its modules had no live-path importers (only the
+superseded `session_bundle.py`, a self-reference, and their own tests), so
+nothing is stranded by leaving them behind.
