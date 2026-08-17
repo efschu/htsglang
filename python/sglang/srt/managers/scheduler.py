@@ -1656,6 +1656,14 @@ class Scheduler(
         # SchedulerBatchResultProcessor.process_batch_result_prefill), never
         # on a forward pass -- that is the exact signal #699 proved blind.
         self.last_first_token_progress_time: float = time.perf_counter()
+        # #739: the SECOND progress signal. The first-token clock alone cannot
+        # separate a wedge from a mega-prefill -- a 500k-token backlog chunking
+        # at chunked_prefill_size produces no first token for minutes while
+        # prefill runs the whole time, with the same queued>0/running==0 shape.
+        # Stamped when a chunked request retires a middle chunk, so it is an
+        # EVENT clock, not a delta of the pending counter (#731 shows that
+        # counter double-billed; a detector keyed to it inherits the noise).
+        self.last_prefill_progress_time: float = time.perf_counter()
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -1785,6 +1793,16 @@ class Scheduler(
         self.last_first_token_progress_time = (
             ts if ts is not None else time.perf_counter()
         )
+
+    def note_prefill_progress(self, ts: Optional[float] = None) -> None:
+        """Stamp the #739 prefill-progress clock.
+
+        Call this when a chunked request retires a middle chunk -- real
+        forward progress on a prompt that has not reached a first token yet.
+        Never call it from a bare forward pass: that is the signal #699 proved
+        blind, and reusing it here would re-import the blindness.
+        """
+        self.last_prefill_progress_time = ts if ts is not None else time.perf_counter()
 
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
@@ -3639,6 +3657,7 @@ class Scheduler(
             abort_request=self.abort_request,
             kv_session_offload=self.kv_session_offload,
             record_first_token_progress=self.note_first_token_progress,
+            record_prefill_progress=self.note_prefill_progress,
         )
 
     def init_req_max_new_tokens(self, req):

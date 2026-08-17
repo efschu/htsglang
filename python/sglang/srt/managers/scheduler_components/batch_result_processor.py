@@ -16,13 +16,13 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.phase_flip_output_trace import trace_round
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.phase_flip_output_trace import trace_round
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -91,6 +91,7 @@ class SchedulerBatchResultProcessor:
     # Defaults to a no-op so callers that don't wire the watchdog are
     # unaffected.
     record_first_token_progress: Callable[[], None] = lambda: None
+    record_prefill_progress: Callable[[], None] = lambda: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -323,6 +324,10 @@ class SchedulerBatchResultProcessor:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
+                    # #739: a retired middle chunk IS progress even though no
+                    # first token was produced. Without it the detector reads a
+                    # mega-prefill as a wedge.
+                    self.record_prefill_progress()
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -376,6 +381,10 @@ class SchedulerBatchResultProcessor:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
+                    # #739: a retired middle chunk IS progress even though no
+                    # first token was produced. Without it the detector reads a
+                    # mega-prefill as a wedge.
+                    self.record_prefill_progress()
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.output_streamer.stream_output(
