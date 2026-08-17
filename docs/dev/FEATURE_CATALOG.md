@@ -3474,6 +3474,46 @@ taxonomy and the global importance ladder.
   waits for exists". One sweep row was rejected on exactly that — the barlink
   NCCL-reference docstring is CORRECT that the measurement does not exist; only
   its LOADER does.
+- **#516 MoE-Offload x Graphs — DETERMINED per half** (`ANALYSE_516_determination.md`).
+  Filed before most surrounding work landed; the three halves have three
+  different answers, which is why it read as stuck.
+  **BREAKABLE ROUTE — DELIVERED.** #462's route is
+  `model_executor/runner_backend_utils/breakable_cuda_graph/`; #468's
+  `va_stable_required` is a descriptor field in
+  `short_term_offload_register.py`, applied at `offload_gdn_states.py:360`; and
+  the open question "did #494's break-cost instrument reach the main lines?" is
+  YES — `utils/break_cost_clock.py` is imported and used at
+  `breakable_cuda_graph.py:42,297,301` AND at `layers/moe/expert_offload.py:120`,
+  i.e. it sits on the path it measures, not in a side tool.
+  **LAYOUT — BUILT, OPT-IN, NOT DEFAULT.** #254/#256 (expert-major waves, fp8
+  presplit) are in `expert_offload.py` / `lazy_expert_staging.py`; #439's
+  link-proportional assignment has its own module
+  `layers/moe/expert_compute_placement.py`. But the solve is env-gated:
+  `compute_policy_label()` (`:560-562`) falls back to `base-plan`, and
+  `expert_stats._moe_compute_policy` (`:127-140`) says so in prose —
+  `base-plan` is "the truthful answer for every launch that did not ask for a
+  solve". So what remains of "schlaues Layout" is a DEFAULTING DECISION, not a
+  build, and it is window-gated: #439's own module records that the first
+  battery hit a fixed point (`:566`) because the runtime did not honour the
+  invariant the solve assumed.
+  **MISS-SLOT BUDGET — NOT BUILT, AND NOT REFUSED EITHER.** Zero hits in
+  `python/sglang/srt` for `miss_slot`, `slot_budget`, `expert_miss`,
+  `miss_budget`. The two neighbours are not budgets: #390
+  `layers/moe/expert_stats.py` is an INSTRUMENT (`hit_rate:291`,
+  `snapshot:301`, periodic dump `:353-386` — it records, it never caps), and
+  #302a `expert_heat_migration.py` is a PLACEMENT policy performing an
+  EQUAL-COUNT swap, which changes WHICH experts are resident and never how many
+  misses may be spent. **No refusing gate exists anywhere** — the distinction
+  matters: there is no prior decision to overturn and no architectural
+  objection on record, only the ordinary bar of beating the equal-count
+  re-rank. Desk-fundable: the budget's shape, against the recorded
+  `expert_stats_*.json` the #302a harness already replays
+  (`scripts/dev/302a_heat_desk/simulate_heat.py`). Window-gated: any claim that
+  it beats current placement.
+  METHOD NOTE worth reusing: commit ancestry was the WRONG delivery test here —
+  every cited task's first-matching commit is a non-ancestor of
+  `train/0817-control` while its code is plainly present, because the work
+  arrived by MERGE. Delivery was asserted from code presence at file:line.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an
