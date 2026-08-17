@@ -1636,11 +1636,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # iteration, outside any cuda graph — "selected-row topk is owned by
         # the worker"): the per-rank argmax/topk/sample here was the last
         # unsynced decision point after the in-loop and verify syncs.
+        # fuse=True (#524): this is the one pick site that is BOTH per-decode-
+        # round and outside any captured region (the comment above states both),
+        # so fusing its two broadcasts into one removes a host-path collective
+        # per round without touching what any CUDA graph allocates. The
+        # in-loop pick at draft_forward and the prefill/catchup sites stay
+        # unfused and byte-identical.
         _broadcast_draft_picks(
             ret_topk_index,
             ret_topk_p,
             ret_draft_probs,
             solo_single_rank=self._spec_solo_active,
+            fuse=True,
         )
         ret_hidden_states = draft_logits_output.hidden_states
 

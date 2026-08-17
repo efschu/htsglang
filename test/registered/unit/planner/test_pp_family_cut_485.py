@@ -113,6 +113,8 @@ def _inputs(
     tp_token_shares=None,
     overheads=(0.0, 0.0, 0.0),
     seam_staging=(0.0, 0.0, 0.0),
+    draft_residency=(None, None, None),
+    draft_runner_present=False,
 ):
     cards = (RANK0_5090, RANK1_3080, RANK2_3080)
     bw = bw or tuple(c["attn_bw_gbs"] for c in cards)
@@ -126,6 +128,7 @@ def _inputs(
             transient_mib=transients[i],
             fixed_overhead_mib=overheads[i],
             seam_staging_mib=seam_staging[i],
+            draft_residency_mib=draft_residency[i],
         )
         for i, label in enumerate(("rank0-5090", "rank1-3080", "rank2-3080"))
     )
@@ -143,6 +146,7 @@ def _inputs(
         kv_pool_tokens=pool,
         tp_token_shares=tp_token_shares,
         corridor_mib=corridor,
+        draft_runner_present=draft_runner_present,
     )
 
 
@@ -919,7 +923,6 @@ class TestTokenShareContract(CustomTestCase):
             pp_cut.token_shares_from_vector(())
 
 
-
 class TestTheTransientIsPerLoadState(CustomTestCase):
     """#485/law 31: a transient measured in one load state is not the transient.
 
@@ -979,8 +982,7 @@ class TestTheTransientIsPerLoadState(CustomTestCase):
         return dataclasses.replace(
             inputs,
             ranks=tuple(
-                dataclasses.replace(r, transient_mib=0.0,
-                                    transient_by_load_state=t)
+                dataclasses.replace(r, transient_mib=0.0, transient_by_load_state=t)
                 for r, t in zip(inputs.ranks, tables)
             ),
         )
@@ -1007,13 +1009,19 @@ class TestTheTransientIsPerLoadState(CustomTestCase):
 
         gentle_inputs = self._with_transients(
             _inputs(transients=(0.0, 0.0, 0.0), budgets=budgets, pool=280000),
-            ({"PREFILL_TRIGGER": gentle}, {"PREFILL_TRIGGER": 1120.0},
-             {"PREFILL_TRIGGER": 982.0}),
+            (
+                {"PREFILL_TRIGGER": gentle},
+                {"PREFILL_TRIGGER": 1120.0},
+                {"PREFILL_TRIGGER": 982.0},
+            ),
         )
         worst_inputs = self._with_transients(
             _inputs(transients=(0.0, 0.0, 0.0), budgets=budgets, pool=280000),
-            ({"PREFILL_TRIGGER": gentle, "MIXED_SOAK": worst},
-             {"PREFILL_TRIGGER": 1120.0}, {"PREFILL_TRIGGER": 982.0}),
+            (
+                {"PREFILL_TRIGGER": gentle, "MIXED_SOAK": worst},
+                {"PREFILL_TRIGGER": 1120.0},
+                {"PREFILL_TRIGGER": 982.0},
+            ),
         )
 
         _s1, gentle_violations = pp_cut.validate_pp_cut(cut, gentle_inputs)
@@ -1030,10 +1038,16 @@ class TestTheTransientIsPerLoadState(CustomTestCase):
         cut = [40, 12, 12]
         budget0 = self._budget_that_binds(cut, 1346.0)
         inputs = self._with_transients(
-            _inputs(transients=(0.0, 0.0, 0.0),
-                    budgets=(budget0, 20054.9, 20054.9), pool=280000),
-            ({"MIXED_SOAK": 1989.0, "IDLE": 1.0},
-             {"MIXED_SOAK": 1120.0}, {"MIXED_SOAK": 982.0}),
+            _inputs(
+                transients=(0.0, 0.0, 0.0),
+                budgets=(budget0, 20054.9, 20054.9),
+                pool=280000,
+            ),
+            (
+                {"MIXED_SOAK": 1989.0, "IDLE": 1.0},
+                {"MIXED_SOAK": 1120.0},
+                {"MIXED_SOAK": 982.0},
+            ),
         )
         _sol, violations = pp_cut.validate_pp_cut(cut, inputs)
         self.assertTrue(violations)

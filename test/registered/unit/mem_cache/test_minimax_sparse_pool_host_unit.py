@@ -80,17 +80,54 @@ def _cuda_major() -> int:
 # host pool and copy on a side stream), not merely unskipped -- unskipping alone
 # leaves it red for the reasons above. Its sibling
 # test_device_to_host_kernel_page_first still segfaults on BOTH wheels via a
-# different path (transfer_kv_all_layer_lf_ph), so this file cannot go green
-# until both are addressed.
+# different path and owes its own ticket (#441(a)), so this file cannot go
+# green until both are addressed.
 #
-# #441 UPDATE on that sibling: it no longer "owes its own ticket" in the sense
-# of having nothing behind it. A real latent defect in that path was found and
-# guarded -- the page-head offset formula subdivides by head_num while the copy
-# helper uses 8-byte-aligned-only PTX, so `item_size % (8 * head_num) == 0` is
-# now checked at both page-head entries (`check_page_head_alignment`,
-# csrc/kvcacheio/transfer.cu). But that is NOT this segfault's cause: the
-# shapes here are aligned. The attribution is still open and its metal
-# falsifier is written and filed at tools/441/falsify_lf_ph_441.py.
+# #441(a) ATTRIBUTION CORRECTED 2026-08-16, statically and against the pinned
+# wheel. The symbol named above, transfer_kv_all_layer_lf_ph, is NOT reachable
+# from this test: pool_host/mha.py gates that call on layout == "page_head"
+# (:405), this test only drives layer_first / page_first / page_first_direct,
+# and the index-K host (MHATokenToKOnlyPoolHost) uses the MLA variants
+# (transfer_kv_all_layer_mla_lf_pf), never lf_ph. Three hypotheses were
+# eliminated rather than ranked:
+#   * wrong-arch cubin -- the pinned .so carries sm_86 and sm_120, both present
+#     on this rig;
+#   * the CPU dst_indices this test deliberately feeds the (kernel,
+#     page_first) arm -- the installed binary contains
+#     TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA
+#     tensor"), so that path RAISES cleanly and cannot be the segfault;
+#   * the int32 index contract -- that message belongs to the grammar kernel,
+#     not kvcacheio.
+# What remains needs the crash observed: the fault is inside a CUDA kernel
+# launch and there is no CPU path through these kernels, so no CVD="" repro is
+# constructible. The smallest CUDA repro is this one test alone under a window.
+# #441(b) RE-VERIFIED 2026-08-16 AND NOT FLIPPED. The wheel was pinned by path
+# and sha first (the #384 two-dists trap), not assumed:
+#
+#   .../site-packages/sgl_kernel/sm100/common_ops.abi3.so
+#   sha256 a12be9bc94aed339...  built 2026-08-03 12:37:15
+#   the ONLY common_ops present; carries sm_86 AND sm_120 cubins, so it
+#   matches both card families on this rig.
+#
+# The guard's TRIGGER IS STILL ALIVE, and the predicate misnames it. The
+# measured matrix above says the failure is the test's memory and stream
+# SHAPE -- pageable host, legacy null stream -- not the CUDA major. Flipping
+# the guard would re-enable a test that fails for a reason the guard's name
+# does not mention, on any CUDA version that enforces the same contract.
+#
+# The discriminating experiment is cheap and is the right next step: make this
+# test production-shaped (pin the host pool, copy on a side stream) and see it
+# pass ON cu13. That would prove the CUDA major was never the trigger and the
+# guard can then be deleted rather than flipped.
+#
+# #441 GUARD, from the sibling lane and NOT contradicted by the attribution
+# above: a real latent defect in that path was found and guarded -- the
+# page-head offset formula subdivides by head_num while the copy helper uses
+# 8-byte-aligned-only PTX, so `item_size % (8 * head_num) == 0` is now checked
+# at both page-head entries (`check_page_head_alignment`,
+# csrc/kvcacheio/transfer.cu). That guard is real and shipped; it is simply not
+# this segfault's cause, since the shapes here are aligned. Metal falsifier:
+# tools/441/falsify_lf_ph_441.py.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 

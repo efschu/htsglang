@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 import tempfile
@@ -336,6 +337,85 @@ def arena_census() -> Dict[int, Dict[str, int]]:
     return out
 
 
+class VmmCoalesceRefused(RuntimeError):
+    """A coalesce was REQUIRED by the caller and the region could not honour it."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CoalesceReport:
+    """What the coalescer did, so a caller can log it rather than guess."""
+
+    coalesced: bool
+    extents_before: int
+    extents_after: int
+    bytes_total: int
+    reason: str
+
+    @property
+    def driver_calls_saved(self) -> int:
+        """One map + one setAccess per extent removed."""
+        return max(0, (self.extents_before - self.extents_after) * 2)
+
+
+def coalesce_commit_plan(plan, *, enabled: bool, require_contiguous: bool = False):
+    """#464: one physical handle per CONTIGUOUS VA run, not one per chunk.
+
+    ``KvVmmArena.commit_range`` splits a gap into ``self._chunk``-sized extents
+    (the #330 dial), so a ~1 GiB resume becomes ~500 x 2 MiB extents and hence
+    ~500 map + ~500 setAccess driver calls. When the run is contiguous those
+    extents describe ONE VA region and can be backed by one handle, taking the
+    resume to ~3 calls (map, setAccess, memset).
+
+    **Contiguity is a precondition, not an assumption.** ``decommit_span`` can
+    leave an interior HOLE -- see the #631 note inside ``commit_range`` -- so a
+    non-contiguous plan is a legitimate state, not a bug. This function then
+    REFUSES TO COALESCE and says why, rather than merging across the hole
+    (which would map pages nobody asked for) or splitting into some other shape
+    silently (which the caller cannot predict).
+
+    #286 asset classes are respected by construction: a plan is built inside a
+    single ``commit_range`` call, which addresses ONE ``offset`` -- one buffer
+    -- so no coalesced run can span two independently parked assets.
+
+    DEFAULT OFF. The 40-85 ms band is unmeasured; the flag exists so the
+    measurement can be taken, not because the win is assumed.
+    """
+    plan = list(plan)
+    total = sum(step for _, step in plan)
+    if not enabled:
+        return plan, CoalesceReport(
+            False, len(plan), len(plan), total, "coalescing disabled (default)"
+        )
+    if len(plan) <= 1:
+        return plan, CoalesceReport(
+            False, len(plan), len(plan), total, "nothing to coalesce"
+        )
+
+    gaps = []
+    for (pos_a, step_a), (pos_b, _) in zip(plan, plan[1:]):
+        if pos_a + step_a != pos_b:
+            gaps.append((pos_a + step_a, pos_b))
+    if gaps:
+        reason = (
+            f"region is not contiguous: {len(gaps)} hole(s), first at "
+            f"[{gaps[0][0]}, {gaps[0][1]}). Refusing to coalesce -- merging "
+            "across a hole would map pages nobody asked for, and splitting "
+            "silently would give a shape the caller cannot predict."
+        )
+        if require_contiguous:
+            raise VmmCoalesceRefused(reason)
+        return plan, CoalesceReport(False, len(plan), len(plan), total, reason)
+
+    merged = [(plan[0][0], total)]
+    return merged, CoalesceReport(
+        True,
+        len(plan),
+        1,
+        total,
+        f"coalesced {len(plan)} contiguous extents into one {total}-byte handle",
+    )
+
+
 class KvVmmArena:
     """One device's CUDA virtual-memory reservation exposed as a ``torch.cuda.MemPool``."""
 
@@ -348,7 +428,12 @@ class KvVmmArena:
         reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
         commit_chunk_bytes: Optional[int] = None,
         retain_handles: bool = False,
+        coalesce_resume: bool = False,
     ):
+        # #464, DEFAULT OFF: the 40-85 ms band is unmeasured, so the flag
+        # exists to make the measurement possible, not because the win is
+        # assumed. Off reproduces the per-#330-chunk plan byte-for-byte.
+        self._coalesce_resume = bool(coalesce_resume)
         self.device_id = int(device_id)
         # Unique per (process, arena instance): the stub .so lives in a host-shared
         # tempdir, so co-located engine processes must not build the same-named .so
@@ -542,6 +627,18 @@ class KvVmmArena:
                     step = min(step, self._chunk)
                 plan.append((p, step))
                 p += step
+        # #464 (flag-gated, DEFAULT OFF): back one CONTIGUOUS run with one
+        # handle instead of one per #330 chunk. Refuses on a hole rather than
+        # merging across it; see coalesce_commit_plan.
+        plan, coalesce_report = coalesce_commit_plan(
+            plan, enabled=self._coalesce_resume
+        )
+        if coalesce_report.coalesced:
+            logger.info(
+                "kv-vmm: #464 %s (%d driver calls saved)",
+                coalesce_report.reason,
+                coalesce_report.driver_calls_saved,
+            )
         with torch.cuda.device(self.device_id):
             for pos, step in plan:
                 addr = self.base + offset + pos

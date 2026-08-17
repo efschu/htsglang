@@ -53,6 +53,15 @@ class _Sched:
     # The method under test, bound off the real class so the test cannot
     # drift from the implementation it is pinning.
     size_for = Scheduler.dynamic_chunked_prefill_size
+    # #624 stub drift, fourth instance of the same shape: #656 added an
+    # engagement-proof call to the method under test and nothing bound it
+    # here, so both cases failed with
+    # ``AttributeError: '_Sched' object has no attribute
+    # '_log_dynamic_chunk_engagement'``. Bound off the real class for the same
+    # reason ``size_for`` is: a stand-in that reimplements it would stop
+    # pinning it. It writes ``_dyn_chunk_last_logged`` on this instance and
+    # reads ``chunked_prefill_size``, both of which this harness already has.
+    _log_dynamic_chunk_engagement = Scheduler._log_dynamic_chunk_engagement
 
 
 def _chunked_req(prefix_len):
@@ -106,6 +115,109 @@ class TheStaticSizeIsStillReachable(unittest.TestCase):
     def test_a_continuing_prefill_with_the_feature_off_is_static(self):
         s = _Sched(chunked_req=_chunked_req(99), enabled=False)
         self.assertEqual(s.size_for(), STATIC)
+
+
+# ---------------------------------------------------------------------------
+# The harness must track the production surface (#624 stub drift)
+# ---------------------------------------------------------------------------
+
+
+def _self_attributes_read_by(func) -> set:
+    """Names this function reads off ``self`` (assignment targets excluded).
+
+    Source-level on purpose: the drift is "someone added a ``self.X`` to the
+    method and did not bind X on the stand-in", which is a property of the
+    method's TEXT. Executing it to find out would need the very stand-in whose
+    completeness is in question.
+    """
+    import inspect
+    import re
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(func))
+    assigned = set(re.findall(r"self\.([A-Za-z_]\w*)\s*=", src))
+    return set(re.findall(r"self\.([A-Za-z_]\w*)", src)) - assigned
+
+
+def _required_surface(entry, harness_cls) -> set:
+    """Every ``self`` member ``entry`` needs from ``harness_cls``.
+
+    ONE LEVEL, AND ONLY THROUGH METHODS THE HARNESS ACTUALLY INHERITS. If the
+    stand-in supplies its OWN implementation of a callee -- as ``_Sched`` does
+    for ``predict_next_chunk_size``, which is the whole point of the harness --
+    then the production version's internals (``length_predictor``,
+    ``model_config``, ``ps`` ...) are never reached and demanding them would
+    make this guard fail on bindings the harness legitimately does not need.
+    Descending only into inherited callees is what keeps the requirement equal
+    to what the code path actually touches.
+    """
+    needed = _self_attributes_read_by(entry)
+    for name in sorted(needed):
+        production = getattr(Scheduler, name, None)
+        if not callable(production):
+            continue
+        if getattr(harness_cls, name, None) is production:
+            needed = needed | _self_attributes_read_by(production)
+    return needed
+
+
+class TheHarnessTracksTheProductionSurface(unittest.TestCase):
+    """#624 stub-drift class, closed for this harness.
+
+    ``_Sched`` binds ``Scheduler.dynamic_chunked_prefill_size`` and hand-writes
+    the state it reads. When #656 added the engagement-proof call, nothing
+    bound it here and both cases went red with an ``AttributeError`` naming ONE
+    attribute -- the same worst-possible signal that let the sibling
+    ``BudgetHarness`` drift three times running: it reports the first missing
+    member, not the set, so fixing the named one can leave the next queued.
+
+    This checks the harness against the real method instead of against the last
+    incident. A member added to ``dynamic_chunked_prefill_size`` and not bound
+    here fails THIS case, with the full list, before it can fail the sizing
+    cases with a single name.
+    """
+
+    def test_every_member_the_sizer_touches_is_on_the_harness(self):
+        harness = _Sched(chunked_req=None)
+        required = _required_surface(Scheduler.dynamic_chunked_prefill_size, _Sched)
+        missing = sorted(n for n in required if not hasattr(harness, n))
+        self.assertEqual(
+            missing,
+            [],
+            "_Sched has drifted behind Scheduler.dynamic_chunked_prefill_size: "
+            f"{missing}. Bind these from Scheduler (or give the harness a "
+            "stand-in field) so the sizing cases keep exercising the real "
+            "contract instead of failing with an AttributeError.",
+        )
+
+    def test_the_guard_can_fail(self):
+        """A drift detector that cannot report a drift is decoration."""
+        harness = _Sched(chunked_req=None)
+        required = _required_surface(Scheduler.dynamic_chunked_prefill_size, _Sched) | {
+            "_a_member_added_next_quarter"
+        }
+        missing = sorted(n for n in required if not hasattr(harness, n))
+        self.assertEqual(missing, ["_a_member_added_next_quarter"])
+
+    def test_an_overridden_callee_is_not_descended_into(self):
+        """The refinement that keeps this guard honest: ``_Sched`` supplies its
+        own ``predict_next_chunk_size``, so the production one's state is never
+        reached and must not be demanded."""
+        required = _required_surface(Scheduler.dynamic_chunked_prefill_size, _Sched)
+        self.assertIn("predict_next_chunk_size", required)
+        for only_reachable_through_the_real_predictor in (
+            "length_predictor",
+            "model_config",
+            "ps",
+        ):
+            self.assertNotIn(only_reachable_through_the_real_predictor, required)
+
+    def test_an_inherited_callee_is_descended_into(self):
+        """The other half: ``_log_dynamic_chunk_engagement`` IS inherited, so
+        what it reads is genuinely required."""
+        required = _required_surface(Scheduler.dynamic_chunked_prefill_size, _Sched)
+        self.assertIn("_log_dynamic_chunk_engagement", required)
+        self.assertIn("chunked_prefill_size", required)
 
 
 if __name__ == "__main__":
