@@ -553,14 +553,6 @@ DEFAULT_REFUSAL_DEGRADE_AFTER = 8
 # one round trip: a server that flips, and is allowed to flip straight back,
 # spends more wall clock moving KV than serving.
 DEFAULT_MIN_DWELL_S = 10.0
-# The post-cutover settle for the IDLE-LOCKED branch. A just-entered layout is
-# empty until its carried work is re-admitted, and reading that emptiness as
-# "this layout cannot run anything" is what produced the 2026-08-17 flip
-# ping-pong (runs to 72 arms / 299 s). Derived from the measured transient --
-# cutover to first built batch over 162 cutovers, 84.7 % within 2 s -- and
-# capped at ``min_dwell_s`` where it is used, so the fast escape can never
-# become slower than the ordinary dwell path. See PhasePolicyConfig.
-DEFAULT_IDLE_LOCKED_SETTLE_S = 2.0
 # The idle return is the OTHER half of resting in PP, and it has to be
 # fast to be worth anything. The serving cycle is: prefill in PP -> flip
 # to TP so the draft/verify of speculation runs where the decode CUDA
@@ -983,26 +975,6 @@ class PhasePolicyConfig:
     enabled: bool = False
     flip_tokens: int = 0
     min_dwell_s: float = DEFAULT_MIN_DWELL_S
-    #: How long a just-entered layout is given to form a batch before the
-    #: IDLE-LOCKED branch may declare it unable to run. 0 disables the guard
-    #: and restores the oscillating behaviour exactly.
-    #:
-    #: DERIVED, NOT CHOSEN. Measured over 162 cutovers in the 16 boot rotations
-    #: of 2026-08-17, the delay from ``cutover complete`` to the first batch the
-    #: new layout builds is: 0 s for 66 of 150, 1 s for 34, 2 s for 27, 3 s for
-    #: 12, then a thin tail to 6 s (one outlier at 30 s). 2.0 s covers 84.7 % of
-    #: those transients.
-    #:
-    #: THE P95 (4 s) IS DELIBERATELY NOT USED. It exceeds the 3 s ``min_dwell_s``
-    #: this rig boots with, and a settle above the dwell would make the fast
-    #: escape slower than the ordinary path it exists to bypass -- so the tail
-    #: is left uncovered on purpose, and the use site caps the value at
-    #: ``min_dwell_s`` regardless of what is configured here.
-    #:
-    #: Log stamps are second-resolution, so this distribution cannot resolve
-    #: below 1 s and the value is a bound rather than an optimum. Stated here
-    #: rather than implied, because the number looks more precise than it is.
-    idle_locked_settle_s: float = DEFAULT_IDLE_LOCKED_SETTLE_S
     idle_dwell_s: float = DEFAULT_IDLE_DWELL_S
     rest_state: str = REST_DECODE
     #: Fairness bound; 0 disables it and restores the pure load-triggered
@@ -1249,15 +1221,11 @@ class PhasePolicyInputs:
 
     #: The OTHER layout can build at least one of those classes.
     #:
-    #: THIS FIELD DOES NOT MAKE THE ARM NON-OSCILLATING. It used to be
-    #: documented as doing exactly that -- "so after the flip the target runs by
-    #: premise and the same condition cannot immediately hold again in the new
-    #: layout" -- and that claim was falsified on metal on 2026-08-17 by
-    #: alternating runs of up to 72 arms over 299 s. One-sidedness holds at the
-    #: instant of evaluation and says nothing about the next layout's first
-    #: round, which is empty by construction until its carried work is
-    #: re-admitted. What bounds the oscillation is the post-cutover settle in
-    #: ``decide``; this field is only the admissibility half of the test.
+    #: This is what makes the arm ONE-SIDED and therefore non-oscillating by
+    #: construction, with no timer floor: the flip is armed only when the
+    #: current layout provably cannot run anything AND the target provably
+    #: can, so after the flip the target runs by premise and the same
+    #: condition cannot immediately hold again in the new layout.
     target_can_admit: bool = False
 
     #: #689: completed carriers waiting for a decode window. NOT running_bs --
@@ -1632,46 +1600,13 @@ def _decide_from_load(
     # observation. So the arm is event-driven off that failure and carries no
     # interval of its own.
     #
-    # IT OSCILLATED. The claim that stood here -- "IT CANNOT OSCILLATE, and not
-    # because a damper stops it ... after the flip the target runs by premise,
-    # so the same condition is false there" -- was FALSE ON METAL, and it is
-    # rewritten rather than deleted so the fix is read next to the reasoning it
-    # replaces.
-    #
-    # The premise fails on WHEN it is evaluated, not on what it says. "The
-    # target runs by premise" is a statement about the target once it is
-    # running; this branch is reached on the FIRST round after a cutover, while
-    # the just-entered layout is still empty and its carried work not yet
-    # re-admitted. Scheduler._idle_locked_inputs is gated on
-    # ``_round_built_nothing``, which a layout that has only just been entered
-    # satisfies trivially. So the new layout is observed in its empty transient,
-    # certified as unable to run, and armed straight back -- with the one damper
-    # that would have stopped it deliberately bypassed.
-    #
-    # Measured, 16 rotations of 2026-08-17: alternating runs of 72 arms / 299 s,
-    # 12 / 31 s, 10 / 27 s twice. The unit of user-visible delay is one whole
-    # cutover (median 2864 ms tp_to_pp, 2772 ms pp_to_tp over 486 flips), which
-    # is where the quantised 0.1 / 3.1 / 5.9 s TTFT levels in the #713 tables
-    # came from: how many cutovers a request sat through.
-    #
-    # THE INVARIANT THIS BRANCH NOW ENFORCES, in place of the false one:
-    #
-    #   A layout may be declared unable to run only after it has HAD THE
-    #   CHANCE to run. An emptiness observed within ``idle_locked_settle_s``
-    #   of entering the layout is a transient, not a verdict.
-    #
-    # That is the whole guard. It does not restore the dwell -- an idle lock
-    # that develops later still escapes immediately, which is #688's purpose
-    # and the reason this branch exists at all.
-    #
-    # FAILURE DIRECTION, stated because a guard that only helps is a guard
-    # nobody bounded: a GENUINE idle lock that forms within the settle of a
-    # cutover is now delayed, by at most the settle. That is the cost. It is
-    # bounded three ways -- the settle is capped below ``min_dwell_s`` at the
-    # use site, so this branch can never be slower than the ordinary dwell path
-    # it exists to bypass; the 180 s decode-stall cap remains the backstop that
-    # released the 09:42:39 specimen; and the settle is only consulted right
-    # after a cutover, which is the only place the transient exists.
+    # IT CANNOT OSCILLATE, and not because a damper stops it. The condition is
+    # ONE-SIDED: it requires that the current layout can build nothing AND
+    # that the target can build something. After the flip the target runs by
+    # premise, so the same condition is false there. Bypassing the dwell is
+    # therefore safe in exactly this branch and nowhere else -- which is why
+    # it is written here, above the dwell, rather than as an exception inside
+    # it.
     if inp.nothing_can_run and not inp.target_can_admit:
         # BOTH SIDES BLOCKED IS AN EVICT PROBLEM, NOT A LAYOUT PROBLEM.
         #
@@ -1702,17 +1637,10 @@ def _decide_from_load(
                 f"{inp.pending_prefill_tokens} pending)"
             )
         else:
-            # #712 RETRACTED. This line used to redirect the reader to "the
-            # state-slot bound (mamba/GDN slots)". That was never a measurement
-            # -- it was a hypothesis written into the redirect text, then read
-            # back out of the log and filed as a finding, and #712 was closed as
-            # unfounded on that evidence. A diagnostic must not name a cause it
-            # has not measured, so this branch now reports only what it knows:
-            # KV is not it.
             binding = (
                 f"KV is NOT the binding resource ({avail} rows available "
-                f"against {inp.pending_prefill_tokens} pending) -- this line "
-                f"does not name the one that is"
+                f"against {inp.pending_prefill_tokens} pending) -- look at the "
+                f"state-slot bound (mamba/GDN slots) before blaming the pool"
             )
         return _no(
             f"{BOTH_BLOCKED}: nothing can run in the {inp.phase} layout and the "
@@ -1723,36 +1651,6 @@ def _decide_from_load(
         )
 
     if inp.nothing_can_run and inp.target_can_admit:
-        # POST-CUTOVER SETTLE. See the block comment above for why the
-        # "cannot oscillate" argument failed and what invariant replaces it.
-        #
-        # CAPPED AT ``min_dwell_s`` STRUCTURALLY, not by choosing a small
-        # default and trusting operators. This branch exists to be FASTER than
-        # the dwell path; a settle above the dwell would invert that, so the cap
-        # is applied here where the value is used rather than left as advice.
-        #
-        # ``phase_since`` and not ``last_flip_at``: the first is when THIS
-        # layout was entered (maintained by observe_idle from the OBSERVED
-        # phase, so a manual POST /phase_flip restarts it too), the second is an
-        # arm stamp that is 0 until the policy itself has armed once. A guard
-        # keyed on the arm stamp would not fire for a manually flipped instance,
-        # which is precisely a case that reaches this branch.
-        #
-        # None means the phase was never observed. That degrades to the
-        # PRE-GUARD behaviour rather than to an infinite settle: an unobserved
-        # phase must not be able to pin the escape shut.
-        settle_s = min(cfg.idle_locked_settle_s, cfg.min_dwell_s)
-        entered = state.phase_since
-        if settle_s > 0 and entered is not None:
-            in_phase = inp.now - entered
-            if in_phase < settle_s:
-                return _no(
-                    f"{IDLE_LOCKED} settle: {in_phase:.1f}s in the {inp.phase} "
-                    f"layout < {settle_s:g}s -- an emptiness this soon after "
-                    f"entering a layout is a transient, not a verdict, and "
-                    f"arming on it is the ping-pong ({inp.running_bs} req "
-                    f"resident, {inp.pending_prefill_tokens} tok pending)"
-                )
         direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
         return PhasePolicyDecision(
             direction,
