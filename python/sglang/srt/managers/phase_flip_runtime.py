@@ -1158,10 +1158,64 @@ def flip_blocking_guards(scheduler) -> List[str]:
     # the whole-page format (#706) -- refusing the backend never protected the
     # bytes, it only prevented anyone from reaching them.
     #
-    # WARNING-NOT-BLOCKER (corridor canon): this path did wedge once for real,
-    # so the first arm that carries a disk tier says so exactly once. If
-    # anything ever regresses here, this line is the attribution -- it names the
-    # defect, the commit that fixed it, and the suite that keeps it fixed.
+    # RESTORED 2026-08-17, AND THE REASONING ABOVE IS WITHDRAWN BY MEASUREMENT.
+    #
+    # The removal argued: "the wedge's root fix is 9da9dfd025 (bounded
+    # collectives) ... a guard cannot be justified by a defect that a green
+    # suite says is fixed." Both halves were wrong, and it was my own call.
+    #
+    # 9da9dfd025 BOUNDED the wait; it never root-fixed the desync. It converted
+    # a silent two-hour gloo hang into a named 600 s
+    # HiCacheCollectiveTimeoutError -- valuable, and exactly what fired below,
+    # but a deadline is not a repair. And test_hicache_bounded_waits_630.py
+    # asserts only that the bounded calls RAISE ON SCHEDULE and post the same
+    # operation `recv` would; every case runs against mocked Work objects and
+    # fake groups. It proves the wait is bounded. It never proves two real
+    # ranks rendezvous, which is the thing that fails.
+    #
+    # MEASURED, 2026-08-17 10:57:50 -> 11:08:39, the first event round after
+    # startup, with --enable-hierarchical-cache --hicache-storage-backend file
+    # on a PP=3 line -- precisely the configuration this clause used to refuse:
+    #
+    #   PP0  pp_sync/isend[0]->pp1   waited 649.1 s
+    #   PP1  pp_sync/recv<-pp0       waited 649.2 s
+    #   PP2  pp_sync/recv<-pp1       waited 649.1 s
+    #
+    # All three ranks were INSIDE the collective. PP0's send and PP1's matching
+    # receive were both posted, same group, same tag, same 0-dim int payload,
+    # and they did not rendezvous. So this is not a missing participant, not an
+    # init-order race, and not #259's numel mismatch; the mechanism is still
+    # unrooted, which is exactly why a guard and not a comment is the honest
+    # response.
+    #
+    # NARROWER THAN THE ORIGINAL, deliberately. The clause that stood before
+    # #703 refused any storage backend under a flip. This one refuses only the
+    # combination that has actually wedged on metal: a PIPELINE (pp_size > 1)
+    # carrying a storage-backed tier. Single-stage flips and the
+    # device+host-local tier stay reachable, which is what #703 was for.
+    #
+    # WHAT IT COSTS, named because a restored guard is a real loss: the #706
+    # disk-tier validation is blocked again until the collective is rooted. The
+    # trade is 11 minutes of wedge and a dead instance versus an immediate,
+    # named refusal that says why -- and the boot it blocks could not complete
+    # anyway. Remove this only when a test proves two ranks RENDEZVOUS, not
+    # when one proves a wait expires.
+    pp_size = int(getattr(server_args, "pp_size", 1) or 1)
+    storage_backend = getattr(server_args, "hicache_storage_backend", None)
+    if (
+        pp_size > 1
+        and getattr(server_args, "enable_hierarchical_cache", False)
+        and storage_backend
+    ):
+        guards.append(
+            f"pipeline parallelism (pp_size={pp_size}) with a storage-backed "
+            f"hierarchical cache ({storage_backend!r}) -- #630's pp_sync desync "
+            "is bounded but NOT fixed; measured 2026-08-17 as a 649 s "
+            "HiCacheCollectiveTimeoutError on all three ranks at warmup"
+        )
+    # WARNING-NOT-BLOCKER (corridor canon): a disk tier WITHOUT a pipeline is
+    # still allowed, and the first such arm says so exactly once, so a
+    # regression there has an attribution line.
     _warn_first_disk_tier_arm(server_args)
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which

@@ -7718,7 +7718,31 @@ class Scheduler(
             mb is None or mb.is_empty() for mb in self.mbs
         )
 
+    def _admin_world_rank(self) -> int:
+        """Flat world rank of this scheduler process, for admin replies.
+
+        ``self.ps.tp_rank``, NOT ``self.tp_rank``: the Scheduler keeps its
+        parallel identity on the ParallelState wrapper, and an earlier cut of
+        another feature used the non-existent attribute and raised on every
+        tick. Reduces to tp_rank without a pipeline.
+        """
+        try:
+            return int(self.ps.pp_rank) * int(self.ps.tp_size) + int(self.ps.tp_rank)
+        except Exception:  # pragma: no cover - an admin reply may not raise
+            return -1
+
     def attach_hicache_storage_wrapped(
+        self, recv_req: AttachHiCacheStorageReqInput
+    ) -> AttachHiCacheStorageReqOutput:
+        # #545: stamp the rank on EVERY return path. Done by wrapping rather
+        # than at each `return`, because there are several and a new one added
+        # later would silently ship unstamped (-1) and break the rollback's
+        # ability to name stranded ranks.
+        out = self._attach_hicache_storage_impl(recv_req)
+        out.rank = self._admin_world_rank()
+        return out
+
+    def _attach_hicache_storage_impl(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
         if not self.enable_hierarchical_cache:
@@ -7775,6 +7799,13 @@ class Scheduler(
         return AttachHiCacheStorageReqOutput(success=ok, message=msg)
 
     def detach_hicache_storage_wrapped(
+        self, recv_req: DetachHiCacheStorageReqInput
+    ) -> DetachHiCacheStorageReqOutput:
+        out = self._detach_hicache_storage_impl(recv_req)
+        out.rank = self._admin_world_rank()
+        return out
+
+    def _detach_hicache_storage_impl(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
         if not self.enable_hierarchical_cache:

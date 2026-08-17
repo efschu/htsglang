@@ -273,6 +273,66 @@ The reconciliation branch was built on a base that merged `fix/717-rebuild` at
 its tip, so it carries `4512136e0e` and therefore inherits the rebuild-boot
 requirement — appropriate for the follow-up train, wrong for the speed boot.
 
+## 5b. CLUSTER B — CORRECTED, AND RECONCILED (2026-08-17, after trial merges)
+
+**§3's Cluster B framing was wrong, and git says so.** The three branches were
+described as each having rewritten the same three files into three models. They
+did not:
+
+* `fix/602-fill-side`, `fix/701-ledger-wiring` and `feat/704-prefill-ladder`
+  merge **cleanly with each other** — all three pairs, zero conflicts.
+* On `seam_slope.py` and `test_pp_cut_prefill_speed_702.py` the three carry
+  **byte-identical blobs**. On `pp_cut.py`, 701 and 704 are identical and 602
+  is a strict subset (+62/−2).
+* The real divergence is **cluster vs the serving line**
+  (`feat/677-park-wiring`), which holds its own version of all three files.
+
+The conflicts measured in §3 were against the accumulated probe state (which
+already contained the serving range), not between the three lanes.
+
+**Reconciliation branch: `reconcile/cluster-b-seam-model` (`6e627f4018`),
+pushed.** It is the FOLLOW-UP train's head and does not ride the speed boot.
+The seam model it lands, decided before code:
+
+1. `seam_slope.py` — union; the cluster's `derive_seam_slope_for_rank` is
+   additive (cold-path, per-rank, no collective needed).
+2. `pp_cut.py` — the cluster's `PhasePoolModel` **supersedes** the serving
+   line's `WorldMemory`/`cosolve_prefill_cut`: measured beats designed and
+   newer beats older, the phase-pool model reproduces both metal calibration
+   points, and the old API has zero callers outside `pp_cut.py` and its own
+   test.
+3. `schedule_policy.py`/`scheduler.py` — #701's ledger is an extension of the
+   serving budget logic, not a competitor.
+4. `mem_cache/common.py` — #602's single `_ledger_tokens` guard replaces the
+   inline copy (one enforced rule beats two).
+5. `test_minimax_sparse_pool_host_unit.py` — union of two non-contradicting
+   investigations; either hunk alone deletes a finding.
+
+Six superseded co-solve tests were **rewritten, not deleted**: four re-pinned
+against the new model (one with its claim INVERTED — under a min-over-ranks
+pool a per-rank cap CAN bind the pool), two recorded as properties of a world
+pool that no longer exists.
+
+Reconciled-branch results: the three lanes' own suites **72 passed**;
+`unit/mem_cache` 1086 passed / 0 failed (the train's 940 CVD="" failures are
+SKIPS here, and the #706 family still executes); `unit/planner` 8 failed, all
+`test_webui`/chess (missing optional dependency, present on every source
+branch); `unit/managers` 19 vs the train's 12, and a detached probe of
+`fix/701-ledger-wiring` alone reproduces 11 of them on the implicated files —
+so the reconciliation introduces none.
+
+## 5c. CORRECTION to the speed-boot train: `fix/717-rebuild` must NOT be merged at its tip
+
+`4512136e0e` (the `transfer.cu` kernel commit) is excluded from this train by
+decision — but it is an **ancestor of the branch tip** `a8b068b718`, so
+`git merge fix/717-rebuild` carries it. The train must merge **`67572ceac3`**
+instead. `a8b068b718` (#536, docs-only) sits on top of the excluded commit and
+must be cherry-picked if wanted.
+
+The reconciliation branch was built on a base that merged `fix/717-rebuild` at
+its tip, so it carries `4512136e0e` and therefore inherits the rebuild-boot
+requirement — appropriate for the follow-up train, wrong for the speed boot.
+
 ## 6. Open items before the train runs
 
 1. `feat/706-phase-uniform-hicache-keys` had **1 unpushed commit** at the time

@@ -1575,6 +1575,13 @@ class AttachHiCacheStorageReqInput(BaseReq, kw_only=True):
 class AttachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+    #: #545 rollback: which scheduler process answered. The fan-out collects
+    #: results in ARRIVAL order (``FanOutCommunicator.handle_recv`` appends),
+    #: so list position does NOT identify a rank -- without this field a
+    #: coordinator cannot say which ranks attached and which were left
+    #: stranded by a failed rollback. Flat world rank
+    #: (``pp_rank * tp_size + tp_rank``); -1 means unstamped.
+    rank: int = -1
 
 
 class DetachHiCacheStorageReqInput(BaseReq, kw_only=True):
@@ -1586,6 +1593,10 @@ class DetachHiCacheStorageReqInput(BaseReq, kw_only=True):
 class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+    #: #545: see AttachHiCacheStorageReqOutput.rank. Needed on the detach
+    #: output too, because a ROLLBACK detach that fails must name the ranks it
+    #: could not clean up.
+    rank: int = -1
 
 
 class ResizeHiCacheStorageReqInput(BaseReq, kw_only=True):

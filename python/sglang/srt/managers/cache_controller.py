@@ -667,14 +667,18 @@ class HiCacheController:
         if server_args is not None and getattr(
             server_args, "phase_flip_canonical_kv_page", False
         ):
-            from sglang.srt.mem_cache.canonical_page_store import build_page_window
+            from sglang.srt.mem_cache.canonical_page_store import (
+                build_page_window,
+                resolve_attn_layer_ids,
+            )
 
             model_config = server_args.get_model_config()
-            attn_layer_ids = getattr(model_config, "full_attention_layer_ids", None)
-            if not attn_layer_ids:
-                # A model with no hybrid split: every layer carries KV, so the
-                # attention-layer list is the layer list.
-                attn_layer_ids = list(range(int(model_config.num_hidden_layers)))
+            # #706: the id list is RESOLVED, not guessed. The previous
+            # `full_attention_layer_ids or range(n)` read an empty SWA-scoped
+            # list as proof of a dense model and cut this GDN hybrid's page
+            # against 64 slots instead of 16. See resolve_attn_layer_ids for
+            # the ladder and why the fix is not in get_hybrid_layer_ids.
+            attn_layer_ids = resolve_attn_layer_ids(model_config)
             canonical_kv_page = build_page_window(
                 attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
             )

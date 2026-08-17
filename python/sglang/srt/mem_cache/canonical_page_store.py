@@ -362,6 +362,87 @@ def host_page_bytes(host_pool) -> int:
     return int(page.numel()) * int(page.element_size())
 
 
+def resolve_attn_layer_ids(model_config) -> list[int]:
+    """The model's full-attention layer ids, or a NAMED refusal.
+
+    THE SPECIMEN, 2026-08-17. The Flip+HiCache boot died on
+
+        CanonicalPageError: attention layers [51, 55, 59, 63] map to page slots
+        [51, 55, 59, 63], which is not a contiguous run.
+
+    Slots should have been [12, 13, 14, 15]. The caller had resolved the id
+    list as ``full_attention_layer_ids or range(num_hidden_layers)``, under the
+    comment "a model with no hybrid split" -- a guard that cannot tell NOT
+    HYBRID from NOT POPULATED. This checkpoint is a GDN hybrid whose 16
+    full-attention layers sit at 3, 7, ... 63, so it took the dense branch and
+    the page was cut against 64 slots instead of 16.
+
+    A LADDER, because there are two different populated sources and one of them
+    is empty for this model:
+
+    (a) ``ModelConfig.full_attention_layer_ids`` -- the SWA-hybrid path. It is
+        filled by ``get_hybrid_layer_ids``, which ModelConfig calls ONLY under
+        ``if self.is_hybrid_swa``. A GDN hybrid is correctly not
+        ``is_hybrid_swa``, so this is empty here and must not be read as "dense".
+    (b) the checkpoint config's OWN property. ``Qwen3NextConfig`` derives
+        ``full_attention_layer_ids`` from ``layers_block_type``, and
+        ``Qwen3_5TextConfig`` inherits it. Measured on the deployed checkpoint:
+        returns [3, 7, ... 63], count 16 -- exactly the question being asked.
+        Sibling GDN configs differ, so this is a per-class lookup by attribute
+        rather than an assumption about all of them.
+    (c) ``range(n)`` ONLY on a POSITIVE DENSE PROOF: the checkpoint declares no
+        layer kinds at all and claims neither hybrid flag. The old comment
+        becomes an actual predicate.
+    (d) anything else -- kinds declared but no id list -- is a REFUSAL naming
+        the architecture and the kinds seen. Guessing here writes a page whose
+        slots nobody can cut, and the only reason that was survivable last time
+        is that the contiguity check happened to catch it.
+
+    Scope is deliberately this mapping. ``get_hybrid_layer_ids`` is SWA-scoped
+    and shared by every model; widening it to classify GDN hybrids would either
+    misroute them into SWA machinery or never run, since the ``is_hybrid_swa``
+    gate stays False for them.
+    """
+    # (a) the SWA-hybrid path, when it actually has an answer.
+    ids = getattr(model_config, "full_attention_layer_ids", None)
+    if ids:
+        return [int(i) for i in ids]
+
+    text_config = getattr(model_config, "hf_text_config", None)
+
+    # (b) the checkpoint's own property (GDN hybrids: Qwen3-Next family, ...).
+    own = getattr(text_config, "full_attention_layer_ids", None) if text_config else None
+    if own:
+        return [int(i) for i in own]
+
+    # (c) dense, PROVEN rather than assumed.
+    kinds = None
+    for attr in ("layer_types", "layers_block_type", "hybrid_layer_pattern"):
+        kinds = getattr(text_config, attr, None) if text_config else None
+        if kinds:
+            break
+    declares_hybrid = bool(getattr(model_config, "is_hybrid", None)) or bool(
+        getattr(model_config, "is_hybrid_swa", None)
+    )
+    if not kinds and not declares_hybrid:
+        return list(range(int(model_config.num_hidden_layers)))
+
+    # (d) kinds are declared but nothing resolved them -- refuse, and say what
+    # was seen so the next reader does not have to re-derive it from a crash.
+    arch = getattr(getattr(model_config, "hf_config", None), "architectures", None)
+    seen = sorted({str(k) for k in (kinds or [])})
+    raise CanonicalPageError(
+        f"cannot resolve the full-attention layer ids for {arch}: "
+        f"ModelConfig.full_attention_layer_ids is empty, the checkpoint config "
+        f"({type(text_config).__name__}) exposes no full_attention_layer_ids "
+        f"property, and it declares layer kinds {seen}. This is a hybrid whose "
+        f"attention layers are not where a dense model's are, so falling back "
+        f"to range(num_hidden_layers) would cut the canonical page against the "
+        f"wrong slots -- refusing instead of guessing. Give that config class a "
+        f"full_attention_layer_ids property, as Qwen3NextConfig has."
+    )
+
+
 def build_page_window(
     attn_layer_ids: Sequence[int], device_pool, host_pool
 ) -> CanonicalPageWindow:

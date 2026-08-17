@@ -145,5 +145,104 @@ backend:
 5. `DELETE` detach: subsequent lookups become misses, never corruption —
    content-addressed, the same argument #703 uses for drops.
 
-On a hybrid-GDN model, expect (1) and (5) to fail with the §4 refusal. That
-is the acceptance for the gap, not a bug to file twice.
+~~On a hybrid-GDN model, expect (1) and (5) to fail with the §4 refusal.~~
+**SUPERSEDED — the gap is now implemented (§7).** On a hybrid-GDN model,
+attach and detach are expected to SUCCEED, with the state (MAMBA) component
+covered rather than refused, because the controller's host pools span every
+component it owns. There is no partial-capability outcome to accept.
+
+---
+
+## 7 — The §4 gap, implemented
+
+`UnifiedRadixCache.attach_storage_backend` / `detach_storage_backend` are no
+longer stubs. They mirror the shipped `HiRadixCache` pair — same validation,
+same named refusals, same "same backend is success, different backend is a
+refusal rather than a silent swap" rule — with one addition this cache needs:
+`_symmetrize_prefetch_capacity()` after the config is applied.
+
+**Why that addition is safe, which was the open question.** That method enters
+an **all_reduce** across DCP/TP ranks, and its own guard says a rank-local
+early return "would leave the other ranks in the all_reduce with no partner".
+A single-rank attach would hang. It cannot happen: attach fans out through
+`FanOutCommunicator` (`managers/tokenizer_control_mixin.py:125`, `:360`) to
+every rank and merges the results, so the group runs it together — and the
+scheduler already refuses a non-idle scheduler by name before reaching it.
+
+**Detach order is the contract**, taken from HiRadixCache: drain the control
+queues *before* tearing the controller down, or acks and releases can no
+longer be matched to their nodes and host pages and locks leak; drain again
+afterwards to sweep what the shutdown produced. The drain is **local**
+(`None` limits = everything on this rank) because the steady-state path
+derives its counts from an all_reduce, and a detach may not depend on a
+collective its peers may already have left.
+
+**No silent partial capability** (#268): the state component is covered, not
+refused. `_get_hybrid_storage_attach_kwargs` passes
+`cache_controller.mem_pool_host.entries`, which spans every component the
+controller owns — the same set the boot-time attach passes — so a hybrid
+attach is whole rather than KV-only wearing a success message.
+
+Pins: `test/registered/unit/mem_cache/test_unified_attach_detach_545.py`, 16
+tests, sibling to the resize file rather than merged into it (that file owns
+the resize authority; one authority per behaviour). Red-first: restoring the
+stubs fails 15 of 16.
+
+~~Still open: the ENOSPC injection test from §5(2), and
+`tokenizer_control_mixin.py:370`'s `# TODO: partial rollback if failed`.~~
+**Both closed — see §8 and §9.**
+
+## 8 — Partial rollback (closes the pre-existing TODO)
+
+A mixed fan-out result left the group **half-attached**: some ranks running
+storage threads with a backend bound, others not — exactly the state the
+detach contract exists to prevent, reported as a clean failure.
+
+Now the terminal state is all-attached or all-detached, never mixed. On a
+mixed result the coordinator detaches the group and, if that rollback fails
+anywhere, **names the stranded ranks** instead of reporting a clean failure.
+
+Three things this needed:
+
+- **A rank on the reply.** `FanOutCommunicator.handle_recv` appends results in
+  **arrival order**, so list position does not identify a rank — "ranks 0 and
+  2 are stranded" was literally unsayable. `AttachHiCacheStorageReqOutput` and
+  `DetachHiCacheStorageReqOutput` now carry `rank` (flat world rank,
+  `pp_rank * tp_size + tp_rank`), stamped in a **wrapper** so every return
+  path gets it; stamping at each `return` would let a later-added path ship
+  unstamped.
+- **A group detach, not a targeted one.** Detach is idempotent by
+  construction — it asks the controller to clean up even when
+  `enable_storage` is already False, precisely to sweep partial-attach
+  leftovers — and the communicator offers no rank-addressed send.
+- **Collective-free**, per §7's own rule: the detach path drains with local
+  (`None`) limits and enters no all_reduce, so a rank whose peers have already
+  left a collective cannot hang on it.
+
+The verdict is never flipped to success; rollback only changes what the
+message can tell you. Pins:
+`test/registered/unit/managers/test_attach_partial_rollback_545.py` (9).
+Mutation: dropping the rollback fails 4.
+
+## 9 — ENOSPC injection (closes §5(2))
+
+`test/registered/unit/mem_cache/test_hicache_enospc_545.py`, 11 pins against a
+real `HiCacheFile` over a real tmpdir with the failing syscall patched. The
+*technique* of the canonical store's three-site injection is reused; none of
+its code is, since that lives on an unmerged train branch.
+
+Pinned: a write hitting ENOSPC returns False **and the key is genuinely not
+readable** (False is only honest if the page really is absent); no torn page is
+ever visible, because the page appears only at `os.replace` — a failure before
+it leaves the final path absent and a failure at it leaves prior content
+intact; the watermark **refuses at the door** when a cap is configured rather
+than failing mid-write with the IO already spent; and the tier still works
+afterwards.
+
+**One pin had to be rebuilt to be honest.** The reservation-leak check first
+asserted that a later write still fits after five failed ones. That could not
+fail: with a cap in force the evictor simply **evicts** to admit, so a leaked
+reservation causes extra eviction rather than a refusal — the pin passed with
+`abort` removed. It now asserts on `_total_bytes` directly, which is what
+distinguishes released from leaked. Mutation (removing `abort` and the tmp
+cleanup) now fails 2; before the rebuild it failed 1.

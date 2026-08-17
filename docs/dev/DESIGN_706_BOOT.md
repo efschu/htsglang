@@ -84,6 +84,54 @@ message does not say, and no ledger entry resolves it. Every number below is
 therefore given per rank AND as the shared 5.37 GB remainder, so the conclusion
 does not depend on that ambiguity.
 
+### 1.2a RESOLVED (2026-08-17): the numbers above are ONE rank's, the SMALLEST
+
+The open question in 1.2 is answered, by executing section 5. The refusal fires
+per rank, and the ranks are not alike:
+
+| rank | image #1 | image #2 | image #3 | images total | vs 23.23 GB usable |
+|---|---|---|---|---|---|
+| PP2 (16 layers) | 10.94 GB | 9.41 GB | 0.15 GB | **20.50 GB** | over by 0.13 GB |
+| PP0 (31 layers) | **18.06 GB** | **17.12 GB** | -- | **35.18 GB** | **over by ~11.95 GB** |
+
+PP2's three figures are IDENTICAL to 1.2's. So 1.2 captured the smallest stage,
+and 1.3 generalised its 5.37 GB remainder to the box. On the BINDING stage there
+is no remainder at all: usable 23.23 minus images 35.18 = **-11.95 GB, before
+any cache tier exists**. The images scale with the stage's layer count, so the
+largest stage carries roughly twice the smallest on ANY cut this box runs --
+`[28,20,16]` puts PP0 at ~31.8 GB against the same usable figure.
+
+Consequence for 5.5: "shrink `--hicache-size`" cannot rescue a boot that refuses
+on PP0. It addresses PP2's 0.13 GB only.
+
+### 1.2b But the blocker was ARITHMETIC, not physics
+
+Checked before any design change was priced, and it is the cheapest of all the
+options: those PP0 images are RESIDENT IN HOST RAM TODAY. Sampled against the
+live serving process on 2026-08-17, mid-flight and flipping normally:
+
+```
+MemAvailable            33.62 GB
+scheduler RSS  PP0 39.85 GB   PP1 22.27 GB   PP2 24.40 GB   (sum 86.51 GB)
+host total             126.75 GB
+```
+
+The images are in RSS and therefore ALREADY ABSENT from `MemAvailable`. The
+runtime backstop then added them to the demand as well:
+`check_and_register_pinned_post` summed every already-registered post plus the
+new one and compared that against the LIVE, post-allocation availability. #695
+registers the weight images AFTER allocating them (`weights_arena.py:428`), so
+they were billed twice.
+
+`joint_pinned_host_error` is exact where it was designed to be used -- once in
+the launcher, over configured numbers, before anything is pinned. Reusing it as
+a runtime backstop is what introduced the error.
+
+Fixed by crediting the already-allocated posts back to availability. The true
+marginal cost of the Flip+HiCache boot on PP0 is the **5.24 GB tier**, which
+fits in 23.23 GB with ~18 GB to spare. No dedup, no mmap, no freeing of host
+RAM is required for this ticket.
+
 ### 1.3 What fits
 
 Rows that fit in the 5.37 GB remainder:
@@ -319,10 +367,19 @@ boot -- it describes one.
 
 | # | check | pass condition | if it fails |
 | --- | --- | --- | --- |
-| 1 | `free -g` available | `> 24.3 G` (the #721 floor) | do not start; the pinned budget refuses at attach, not at OOM |
+| 1 | `free -g` available | `> 24.3 G` (the #721 floor) -- and see the note below | do not start; the pinned budget refuses at attach, not at OOM |
 | 2 | serving line carries the flip | `--enable-phase-flip` boots today | the flip is the dependency, not this ticket -- see #722 (barlink) if it is flip-less |
 | 3 | disk L3 sized | `~100 GB` free at `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` | shrink the retention expectation, not the min-free floor |
 | 4 | GPU window held | gpu-arb claim, heartbeat running | this boot takes the cards |
+
+**On precondition 1, corrected 2026-08-17.** `24.3 G` is calibrated on the
+SMALLEST rank and it passed at 39 G while the boot refused anyway (1.2a). Before
+the 1.2b fix, the honest floor for the BINDING rank was
+`images 35.18 + tier + OS reserve 10.74` ~= **51.2 GB available**. With the
+double-count fixed the images are no longer charged at attach, so `24.3 G`
+governs again -- but a precondition that passes and is then contradicted by the
+thing it gates is worse than none, so the number it is calibrated on is stated
+here rather than left implicit.
 
 ### 5.2 Flag set (add to the current serving line, verbatim)
 
@@ -333,8 +390,16 @@ boot -- it describes one.
   --phase-flip-canonical-kv-page
   --phase-flip-writeback
   --phase-flip-writeback-deadline-s 2.0
-  --hicache-size 5G
+  --hicache-size 5
+  --hicache-mem-layout page_first_direct
 ```
+
+`--hicache-mem-layout page_first_direct` is REQUIRED on a hybrid checkpoint and
+was missing from this list: `MambaPoolHost only supports
+layout='page_first_direct', got 'page_first'` kills the boot at pool
+construction. Setting it also switches `--hicache-io-backend` to `direct`
+automatically (`server_args.py:_resolve_layout_io_compatibility`). Cost a boot
+on 2026-08-17.
 
 ```
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<disk L3, ~100 GB>
@@ -345,9 +410,15 @@ boot -- it describes one.
 
 NOT set, deliberately: `--phase-flip-rebind-hicache`. See 5.4.
 
-`--hicache-size` must stay at or below the 5.37 GB remainder from 1.2. Do not
-raise it to 9 GB "because the tier wants it" -- the pinned budget will refuse
-at attach and the boot dies late instead of not starting.
+`--hicache-size` takes an INTEGER NUMBER OF GIGABYTES (`server_args.py:4187`).
+`5G` is not accepted -- `argparse` rejects it with `invalid int value: '5G'`
+before anything starts. This section said `5G` and described itself as
+verbatim; executing it cost a boot on 2026-08-17.
+
+`--hicache-size` must stay at or below the remainder from 1.2. Do not raise it
+to 9 "because the tier wants it" -- the pinned budget will refuse at attach and
+the boot dies late instead of not starting. But see 1.2a: on this box the tier
+was never the binding term.
 
 ### 5.3 Ordered steps
 
