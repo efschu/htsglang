@@ -1929,6 +1929,28 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     Split out from ``decide`` so the decision stays pure and so the clock is
     driven by observation rather than by the policy's own verdict.
     """
+    # #677 HOLD COUNTER, maintained HERE for the same reason the idle and
+    # formation clocks are: ``decide`` is pure and must not mutate, so a bound
+    # driven from inside the decision would never advance. Without this the
+    # 8-round bound was a comment-claimed invariant with no wiring -- the
+    # documented-but-inert class -- and every evaluation saw round 0 forever,
+    # so EXHAUSTED was unreachable and the SLO cap was silently the only
+    # backstop.
+    #
+    # FIRST SIGHT COUNTS AS ROUND ONE: `hold_phase` is empty before the first
+    # observation, and treating that as a phase CHANGE would spend round one
+    # resetting, so a hold would always be one round shorter than its bound
+    # claims. A genuine phase change still resets, which is the case the reset
+    # exists for.
+    _prev_hold_phase = getattr(state, "hold_phase", "") or inp.phase
+    state.hold_rounds = next_hold_rounds(
+        int(getattr(state, "hold_rounds", 0) or 0),
+        _prev_hold_phase,
+        inp.phase,
+        int(inp.pending_prefill_tokens or 0),
+    )
+    state.hold_phase = inp.phase
+
     idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
     if idle:
         if state.idle_since is None:

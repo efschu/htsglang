@@ -217,3 +217,74 @@ class TestTpMirrorAndCounterLifecycle677(CustomTestCase):
         self.assertTrue(layout_hold_verdict("pp", 22, 0, hold_rounds_so_far=stale)[0])
         fresh = next_hold_rounds(stale, "tp", "pp", 22)
         self.assertFalse(layout_hold_verdict("pp", 22, 0, hold_rounds_so_far=fresh)[0])
+
+
+class TestHoldCounterActuallyAdvances677(CustomTestCase):
+    """RED-FIRST on 332cb3b345: the bound was documented but never advanced.
+
+    layout_hold_verdict took hold_rounds_so_far from the caller and
+    next_hold_rounds computed the successor, but NOTHING incremented the state
+    -- so every round evaluated at 0 and the 8-round bound could never be
+    reached. A documented invariant with no wiring is the #505/#421 class this
+    tree has hunted twice this week; shipping it inert on purpose would be
+    worse than not having the bound at all.
+
+    These tests drive the real per-round observer, so they fail unless the
+    counter is genuinely maintained.
+    """
+
+    def _round(self, state, phase, pending, running, now):
+        from sglang.srt.managers.phase_policy import PhasePolicyInputs, observe_idle
+
+        inp = PhasePolicyInputs(
+            phase=phase,
+            pending_prefill_tokens=pending,
+            running_bs=running,
+            now=now,
+        )
+        observe_idle(state, inp)
+        return inp
+
+    def test_hold_rounds_reaches_N_under_a_live_hold(self):
+        from sglang.srt.managers.phase_policy import PhasePolicyState
+
+        st = PhasePolicyState()
+        for i in range(5):
+            self._round(st, "pp", 22, 0, 1000.0 + i)
+        self.assertEqual(
+            getattr(st, "hold_rounds", 0),
+            5,
+            "the counter must advance once per round while the hold is live",
+        )
+
+    def test_exhausted_is_reachable_by_running_the_bound(self):
+        """The EXHAUSTED path must be REACHABLE, not merely written."""
+        from sglang.srt.managers.phase_policy import PhasePolicyState
+
+        st = PhasePolicyState()
+        for i in range(LAYOUT_HOLD_MAX_ROUNDS):
+            self._round(st, "pp", 22, 0, 1000.0 + i)
+        allow, why = layout_hold_verdict(
+            "pp", 22, 4, hold_rounds_so_far=getattr(st, "hold_rounds", 0)
+        )
+        self.assertTrue(allow, f"the bound must release: {why}")
+        self.assertIn("EXHAUSTED", why)
+
+    def test_counter_resets_on_a_real_phase_change(self):
+        from sglang.srt.managers.phase_policy import PhasePolicyState
+
+        st = PhasePolicyState()
+        for i in range(4):
+            self._round(st, "pp", 22, 0, 1000.0 + i)
+        self.assertGreater(getattr(st, "hold_rounds", 0), 0)
+        self._round(st, "tp", 22, 0, 1010.0)
+        self.assertEqual(getattr(st, "hold_rounds", 0), 0, "phase change resets")
+
+    def test_counter_resets_when_the_work_drains(self):
+        from sglang.srt.managers.phase_policy import PhasePolicyState
+
+        st = PhasePolicyState()
+        for i in range(4):
+            self._round(st, "pp", 22, 0, 1000.0 + i)
+        self._round(st, "pp", 0, 0, 1010.0)
+        self.assertEqual(getattr(st, "hold_rounds", 0), 0, "pend->0 resets")
