@@ -818,7 +818,7 @@ def test_only_the_zmq_intake_rank_injects():
             max_recv_per_poll=-1,
             stream_output=lambda *a, **kw: None,
             get_last_forward_mode=lambda: None,
-            phase_policy_hook=lambda: (calls.append(1), sentinel)[1],
+            phase_policy_hook=lambda *_a: (calls.append(1), sentinel)[1],
         )
         cls = SchedulerRequestReceiver
         with ExitStack() as st:

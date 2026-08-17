@@ -418,6 +418,40 @@ def default_pp_micro_batch_size(
     return max(int(max_running_requests) // max(int(pp_size), 1), 1)
 
 
+def _arriving_prefill_tokens(inflight) -> int:
+    """#713: prompt tokens that have ARRIVED but are not yet on the queue.
+
+    ``inflight`` is the raw ``recv_reqs`` list. It is heterogeneous -- abort
+    messages, the policy's own flip arm, control traffic -- so only items that
+    actually carry a prompt are counted. Counting a control message as work
+    would arm a flip on nothing, which is the opposite defect to the one this
+    fixes and would be harder to see.
+
+    A just-received request is a ``TokenizedGenerateReqInput`` and carries
+    ``input_ids`` (``io_struct.py:798``); the ``Req`` the scheduler builds
+    later carries ``origin_input_ids``. Both are accepted because this helper
+    runs on the boundary between them and reading only one field would make
+    the count depend on where in the round it was called.
+
+    Every access is guarded. This runs inside the admission path, and a probe
+    that faults there kills the round it exists to inform -- the #715 lesson,
+    where a diagnostic died inside the crash it was written to explain.
+    """
+    if not inflight:
+        return 0
+    total = 0
+    for item in inflight:
+        for field in ("input_ids", "origin_input_ids"):
+            try:
+                ids = getattr(item, field, None)
+                if ids:
+                    total += len(ids)
+                    break
+            except Exception:  # noqa: BLE001 - a probe must not break intake
+                continue
+    return total
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -8502,8 +8536,24 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
-    def _pending_prefill_tokens(self) -> int:
+    def _pending_prefill_tokens(self, inflight=None) -> int:
         """Prompt tokens ADMITTED BUT NOT YET COMPUTED (#631 defect N).
+
+        ``inflight`` (#713) is the batch of requests that have just been pulled
+        off the wire and have NOT yet reached ``waiting_queue``. Passing it is
+        what the flip policy must do; every other caller leaves it None and
+        gets the pre-#713 number unchanged, because that number is the #363
+        observer's quantity and the denominator the break-even N is expressed
+        in, and moving it would move a different rule.
+
+        WHY THIS PARAMETER EXISTS. ``recv_requests`` evaluates the phase policy
+        BEFORE the requests it just received are queued
+        (``scheduler_components/request_receiver.py:104-129``, then
+        ``scheduler.py:4089``). So on an idle box the policy asked "is there
+        prefill work?" of a queue that had not been told yet, read 0, and
+        ``_layout_admits("pp")`` early-falsed on its first line -- refusing a
+        flip whose other two terms both held. Measured cost: 31.64 s to first
+        token for a ten-token prompt. The rule was right; its input was stale.
 
         This used to be ``sum(len(req.origin_input_ids) for req in
         self.waiting_queue)`` -- the NOT-YET-ADMITTED queue -- while the
@@ -8536,10 +8586,18 @@ class Scheduler(
             rng = getattr(chunked, "extend_range", None)
             filled = int(rng.end) if rng is not None else 0
             pending += max(0, len(chunked.origin_input_ids) - filled)
+        pending += _arriving_prefill_tokens(inflight)
         return pending
 
-    def maybe_arm_phase_policy(self):
+    def maybe_arm_phase_policy(self, inflight_reqs=None):
         """#631: evaluate the automatic phase policy on the intake rank.
+
+        ``inflight_reqs`` (#713) is the ``recv_reqs`` batch this evaluation is
+        riding in. It is REQUIRED for a correct verdict on an idle box: this
+        hook runs before those requests are queued, so without it the policy
+        reads an empty queue and refuses to flip toward the very work that
+        just woke it. Optional in the signature only so a caller that does not
+        have the batch degrades to the pre-#713 reading rather than failing.
 
         Returns a ``PhaseFlipReqInput`` to put on the request stream, or
         None. The AUTOMATIC path is then byte-for-byte the manual one --
@@ -8678,12 +8736,16 @@ class Scheduler(
                 repaired,
                 running_bs,
             )
+        # #713: ONE reading, used by the verdict AND by the message that
+        # reports it. Calling the accessor twice inside one constructor is how
+        # a refusal could name a number the simulation never saw.
+        _pending_now = self._pending_prefill_tokens(inflight_reqs)
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
-            pending_prefill_tokens=self._pending_prefill_tokens(),
+            pending_prefill_tokens=_pending_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
             # getattr, because this gate is driven in tests by scheduler
@@ -8715,7 +8777,7 @@ class Scheduler(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
                     getattr(self, "_idle_locked_inputs", lambda *_: (False, False))(
-                        int(running_bs or 0), self._pending_prefill_tokens()
+                        int(running_bs or 0), _pending_now
                     ),
                 )
             ),
