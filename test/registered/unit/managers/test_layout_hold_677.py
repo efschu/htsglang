@@ -135,3 +135,85 @@ class TestLayoutHold677(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTpMirrorAndCounterLifecycle677(CustomTestCase):
+    """Review findings on the rule/decide() seam, both pinned here.
+
+    FINDING 1, THE MIRROR. An unconditional pull on pend>0 recreates the defect
+    this lever fixes, phases swapped: after an EXHAUSTED release (pp->tp with
+    prefill still pending) the next TP evaluation sees pend>0 and pulls straight
+    back, so decode loses the layout before serving anything. Under sustained
+    both-sides load that degenerates to max_hold PP rounds, ~0 TP rounds, and
+    TWO seams per cycle -- strictly worse than the timer it replaced.
+
+    FINDING 2, THE COUNTER. hold_rounds_so_far is caller-maintained; a stale
+    counter makes the first hold of the next episode start half-exhausted.
+    """
+
+    def test_pull_does_not_preempt_a_running_decode_batch(self):
+        allow, why = layout_hold_verdict(
+            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=0
+        )
+        self.assertFalse(allow, why)
+        self.assertIn("preempt mid-batch", why)
+
+    def test_pull_proceeds_once_the_decode_minimum_is_met(self):
+        """CAN-FAIL for the mirror: it must be a BOUNDED yield, not a new
+        starvation of the prefill side."""
+        from sglang.srt.managers.phase_policy import MIN_DECODE_ROUNDS
+
+        allow, why = layout_hold_verdict(
+            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=MIN_DECODE_ROUNDS
+        )
+        self.assertTrue(allow, why)
+        self.assertIn("minimum", why)
+
+    def test_no_running_decode_means_no_yield(self):
+        """The mirror guards a RUNNING batch, not an idle TP layout."""
+        allow, _ = layout_hold_verdict("tp", 22, 0, decode_serving=False)
+        self.assertTrue(allow)
+
+    def test_the_exhausted_release_cannot_ping_pong_straight_back(self):
+        """THE DEGENERATE CYCLE, pinned. Release from PP under both-sides load,
+        then evaluate in TP with a decode batch now running: the pull must
+        YIELD, so the cycle cannot become 8 PP rounds + 0 TP rounds."""
+        allow_release, _ = layout_hold_verdict(
+            "pp", 22, 4, hold_rounds_so_far=LAYOUT_HOLD_MAX_ROUNDS
+        )
+        self.assertTrue(allow_release, "pp must release at the bound")
+        allow_back, why = layout_hold_verdict(
+            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=0
+        )
+        self.assertFalse(allow_back, f"must not pull straight back: {why}")
+
+    def test_counter_resets_on_phase_change(self):
+        from sglang.srt.managers.phase_policy import next_hold_rounds
+
+        self.assertEqual(next_hold_rounds(7, "pp", "tp", 22), 0)
+        self.assertEqual(next_hold_rounds(7, "tp", "pp", 22), 0)
+
+    def test_counter_resets_when_nothing_pends(self):
+        from sglang.srt.managers.phase_policy import next_hold_rounds
+
+        self.assertEqual(next_hold_rounds(7, "pp", "pp", 0), 0)
+
+    def test_counter_advances_within_an_episode(self):
+        """CAN-FAIL: a counter that always reset would make the hold unbounded,
+        which is the starvation direction the bound exists to prevent."""
+        from sglang.srt.managers.phase_policy import next_hold_rounds
+
+        n = 0
+        for _ in range(5):
+            n = next_hold_rounds(n, "pp", "pp", 22)
+        self.assertEqual(n, 5)
+
+    def test_a_stale_counter_would_start_the_next_episode_exhausted(self):
+        """The defect the reset prevents, stated as a test: carrying 8 across a
+        phase change would release the very first hold of the next episode."""
+        from sglang.srt.managers.phase_policy import next_hold_rounds
+
+        stale = LAYOUT_HOLD_MAX_ROUNDS
+        self.assertTrue(layout_hold_verdict("pp", 22, 0, hold_rounds_so_far=stale)[0])
+        fresh = next_hold_rounds(stale, "tp", "pp", 22)
+        self.assertFalse(layout_hold_verdict("pp", 22, 0, hold_rounds_so_far=fresh)[0])
