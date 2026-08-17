@@ -486,6 +486,19 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   reusable part**: the weights sit on a `KvVmmArena` reservation, so a spill
   is `cuMemUnmap`+`cuMemRelease` behind a FIXED virtual address — pages go
   back to the driver while every address a CUDA graph baked stands still.
+  **#464 coalesces the restore**: `commit_range` splits a gap into
+  `self._chunk` extents (map + setAccess each), and on a CONTIGUOUS run one
+  handle suffices — 257 calls -> 3 at the KV-seam chunk. `coalesce_commit_plan`
+  REFUSES on an interior hole rather than merging across it (a hole is a
+  legitimate `decommit_span` state, not a bug). DEFAULT OFF, reachable via
+  `SGLANG_VMM_COALESCE_RESUME` (`resolve_coalesce_resume`; explicit argument
+  beats the env). Extent counts are chunk-dependent and no default is 2 MiB:
+  KV seam 8 MiB (`memory_pool.py:2477`) -> 128/GiB, carriers 64 MiB
+  (`phase_flip_spill.py:219`) -> 16/GiB. The 40-85 ms band is NOT this path's
+  baseline — it is the graph-state swap through `torch_memory_saver`
+  (`adaptive_graph_memory.py:207-214`), which routes through no `KvVmmArena`.
+  Wall time GPU-PENDING; gate `bench/464/run_464_resume.py`;
+  `TICKET_464_coalesced_resume.md`.
   That is why spilling and keeping draft graphs ON are compatible (#656 item
   8 priced those graphs at 41% of decode). A boot-time pin AFTER graph
   capture refuses the boot if any carried parameter escaped the reservation,
