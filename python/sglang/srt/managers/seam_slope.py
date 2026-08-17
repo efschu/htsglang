@@ -86,7 +86,11 @@ from __future__ import annotations
 
 from typing import List, Sequence, Tuple
 
-__all__ = ["derive_seam_slope_bytes_per_token", "received_attention_layers"]
+__all__ = [
+    "derive_seam_slope_bytes_per_token",
+    "derive_seam_slope_for_rank",
+    "received_attention_layers",
+]
 
 
 def received_attention_layers(
@@ -148,4 +152,40 @@ def derive_seam_slope_bytes_per_token(
     return tuple(
         r * float(kv_bytes_per_token_per_attn_layer) + float(b)
         for r, b in zip(received, base)
+    )
+
+
+def derive_seam_slope_for_rank(
+    flip_tp_vector: Sequence[float],
+    rank: int,
+    attention_held: int,
+    kv_bytes_per_token_per_attn_layer: float,
+    n_attention_total: int,
+    baseline_bytes_per_token: float = 0.0,
+) -> float:
+    """One rank's slope, from inputs that rank already has.
+
+    THE POINT OF THE SINGLE-RANK FORM. ``received_r`` depends only on this
+    rank's own share and its own attention count -- never on its peers'. A
+    rank can therefore price its own seam at boot without a collective and
+    without knowing how the other stages were cut, which is what makes this
+    usable on the COLD path where nothing has been measured or exchanged yet.
+    """
+    n = len(flip_tp_vector)
+    if not 0 <= int(rank) < n:
+        raise ValueError(f"seam slope: rank {rank} outside a {n}-stage vector.")
+    if kv_bytes_per_token_per_attn_layer < 0.0:
+        raise ValueError(
+            "seam slope: kv_bytes_per_token_per_attn_layer is "
+            f"{kv_bytes_per_token_per_attn_layer}."
+        )
+    total = float(sum(float(w) for w in flip_tp_vector))
+    if total <= 0.0:
+        raise ValueError("seam slope: the flip vector sums to zero.")
+    if n_attention_total < 0:
+        raise ValueError(f"seam slope: n_attention_total is {n_attention_total}.")
+    share = float(flip_tp_vector[int(rank)]) / total
+    received = max(0.0, share * float(n_attention_total) - float(attention_held))
+    return received * float(kv_bytes_per_token_per_attn_layer) + float(
+        baseline_bytes_per_token
     )

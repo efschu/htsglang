@@ -473,6 +473,21 @@ class BudgetHarness:
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
     _local_host_avail = Scheduler._local_host_avail
     _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
+    # #639b: the reduce grew a MAMBA pair, the same way #616g and #639 grew
+    # theirs, and the same way it was missed both previous times -- both
+    # admission cases failed with
+    # ``AttributeError: 'BudgetHarness' object has no attribute
+    # '_local_mamba_avail'``. This harness has no ``req_to_token_pool``, so
+    # the production reader finds no allocator and the sentinel rides,
+    # exactly as it does for the host tier above.
+    #
+    # ``_publish_uniform_mamba_floor`` was NOT the attribute that failed: it
+    # was the next one queued to fail, found by the drift guard below rather
+    # than by a fourth red. Binding only the reported name would have shipped
+    # the same incident again.
+    _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
+    _local_mamba_avail = Scheduler._local_mamba_avail
+    _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
     if hasattr(Scheduler, "uniform_budget_deficit"):
@@ -491,6 +506,75 @@ class BudgetHarness:
             full_evictable_size=None,
         )
         self.server_args = SimpleNamespace(dcp_size=dcp_size)
+
+
+def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
+    """A ``PrefillAdder`` built past ``__init__``, carrying exactly the state
+    ``budget_state`` reads on the non-SWA, non-DLLM path.
+
+    ``__new__`` is deliberate -- constructing a real adder needs a scheduler --
+    but it means every field the predicate reads has to be set BY HAND here,
+    and a field added to the production class is silently absent until it is.
+    ``TheAdderStubTracksTheBudgetPredicate`` below is what makes that absence
+    loud; see #624 for why this harness class keeps earning one.
+    """
+    from sglang.srt.managers.schedule_policy import PrefillAdder
+
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.prefill_spill_deep_taken = False
+    adder.is_hybrid_swa = False
+    adder.is_all_swa = False
+    adder.is_hybrid_ssm_cache = False
+    adder.rem_mamba_slots = None
+    adder.rem_input_tokens = 1 << 20
+    adder.rem_chunk_tokens = None
+    adder.dllm_config = None
+    adder.rem_total_token_offset = 1000
+    adder.cur_rem_token_offset = 1000
+    #: #681 added a group-uniform ceiling to ``rem_total_tokens``. Absent here
+    #: the predicate raised AttributeError on both ranks -- the same drift
+    #: shape, this time introduced by the fix rather than by a reduce.
+    adder.fundable_extend_floor = None
+    adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
+    adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
+    adder.dcp_avail_deficit = deficit
+    return adder
+
+
+class TheAdderStubTracksTheBudgetPredicate(unittest.TestCase):
+    """#624 again, on the adder stub this time.
+
+    Scope is ``rem_total_tokens`` and not the whole ``budget_state`` surface,
+    deliberately: the stub pins ``is_hybrid_swa``/``is_all_swa`` False, so the
+    SWA members are never reached and demanding them would fail this guard on
+    state the harness legitimately does not need. ``rem_total_tokens`` is the
+    term the uneven-DCP budget is actually about, and it is where the #681
+    ceiling landed.
+    """
+
+    def test_the_stub_carries_everything_the_budget_term_reads(self):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
+        needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget)
+        missing = sorted(n for n in needed if not hasattr(stub, n))
+        self.assertEqual(
+            missing,
+            [],
+            "the PrefillAdder stub has drifted behind rem_total_tokens: "
+            f"{missing}. Set them in _budget_state_stub so budget_state keeps "
+            "exercising the real predicate instead of raising AttributeError.",
+        )
+
+    def test_the_guard_can_fail(self):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
+        needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget) | {
+            "_a_field_added_next_quarter"
+        }
+        missing = sorted(n for n in needed if not hasattr(stub, n))
+        self.assertEqual(missing, ["_a_field_added_next_quarter"])
 
 
 class PrefillAdmissionBudgetTest(unittest.TestCase):
@@ -547,32 +631,17 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
         """The symptom itself, through the real PrefillAdder predicate: with a
         per-request demand between the two ranks' local budgets, the unpinned
         code makes them disagree on NO_TOKEN."""
-        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.managers.schedule_policy import AddReqResult
 
         budgets, errors = self._budgets()
         self.assertEqual(errors, [], f"a rank broke the budget reduce: {errors}")
 
         verdicts = []
         for rank in (0, 1):
-            adder = PrefillAdder.__new__(PrefillAdder)
-            adder.prefill_spill_deep_taken = False
-            adder.is_hybrid_swa = False
-            adder.is_all_swa = False
-            adder.is_hybrid_ssm_cache = False
-            adder.rem_mamba_slots = None
-            adder.rem_input_tokens = 1 << 20
-            adder.rem_chunk_tokens = None
-            adder.dllm_config = None
-            adder.rem_total_token_offset = 1000
-            adder.cur_rem_token_offset = 1000
-            adder.token_to_kv_pool_allocator = SimpleNamespace(
-                available_size=lambda r=rank: self.AVAIL[r]
-            )
-            adder.tree_cache = SimpleNamespace(
-                evictable_size=lambda r=rank: self.EVICT[r]
-            )
-            adder.dcp_avail_deficit = (
-                self.AVAIL[rank] + self.EVICT[rank] - budgets[rank]
+            adder = _budget_state_stub(
+                avail=self.AVAIL[rank],
+                evictable=self.EVICT[rank],
+                deficit=self.AVAIL[rank] + self.EVICT[rank] - budgets[rank],
             )
             verdicts.append(adder.budget_state())
 
@@ -587,3 +656,101 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# S3b -- the harness must track the production surface (#624 stub drift)
+# ---------------------------------------------------------------------------
+
+
+def _self_attributes_read_by(func) -> set:
+    """Names this function reads off ``self`` (assignment targets excluded).
+
+    Source-level on purpose. The drift being caught is "someone added a
+    ``self.X`` to the reduce and did not bind X on the harness", and that is a
+    property of the method's TEXT. Executing the method to find out would need
+    the very stand-in whose completeness is in question.
+    """
+    import inspect
+    import re
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(func))
+    assigned = set(re.findall(r"self\.([A-Za-z_]\w*)\s*=", src))
+    return set(re.findall(r"self\.([A-Za-z_]\w*)", src)) - assigned
+
+
+class TheHarnessTracksTheProductionSurface(unittest.TestCase):
+    """#624 stub-drift class, closed for this harness.
+
+    ``BudgetHarness`` binds a hand-written subset of ``Scheduler``. Three times
+    now the reduce has grown a member and the subset has not: #616g added
+    ``_publish_uniform_evict_floor``, #639 the HOST pair, #639b the MAMBA pair.
+    Each was found by both admission cases going red with an ``AttributeError``
+    naming ONE attribute, which is the worst possible signal -- it reports the
+    first missing name, not the set, so fixing it can leave the next one
+    queued. That is exactly what happened here: the red named
+    ``_local_mamba_avail`` while ``_publish_uniform_mamba_floor`` was also
+    missing.
+
+    So the harness is checked against the real method instead of against the
+    last incident. A member added to the reduce and not bound here fails THIS
+    case, with the full list, before it can fail the admission cases with a
+    single name.
+
+    SCOPE, STATED. Direct ``self.X`` in ``_update_uniform_pool_budget``, plus
+    one level through the Scheduler methods it calls (which is what carries
+    the sentinel constants like ``_MAMBA_AVAIL_ABSENT``). Deeper transitive
+    reads are not covered: every one of the three incidents was a direct
+    member of the reduce, and a guard that tried to close the whole transitive
+    surface would fail on attributes the harness legitimately never needs.
+    """
+
+    def _required(self) -> set:
+        """One level down, and ONLY through helpers the harness inherits.
+
+        A stand-in that supplies its OWN implementation of a callee never
+        reaches the production version's state, so demanding it would fail this
+        guard on bindings the harness legitimately does not need. Every helper
+        this harness uses IS bound off ``Scheduler``, so the rule changes
+        nothing here -- it is written this way so the idiom is the same one the
+        sibling guard in ``test_first_chunk_dynamic_chunking`` needs, where the
+        harness DOES override a callee.
+        """
+        needed = _self_attributes_read_by(Scheduler._update_uniform_pool_budget)
+        for name in sorted(needed):
+            member = getattr(Scheduler, name, None)
+            if callable(member) and getattr(BudgetHarness, name, None) is member:
+                needed = needed | _self_attributes_read_by(member)
+        return needed
+
+    def test_every_member_the_reduce_touches_is_on_the_harness(self):
+        harness = BudgetHarness(None, 1, 1)
+        missing = sorted(n for n in self._required() if not hasattr(harness, n))
+        self.assertEqual(
+            missing,
+            [],
+            "BudgetHarness has drifted behind Scheduler._update_uniform_pool_budget: "
+            f"{missing}. Bind these from Scheduler (or give the harness a "
+            "stand-in field) so the admission cases keep exercising the real "
+            "contract instead of failing with an AttributeError.",
+        )
+
+    def test_the_guard_can_fail(self):
+        """A drift detector that cannot report a drift is decoration.
+
+        Stands in for the next incident: the reduce grows a member nothing has
+        bound. The guard must name it rather than pass.
+        """
+        harness = BudgetHarness(None, 1, 1)
+        required = self._required() | {"_a_member_added_next_quarter"}
+        missing = sorted(n for n in required if not hasattr(harness, n))
+        self.assertEqual(missing, ["_a_member_added_next_quarter"])
+
+    def test_the_extractor_separates_reads_from_writes(self):
+        """``_uniform_min_avail`` is ASSIGNED by the reduce, not read from the
+        harness. Counting it would demand a binding that must not exist."""
+        reads = _self_attributes_read_by(Scheduler._update_uniform_pool_budget)
+        self.assertNotIn("_uniform_min_avail", reads)
+        self.assertNotIn("_uniform_budget_deficit", reads)
+        self.assertIn("_local_mamba_avail", reads)

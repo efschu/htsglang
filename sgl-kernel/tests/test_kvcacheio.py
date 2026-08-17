@@ -15,11 +15,41 @@ from sgl_kernel.kvcacheio import (
 
 from sglang.srt.utils import get_cuda_version, is_hip
 
-# Skip entire module on CUDA 13.x — segfaults in transfer_kv kernel.
+# Skip entire module: segfaults in the transfer_kv kernel.
 # Reference failure: https://github.com/sgl-project/sglang/actions/runs/24600433057/job/71938317621?pr=23119
+#
+# #441: THE CUDA-13 FRAMING IS WRONG AND COST A DAY. This skip was written as
+# a CUDA 13.x issue, and the wheel condition below still selects on that --
+# but the segfault in `transfer_kv_all_layer_lf_ph` REPRODUCES ON BOTH WHEELS.
+# It is therefore not the #436 ABI problem and not wheel-specific at all. A
+# reader who trusts the old reason goes hunting on the wrong toolkit.
+#
+# ROOT: not yet attributed. One real defect in this path HAS been found and
+# fixed -- the page-head offset formula subdivides every address term by
+# head_num while the copy helper uses 8-byte-aligned-only PTX, and nothing
+# checked `item_size % (8 * head_num) == 0`; see `check_page_head_alignment`
+# in csrc/kvcacheio/transfer.cu and the hermetic proof in
+# test/registered/unit/mem_cache/test_page_head_offset_alignment_441.py.
+# That defect does NOT explain this crash: the shapes involved here are
+# aligned. So the guard is a genuine fix for a different, latent bug, and the
+# segfault still owes an attribution.
+#
+# NEXT STEP is metal, and it is written and waiting rather than described:
+# tools/441/falsify_lf_ph_441.py (arms: repro / alignment / bisect, one arm
+# per invocation because each is expected to kill the process, to be run under
+# a gpu-arb claim).
+#
+# The condition is deliberately LEFT AS-IS pending that attribution: widening
+# it to skip everywhere would hide the cu12 signal the falsifier needs, and
+# removing it would hand CI a known segfault. It is narrowed or lifted when
+# the root is named, not before.
 pytestmark = pytest.mark.skipif(
     get_cuda_version()[0] >= 13,
-    reason="test_kvcacheio segfaults on CUDA 13.x (sgl-kernel bug)",
+    reason=(
+        "transfer_kv segfault; root NOT yet attributed and NOT CUDA-13-specific "
+        "(reproduces on both wheels, #441) -- metal falsifier filed at "
+        "tools/441/falsify_lf_ph_441.py"
+    ),
 )
 
 

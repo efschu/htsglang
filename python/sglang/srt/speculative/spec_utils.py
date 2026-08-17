@@ -138,8 +138,87 @@ def capture_safe_tp_broadcast(tp_group, tensors, src: int = 0) -> None:
                 tp_group.broadcast(t, src=src)
 
 
+def _present_picks(tensors):
+    return [t for t in tensors if t is not None]
+
+
+def draft_pick_payload_bytes(tensors) -> int:
+    """Total wire bytes of the fused draft-pick payload."""
+    return sum(t.numel() * t.element_size() for t in _present_picks(tensors))
+
+
+def pack_draft_picks(tensors) -> torch.Tensor:
+    """Fuse the draft-pick tensors into ONE uint8 wire buffer (#524).
+
+    Why fuse: ``capture_safe_tp_broadcast`` issues one collective PER tensor,
+    so a draft-pick sync costs two host-path broadcasts per decode round (the
+    #517 Seam A sites 4-5). They sit between CUDA-graph replays, so each is a
+    lost host run-ahead. One buffer makes it one.
+
+    Why BYTE-level, unlike ``pack_accept_payload``'s int32 buffer: the picks
+    have mixed dtypes -- ``topk_index`` is integer and ``topk_p`` is float32
+    with the SAME shape -- so there is no common element type to fuse into
+    without a value-changing cast.
+
+    Contiguity is REQUIRED, not coerced: ``reshape(-1)`` on a non-contiguous
+    tensor returns a copy, and the in-place unpack would then write to that
+    temporary and silently drop the broadcast. The picks come straight from
+    ``argmax`` / ``fast_topk`` / ``fast_sample``, which allocate contiguous
+    outputs, so this refuses a future caller rather than today's.
+
+    Device-side and shape-static: no host sync, no D2H.
+    """
+    present = _present_picks(tensors)
+    if not present:
+        raise ValueError("pack_draft_picks called with no non-None tensors")
+    for t in present:
+        if not t.is_contiguous():
+            raise ValueError(
+                "pack_draft_picks requires contiguous draft-pick tensors, got a "
+                f"non-contiguous {tuple(t.shape)} {t.dtype}. reshape(-1) on a "
+                "non-contiguous tensor returns a COPY, so the in-place unpack "
+                "would write to a temporary and drop the broadcast silently."
+            )
+    packed = torch.empty(
+        draft_pick_payload_bytes(tensors),
+        dtype=torch.uint8,
+        device=present[0].device,
+    )
+    off = 0
+    for t in present:
+        n = t.numel() * t.element_size()
+        packed[off : off + n] = t.reshape(-1).view(torch.uint8)
+        off += n
+    return packed
+
+
+def unpack_draft_picks(packed: torch.Tensor, tensors) -> None:
+    """Inverse of :func:`pack_draft_picks`, written back IN PLACE.
+
+    In place because the caller returns these same objects inside an
+    ``EagleDraftInput``; rebinding would leave that alias pointing at the
+    pre-broadcast, rank-local pick.
+    """
+    present = _present_picks(tensors)
+    total = draft_pick_payload_bytes(tensors)
+    if packed.numel() != total:
+        raise ValueError(
+            "draft-pick payload length mismatch: got "
+            f"{packed.numel()} bytes, expected {total} for shapes "
+            f"{[tuple(t.shape) for t in present]}. A fused payload of the "
+            "wrong length means the ranks disagree on the draft-pick shape."
+        )
+    off = 0
+    for t in present:
+        n = t.numel() * t.element_size()
+        t.reshape(-1).view(torch.uint8).copy_(packed[off : off + n])
+        off += n
+
+
 def _broadcast_draft_picks(
-    *tensors: Optional[torch.Tensor], solo_single_rank: bool = False
+    *tensors: Optional[torch.Tensor],
+    solo_single_rank: bool = False,
+    fuse: bool = False,
 ) -> None:
     """Sync per-rank draft decisions from TP rank 0.
 
@@ -186,6 +265,17 @@ def _broadcast_draft_picks(
         get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
     )
     if tp_group.world_size == 1:
+        return
+    if fuse:
+        # #524: ONE host-path collective instead of one per tensor. Opt-in per
+        # call site, and DEFAULT OFF, because several callers of this helper
+        # run INSIDE the draft CUDA-graph capture (eagle_worker_v2's in-loop
+        # pick) while the sites this fuses sit between replays. Turning it on
+        # globally would change what a captured region allocates, which is a
+        # capture change; every non-opted site therefore stays byte-identical.
+        packed = pack_draft_picks(tensors)
+        capture_safe_tp_broadcast(tp_group, (packed,), src=0)
+        unpack_draft_picks(packed, tensors)
         return
     capture_safe_tp_broadcast(tp_group, tensors, src=0)
 
@@ -243,9 +333,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert (
-        num_seqs * topk * max_context_len < 2**31
-    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    assert num_seqs * topk * max_context_len < 2**31, (
+        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    )
     return num_seqs * topk * max_context_len
 
 

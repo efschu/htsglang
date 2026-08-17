@@ -260,6 +260,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # the path that happens to set it (#606).
     uniform_avail_floor: Optional[int] = None
 
+    # #694: device allocations admitted since that floor was published. The
+    # floor is a snapshot; without charging against it the evict trigger reads
+    # a stale-optimistic number late in an iteration, SKIPS the eviction, and
+    # the alloc raises on a tree full of evictable tokens. Reset by the
+    # scheduler in the same call that publishes the next floor, so it never
+    # outlives the number it corrects. DECLARED HERE for the #606 reason.
+    uniform_admitted_since_floor: int = 0
+
     # #639: the same pin one tier down, for the HOST pool. The host KV pools
     # are rank-sized too (359652 / 287722 / 273336 slots on the crashing
     # boot), and `write_backup`'s admission is decided against them from a

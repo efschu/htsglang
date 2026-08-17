@@ -221,6 +221,7 @@ from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlus
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
+    create_admission_wedge_watchdog,
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
@@ -416,6 +417,40 @@ def default_pp_micro_batch_size(
     if enable_phase_flip:
         return max(int(max_running_requests), 1)
     return max(int(max_running_requests) // max(int(pp_size), 1), 1)
+
+
+def _arriving_prefill_tokens(inflight) -> int:
+    """#713: prompt tokens that have ARRIVED but are not yet on the queue.
+
+    ``inflight`` is the raw ``recv_reqs`` list. It is heterogeneous -- abort
+    messages, the policy's own flip arm, control traffic -- so only items that
+    actually carry a prompt are counted. Counting a control message as work
+    would arm a flip on nothing, which is the opposite defect to the one this
+    fixes and would be harder to see.
+
+    A just-received request is a ``TokenizedGenerateReqInput`` and carries
+    ``input_ids`` (``io_struct.py:798``); the ``Req`` the scheduler builds
+    later carries ``origin_input_ids``. Both are accepted because this helper
+    runs on the boundary between them and reading only one field would make
+    the count depend on where in the round it was called.
+
+    Every access is guarded. This runs inside the admission path, and a probe
+    that faults there kills the round it exists to inform -- the #715 lesson,
+    where a diagnostic died inside the crash it was written to explain.
+    """
+    if not inflight:
+        return 0
+    total = 0
+    for item in inflight:
+        for field in ("input_ids", "origin_input_ids"):
+            try:
+                ids = getattr(item, field, None)
+                if ids:
+                    total += len(ids)
+                    break
+            except Exception:  # noqa: BLE001 - a probe must not break intake
+                continue
+    return total
 
 
 class Scheduler(
@@ -1614,6 +1649,13 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        # #699: the admission-wedge clock. Seeded to "now" so an idle box at
+        # boot reads as "no progress yet since start" rather than a false
+        # infinite age; stamped again only when a request's first output
+        # token is committed (see note_first_token_progress /
+        # SchedulerBatchResultProcessor.process_batch_result_prefill), never
+        # on a forward pass -- that is the exact signal #699 proved blind.
+        self.last_first_token_progress_time: float = time.perf_counter()
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -1729,11 +1771,32 @@ class Scheduler(
                 self, watchdog_timeout=x, soft=True
             )
 
+    def note_first_token_progress(self, ts: Optional[float] = None) -> None:
+        """#699: stamp the moment ANY request reached its first output token.
+
+        This is the clock the admission-wedge detector reads (queue age vs
+        progress), never forward_ct: chunked prefill can advance forward_ct
+        for tens of seconds while zero requests progress, which is exactly
+        the wedge shape #699 exists to catch. Call this ONLY at the instant a
+        request's first output token is committed
+        (SchedulerBatchResultProcessor.process_batch_result_prefill), never
+        from a forward pass alone.
+        """
+        self.last_first_token_progress_time = (
+            ts if ts is not None else time.perf_counter()
+        )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
+
+        # #699: log-only admission-wedge watchdog, wired to the real
+        # first-token-progress clock above (queue age vs progress -- see
+        # invariant_checker.create_admission_wedge_watchdog for why this is
+        # not the same signal as the forward_ct watchdog just started).
+        self.admission_wedge_watchdog = create_admission_wedge_watchdog(self)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -2949,6 +3012,35 @@ class Scheduler(
     #: wedged.
     BOTH_BLOCKED_EVICT_INTERVAL_S = 5.0
 
+    def _uniform_kv_available(self):
+        """Rank-uniform KV rows available, or None (#708).
+
+        The BOTH-BLOCKED decline names its binding resource from this. It must
+        be the GROUP MIN, not the local pool: every PhasePolicyInputs field is
+        replicated by contract, and under uneven DCP the local availability
+        differs per rank, so a local value would make the decline text -- and
+        anything later keyed on it -- rank-dependent. That is the #616g
+        divergence class this codebase already pays to avoid.
+        ``uniform_avail_for_evict`` is the existing accessor: it returns the
+        published group-min floor when the pools are uneven and the live local
+        value when they agree.
+
+        Returns None rather than a guess when it cannot be read, so the policy
+        can say "not measured" instead of asserting.
+        """
+        try:
+            tree = getattr(self, "tree_cache", None)
+            if tree is None:
+                return None
+            allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+            if allocator is None:
+                return None
+            from sglang.srt.mem_cache.common import uniform_avail_for_evict
+
+            return int(uniform_avail_for_evict(tree, allocator))
+        except Exception:  # noqa: BLE001 - a diagnosis must never break a round
+            return None
+
     def _apply_both_blocked_relief(self, decision, inp) -> None:
         """Actually run the eviction the BOTH-BLOCKED receipt promises.
 
@@ -3024,17 +3116,38 @@ class Scheduler(
             if freed > 0:
                 verdict = "The remedy the receipt names has now actually run."
             elif avail_before is not None and avail_before >= want:
-                # Benign. KV was NOT the binding resource at this instant, so
-                # whatever blocks admission is something else -- mamba/GDN state
-                # slots are the standing candidate on this model, since a
-                # request needs a slot even when KV is plentiful.
-                verdict = (
-                    f"Eviction was SKIPPED, not defeated: {avail_before} rows "
-                    f"were already available against {want} wanted, so the "
-                    f"actuator had nothing to do. KV is therefore NOT the "
-                    f"binding resource here -- look at the state-slot bound "
-                    f"(mamba/GDN slots) before blaming the pool."
-                )
+                # Eviction was skipped: `want` was already available. But `want`
+                # is chunked_prefill_size, an arbitrary chunk, NOT what the
+                # blocked work actually needs -- so "avail >= 512" does NOT
+                # license "KV is not binding". The 22:22:33 specimen made that
+                # concrete: 19004 rows available, 512 wanted, and 97922 tokens
+                # of prefill pending. The first version of this branch concluded
+                # KV was not the binding resource from the 512 test alone, which
+                # is the same over-claim from a partial instrument that this
+                # routine exists to stop. Compare against the real demand.
+                pending = None
+                try:
+                    pending = int(getattr(inp, "pending_prefill_tokens", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    pending = None
+                if pending and avail_before < pending:
+                    verdict = (
+                        f"Eviction was SKIPPED, not defeated: {avail_before} "
+                        f"rows were already available against the {want} asked "
+                        f"for. But {pending} tokens of prefill are pending, so "
+                        f"KV may well be binding for the REAL demand -- this "
+                        f"asked for a chunk, not for what the blocked work "
+                        f"needs. Do not read this as 'KV is fine'."
+                    )
+                else:
+                    verdict = (
+                        f"Eviction was SKIPPED, not defeated: {avail_before} "
+                        f"rows were already available against {want} wanted"
+                        + (f" and {pending} pending" if pending else "")
+                        + ", so the actuator had nothing to do. KV is not the "
+                        "binding resource here -- look at the state-slot bound "
+                        "(mamba/GDN slots) before blaming the pool."
+                    )
             else:
                 verdict = (
                     "Eviction RAN and delivered nothing"
@@ -3274,6 +3387,66 @@ class Scheduler(
         other = "tp" if phase == "pp" else "pp"
         here = self._layout_admits(phase, running_bs, pending_tokens)
         there = self._layout_admits(other, running_bs, pending_tokens)
+        # #713: NAME THE TERMS WHEN THE VERDICT IS THE EXPENSIVE ONE.
+        #
+        # Measured 2026-08-17 03:0x: a TEN-token prompt waited 31.64 s on an
+        # idle box -- 0 running, 1 queued, 3 mamba slots free, 72033 KV rows
+        # free -- because this returned target_can_admit=False and the policy
+        # declined to flip. But replaying _layout_admits with exactly those
+        # numbers returns pp=True/tp=False, i.e. the simulation is RIGHT for
+        # that state and would have armed. So the inputs it reads in-process
+        # differ from what /metrics reports, and no external sampling can show
+        # which -- the terms have to be printed where they are computed.
+        #
+        # Emitted only on the refusal (nothing here, nothing there), and rate
+        # limited, because the whole point is to catch a state that persists
+        # for tens of seconds rather than to narrate healthy rounds.
+        if (not here) and (not there):
+            now = time.perf_counter()
+            last = getattr(self, "_idle_locked_diag_at", 0.0)
+            if now - last >= 5.0:
+                self._idle_locked_diag_at = now
+                mamba = getattr(
+                    getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+                )
+                try:
+                    slots = int(mamba.available_size()) if mamba is not None else -1
+                except Exception as exc:  # noqa: BLE001 - a probe must not break
+                    slots = f"RAISED {type(exc).__name__}"
+                alloc = getattr(self, "token_to_kv_pool_allocator", None)
+                try:
+                    avail = int(alloc.available_size()) if alloc is not None else -1
+                except Exception as exc:  # noqa: BLE001
+                    avail = f"RAISED {type(exc).__name__}"
+                # THE THIRD PROBE GETS THE SAME ARMOUR, and it is not
+                # decoration: called bare inside the logger arguments, a raise
+                # here would kill the scheduler round this line exists to
+                # OBSERVE -- which is exactly how #715's RADIX SHAPE walk died
+                # inside the crash it was written to explain. "Probably safe
+                # because _layout_admits just evaluated it" is the reasoning
+                # the RAISED pattern exists to replace.
+                try:
+                    rows_seen = self._post_evict_rows()
+                except Exception as exc:  # noqa: BLE001
+                    rows_seen = f"RAISED {type(exc).__name__}"
+                logger.warning(
+                    "PHASE-POLICY IDLE-LOCKED TERMS phase=%s running_bs=%s "
+                    "pending_tokens=%s | here(%s)=%s there(%s)=%s | "
+                    "post_evict_rows=%s allocator_avail=%s mamba_slots=%s "
+                    "chunk=%s -- both layouts refused; these are the numbers "
+                    "the simulation actually read.",
+                    phase,
+                    running_bs,
+                    pending_tokens,
+                    phase,
+                    here,
+                    other,
+                    there,
+                    rows_seen,
+                    avail,
+                    slots,
+                    getattr(self.server_args, "chunked_prefill_size", None),
+                )
         return (not here), there
 
     def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
@@ -3286,7 +3459,9 @@ class Scheduler(
             return
         phase = getattr(self, "phase_flip_active_stack", None)
         self._parked_decode_verdict = (phase, bool(decode_blocked))
-        reqs = list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        reqs = (
+            list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        )
         self.parked_decode_set.sync_carriers(
             [getattr(r, "rid", "") for r in reqs],
             len(getattr(running_batch, "reqs", None) or []),
@@ -3463,6 +3638,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
             kv_session_offload=self.kv_session_offload,
+            record_first_token_progress=self.note_first_token_progress,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -4520,8 +4696,18 @@ class Scheduler(
             return
         if min_avail is None or (max_avail is not None and min_avail >= max_avail):
             tree.uniform_avail_floor = None
+            # #694: the ledger corrects a floor; with no floor there is nothing
+            # to correct, and a value left over from a previous generation
+            # would be charged against the NEXT one.
+            tree.uniform_admitted_since_floor = 0
             return
         tree.uniform_avail_floor = int(min_avail)
+        # #694: RESET IN THE SAME CALL THAT PUBLISHES, so the ledger never
+        # outlives the number it corrects. The floor is a snapshot of this
+        # instant; allocations charged against the PREVIOUS snapshot have
+        # already been reflected in this new MIN, and charging them twice would
+        # drive the predicate to zero and evict on every allocation.
+        tree.uniform_admitted_since_floor = 0
 
     #: What a rank with no host tier contributes to the host pair, so the
     #: reduce payload width never depends on a per-rank capability. Large
@@ -6005,6 +6191,33 @@ class Scheduler(
             )
         return self.tree_cache.check_prefetch_progress(req.rid)
 
+    @property
+    def chunked_commitment_ledger(self):
+        """#701 defect (b): the cross-pass reservation, owned HERE.
+
+        A ``PrefillAdder`` is rebuilt on every pass (see the construction in
+        ``_get_new_batch_prefill_raw``), so a ledger the adder made would forget
+        a resident chunked request's outstanding prefill exactly when the next
+        pass needs to see it -- which IS the defect. The scheduler outlives the
+        passes, so it is the right owner.
+
+        Not per-request-set either: commitments are keyed by request id and
+        released on finish/abort/retract, so the ledger self-cleans; tying it to
+        a set that turns over would drop live commitments instead.
+
+        LAZY on purpose. This must not depend on anything ``__init__`` builds --
+        it holds no pool, no allocator and no config, only integers keyed by
+        request id -- and constructing it on first read is what lets the
+        ownership be tested without standing up a scheduler.
+        """
+        from sglang.srt.planner.chunked_admission import ChunkedCommitmentLedger
+
+        ledger = getattr(self, "_chunked_commitment_ledger", None)
+        if ledger is None:
+            ledger = ChunkedCommitmentLedger()
+            self._chunked_commitment_ledger = ledger
+        return ledger
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -6219,6 +6432,11 @@ class Scheduler(
             # published. See that helper for why the two gates read the same
             # number through different doors.
             fundable_extend_floor=published_fundable_floor(self.tree_cache),
+            # #701 defect (b): pass the SCHEDULER-owned ledger into the adder
+            # this pass builds. Constructing it here instead would reset the
+            # outstanding commitments every pass, which is the hole the
+            # chokepoint subtraction cannot close on its own.
+            commitment_ledger=self.chunked_commitment_ledger,
         )
 
         if self.chunked_req is not None:
@@ -6269,9 +6487,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -8381,8 +8598,24 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
-    def _pending_prefill_tokens(self) -> int:
+    def _pending_prefill_tokens(self, inflight=None) -> int:
         """Prompt tokens ADMITTED BUT NOT YET COMPUTED (#631 defect N).
+
+        ``inflight`` (#713) is the batch of requests that have just been pulled
+        off the wire and have NOT yet reached ``waiting_queue``. Passing it is
+        what the flip policy must do; every other caller leaves it None and
+        gets the pre-#713 number unchanged, because that number is the #363
+        observer's quantity and the denominator the break-even N is expressed
+        in, and moving it would move a different rule.
+
+        WHY THIS PARAMETER EXISTS. ``recv_requests`` evaluates the phase policy
+        BEFORE the requests it just received are queued
+        (``scheduler_components/request_receiver.py:104-129``, then
+        ``scheduler.py:4089``). So on an idle box the policy asked "is there
+        prefill work?" of a queue that had not been told yet, read 0, and
+        ``_layout_admits("pp")`` early-falsed on its first line -- refusing a
+        flip whose other two terms both held. Measured cost: 31.64 s to first
+        token for a ten-token prompt. The rule was right; its input was stale.
 
         This used to be ``sum(len(req.origin_input_ids) for req in
         self.waiting_queue)`` -- the NOT-YET-ADMITTED queue -- while the
@@ -8415,10 +8648,51 @@ class Scheduler(
             rng = getattr(chunked, "extend_range", None)
             filled = int(rng.end) if rng is not None else 0
             pending += max(0, len(chunked.origin_input_ids) - filled)
+        pending += _arriving_prefill_tokens(inflight)
+        # #713 (a): RESIDENT-BUT-UNPREFILLED. The three terms above see a
+        # request in the waiting queue, in the chunked slot, or in the recv
+        # batch -- and NOWHERE ELSE. A request that has been ADMITTED has left
+        # the waiting queue, and if it is not the chunked_req it is invisible,
+        # so the policy reads 0 prefill pending while holding exactly that
+        # work. The arm states the contradiction itself:
+        #
+        #   IDLE-LOCKED: ... (1 REQ RESIDENT, 0 TOK PREFILL PENDING)
+        #
+        # Measured 2026-08-17 06:53:59.344 (specimen D2): admitted inside the
+        # :59->:01 PP window with ~1.7 s of PP left, invisible at the :01 arm,
+        # first token not until :04.879 -- a full cycle late.
+        #
+        # SAME EXTENT LOGIC AS THE CHUNKED TERM, deliberately: origin_input_ids
+        # minus the filled prefix. No new notion of progress is introduced.
+        #
+        # UNKNOWN PROGRESS COUNTS AS ZERO, and that direction is chosen. An
+        # over-count would keep pending above 0 forever, pull and hold the
+        # policy toward PP permanently and starve decode -- bounded only by the
+        # SLO cap. Under-counting merely restores today's behaviour for that
+        # request. So a missing extend_range is treated as fully prefilled.
+        try:
+            running = getattr(self, "running_batch", None)
+            for req in list(getattr(running, "reqs", None) or ()):
+                if chunked is not None and req is chunked:
+                    continue  # already priced by the chunked term above
+                rng = getattr(req, "extend_range", None)
+                if rng is None:
+                    continue
+                total = len(getattr(req, "origin_input_ids", ()) or ())
+                pending += max(0, total - int(rng.end))
+        except Exception:  # noqa: BLE001 - an observation must not break a round
+            pass
         return pending
 
-    def maybe_arm_phase_policy(self):
+    def maybe_arm_phase_policy(self, inflight_reqs=None):
         """#631: evaluate the automatic phase policy on the intake rank.
+
+        ``inflight_reqs`` (#713) is the ``recv_reqs`` batch this evaluation is
+        riding in. It is REQUIRED for a correct verdict on an idle box: this
+        hook runs before those requests are queued, so without it the policy
+        reads an empty queue and refuses to flip toward the very work that
+        just woke it. Optional in the signature only so a caller that does not
+        have the batch degrades to the pre-#713 reading rather than failing.
 
         Returns a ``PhaseFlipReqInput`` to put on the request stream, or
         None. The AUTOMATIC path is then byte-for-byte the manual one --
@@ -8557,12 +8831,16 @@ class Scheduler(
                 repaired,
                 running_bs,
             )
+        # #713: ONE reading, used by the verdict AND by the message that
+        # reports it. Calling the accessor twice inside one constructor is how
+        # a refusal could name a number the simulation never saw.
+        _pending_now = self._pending_prefill_tokens(inflight_reqs)
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
-            pending_prefill_tokens=self._pending_prefill_tokens(),
+            pending_prefill_tokens=_pending_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
             # getattr, because this gate is driven in tests by scheduler
@@ -8582,11 +8860,27 @@ class Scheduler(
                 or 0
             ),
             queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
+            # #708: the RANK-UNIFORM availability, so the BOTH-BLOCKED decline
+            # names its binding resource from a measurement. Group MIN via the
+            # existing accessor, never this rank's local pool -- every field on
+            # PhasePolicyInputs is replicated by contract, and a local value
+            # would make the decline rank-dependent (#616g). None when it
+            # cannot be read, which the policy reports as "not measured"
+            # instead of guessing.
+            # getattr, because this gate is driven in tests by scheduler
+            # STAND-INS that carry only the fields the policy reads -- the
+            # same trap that broke _idle_locked_inputs and the both-blocked
+            # relief earlier in this series. A stand-in without the probe has
+            # measured nothing, and 'not measured' is a state the policy
+            # already reports honestly.
+            kv_available_tokens=getattr(
+                self, "_uniform_kv_available", lambda: None
+            )(),
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
                     getattr(self, "_idle_locked_inputs", lambda *_: (False, False))(
-                        int(running_bs or 0), self._pending_prefill_tokens()
+                        int(running_bs or 0), _pending_now
                     ),
                 )
             ),
@@ -9159,9 +9453,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert (
-        scheduler.disaggregation_mode == DisaggregationMode.NULL
-    ), "phase flip x PD disaggregation is refused at argument time"
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
@@ -9570,8 +9864,17 @@ def run_scheduler_process(
             # without an active exception", after a clean drain, which is the
             # #673 signature. Graceful path only and flag-gated: the destroy
             # path runs barlink's close(), which is #722's machinery.
-            from sglang.srt.managers.scheduler_teardown import release_distributed
+            from sglang.srt.managers.scheduler_teardown import (
+                release_distributed,
+                release_lockstep_sentinel,
+            )
 
+            # #673: the sentinel's sidecar runs all_gather_object on its own
+            # gloo group every 0.5 s. It must be stopped AND JOINED before any
+            # group is destroyed, so it goes first here -- and release_distributed
+            # repeats the call internally, because this ordering must survive a
+            # careless edit to this block.
+            release_lockstep_sentinel(scheduler, graceful=scheduler.gracefully_exit)
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 

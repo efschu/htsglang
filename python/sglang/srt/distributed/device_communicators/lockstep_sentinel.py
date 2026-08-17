@@ -81,6 +81,14 @@ logger = logging.getLogger(__name__)
 _MASK64 = (1 << 64) - 1
 _FNV_PRIME = 0x100000001B3
 
+# #673: how long teardown waits for the sidecar before detaching it. Bounded
+# because a peer that has already gone leaves all_gather_object blocked until
+# the gloo timeout fires, and hanging shutdown is worse than the abort it
+# prevents. Same deadline class as the kvso-dest-io and dual-group-lane
+# siblings, so the family has one number.
+LS_JOIN_TIMEOUT_S: float = 2.0
+LS_LOG_PREFIX = "[#673 lockstep-sentinel]"
+
 ENV_ENABLE = "SGLANG_LOCKSTEP_SENTINEL"
 ENV_INTERVAL = "SGLANG_SENTINEL_INTERVAL_S"
 ENV_RING = "SGLANG_SENTINEL_RING"
@@ -244,8 +252,48 @@ class LockstepSentinel:
 
     # -- sidecar --------------------------------------------------------
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = LS_JOIN_TIMEOUT_S) -> str:
+        """Stop the sidecar and WAIT for it. Returns what happened (#673).
+
+        SETTING THE FLAG IS NOT AN ORDERING GUARANTEE, and that is the whole
+        reason this grew a join. The body used to be ``self._stop.set()`` and
+        nothing else, while the loop is ``while not stop: sleep(interval);
+        compare_once()`` and ``compare_once`` calls
+        ``dist.all_gather_object`` on the sentinel's gloo group. So ``stop()``
+        could return with the thread still inside a collective.
+
+        That window is exactly when #673's other fix destroys the process
+        groups. Destroying a group under a live collective is its own abort, so
+        the caller needs "the sidecar is no longer touching the group", which
+        only a join can promise.
+
+        Bounded, and the handle is kept on a timeout: a peer that has already
+        gone leaves the gather blocked until the gloo timeout fires, and
+        waiting that out would hang shutdown instead of ending it. Detaching is
+        then the lesser evil, said out loud so the leak stays visible.
+
+        Never raises, idempotent.
+        """
         self._stop.set()
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.is_alive():
+            self._thread = None
+            return "already stopped"
+        thread.join(timeout=float(timeout_s))
+        if thread.is_alive():
+            logger.warning(
+                "%s lockstep-sentinel did not stop within %.2fs and is being "
+                "DETACHED deliberately. It is most likely inside "
+                "all_gather_object on its gloo group waiting for a peer that "
+                "is gone. The handle is KEPT so the leak stays visible. "
+                "CAUTION: the group it uses must NOT be destroyed while this "
+                "is true -- that is an abort, not a leak.",
+                LS_LOG_PREFIX,
+                float(timeout_s),
+            )
+            return "detached"
+        self._thread = None
+        return "joined"
 
     def _gather(self, obj: Any) -> Optional[List[Any]]:
         import torch.distributed as dist
@@ -499,6 +547,27 @@ def install(rank: int, world_size: int, group: Any) -> None:
         _SENTINEL.interval_s,
         _SENTINEL.ring_len,
     )
+
+
+def stop_sentinel(timeout_s: float = LS_JOIN_TIMEOUT_S) -> Optional[str]:
+    """Stop the process-wide sentinel if one is installed (#673).
+
+    The counterpart ``install`` never had. Returns the outcome, or None when
+    nothing is installed -- which is the default boot, since the sentinel is
+    opt-in via ``SGLANG_LOCKSTEP_SENTINEL``.
+
+    Never raises: it runs during shutdown, and it is also called from
+    ``release_distributed`` as an ordering precondition, where an exception
+    would abort the very teardown it exists to make safe.
+    """
+    sentinel = _SENTINEL
+    if sentinel is None:
+        return None
+    try:
+        return sentinel.stop(timeout_s)
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s stopping the sentinel failed: %s", LS_LOG_PREFIX, e)
+        return None
 
 
 def armed() -> bool:

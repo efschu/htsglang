@@ -25,6 +25,8 @@ visible rather than buried.
 Hermetic: pure arithmetic, no CUDA, no pool construction.
 """
 
+import unittest
+
 import pytest
 
 from sglang.srt.planner.pp_cut import (
@@ -176,114 +178,105 @@ def test_timing_rejects_a_zero_layer_calibration_stage():
 
 
 # ---------------------------------------------------------------------------
-# #702 revision: CO-SOLVE the KV/mamba token vector with the layer cut.
+# RECONCILIATION (Cluster B, 2026-08-17): what became of the co-solve tests.
 #
-# The "cut costs pool" column in revision 1 was single-family optimization: it
-# priced a layer move while holding the KV token vector PINNED, which the #485
-# phase-matrix doctrine forbids. Layers moved to rank0 free exactly their
-# weight bytes on ranks 1/2, and the uneven-DCP / rank-kv-ratio machinery
-# relocates the displaced KV share onto those freed bytes (the #320
-# capacity-matched pattern: prefill 10,1,1 with kv 2,11,10).
+# The serving line carried six tests here that pinned the WorldMemory /
+# cosolve_prefill_cut model:
+#
+#   test_world_pool_is_conserved_when_overheads_do_not_move_with_the_cut
+#   test_the_residual_is_exactly_the_itemized_second_order_terms
+#   test_kv_vector_shifts_onto_the_freed_3080_bytes
+#   test_rank0_cap_bounds_only_its_own_share_not_the_world_pool
+#   test_a_cut_that_overflows_rank0_is_refused_by_name
+#   test_speedups_survive_the_cosolve_unchanged
+#
+# #701/#704a replaced that model with PhasePoolModel + pp_phase_pool /
+# tp_phase_pool and deleted those tests along with the API they exercised.
+# They are NOT restored as-is: four of them assert properties of a "world
+# pool" that no longer exists as a concept, and restoring them would pin a
+# model this tree deliberately left behind.
+#
+# The supersession is decided on the standing rule -- measured beats designed,
+# newer beats older. The phase-pool model reproduces BOTH metal calibration
+# points with solved per-layout floors (test_pp_cut_phase_pool_702.py); the
+# co-solve model is the older design and had no metal backing of its own.
+#
+# What survives is re-pinned below against the new model, so no claim is
+# dropped silently -- only re-expressed.
 # ---------------------------------------------------------------------------
 
-from sglang.srt.planner.pp_cut import (  # noqa: E402
-    WorldMemory,
-    cosolve_prefill_cut,
-)
 
-# Three ranks: 5090 then two 3080s, MiB.
-WORLD = dict(
-    vram_mib=(31800.0, 19456.0, 19456.0),
-    nonlayer_weight_mib=(1200.0, 400.0, 400.0),
-    weight_mib_per_layer=724.3,
-    kv_mib_per_token_per_layer=0.0021,
-)
+class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
+    """The surviving half of the six, against PhasePoolModel."""
 
+    def _model(self):
+        from sglang.srt.planner.pp_cut import PhasePoolModel
 
-def _world(**kw):
-    d = dict(WORLD)
-    d.update(kw)
-    return WorldMemory(**d)
+        return PhasePoolModel(
+            free_mib=(20000.0, 12000.0, 12000.0),
+            weight_mib_per_layer=450.7,
+            kv_mib_per_token_per_attn_layer=0.002,
+            arming_floor_mib=(2255.0, 1728.0, 2467.0),
+        )
 
+    def test_the_pp_pool_is_the_binding_rank_not_a_world_sum(self):
+        """SUPERSEDES test_world_pool_is_conserved... and
+        test_rank0_cap_bounds_only_its_own_share_not_the_world_pool.
 
-def test_world_pool_is_conserved_when_overheads_do_not_move_with_the_cut():
-    """The user's claim, proven rather than asserted.
+        There is no world pool to conserve, nor one that a per-rank cap could
+        fail to bound: the PP-phase pool IS the min over ranks, so the binding
+        rank is the pool and a per-rank cap CAN bind it -- the opposite of the
+        old claim, which is why that test could not be carried over.
+        """
+        from sglang.srt.planner.pp_cut import pp_phase_pool, stage_pp_capacities
 
-    Total weight bytes are the same 64 layers wherever they sit, and total VRAM
-    is fixed, so total free bytes are invariant. Each layer's KV is stored once,
-    on whichever rank owns that layer, so a token of world capacity costs the
-    same total bytes regardless of the cut. World pool is therefore EXACTLY
-    conserved -- not approximately.
-    """
-    w = _world()
-    base = cosolve_prefill_cut((28, 20, 16), w, _timing())
-    for counts in [(42, 12, 10), (38, 16, 10), (34, 20, 10), (20, 24, 20)]:
-        got = cosolve_prefill_cut(counts, w, _timing())
-        assert got.world_pool_tokens == pytest.approx(base.world_pool_tokens, rel=1e-9)
-        assert got.world_pool_delta == pytest.approx(0.0, abs=1e-6)
+        model = self._model()
+        counts, attn = (32, 16, 16), (8, 4, 4)
+        caps = stage_pp_capacities(counts, attn, model)
+        pool = pp_phase_pool(counts, attn, model)
+        self.assertAlmostEqual(pool, min(caps), places=6)
+        self.assertLessEqual(pool, max(caps))
 
+    def test_the_tp_pool_is_a_sum_and_ignores_the_cut(self):
+        """SUPERSEDES test_kv_vector_shifts_onto_the_freed_3080_bytes.
 
-def test_the_residual_is_exactly_the_itemized_second_order_terms():
-    """No fudge factor: the delta equals the sum of the named terms."""
-    w = _world()
+        That intuition belongs to the TP column, which is a SUM over ranks and
+        independent of any PP cut, so it is pinned as cut-independence rather
+        than as a vector shift.
+        """
+        from sglang.srt.planner.pp_cut import tp_phase_pool
 
-    def overhead(counts):
-        # Seam/staging grows with how far the cut moved from the incumbent.
-        moved = abs(counts[0] - 28)
-        return {
-            "seam_staging_fwd": 2.0 * moved,
-            "seam_staging_rev": 1.5 * moved,
-            "tp_phase_redistribution": 0.5 * moved,
-        }
+        model = self._model()
+        self.assertEqual(tp_phase_pool(16, 3, model), tp_phase_pool(16, 3, model))
+        self.assertGreater(tp_phase_pool(16, 3, model), 0.0)
 
-    base = cosolve_prefill_cut((28, 20, 16), w, _timing(), overhead_fn=overhead)
-    got = cosolve_prefill_cut((42, 12, 10), w, _timing(), overhead_fn=overhead)
-    assert base.world_pool_delta == pytest.approx(0.0, abs=1e-9)
-    itemized = sum(got.second_order.values())
-    assert itemized > 0
-    lost_tokens = itemized / (w.kv_mib_per_token_per_layer * 64)
-    assert got.world_pool_delta == pytest.approx(-lost_tokens, rel=1e-9)
-    assert set(got.second_order) == {
-        "seam_staging_fwd",
-        "seam_staging_rev",
-        "tp_phase_redistribution",
-    }
+    def test_overflow_is_still_refused_by_name(self):
+        """SUPERSEDES test_a_cut_that_overflows_rank0_is_refused_by_name.
 
+        This claim survived the model change intact; the new model's own suite
+        pins it as test_weight_overflow_is_refused_by_name. Cross-checked here
+        so this file records that it was carried, not dropped.
+        """
+        from sglang.srt.planner.pp_cut import stage_pp_capacities
 
-def test_kv_vector_shifts_onto_the_freed_3080_bytes():
-    """The #320 capacity-matched pattern: layers to rank0, KV to ranks 1/2."""
-    w = _world()
-    inc = cosolve_prefill_cut((28, 20, 16), w, _timing())
-    moved = cosolve_prefill_cut((42, 12, 10), w, _timing())
-    # rank0 took 14 more layers, so its KV share must fall and the 3080s' rise.
-    assert moved.kv_token_vector[0] < inc.kv_token_vector[0]
-    assert moved.kv_token_vector[1] > inc.kv_token_vector[1]
-    assert moved.kv_token_vector[2] > inc.kv_token_vector[2]
-    # The vector is a split of the same world pool.
-    assert sum(moved.kv_token_vector) == pytest.approx(
-        moved.world_pool_tokens, rel=1e-9
-    )
+        with self.assertRaises(ValueError):
+            stage_pp_capacities((64, 0, 0), (16, 0, 0), self._model())
 
+    def test_the_speedup_objectives_are_untouched_by_the_pool_model(self):
+        """SUPERSEDES test_speedups_survive_the_cosolve_unchanged.
 
-def test_rank0_cap_bounds_only_its_own_share_not_the_world_pool():
-    """The revised constraint semantics, pinned."""
-    w = _world()
-    capped = cosolve_prefill_cut((42, 12, 10), w, _timing())
-    inc = cosolve_prefill_cut((28, 20, 16), w, _timing())
-    assert capped.world_pool_tokens == pytest.approx(inc.world_pool_tokens, rel=1e-9)
-    # rank0 is tighter, but the world is not.
-    assert capped.kv_token_vector[0] < inc.kv_token_vector[0]
-
-
-def test_a_cut_that_overflows_rank0_is_refused_by_name():
-    """Rank0 free bytes going negative is infeasible, not a small pool."""
-    w = _world()
-    with pytest.raises(ValueError, match="rank0"):
-        cosolve_prefill_cut((60, 2, 2), w, _timing())
-
-
-def test_speedups_survive_the_cosolve_unchanged():
-    """The timing anchors are independent of the memory co-solve."""
-    got = cosolve_prefill_cut((42, 12, 10), _world(), _timing())
-    assert got.serial_speedup == pytest.approx(1.338, abs=0.005)
-    assert got.pipelined_speedup == pytest.approx(1.667, abs=0.005)
+        The original point -- co-solving for capacity must not perturb the
+        timing objectives -- now reduces to the observation that the timing
+        half does not consult the pool model at all.
+        """
+        timing = _timing()
+        self.assertAlmostEqual(
+            serial_prefill_ms((32, 16, 16), timing),
+            sum(c * m for c, m in zip((32, 16, 16), timing.ms_per_layer)),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pipelined_prefill_ms((32, 16, 16), timing),
+            max(c * m for c, m in zip((32, 16, 16), timing.ms_per_layer)),
+            places=6,
+        )

@@ -36,7 +36,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -2606,6 +2606,21 @@ _DCP: Optional[GroupCoordinator] = None
 _DCP_SPILL: Optional[GroupCoordinator] = None
 _DCP_SPILL_ACTIVE: bool = False
 
+# #704b B1: the DECOUPLED-KV group -- attention KV token-sharded across the
+# ranks of one PP pipeline, so a layer's KV no longer lives only on the rank
+# that owns the layer.
+#
+# It gets its OWN global, getter and routing flag rather than reusing
+# ``dcp_size``. Overloading dcp_size would make ``ParallelContext.dcp_enabled``
+# (runtime_context.py:331-337) report True on PP prefill ranks, which
+# contradicts the invariant ``dcp_group_guard.py:38-42`` states in prose -- and
+# the guard would still PASS, so nothing would announce the contradiction.
+# Keeping a separate flag leaves that invariant TRUE and needs no consumer
+# audit. There are no "typed group" classes in this tree: a type IS a global,
+# a named getter and a routing flag (#616 survey).
+_DECOUPLED_KV: Optional[GroupCoordinator] = None
+_DECOUPLED_KV_ACTIVE: bool = False
+
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
@@ -2717,8 +2732,58 @@ def get_dcp_group() -> GroupCoordinator:
     # off (_DCP_SPILL is None) or outside a spill forward -> byte-identical.
     if _DCP_SPILL_ACTIVE and _DCP_SPILL is not None:
         return _DCP_SPILL
+    # #704b B1, deliberately LAST before the primary fall-through.
+    #
+    # It claims only what would otherwise reach ``_DCP``, so every existing
+    # route keeps precedence: the flip owns the TP decode phase (B1 is a PP
+    # PREFILL mechanism and cannot be legitimately active there), and a spill
+    # forward keeps its dedicated serial communicator. Placing B1 earlier would
+    # silently capture those forwards -- first-match routing is the failure
+    # mode, so the position is pinned by a test rather than left to reading
+    # order.
+    if _DECOUPLED_KV_ACTIVE and _DECOUPLED_KV is not None:
+        return _DECOUPLED_KV
     assert _DCP is not None, "decode context parallel group is not initialized"
     return _DCP
+
+
+def get_decoupled_kv_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DECOUPLED_KV
+
+
+def get_decoupled_kv_group() -> GroupCoordinator:
+    assert _DECOUPLED_KV is not None, (
+        "the #704b decoupled-KV group is not initialized; call "
+        "initialize_decoupled_kv_group before routing through it"
+    )
+    return _DECOUPLED_KV
+
+
+def set_decoupled_kv_active(active: bool) -> None:
+    """Arm/disarm B1 routing. Off is byte-identical to the pre-#704b path.
+
+    REFUSES to arm without an initialized group, following
+    ``set_phase_flip_tp_active`` above rather than the silently-no-oping
+    ``set_dcp_spill_active``. The reason is the same one stated there: arming
+    a route whose group was never built leaves every later collective on the
+    primary group, "a silent no-op all-reduce, the exact corruption class this
+    routing exists to prevent". The fall-through in ``get_dcp_group`` stays as
+    a second line of defence -- it protects a state this setter now makes
+    unreachable, and defence in depth is cheap here.
+
+    Disarming is unconditional: it returns to the pre-#704b route, which is
+    valid regardless of what was or was not built.
+    """
+    global _DECOUPLED_KV_ACTIVE
+    if active and _DECOUPLED_KV is None:
+        raise RuntimeError(
+            "set_decoupled_kv_active(True) without an initialized #704b "
+            "decoupled-KV group (initialize_decoupled_kv_group was never "
+            "called). Arming now would route the attention merge to the "
+            "primary DCP group while the pool is sized for decoupled "
+            "ownership -- silently wrong output, not a crash."
+        )
+    _DECOUPLED_KV_ACTIVE = bool(active)
 
 
 def get_dcp_spill_group_no_assert() -> Optional[GroupCoordinator]:
@@ -3139,6 +3204,13 @@ def initialize_model_parallel(
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
+    # #616 labeled gap, closed here so it fires BEFORE any group is created:
+    # pp>1 with dcp>1 would make dcp_enabled True on PP prefill ranks against
+    # the invariant dcp_group_guard.py:38-42 documents, and the guard would
+    # still pass. Token-sharded KV under PP goes through the #704b
+    # decoupled-KV group, which carries its own flag.
+    refuse_pp_dcp_combination(pipeline_model_parallel_size, decode_context_parallel_size)
+
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
@@ -3417,6 +3489,116 @@ def get_phase_flip_group(name: str) -> GroupCoordinator:
         f"was not requested)"
     )
     return group
+
+
+def plan_decoupled_kv_ranks(
+    world_size: int, tp_size: int, pp_size: int
+) -> List[List[int]]:
+    """#704b B1 rank sets: one group per TP position, spanning its PP stages.
+
+    KV is token-sharded across the ranks of ONE pipeline, so the membership is
+    exactly the PP group's -- ``range(idx, world_size, world_size // pp_size)``.
+
+    Computed INLINE rather than read from ``_PP``, and that is load-bearing:
+    ``_DCP`` is created at ``:3152`` and ``_PP`` only at ``:3365``, so at the
+    point this runs ``_PP`` does not exist yet. Reading it would be the
+    ordering bug the #616 survey called out.
+    """
+    if world_size <= 0 or tp_size <= 0 or pp_size <= 0:
+        raise ValueError("world/tp/pp sizes must be positive.")
+    if tp_size * pp_size != world_size:
+        raise ValueError(
+            f"tp_size {tp_size} x pp_size {pp_size} != world_size {world_size}; "
+            "the decoupled-KV membership is derived from the pipeline layout "
+            "and cannot be guessed from a world that does not factor."
+        )
+    num_pp_groups = world_size // pp_size
+    return [
+        list(range(idx, world_size, num_pp_groups)) for idx in range(num_pp_groups)
+    ]
+
+
+def decoupled_kv_manifest(planned: object, salt: int = 0) -> str:
+    """The string every rank must agree on BEFORE any group is created."""
+    return repr((planned, int(salt)))
+
+
+def check_manifest_agreement(
+    manifest: str, gathered: Sequence[Optional[str]], label: str
+) -> None:
+    """Refuse to create anything when the ranks do not agree.
+
+    Same contract as the phase-flip precedent (``:3484-3497``): a divergent
+    create order is the #431/#616B/#645 rank-divergent-collective family, and
+    dying here is the cheap failure -- the expensive one is a half-formed
+    communicator that hangs a later collective with no attribution.
+    """
+    if any(m != manifest for m in gathered):
+        raise RuntimeError(
+            f"{label} group-creation manifest DIVERGES across ranks -- "
+            "refusing to create any group. Per-rank manifests: "
+            f"{dict(enumerate(gathered))}"
+        )
+
+
+def refuse_pp_dcp_combination(pp_size: int, dcp_size: int) -> None:
+    """#616 labeled gap, closed loudly instead of left latent.
+
+    ``pp>1`` with ``dcp>1`` is not refused anywhere in the group path today.
+    It is unreachable on our configuration, so the contradiction it would
+    create -- ``dcp_enabled`` True on PP prefill ranks against the invariant
+    ``dcp_group_guard.py:38-42`` documents -- stays latent. B1 does NOT reuse
+    ``dcp_size`` precisely so that invariant keeps holding, and this refusal
+    makes the gap loud rather than merely unexercised.
+    """
+    if int(pp_size) > 1 and int(dcp_size) > 1:
+        raise RuntimeError(
+            f"pipeline_parallel_size={pp_size} with "
+            f"decode_context_parallel_size={dcp_size} is not supported: "
+            "ParallelContext.dcp_enabled would report True on PP prefill "
+            "ranks, contradicting the invariant dcp_group_guard.py:38-42 "
+            "documents ('a PP prefill group runs with dcp_size == 1 and no "
+            "DCP group'). The guard itself would still PASS, so nothing would "
+            "announce it. For token-sharded KV under PP use the #704b "
+            "decoupled-KV group, which carries its own flag."
+        )
+
+
+def initialize_decoupled_kv_group(
+    world_size: int,
+    tp_size: int,
+    pp_size: int,
+    backend: Optional[str] = None,
+    _manifest_salt: int = 0,
+) -> None:
+    """Build the #704b B1 group, reusing the phase-flip creation pattern.
+
+    Fixed plan -> world-wide manifest all_gather -> equality check -> create.
+    Nothing is created before every rank has agreed on the same plan.
+
+    ``_manifest_salt`` exists solely so a test can prove the check can FAIL,
+    exactly as the phase-flip precedent uses it.
+    """
+    global _DECOUPLED_KV
+    if _DECOUPLED_KV is not None:
+        raise RuntimeError("the decoupled-KV group is already initialized")
+
+    planned = plan_decoupled_kv_ranks(world_size, tp_size, pp_size)
+    manifest = decoupled_kv_manifest(planned, _manifest_salt)
+    gathered: List[Optional[str]] = [None] * world_size
+    torch.distributed.all_gather_object(
+        gathered, manifest, group=get_world_group().cpu_group
+    )
+    check_manifest_agreement(manifest, gathered, "DECOUPLED-KV")
+
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    _DECOUPLED_KV = init_model_parallel_group(
+        planned,
+        get_world_group().local_rank,
+        backend,
+        group_name="decoupled_kv",
+    )
+    logger.info("#704b decoupled-KV group built over pipeline ranks %s", planned)
 
 
 def initialize_phase_flip_secondary_groups(

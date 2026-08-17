@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import os
@@ -155,6 +156,32 @@ MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
 
+#: The names :func:`decompose_mamba_budget_post` emits, in order. Anything that
+#: sums "the mamba post" must accept BOTH shapes -- the lump and these parts --
+#: or it silently reads zero on exactly the boots that carry the instrument.
+MAMBA_POST_PART_NAMES = (
+    "mamba state pool",
+    "speculative intermediate state",
+    "prefill activation reserve",
+)
+
+
+def mamba_post_total_gb(posts) -> float:
+    """The mamba post total, whether it was emitted lumped or decomposed.
+
+    Exists because the decomposition broke the ceiling hint in
+    ``budget_exhausted_message``: that summed posts named ``MAMBA_BUDGET_POST``,
+    which matches nothing once the post is emitted as three parts, so the
+    ``--max-running-requests-ceiling`` advice disappeared from the refusal
+    message precisely on the boots that have the new instrument. Callers should
+    use this rather than matching a name.
+    """
+    return sum(
+        gb
+        for name, gb in posts
+        if name == MAMBA_BUDGET_POST or name in MAMBA_POST_PART_NAMES
+    )
+
 
 def _note_mamba_component(runner, name: str, gb: float) -> None:
     """Record one NAMED sub-term of the lumped mamba budget post (#704).
@@ -223,7 +250,7 @@ def decompose_mamba_budget_post(total_gb: float, components: dict):
     if not components:
         return [(MAMBA_BUDGET_POST, float(total_gb))]
     named = sum(float(v) for v in components.values())
-    out = [("mamba state pool", float(total_gb) - named)]
+    out = [(MAMBA_POST_PART_NAMES[0], float(total_gb) - named)]
     out.extend((str(k), float(v)) for k, v in components.items())
     return out
 
@@ -643,7 +670,7 @@ class ModelRunnerKVCacheMixin:
         short_mib = math.ceil(-rest_memory_gb * 1024)
         total_gb, outside_gb = occupancy
         ceiling_note = ""
-        mamba_post_gb = sum(gb for name, gb in posts if name == MAMBA_BUDGET_POST)
+        mamba_post_gb = mamba_post_total_gb(posts)
         if ceiling and mamba_post_gb > 0.005:
             # The post is (slots + admitted*D) * per_req + a constant reserve,
             # and both slot terms are proportional to the ceiling -- so the
@@ -3061,6 +3088,90 @@ class ModelRunnerKVCacheMixin:
         )
         return rows
 
+    def _decoupled_kv_pool_override(
+        self: ModelRunner, all_attn_layer_ids, default_size: int
+    ):
+        """#704b B1: swap layer-ownership sizing for token-share sizing.
+
+        Returns ``(layer_ids_or_None, size)``. ``None`` means "unchanged" and
+        is returned for every rank on every path unless B1 is explicitly
+        enabled, so the default build is byte-identical -- the caller keeps its
+        own expression rather than receiving a reconstructed copy of it, which
+        is what makes "unchanged" mean unchanged instead of "recomputed the
+        same way".
+
+        Enabled by ``SGLANG_DECOUPLED_KV=1``. B1 has no CLI surface yet by
+        decision (the flag is module-level, dcp_size was deliberately NOT
+        overloaded), so the build gate is an env var rather than a server arg
+        that would have to be threaded through a shared parse path.
+        """
+        from sglang.srt.utils import get_bool_env_var
+
+        if not get_bool_env_var("SGLANG_DECOUPLED_KV"):
+            return None, default_size
+
+        from sglang.srt.distributed.utils import (
+            cp_token_split_factor,
+            get_cp_token_ratios,
+        )
+        from sglang.srt.mem_cache.decoupled_kv_arming import record_pool_plan
+        from sglang.srt.mem_cache.decoupled_kv_pool_plan import (
+            plan_for_rank,
+            pool_build_args,
+        )
+
+        _S = cp_token_split_factor(self.dcp_size)
+        _ratios = get_cp_token_ratios()
+        _ratio_r = int(_ratios[get_parallel().attn_dcp_rank])
+        plan = plan_for_rank(
+            list(all_attn_layer_ids),
+            self.start_layer,
+            self.end_layer,
+            self.max_total_num_tokens,
+            # Per-layer cell bytes are not needed for the two build arguments;
+            # the plan carries them only for the world-conservation check, so
+            # a placeholder here would silently corrupt that check. Pass the
+            # real per-token-per-layer cell instead.
+            self._decoupled_kv_cell_bytes(),
+            armed=True,
+            share=_ratio_r / _S,
+            period=_S,
+        )
+        # Record what was BUILT, so arming can be checked against reality.
+        record_pool_plan(plan)
+        layer_ids, size = pool_build_args(plan)
+        logger.info(
+            "#704b B1 decoupled KV pool: %d attention layers (all), %d rows "
+            "for token share %d/%d on dcp_rank %d (stage-local would have been "
+            "%d layers x %d rows)",
+            len(layer_ids),
+            size,
+            _ratio_r,
+            _S,
+            get_parallel().attn_dcp_rank,
+            sum(1 for i in all_attn_layer_ids if self.start_layer <= i < self.end_layer),
+            default_size,
+        )
+        return list(layer_ids), size
+
+    def _decoupled_kv_cell_bytes(self: ModelRunner) -> int:
+        """KV bytes per token per full-attention layer, FROM CONFIG.
+
+        K and V, this rank's kv heads, head_dim, element size -- the same
+        quantities and the same idiom as ``pool_configurator._compute_cell_size``
+        (``:315-331``), deliberately not a fitted constant: fitting this against
+        an observed pool is how #704 previously arrived at a 2x-wrong cell that
+        a compensating fudge hid.
+        """
+        import torch
+
+        return (
+            2
+            * self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            * self.model_config.head_dim
+            * torch._utils._element_size(self.kv_cache_dtype)
+        )
+
     def _swa_hybrid_dcp_lane(self: ModelRunner) -> bool:
         """Is this rank serving SWA-hybrid uneven DCP? (#96, Stage B)
 
@@ -3998,9 +4109,15 @@ class ModelRunnerKVCacheMixin:
                         _dial_initial_rows,
                         _dial_chunk >> 20,
                     )
+                # #704b B1: token-share sizing instead of layer-ownership
+                # sizing. Returns (None, _dial_reserve) unless explicitly
+                # enabled, so the default build below is untouched.
+                _b1_ids, _b1_size = self._decoupled_kv_pool_override(
+                    config.full_attention_layer_ids, _dial_reserve
+                )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
-                    size=_dial_reserve,
+                    size=_b1_size,
                     dtype=self.kv_cache_dtype,
                     head_num=_hybrid_kv_head_num,
                     head_dim=self.model_config.head_dim,
@@ -4009,7 +4126,9 @@ class ModelRunnerKVCacheMixin:
                     # (secondary-runner gates) but runs the FULL model: it
                     # needs every full-attention layer's kv pool.
                     full_attention_layer_ids=(
-                        [0]
+                        _b1_ids
+                        if _b1_ids is not None
+                        else [0]
                         # A dual-group lane TARGET and the #631 phase-flip
                         # TP stack are draft-gated secondary runners that
                         # run the FULL model: every full-attention layer.
@@ -5757,12 +5876,128 @@ class ModelRunnerKVCacheMixin:
         self._seam_reserve_cached = cached
         return cached
 
+    def _maybe_price_cold_seam(self: ModelRunner, reserve, configurator):
+        """On a COLD record only, derive the per-token seam slope (#685).
+
+        THE DEFECT THIS CLOSES. A cold ``SeamReserve`` has every measured
+        field at zero, ``per_row_bytes`` included, so ``solve_pool_tokens``
+        evaluates ``staging(T) = A + max(F, a*T)`` with ``a = 0`` and the
+        per-token term vanishes. A first boot is then sized floor-only and
+        grants a pool whose cutover it cannot fund. The arming FLOOR has been
+        charged on a cold record since #662-F4/A0; the SLOPE never was.
+
+        WHY IT CAN BE DERIVED HERE. #685: a rank's per-row seam cost is the
+        full-attention layers it must RECEIVE at the cutover,
+        ``max(0, share*n_total - held)``, and every term is rank-LOCAL and
+        known at boot -- the share from the flip vector, ``held`` from the
+        attention modules this runner actually built, the total from the model
+        config, and the per-layer cell from the configurator's own cell
+        divided by this rank's attention count. No collective, no measurement,
+        nothing transferred from another rig.
+
+        A FALLBACK, NEVER AN OVERRIDE. Any non-cold provenance is returned
+        untouched: a stored record is a measurement of THIS rig and outranks a
+        model of it.
+
+        ABSTAIN RATHER THAN APPROXIMATE. Every input is checked and a missing
+        one leaves the reserve at zero -- the same refusal the cell read below
+        already makes for a configurator with no single cell. A rank that
+        receives NOTHING (it sheds, or breaks even) is also left at zero:
+        charging it a per-token seam would reserve against a transfer that
+        does not happen, which is the over-reservation #685 named.
+
+        WHAT THIS DOES NOT YET DO, AND WHY IT STOPS HERE. The slope is derived
+        and carried, but the reserve stays INACTIVE: ``SeamReserve.active``
+        requires ``id_space > 0``, and the downstream solve anchors on that
+        measurement point together with ``have_bytes``
+        (``t_floor = t_m + (have_m - A - F) // cell``). A derived slope has no
+        measurement point, so setting those to make it active would fabricate
+        the anchor. The budget path therefore still returns floor-only on a
+        cold boot; what has changed is that the number now EXISTS and is
+        announced, instead of being silently zero.
+
+        Consuming it needs an anchor-free branch. ``solve_pool_tokens`` is
+        exactly that form and takes no anchor -- but it currently has no live
+        caller, so which budget it is solved against (``budget_bytes`` net of
+        the floor charge, or something the sizer has not yet subtracted) is a
+        design decision on the boot path rather than a wiring detail. Left to
+        be decided rather than picked here.
+        """
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        if reserve.provenance != seam.PROVENANCE_COLD or reserve.per_row_bytes:
+            return reserve
+
+        def _abstain(why: str):
+            logger.debug(
+                "%s: cold seam slope NOT derived (%s); the per-token term "
+                "stays 0 and the pool is sized floor-only.",
+                seam.LOG_PREFIX,
+                why,
+            )
+            return reserve
+
+        raw = getattr(self.server_args, "phase_flip_tp_vector", None)
+        if not raw:
+            return _abstain("no --phase-flip-tp-vector")
+        try:
+            vector = [int(x) for x in str(raw).split(",")]
+        except (TypeError, ValueError):
+            return _abstain(f"unparsable flip vector {raw!r}")
+        rank = int(self._seam_world_rank())
+        if not 0 <= rank < len(vector):
+            return _abstain(f"rank {rank} outside the {len(vector)}-stage vector")
+        held = int(self._lane_kv_bearing_layer_count() or 0)
+        if held <= 0:
+            return _abstain("this runner holds no full-attention layer")
+        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+        if cell <= 0:
+            return _abstain("the configurator has no single per-token cell")
+        n_layers = int(getattr(self.model_config, "num_hidden_layers", 0) or 0)
+        interval = getattr(self.model_config, "full_attention_interval", None)
+        total = n_layers // int(interval) if interval else n_layers
+        if total <= 0:
+            return _abstain("the model config reports no full-attention layer")
+
+        from sglang.srt.managers.seam_slope import derive_seam_slope_for_rank
+
+        slope = derive_seam_slope_for_rank(
+            flip_tp_vector=vector,
+            rank=rank,
+            attention_held=held,
+            kv_bytes_per_token_per_attn_layer=float(cell) / float(held),
+            n_attention_total=total,
+        )
+        if slope <= 0.0:
+            return _abstain(
+                f"rank {rank} receives no layer at the cutover (holds {held} "
+                f"of {total}, flip share {vector[rank]}/{sum(vector)})"
+            )
+        logger.info(
+            "%s (rank %d): COLD record -- per-token seam DERIVED, not "
+            "measured: %.1f B/row. This rank holds %d of %d full-attention "
+            "layers and the flip hands it %d/%d of the token axis, so it must "
+            "RECEIVE %.2f layer(s) of KV per row at a pp->tp cutover. Without "
+            "this the cold pool is sized floor-only and grants a pool whose "
+            "cutover it cannot fund (#685). A measured record from any later "
+            "boot supersedes this.",
+            seam.LOG_PREFIX,
+            rank,
+            slope,
+            held,
+            total,
+            vector[rank],
+            sum(vector),
+            slope / (float(cell) / float(held)),
+        )
+        return dataclasses.replace(reserve, per_row_bytes=float(slope))
+
     def _seam_adjusted_budget(
         self: ModelRunner, budget_bytes: int, configurator
     ) -> int:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
-        reserve = self._seam_reserve()
+        reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
 
         # #662-F4 / A0: THE ARMING FLOOR IS CHARGED EVEN ON A COLD RECORD.

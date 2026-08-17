@@ -76,9 +76,9 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
+    assert req.cache_protected_len % page_size == 0, (
+        "cache_protected_len must be page aligned"
+    )
     evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
@@ -556,6 +556,13 @@ def alloc_token_slots(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    # #694: charge this draw against the published floor. Reached only on
+    # success, so a failed allocation never inflates the ledger. Without this
+    # the floor stays at its publish-time value all iteration, the evict
+    # trigger reads it, skips, and the NEXT allocation raises on a tree full of
+    # evictable tokens -- the two 2026-08-16 specimens.
+    note_uniform_admitted(tree_cache, num_tokens)
+
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
@@ -747,6 +754,28 @@ def _attempt_extend_relief(num_tokens: int) -> int:
     return freed
 
 
+def _ledger_tokens(value) -> int:
+    """Read a per-iteration ledger attribute safely. THE NAMED LIST (#624).
+
+    Both floor correctors -- the DEVICE one in
+    :func:`uniform_avail_for_evict` and the HOST one in
+    :func:`uniform_host_avail_for_backup` -- read a ledger attribute off the
+    tree cache. Real caches declare it on ``BasePrefixCache`` with a 0 default;
+    a test double usually does not, and ``int(Mock())`` is **1**, not 0. So an
+    unconfigured stand-in silently shaved one token off whichever floor it fed:
+    measured as ``499 != 500`` against the device ledger
+    (test_a_published_floor_is_returned) and reproducible against the host one.
+
+    Third appearance of the stub-drift class, so the guard lives in ONE place
+    rather than as two isinstance checks that would drift apart. ``bool`` is
+    excluded deliberately: it is an ``int`` subclass, and a truthy flag landing
+    here would charge 1 token for the same reason a Mock did.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return int(value)
+
+
 def uniform_avail_for_evict(tree_cache, allocator) -> int:
     """The availability a cache-mutation trigger must decide from (#616g).
 
@@ -756,10 +785,28 @@ def uniform_avail_for_evict(tree_cache, allocator) -> int:
     identical. When it is None -- single rank, or pools that agree -- this is
     the live local value and the caller behaves exactly as it did before.
     """
+    #: #694: CHARGE ALLOCATIONS AGAINST THE FLOOR, exactly as the HOST sibling
+    #: below already does for backups. The floor is published ONCE per
+    #: iteration (scheduler.py:4142-4144) as the group MIN at that instant;
+    #: allocations made later in the same iteration are not reflected in it, so
+    #: late in an iteration it is stale-OPTIMISTIC. With ``floor >= num_tokens``
+    #: the eviction is SKIPPED entirely, the alloc then fails against the live
+    #: pool, and the raise reports a tree full of evictable tokens nothing ever
+    #: asked for -- the two 2026-08-16 specimens, 512 refused at ~167k
+    #: evictable, both scheduler deaths.
+    #:
+    #: SUFFICIENT, by the same argument #645 makes for the host: this rank's
+    #: live availability is at least ``avail_at_publish - admitted``, and
+    #: ``avail_at_publish >= floor``, so a request clearing ``floor - admitted``
+    #: fits the real pool too. RANK-UNIFORM by construction: ``num_tokens``
+    #: comes from the replicated batch, so every rank charges the same amount at
+    #: the same allocation and the predicate stays identical across ranks --
+    #: which is the #616g invariant this must not break.
     floor = getattr(tree_cache, "uniform_avail_floor", None)
     if floor is None:
         return int(allocator.available_size())
-    return int(floor)
+    admitted = _ledger_tokens(getattr(tree_cache, "uniform_admitted_since_floor", 0))
+    return max(0, int(floor) - admitted)
 
 
 def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
@@ -806,8 +853,14 @@ def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
     floor = getattr(tree_cache, "uniform_host_avail_floor", None)
     if floor is None:
         return int(mem_pool_host.available_size())
-    admitted = getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
-    return max(0, int(floor) - int(admitted))
+    #: #624 (third appearance): guarded through the shared reader for the same
+    #: reason the device sibling is -- an unconfigured double yields a Mock and
+    #: ``int(Mock())`` is 1, which moved this floor too (reproduced at 499 vs
+    #: 500 before the guard).
+    admitted = _ledger_tokens(
+        getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
+    )
+    return max(0, int(floor) - admitted)
 
 
 def uniform_host_floor_active(tree_cache) -> bool:
@@ -846,6 +899,21 @@ def uniform_host_floor_active(tree_cache) -> bool:
     ``test/registered/unit/distributed/test_uniform_host_evict_floor_645.py``.
     """
     return getattr(tree_cache, "uniform_host_avail_floor", None) is not None
+
+
+def note_uniform_admitted(tree_cache, tokens: int) -> None:
+    """Charge an admitted DEVICE allocation against the published floor (#694).
+
+    The device twin of :func:`note_uniform_host_admitted`. Only meaningful while
+    a floor is active -- with no floor the attribute is never read, so charging
+    is a no-op and the no-floor path stays byte-identical. Reset once per
+    iteration by the scheduler when it publishes the next floor, so the ledger
+    never outlives the number it corrects.
+    """
+    if getattr(tree_cache, "uniform_avail_floor", None) is None:
+        return
+    current = getattr(tree_cache, "uniform_admitted_since_floor", 0)
+    tree_cache.uniform_admitted_since_floor = current + int(tokens)
 
 
 def note_uniform_host_admitted(tree_cache, tokens: int) -> None:
@@ -1104,37 +1172,89 @@ def alloc_paged_token_slots_extend(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    def _attempt_alloc():
+        """One allocation attempt, including the DSV4 bundle unwrap.
 
-    if is_dsv4:
-        bundle = out
-        out_cache_loc = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
-    else:
-        out_cache_loc = out
+        A closure so the RETRY below is the same call as the first attempt --
+        the previous shape duplicated neither, and that is exactly how the
+        retry came to be missing.
+        """
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
+        if is_dsv4:
+            bundle = out
+            if batch is not None:
+                batch.out_cache_loc_dsv4 = bundle
+            return None if bundle is None else bundle.out_full_loc
+        return out
+
+    out_cache_loc = _attempt_alloc()
+
+    if out_cache_loc is None:
+        # #715 / #681 THIRD ROOT, AND IT IS TRIED FIRST BECAUSE IT IS NOT
+        # RELIEF -- the same ordering, for the same reason, as in
+        # alloc_token_slots.
+        #
+        # RULE 3 was applied to this path for the relief NET but not for the
+        # third root, so a paged prefill reached its raise without ever asking
+        # whether the pages it needed were already freed and merely staged.
+        # That is the 2026-08-17 02:18 crash: 512 tokens refused with 147,456
+        # counted evictable, because the eviction ran inside a free-group
+        # window (batch_result_processor.py:92 and :741) and honestly reported
+        # full delivery while available_size could not yet see the pages.
+        #
+        # Costs nothing: it applies frees the tree has ALREADY performed and
+        # already counted. Cold path only -- reached after an allocation has
+        # failed, so a healthy alloc pays one list check less than nothing.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            if backup_state:
+                # The snapshot above predates the flush; re-take it so a
+                # rollback cannot drop the pages the flush just applied.
+                state = allocator.backup_state()
+            out_cache_loc = _attempt_alloc()
+            logger.warning(
+                "paged extend allocation of %d tokens failed with %d tokens "
+                "already freed but still staged in the allocator's batching "
+                "group; applying them %s. This is #681's third root on the "
+                "paged path: an eviction inside a free-group window counts "
+                "tokens the pool cannot yet hand out.",
+                extend_num_tokens,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
 
     if out_cache_loc is None:
         # #681 RULE 3: every alloc path reachable from prefill admission gets
         # the same net. This is the page_size > 1 twin of alloc_token_slots and
         # it had none -- the audit found three raise sites on this path
         # (alloc_req_slots, alloc_token_slots, this one) and only one covered.
+        #
+        # #681 REMAINDER: and having asked for relief, SPEND IT. This path used
+        # to consult the provider, log that relief had SUCCEEDED, and then fall
+        # through to the raise without retrying -- the net was cast, the catch
+        # announced, and the batch died anyway. alloc_token_slots has retried
+        # since #679 (see its `allocator.alloc(num_tokens)` after the same
+        # call); this is that discipline applied verbatim, not a new policy.
+        # The raise below is unchanged, so fail-loud still has the last word.
         freed = _attempt_extend_relief(extend_num_tokens)
         if freed > 0:
+            out_cache_loc = _attempt_alloc()
             logger.warning(
                 "paged extend allocation of %d tokens failed; rank-local "
-                "relief returned %d tokens. Admission should have prevented "
-                "this -- treat a recurring line here as an admission defect.",
+                "relief returned %d tokens and the retry %s. Admission should "
+                "have prevented this -- treat a recurring line here as an "
+                "admission defect, not as relief working.",
                 extend_num_tokens,
                 freed,
+                "SUCCEEDED" if out_cache_loc is not None else "still failed",
             )
     if out_cache_loc is None:
         error_msg = (
@@ -1370,6 +1490,34 @@ def alloc_paged_token_slots_decode(
         out_cache_loc = out
 
     if out_cache_loc is None:
+        # #715 / #681 THIRD ROOT, decode twin. The free-group window that
+        # strands pages is opened by the event loop and does not care which
+        # allocation runs inside it, so this path can reach its raise with the
+        # pages it needs already freed and merely staged -- exactly as the
+        # extend path did. Applying them gives up nothing; the raise below is
+        # unchanged, so fail-loud still has the last word.
+        staged = _flush_deferred_frees(allocator)
+        if staged > 0:
+            out = allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
+            )
+            if is_dsv4:
+                bundle = out
+                out_cache_loc = None if bundle is None else bundle.out_full_loc
+                if batch is not None:
+                    batch.out_cache_loc_dsv4 = bundle
+            else:
+                out_cache_loc = out
+            logger.warning(
+                "paged decode allocation of %d tokens failed with %d tokens "
+                "already freed but still staged in the allocator's batching "
+                "group; applying them %s.",
+                len(seq_lens) * token_per_req,
+                staged,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
+
+    if out_cache_loc is None:
         error_msg = (
             f"Decode out of memory. Try to lower your batch size.\n"
             f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
@@ -1440,9 +1588,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -1491,9 +1639,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -1507,9 +1655,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.mamba_pool_idx is not None, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)

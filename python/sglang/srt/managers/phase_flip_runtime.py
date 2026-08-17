@@ -1008,6 +1008,86 @@ def _probe_allocated_extent(scheduler, reqs) -> None:
         logger.warning("%s flip extent probe failed: %s", LOG_PREFIX, exc)
 
 
+#: #721: how many consecutive host-RAM defers before the guard stands aside.
+#: A permanent hold is WORSE than the hazard it avoids -- the flip is how this
+#: instance alternates prefill and decode, so refusing forever converts a
+#: POSSIBLE process kill into a CERTAIN half-service outage, and the kill is
+#: recoverable by a restore while the outage is not self-clearing. So the guard
+#: defers a bounded number of times, then escalates loudly and proceeds.
+FLIP_HOST_RAM_MAX_DEFERS: int = 3
+
+#: Margin above the transient's own projected demand, in bytes.
+#:
+#: JUSTIFIED FROM THIS BOX, not chosen round. Steady state measured 2026-08-17
+#: 04:0x: 118G total, 38G available, with the flip's host weight images already
+#: pinned at 20.5G. 4G is ~10% of that steady headroom -- enough to absorb the
+#: lane RSS jitter that shares this container (pytest/git spikes run under 2G)
+#: without deferring on ordinary noise. It is deliberately NOT the 10G
+#: PINNED_HOST_RESERVE_BYTES: that reserve protects PERMANENT pins, and a
+#: staging transient is by definition returned.
+FLIP_HOST_RAM_FLOOR_BYTES: int = 4 * (1024**3)
+
+#: The defer reason, spelled once. #696 accounting must see a host-RAM defer as
+#: THIS, not absorb it into the generic unfunded bucket -- a flip that did not
+#: arm because the HOST was tight is a different fact from one that could not
+#: fund its VRAM seam, and merging them would hide exactly the signal #721 is
+#: trying to collect.
+DEFERRED_HOST_RAM = "DEFERRED-HOST-RAM"
+
+
+def flip_host_headroom_verdict(
+    available_bytes,
+    projected_transient_bytes: int,
+    defers_so_far: int,
+    floor_bytes: int = FLIP_HOST_RAM_FLOOR_BYTES,
+    max_defers: int = FLIP_HOST_RAM_MAX_DEFERS,
+):
+    """``(allow, escalated, detail)`` for one flip's host-RAM headroom (#721).
+
+    THIS GUARD IS ALSO THE DISCRIMINATOR, which is why it ships default-on
+    before its hazard is fully attributed. Two host-OOM-shaped kills on this box
+    landed 7 s and 11 s after a completed flip; one is a ledger-confirmed kernel
+    OOM kill. The attribution needs host journal access this container does not
+    have. But every firing of this guard produces the terms we lack: if it fires
+    and no kill follows, the flip-transient candidate gains; if a kill happens
+    anyway while this reported ample headroom, that candidate dies and lane
+    spikes gain. Either way #721 moves without the journal.
+
+    ``available_bytes`` None means no honest number was available -- degrade to
+    NO GUARD rather than guess, exactly as ``pinned_host_memory_bytes`` requires
+    of its callers. Refusing a flip on a fabricated figure is worse than not
+    checking, because the refusal is the thing with a service cost.
+    """
+    need = max(0, int(projected_transient_bytes)) + max(0, int(floor_bytes))
+    if available_bytes is None:
+        return True, False, "host RAM unreadable -- guard stood down (no honest number)"
+    avail = int(available_bytes)
+    if avail >= need:
+        return True, False, (
+            f"host headroom OK: {avail / 1e9:.2f} GB available >= "
+            f"{need / 1e9:.2f} GB needed "
+            f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
+            f"{int(floor_bytes) / 1e9:.2f})"
+        )
+    if int(defers_so_far) >= int(max_defers):
+        return True, True, (
+            f"{DEFERRED_HOST_RAM} ESCALATED after {defers_so_far} defers: "
+            f"{avail / 1e9:.2f} GB available < {need / 1e9:.2f} GB needed "
+            f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
+            f"{int(floor_bytes) / 1e9:.2f}). PROCEEDING WITH EYES OPEN -- a "
+            f"permanent hold would stop the instance alternating prefill and "
+            f"decode, which is a certain half-service outage, while the kill "
+            f"this defends against is recoverable by a restore."
+        )
+    return False, False, (
+        f"{DEFERRED_HOST_RAM}: {avail / 1e9:.2f} GB available < "
+        f"{need / 1e9:.2f} GB needed (transient "
+        f"{int(projected_transient_bytes) / 1e9:.2f} + floor "
+        f"{int(floor_bytes) / 1e9:.2f}); defer {int(defers_so_far) + 1} of "
+        f"{max_defers}, the flip is retried next round"
+    )
+
+
 _DISK_TIER_ARM_WARNED = False
 
 
@@ -1224,6 +1304,17 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         from sglang.srt.layers.dcp.owner import refresh_all_owner_bounds
         from sglang.srt.runtime_context import get_server_args
 
+        # #690 capture A: cutover SUB-STEP timing. The aggregate cutover cost
+        # spans 43.5 to 1041.5 ms -- a 24x spread, which is the signature of a
+        # WAIT or a serialization, not of a fixed cost. The DONE line reports
+        # only the total, so the spread cannot be attributed from it; the 43.5
+        # ms minimum is the honest target. These marks cost one perf_counter
+        # call per step and change no control flow.
+        _marks = [("enter", time.perf_counter())]
+
+        def _mark(label: str) -> None:
+            _marks.append((label, time.perf_counter()))
+
         stacks = scheduler.phase_flip_stacks
         tp_phase = direction == PP_TO_TP
         n = len(stacks.vector)
@@ -1267,6 +1358,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         set_cp_token_ratios(list(stacks.token_vector))
         refresh_all_owner_bounds()
 
+        _mark("routing+owner")
         # 3. Scheduler topology snapshot (frozen dataclass -> new instance).
         if tp_phase:
             scheduler.ps = _dc.replace(
@@ -1290,6 +1382,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # dp-attention is a flip arming guard; the dp routing group is tp.
         scheduler.dp_tp_group = scheduler.tp_group
 
+        _mark("topology+groups")
         # 4b. Scheduler COMPONENTS holding ps / group snapshots (found on
         # the first post-flip serving attempt, 2026-08-08): the request
         # receiver kept the boot ps and relayed requests PP-chain-style
@@ -1345,6 +1438,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 draft_worker=want_draft,
                 model_worker=want_model_worker,
             )
+        _mark("components")
         # 4c. Census round realign: the detector's cadence counter drifted
         # per-rank under the pp loop; the cutover is group-aligned, so
         # re-zero here or the post-flip detector fires its gloo
@@ -1363,6 +1457,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             ),
         )
 
+        _mark("census+microbatch")
         # 6. PP loop arrays: re-initialized for the new topology (reads the
         # NEW ps.pp_size).
         #
@@ -1434,6 +1529,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 f"mamba slot lock and its answer is simply never finished."
             )
 
+        _mark("pp_loop_arrays")
         # 7. Active stack swap: the forward path follows model_worker.
         #
         # Speculation belongs to the TP DECODE phase (#631). The draft
@@ -1449,6 +1545,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         scheduler.model_worker = want_model_worker
         scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
 
+        _mark("stack_swap")
         # 7b. DRAFT STATE for the requests step 6 just carried in.
         #
         # AFTER the swap, deliberately: the pool that gets scrubbed is the
@@ -1600,6 +1697,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     drained,
                 )
 
+        _mark("draft_state")
         # 9. Completeness self-check: every snapshot the rebuild list names
         # is verified against the routed source of truth, HERE, before the
         # first post-flip round can touch a stale handle. A missed rebuild
@@ -1643,6 +1741,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 e,
             )
         trace_cutover(scheduler, direction)
+        _mark("verify+publish+trace")
+        # #690 capture A: one line, sorted by cost, so the 24x spread can be
+        # ATTRIBUTED instead of guessed at. Emitted after the completeness
+        # check so a cutover that failed verification never reports timings as
+        # if it had succeeded.
+        try:
+            steps = [
+                (_marks[i + 1][0], (_marks[i + 1][1] - _marks[i][1]) * 1000.0)
+                for i in range(len(_marks) - 1)
+            ]
+            total_ms = (_marks[-1][1] - _marks[0][1]) * 1000.0
+            worst = sorted(steps, key=lambda kv: kv[1], reverse=True)
+            logger.warning(
+                "%s CUTOVER SUB-STEPS %s total=%.1f ms | %s",
+                LOG_PREFIX,
+                direction,
+                total_ms,
+                ", ".join(f"{k}={v:.1f}" for k, v in worst),
+            )
+        except Exception:  # noqa: BLE001 - timing must never break a cutover
+            pass
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
             LOG_PREFIX,
@@ -5010,6 +5129,85 @@ class PhaseFlipRuntime:
         if torch.cuda.is_available():  # pragma: no cover - needs a device
             torch.cuda.empty_cache()
 
+    def _record_seam_peak(
+        self,
+        direction: str,
+        staging_bytes: int,
+        driver_free: int,
+        cached_free: int,
+    ) -> None:
+        """#677: attribute the seam draw AT ITS PEAK INSTANT, per component.
+
+        WHY HERE. This is the moment the flip's demand is weighed against
+        free VRAM -- the peak the arming floor is sized to survive. Anywhere
+        earlier the buffers do not exist yet; anywhere later the decision has
+        already been taken on a number nobody decomposed.
+
+        WHAT IT IS FOR. The arming floor is one scalar per rank (909 / 1006 /
+        1648 MiB on this rig, NOTE_677_floor_components.md) with no recorded
+        composition, so no part of it can be traded against anything: a
+        component that could live in host RAM cannot be identified, and one
+        that genuinely must stay resident cannot be defended. Splitting the
+        peak is the precondition for every per-component decision #702 and
+        #677 want to make.
+
+        ON THE #605 CHANNEL, not a new one. ``flight_recorder.mark`` already
+        carries the torch view, the NVML view and the boot id, and it is
+        append-only -- a rank that dies here still leaves its line. A second
+        channel would have to re-derive all of that and could disagree with
+        it.
+
+        NULLS, NEVER ZEROS, for components this layer cannot see. A zero here
+        would read as "this component costs nothing", which is the #606
+        defaulted-measurement defect; ``None`` reads as "not measured from
+        here", which is true and actionable. ``unattributed_bytes`` is the
+        residual the named terms do not explain and is the number that says
+        how far this instrument still has to go.
+
+        Cannot break a flip: the recorder no-ops unless its directory env is
+        set, and the whole body is guarded -- an instrument on the seam path
+        may cost a missing line, never a cutover.
+        """
+        try:
+            from sglang.srt.mem_ledger import flight_recorder
+
+            arena_tail = None
+            try:
+                arena_tail = int(self._arena_tail_bytes(direction))
+            except Exception:  # pragma: no cover - defensive
+                arena_tail = None
+
+            named = int(staging_bytes) + int(arena_tail or 0)
+            extra = {
+                "direction": str(direction),
+                "epoch": int(getattr(self, "_epoch", 0)),
+                # The staging peak: incoming + max(outgoing, local) over the
+                # WIDEST wave, per _staging_bytes.
+                "staging_bytes": int(staging_bytes),
+                # The refill destination: arena tail this direction commits.
+                "refill_destination_bytes": arena_tail,
+                # Graph capture workspace is a BOOT-time term under the
+                # restore-never-rebuild invariant (#677) and is not visible
+                # from this layer. Explicitly unmeasured rather than 0.
+                "graph_workspace_bytes": None,
+                "staging_reserve_bytes": int(self._staging_reserve_bytes),
+                "driver_free_bytes": int(driver_free),
+                "allocator_cached_free_bytes": int(cached_free),
+                "named_bytes": named,
+                # What the named terms do not explain. Signed on purpose: a
+                # NEGATIVE residual means the named terms over-count, which is
+                # a different defect from an unattributed remainder and must
+                # not be hidden by a max(0, ...).
+                "unattributed_bytes": int(staging_bytes) - named,
+            }
+            flight_recorder.mark(
+                "seam_peak",
+                rank=int(getattr(self, "_world_rank", 0) or 0),
+                extra=extra,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("%s seam-peak attribution skipped: %s", LOG_PREFIX, e)
+
     def _staging_affordable(
         self, staging_bytes: int, direction: str = ""
     ) -> Tuple[bool, str]:
@@ -5073,6 +5271,7 @@ class PhaseFlipRuntime:
         # has no way to quote the figure the refusal was about.
         self._last_staging_bytes = int(staging_bytes)
         driver_free, cached_free = probe()
+        self._record_seam_peak(direction, int(staging_bytes), driver_free, cached_free)
         from_driver = max(0, driver_free - reserve)
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
             before = driver_free
@@ -6379,6 +6578,48 @@ class PhaseFlipRuntime:
         )
         if not affordable:
             too_small.append(staging_detail)
+
+        # #721: HOST RAM, measured at the flip, every flip.
+        #
+        # THE MEASUREMENT IS THE POINT, and the gate is secondary -- I want that
+        # the right way round in the record. Two host-OOM-shaped kills landed
+        # 7 s and 11 s after a completed flip, but steady-state host headroom
+        # was ~38 GB, so a floor small enough to be safe would never have fired
+        # and a floor large enough to fire would defer constantly. I do not have
+        # a measured projected transient for the flip's host demand, and I will
+        # not invent one to make a gate look decisive.
+        #
+        # So this LOGS the headroom at every flip -- a number nobody currently
+        # records -- and defers only under a floor that is deliberately
+        # conservative. If the logs show availability collapsing at flips, the
+        # transient candidate is confirmed and the floor can then be set from
+        # data. If availability stays flat while kills continue, the flip is
+        # exonerated and lane RSS gains. That is the discriminator working
+        # whichever way it points.
+        try:
+            from sglang.srt.mem_cache.pinned_host_budget import (
+                pinned_host_memory_bytes,
+            )
+
+            _host_total, _host_avail = pinned_host_memory_bytes()
+            allow_host, escalated, host_detail = flip_host_headroom_verdict(
+                _host_avail, 0, int(getattr(self, "_host_ram_defers", 0))
+            )
+            logger.info("%s HOST HEADROOM %s: %s", LOG_PREFIX, direction, host_detail)
+            if not allow_host:
+                self._host_ram_defers = int(getattr(self, "_host_ram_defers", 0)) + 1
+                too_small.append(host_detail)
+            else:
+                if escalated:
+                    logger.warning("%s %s", LOG_PREFIX, host_detail)
+                self._host_ram_defers = 0
+        except Exception as exc:  # noqa: BLE001 - a guard must not break a flip
+            logger.warning(
+                "%s host-headroom guard could not run (%r); the flip proceeds "
+                "unguarded rather than being refused on an unknown.",
+                LOG_PREFIX,
+                exc,
+            )
 
         fits = 0 if too_small else 1
         # #656 C20: is the group's objection NOTHING BUT the seam-entry

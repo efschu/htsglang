@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -517,6 +519,152 @@ class SchedulerInvariantChecker:
             or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
+
+
+#: #699: seconds a request may sit admissible-but-unserved before the
+#: admission wedge is called. 20 s is chosen from the measured specimen, not
+#: round: the #713 idle refusal held a TEN-token prompt for 31.64 s with 0
+#: running and 1 queued, and an 8-arm run put every TTFT between 11.87 s and
+#: 62.65 s. A threshold above 11.87 s would miss the fastest real wedge; 20 s
+#: sits above ordinary scheduling latency on this rig (healthy TTFT for a short
+#: prompt is sub-second) and below the fastest observed wedge's own duration.
+ADMISSION_WEDGE_SECONDS: float = 20.0
+
+ADMISSION_WEDGE = "ADMISSION-WEDGE"
+
+
+def admission_wedge_verdict(
+    queued: int,
+    running: int,
+    seconds_since_progress: float,
+    threshold: float = ADMISSION_WEDGE_SECONDS,
+    idle_locked_seen: bool = False,
+):
+    """``(alarm, detail)`` for the admission-wedge class (#699, from #713).
+
+    WHY forward_ct CANNOT SEE THIS, which is the whole reason this exists.
+    ``create_scheduler_watchdog`` fires when ``forward_ct`` stops advancing
+    while a batch exists. In the measured wedge BOTH signals read healthy:
+    chunked prefill kept running, so ``forward_ct`` advanced, and
+    ``cur_batch_for_debug`` stayed non-None -- for 31.64 s during which a
+    ten-token prompt produced no first token, with 0 running and 1 queued.
+    Health-200 is blind to it for the same reason. The signal is therefore
+    QUEUE AGE VERSUS PROGRESS, never batch existence or forward count.
+
+    PROGRESS means a request reached its FIRST TOKEN. Completions are the wrong
+    clock -- a long generation legitimately produces none for minutes -- and
+    forward passes are the wrong clock for the reason above.
+
+    ``idle_locked_seen`` is the PHASE-POLICY IDLE-LOCKED TERMS line, which
+    corroborates when present. It is deliberately NOT required: the wedge class
+    is broader than the phase-policy path, and a detector that only fired
+    alongside a policy log would miss every wedge arising anywhere else.
+    """
+    q = int(queued)
+    r = int(running)
+    age = float(seconds_since_progress)
+    if q <= 0:
+        return False, "no queue: nothing is waiting, so nothing is wedged"
+    if r > 0:
+        return False, (
+            f"{r} request(s) running: the box is serving, not wedged "
+            f"(queued {q})"
+        )
+    if age < float(threshold):
+        return False, (
+            f"queued {q}, running 0, but only {age:.1f}s since the last first "
+            f"token (< {float(threshold):.1f}s) -- ordinary scheduling latency"
+        )
+    return True, (
+        f"{ADMISSION_WEDGE}: {q} queued, 0 running, and NO first token for "
+        f"{age:.1f}s (>= {float(threshold):.1f}s). Work is admissible and "
+        f"nothing is serving it. forward_ct and health both read healthy in "
+        f"this state, which is why neither catches it"
+        + (
+            "; PHASE-POLICY IDLE-LOCKED TERMS corroborates on this round"
+            if idle_locked_seen
+            else "; no phase-policy corroboration seen -- the wedge class is "
+            "broader than that path"
+        )
+    )
+
+
+#: #699 wiring: how often the admission-wedge watchdog polls scheduler state.
+#: Half the alarm threshold, matching the existing forward_ct watchdog's own
+#: poll-vs-timeout ratio (see WatchdogRaw._watchdog_once), so the alarm is
+#: never more than one poll interval late.
+ADMISSION_WEDGE_POLL_SECONDS: float = ADMISSION_WEDGE_SECONDS / 2
+
+
+def check_admission_wedge_once(
+    scheduler: Scheduler,
+    now: Optional[float] = None,
+    log_on_alarm: bool = False,
+) -> Tuple[bool, str]:
+    """One admission-wedge check against live scheduler state (#699 wiring).
+
+    Reads exactly the three numbers ``admission_wedge_verdict`` needs off the
+    scheduler: ``len(waiting_queue)``, ``len(running_batch.reqs)``, and the
+    age of ``last_first_token_progress_time`` -- the clock a request's first
+    committed output token stamps (see
+    ``SchedulerBatchResultProcessor.process_batch_result_prefill``), never a
+    forward-pass counter. That distinction is the entire point of #699:
+    forward_ct and cur_batch_for_debug both read healthy during the measured
+    wedge, so a clock keyed to either would stay blind to it too.
+
+    During scheduler startup (``is_initializing``) the progress clock has not
+    been seeded by any real request yet, so polling would read a false age;
+    this returns silent instead.
+    """
+    if scheduler.is_initializing:
+        return False, "scheduler is initializing: admission-wedge check skipped"
+
+    now = now if now is not None else time.perf_counter()
+    queued = len(scheduler.waiting_queue)
+    running = len(scheduler.running_batch.reqs)
+    age = now - scheduler.last_first_token_progress_time
+
+    alarm, verdict_detail = admission_wedge_verdict(queued, running, age)
+    detail = (
+        f"queue age {age:.1f}s since last first-token progress "
+        f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
+        f"{verdict_detail}"
+    )
+    if alarm and log_on_alarm:
+        logger.error(detail)
+    return alarm, detail
+
+
+def create_admission_wedge_watchdog(
+    scheduler: Scheduler,
+    poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
+) -> threading.Thread:
+    """#699: log-only admission-wedge watchdog, wired to the real progress clock.
+
+    Deliberately NOT a ``WatchdogRaw``: that class's signal is forward_ct
+    staleness, which #699 (commit 9c686ca936) proved blind to this exact
+    wedge shape -- chunked prefill keeps forward_ct advancing for tens of
+    seconds while zero requests reach a first token. This thread instead
+    polls ``check_admission_wedge_once``, which reads queue/running counts
+    and the first-token-progress clock.
+
+    Log-only in this slice, by design: there is no SIGQUIT path here. Restart
+    policy on a confirmed wedge is a separate decision with its own review.
+    """
+
+    def _loop() -> None:
+        while True:
+            time.sleep(poll_interval)
+            try:
+                check_admission_wedge_once(scheduler, log_on_alarm=True)
+            except Exception as e:  # noqa: BLE001 - a watchdog must not die
+                logger.error(f"admission-wedge watchdog check failed: {e}")
+
+    t = threading.Thread(
+        target=_loop, daemon=True, name="admission-wedge-watchdog"
+    )
+    t.start()
+    return t
 
 
 def create_scheduler_watchdog(

@@ -444,6 +444,23 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    #: #557: per-request chat-template arguments, passed through to the
+    #: template layer.
+    #:
+    #: DECLARED, because undeclared is not neutral here. This model sets no
+    #: ``model_config``, so pydantic's default ``extra="ignore"`` applies and
+    #: an undeclared field is SILENTLY DROPPED -- the caller's kwargs never
+    #: reach the template and nothing says so. Rejecting would at least be
+    #: visible; dropping is not.
+    #:
+    #: Semantics are the OpenAI front's, not new ones: the adapter converts
+    #: into a ``ChatCompletionRequest`` (which has carried
+    #: ``chat_template_kwargs`` all along) and delegates. Note that
+    #: ``OpenAIServingChat.apply_reasoning_enabled`` MERGES into this dict and
+    #: overrides only the reasoning toggle, so unrelated keys survive while
+    #: Anthropic's typed ``thinking`` field stays authoritative over the
+    #: toggle itself.
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @field_validator("model")
     @classmethod

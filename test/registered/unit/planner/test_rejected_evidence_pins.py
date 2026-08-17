@@ -49,41 +49,83 @@ class PpWithSpecEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(match.group(1), "server_args.py")
 
-    def test_evidence_line_lands_on_the_assert(self):
-        """The cited line sits inside the pp_size/spec assert, not near it.
+    def test_evidence_cites_land_on_BOTH_halves_of_the_guard(self):
+        """The guard is two asserts now, so the row cites two lines.
 
-        The assert spans a few lines (condition, message), so the pin accepts
-        the cited line landing anywhere in the statement that mentions BOTH
-        guarded fields.
+        It used to be one conjunction. #704b found it split: the overlap half
+        and the speculation half are separate statements 15 lines apart, so a
+        single cite cannot land on both and a window around one no longer
+        mentions the other.
         """
         entry = by_key("pp_with_spec")
-        cited = int(_LINE_REF.search(entry.evidence).group(2))
         lines = _SERVER_ARGS.read_text().splitlines()
-        self.assertLessEqual(
-            cited, len(lines), "evidence cites a line past the end of server_args.py"
-        )
-        # Statement window: the assert and its message, generously bounded.
-        window = "\n".join(lines[max(0, cited - 3) : cited + 8])
-        self.assertIn("pp_size", window)
+        cites = [
+            int(n) for f, n in _LINE_REF.findall(entry.evidence) if f == "server_args.py"
+        ]
+        self.assertEqual(len(cites), 2, f"expected two cites, got {cites}")
+        for cited in cites:
+            self.assertLessEqual(cited, len(lines), "cite past end of server_args.py")
+        head, spec = cites
+        self.assertIn("pp_size > 1", "\n".join(lines[head - 1 : head + 2]))
+        window = "\n".join(lines[max(0, spec - 3) : spec + 8])
         self.assertIn("speculative_algorithm is None", window)
-        self.assertIn("disable_overlap_schedule", window)
+        self.assertIn("enable_phase_flip", window)
 
-    def test_the_assert_is_still_a_hard_assert(self):
+    def test_the_spec_half_is_still_a_hard_assert(self):
         """The verdict says 'hard assert, not an auto-disable'. Pin that word.
 
-        If upstream ever softens this to a warning plus auto-disable, the
-        verdict text becomes wrong in the direction that matters most -- a PP
-        boot would then silently lose speculation instead of refusing -- and
-        this test is the thing that notices.
+        If this is ever softened to a warning plus auto-disable, a PP boot
+        would silently lose speculation instead of refusing, and this test is
+        the thing that notices.
         """
-        text = _SERVER_ARGS.read_text()
         self.assertRegex(
-            text,
-            r"if self\.pp_size > 1:\s*\n\s*assert \(\s*\n\s*self\.disable_overlap_schedule"
-            r" and self\.speculative_algorithm is None",
+            _SERVER_ARGS.read_text(),
+            r"if self\.pp_size > 1:(?:.|\n)*?assert self\.speculative_algorithm is None"
+            r" or self\.enable_phase_flip",
             "the pp_size>1 / speculation guard is no longer the hard assert the "
             "pp_with_spec register row describes",
         )
+
+    def test_the_register_records_the_PHASE_FLIP_EXEMPTION(self):
+        """The row must not claim PP is unconditionally no-spec.
+
+        This is the check the old pin could not make, and the reason the row
+        was stale rather than merely mis-pointed: the assert grew an
+        `or self.enable_phase_flip` escape, so a phase-flip instance MAY run
+        PP-prefill and speculation in one engine. A register row that still
+        read 'every PP number is a no-spec number' would forbid on paper the
+        exact configuration #704 is built on.
+        """
+        entry = by_key("pp_with_spec")
+        text = (entry.verdict + " " + entry.why).lower()
+        self.assertIn("phase-flip", text)
+        self.assertIn("plain", text)
+
+    def test_the_overlap_half_is_now_an_AUTO_DISABLE(self):
+        """The sibling half went the other way, and the row says so.
+
+        `_pipeline_parallel_overlap_disable` sets disable_overlap_schedule to
+        True and warns, running BEFORE the assert, so that assert can no
+        longer fire. Recording only the surviving hard assert would leave the
+        register implying both halves still refuse.
+        """
+        overrides = (_SRT / "arg_groups" / "overrides.py").read_text()
+        self.assertRegex(
+            overrides,
+            r"def _pipeline_parallel_overlap_disable\(view: Any\) -> dict:\s*\n"
+            r"\s*if view\.pp_size > 1:(?:.|\n)*?"
+            r'return \{"disable_overlap_schedule": True\}',
+            "the overlap half is no longer the warning + auto-disable the "
+            "pp_with_spec row describes",
+        )
+        # Naming the field is what makes this a real check: the PRE-#704b row
+        # also contained the string "auto-disable", inside the phrase "not a
+        # quiet auto-disable" -- the opposite claim. A substring test alone
+        # would have passed against the stale text it is meant to catch.
+        entry = by_key("pp_with_spec")
+        why = entry.why.lower()
+        self.assertIn("auto-disable", why)
+        self.assertIn("disable_overlap_schedule", why)
 
 
 if __name__ == "__main__":
