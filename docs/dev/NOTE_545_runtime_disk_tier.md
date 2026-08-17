@@ -145,5 +145,52 @@ backend:
 5. `DELETE` detach: subsequent lookups become misses, never corruption —
    content-addressed, the same argument #703 uses for drops.
 
-On a hybrid-GDN model, expect (1) and (5) to fail with the §4 refusal. That
-is the acceptance for the gap, not a bug to file twice.
+~~On a hybrid-GDN model, expect (1) and (5) to fail with the §4 refusal.~~
+**SUPERSEDED — the gap is now implemented (§7).** On a hybrid-GDN model,
+attach and detach are expected to SUCCEED, with the state (MAMBA) component
+covered rather than refused, because the controller's host pools span every
+component it owns. There is no partial-capability outcome to accept.
+
+---
+
+## 7 — The §4 gap, implemented
+
+`UnifiedRadixCache.attach_storage_backend` / `detach_storage_backend` are no
+longer stubs. They mirror the shipped `HiRadixCache` pair — same validation,
+same named refusals, same "same backend is success, different backend is a
+refusal rather than a silent swap" rule — with one addition this cache needs:
+`_symmetrize_prefetch_capacity()` after the config is applied.
+
+**Why that addition is safe, which was the open question.** That method enters
+an **all_reduce** across DCP/TP ranks, and its own guard says a rank-local
+early return "would leave the other ranks in the all_reduce with no partner".
+A single-rank attach would hang. It cannot happen: attach fans out through
+`FanOutCommunicator` (`managers/tokenizer_control_mixin.py:125`, `:360`) to
+every rank and merges the results, so the group runs it together — and the
+scheduler already refuses a non-idle scheduler by name before reaching it.
+
+**Detach order is the contract**, taken from HiRadixCache: drain the control
+queues *before* tearing the controller down, or acks and releases can no
+longer be matched to their nodes and host pages and locks leak; drain again
+afterwards to sweep what the shutdown produced. The drain is **local**
+(`None` limits = everything on this rank) because the steady-state path
+derives its counts from an all_reduce, and a detach may not depend on a
+collective its peers may already have left.
+
+**No silent partial capability** (#268): the state component is covered, not
+refused. `_get_hybrid_storage_attach_kwargs` passes
+`cache_controller.mem_pool_host.entries`, which spans every component the
+controller owns — the same set the boot-time attach passes — so a hybrid
+attach is whole rather than KV-only wearing a success message.
+
+Pins: `test/registered/unit/mem_cache/test_unified_attach_detach_545.py`, 16
+tests, sibling to the resize file rather than merged into it (that file owns
+the resize authority; one authority per behaviour). Red-first: restoring the
+stubs fails 15 of 16.
+
+**Still open, and NOT addressed here:** the ENOSPC injection test from §5(2),
+and `tokenizer_control_mixin.py:370`'s own `# TODO: partial rollback if
+failed` — if some ranks attach and others do not, nothing rolls back. The
+fan-out merges results into one verdict, so the caller learns it failed, but
+the group can be left inconsistent. That is a real gap and it predates this
+change.

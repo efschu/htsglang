@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
@@ -2774,18 +2775,176 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage attach yet. "
-            "Configure hicache_storage_backend at startup instead.",
+        """Attach (enable) the storage backend at runtime (#545).
+
+        Mirrors ``HiRadixCache.attach_storage_backend`` -- same validation, same
+        named refusals, same "already attached to this backend is success,
+        attached to a DIFFERENT backend is failure" rule -- with one addition
+        this cache needs and HiRadixCache does not: the prefetch capacity must
+        be re-symmetrized across ranks afterwards.
+
+        THE CALLER IS THE WHOLE GROUP, and that is what makes this safe.
+        ``_symmetrize_prefetch_capacity`` enters an all_reduce over the DCP/TP
+        ranks, and its own guard says a rank-local early return "would leave
+        the other ranks in the all_reduce with no partner". A single-rank
+        attach would therefore hang or raise. It does not happen because
+        ``attach_hicache_storage`` fans out through ``FanOutCommunicator`` to
+        every rank and merges the results, so every rank runs this method or
+        none does. The scheduler additionally refuses a non-idle scheduler by
+        name before reaching here.
+        """
+        if hicache_storage_prefetch_policy is not None:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if hicache_storage_prefetch_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_storage_prefetch_policy: "
+                    f"{hicache_storage_prefetch_policy!r}. Expected one of {allowed}.",
+                )
+        if hicache_write_policy is not None:
+            allowed = ["write_back", "write_through", "write_through_selective"]
+            if hicache_write_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
+                    f"Expected one of {allowed}.",
+                )
+
+        if self.cache_controller is None:
+            return (
+                False,
+                "UnifiedRadixCache has no cache controller: hierarchical "
+                "caching was not enabled at startup, and enabling it at "
+                "runtime is a separate capability (the host pool and its "
+                "threads are built at boot).",
+            )
+
+        # Already attached: same backend is success (policies may still be
+        # updated), a DIFFERENT backend is a refusal rather than a silent
+        # swap -- swapping would strand every page written under the old one.
+        if self.enable_storage:
+            current = getattr(self.cache_controller, "storage_backend_type", None)
+            if current == storage_backend:
+                return True, (
+                    f"HiCache storage backend {storage_backend!r} is already "
+                    f"attached."
+                )
+            return False, (
+                f"A different HiCache storage backend is already attached "
+                f"({current!r}); detach it before attaching {storage_backend!r}."
+            )
+
+        extra_config = None
+        if storage_backend_extra_config_json:
+            try:
+                extra_config = json.loads(storage_backend_extra_config_json)
+            except Exception as e:
+                logger.exception("Failed to parse storage_backend_extra_config_json")
+                return False, (
+                    f"Failed to parse storage_backend_extra_config_json "
+                    f"{storage_backend_extra_config_json!r}: {e}"
+                )
+
+        prefetch_threshold = getattr(self, "prefetch_threshold", 256)
+        try:
+            self.cache_controller.attach_storage_backend(
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=served_model_name,
+                storage_backend_extra_config=extra_config,
+                **self._get_hybrid_storage_attach_kwargs(),
+            )
+        except Exception as e:
+            logger.exception(f"Failed to attach storage backend {storage_backend!r}")
+            return False, f"Failed to attach storage backend {storage_backend!r}: {e}"
+
+        self._apply_storage_runtime_config(
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            prefetch_timeout_base=getattr(self, "prefetch_timeout_base", 3.0),
+            prefetch_timeout_per_ki_token=getattr(
+                self, "prefetch_timeout_per_ki_token", 0.25
+            ),
+            hicache_storage_pass_prefix_keys=getattr(
+                self, "hicache_storage_pass_prefix_keys", False
+            ),
+            enable_storage=True,
+            enable_storage_metrics=getattr(self, "_enable_metrics_flag", False),
+            extra_metric_labels=getattr(self, "extra_metric_labels", None),
         )
+        if hicache_storage_prefetch_policy is not None:
+            self.prefetch_stop_policy = hicache_storage_prefetch_policy
+        if hicache_write_policy is not None:
+            self.write_through_threshold = (
+                1 if hicache_write_policy == "write_through" else 2
+            )
+
+        # AFTER the config is applied, and on every rank: the capacity limit is
+        # derived from the MIN host-pool size across ranks, so it can only be
+        # computed once each rank knows storage is on.
+        self._symmetrize_prefetch_capacity()
+        return True, "Attached HiCache storage backend successfully."
+
+    def _get_hybrid_storage_attach_kwargs(self) -> dict:
+        """Host pools for a multi-component (hybrid/GDN) controller.
+
+        Mirrors the HiRadixCache helper of the same name. The MAMBA/state
+        component is covered here rather than refused: the controller's
+        ``mem_pool_host.entries`` spans every component it owns, which is the
+        same set the boot-time attach passes.
+        """
+        cc = self.cache_controller
+        entries = getattr(getattr(cc, "mem_pool_host", None), "entries", None)
+        return {"host_pools": entries} if entries is not None else {}
 
     def detach_storage_backend(self) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage detach yet. "
-            "Restart without hicache_storage_backend to disable it.",
-        )
+        """Detach (disable) the storage backend at runtime (#545).
+
+        ORDER IS THE CONTRACT, and it is HiRadixCache's: drain the control
+        queues BEFORE tearing the controller's threads down, or acks and
+        releases can no longer be matched to their nodes and host pages and
+        locks leak. Drained again afterwards to sweep whatever the shutdown
+        itself produced.
+
+        The drain here is LOCAL -- ``None`` limits mean "drain everything on
+        this rank". The queue-size path used in the steady state derives its
+        counts from an all_reduce, and a detach may not depend on a collective
+        that its peers may already have left.
+
+        A detached tier's pages become MISSES, never corruption: the keys are
+        content-addressed, so a page that is no longer reachable is simply not
+        found -- the same argument #703 uses for its drops.
+        """
+        if self.cache_controller is None:
+            return False, "UnifiedRadixCache has no cache controller to detach."
+
+        try:
+            self._drain_storage_control_queues_impl(
+                n_revoke=None,
+                n_backup=None,
+                n_release=None,
+                extra_release_counts=None,
+                log_metrics=False,
+            )
+            # Idempotent: ask the controller to clean up even when
+            # enable_storage is already False, since that may be leftover
+            # state from a partially-failed previous detach.
+            self.cache_controller.detach_storage_backend()
+            self._drain_storage_control_queues_impl(
+                n_revoke=None,
+                n_backup=None,
+                n_release=None,
+                extra_release_counts=None,
+                log_metrics=False,
+            )
+        except Exception as e:
+            logger.exception("Failed to detach storage backend.")
+            # An admin operation must not kill the server.
+            return False, f"Failed to detach HiCache storage backend: {e}"
+
+        self.enable_storage = False
+        self.enable_storage_metrics = False
+        return True, "Detached HiCache storage backend successfully."
 
     def storage_capacity_stats(self) -> Optional[dict]:
         """Capacity limits and on-disk usage of the attached backend, if any."""
