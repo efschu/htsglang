@@ -927,6 +927,63 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+#: O_DIRECT needs the buffer, the offset and the length aligned. 4096 covers
+#: every ashift/recordsize combination this rig runs; a larger block only costs
+#: a bigger tail, never correctness.
+_DIRECT_ALIGN = 4096
+_DIRECT_BLOCK = 1 << 20
+
+
+def read_file_direct(path: str) -> bytes:
+    """Read `path` with O_DIRECT, bypassing the page cache entirely.
+
+    WHY THIS EXISTS (#738). On ZFS both eviction-advice rungs are no-ops:
+    `posix_fadvise(DONTNEED)` was measured dead by #408, and its replacement
+    `MADV_PAGEOUT` was measured dead here on 2026-08-17 -- it returns rc=0,
+    reporting the advice ACCEPTED, and freed 529 of 136,781 pages (0.4%). A
+    silent success is the worst shape: the flag looked wired and did nothing.
+
+    You cannot evict what you never cached, so this attacks the cause instead
+    of the symptom. Measured on this pool (OpenZFS 2.3.4, real direct I/O):
+    an aligned 1.20 GB read moved the page cache by ZERO pages, against a
+    baseline where a buffered read of the same shard adds ~293k.
+
+    STRICTLY OPT-IN and byte-identical: the returned bytes are exactly what
+    `open(path,'rb').read()` returns. Only the path they take into memory
+    differs.
+
+    THE TAIL IS READ BUFFERED, deliberately. O_DIRECT requires aligned length;
+    the final partial block cannot satisfy that. Reading it through the normal
+    path caches at most `_DIRECT_ALIGN`-rounded bytes -- kilobytes against
+    gigabytes -- and keeps the function total rather than refusing files whose
+    size is not a multiple of the block.
+    """
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    o_direct = getattr(os, "O_DIRECT", 0o40000)
+    size = os.path.getsize(path)
+    whole = (size // _DIRECT_BLOCK) * _DIRECT_BLOCK
+    out = bytearray()
+    raw = ctypes.create_string_buffer(_DIRECT_BLOCK + _DIRECT_ALIGN)
+    base = (ctypes.addressof(raw) + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
+    fd = os.open(path, os.O_RDONLY | o_direct)
+    try:
+        while len(out) < whole:
+            n = libc.read(fd, ctypes.c_void_p(base), ctypes.c_size_t(_DIRECT_BLOCK))
+            if n <= 0:
+                err = ctypes.get_errno()
+                raise OSError(err, f"O_DIRECT read failed on {path} at {len(out)}")
+            out += ctypes.string_at(base, n)
+    finally:
+        os.close(fd)
+    if size > whole:  # the unalignable tail, through the ordinary path
+        with open(path, "rb") as f:
+            f.seek(whole)
+            out += f.read()
+    return bytes(out)
+
+
 def _drop_file_cache_after_load(
     path: str, extents: Optional[Sequence[Tuple[int, int]]] = None
 ) -> None:
@@ -1011,6 +1068,7 @@ def _drop_file_cache_after_load(
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
+    direct_io: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
@@ -1033,14 +1091,22 @@ def safetensors_weights_iterator(
         position=tqdm._get_free_pos(),
     ):
         if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name in sorted(result.keys()):
-                    yield name, result[name]
-            if drop_cache_after_load:
+            if direct_io:
+                # #738: bypass the page cache instead of trying to evict it
+                # afterwards. Both advice rungs are no-ops on ZFS, and
+                # MADV_PAGEOUT reports rc=0 while freeing 0.4% -- a silent
+                # success. Bytes are identical; only the route differs.
+                result = safetensors.torch.load(read_file_direct(st_file))
+            else:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
+            for name in sorted(result.keys()):
+                yield name, result[name]
+            if drop_cache_after_load and not direct_io:
                 # The whole file went through a plain read() into a fresh
                 # buffer, not a memory map -- there is no live mapping to
                 # hand the ladder, so this falls back to plain fadvise.
+                # Pointless after a direct read: nothing was cached.
                 _drop_file_cache_after_load(st_file)
         else:
             extents: List[Tuple[int, int]] = []
@@ -1119,6 +1185,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    direct_io: bool = False,
     drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
@@ -1174,6 +1241,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    direct_io: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,

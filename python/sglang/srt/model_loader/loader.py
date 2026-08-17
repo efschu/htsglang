@@ -637,6 +637,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 server_args.weight_loader_drop_cache_after_load
             )
+            weight_loader_direct_io = server_args.weight_loader_direct_io
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -680,6 +681,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    direct_io=weight_loader_direct_io,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -688,6 +690,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    direct_io=weight_loader_direct_io,
                 )
 
         else:
