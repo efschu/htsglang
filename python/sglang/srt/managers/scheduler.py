@@ -9570,8 +9570,17 @@ def run_scheduler_process(
             # without an active exception", after a clean drain, which is the
             # #673 signature. Graceful path only and flag-gated: the destroy
             # path runs barlink's close(), which is #722's machinery.
-            from sglang.srt.managers.scheduler_teardown import release_distributed
+            from sglang.srt.managers.scheduler_teardown import (
+                release_distributed,
+                release_lockstep_sentinel,
+            )
 
+            # #673: the sentinel's sidecar runs all_gather_object on its own
+            # gloo group every 0.5 s. It must be stopped AND JOINED before any
+            # group is destroyed, so it goes first here -- and release_distributed
+            # repeats the call internally, because this ordering must survive a
+            # careless edit to this block.
+            release_lockstep_sentinel(scheduler, graceful=scheduler.gracefully_exit)
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 

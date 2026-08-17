@@ -77,6 +77,17 @@ def release_distributed(scheduler: Any, *, graceful: bool) -> Optional[str]:
     server_args = getattr(scheduler, "server_args", None)
     if not distributed_teardown_enabled(server_args):
         return None
+    # #673 ORDERING, ENFORCED HERE RATHER THAN BY CALL ORDER. The lockstep
+    # sentinel runs dist.all_gather_object on a dedicated gloo group every
+    # 0.5 s. Destroying the groups while that thread is inside a collective is
+    # its own abort, so the sidecar is stopped -- and JOINED -- first.
+    #
+    # This lives INSIDE the destroy rather than only earlier in the scheduler's
+    # finally because the two are one careless reorder apart, and an
+    # armed-together boot must be safe by construction, not by the sentinel
+    # being opt-in and this being default-off. Idempotent, so the explicit
+    # earlier call does not make this a second stop.
+    release_lockstep_sentinel(scheduler, graceful=True)
     try:
         from sglang.srt.distributed import parallel_state
     except Exception as e:  # pragma: no cover - import shape, not behaviour
@@ -104,3 +115,41 @@ def release_distributed(scheduler: Any, *, graceful: bool) -> Optional[str]:
             " + ".join(done),
         )
     return " + ".join(done) if done else None
+
+
+def release_lockstep_sentinel(scheduler: Any, *, graceful: bool) -> Optional[str]:
+    """Stop the lockstep sentinel sidecar before exit (#673).
+
+    UNGATED, and deliberately not sharing the process-group destroy's flag: the
+    sidecar leaks on every boot that sets SGLANG_LOCKSTEP_SENTINEL, whether or
+    not the destroy is armed, so inheriting that gate would leave the common
+    case unfixed.
+
+    Also called from ``release_distributed`` as an ordering precondition -- see
+    the comment there. Idempotent, never raises, graceful path only.
+    """
+    if not graceful:
+        return None
+    try:
+        from sglang.srt.distributed.device_communicators import (
+            lockstep_sentinel as _ls,
+        )
+
+        outcome = _ls.stop_sentinel()
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        logger.warning("%s stopping the lockstep sentinel failed: %s", LOG_PREFIX, e)
+        return None
+    if outcome == "joined":
+        logger.info(
+            "%s lockstep sentinel joined before exit; its gloo group is no "
+            "longer in use by a live thread, so it is safe to destroy.",
+            LOG_PREFIX,
+        )
+    elif outcome == "detached":
+        logger.warning(
+            "%s the lockstep sentinel could NOT be joined. Its gloo group must "
+            "not be destroyed while that is true -- destroying a group under a "
+            "live collective is an abort, not a leak.",
+            LOG_PREFIX,
+        )
+    return outcome
