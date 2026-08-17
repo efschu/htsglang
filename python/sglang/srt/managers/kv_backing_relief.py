@@ -1123,6 +1123,40 @@ class KvBackingRelief:
         except Exception:  # pragma: no cover - defensive
             return -1
 
+    def _nothing_resident(self) -> bool:
+        """True when the split is READABLE and reports zero resident rows.
+
+        #717. ``_resident_ceiling`` returns -1 for two opposite states and the
+        caller cannot tell them apart:
+
+          * the split is unreadable -- evict NOTHING, because unmapping a row
+            a live request is reading is the one unrecoverable error;
+          * there are no resident requests at all -- every live row is held by
+            the radix tree alone, so the set is recomputable.
+
+        ``build_flip_live_slots_fn`` sets ``req_max`` to -1 when it has no
+        request parts, so the second state is encoded exactly like the first,
+        and the rung took the conservative branch precisely when it had the
+        most to win.
+
+        WHAT THIS PREDICATE DOES NOT MEAN, and the first attempt at #717 read
+        it this way: it does not mean there are no live rows. The tree's rows
+        are live and addressable. It means only that they are RECOMPUTABLE --
+        that an eviction is permitted to try. Whether the eviction actually
+        succeeded is a separate question, answered after the fact in
+        ``_shrink_to``, never assumed here.
+
+        The split records ``req_rows`` beside ``req_max``, so the two states
+        are distinguishable from data already on hand -- no new enumeration.
+        """
+        split = getattr(self, "_last_live_split", None)
+        if not split:
+            return False
+        try:
+            return int(split.get("req_rows", -1)) == 0
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     def _evict_floor_rows(self, max_live: int) -> Tuple[int, int]:
         """``(floor_rows, evictable_rows)`` if the mark were lowered.
 
@@ -1141,8 +1175,21 @@ class KvBackingRelief:
             return plain, 0
         req_max = self._resident_ceiling()
         if req_max < 0:
-            # Unknown resident half: refuse to price an eviction at all.
-            return plain, 0
+            if not self._nothing_resident():
+                # Unknown resident half: refuse to price an eviction at all.
+                return plain, 0
+            # #717: NOTHING RESIDENT is not "unknown". No request pins any
+            # row, so nothing is above the reserve that an eviction may not
+            # touch, and _floor_rows(-1) is the reserve alone. Treating this
+            # as unknown is what pinned slack to 0 on an idle box and left
+            # every flip funded by the raw seam budget.
+            #
+            # This is a PRICE, not a promise. It says what could be won if the
+            # eviction succeeds; _shrink_to re-reads the live set afterwards
+            # and raises the cap if it did not. Pricing optimistically here is
+            # only safe BECAUSE of that check -- the first attempt at #717
+            # made this same change without it and unmapped live rows.
+            req_max = -1  # _floor_rows(-1) == the reserve, nothing above it
         if req_max >= int(max_live):
             # The mark is pinned by work in flight; nothing to win here.
             return plain, 0
@@ -1173,8 +1220,19 @@ class KvBackingRelief:
         if tree is None:
             return 0
         req_max = self._resident_ceiling()
-        if req_max < 0:
+        if req_max < 0 and not self._nothing_resident():
             return 0
+        # #717, THE HALF THE FIRST ATTEMPT MISSED. It opened PRICING on the
+        # nothing-resident branch and left this refusal in place, so the rung
+        # priced a win it then declined to collect: the target dropped to the
+        # reserve, this method returned 0 without evicting anything, and the
+        # cap engaged over a full live set. Both sides must agree on what the
+        # branch means, or the disagreement becomes an illegal address.
+        #
+        # req_max stays -1 here, which `evict_rows_above` reads as "no
+        # resident row pins anything" and therefore does not refuse -- the
+        # correct reading when the split has told us there are zero resident
+        # rows.
         try:
             from sglang.srt.managers.kv_radix_watermark import evict_rows_above
 
@@ -1579,6 +1637,61 @@ class KvBackingRelief:
         # ORDER that is the safety property and splitting it across two
         # modules is how it would come apart.
         self._lower_watermark_to(target)
+        # #717: THE FLOOR FOLLOWS COMPLETION, NOT INTENTION.
+        #
+        # ``target`` was priced on the assumption that the eviction above
+        # would bring the high-water mark under it. That assumption is not
+        # self-enforcing, and when it failed the pool capped below rows that
+        # were still mapped: 69,054 rows of backing under a highest live row
+        # of 233,289, and the next access to a row above the cap was an
+        # illegal address (the crash that reverted c4e557963e).
+        #
+        # It fails for ordinary reasons, not exotic ones.
+        # ``_lower_watermark_to`` REFUSES and returns 0 whenever
+        # ``_resident_ceiling()`` is negative, and this call site used to
+        # discard that return value; ``evict_rows_above`` likewise refuses
+        # outright when a resident request pins a row above the target; and a
+        # pass over the tree can free less than asked. In every one of those
+        # cases the intention was recorded and the completion was not.
+        #
+        # "No running requests" is NOT "no live rows" -- the radix tree's
+        # cached rows are live and addressable -- so the only statistic this
+        # may trust is the live set AFTER the eviction ran. Re-measuring
+        # costs one enumeration on the shrink path, which is the seam, and it
+        # is the price of the cap being a fact rather than a hope.
+        post_live = self._max_live_row()
+        if post_live < 0:
+            # An unknown live set is not an empty one, and this is the last
+            # point at which refusing is still free.
+            logger.warning(
+                "%s ABANDONED the shrink to %d rows: the live set could not "
+                "be re-read after the eviction, so no cap can be shown safe.",
+                LOG_PREFIX,
+                target,
+            )
+            return 0
+        safe_floor = self._floor_rows(post_live)
+        if target < safe_floor:
+            page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
+            raised = int(math.ceil(safe_floor / page) * page)
+            logger.warning(
+                "%s the eviction did not deliver the mark this shrink was "
+                "priced against: target %d rows sits below the highest live "
+                "row %d, whose floor is %d. RAISING the cap to %d -- capping "
+                "as asked would unmap rows that are still addressable. The "
+                "rung wins less than it priced; that is the correct outcome, "
+                "not a failure to work around.",
+                LOG_PREFIX,
+                target,
+                post_live,
+                safe_floor,
+                raised,
+            )
+            target = raised
+            if target >= current:
+                # Nothing left to win. Capping at `current` would spend the
+                # seam's one attempt for zero bytes.
+                return 0
         # ORDER IS THE SAFETY PROPERTY: cap FIRST, unmap SECOND. Reversed,
         # there is a window in which the allocator may hand out an id whose
         # pages have already gone back to the driver.
