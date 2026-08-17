@@ -8587,6 +8587,39 @@ class Scheduler(
             filled = int(rng.end) if rng is not None else 0
             pending += max(0, len(chunked.origin_input_ids) - filled)
         pending += _arriving_prefill_tokens(inflight)
+        # #713 (a): RESIDENT-BUT-UNPREFILLED. The three terms above see a
+        # request in the waiting queue, in the chunked slot, or in the recv
+        # batch -- and NOWHERE ELSE. A request that has been ADMITTED has left
+        # the waiting queue, and if it is not the chunked_req it is invisible,
+        # so the policy reads 0 prefill pending while holding exactly that
+        # work. The arm states the contradiction itself:
+        #
+        #   IDLE-LOCKED: ... (1 REQ RESIDENT, 0 TOK PREFILL PENDING)
+        #
+        # Measured 2026-08-17 06:53:59.344 (specimen D2): admitted inside the
+        # :59->:01 PP window with ~1.7 s of PP left, invisible at the :01 arm,
+        # first token not until :04.879 -- a full cycle late.
+        #
+        # SAME EXTENT LOGIC AS THE CHUNKED TERM, deliberately: origin_input_ids
+        # minus the filled prefix. No new notion of progress is introduced.
+        #
+        # UNKNOWN PROGRESS COUNTS AS ZERO, and that direction is chosen. An
+        # over-count would keep pending above 0 forever, pull and hold the
+        # policy toward PP permanently and starve decode -- bounded only by the
+        # SLO cap. Under-counting merely restores today's behaviour for that
+        # request. So a missing extend_range is treated as fully prefilled.
+        try:
+            running = getattr(self, "running_batch", None)
+            for req in list(getattr(running, "reqs", None) or ()):
+                if chunked is not None and req is chunked:
+                    continue  # already priced by the chunked term above
+                rng = getattr(req, "extend_range", None)
+                if rng is None:
+                    continue
+                total = len(getattr(req, "origin_input_ids", ()) or ())
+                pending += max(0, total - int(rng.end))
+        except Exception:  # noqa: BLE001 - an observation must not break a round
+            pass
         return pending
 
     def maybe_arm_phase_policy(self, inflight_reqs=None):
