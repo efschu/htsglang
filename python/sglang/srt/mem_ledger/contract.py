@@ -49,7 +49,9 @@ from sglang.srt.mem_ledger.terms import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["enforce_boot_contract", "kv_pool_mib_per_rank"]
+#: ``kv_pool_mib_per_rank`` is deliberately NOT exported: see its docstring.
+#: It is retained, not public, and not the integration contract.
+__all__ = ["enforce_boot_contract"]
 
 
 def enforce_boot_contract(
@@ -87,6 +89,26 @@ def kv_pool_mib_per_rank(
     rank_gpu_id: Sequence[int],
 ) -> List[int]:
     """Per-rank KV budget: the card's residual, split among its ranks.
+
+    NOT THE INTEGRATION CONTRACT, and demoted from ``__all__`` in #584 for a
+    reason rather than for tidiness. It had ZERO callers while being exported
+    as the canonical accessor, so the module advertised one contract and the
+    tree used another -- which teaches the next reader the wrong path.
+
+    THE REAL PATH is ``ServerArgs._vram_ledger_non_kv_per_gpu`` (server_args.py),
+    which takes ``demand_outside_budget_mib`` per card and feeds it into the
+    SAME ``budget = (total - non_kv) // colocated_ranks`` arithmetic the
+    reserve path already uses. Its call site states why that is deliberate:
+    "the ledger changes where the number comes from, not how a budget is
+    formed, so everything downstream behaves identically and only the input is
+    now exact".
+
+    Wiring THIS function instead would introduce a SECOND way to form a rank
+    budget -- residual-split-with-remainder rather than the shared floor-divide
+    -- which is exactly what the chosen design avoids. So it is demoted rather
+    than wired, and kept rather than deleted only because its surplus rule
+    below documents an invariant the ledger relies on (nothing is left
+    unclaimed).
 
     THE SURPLUS RULE. Whatever the reserve and the demand do not take goes
     here. That is what makes an over-large user reserve cost KV capacity

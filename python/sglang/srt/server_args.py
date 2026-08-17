@@ -14297,7 +14297,29 @@ class ServerArgs:
         # AMD platforms backends
         if resolved_view(self).attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                # #584: NOT on the rank-budget path. --rank-gpu-memory-mib
+                # states its contract in apply_rank_memory_budget: "the MiB
+                # value is the rank's ENTIRE budget, so no further utilization
+                # ceiling or safety factor is added here". Scaling it by 0.85
+                # here makes that guarantee false -- silently, and only for
+                # aiter above 8192 context, which is exactly the combination
+                # nobody would think to check.
+                #
+                # The operator asked for a specific number of MiB. If that
+                # number is too large for this backend, the operator lowers
+                # it; this code does not lower it for them behind their back.
+                if getattr(self, "_rank_mem_fraction_static", None) is not None:
+                    logger.warning(
+                        "aiter with context_len %d would normally scale "
+                        "mem_fraction_static by 0.85, but --rank-gpu-memory-mib "
+                        "is set and that flag's contract is that the MiB value "
+                        "is the rank's ENTIRE budget. NOT scaling. If aiter "
+                        "needs more headroom at this context length, lower "
+                        "--rank-gpu-memory-mib yourself.",
+                        model_config.context_len,
+                    )
+                else:
+                    self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
