@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.mem_cache.pinned_host_budget import revert_pinned_posts_on_failure
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -65,6 +66,7 @@ if _is_cuda or _is_hip:
             transfer_kv_per_layer_pf_lf,
             transfer_kv_per_layer_ph_lf,
         )
+
         _has_sgl_kvcacheio = True
     except ImportError:
         transfer_kv_all_layer = None
@@ -650,6 +652,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
     device_pool: MHATokenToKOnlyPool
 
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         device_pool: MHATokenToKOnlyPool,

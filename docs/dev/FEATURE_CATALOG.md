@@ -1935,11 +1935,19 @@ declaration rather than discovered at the allocation
 allocation then raises, the post describes bytes that never existed, and #706's
 credit-back (`d7d85b4e37`) subtracts already-allocated posts from the next
 admission's demand -- so a post that never allocated is credited back anyway and
-the next admission is charged too little. Closed at `weights_arena.py`
-(`_alloc_host_image`, post taken back on failure, original error re-raised
-untouched) and `read_buffer_pool.py:79`. STILL OPEN, same shape, filed with
-file:line: `memory_pool_host.py:141`, `:770`, `:1147`, `:1680`,
-`pool_host/mha.py:684`, `pool_host/base.py:164`.
+the next admission is charged too little. CLOSED EVERYWHERE (#729). Two sites carry an explicit
+try/except because their allocation is a single expression --
+`weights_arena.py` (`_alloc_host_image`) and `read_buffer_pool.py:79`. The
+other six are CONSTRUCTORS whose allocation runs to the end of `__init__`, so
+they carry `@revert_pinned_posts_on_failure` instead (one line each, success
+path byte-identical): `MambaPoolHost`, `DeepSeekV4PagedHostPool`,
+`DeepSeekV4StateHostPool`, `DSAIndexerPoolHost` (`memory_pool_host.py`),
+`MHATokenToKOnlyPoolHost` (`pool_host/mha.py`) and the base `HostKVCache`
+(`pool_host/base.py`). The decorator undoes exactly the posts that appeared
+during a FAILED call, computed as a set difference, and re-raises the original
+exception untouched (#386). Its one limit is stated at the definition: the set
+difference is not safe against a concurrent registration from another thread in
+the same extent, so an off-thread producer must not use it.
 
 RESOLVED IN #550, and the split between the two halves is the lesson. Gap (1)
 was a MECHANISM and could be built at the desk: `mem_cache/pinned_host_budget`

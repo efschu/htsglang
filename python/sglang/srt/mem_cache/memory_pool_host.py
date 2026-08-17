@@ -73,10 +73,13 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pinned_host_budget import (  # noqa: E402
+    revert_pinned_posts_on_failure,
+)
 
 
 class MambaPoolHost(HostKVCache):
-
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         device_pool: MambaPool,
@@ -305,9 +308,9 @@ class MambaPoolHost(HostKVCache):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
         select_index = self.free_slots[:need_size]
@@ -461,8 +464,7 @@ class MambaPoolHost(HostKVCache):
     ):
         if io_backend != "direct":
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
+                f"MambaPoolHost only supports io_backend='direct', got '{io_backend}'."
             )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
@@ -506,8 +508,7 @@ class MambaPoolHost(HostKVCache):
     ):
         if io_backend != "direct":
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
+                f"MambaPoolHost only supports io_backend='direct', got '{io_backend}'."
             )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
@@ -734,6 +735,7 @@ class LogicalHostPool:
 class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
 
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         pool_name: str,
@@ -1106,6 +1108,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 class DeepSeekV4StateHostPool(HostKVCache):
     """Host pool for V4 CompressStatePool page rows."""
 
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         pool_name: str,
@@ -1636,6 +1639,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     device_pool: DSATokenToKVPool
 
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         device_pool: DSATokenToKVPool,

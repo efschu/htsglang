@@ -46,6 +46,7 @@ numbers only.
 from __future__ import annotations
 
 import logging
+import functools
 import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
@@ -159,6 +160,55 @@ def unregister_pinned_post(name: str) -> None:
     """
     with _registry_lock:
         _registered.pop(name, None)
+
+
+def revert_pinned_posts_on_failure(fn):
+    """Decorator: undo posts a FAILED call registered, and only those (#729).
+
+    THE WINDOW. Every producer declares its post BEFORE allocating -- on
+    purpose, so an over-commitment is refused at the declaration rather than
+    discovered at the allocation. If the allocation then raises, the post
+    describes bytes that never existed, and #706's credit-back subtracts
+    already-allocated posts from the next admission's demand. A post that never
+    allocated is credited back anyway, so the next admission is charged too
+    little: the registry waves through the very over-commitment it exists to
+    refuse.
+
+    WHY A DECORATOR AND NOT A TRY BLOCK PER SITE. All six remaining producers
+    are ``__init__`` bodies whose allocation runs to the end of the
+    constructor; wrapping each would mean re-indenting six constructors, which
+    is a large diff for a small property. This changes one line per site and
+    leaves every success path byte-identical -- on success the wrapper does
+    nothing at all.
+
+    WHAT IT UNDOES: exactly the posts that appeared during the call, computed
+    as a set difference, so a post registered by someone else is never touched.
+    Nesting is correct by construction: a subclass ``__init__`` that fails
+    after ``super().__init__()`` registered undoes BOTH, which is right,
+    because the object as a whole failed.
+
+    #386: the original exception is re-raised UNTOUCHED. Cleanup never
+    substitutes the diagnosis.
+
+    LIMIT, stated rather than hidden: the set difference is not safe against a
+    CONCURRENT registration from another thread inside the same extent -- that
+    post would be undone with the failing one. Every producer this wraps is a
+    boot-time constructor on one thread. A future producer that registers
+    off-thread must not use this.
+    """
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        before = {p.name for p in registered_posts()}
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            for post in registered_posts():
+                if post.name not in before:
+                    unregister_pinned_post(post.name)
+            raise
+
+    return _wrapped
 
 
 def registered_posts() -> Tuple[PinnedHostPost, ...]:

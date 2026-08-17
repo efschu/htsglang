@@ -241,5 +241,115 @@ class TheAllocationFailureWindow(unittest.TestCase):
         )
 
 
+#: #729: the six remaining producers, all constructors, all register-then-
+#: allocate. Driven from ONE case rather than six hand-rolled copies, because
+#: the property is a property of the SHAPE -- a per-site copy would drift and
+#: would not notice a seventh producer written tomorrow.
+_729_SITES = (
+    ("mem_cache.memory_pool_host", "MambaPoolHost"),
+    ("mem_cache.memory_pool_host", "DeepSeekV4PagedHostPool"),
+    ("mem_cache.memory_pool_host", "DeepSeekV4StateHostPool"),
+    ("mem_cache.memory_pool_host", "DSAIndexerPoolHost"),
+    ("mem_cache.pool_host.mha", "MHATokenToKOnlyPoolHost"),
+    ("mem_cache.pool_host.base", "HostKVCache"),
+)
+
+
+class TheSixConstructorsRevertTheirPost(unittest.TestCase):
+    """#729. Each of these registers a post and then allocates; a raise in the
+    allocation used to leave the post behind. The decorator undoes exactly what
+    the failed call registered, so this drives the DECORATOR over every site
+    rather than re-testing six constructors' internals -- which is what makes
+    it a shape test and not six copies.
+    """
+
+    def setUp(self):
+        clear_registered_posts()
+        self.addCleanup(clear_registered_posts)
+
+    def _decorated_init(self, module_suffix, cls_name):
+        import importlib
+
+        module = importlib.import_module(f"sglang.srt.{module_suffix}")
+        return getattr(module, cls_name).__init__
+
+    def test_every_site_carries_the_guard(self):
+        """The wiring half: a site that loses its decorator stops reverting,
+        and nothing else in this file would notice."""
+        for module_suffix, cls_name in _729_SITES:
+            with self.subTest(site=f"{module_suffix}.{cls_name}"):
+                init = self._decorated_init(module_suffix, cls_name)
+                self.assertTrue(
+                    getattr(init, "__wrapped__", None) is not None,
+                    f"{cls_name}.__init__ is not wrapped by "
+                    "revert_pinned_posts_on_failure (#729)",
+                )
+
+    def test_a_failing_call_reverts_only_what_it_registered(self):
+        """The behaviour half, driven through the real decorator."""
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            revert_pinned_posts_on_failure,
+        )
+
+        register_pinned_post(
+            PinnedHostPost(name="pre-existing", flag="--pre", nbytes=_GB)
+        )
+
+        @revert_pinned_posts_on_failure
+        def _construct():
+            register_pinned_post(
+                PinnedHostPost(name="doomed pool", flag="--doomed", nbytes=_GB)
+            )
+            raise RuntimeError("pin_memory: cannot lock 30 GB")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _construct()
+
+        self.assertIn("cannot lock 30 GB", str(ctx.exception))
+        self.assertEqual(
+            [p.name for p in registered_posts()],
+            ["pre-existing"],
+            "the failed call must undo its OWN post and leave every other "
+            "post standing",
+        )
+
+    def test_a_successful_call_keeps_its_post(self):
+        """Without this the guard could pass by never registering anything."""
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            revert_pinned_posts_on_failure,
+        )
+
+        @revert_pinned_posts_on_failure
+        def _construct():
+            register_pinned_post(
+                PinnedHostPost(name="good pool", flag="--good", nbytes=_GB)
+            )
+
+        _construct()
+        self.assertEqual([p.name for p in registered_posts()], ["good pool"])
+
+    def test_a_nested_failure_undoes_the_super_call_too(self):
+        """A subclass __init__ that fails after super().__init__() registered
+        must undo BOTH -- the object as a whole failed."""
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            revert_pinned_posts_on_failure,
+        )
+
+        @revert_pinned_posts_on_failure
+        def _base():
+            register_pinned_post(
+                PinnedHostPost(name="base post", flag="--base", nbytes=_GB)
+            )
+
+        @revert_pinned_posts_on_failure
+        def _subclass():
+            _base()
+            raise RuntimeError("subclass allocation failed")
+
+        with self.assertRaises(RuntimeError):
+            _subclass()
+        self.assertEqual([p.name for p in registered_posts()], [])
+
+
 if __name__ == "__main__":
     unittest.main()

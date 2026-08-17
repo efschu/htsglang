@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.mem_cache.pinned_host_budget import revert_pinned_posts_on_failure
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
-
+    @revert_pinned_posts_on_failure  # #729
     def __init__(
         self,
         device_pool: KVCache,
@@ -320,9 +321,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 
