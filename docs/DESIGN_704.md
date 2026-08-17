@@ -1811,6 +1811,73 @@ Note `page_size == 1` is **already mandatory** for Option A independently
 (#706: a multi-token page would span owner ranks), so the two constraints agree
 rather than compete.
 
+### B1 AMENDMENT — the #616 survey returned, and it revises three things
+
+Survey: `/spinning/evidence-665-f1/SURVEY_616_B1_GROUPS.md`. I verified its two
+load-bearing claims at file:line before folding rather than taking the summary.
+
+**1. "A DCP-TYPED group" was imprecise. There are no typed group classes.**
+Every group in this tree is a bare `GroupCoordinator`
+(`parallel_state.py:564`) built by `init_model_parallel_group` (`:2550`).
+"Typed", here, means exactly three things and nothing more:
+
+* a **module global** (`_DCP`, `_PP`, …),
+* a **named getter** (`get_dcp_group`, `get_dcp_group_no_assert`),
+* a **routing flag** consulted by the getter.
+
+So B1 does not subclass or register anything. It adds a global, a getter and a
+routing decision — which is a smaller change than "typed group" implied, and a
+more precise one to specify.
+
+**2. THE PRECEDENT ALREADY EXISTS IN-TREE. Reuse it; do not invent.**
+`initialize_phase_flip_secondary_groups` (`:3422-3517`) **already creates a DCP
+group in the same world as a PP group**. Verified at `:3470-3482`: it builds a
+`planned` list of `flip_tp` → `flip_dcp` (when `dcp_size > 1`) → `flip_pp`, in
+that fixed order, and then — `:3484-3497` — verifies a **world-wide manifest by
+all_gather with an equality check BEFORE creating anything**.
+
+That is the whole pattern B1 needs: fixed creation order, manifest agreed
+across the world before any group is built, so a rank that disagrees fails at
+the check rather than half-forming a communicator. **The earlier draft of this
+spec proposed reconstructing PP rank arithmetic inline; that is unnecessary —
+the precedent computes exactly the same `range(idx, world_size, num_pp_groups)`
+layout and already sequences it correctly.**
+
+**3. The ordering window is narrower than feared.** `_DCP` is created at
+`:3152`, `_PP` at `:3365`, and between them **only the kvso-spill block
+(`:3185-3188`) reads `_DCP`**. So the "must not read `_PP`" constraint holds,
+but the exposure is one known block rather than an open region.
+
+**Routing precedence must be chosen deliberately.** `get_dcp_group` resolves in
+order: **flip route first (`:2709`)**, then kvso-spill (`:2718`), then primary
+(`:2720`). B1's group has to slot into that precedence explicitly — inheriting
+whichever branch happens to match first is how a decoupled read would silently
+land on the flip's secondary group during a phase change.
+
+### NAMED PREREQUISITE — fix before B1, not during
+
+**`pp > 1` AND `dcp > 1` is not refused anywhere in the group path**, and
+`ParallelContext.dcp_enabled` (`runtime_context.py:331-337`) returns True
+whenever a DCP group exists and `dcp_size > 1`. Creating B1's group therefore
+makes `dcp_enabled` **True on PP prefill ranks**, which directly contradicts the
+assumption `dcp_group_guard.py:38-42` states in prose:
+
+> "In particular a PP prefill group runs with `dcp_size == 1` and no DCP group,
+> so both sides read 1 and the guard passes."
+
+Note the failure shape: the guard itself would still **pass** (both sides would
+read the same new size), so this does not announce itself. What breaks is every
+*other* consumer that relies on the documented invariant. The combination is
+currently unreachable, so the inconsistency is latent; B1 is precisely the
+change that makes it live.
+
+**Prerequisite, therefore:** either make the group path *deliberately* accept
+`pp>1 ∧ dcp>1` and audit every `dcp_enabled` consumer for PP-prefill
+correctness, or refuse the combination explicitly and give B1 its own flag
+rather than overloading `dcp_size`. **That decision belongs before the build,
+not inside it** — it is the kind of latent contradiction that only becomes
+visible once something depends on it.
+
 **Still open, routed to the survey in flight:** the #616 group-MIN-floor
 interaction, whether an extra communicator carries a budgeted per-group cost,
 and whether any census/registry must be told about a new group. Those are
