@@ -163,3 +163,146 @@ class TestTheContractConsumersRelyOn(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClassSelectorIsAComplement(CustomTestCase):
+    """#485 item 1a: `targets: ["Linear"]` names a module CLASS, not a path.
+
+    `gemm_family_of_module` maps it to no family, so before this it contributed
+    nothing and the quantized side of a single-group checkpoint was invisible.
+    A class selector means "every GEMM family EXCEPT the ignored ones" -- a
+    COMPLEMENT over the family enum, not an enumeration.
+    """
+
+    def test_a_class_selector_quantizes_every_unignored_family(self):
+        qc = _ct(
+            {"group_0": _group_for(["Linear"])},
+            ignore=["lm_head", "re:.*embed_tokens.*"],
+        )
+        families = _per_family_formats(qc)
+        self.assertEqual(families.get(GEMM_FAMILY_VOCAB), "bf16")
+        self.assertEqual(families.get(GEMM_FAMILY_MLP), "int8")
+        self.assertEqual(families.get(GEMM_FAMILY_ATTN_GDN), "int8")
+
+    def test_a_regex_target_is_not_treated_as_a_class(self):
+        # `re:.*router.*` maps to no family either, but it is a PATH pattern --
+        # treating it as "all families" would quantize families it never named.
+        qc = _ct({"group_0": _group_for(["re:.*router.*"])}, ignore=["lm_head"])
+        families = _per_family_formats(qc)
+        self.assertNotIn(GEMM_FAMILY_MLP, families)
+
+    def test_a_dotted_path_is_not_treated_as_a_class(self):
+        qc = _ct({"group_0": _group_for(["model.layers.0.foo"])}, ignore=["lm_head"])
+        self.assertNotIn(GEMM_FAMILY_MLP, _per_family_formats(qc))
+
+
+class TestMixedFamilyResolvedByLayers(CustomTestCase):
+    """#485 item 1b: attn_gdn spans self_attn AND linear_attn.
+
+    Family granularity has no single answer, but #371's per-layer counts do:
+    on this checkpoint 48 layers are linear_attention (ignored -> bf16) and 16
+    are full_attention (quantized). Resolving by LAYER is honest; resolving by
+    config-entry count -- which is what `_dominant` does -- is not.
+    """
+
+    def test_the_layer_majority_decides(self):
+        qc = _ct(
+            {"group_0": _group_for(["re:.*self_attn.*", "re:.*mlp.*"])},
+            ignore=["re:.*linear_attn.*"],
+        )
+        families = _per_family_formats(qc, layer_split={"gdn": 48, "full": 16})
+        self.assertEqual(
+            families.get(GEMM_FAMILY_ATTN_GDN),
+            "bf16",
+            "48 of 64 attention-family layers are bf16-resident GDN",
+        )
+
+    def test_the_other_majority_also_decides(self):
+        # Reverse the split: the same config now resolves the other way.
+        qc = _ct(
+            {"group_0": _group_for(["re:.*self_attn.*", "re:.*mlp.*"])},
+            ignore=["re:.*linear_attn.*"],
+        )
+        families = _per_family_formats(qc, layer_split={"gdn": 4, "full": 60})
+        self.assertEqual(families.get(GEMM_FAMILY_ATTN_GDN), "int8")
+
+    def test_without_a_layer_split_it_still_refuses_to_invent(self):
+        qc = _ct(
+            {"group_0": _group_for(["re:.*self_attn.*", "re:.*mlp.*"])},
+            ignore=["re:.*linear_attn.*"],
+        )
+        self.assertNotIn(GEMM_FAMILY_ATTN_GDN, _per_family_formats(qc))
+
+
+class TestKnownFormatsWithoutALane(CustomTestCase):
+    """#485 item 1d: `int8_a16` is RECOGNISED, just unmeasured.
+
+    `_FORMAT_LANES` deliberately omits lanes the serving path cannot take (its
+    own comment says registering one 'would make the plan lie'), so weight-only
+    int8 correctly has no row. What was missing is the #606 distinction: a
+    reader of the fallback could not tell 'we know this format and have no
+    measured lane' from 'we do not recognise this format at all'.
+    """
+
+    def test_int8_a16_is_declared_known_but_unmeasured(self):
+        from sglang.srt.uneven_perf import FORMATS_WITHOUT_LANES
+
+        self.assertIn("int8_a16", FORMATS_WITHOUT_LANES)
+
+    def test_it_is_not_in_the_lane_table(self):
+        from sglang.srt.uneven_perf import _FORMAT_LANES
+
+        self.assertNotIn(
+            "int8_a16",
+            _FORMAT_LANES,
+            "adding a lane the serving path cannot take would make the plan lie",
+        )
+
+    def test_the_warning_names_it_as_unmeasured_not_unknown(self):
+        from sglang.srt.uneven_perf import rank_gemm_scores
+
+        entries = [{"gemm_tflops": 100.0}]
+        _scores, _labels, warnings = rank_gemm_scores(entries, "int8_a16")
+        joined = " ".join(warnings)
+        self.assertIn("int8_a16", joined)
+        self.assertIn("weight-only", joined.lower())
+
+
+class TestTheRealCheckpointNowReports(CustomTestCase):
+    """#485 item 1 acceptance: `{}` was the proven RED here."""
+
+    CKPT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-yarn1.5"
+
+    def setUp(self):
+        import os
+
+        if not os.path.isdir(self.CKPT):
+            self.skipTest("serving checkpoint not on this box")
+
+    def _report(self):
+        from sglang.srt.uneven_perf import checkpoint_compute_format_families
+
+        return checkpoint_compute_format_families(self.CKPT)
+
+    def test_it_is_no_longer_empty(self):
+        _fmt, _desc, families = self._report()
+        self.assertTrue(families, "the divergence must now be visible")
+
+    def test_the_bf16_resident_families_are_named(self):
+        _fmt, _desc, families = self._report()
+        self.assertEqual(families.get(GEMM_FAMILY_VOCAB), "bf16")
+        self.assertEqual(families.get(GEMM_FAMILY_ATTN_GDN), "bf16")
+
+    def test_the_quantized_families_keep_the_checkpoint_key(self):
+        fmt, _desc, families = self._report()
+        self.assertEqual(fmt, "int8")
+        self.assertEqual(families.get(GEMM_FAMILY_MLP), "int8")
+
+    def test_the_description_discloses_what_the_key_does_not_cover(self):
+        # attn_gdn=bf16 is a MAJORITY statement: 48 GDN layers are bf16, but 16
+        # full-attention layers are not, and a reader assuming uniformity would
+        # mis-price them.
+        _fmt, desc, _families = self._report()
+        self.assertIn("48 linear_attention", desc)
+        self.assertIn("16 full_attention", desc)
+        self.assertIn("does NOT describe", desc)
