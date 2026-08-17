@@ -543,3 +543,92 @@ internals:
 
 FEATURE_CATALOG's "STILL OPEN, six sites" entry is replaced with the closed
 state and the mechanism, in the same step.
+
+---
+
+# SIXTH PASS — the #410/#411 reconciliation merged (2026-08-17)
+
+`train/0818-desk-410-reconcile` (through `9509c7ba8a`) is in, with the lineage-B
+modules deleted in the merge commit itself.
+
+## H1. The deletion set was two files, not three
+
+`pin_ledger.py` STAYS: the reconciliation keeps and extends it (the `unpinned`
+shortfall field) and `hicache_storage` consumes it. Deleted instead:
+`mem_cache/session_manifest.py`, `mem_cache/session_bundle.py`, and
+`test_session_manifest_410.py` — the B test that imported a deleted module and
+would otherwise have errored the suite.
+
+## H2. Resolution authority
+
+21 hunks / 11 files, resolved on DESIGN_410 and NOTE_411's own verdicts. The
+three that were not mechanical:
+
+* evictor "allocated accounting" hunks -> theirs, per NOTE_411 §"A's evictor
+  moves to ALLOCATED bytes".
+* evictor scan hunk -> OURS, departing from the incoming text ON EVIDENCE: this
+  train had already refactored that inline flat scan into the injectable
+  `_iter_existing` and applies `_allocated_size` in `_scan_existing_files`. The
+  verdict was already satisfied; taking theirs would have duplicated the stat
+  and regressed sharded-layout support.
+* `AUDIT_421` F6 cells -> merged to name BOTH credits (#286's first consumer,
+  #410's checkpoint tier). Both are true and a table cell cannot hold two rows.
+
+## H3. Three incoherences the textual merge hid
+
+Every one was found by RUNNING the suites, not by reading the diff.
+
+1. **Duplicate methods, second silently shadowing the first.** Both lineages
+   define the same methods in different places, so git kept both. An AST audit
+   over every merged file found five: `stats` and `_allocated_size` in the
+   evictor; `capacity_stats`, `pin_checkpoint`, `unpin_checkpoint`, `pin_stats`
+   in `hicache_storage`. Resolved per pair. (`http_server`'s same-named pair is
+   NOT an artifact — two different FastAPI handlers, present at HEAD.)
+2. **Eviction stopped removing files.** An incoming block extended past its
+   comment into the removal line, replacing the injected resolver with a flat
+   join. This backend injects the sharded resolver, so `os.remove` missed, the
+   entry left the LRU and the bytes stayed — the cap silently stopped holding.
+3. **`_pin_path` was flat on a sharded store.** The reconciliation wrote it flat
+   because its own lineage had no sharding; here it names a path the store never
+   writes, so `pin_checkpoint` dropped every stem as "missing" and pinned
+   NOTHING while reporting success. It now delegates to `_existing_path`, which
+   preserves the property the reconciliation actually asked for — "the ledger
+   must stat exactly what the evictor unlinks" — under this layout.
+
+## H4. Candidates: one taken, then dropped; two deferred
+
+* `audit/stale-gates` merged clean and was then DROPPED. It carries
+  `4a16043d1a Revert "[#713] IDLE-LOCKED post-cutover settle"`, which strips 116
+  lines from `phase_policy.py` and removes a `PhasePolicyConfig` kwarg that
+  F4-r4's #730 tests use — six failures, all in `test_vacuous_decode_exit_730.py`.
+  A revert of #713 versus the serving lineage's #730/#731 is a coordination
+  decision, not a merge resolution. **The branch needs rebasing onto the current
+  train, or the revert re-justified, before it can ride.**
+* `feat/407-registry-reconcile` — DOCS-ONLY conflicts
+  (`DESIGN_407_memtier_registry.md`, which carries my own §9 determination, and
+  `FEATURE_CATALOG.md`). Cheap next pass.
+* `fix/485-gdn-family-report` — conflicts in `uneven_perf.py` (code). Next pass.
+
+## H5. Gate — base `a157bf1889`, head `4b9e4c2192`
+
+| suite | established | now |
+| --- | --- | --- |
+| `mem_ledger` | 0 F / 514 P | 0 F / 514 P |
+| `server_args` | 0 F / 672 P | **0 F / 681 P** |
+| `boot_matrix` | 0 F / 159 P | 0 F / 159 P |
+| `spec` | 13 F / 711 P | 13 F / 711 P |
+| `entrypoints` | 4 F / 450 P / 3 E | 4 F / 450 P / 3 E |
+| `planner` | 1 F / 2880 P | 1 F / 2880 P |
+| `mem_cache` | 0 F / 1153 P | **0 F / 1157 P** |
+| `managers` | 22 F / 2413 P | **19-20 F / 2530 P** |
+| `distributed` | 27 F / 2769 P | 27 F / 2769 P |
+
+`managers` IMPROVED on its established 22: the reconciliation's own #410/#411
+tests now pass and the remainder is the cluster-b inherited family plus the
+documented order-dependent gate-tools pair (passes alone and under filters).
+Zero unexplained failures.
+
+Also verified rather than assumed: `54ffc4d90a` (pp_with_spec register row) is
+an ancestor, and `test_phase_flip_args` no longer asserts the #630
+hierarchical-cache refusal — F4-r4's lift `be933407ab` removed that third twin
+and the file is 23 passed / 0 failed here.
