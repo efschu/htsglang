@@ -75,55 +75,91 @@ the two default-unchanged tests). One test round-trips the runtime against the
 requant tool, because a tool and a loader that disagree make the checkpoint
 unreadable in the only way that matters.
 
-## The two halves carry different risk, and only one was requantized
+## The two halves, and which one is a HYPOTHESIS rather than a verdict
 
-* **`embed_tokens` -- LOW.** A gather. Per-row scales make dequant exact per
-  row and cost one multiply on the rows a batch touches. The result feeds a
-  layernorm, which absorbs a per-row scale error. **Requantized here.**
-* **`lm_head` -- the risky half.** A GEMM producing logits directly. A ~0.4%
-  per-channel error lands on logit DIFFERENCES, which is exactly what softmax
-  and argmax read, so near-ties can flip. This is plausibly what the producer's
-  ignore list was protecting. **Deliberately NOT requantized**; the tool takes
-  `--targets lm_head` when someone decides to, and it needs its own A/B.
+Both halves are now built as separate artifacts, because the difference between
+them is a prediction that the arm exists to test -- not a reason to skip one.
 
-## Switchover A/B -- boot-gated, filed for the window list
+* **`embed_tokens`.** A gather. Per-row scales make dequant exact per row and
+  cost one multiply on the rows a batch touches, and the result feeds a
+  layernorm that absorbs a per-row scale error. Expected near-neutral.
+* **`lm_head`.** A GEMM producing logits directly. **HYPOTHESIS UNDER TEST:**
+  a ~0.4% per-output-channel error lands on logit DIFFERENCES, which is exactly
+  what softmax and argmax read, so near-ties can flip. This is plausibly what
+  the producer's ignore list was protecting.
 
-**Arm name:** `vocab-int8-embed`. Control is today's serving checkpoint;
-treatment swaps only `--model-path`. Nothing else changes -- same cut, same
-token budget, same flags.
+That hypothesis is stated so the suite can refute it. It is deliberately NOT
+used to withhold the artifact: a desk argument about logit differences is not
+evidence, and the three-arm suite produces numbers where the argument produces
+only a prediction. If the suite shows flips, the numbers say so; if it does
+not, both halves ship.
+
+## Artifacts
+
+| arm | path | vocab state | disk |
+|---|---|---|---|
+| baseline | `Qwen3.8-27B-INT8-yarn1.5` | both BF16 | (incumbent) |
+| embed-only | `Qwen3.8-27B-INT8-vocabint8-embed` | embed I8, lm_head BF16 | 1.2 GB |
+| both | `Qwen3.8-27B-INT8-vocabint8-both` | both I8 | 2.7 GB |
+
+Each was verified from the safetensors headers after writing: I8
+`[248320, 5120]` with `weight_scale` BF16 `[248320, 1]`, and the matching
+`ignore` entries dropped (`embed` only for the first, both for the second).
+`-both` was built FROM `-embed`, so the two are the same bytes except for
+`lm_head` -- the arms differ in exactly one tensor each, which is what makes
+the three-way comparison attributable.
+
+Disk cost is small because unchanged shards are hard-linked: 18 shards, one
+rewritten per artifact.
+
+## Switchover A/B -- THREE arms, boot-gated, filed for the window list
+
+**Arm name:** `vocab-int8`. Only `--model-path` changes between arms. Same
+cut, same token budget, same flags, same rope (both artifacts inherit
+yarn1.5's config, so it is not a confound).
 
 ```
-# control
---model-path .../Qwen3.8-27B-INT8-yarn1.5
-# treatment
---model-path .../Qwen3.8-27B-INT8-vocabint8-embed
+A  baseline    --model-path .../Qwen3.8-27B-INT8-yarn1.5
+B  embed-only  --model-path .../Qwen3.8-27B-INT8-vocabint8-embed
+C  both        --model-path .../Qwen3.8-27B-INT8-vocabint8-both
 ```
 
-Note the treatment inherits yarn1.5's config (it was requantized FROM that
-overlay), so the rope settings are identical and are not a confound.
+Run A, B, C. B is what isolates `lm_head`: any quality delta present in C but
+absent in B is attributable to `lm_head` alone, which is the entire reason the
+middle arm exists rather than a two-arm baseline-vs-both.
 
 **Acceptance, in order. Stop at the first failure.**
 
-1. **GATE 0 -- it loads and generates.** The int8 vocab must be picked up by
-   the new method, not silently fall back. Confirm the embedding parameter is
-   int8 at runtime; a boot that quietly took the dense path proves nothing and
-   would show a *worse* VRAM number, not a better one.
-2. **GATE A -- VRAM.** PP0 resident must fall by ~1212 MiB. Less than that
-   means the dense path ran; more means something else moved and the
-   measurement is confounded.
-3. **GATE B -- quality, and this is the point of the arm.** Greedy
-   (`temperature 0`) on a fixed prompt set, control vs treatment, compared as
-   text. The embedding half should be near-neutral by construction; the arm
-   exists to confirm that rather than assume it. Report first-differing
-   character, not a pass/fail feeling.
-4. **GATE C -- TTFT/decode unchanged within the boot's own A-vs-A floor.**
-   The gather is one extra multiply on a handful of rows; a measurable
-   regression here would mean the dequant is running somewhere it should not.
+1. **GATE 0 -- each arm loads and generates.** The int8 vocab must be picked up
+   by `CompressedTensorsEmbeddingMethod`, not silently fall back to dense.
+   Confirm the embedding parameter is int8 at runtime; a boot that quietly took
+   the dense path proves nothing and would show a *worse* VRAM number, not a
+   better one.
+2. **GATE A -- VRAM, per stage.** B: PP0 resident falls ~1212 MiB, PP2
+   unchanged. C: PP0 AND PP2 each fall ~1212 MiB. A saving materially below
+   that means the method did not engage on that stage.
+3. **GATE B -- QUALITY, the point of the suite.** Per arm: the club-3090 suite
+   plus determined-answer probes (questions with a single correct answer, where
+   a flipped near-tie is visible as a wrong answer rather than as a style
+   difference). Greedy, `temperature 0`, fixed prompt set, fixed order, fixed
+   seed. Report per arm: suite score, determined-answer accuracy, and
+   first-differing character against arm A. **A vs A first** -- without the
+   baseline's own boot-to-boot floor, a B or C delta cannot be read, and this
+   model is not deterministic across boots (the GDN prefill limit).
+4. **GATE C -- TTFT / decode within each boot's own A-vs-A floor.** The gather
+   is one extra multiply on a handful of rows. `lm_head` in arm C is a
+   dequantized GEMM, so C is where a decode regression would appear if
+   anywhere; report per rank.
 
-**What would falsify the design:** a VRAM saving materially below 1212 MiB on
-PP0 (the method did not engage), or a quality delta on GATE B that clears the
-floor (the per-row scheme is not as benign for embeddings as the structure
-predicts, which would also cast doubt on ever doing `lm_head`).
+**Decision rule, fixed before the run so it cannot be argued afterwards:**
 
-**Not in this arm:** `lm_head` requantization, and any prefill-graph or cut
-change -- both would confound GATE C.
+* B clears GATE B within the A-vs-A floor -> **embed-only ships.**
+* C also clears it -> **both ship**; the logit-difference hypothesis is
+  refuted and should be recorded as such.
+* C degrades while B does not -> the hypothesis is **confirmed**, `lm_head`
+  stays BF16, and the 1212 MiB on PP2 is the priced cost of that.
+* B degrades -> stop; the per-row scheme is not benign even for a gather,
+  which would also retire the `lm_head` question.
+
+**Not in this arm:** any prefill-graph or cut change -- both would confound
+GATE C.
