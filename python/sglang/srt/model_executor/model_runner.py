@@ -1116,7 +1116,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
         # the field being absent — otherwise the draft worker takes the MTP branch below with
         # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
-        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[self.local_slot(layer_id)]`).
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         if self.is_draft_worker and model_has_mtp_layers:

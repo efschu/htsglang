@@ -53,6 +53,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def shard_start_global(start_layer, my_start, local_slot_of):
+    """Local shard offset -> GLOBAL first layer id, for the PD transfer label.
+
+    This is the INVERSE of `KVCache.local_slot`, and it is the direction that
+    non-contiguous ownership cannot express. `disaggregation/prefill.py` builds
+    the transfer descriptor as::
+
+        prefill_start_layer = layer_shard_start
+        prefill_end_layer   = prefill_start_layer + len(kv_data_ptrs)
+
+    -- a start plus a COUNT, read on the wire as a contiguous global range. For
+    the family plan's second full-attention stage (layers 35..63 step 4, so
+    start 35 and count 8) that pair claims layers 36..42 this stage does not
+    own, and omits 47..63 that it does.
+
+    That is a wire-format limit, not an index translation, so it is refused
+    here rather than papered over: a wrong answer would corrupt a KV transfer
+    silently. Carrying a layer SET across the wire is a separate design
+    question, filed in docs/dev/DESIGN_pp_layer_set.md.
+    """
+    if local_slot_of is not None:
+        raise NotImplementedError(
+            "layer-shard KV transfer requires contiguous layer ownership: the "
+            "PD descriptor carries prefill_start_layer plus a layer COUNT, "
+            "which cannot express the non-contiguous set "
+            f"{sorted(local_slot_of)} owned by this stage under "
+            "SGLANG_PP_LAYER_SET. Use contiguous PP partitioning for "
+            "disaggregated layer-split serving."
+        )
+    return start_layer + my_start
+
+
 class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     """DSA KV pool that shards layers across CP ranks with owner-broadcast reads."""
 
@@ -72,14 +104,25 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_broadcast_comm = None
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
-        # label the contiguous owned-buffer range).
+        # label the contiguous owned-buffer range). See `shard_start_global`
+        # for why that label cannot express non-contiguous ownership.
         my_start, _ = self._owned_local_layer_range()
-        self.layer_shard_start = self.start_layer + my_start
+        self.layer_shard_start = shard_start_global(
+            self.start_layer, my_start, self._local_slot_of
+        )
 
     # ---- layer ownership helpers ------------------------------------------
 
     def _local_layer_idx(self, layer_id: int) -> int:
-        return layer_id - self.start_layer
+        """Global layer id -> this stage's LOCAL buffer slot.
+
+        Delegates to the one rule on `KVCache`; the name is kept because this
+        file's ownership helpers read better with it. Under contiguous
+        ownership this is still the plain subtraction of `start_layer`; under
+        `SGLANG_PP_LAYER_SET` it is the rank of the layer within the owned set,
+        and a layer this stage does not own is refused rather than answered.
+        """
+        return self.local_slot(layer_id)
 
     def _owned_local_layer_range(self) -> tuple[int, int]:
         return get_layer_shard_range(
@@ -260,7 +303,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
@@ -269,7 +312,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
@@ -297,11 +340,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+            self.kv_buffer[self._local_layer_idx(layer_id)][loc] = cache_k.view(
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[self._local_layer_idx(layer_id)][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -322,7 +365,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         if not self._is_layer_owned(layer_id):
             return
         self._write_mla_kv_buffer(
-            self.kv_buffer[layer_id - self.start_layer],
+            self.kv_buffer[self._local_layer_idx(layer_id)],
             loc,
             cache_k_nope,
             cache_k_rope,
@@ -429,12 +472,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self, layer_id: int
     ) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
         return self._get_broadcastable_index_buffer(layer_id)
 
     def get_index_k_continuous(self, layer_id, seq_len, page_indices):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
         buf = self._get_broadcastable_index_buffer(layer_id)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -442,7 +485,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def get_index_k_scale_continuous(self, layer_id, seq_len, page_indices):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
         buf = self._get_broadcastable_index_buffer(layer_id)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -452,7 +495,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self, layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
     ):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self._local_layer_idx(layer_id))
         buf = self._get_broadcastable_index_buffer(layer_id)
         # Overlap the latent-KV owner-broadcast with the indexer read.
         self.prefetch_kv_buffer(layer_id)
@@ -469,7 +512,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.invalidate_index_buffer_for_layer(layer_id)
         if not self._is_layer_owned(layer_id):
             return
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self._local_layer_idx(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )

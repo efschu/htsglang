@@ -120,6 +120,11 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_kv_pool.register_layer_transfer_counter(None)
 
     def _wait_for_layer(self, layer_id: int):
+        # NOT routed through `KVCache.local_slot`, deliberately: this class
+        # pins `start_layer = 0` above and never calls `super().__init__`, so
+        # the expression is an identity on a GLOBAL layer id and the accessor's
+        # ownership map is never built here. Converting it would be the wrong
+        # conversion. Making this pool PP-aware is a separate question.
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 

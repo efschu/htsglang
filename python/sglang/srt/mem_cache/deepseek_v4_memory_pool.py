@@ -152,7 +152,7 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            return self.kv_buffer[self.local_slot(layer_id)].view(self.dtype)
 
         return self.kv_buffer[layer_id]
 
@@ -343,7 +343,7 @@ class DeepSeekV4IndexerPool(KVCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self.local_slot(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
@@ -356,7 +356,7 @@ class DeepSeekV4IndexerPool(KVCache):
     ) -> None:
         return fused_store_cache(
             input=cache_k,
-            cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
+            cache=self.index_k_with_scale_buffer[self.local_slot(layer_id)],
             indices=loc,
             page_size=self.page_size,
             type="indexer",
@@ -374,7 +374,7 @@ class DeepSeekV4IndexerPool(KVCache):
 
         return store_fp4_index_k_cache(
             input=cache_k,
-            cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
+            cache=self.index_k_with_scale_buffer[self.local_slot(layer_id)],
             loc=loc,
             page_size=self.page_size,
         )
@@ -972,7 +972,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def wait_layer_transfer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
 
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)

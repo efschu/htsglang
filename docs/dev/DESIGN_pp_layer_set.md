@@ -190,7 +190,49 @@ driven through it.
 **Still not built**: the transport itself. This module moves no bytes and knows
 no wire format — by design, so it could be finished before the wire exists.
 
-## 6. What remains
+## 6. The routing conversion — done, with two honest exclusions
 
-The KV-pool index translation (§3.1): ~80 inlined subtractions that must route
-through a rank-lookup accessor. Its own slice, with a correctness surface.
+§3.1's ~80 inlined subtractions are converted. `KVCache.local_slot` is the one
+rule: the plain subtraction under contiguous ownership, the rank of the layer
+within the owned set otherwise, and a **refusal** for a layer the stage does not
+own. The old expression's real defect was not that it was wrong but that it
+ANSWERED — an off-by-N index into a live KV buffer returns another layer's keys
+without crashing or warning, for exactly one layer.
+
+Converted (family **a**, local-slot semantics, all indexing a per-layer buffer):
+`memory_pool.py` (64 sites), `dsa_cache_layer_split.py` (11, through its own
+`_local_layer_idx`, which keeps its name and delegates),
+`deepseek_v4_memory_pool.py` (5).
+
+**Not** converted, deliberately (family **b**): `swa_memory_pool.py`. `SWAKVPool`
+pins `start_layer = 0` and never calls `super().__init__`, so its subtraction is
+an identity on a GLOBAL id and the accessor's map is never built there.
+Converting it would have been the wrong conversion. Making that pool PP-aware is
+a separate question; the reason is pinned at the site and in the suite, so a
+later `super().__init__` re-opens it. The 19 vendor NPU sites are untouched.
+
+### 6.1 The one thing the accessor does NOT fix: the PD wire format
+
+`local_slot` maps global -> local. `layer_shard_start` needs the INVERSE, and
+that direction is where non-contiguous ownership stops being an indexing
+problem. `disaggregation/prefill.py:170` builds the transfer descriptor as
+`prefill_start_layer + len(kv_data_ptrs)` — a start plus a **count**, read on
+the wire as a contiguous global range.
+
+For the family plan's second FA stage (layers 35..63 step 4: start 35, count 8)
+that pair claims layers 36..42 the stage does not own and omits 47..63 that it
+does. No index translation repairs this; the descriptor cannot represent a set.
+So `shard_start_global` **refuses** it rather than emitting a plausible range
+that would corrupt a KV transfer silently.
+
+This is scoped OUT of the family plan rather than blocking it: the plan is
+single-node PP+TP with no prefill/decode disaggregation, so it never builds this
+descriptor. Carrying a layer SET across the PD wire is a real design question
+(descriptor format + both endpoints), and it is open.
+
+## 7. What remains
+
+- The transport (§5): the schedule drives a `Link`; no wire exists yet.
+- KV-pool LAYOUT for non-contiguous FA ownership, beyond index translation.
+  Adjacent prior art: #718/#719 pool-rebind.
+- The PD descriptor question above, if disaggregation ever meets a layer set.
