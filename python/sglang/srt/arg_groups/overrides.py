@@ -2119,8 +2119,8 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
-        # bar1ep bildet Experte e auf Rang e // num_local_experts ab, genau
-        # wie deepep -- also spannt auch hier EP die ganze TP-Gruppe.
+        # bar1ep maps expert e onto rank e // num_local_experts, exactly as
+        # deepep does -- so here too EP spans the whole TP group.
         "bar1ep",
         "mooncake",
         "nixl",

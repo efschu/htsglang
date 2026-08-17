@@ -70,8 +70,8 @@ was alive (HANDOFF_675 1a, and the reason
 
 The user's own wording for item 15a is not "refuse", it is:
 
-    "Pruefung an der Allokation (frei-X >= 1024 sonst erst synchron
-     spillen)"
+    "check AT the allocation (free-X >= 1024, otherwise spill synchronously
+     first)"
 
 -- check at the allocation, and otherwise SPILL FIRST, synchronously. That
 is what this does. The verdict is recorded, logged and counted, and it does

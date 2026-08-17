@@ -6,8 +6,11 @@ WHY THIS IS NOT ``kv_pressure_runtime``
 takes a ``spill_fn``. It is nonetheless the wrong shape for item 15a, and the
 difference is the whole point of the user's order:
 
-    "SPILL-VOR-ALLOC -- Pruefung an der Allokation (frei-X >= 1024 sonst erst
-     synchron spillen), nicht reaktive Schwellen-Beobachtung"
+    "SPILL-BEFORE-ALLOC -- check AT the allocation (free-X >= 1024, otherwise
+     spill synchronously first), not reactive threshold watching"
+
+(Translated from the user's German; the original wording is in the commit that
+introduced this module.)
 
 ``on_round`` observes occupancy at a ROUND BOUNDARY and reacts. Between two
 boundaries an allocation can take the card below the floor, and the corridor

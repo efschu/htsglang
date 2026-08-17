@@ -277,10 +277,10 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
-    # Derselbe Dispatch-Vertrag wie deepep, Transport ueber den
-    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_BARLINK=1
-    # und SGLANG_BARLINK_TRANSPORT=bar1|matrix; ohne das meldet sich die
-    # Auswahl mit Grund ab, statt still auf etwas anderes auszuweichen.
+    # Same dispatch contract as deepep, transport over the BAR1 direct path
+    # (token_dispatcher/bar1ep.py). Requires SGLANG_BARLINK=1 and
+    # SGLANG_BARLINK_TRANSPORT=bar1|matrix; without those the selection
+    # refuses by name instead of quietly falling back to something else.
     "bar1ep",
     "mooncake",
     "nixl",

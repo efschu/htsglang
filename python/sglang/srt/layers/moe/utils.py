@@ -29,10 +29,10 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
-    # Derselbe Dispatch-Vertrag wie DEEPEP (Normalform, Ausgabeformat
-    # DEEPEP_NORMAL), anderer Transport: der BAR1-Direktpfad statt der
-    # DeepEP-Bibliothek. Siehe token_dispatcher/bar1ep.py. Opt-in; ohne
-    # ausdrueckliche Wahl aendert sich nichts.
+    # Same dispatch contract as DEEPEP (normal form, output format
+    # DEEPEP_NORMAL), different transport: the BAR1 direct path instead of the
+    # DeepEP library. See token_dispatcher/bar1ep.py. Opt-in; nothing changes
+    # without an explicit choice.
     BAR1EP = "bar1ep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
@@ -55,21 +55,21 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.NONE
 
     def is_deepep(self):
-        """DeepEP-Vertrag -- NICHT "die DeepEP-Bibliothek".
+        """The DeepEP CONTRACT -- NOT "the DeepEP library".
 
-        ``bar1ep`` gehoert bewusst hierher. Diese Abfrage steht an ueber
-        fuenfzig Stellen im Modellbaum und entscheidet dort **nicht**, welche
-        Bibliothek ruft, sondern ob die Schicht ueberhaupt ueber einen
-        Dispatcher geht (z.B. qwen3_moe.py:336 ``forward_normal`` vs
-        ``forward_deepep``, ep_moe/layer.py:275 ``get_moe_impl_class``,
-        utils.py ``is_deepep_class_backend``). Gaebe ``bar1ep`` hier False,
-        liefe die MoE-Schicht an ihrem eigenen Dispatcher vorbei -- genau der
-        Fehler, wegen dem das a2a in der barlink-Naht wirkungslos blieb.
+        ``bar1ep`` belongs here deliberately. This query appears at over fifty
+        places in the model tree, and what it decides there is **not** which
+        library gets called, but whether the layer goes through a dispatcher at
+        all (e.g. qwen3_moe.py:336 ``forward_normal`` vs ``forward_deepep``,
+        ep_moe/layer.py:275 ``get_moe_impl_class``, utils.py
+        ``is_deepep_class_backend``). If ``bar1ep`` answered False here, the
+        MoE layer would run straight past its own dispatcher -- precisely the
+        bug that left the a2a inert in the barlink seam.
 
-        Wer wirklich die DeepEP-Bibliothek meint (also den Bau von
-        ``DeepEPDispatcher``/``DeepEPBuffer``), fragt :meth:`is_deepep_native`.
-        Das sind genau die Stellen, die ein Objekt bauen -- nicht die, die
-        eine Wegentscheidung treffen.
+        Whoever really means the DeepEP LIBRARY (i.e. constructing
+        ``DeepEPDispatcher``/``DeepEPBuffer``) asks :meth:`is_deepep_native`.
+        Those are exactly the places that BUILD an object -- not the ones that
+        make a routing decision.
         """
         return self in (MoeA2ABackend.DEEPEP, MoeA2ABackend.BAR1EP)
 
@@ -385,8 +385,8 @@ def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
 def is_flashinfer_cutedsl_v1_path() -> bool:
     """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune).
 
-    ``is_deepep_native``, nicht ``is_deepep``: dieser Pfad haengt an DeepEPs
-    Low-Latency-Ausgabeform, und ``bar1ep`` baut nur die Normalform.
+    ``is_deepep_native``, not ``is_deepep``: this path depends on DeepEP's
+    low-latency output form, and ``bar1ep`` builds only the normal form.
     """
     return (
         get_moe_runner_backend().is_flashinfer_cutedsl()

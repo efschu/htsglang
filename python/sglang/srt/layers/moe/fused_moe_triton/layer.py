@@ -114,10 +114,10 @@ def _get_deepep_comm_group(a2a_backend):
         group = get_tp_group()
 
     elif a2a_backend.is_bar1ep():
-        # Der BAR1-Direktpfad haengt an get_tp_group().barlink_comm -- Peer-
-        # Zeiger-Tabelle und Schlitze gibt es nur fuer diese Gruppe. Eine
-        # andere Gruppe waere ein Haenger, kein Fehler; deshalb steht dieser
-        # Zweig hier und nicht als Sonderfall im Dispatcher.
+        # The BAR1 direct path hangs off get_tp_group().barlink_comm -- the
+        # peer pointer table and its slots exist for THIS group only. Another
+        # group would hang rather than raise, which is why this branch lives
+        # here and not as a special case inside the dispatcher.
         group = get_tp_group().device_group
 
     elif _is_npu:

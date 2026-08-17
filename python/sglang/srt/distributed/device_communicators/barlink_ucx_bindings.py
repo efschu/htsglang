@@ -386,8 +386,9 @@ class UcpWorker:
     """A UCP context + worker, plus persistent endpoints to peers.
 
     One worker per process. Endpoints are created once at rendezvous and kept
-    for the lifetime of the transport -- the brief's "persistente UCX-Endpoints,
-    keine per-Call-Verbindungen". Endpoint setup involves a wireup handshake
+    for the lifetime of the transport -- the brief's "persistent UCX endpoints,
+    no per-call connections" (translated). Endpoint setup involves a wireup
+    handshake
     that costs orders of magnitude more than the ~1.5 us the link is capable
     of; doing it per collective would dominate every decode step.
     """
