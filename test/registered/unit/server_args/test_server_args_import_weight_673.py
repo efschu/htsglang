@@ -116,17 +116,20 @@ class TestServerArgsImportWeight(CustomTestCase):
             "tightened to assert their absence after importing server_args too",
         )
 
-    def test_the_owner_of_the_torch_and_triton_pull_is_named(self):
-        """Not a behaviour test: it keeps the file:line attribution honest, so
-        the next reader does not re-derive it. Fails if utils/common stops
-        importing them at module level -- i.e. when the sibling fix lands."""
+    def test_the_owner_of_the_torch_pull_is_named(self):
+        """Keeps the attribution honest so the next reader does not re-derive
+        it. LADDER RUNG UPDATED: this used to assert that utils/common imported
+        BOTH torch and triton at module scope. The triton import is gone (the
+        override now arrives through the import hook, see
+        test_triton_patch_ordering_673.py), so the rung was tightened rather
+        than deleted -- torch is what remains, and it is structural."""
         import pathlib
 
         import sglang.srt.utils.common as common
 
-        lines = pathlib.Path(common.__file__).read_text().splitlines()
-        self.assertEqual(lines[86].strip(), "import torch")
-        self.assertEqual(lines[88].strip(), "import triton")
+        text = pathlib.Path(common.__file__).read_text()
+        self.assertIn("\nimport torch\n", text)
+        self.assertNotIn("\nimport triton\n", text)
 
 
 if __name__ == "__main__":
