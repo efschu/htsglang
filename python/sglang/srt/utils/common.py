@@ -1965,6 +1965,32 @@ class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
+def owned_layer_ids(layers, start_layer: int, end_layer: int):
+    """The global ids of the layers this stage owns, in execution order.
+
+    The counterpart to `make_layers`, and the ITERATION half of non-contiguous
+    ownership (`KVCache.local_slot` is the indexing half). Callers that used to
+    write ``range(self.start_layer, self.end_layer)`` should call this instead.
+
+    Contiguous ownership returns exactly that `range` object, so the default
+    path is unchanged. Under `SGLANG_PP_LAYER_SET` the span is WIDER than the
+    ownership -- a stage owning [35, 39, ..., 63] spans 29 layers and owns 8 --
+    and the span is not merely wasteful to iterate: the 21 unowned slots hold
+    `PPMissingLayer`, whose forward returns its first argument, so an invoked
+    placeholder hands back `positions` where the caller expects hidden states.
+    Placeholders have never been invoked before because the loop bounds and the
+    ownership were the same thing; a gapped set is the first case where a loop
+    can reach one. Iterating ownership keeps that true.
+
+    Ascending order is guaranteed here rather than left to the caller: layer
+    execution order is semantic, and a set has no order of its own.
+    """
+    owned = getattr(layers, "owned_layers", None)
+    if owned is None:
+        return range(start_layer, end_layer)
+    return sorted(owned)
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
