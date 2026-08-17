@@ -2906,7 +2906,9 @@ class Scheduler(
             return
         phase = getattr(self, "phase_flip_active_stack", None)
         self._parked_decode_verdict = (phase, bool(decode_blocked))
-        reqs = list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        reqs = (
+            list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
+        )
         self.parked_decode_set.sync_carriers(
             [getattr(r, "rid", "") for r in reqs],
             len(getattr(running_batch, "reqs", None) or []),
@@ -5618,6 +5620,33 @@ class Scheduler(
             )
         return self.tree_cache.check_prefetch_progress(req.rid)
 
+    @property
+    def chunked_commitment_ledger(self):
+        """#701 defect (b): the cross-pass reservation, owned HERE.
+
+        A ``PrefillAdder`` is rebuilt on every pass (see the construction in
+        ``_get_new_batch_prefill_raw``), so a ledger the adder made would forget
+        a resident chunked request's outstanding prefill exactly when the next
+        pass needs to see it -- which IS the defect. The scheduler outlives the
+        passes, so it is the right owner.
+
+        Not per-request-set either: commitments are keyed by request id and
+        released on finish/abort/retract, so the ledger self-cleans; tying it to
+        a set that turns over would drop live commitments instead.
+
+        LAZY on purpose. This must not depend on anything ``__init__`` builds --
+        it holds no pool, no allocator and no config, only integers keyed by
+        request id -- and constructing it on first read is what lets the
+        ownership be tested without standing up a scheduler.
+        """
+        from sglang.srt.planner.chunked_admission import ChunkedCommitmentLedger
+
+        ledger = getattr(self, "_chunked_commitment_ledger", None)
+        if ledger is None:
+            ledger = ChunkedCommitmentLedger()
+            self._chunked_commitment_ledger = ledger
+        return ledger
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -5832,6 +5861,11 @@ class Scheduler(
             # published. See that helper for why the two gates read the same
             # number through different doors.
             fundable_extend_floor=published_fundable_floor(self.tree_cache),
+            # #701 defect (b): pass the SCHEDULER-owned ledger into the adder
+            # this pass builds. Constructing it here instead would reset the
+            # outstanding commitments every pass, which is the hole the
+            # chokepoint subtraction cannot close on its own.
+            commitment_ledger=self.chunked_commitment_ledger,
         )
 
         if self.chunked_req is not None:
@@ -5882,9 +5916,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -8700,9 +8733,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert (
-        scheduler.disaggregation_mode == DisaggregationMode.NULL
-    ), "phase flip x PD disaggregation is refused at argument time"
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
