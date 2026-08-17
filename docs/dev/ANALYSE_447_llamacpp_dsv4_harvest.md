@@ -608,3 +608,128 @@ effort/yield item, and E is the one thing this task went looking for and found
   (our top-k is the JIT `topk_v1`/`topk_v2` at
   `python/sglang/jit_kernel/dsv4/topk.py:79-172`, not CUB).
 * No GPU was used. No `/spinning/gpu-arb/` window taken.
+
+---
+
+## 6 — Remainder determination (2026-08-17)
+
+Asked: what did #447 promise that #470 / #491 / #463 / #442 did NOT deliver?
+The two halves separately, each item matched to a commit or a file:line.
+
+### 6.1 Item (a), the DSpark head — NO DESK RESIDUE, all remainder is Boot B
+
+| §1.6 item | status | evidence |
+| --- | --- | --- |
+| fetch + filter the head to `mtp.*` | DELIVERED (operationally) | the boot arms run against `…/DeepSeek-V4-Flash-0731-dspark-head-filtered` |
+| boot-arm CLI recipe | DELIVERED, corrected and expanded | `TICKET_470_dspark_boots.md:70-79` adds solo placement, the draft GPU and the marlin runner |
+| risk 1, "fp8 on sm86" | SUPERSEDED by #463, and now a code refusal | real constraint is MXFP4-Marlin on SM90/SM120 (`mxfp4_marlin_moe.py:116-117`); enforced by `_refuse_unsupported_speculative_moe_backend` (`draft_worker_common.py:57-119`, #470) |
+| risk 3, vocab identity | DELIVERED (pre-existing, confirmed live) | `dspark_worker_v2.py:159-163`, `dspark_config.py:108-116` |
+| risk 2, draft attention backend pinned to `dsv4` | **OPEN, boot-gated** | `dspark_config.py:19-21` still hard-pins `DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"`; #417's own gates are desk-only and unrun |
+| risk 4 / §2.4, compressor rollback | **ANSWERED AT THE DESK — see 6.3** | this section |
+| acceptance-ladder floor (A-vs-A, same boot) | **OPEN, boot-gated** | no accept-length or ms/verify number for DSpark exists in the tree |
+
+The load-bearing fact behind all of it: **DSpark on DSV4 has never booted in
+this fork.** Four attempts on 2026-08-04 all died before `/health_generate`
+(marlin guard on a shadow rank, the `gpu_id`-vs-`tp_rank` axis, GGUF
+load-format inheritance, and finally a `resident_fraction` vector of three
+entries against `tensor parallelism is 1`). Boot A measured something real —
+pricing the residency cut at ~1.3-1.4 % of decode ms/round to free 10.21 GiB —
+but it ran with **no draft present at all**. Every DSpark-specific number
+(accept rate, ms/verify, whether the arm completes a forward) is unmeasured.
+
+So item (a) has nothing left that a desk can move. Its residue is one Boot B.
+
+### 6.2 Item (b), the llama.cpp delta sweep — COMPLETE, with recorded residue
+
+The sweep was not left unfinished: §4 IS its verdict list, six candidates with
+gain, effort and a note each. Their state today:
+
+* **A** — boot the §1.6 arm: boot-gated, and the same Boot B as 6.1.
+* **B** — query-axis chunking into `dsv4/`: consumed by **#449**. This is the
+  one item a later task took, which is what made the sweep look partial.
+* **C** — per-query-token page-table dedup (medium-large): open, unclaimed.
+* **D** — fused sm86/sm120 indexer kernel (large): open, unclaimed.
+* **E** — GGUF DSpark drafter: **deliberately refused** — "the one thing this
+  task went looking for and found not worth building", dominated by A.
+* **F** — SWA window from config: **BUILT (2026-08-17)**, see 6.4.
+
+C and D are ordinary indexer/prefill performance work with their effort and
+yield already priced. They are not DSpark-harvest work and do not need #447
+open to be picked up.
+
+### 6.3 §2.4 answered: we do not need llama.cpp's rollback, and it is structural
+
+§2.4 asked whether our compressor is a stateful ring that must be unwound when
+a draft token is rejected, and both this document and
+`TICKET_470_RESULT_first_boot.md:203-205` recorded it as unanswered and
+requiring Boot B. The DESIGN half of it does not: it is answerable by reading
+the write, and the answer is **no rollback machinery is needed**.
+
+1. **The write is position-addressed, not a ring append.** In the C128 decode
+   kernel, step 1 is a bare `tl.store(buf_ptr + write_loc * buf_stride_slot +
+   d, input_val)` — the destination slot is never loaded first, and nothing
+   accumulates. The PyTorch sibling is the same statement in one line:
+   `buf_flat[write_locs[valid_write]] = kv_score_input[valid_write]`
+   (`compressor_v2.py:385`). Re-running a position writes the same bytes.
+2. **The state buffer is paged and indexed, not sequential.**
+   `kv_score_buffer` is `[num_pages, 128, head_dim*2]` and is read by page
+   gather (`compressor_v2.py:418`).
+3. **A page is pooled only when it completes.** Step 2 returns zeros unless
+   `seq_len % COMPRESS_RATIO == 0`, so the softmax-pool over the page runs at
+   the completion boundary and nowhere else.
+
+llama.cpp needs `state_snapshot_*`/`state_restore_*` because its compressor
+state lives in `llama-memory-recurrent` rings, allocated with `n_rs_seq` EXTRA
+planes, where a write ADVANCES the state and a rejected token therefore leaves
+the ring in the wrong place. Ours has no position to rewind: a rejected draft's
+slot is either overwritten when that position is recomputed with the accepted
+token, or never pooled. The absence of `rollback|rewind|snapshot` in our tree
+is correct, not a gap.
+
+**What remains for the boot is now a confirmation, not an open question**, and
+it is narrower than "instrument the compressor": the pooling loop is
+`tl.static_range(COMPRESS_RATIO)` over all 128 slots with NO per-slot `seq_len`
+mask, so the safety rests entirely on (1) plus (3) — positional overwrite plus
+completion gating. The Boot B check is therefore: **no page is ever pooled
+while it still holds a slot belonging to a rejected position that is never
+recomputed.** That requires accepted lengths to advance contiguously, which is
+what makes it a check rather than a redesign.
+
+### 6.4 Candidate F, built
+
+`SWA_WINDOW = 128` was a bare constant, and all three DSV4 configs on this box
+declare `"sliding_window": 128` (0731-GGUF/UD-Q3_K_XL, the DSpark head, its
+filtered sibling — read before writing this). So the constant was right by
+luck. `verify_swa_window()` now checks the declared window at backend init and
+refuses a divergent checkpoint by name with both numbers; an UNDECLARED window
+keeps today's behaviour, because most configs in this family carry no such key.
+
+Built as a CHECK rather than a plumb-through deliberately: the window is not a
+free parameter. The compressor pools with `tl.static_range(COMPRESS_RATIO)` and
+the backend asserts `swa_page_size == SWA_WINDOW`, so threading a different
+number through would compress against the wrong span rather than honour it.
+Gain is exactly what §4 promised — zero today, correctness-by-luck removed.
+
+### 6.5 Proposed closure
+
+#447's desk work is COMPLETE. Item (b)'s sweep is finished and its verdicts
+stand; item (a) has no desk residue; §2.4, the one correctness question that
+looked boot-gated, is answered above and reduced to a confirmation.
+
+Recommendation: **close #447**, and carry its residue where it already lives —
+`WINDOW_2026_08_04_dsv4f_summary.md`'s Boot B entry, extended (6.6 below) with
+the two risks that were only implicit there. Candidates C and D re-file as
+their own indexer-performance items if they are wanted; keeping a harvest task
+open as their container hides that they are unclaimed.
+
+### 6.6 What was appended to the window ticket
+
+`WINDOW_2026_08_04_dsv4f_summary.md`'s Boot B entry already named the §2.4
+idempotence comparison. Two §1.6 risks were carried only implicitly there —
+"prerequisites for Boot B succeeding at all" rather than named gates — and are
+now written out, together with the narrowed form of §2.4 from 6.3:
+
+* risk 2, the `dsv4` draft-attention pin and its #417 dependency;
+* the acceptance-ladder floor as an A-vs-A same-boot measurement, not a
+  comparison against the external 0.6-0.77 band;
+* §2.4 restated as a confirmation with its exact check.

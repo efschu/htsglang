@@ -107,3 +107,42 @@ be called done.
 * **#478 stream-trim budget model** — see above. FIXED — the trim's target is raised to `anon + pinned(all live ranks) + headroom` when that floor sits above the configured target, with the pinned term published cross-rank because `memory.current` is cgroup-wide. **Next window: rerun the UD-Q3_K_XL attempt as a falsifier repetition — the sawtooth (86.2 → 76.8 → 95.5 → 82.7 → 101.5 → 103.5 → 103.9) must NOT recur, and one floor-above-target warning must appear instead; plus a neutrality boot on the standing IQ3_XXS recipe, whose floor is below its target and whose load time must not move.**
 * ~~`RESIDENT_FRACTION_CUT` default of 0.383 should become **~0.23** (measured); at 0.383 rank 0 OOMs mid-build.~~ DONE (`boot_470_dspark.sh:59`).
 * The `geom_seq` determined scorer is too strict — it marks `2 4 8 16 32 64 128` wrong for wanting `32 64 128`, understating quality.
+
+## Boot B, the #447 residue written out (added 2026-08-17, #447 §6)
+
+#447's remainder determination found item (a) has NO desk residue left: every
+open piece is this one boot. The Boot B entry above names the §2.4 comparison;
+these three are the rest of it, previously implicit as "prerequisites" rather
+than named gates. Nothing here is new work — it is #447 §1.6's risk list,
+carried to the window that can actually settle it.
+
+* **§2.4 compressor rollback — now a CONFIRMATION, not an open question.**
+  #447 §6.3 answered the design half at the desk: our compressor state is
+  position-addressed (`compressor_v2.py:385`, and the kernel's step 1 is a bare
+  `tl.store` with no read of the destination), paged rather than sequential,
+  and pooled only at a page-completion boundary (`seq_len % COMPRESS_RATIO ==
+  0`). llama.cpp needs snapshot/restore because its state is a recurrent ring
+  that a write ADVANCES; ours has no position to rewind. **What the boot must
+  confirm** is therefore narrow: no page is ever pooled while it still holds a
+  slot belonging to a REJECTED position that is never recomputed. The pooling
+  loop is `tl.static_range(128)` with no per-slot `seq_len` mask, so this rests
+  on positional overwrite plus completion gating — check it against
+  `idem_reference_470_a_cut.json` as already planned.
+* **Risk 2 — the draft attention backend is pinned.**
+  `dspark_config.py:19-21` hard-pins `DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"`,
+  the same backend whose sm86/sm120 routes #417 addresses. #417's own gates are
+  desk-only and have never run (no `RESULT_417` exists). If Boot B fails inside
+  the draft's attention rather than in placement, this is the first suspect,
+  and it makes #417 a dependency of this window rather than a parallel task.
+* **Acceptance-ladder floor — measure OURS, do not import theirs.** The
+  external 0.6-0.77 accept / 1.4-1.8x decode band is a reference, not a
+  baseline. #447 §1.6 requires "an A-vs-A same-boot measurement before any
+  delta is reported". Boot B produces the first DSpark accept length and
+  ms/verify this fork has ever had; until the A-vs-A floor is recorded in the
+  same boot, no delta against the external band may be claimed.
+
+Standing correction for whoever reads the DSpark claims: **no DSpark arm has
+ever booted on this rig.** Four attempts on 2026-08-04 died before
+`/health_generate`. Boot A's residency-cut number (~1.3-1.4 % of decode
+ms/round to free 10.21 GiB) is real and was measured with NO DRAFT PRESENT.
+Every DSpark-specific number in the tree is desk-only.
