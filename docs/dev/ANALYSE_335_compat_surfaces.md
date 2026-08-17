@@ -238,3 +238,122 @@ serving internals.
 load-bearing properties: reintroducing a serving handle fails 1, dropping the
 `response_format` mapping fails 3, routing `/api/generate` through the CHAT
 front fails 7.
+
+---
+
+## 8. `think`: the decline, revisited at code — and reversed for one half
+
+§7 declined to wire `think` because §6's "it becomes wirable via
+`chat_template_kwargs`" was a claim about a mechanism nobody had checked. It is
+checked now, and the mechanism is real:
+
+* `ChatCompletionRequest` carries `chat_template_kwargs`
+  (`entrypoints/openai/protocol.py:844`); `CompletionRequest` does **not**;
+* the chat front consumes it -- `merge_chat_template_kwargs`
+  (`serving_chat.py:160`), applied in `_convert_to_internal_request`
+  (`:566-582`), which also lifts `reasoning_effort` out of it onto the request;
+* #557 (`eef0e7734c`) built the per-request path and the Anthropic front
+  already drives it through `OpenAIServingChat.apply_reasoning_enabled`
+  (`serving_chat.py:1761`, used at `anthropic/serving.py:701,716`).
+
+So the mechanism reaches the front this surface composes, and the decline is
+reversed **for the boolean**. `think: true` / `think: false` now go through
+`apply_reasoning_enabled` — the front's own method, which knows the model's
+reasoning family (hunyuan, mistral, always-on) and RAISES for a model with no
+reasoning parser at all. That raise IS the per-template refusal the brief asked
+for, so it is delegated rather than re-derived: a second authority for a
+capability question is how two answers start disagreeing.
+
+**Two cases stay refused, and neither is squeamishness.**
+
+* **An effort level** (`"low"`/`"medium"`/`"high"`) would have to become
+  `reasoning_effort`. The served checkpoint takes its effort BY OMISSION, and
+  explicit high/max has been observed to fail at the server. That is live-model
+  behaviour this desk cannot verify, and sending a value the backend rejects
+  turns the caller's request into an error they did not cause. Refused with the
+  route named, so a caller who wants a level owns the choice on a path where
+  the error is theirs to see.
+* **Any `think` on `/api/generate`.** That path composes `CompletionRequest`,
+  which carries no `chat_template_kwargs` at all — there is no template being
+  applied, so there is no toggle. The asymmetry is a property of the protocols,
+  not an omission.
+
+The golden corpus took its second — and, by construction, last — intended
+delta: `think: true` is honoured, an effort level is still refused, and every
+other client-visible behaviour passed untouched.
+
+---
+
+## 9. ComfyUI — SCOPE ONLY, no build. Recommendation: PARK.
+
+**It is not a server-side surface, and that is the whole finding.** Every other
+entry in §1's matrix is an HTTP surface this server mounts. A ComfyUI
+integration is a *node pack*: a Python package the **user** installs into
+*their* ComfyUI tree, which then talks to us over HTTP as a client. Different
+artifact, different install path, different release cadence, different repo.
+
+**Do not confuse it with two things already in the tree**, both of which make
+"ComfyUI" grep-positive and neither of which is this:
+
+* `multimodal_gen/registry.py:233` handles **ComfyUI-format pipelines** — we
+  can LOAD what ComfyUI loads. That is a model-format concern.
+* `IA_342_frontend_v2.md:69-81` studies ComfyUI's **UI layout** as a source of
+  patterns for our own webui. That is design research.
+
+### What a minimal node pack would contain
+
+| node | talks to | notes |
+|---|---|---|
+| `SGLangChat` | `POST /v1/chat/completions` | text in / text out; the honest MVP, and it needs nothing this server does not already serve |
+| `SGLangImage` | `POST /v1/images/generations` | only useful when a diffusion lane is configured; `OpenAIServingImages` already refuses by name when none is (`serving_images.py:62`), so the node inherits a good error instead of inventing one |
+| `SGLangEndpoint` | — | a config node holding base URL + API key, so the other two do not each carry connection state |
+
+Plus the packaging ComfyUI requires: `__init__.py` exporting
+`NODE_CLASS_MAPPINGS` / `NODE_DISPLAY_NAME_MAPPINGS`, a `pyproject.toml` for
+the Comfy Registry, and a README. Perhaps 300-400 lines including the manifest.
+
+### Where it would live
+
+**Its own repository**, not a subdirectory here. Three reasons, in order of
+force: ComfyUI's registry installs from a repo root, so a subdirectory needs a
+publishing shim that will rot; its dependency set is ComfyUI's, not ours, and
+vendoring that into this tree's requirements would be a real cost for a client
+artifact; and its release cadence follows ComfyUI's breaking changes, which
+have nothing to do with this server's.
+
+### Effort against yield, honestly
+
+Implementation is **S-to-M** — the nodes are thin HTTP calls. The cost is not
+the code:
+
+* a second installable to version, publish and support, on a registry with its
+  own review process;
+* it cannot be tested in this repo's CI without a ComfyUI checkout, so its
+  falsifiers live somewhere we do not currently run anything;
+* the image node's value is gated on the diffusion lane being up, which on this
+  rig is not the default state.
+
+**Yield is real but indirect**: it reaches ComfyUI's user base, which is large
+and is exactly the audience the sdapi surface was also aimed at — and that
+audience can already reach us through `/sdapi/v1` using existing ComfyUI nodes
+that speak A1111. **That overlap is the strongest argument for parking**: the
+surface built this week may already serve most of this population.
+
+### Recommendation
+
+**PARK**, and revisit only if a concrete request for it appears, or after the
+sdapi window item shows real A1111-speaking clients working (which would both
+prove the reach and tell us what the node pack would need to do differently).
+The decision is the user's; this section exists so it can be made on the shape
+of the work rather than on the name.
+
+### The adjacent gap the brief asked about
+
+**OpenAI embeddings on a generative-only checkpoint: NOT ESTABLISHED.** The
+route is mounted (`http_server.py:2168`) and forwards to
+`openai_serving_embedding.handle_request`. I did not find a named refusal for
+"this checkpoint cannot embed" in `serving_embedding.py`, but I only grepped it
+— I did not trace the path to its failure mode, and an absence claim needs the
+file:line of the gate that refuses. So this is a CANDIDATE gap, not a finding,
+and it is cheap to settle: one hermetic test asking a generation-only server
+for an embedding and reading what comes back.

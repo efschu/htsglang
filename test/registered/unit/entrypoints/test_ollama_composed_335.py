@@ -52,9 +52,23 @@ def _code_only() -> str:
 class _Front:
     status_code = 200
 
-    def __init__(self, chat=True):
+    def __init__(self, chat=True, reasoning=True):
         self.chat = chat
         self.last_request = None
+        self.reasoning = reasoning
+        self.reasoning_calls = []
+
+    def apply_reasoning_enabled(self, request, enabled):
+        """The real front's signature. It RAISES for a model with no reasoning
+        parser, which is where the per-template refusal comes from."""
+        if not self.reasoning:
+            if enabled:
+                raise ValueError(
+                    "Anthropic thinking is not supported for models without "
+                    "a reasoning parser"
+                )
+            return
+        self.reasoning_calls.append(enabled)
 
     async def handle_request(self, request, raw_request):
         self.last_request = request
@@ -180,6 +194,60 @@ class TestTheFormatWin(CustomTestCase):
             )
         )
         self.assertEqual(comp.last_request.response_format.type, "json_object")
+
+
+class TestThinkIsWiredThroughTheFront(CustomTestCase):
+    """#557's per-request chat_template_kwargs mechanism DOES reach the chat
+    front this surface composes, so ``think`` stops being a refusal -- but
+    only the half whose safety can be established.
+
+    The capability question is not re-implemented here: the front's own
+    ``apply_reasoning_enabled`` knows the model's reasoning family and raises
+    for a model that has no reasoning parser at all. Extending that is the
+    whole point of composing.
+    """
+
+    def test_think_true_turns_reasoning_on_through_the_front(self):
+        serving, chat, _ = _serving()
+        _run(serving.handle_chat(_chat(think=True), None))
+        self.assertEqual(chat.reasoning_calls, [True])
+
+    def test_think_false_turns_reasoning_off_through_the_front(self):
+        serving, chat, _ = _serving()
+        _run(serving.handle_chat(_chat(think=False), None))
+        self.assertEqual(chat.reasoning_calls, [False])
+
+    def test_no_think_field_touches_nothing(self):
+        """The falsifier: absent must mean absent. Forcing a mode when the
+        caller said nothing would override the server's own default, which is
+        the #540 absent-means-something question and not this adapter's to
+        answer."""
+        serving, chat, _ = _serving()
+        _run(serving.handle_chat(_chat(), None))
+        self.assertEqual(chat.reasoning_calls, [])
+
+    def test_a_model_without_reasoning_is_refused_not_500(self):
+        """The front raises; the adapter must turn that into Ollama's 400
+        envelope rather than letting it surface as a server error."""
+        chat, comp = _Front(True, reasoning=False), _Front(False)
+        serving = OllamaServing(chat, comp, model_name="test-model")
+        r = _run(serving.handle_chat(_chat(think=True), None))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("think", str(r.body))
+
+    def test_effort_levels_are_still_refused_by_name(self):
+        """Ollama also allows think="low"|"medium"|"high". Those would have to
+        become reasoning_effort, and the operative checkpoint's semantics are
+        effort-BY-OMISSION with explicit high/max observed to fail at the
+        server. Sending a value the backend rejects is the one thing an
+        adapter must not do, and the hazard is a live-model behaviour this
+        desk cannot verify -- so it is refused with the route named."""
+        for level in ("low", "medium", "high"):
+            with self.subTest(level=level):
+                serving, chat, _ = _serving()
+                r = _run(serving.handle_chat(_chat(think=level), None))
+                self.assertEqual(r.status_code, 400)
+                self.assertEqual(chat.reasoning_calls, [])
 
 
 class TestOptionsReachTheRequest(CustomTestCase):

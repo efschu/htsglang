@@ -3458,9 +3458,22 @@ taxonomy and the global importance ladder.
   REFUSED. Composing made it reachable: `format` is `response_format`
   (`"json"` -> `json_object`; a schema -> a named `json_schema` with `strict`,
   because a caller who supplied a schema wants it obeyed, not approximated).
-  `think` REMAINS refused, with the route named: `chat_template_kwargs` is a
-  plausible mechanism that was not verified at code, and wiring on that basis
-  would be the guess this family refuses elsewhere.
+  `think` is WIRED as a boolean and refused otherwise, verified at code
+  (`ANALYSE_335` §8): `ChatCompletionRequest` carries `chat_template_kwargs`
+  (`protocol.py:844`), the front consumes it (`merge_chat_template_kwargs`,
+  `serving_chat.py:160`), and #557 (`eef0e7734c`) built the per-request path
+  the Anthropic front already drives. `think: true|false` goes through
+  `OpenAIServingChat.apply_reasoning_enabled` (`serving_chat.py:1761`) — the
+  front's OWN method, which knows the model's reasoning family and RAISES for a
+  model with no reasoning parser; that raise is the per-model refusal,
+  delegated rather than re-derived, and turned into Ollama's 400 envelope.
+  STILL REFUSED, each for a stated reason: an effort level
+  (`"low"/"medium"/"high"`), because it would become `reasoning_effort` and the
+  served checkpoint takes effort BY OMISSION with explicit high/max observed to
+  fail at the server — sending what the backend rejects turns the caller's
+  request into an error they did not cause; and any `think` on `/api/generate`,
+  because that path composes `CompletionRequest`, which carries no
+  `chat_template_kwargs` at all, so there is no template to toggle.
   GATES: a CODE-ONLY forbidden-vocabulary pin (`tokenizer_manager`,
   `apply_chat_template`, `sampling_params`, `GenerateReqInput`,
   `guard_generate_stream`) — comments and docstrings are stripped before the
@@ -3480,6 +3493,29 @@ taxonomy and the global importance ladder.
   bypassed by it.
   NOT CLAIMED: no stock Ollama client has been pointed at a running server —
   window item.
+- **ComfyUI integration (#335) — SCOPED, NOT BUILT, recommendation PARK.**
+  `ANALYSE_335` §9; the user decides park-vs-build. It is NOT a server-side
+  surface: it is a NODE PACK the user installs into their own ComfyUI tree,
+  which then talks to this server as an HTTP client — own repo, own dependency
+  set, own release cadence, and untestable in this repo's CI without a ComfyUI
+  checkout. A minimal pack is ~300-400 lines: an `SGLangChat` node against
+  `/v1/chat/completions`, an `SGLangImage` node against
+  `/v1/images/generations` (which inherits the lane-absent refusal at
+  `serving_images.py:62` instead of inventing one), and an endpoint/config
+  node, plus the registry manifest.
+  DO NOT CONFUSE with two grep-positive things that are not it:
+  `multimodal_gen/registry.py:233` loads ComfyUI-format PIPELINES (a model
+  format concern), and `IA_342_frontend_v2.md:69-81` studies ComfyUI's UI
+  LAYOUT for our own webui (design research).
+  THE PARK ARGUMENT: ComfyUI users can already reach this server through the
+  `/sdapi/v1` surface using existing A1111-speaking nodes, so the surface built
+  this week may already serve most of that population. Revisit if a concrete
+  request appears, or after the sdapi window item shows real clients working.
+  ADJACENT, NOT ESTABLISHED: whether `/v1/embeddings` names a refusal on a
+  generative-only checkpoint. The route is mounted (`http_server.py:2168`); I
+  grepped `serving_embedding.py` and found no named refusal, but did not trace
+  the path, and an absence claim needs the refusing gate's file:line. Candidate
+  gap, settleable by one hermetic test.
 - **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
   idle work is wrapped behind: a VRAM lease, preemption by
   checkpoint-and-release, a work estimate, a feasibility answer and an

@@ -127,6 +127,12 @@ class _FakeFront:
         self.deltas = deltas
         self.chat = chat
         self.last_request = None
+        self.reasoning_calls = []
+
+    def apply_reasoning_enabled(self, request, enabled):
+        """Mirrors OpenAIServingChat's real method, which the composed adapter
+        delegates the per-model reasoning capability question to."""
+        self.reasoning_calls.append(enabled)
 
     async def handle_request(self, request, raw_request):
         self.last_request = request
@@ -404,8 +410,16 @@ class TestTheFourNamedRefusals(CustomTestCase):
         r = self._chat(format="json")
         self.assertEqual(_body(r)["done"], True)
 
-    def test_think_is_refused(self):
+    def test_think_true_is_now_HONOURED_not_refused(self):
+        """The second and last golden assertion this surface's rewrites are
+        allowed to change: #557's chat_template_kwargs mechanism reaches the
+        chat front, so the boolean toggle is wired. An effort LEVEL is still
+        refused -- see the composed suite for why."""
         r = self._chat(think=True)
+        self.assertEqual(_body(r)["done"], True)
+
+    def test_an_effort_level_is_still_refused(self):
+        r = self._chat(think="high")
         self.assertEqual(r.status_code, 400)
         self.assertIn("think", _body(r)["error"])
 
@@ -438,7 +452,7 @@ class TestTheFourNamedRefusals(CustomTestCase):
                     model="m",
                     messages=[OllamaMessage(role="user", content="hi")],
                     stream=False,
-                    think=True,
+                    think="high",
                 ),
                 None,
             )

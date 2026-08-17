@@ -77,13 +77,10 @@ class OllamaServing:
     #:
     #: ``format`` is NO LONGER HERE: composing made it reachable, which is the
     #: change this module exists for.
-    UNSUPPORTED_FIELDS: Dict[str, str] = {
-        "think": (
-            "reasoning control is not mapped by this surface. Use "
-            "/v1/chat/completions, whose chat_template_kwargs reaches the "
-            "model's own reasoning toggle"
-        ),
-    }
+    #: Nothing is unconditionally unsupported any more. ``think`` is refused
+    #: CONDITIONALLY -- see :meth:`_think_refusal` -- because whether it can be
+    #: honoured depends on the shape of the value and on which endpoint asked.
+    UNSUPPORTED_FIELDS: Dict[str, str] = {}
 
     #: Declared, accepted, and knowingly without effect -- the honest third
     #: category between mapped and refused.
@@ -152,6 +149,9 @@ class OllamaServing:
         for field_name, why in self.UNSUPPORTED_FIELDS.items():
             if getattr(request, field_name, None) is not None:
                 reasons.append(f"{field_name!r}: {why}")
+        think_refusal = self._think_refusal(request)
+        if think_refusal:
+            reasons.append(think_refusal)
         options = getattr(request, "options", None) or {}
         unknown = sorted(k for k in options if k not in self.SUPPORTED_OPTIONS)
         if unknown:
@@ -162,6 +162,57 @@ class OllamaServing:
                 f"asked and nothing would say so."
             )
         return reasons
+
+    def _think_refusal(self, request) -> Optional[str]:
+        """``think`` is honourable only as a BOOLEAN, and only on /api/chat.
+
+        #557 built per-request ``chat_template_kwargs`` and it reaches the
+        chat front this surface composes (``ChatCompletionRequest`` carries the
+        field; ``merge_chat_template_kwargs`` consumes it). So ``think: true``
+        and ``think: false`` are wired -- through the front's OWN
+        ``apply_reasoning_enabled``, which knows the model's reasoning family
+        and refuses a model that has no reasoning parser at all. Re-deriving
+        that capability check here would be a second authority for it.
+
+        TWO CASES STAY REFUSED, each for a reason that is not squeamishness:
+
+        * **an effort level** (``"low"``/``"medium"``/``"high"``) would have to
+          become ``reasoning_effort``. The operative checkpoint's semantics are
+          effort-BY-OMISSION, with explicit high/max observed to fail at the
+          server; sending a value the backend rejects is precisely what an
+          adapter must not do, and that hazard is live-model behaviour this
+          module cannot verify. Refused with the route named, so a caller who
+          wants it owns the choice on a path where the error is theirs to see.
+        * **any ``think`` on /api/generate**, because that path composes
+          ``CompletionRequest``, which carries no ``chat_template_kwargs`` at
+          all -- there is no template being applied to toggle.
+        """
+        value = getattr(request, "think", None)
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            return (
+                f"'think': {value!r} is an effort level, which would have to "
+                f"become reasoning_effort. This surface will not send it: the "
+                f"served checkpoint takes its effort by OMISSION and explicit "
+                f"high/max has been observed to fail at the server, so an "
+                f"adapter guessing here turns your request into an error you "
+                f"did not cause. Use /v1/chat/completions with "
+                f"reasoning_effort if you want to choose a level yourself, or "
+                f"send think: true / think: false, which are honoured."
+            )
+        if not self._is_chat_request(request):
+            return (
+                "'think' is only honourable on /api/chat: /api/generate is a "
+                "raw completion, which applies no chat template and therefore "
+                "has no reasoning toggle to set. Use /api/chat, or "
+                "/v1/chat/completions."
+            )
+        return None
+
+    @staticmethod
+    def _is_chat_request(request) -> bool:
+        return hasattr(request, "messages")
 
     def _refusal(self, reasons: List[str]) -> ORJSONResponse:
         return ORJSONResponse(
@@ -232,6 +283,25 @@ class OllamaServing:
             stream=bool(request.stream),
             **self._openai_fields(request),
         )
+
+        if isinstance(getattr(request, "think", None), bool):
+            # The front owns the capability question (which reasoning family,
+            # always-on models, no parser at all). It RAISES rather than
+            # silently leaving the model in the wrong mode, and that raise is
+            # the per-model refusal this surface promises -- turned into
+            # Ollama's own 400 envelope rather than allowed to surface as a
+            # server error the client cannot read.
+            try:
+                self._chat.apply_reasoning_enabled(chat_request, request.think)
+            except ValueError as exc:
+                return self._refusal(
+                    [
+                        f"'think': {exc}. This model cannot serve the "
+                        f"reasoning mode you asked for, and answering in the "
+                        f"other one without saying so would be the silent "
+                        f"overrule this surface exists to prevent."
+                    ]
+                )
 
         start = time.time_ns()
         response = await self._chat.handle_request(chat_request, raw_request)

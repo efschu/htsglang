@@ -105,14 +105,24 @@ class TestUnhonouredFieldsAreRefusedByName(unittest.TestCase):
         self.assertEqual(got["json_schema"]["schema"], schema)
         self.assertIs(got["json_schema"]["strict"], True)
 
-    def test_think_is_refused(self):
-        reasons = _serving().unsupported_reasons(_chat(think=True))
+    def test_think_as_a_boolean_is_honoured_not_refused(self):
+        """#557's mechanism reaches the chat front, so the toggle is wired."""
+        self.assertEqual(_serving().unsupported_reasons(_chat(think=True)), [])
+        self.assertEqual(_serving().unsupported_reasons(_chat(think=False)), [])
+
+    def test_an_effort_level_is_refused_with_the_route_named(self):
+        """It would become reasoning_effort, and the served checkpoint takes
+        effort by OMISSION with explicit high/max observed to fail. Refusing
+        beats turning the caller's request into an error they did not cause."""
+        reasons = _serving().unsupported_reasons(_chat(think="high"))
         self.assertEqual(len(reasons), 1)
-        self.assertIn("think", reasons[0])
+        self.assertIn("reasoning_effort", reasons[0])
 
     def test_generate_is_gated_the_same_way(self):
         """Both handlers, or a client just moves to the ungated one."""
         self.assertTrue(_serving().unsupported_reasons(_gen(think=True)))
+        # /api/generate composes CompletionRequest, which carries no
+        # chat_template_kwargs at all -- there is no template to toggle.
 
 
 class TestUnmappedOptionsAreRefusedNotDropped(unittest.TestCase):
