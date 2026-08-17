@@ -201,8 +201,44 @@ def check_and_register_pinned_post(
         register_pinned_post(post)
         return
     others = [p for p in registered_posts() if p.name != name]
+    # THE ALREADY-ALLOCATED POSTS MUST BE CREDITED BACK, or they are charged
+    # twice. `available` is read LIVE, a moment where every post in `others`
+    # has ALREADY been allocated -- their bytes are therefore already missing
+    # from it. Adding them to the demand as well bills them a second time.
+    #
+    # `joint_pinned_host_error` is right where it was designed to be used: the
+    # launcher calls it once over CONFIGURED numbers, before anything is
+    # pinned, so there `available` is untouched by any post and summing them
+    # all is exact. Reusing that same comparison as a RUNTIME backstop is what
+    # introduces the error, because by then the sum and the availability
+    # figure disagree about what has happened.
+    #
+    # MEASURED, 2026-08-17. The Flip+HiCache boot refused on PP0 with
+    # "40.42 GB requested ... does not fit in 33.97 GB available minus a
+    # 10.74 GB OS reserve": 35.18 GB of that demand was the three phase-flip
+    # weight images, which #695 registers AFTER allocating them
+    # (weights_arena.py:428). Sampled against the live serving process the same
+    # day: MemAvailable 33.62 GB while the three schedulers held 86.51 GB
+    # resident on a 126.75 GB box -- i.e. the images were in RSS and already
+    # absent from `available`. The true marginal cost of that boot was the 5.24
+    # GB tier, which fits in 23.23 GB with 18 GB to spare.
+    #
+    # Crediting is sound only because registration FOLLOWS allocation for every
+    # producer of a post: `check_and_register_pinned_post` registers after its
+    # own check (so the post being weighed now is correctly NOT credited), and
+    # the weight images register after `_alloc_host_image` returns. A post that
+    # was registered BEFORE its allocation would be over-credited here, so a
+    # future producer that reserves ahead of allocating must not use this path.
+    #
+    # Other ranks' pins are correctly still charged: they are absent from
+    # `available` and absent from `others`, which is this process's registry
+    # only -- the rank-divergence bound in the module docstring is unchanged.
+    already_allocated = sum(int(p.nbytes) for p in others)
     err = joint_pinned_host_error(
-        list(others) + [post], total, available, reserve_bytes
+        list(others) + [post],
+        total,
+        int(available) + already_allocated,
+        reserve_bytes,
     )
     if err is not None:
         raise ValueError(err)
