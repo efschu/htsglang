@@ -355,3 +355,79 @@ Any of: a hard OOM; a rank divergence or wedge; retracted requests that do not
 return; parks not falling per engagement **while rungs report they paid** (which
 would mean the accounting lies); or a decode-latency regression beyond what the
 spill's host bandwidth explains.
+
+---
+
+## 7. The counter-vs-actuator family register (#694 remainder, 2026-08-17)
+
+Recorded here so a later member is found **by search rather than by a crash**.
+
+### The signature
+
+> A relief / eviction / recovery path **counts** capacity; a **separate
+> actuator** delivers it; the actuator delivers **less** than the count; and
+> the caller **treats the count as a promise**, so it raises or wedges instead
+> of degrading or retrying.
+
+### Members
+
+| # | member | where the count and the delivery part ways | remedy |
+|---|---|---|---|
+| 1 | **#679** alloc retry | relief ladder re-entry | retry = *identical* call |
+| 2 | **#681** paged twin / third root | `free_group` staging is invisible to `available_size` while the tree has already counted the rows evicted | `flush_free_group` before the raise |
+| 3 | **#684** recover-over-ceiling | recovery counted past the ceiling | — |
+| 4 | **#715** evictable-not-deliverable | same root as #681, wired on only one of three alloc paths | flush staged frees + retry **before** the relief ladder, on *all* paged paths |
+| 5 | **unified-SWA joint budget** (below) | closed-form joint count vs sequential two-step bind | **not fixed — unreachable, pinned** |
+
+### Sweep result: no *reachable* fifth member
+
+Everything live in a default or commonly-enabled configuration either traces to
+one of the four above, or re-checks real post-delivery state instead of
+trusting a count. Worth naming, because these are the shape the family wants
+copied:
+
+* `corridor_guard._spend_ladder` re-probes real `free_bytes()` after every
+  relief-provider call rather than trusting the provider's arithmetic — and
+  says so in a comment.
+* `pin_ledger.reserve` and `lru_file_evictor._enforce_free_space_locked`
+  re-probe real post-eviction state, citing *"the #715 lesson"* by name.
+* `schedule_batch` **discards** `evict_from_tree_cache()`'s return value and
+  gates on a fresh `decode_mem_avail()`.
+* The radix-cache family computes the count and performs the delivery in the
+  **same call**, so divergence is structurally impossible there.
+* `allocator/hisparse.py`'s `free_group_begin`/`free_group_end` are literal
+  no-ops, which makes its staging branch dead code — safe for a reason worth
+  writing down, since it looks like #681 and is not.
+
+### Member 5 — `UnifiedSWATokenToKVPoolAllocator`, SUSPECT and UNREACHABLE
+
+`python/sglang/srt/mem_cache/multi_ended_allocator.py`.
+
+* **Count:** `UnifiedSWATokenToKVPoolAllocator.available_size()` solves a
+  closed-form joint budget across *both* sub-pools at once.
+* **Actuator:** `MultiEndedAllocator._alloc_bind_fast_or_slow()` runs
+  **sequentially** — the full-attention side binds first and consumes its share
+  of the shared byte gap; the SWA side then binds against what remains, using a
+  virtual-page snapshot taken *before* the first bind ran.
+* **Promise:** four bare asserts (`:769`, `:2280`, `:2326`, `:2355`). The one at
+  `:769` states the trust in its own message — *"the composite's byte-budget
+  check should have caught this"*. Worse, `alloc()` already **has** a graceful
+  path (restores its virtual ids, returns `None`), and the composite wraps that
+  safe return in `assert ... is not None`, turning a designed degradation back
+  into a crash.
+
+**Not fixed, per the #487 rule:** gated behind `--enable-unified-memory`
+(default `False`, and refused alongside speculative decoding and PD
+disaggregation), so it is unreachable today. Pinned instead, in
+`test/registered/unit/mem_cache/test_counter_actuator_sweep_694.py`, including
+a pin on the default itself — **if that default ever flips, the pin fails and
+this must be fixed before the flip lands.**
+
+### Branch-state note, not a family member
+
+On this integration base, `_flush_deferred_frees` is called **only** from
+`alloc_token_slots` (`mem_cache/common.py:513`); `alloc_paged_token_slots_extend`
+(`:1075`) and `alloc_paged_token_slots_decode` (`:1334`) do not call it. That is
+the already-diagnosed **#715** defect, whose fix lives on the `fix/717-rebuild`
+lineage and has not yet been reconciled onto this base — a merge-train item,
+not a new member. It is recorded here so nobody re-diagnoses it from a crash.
