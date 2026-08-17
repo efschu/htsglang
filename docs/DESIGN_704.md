@@ -2449,3 +2449,147 @@ setter now makes unreachable.
 5. **Pool/group world agreement is unchecked at boot.** B1's manifest check
    covers the group; nothing yet cross-checks that every rank recorded a plan
    with the same period and layer set.
+
+## §5 — #704a: the layout ladder indexed by FILL, and what a rung change costs
+
+**Status: MECHANISM, not a recommendation.** Every pool and speed number below
+is solver output on the STRUCTURAL free-bytes fixture, which the review gate
+established was fitted against the incumbent and does not reproduce measured
+boots. No cut is recommended here; the only cut on the user's morning list is
+#702's, and this section does not add to it. What the ladder contributes is the
+mechanism and the *cost* side, and the cost side rests on measured inputs
+(arena bytes, link rates) rather than on the fitted vector.
+
+### The machinery already existed; what was missing was the price
+
+`planner/layout_ladder.py` already solved rungs as a Pareto frontier, indexed
+them by occupancy (`Rung.admit_up_to_tokens`), and derived hysteresis bands
+(`Transition.descend_below_tokens` / `ascend_above_tokens`). This slice did not
+rebuild any of that. It corrected what a step COSTS and added the fill-indexed
+view over it.
+
+### The mispricing: a rung change is not a delta move
+
+`_solve_transitions` charged a step as `moved_layers x weight_mib_per_layer`
+over the gating link. That prices a cross-rank weight mover — which does not
+exist, and whose absence is explicit (`regime_stages.py:100`,
+`REACH_NO_WEIGHT_MOVER`).
+
+The actuator that does exist is `PhaseFlipStacks.refill`
+(`managers/phase_flip_boot.py:361`, `arena_refill` `:539`,
+`dst.copy_(payload)` `:576`): a CONTIGUOUS host→device memcpy of a whole
+boot-baked arena image, swapping which pre-loaded layout occupies a rank's
+arena. The bytes on the wire are the same whether one layer moves or six.
+
+With the #690-rev2 refill of 9614.9 MiB per rank over the measured links
+(13 / 13 / 6.4 GB/s, authoritative mapping), and noting that nothing crosses a
+rank boundary so the refills run CONCURRENTLY and the slowest card sets the
+step:
+
+| | x8 card | x8 card | x4 card | step |
+|---|---|---|---|---|
+| refill 9614.9 MiB | 776 ms | 776 ms | **1575 ms** | **1575.3 ms** |
+
+Against the moved-layer estimate the correction is **10.7x to 21.3x**. A rung
+change is **38–79% of a whole phase flip** (#690's fixed 2.0–4.2 s), not a
+cheap dial.
+
+The band consequence is real but small: a longer move must start earlier, so
+every `ascend_above_tokens` drops — by ~30k tokens, under 1% of pool at these
+sizes. **The mispricing mattered for the DECISION, not for the guard.**
+
+### The consequence that changes how a ladder should be driven
+
+The switch cost is **constant in the distance travelled** — it is the whole
+arena either way. So crossing twelve rungs one at a time costs
+`12 x 1.575 s = 18.9 s`; crossing them in ONE jump costs 1.575 s. A
+constant-cost actuator inverts the usual ladder intuition:
+
+> **A ladder with a constant-cost step must be traversed in single jumps, never
+> rung by rung.** Rungs are choices of destination, not stations to stop at.
+
+The per-step value is also wildly unequal, which the fill table makes visible
+(arena depth 40, draining leg):
+
+| fill | cut | pool | speed | step | payback |
+|---|---|---|---|---|---|
+| 346,192 | [33,15,16] | 364,413 | 1.0000 | — | — |
+| 276,954 | [39,12,13] | 309,458 | 1.2308 | 1575 ms | **8.4 s** |
+| 207,715 | [40,12,12] | 278,513 | 1.2532 | 1575 ms | **87.9 s** |
+| 138,477 | [40,12,12] | 278,513 | 1.2532 | 0 | — |
+
+The first step buys 23% for 1.575 s; the next buys 1.8% for the same 1.575 s
+and needs 88 s of prefill to repay. A controller stepping uniformly would pay
+full price for a marginal rung.
+
+### Arena depth is the master knob, and it is a real trade
+
+The arena is sized for the DEEPEST reachable rung and is resident at EVERY
+rung, so asking for ladder range makes every rung poorer:
+
+| deepest rank0 | rungs | roomiest pool | fastest | pool span | end-to-end payback |
+|---|---|---|---|---|---|
+| 36 | 2 | 421,894 | 1.0071 | 0.3% | **224.7 s** |
+| 38 | 5 | 418,848 | 1.1538 | 13.2% | 11.8 s |
+| 40 | 8 | 364,413 | 1.2532 | 23.6% | **7.8 s** |
+
+At depth 36 the ladder is **economically dead**: 1.575 s buys 0.7%, repaid
+after 225 s. At depth 40 it is live, but the roomiest rung has lost 13.6% of
+its pool against depth 36 purely for holding the option. **The viability
+condition is a property of the arena depth, not of the ladder.**
+
+### The two kinds of step, and a defect this found in my own API
+
+A ladder is traversed in both directions and only ONE direction is an economic
+decision:
+
+* **ASCEND** (fill rising → roomier, slower rung) is **MANDATORY**. Its
+  alternative is not "stay fast", it is "stop admitting". Payback is correctly
+  infinite, and reading that as "never do this" inverts the meaning.
+* **DESCEND** (fill draining → tighter, faster rung) is **DISCRETIONARY**, and
+  is the only step the #677 economics decide.
+
+The first cut of `solve_fill_ladder` required ASCENDING fill levels. Rising
+fill only ever moves to roomier, slower rungs, so the interface could express
+nothing but forced moves and reported an infinite payback on every one of
+them — the discretionary step, the one the function exists to price, was
+unreachable through it. Monotone in either direction now; a test pins both legs.
+
+### Integration with the #677 economics controller
+
+They share the arena machinery, so they are spending from the SAME budget: a
+cut jump and a phase flip are both an arena refill, and a rank cannot do both
+at once. The controller therefore ranks them rather than running two policies.
+
+Admit a discretionary cut jump only when all four hold:
+
+1. **It is a jump, not a step.** Target the fastest rung the projected
+   occupancy admits, never the adjacent one. Cost is distance-independent.
+2. **Payback fits the window.** `payback = switch_s / (1 - s_from/s_to)` must
+   be shorter than the expected residence at the target, using #677's own
+   backlog-derived window rather than a fixed horizon.
+3. **It beats the flip for the same stall.** Both cost one refill. A cut jump
+   buys a prefill factor within one regime; a flip changes regime. Where a
+   decode backlog is what is starving, the flip wins on the same budget — the
+   cut jump is only preferred when the workload is prefill-bound at an
+   occupancy the faster rung still admits.
+4. **The band still holds.** The #677 decision is a veto on top of the
+   hysteresis, never a replacement: `descend_below_tokens` prevents
+   oscillation, and economics only decide whether an already-safe step is
+   worth its stall.
+
+Mandatory ascends bypass all four. They are not economic and must not be
+gated on payback.
+
+### What is NOT established
+
+- No cut is recommended, and the arena-depth table is a trade to be decided,
+  not a proposal.
+- Pool values inherit the fitted free vector and the ±500 MiB unbooted arming
+  floor uncertainty (~7% at 8 attention layers).
+- 9614.9 MiB is taken as given from #690-rev2 and assumed uniform per rank; if
+  arenas differ per rank the gating term changes, though the concurrency
+  argument does not.
+- Nothing here has booted. The ladder has never performed a rung change on
+  metal, so the 1575 ms is an arithmetic prediction from measured bandwidth,
+  not a measured switch.

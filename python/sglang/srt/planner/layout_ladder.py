@@ -82,6 +82,11 @@ class LadderInputs:
     # deployment input (the corridor's own safety statement), not a tuning
     # constant invented here.
     admit_fraction: float = 0.95
+    # #704a: per-rank arena bytes the ACTUATOR actually moves for a rung
+    # change. Optional only so the pre-#704a callers keep working; when it is
+    # supplied it REPLACES the moved-layer estimate in every threshold,
+    # because it is what the metal does. See :func:`arena_refill_ms`.
+    arena_refill_mib: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.arming_floor_for is None:
@@ -140,6 +145,14 @@ class Transition:
     kv_move_mib_per_token: float
     descend_below_tokens: float
     ascend_above_tokens: float
+    # #704a: what the ACTUATOR costs, as opposed to what a cross-rank weight
+    # mover WOULD have cost if one existed. ``weight_move_ms`` above is the
+    # counterfactual and is kept only because it is the honest statement of
+    # the moved-layer delta; ``switch_ms`` is the number a controller must
+    # budget. Zero when no arena size was supplied, i.e. unpriced, never
+    # "free".
+    switch_ms: float = 0.0
+    switch_is_arena_refill: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,6 +262,71 @@ def solve_layout_ladder(inputs: LadderInputs) -> Ladder:
     return Ladder(rungs=rungs, transitions=transitions)
 
 
+def arena_refill_ms(
+    arena_refill_mib: Sequence[float], link_mib_per_s: Sequence[float]
+) -> float:
+    """Wall time of a rung change, priced on the actuator that exists.
+
+    A rung change is NOT a delta move. There is no cross-rank weight mover in
+    this tree -- ``regime_stages.py:100`` names its absence
+    (``REACH_NO_WEIGHT_MOVER``) -- and the thing that does exist,
+    ``PhaseFlipStacks.refill`` (``managers/phase_flip_boot.py:361``, arena_refill
+    ``:539``, ``dst.copy_(payload)`` ``:576``), is a CONTIGUOUS host->device
+    memcpy of a whole boot-baked arena image. It swaps which pre-loaded layout
+    occupies a rank's arena; it does not transfer the boundary layers.
+
+    So the bytes on the wire for a one-layer change are the same as for a
+    six-layer change: the whole arena, every time. Pricing a rung change by
+    its moved layers understates it by the ratio of arena to delta, and that
+    is the difference between "a ladder is a cheap dial" and "a ladder step is
+    a flip-scale event".
+
+    Each rank refills its OWN arena over its OWN link and nothing crosses a
+    rank boundary, so the refills run concurrently and the cost is the SLOWEST
+    rank's, not the sum. That is the per-barrier pacemaker rule: on a rig whose
+    cards do not share a link width, the narrow card sets the step time however
+    few layers it gained.
+    """
+    if len(arena_refill_mib) != len(link_mib_per_s):
+        raise ValueError(
+            f"arena sizes cover {len(arena_refill_mib)} ranks but the link "
+            f"matrix covers {len(link_mib_per_s)}."
+        )
+    if not arena_refill_mib:
+        raise ValueError("no ranks to price an arena refill over.")
+    worst = 0.0
+    for mib, link in zip(arena_refill_mib, link_mib_per_s):
+        if float(link) <= 0.0:
+            raise ValueError(
+                "a measured link bandwidth of zero cannot refill an arena; the "
+                "rung change would never complete."
+            )
+        worst = max(worst, float(mib) / float(link) * 1000.0)
+    return worst
+
+
+def switch_payback_s(from_speedup: float, to_speedup: float, switch_ms: float) -> float:
+    """Prefill-seconds that must follow a switch before it has paid for itself.
+
+    Prefill time scales as ``1 / speedup``, so moving from a rung at
+    ``from_speedup`` to one at ``to_speedup`` saves a fraction
+    ``1 - from/to`` of every prefill second spent afterwards. The switch is
+    worth making only if the controller expects to stay long enough to earn
+    back the stall:
+
+        ``payback = switch_s / (1 - from_speedup / to_speedup)``
+
+    Returns infinity when the target is not faster -- which is the correct
+    answer, not an error: a switch that buys no speed never repays a stall,
+    and a controller asking the question deserves that stated rather than a
+    division by zero.
+    """
+    gain = 1.0 - float(from_speedup) / float(to_speedup)
+    if gain <= 0.0:
+        return float("inf")
+    return float(switch_ms) / 1000.0 / gain
+
+
 def _move_ms_at(
     tokens: float, weight_ms: float, kv_per_token: float, gating_link: float
 ) -> float:
@@ -292,6 +370,19 @@ def _solve_transitions(
         if gating_link <= 0.0:
             raise ValueError("a measured link bandwidth of zero cannot move a layer.")
         weight_ms = weight_mib / gating_link * 1000.0
+        # #704a: when the arena size is known, the ACTUATOR's cost replaces the
+        # moved-layer estimate everywhere a threshold consumes a move time.
+        # Keeping the estimate in the bands while reporting the real cost
+        # separately would give a controller two different move times and let
+        # it plan with the cheaper one.
+        if inputs.arena_refill_mib is not None:
+            switch_ms = arena_refill_ms(inputs.arena_refill_mib, inputs.link_mib_per_s)
+            budget_ms = switch_ms
+            is_arena = True
+        else:
+            switch_ms = 0.0
+            budget_ms = weight_ms
+            is_arena = False
         # KV that must follow its layer, per live token, under the coupled
         # (part A) layout. Part B drives this term to zero by construction.
         kv_per_token = attn_moved * float(inputs.pool.kv_mib_per_token_per_attn_layer)
@@ -299,13 +390,13 @@ def _solve_transitions(
         # Ascend: leave the deeper rung before it runs out.
         ascend = b.admit_up_to_tokens
         for _ in range(8):  # KV term depends on the fill it is evaluated at
-            move_ms = _move_ms_at(ascend, weight_ms, kv_per_token, gating_link)
+            move_ms = _move_ms_at(ascend, budget_ms, kv_per_token, gating_link)
             ascend = b.admit_up_to_tokens - fill_rate * move_ms / 1000.0
         # Descend: only into a rung that can hold the live set plus the window.
         descend = (
             b.admit_up_to_tokens
             - fill_rate
-            * _move_ms_at(max(ascend, 0.0), weight_ms, kv_per_token, gating_link)
+            * _move_ms_at(max(ascend, 0.0), budget_ms, kv_per_token, gating_link)
             / 1000.0
             * 2.0
         )
@@ -327,8 +418,122 @@ def _solve_transitions(
                 kv_move_mib_per_token=kv_per_token,
                 descend_below_tokens=descend,
                 ascend_above_tokens=ascend,
+                switch_ms=switch_ms,
+                switch_is_arena_refill=is_arena,
             )
         )
+    return tuple(out)
+
+
+@dataclasses.dataclass(frozen=True)
+class FillRung:
+    """The rung a controller should sit on at one occupancy, and what the step
+    to it costs. ESTIMATE: every field is solver output, not a booted number."""
+
+    fill_tokens: float
+    counts: tuple[int, ...]
+    pool_tokens: float
+    pipelined_speedup: float
+    switch_ms_from_previous: float
+    payback_prefill_s: float
+    changed: bool
+    # A ladder has two kinds of step and only ONE of them is an economic
+    # decision.
+    #
+    # ASCEND (fill rising -> roomier, slower rung) is MANDATORY. Its
+    # alternative is not "stay fast", it is "stop admitting" -- so it never
+    # repays itself in throughput and ``payback_prefill_s`` is correctly
+    # infinite for it. Reading that infinity as "never do this" would invert
+    # the meaning: the step is not optional.
+    #
+    # DESCEND (fill falling -> tighter, faster rung) is DISCRETIONARY, and the
+    # payback figure is exactly the question the controller must answer before
+    # paying the stall.
+    mandatory: bool = False
+
+
+def solve_fill_ladder(
+    ladder: Ladder, inputs: LadderInputs, fill_levels: Sequence[float]
+) -> tuple[FillRung, ...]:
+    """The layout ladder indexed by FILL, which is what a controller holds.
+
+    At occupancy ``F`` the admissible rungs are those whose admission ceiling
+    still covers the live set; among those the fastest is the one to sit on,
+    because below the ceiling the pool constraint is slack and the speed is
+    free. That is the ladder's founding argument applied pointwise.
+
+    The step cost is deliberately reported per fill level rather than per rung
+    pair. A rung pair's cost is a property of the ladder; what a controller
+    actually needs to know is "if occupancy moves from here to there, what do I
+    pay", and at fill levels where the rung does not change the answer is zero
+    -- which is the common case and the reason a ladder is worth having at all.
+
+    ``payback_prefill_s`` is the honest counterweight: a step that costs a
+    flip-scale stall must be followed by enough prefill work at the faster rung
+    to earn it back. A ladder that reported only the speedup would read as free
+    money.
+    """
+    if not ladder.rungs:
+        raise ValueError("an empty ladder has no rung to sit on at any fill.")
+    levels = [float(f) for f in fill_levels]
+    if any(f < 0.0 for f in levels):
+        raise ValueError("a negative occupancy is not a fill level.")
+    if levels != sorted(levels) and levels != sorted(levels, reverse=True):
+        raise ValueError(
+            "fill levels must be MONOTONE, ascending or descending: the ladder "
+            "is a path through occupancy, and pricing the steps of an "
+            "unordered list would charge moves the controller never makes."
+        )
+    # Both directions are admissible on purpose, and an earlier cut of this
+    # function got that wrong by requiring ascent. Rising fill only ever moves
+    # to roomier, SLOWER rungs -- every such step is a mandatory retreat, so an
+    # ascent-only interface can express nothing but forced moves and reports
+    # an infinite payback on all of them. The discretionary step, the one the
+    # #677 economics actually decide, lives on the DRAINING leg: as the pool
+    # empties, the controller may pay a stall to take speed back.
+    switch_ms = (
+        arena_refill_ms(inputs.arena_refill_mib, inputs.link_mib_per_s)
+        if inputs.arena_refill_mib is not None
+        else 0.0
+    )
+    out: list[FillRung] = []
+    previous: Rung | None = None
+    for fill in levels:
+        admissible = [r for r in ladder.rungs if r.admit_up_to_tokens >= fill]
+        if not admissible:
+            raise ValueError(
+                f"no rung admits {fill:,.0f} live tokens; the deepest ceiling "
+                f"on this ladder is "
+                f"{max(r.admit_up_to_tokens for r in ladder.rungs):,.0f}. This "
+                "occupancy cannot be served by ANY layout, which is a capacity "
+                "answer, not a layout one."
+            )
+        # Rungs run pool-descending / speed-ascending, so the last admissible
+        # rung is the fastest one that still holds the live set.
+        chosen = admissible[-1]
+        changed = previous is not None and chosen.counts != previous.counts
+        payback = (
+            switch_payback_s(
+                previous.pipelined_speedup, chosen.pipelined_speedup, switch_ms
+            )
+            if changed
+            else 0.0
+        )
+        out.append(
+            FillRung(
+                fill_tokens=fill,
+                counts=chosen.counts,
+                pool_tokens=chosen.pool_tokens,
+                pipelined_speedup=chosen.pipelined_speedup,
+                switch_ms_from_previous=switch_ms if changed else 0.0,
+                payback_prefill_s=payback,
+                changed=changed,
+                mandatory=bool(
+                    changed and chosen.pipelined_speedup < previous.pipelined_speedup
+                ),
+            )
+        )
+        previous = chosen
     return tuple(out)
 
 
