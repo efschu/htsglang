@@ -2741,7 +2741,16 @@ ladder could rank and ascend and nothing would change. An unknown feature,
 an unwired actuator, and a geometry_flip/external rung all REFUSE: a relief
 step that silently no-ops lets the ladder ascend believing pressure was
 relieved. Cut 4 (arbitration) is gated on #305's multi-model binding, not
-only on cuts 1-3. `ANALYSE_553_elastic_coresidence.md` §10. Latency is reported
+only on cuts 1-3. `ANALYSE_553_elastic_coresidence.md` §10.
+`managers/tenant_mover.py` completes cut 2: it registers TENANTS over the
+translator ledger's existing `ParkRoute` protocol rather than reimplementing
+parking, taking each tenant's restore order as CONFIGURATION so the
+translator's ASR->talker->codec need order is not worn by a second tenant.
+A route asked to park that reports nothing is STRANDED, never zero, and
+`release_fn()` hands `cold_event` a None in that case so it surfaces at the
+policy layer. With it, #553's DESK surface is exhausted: cut 4 is gated on
+#305's multi-model binding, cut 5 is rig-gated by its own text, G1 (GDN slot
+rebind on hot) is filed, and the live bindings are window items. Latency is reported
 SPLIT: time-to-first-serve vs time-to-full-restore. `--never-park` is the hard
 override. GPU verification of the nvidia-smi drop and the wake numbers is
 BOOT-PENDING (NOTE_546 §6).

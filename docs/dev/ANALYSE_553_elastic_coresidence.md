@@ -442,7 +442,7 @@ vocabulary to one feature, each red exactly the test that asserts against it.
 
 | item | state |
 |---|---|
-| Cut 2 second half — generic tenant mover factored out of `AudioAssetLedger` | desk-fundable, undelivered |
+| Cut 2 second half — generic tenant mover | **DELIVERED 2026-08-17**, see §11 |
 | Cut 4 — arbitration policy | gated on **#305 binding** (§10.4) as well as cuts 1-3 |
 | Cut 5 — cross the graph wall | **rig-gated by its own text** ("LAST, and only with the rig") |
 | G1 — GDN slot rebind on hot | filed, needs the slot runtime's admission rules |
@@ -451,3 +451,78 @@ vocabulary to one feature, each red exactly the test that asserts against it.
 **Window items, named rather than attempted:** the live binding of the event
 layer's injected callables, and Cut 5. Anything that resizes a live pool needs a
 scheduler and a boot; §9 already filed the live acceptance.
+
+
+---
+
+## 11. Cut 2 SECOND HALF DELIVERED (2026-08-17) — `managers/tenant_mover.py`
+
+### The gating column was right here, and I checked rather than trusted it
+
+§10 caught this table lying about NUMBERING, so its desk/window column earned
+the same skepticism. Checked: `test/registered/translator/test_ledger.py` runs
+**22 passed** under `CUDA_VISIBLE_DEVICES=""`. The ledger's park/restore is
+already exercised hermetically with CPU tensors, so a mover over the same
+protocol is desk-provable and the marking holds. Had those tests needed a
+device, this would have been a window item and the table would have been wrong
+twice.
+
+### Not a second ledger
+
+`AudioAssetLedger` already parks and restores, and its `ParkRoute` protocol
+(`device` / `park` / `restore` / `size_bytes`) is already generic. What was
+missing was never the parking — §2's tenant-COLD row says it: "**no generic
+per-tenant mover; no single caller that can address 'tenant X'**". So
+`TenantMover` registers TENANTS over that same protocol and reimplements
+nothing. A parallel asset ledger would have been the two-authorities defect the
+#553 bridge exists to reconcile.
+
+### The vocabulary is per tenant, which is the whole factoring
+
+The translator's ASR -> talker -> codec need order is one tenant's physics, not
+a property of moving tenants. `register(tenant, routes, ranks=...)` takes it as
+configuration, and a test asserts a second tenant restores in `y, x` — an order
+that is nonsense for the translator and correct for that tenant. An unranked
+route sorts last (`UNRANKED`), because an unlisted asset is unknown, not urgent.
+
+### Stranding, again, and deliberately the same shape
+
+Released bytes come from what a route RETURNED (#694). A route asked to park
+that reports nothing is STRANDED, never zero: `park()` returning `None`, and a
+route that raises, both land there. A route reporting `0` is an accounting
+("nothing to give"); silence is the absence of one. `release_fn()` hands
+`cold_event` a `None` in exactly that case, which is how that layer already
+reads "did not report" — so a stranded tenant surfaces at the policy layer
+instead of being counted as a delivered zero.
+
+`parked_bytes_by_device()` omits a device with nothing parked rather than
+reporting it as 0 (#606): an all-zeros map reads as "measured, empty".
+
+### Refusal
+
+An unknown tenant RAISES and names who is registered. "No such tenant" and
+"that tenant had nothing to give" are different answers, and a cold event that
+cannot tell them apart keeps asking the wrong one.
+
+Mutation-proven: collapsing stranding to zero reds the two stranding pins;
+ignoring the supplied ranks reds all three vocabulary pins.
+
+### A defect in my own test, recorded
+
+The first `_Route` stub used `parked_bytes=None` for "not specified", so
+"reports nothing" was inexpressible and two stranding tests failed against
+correct code. A distinct `REPORTS_NOTHING` sentinel fixes it. A stub whose
+default and whose absence-case share a value cannot test an absence rule.
+
+### #553's desk surface is now exhausted
+
+| item | state |
+|---|---|
+| Cuts 1, 2 (both halves), planned cut 3 | delivered |
+| Cut 4 — arbitration | gated on **#305** multi-model binding (§10.4) |
+| Cut 5 — cross the graph wall | **rig-gated by its own text** |
+| G1 — GDN slot rebind on hot | filed; needs the slot runtime's admission rules |
+| live binding of `release_fn`/`grow_fn`/`measure_fn` | **window item** (§9) |
+| correctness of any live number | **window item** (§7 honest limit) |
+
+Nothing desk-fundable remains.
