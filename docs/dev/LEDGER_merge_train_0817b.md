@@ -480,3 +480,66 @@ the ring's cleanup reds the sibling case. Each reds ONLY its own test.
 `unit/mem_cache`: 1148 passed, 0 failed. `unit/model_executor`: 15 failed / 660
 passed, IDENTICAL to the pre-slice commit `fac99d644d` measured in a pristine
 worktree — the 15 are pre-existing and this slice adds none.
+
+---
+
+# FIFTH PASS — #729 closed (2026-08-17)
+
+The six remaining register-then-allocate sites are closed, so the window the
+fourth pass found is shut at all eight producers.
+
+## G1. Why a decorator and not six try blocks
+
+All six are `__init__` bodies whose allocation runs to the END of the
+constructor. Wrapping each would mean re-indenting six constructors — a large
+diff for a small property, on a train branch, in the KV-pool hot path. Instead
+`revert_pinned_posts_on_failure` (added to `pinned_host_budget`, the same
+authority that owns `unregister_pinned_post`) is applied as one line per site.
+
+On success the wrapper does nothing at all, so every success path is
+byte-identical. On failure it undoes exactly the posts that appeared during the
+call — a set difference, so a post registered by someone else is never touched
+— and re-raises the ORIGINAL exception untouched (#386).
+
+Nesting is correct by construction, which matters because **`HostKVCache` is
+the base class of the other five**: a subclass `__init__` that fails after
+`super().__init__()` registered undoes BOTH, which is right, because the object
+as a whole failed. A dedicated case pins that.
+
+**Limit stated at the definition rather than discovered later:** the set
+difference is not safe against a CONCURRENT registration from another thread
+inside the same extent. Every producer wrapped here is a boot-time constructor
+on one thread; a future off-thread producer must not use this.
+
+## G2. One test over the shape, not six copies
+
+`TheSixConstructorsRevertTheirPost` drives the property, not six constructors'
+internals:
+
+* `test_every_site_carries_the_guard` — subtests over all six, asserting each
+  `__init__` is actually wrapped. This is the half that catches a site quietly
+  losing its decorator, and a seventh producer written tomorrow is one tuple
+  away from being covered.
+* three behaviour cases over the real decorator: a failing call reverts only
+  what IT registered, a successful call keeps its post (so the guard cannot
+  pass by never registering), and a nested failure undoes the `super()` call
+  too.
+
+## G3. Can-fail, three mutations, each redding only its own case
+
+| mutation | reds |
+| --- | --- |
+| one site loses its decorator | `test_every_site_carries_the_guard` (1 subtest of 6) |
+| the decorator stops unregistering | the failing-call case AND the nested case |
+| it undoes everything, not just new posts | `test_a_failing_call_reverts_only_what_it_registered` |
+
+## G4. Suites — zero new failures
+
+| suite | before this slice | after |
+| --- | --- | --- |
+| `unit/mem_cache` | 1148 P / 0 F | **1152 P / 0 F** |
+| `unit/model_executor` | 15 F / 660 P | 15 F / 660 P (identical) |
+| `unit/managers` | 22 F / 2413 P | 22 F / 2413 P (identical) |
+
+FEATURE_CATALOG's "STILL OPEN, six sites" entry is replaced with the closed
+state and the mechanism, in the same step.
