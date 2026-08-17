@@ -7,9 +7,32 @@
 # ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
 # the original (no regression to the validated GDN kernel).
 #
-# This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
-# into the memory pool / radix cache / scheduler / backend dispatch. The caller
-# (currently the correctness test and the microbenchmark) owns the ring tensors.
+# WIRING STATUS (#700, corrected 2026-08-16). This header used to say the
+# increment was "kernel + wrapper only ... NOT yet wired into the memory pool /
+# radix cache / scheduler / backend dispatch". That is STALE and was false in
+# every one of the four places it named:
+#
+#   * memory pool  -- ring allocation and documented layout
+#     (mem_cache/memory_pool.py:469-477, :611-633), cursor reset on slot
+#     (re)alloc (:1530), copy_from with a stated invariant and dst reset
+#     (:941-968), flush/clear (:908), and write_pos carried in the
+#     offload/restore blob (:1017, :1049, :1075);
+#   * radix cache  -- the donate is capped to the last flush boundary
+#     (mem_cache/mamba_radix_cache.py:599-608), mirrored for the unified cache
+#     (unified_cache_components/mamba_component.py:409-417);
+#   * scheduler / backend -- per-bs static buffers and the cursor advance
+#     (layers/attention/hybrid_linear_attn_backend.py, 54 references), and
+#     dispatch at layers/attention/linear/gdn_backend.py:497-537.
+#
+# The ring tensors are therefore owned by the POOL, not by the caller. Leaving
+# the old text in place cost a wrong "irreducible state traffic" conclusion in
+# #325 revision 1, because it was read as evidence the feature was inert.
+#
+# What is genuinely NOT established is OUTPUT FIDELITY: the flag claims only
+# "numerically correct", and the buffered reconstruction sums the rank-1 updates
+# in a different order than the sequential path, so byte-identity must be
+# assumed ABSENT until measured. scripts/replayssm/identity_probe.py is that
+# measurement; --enable-linear-replayssm stays off until it passes.
 #
 # Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
 #   The plain packed decode reads the full recurrent state S [HV, V, K] from
