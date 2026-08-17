@@ -113,6 +113,26 @@ class Probes:
     #: installation. The #384 state this catches is one where the import
     #: answers correctly and the installation is still wrong.
     dist_providers: Callable[[str], Sequence["DistObs"]]
+    #: ``() -> (fingerprint, is_cached)`` for the VRAM ledger's hardware
+    #: calibration. A probe rather than a direct call so the "never probed"
+    #: state is reachable in a hermetic test -- which is the state that
+    #: matters, since it is the one every fresh rig starts in.
+    #:
+    #: Defaulted, unlike its siblings: every existing Probes construction in
+    #: the tree predates it, and the check it feeds is opt-in
+    #: (``require_vram_calibration``), so the inert "nothing cached" answer
+    #: cannot change any existing outcome.
+    vram_calibration: Callable[[], "CalibrationObs"] = staticmethod(
+        lambda: CalibrationObs(fingerprint="", cached=False)
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class CalibrationObs:
+    """Whether this rig has a cached VRAM calibration, and under which key."""
+
+    fingerprint: str
+    cached: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -217,6 +237,32 @@ def _real_dist_providers(package: str) -> Sequence[DistObs]:
     ]
 
 
+def _real_vram_calibration() -> "CalibrationObs":
+    """Read-only: does a cached calibration match this rig's fingerprint?
+
+    ``load_calibration`` never measures as a side effect, which is what makes
+    it usable here -- this module checks and never repairs. Running the probe
+    from preflight would both violate that and touch a card before the boot
+    is allowed to.
+    """
+    try:
+        from sglang.srt.mem_ledger.calibration import (
+            calibration_fingerprint,
+            load_calibration,
+        )
+    except ImportError:
+        return CalibrationObs(fingerprint="", cached=False)
+    try:
+        fingerprint = calibration_fingerprint() or ""
+    except Exception:
+        fingerprint = ""
+    try:
+        cached = load_calibration() is not None
+    except Exception:
+        cached = False
+    return CalibrationObs(fingerprint=fingerprint, cached=cached)
+
+
 def default_probes() -> Probes:
     return Probes(
         cards=_real_cards,
@@ -227,6 +273,7 @@ def default_probes() -> Probes:
         path_exists=os.path.exists,
         probe_import=_real_probe_import,
         dist_providers=_real_dist_providers,
+        vram_calibration=_real_vram_calibration,
     )
 
 
@@ -447,6 +494,44 @@ def check_ports(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
     return None
 
 
+def check_vram_calibration(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
+    """The VRAM ledger is the sizing authority; say so before the boot, not
+    after it has quietly fallen back.
+
+    ``enable_vram_ledger`` is ON by default: the ledger prices every card and
+    the inherited heuristic runs only where a term cannot be priced. That
+    fallback is safe -- it boots, and it names the term in the log -- but it
+    is also easy to never notice, and a rig sized by the falsified
+    ``512 + tokens*1.5`` catch-all is exactly what the ledger exists to
+    replace.
+
+    So this states the fact at the one place an operator reads before a boot.
+    It is a WARNING-shaped refusal only in the sense that it names a remedy;
+    whether an uncalibrated rig may boot is the config's decision
+    (``preflight.require_vram_calibration``), defaulting to permissive so a
+    fresh rig is not bricked by a default it never chose.
+    """
+    if not getattr(cfg.preflight, "require_vram_calibration", False):
+        return None
+    obs = p.vram_calibration()
+    if obs.cached:
+        return None
+    return Refusal(
+        name="vram_calibration_missing",
+        subject="VRAM ledger hardware calibration",
+        observed=(
+            f"no cached calibration for fingerprint "
+            f"{obs.fingerprint or '<unresolved>'}"
+        ),
+        expected="a calibration cached for this card set, driver and torch build",
+        remedy=(
+            "run `python -m sglang.srt.mem_ledger.probe` once on this rig, or "
+            "set preflight.require_vram_calibration = false to boot on the "
+            "inherited heuristic (which the ledger will name in the log)"
+        ),
+    )
+
+
 def run_all(cfg: StackConfig, p: Optional[Probes] = None) -> List[Refusal]:
     """Run every check and return ALL refusals, in a stable order.
 
@@ -462,7 +547,8 @@ def run_all(cfg: StackConfig, p: Optional[Probes] = None) -> List[Refusal]:
         if r:
             out.append(r)
     for fn in (check_paths, check_wheel, check_wheel_dist_shadow, check_cards,
-               check_host_headroom, check_disk, check_ports):
+               check_host_headroom, check_disk, check_ports,
+               check_vram_calibration):
         try:
             r = fn(cfg, p)
         except RefusalError as e:

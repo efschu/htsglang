@@ -53,9 +53,24 @@ def test_user_reserve_defaults_to_1024_mib_per_card():
     assert field.default == DEFAULT_USER_RESERVE_MIB
 
 
-def test_ledger_is_off_by_default_so_existing_recipes_are_unchanged():
+def test_ledger_is_on_by_default_because_it_is_the_authority():
+    """This pinned ``False`` -- "off by default so existing recipes are
+    unchanged" -- and that was the right pin while the ledger was opt-in.
+
+    The standing decision reversed it: the ledger/planner is THE VRAM
+    authority and hand-set numbers do not decide, so the default is ON and the
+    inherited heuristic runs only where the ledger declares a term
+    unresolvable and names it in the log.
+
+    The compatibility promise the old name carried is NOT dropped, it moves:
+    an unprobed rig still boots, because the full-demand lookup REFUSES rather
+    than guesses and the caller falls back (see
+    ``test_ledger_authority_reach.py``). What genuinely changes is that a
+    recipe pinning ``--rank-auto-reserve-mib`` now conflicts with a default,
+    and is refused by name below rather than quietly co-existing.
+    """
     field = ServerArgs.__dataclass_fields__["enable_vram_ledger"]
-    assert field.default is False
+    assert field.default is True
 
 
 # --- the split is enforced, never silently merged --------------------------

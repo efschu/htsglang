@@ -45,6 +45,12 @@ def _fake_query(gpu_ids):
 
 
 def make_args(**kwargs):
+    # This file exercises the LEGACY --rank-auto-reserve-mib path, which is
+    # mutually exclusive with the VRAM ledger -- and the ledger is now ON by
+    # default (it is the VRAM authority). Opt out explicitly so each case
+    # states which reserve path it is testing instead of colliding with a
+    # default it never mentioned.
+    kwargs.setdefault("enable_vram_ledger", False)
     return ServerArgs(model_path="dummy", **kwargs)
 
 

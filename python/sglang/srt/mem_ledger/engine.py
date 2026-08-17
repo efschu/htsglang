@@ -133,6 +133,17 @@ TERM_LOAD_TRANSIENT = "load transient (allocator peak over resident)"
 #: recorder post. Do not recalibrate this from a desk.
 LOAD_TRANSIENT_REFERENCE_MIB = 70
 
+
+class _LoadTransientFallback:
+    """Once-per-process latch for the inherited-constant warning below.
+
+    A class attribute rather than a module global so a test can reset it
+    without reaching into this module's namespace, and so the module-state
+    ratchet stays green.
+    """
+
+    announced = False
+
 #: The fingerprint the inherited number above carries. Deliberately a WINDOW
 #: tag and not a rig fingerprint: it can never equal ``live_fingerprint()``, so
 #: the ledger row renders as ``calibrated@window-2026-`` and a reader can see at
@@ -1038,6 +1049,25 @@ def build_card_ledgers(
                 )
             )
         else:
+            # NAMED, LOGGED FALLBACK. The row has always said "INHERITED" and
+            # carried a window tag that cannot match a live fingerprint (#612),
+            # but a printout is only read by someone who goes looking. The
+            # standing rule is that the ledger is the authority and a hand-set
+            # number never decides silently, so the one term still standing on
+            # an unmeasured literal announces itself once per process, by name.
+            if not _LoadTransientFallback.announced:
+                _LoadTransientFallback.announced = True
+                logger.warning(
+                    "mem_ledger: %s falls back to the INHERITED constant "
+                    "%d MiB per rank on %s -- not measured on this rig. It "
+                    "comes from the 2026-08-06 #602 corridor window and is "
+                    "queued for calibration (measured.CALIBRATION_QUEUE). "
+                    "Boot with SGLANG_VRAM_FLIGHT_DIR set to replace it with "
+                    "this rig's own allocator_transient_bytes.",
+                    TERM_LOAD_TRANSIENT,
+                    LOAD_TRANSIENT_REFERENCE_MIB,
+                    card.name,
+                )
             terms.append(
                 LedgerTerm(
                     name=TERM_LOAD_TRANSIENT,

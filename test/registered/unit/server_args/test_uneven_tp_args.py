@@ -44,7 +44,17 @@ def _fake_query(gpu_ids):
 
 def make_args(**kwargs):
     """ServerArgs with model_path='dummy' short-circuits __post_init__, so
-    the uneven-TP handler can be exercised in isolation."""
+    the uneven-TP handler can be exercised in isolation.
+
+    ``enable_vram_ledger`` defaults to False HERE, not because the product
+    default is False -- it is now True, the ledger is the VRAM authority --
+    but because this file tests the LEGACY --rank-auto-reserve-mib reserve
+    path, and the two are mutually exclusive by design
+    (``_check_vram_ledger_flags``). Saying so once here is better than every
+    case in the file rediscovering the conflict; a case that wants the ledger
+    passes ``enable_vram_ledger=True`` explicitly.
+    """
+    kwargs.setdefault("enable_vram_ledger", False)
     return ServerArgs(model_path="dummy", **kwargs)
 
 

@@ -242,11 +242,32 @@ class TestTheKnownWrongTermsAreFiledNotFixed(unittest.TestCase):
 
     def test_each_constant_points_back_at_the_queue(self):
         """The person who finds the constant must find the filing, not just
-        the person who finds the queue."""
-        from sglang.srt.mem_ledger import engine
+        the person who finds the queue.
 
-        src = inspect.getsource(engine)
-        self.assertEqual(src.count("measured.CALIBRATION_QUEUE"), 2)
+        This asserted ``count == 2`` when the only two mentions were the two
+        pointers. That counted the evidence instead of stating the invariant,
+        and it fired the moment a THIRD, legitimate mention appeared -- the
+        runtime warning that announces the inherited load-transient fallback.
+        The invariant was never "exactly two mentions exist"; it is "each
+        queued constant has a pointer next to IT", so that is what is checked
+        now, per constant, by locality.
+        """
+        from sglang.srt.mem_ledger import engine
+        from sglang.srt.mem_ledger.measured import CALIBRATION_QUEUE
+
+        lines = inspect.getsource(engine).splitlines()
+        for term in CALIBRATION_QUEUE:
+            with self.subTest(term=term):
+                defs = [
+                    i for i, ln in enumerate(lines) if ln.startswith(f"{term} = ")
+                ]
+                self.assertEqual(len(defs), 1, f"{term}: expected one definition")
+                window = lines[max(0, defs[0] - 12) : defs[0]]
+                self.assertTrue(
+                    any("CALIBRATION_QUEUE" in ln for ln in window),
+                    f"{term} is queued but its definition carries no pointer to "
+                    f"the queue within the 12 lines above it",
+                )
 
     def test_leaving_the_queue_requires_a_mapping_not_a_better_guess(self):
         from sglang.srt.mem_ledger import measured

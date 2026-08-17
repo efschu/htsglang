@@ -56,6 +56,12 @@ def layer_types(num_layers=QWEN36_LAYERS, interval=QWEN36_FULL_ATTENTION_INTERVA
 def make_args(**kwargs):
     """ServerArgs with model_path='dummy' short-circuits __post_init__, so a
     single handler can be exercised in isolation."""
+    # This file exercises the LEGACY --rank-auto-reserve-mib path, which is
+    # mutually exclusive with the VRAM ledger -- and the ledger is now ON by
+    # default (it is the VRAM authority). Opt out explicitly so each case
+    # states which reserve path it is testing instead of colliding with a
+    # default it never mentioned.
+    kwargs.setdefault("enable_vram_ledger", False)
     return ServerArgs(model_path="dummy", **kwargs)
 
 
