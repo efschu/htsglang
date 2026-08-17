@@ -4140,7 +4140,12 @@ class ServerArgs:
         "scheduler refuse every request longer than the budget, so the server "
         "boots, reports ready and then admits nothing (refused at startup). "
         "Recommended: the chunked prefill size, or 2048 when the chunk budget "
-        "is at least that large.",
+        "is at least that large. Composes with --enable-hierarchical-cache "
+        "(#747): anchors are host-tier-eligible like any other retained "
+        "node, so an interval anchor survives device eviction (it stays "
+        "matchable and loads back) and can reach disk through the storage "
+        "backend. For deterministic 8k anchors that survive on disk use "
+        "8192, which requires --chunked-prefill-size >= 8192.",
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
@@ -14322,18 +14327,18 @@ class ServerArgs:
                 "--mamba-checkpoint-interval requires the (mamba) radix "
                 "cache; remove --disable-radix-cache."
             )
-        if self.enable_hierarchical_cache:
-            raise ValueError(
-                "--mamba-checkpoint-interval does not support "
-                "--enable-hierarchical-cache yet (HiMambaRadixCache has its "
-                "own match/evict paths)."
-            )
-        if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-            raise ValueError(
-                "--mamba-checkpoint-interval does not support the unified "
-                "radix tree yet (its mamba component has its own match/"
-                "branching path)."
-            )
+        # #747: --enable-hierarchical-cache and the unified radix tree
+        # compose with the checkpoint grid. The unified mamba component
+        # mirrors the grid at every decision MambaRadixCache makes (match
+        # gating, retention, cache_len, branching, eviction -- shared rules
+        # in mamba_ckpt_utils.py, seam map in
+        # docs/dev/NOTE_747_mamba_ckpt_hicache_refusal.md). Under a host
+        # tier, interval anchors are host-tier-eligible like any other
+        # retained node: an evicted anchor stays a valid match and loads
+        # back, so the anchors survive device eviction and can reach disk.
+        # (The refusals that stood here blamed HiMambaRadixCache, a class
+        # with no construction site; the real gap was the then-unbuilt grid
+        # support in the unified component.)
         if interval <= 0:
             raise ValueError(
                 f"--mamba-checkpoint-interval must be positive, got {interval}."
