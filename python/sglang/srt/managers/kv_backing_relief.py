@@ -1123,37 +1123,6 @@ class KvBackingRelief:
         except Exception:  # pragma: no cover - defensive
             return -1
 
-    def _nothing_resident(self) -> bool:
-        """True when the split is READABLE and reports zero resident rows.
-
-        #717. ``_resident_ceiling`` returns -1 for two opposite states, and
-        the caller cannot tell them apart:
-
-          * the split is unreadable -- evict NOTHING, because unmapping a row
-            a live request is reading is the one unrecoverable error;
-          * there are no resident requests at all -- the entire live set is
-            tree-only and therefore MAXIMALLY evictable.
-
-        ``build_flip_live_slots_fn`` sets ``req_max`` to -1 when it has no
-        request parts, so the second state is encoded exactly like the first.
-        The rung then took the conservative branch precisely when it had the
-        most to win, and that is why the floor pinned to max_live + reserve
-        with an idle box:
-
-            BOTH BLOCKED ... 0 req resident
-            KV rung: current=137216 rows, floor=398471, slack=0
-
-        The split records ``req_rows`` alongside ``req_max``, so the two states
-        are distinguishable from data already on hand -- no new enumeration.
-        """
-        split = getattr(self, "_last_live_split", None)
-        if not split:
-            return False
-        try:
-            return int(split.get("req_rows", -1)) == 0
-        except Exception:  # pragma: no cover - defensive
-            return False
-
     def _evict_floor_rows(self, max_live: int) -> Tuple[int, int]:
         """``(floor_rows, evictable_rows)`` if the mark were lowered.
 
@@ -1172,15 +1141,8 @@ class KvBackingRelief:
             return plain, 0
         req_max = self._resident_ceiling()
         if req_max < 0:
-            if not self._nothing_resident():
-                # Unknown resident half: refuse to price an eviction at all.
-                return plain, 0
-            # #717: NOTHING RESIDENT is not "unknown". Every live row belongs
-            # to the radix tree, so the whole set is recomputable and the floor
-            # is the admission reserve alone. Treating this as unknown is what
-            # pinned slack to 0 on an idle box and left every flip funded by
-            # the raw seam budget -- three FLIP ABANDONED over 55 MiB.
-            req_max = -1  # _floor_rows(-1) == the reserve, nothing above it
+            # Unknown resident half: refuse to price an eviction at all.
+            return plain, 0
         if req_max >= int(max_live):
             # The mark is pinned by work in flight; nothing to win here.
             return plain, 0
