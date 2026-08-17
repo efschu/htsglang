@@ -2858,3 +2858,135 @@ erzwungen EAGER) rechnet dasselbe Modell wie der Verband.
 unbeabsichtigte Vor-Fix-Kontrolle. Fenster-Skripte muessen den WT-Stand
 gegen den Tip pruefen (git merge-base --is-ancestor des Fix-Commits), bevor
 eine Karte angefasst wird — die #404-Schlussrunde hat genau das vorgemacht.
+
+---
+
+## 16. Remainder determination (2026-08-17)
+
+Written in English per the fork's code/doc language rule; the sections above
+predate it and are left as they are.
+
+### 16.1 A premise correction first, because it decides the rescope
+
+The determination was requested against a framing of #121 as "Variant C:
+one-process dual lane WITH a unified tiered KV fabric (NCCL-L0 + HiCache) AND
+atomic session migration". That is three tasks, not one, and only the first is
+#121:
+
+* **#121 is the Dual-Gruppen-Runtime.** This document's own title, line 1:
+  `DESIGN #121 — Dual-Gruppen-Runtime (Variant C), Slice A`. Nothing in it, or
+  in any `#121` commit, describes a KV tier.
+* **"NCCL-L0" is #111**, whose ticket is titled `Task #111 — NCCL
+  cross-instance KV transport for PD (L0 tier)`
+  (`docs/dev/TASK_111_PD_KV_NCCL.md:1`).
+* **Atomic session migration is #261** (live handover) plus #411/#410 (the
+  portable format), with #121 contributing only the offline geometry umsharder.
+
+"Variant C" is a genuine #121 name AND is used elsewhere for the weightless-KV
+fast lane (#131/#133, `ANALYSE_321:578`), which is a third thing again. That
+collision is the likely source of the conflation, and it is worth fixing in the
+task title rather than re-deriving every time.
+
+### 16.2 The three components, four-way
+
+**(1) Dual-lane runtime — DELIVERED, and boot-proven.** Not merely built:
+`distributed/dual_group.py` (#121 slice A, `0d155ba32d`) carries the nesting
+algebra and the local collective replacements; `model_executor/dual_group_lane.py`
+(#274) is the runtime, with EIGHT production importers (scheduler, model_runner,
+phase_flip_runtime, vram_dial, kv_reshard, short_term_offload_register,
+runtime_context, server_args) and a full flag set (`--dual-group-lane`,
+`--dual-group-lane-part-gpu-id`, `--dual-group-lane-budget-mib`,
+`--dual-group-lane-max-requests`). §15's tail records the metal result: gate
+green, **byte-identical 3/3, rc=0 in 77 s**, a 27B-FP8 lane across two cards
+computing the same model as the main group. Slices A-D are in this document.
+
+**(2) Tiered KV fabric / L0 — NOT #121's, and not rig-gated the way assumed.**
+Under #111: the seam, the transport contract, the route policy, the block
+planner and 53 hermetic tests are DELIVERED; the wire path is BUILT-BUT-UNWIRED
+— `NcclLink.transfer` raises `NotImplementedError` ("it needs a cross-instance
+NCCL group to run against and has therefore not been written blind",
+`disaggregation/nccl/link.py:456`), `TransferBackend` has no NCCL member
+(`disaggregation/utils.py:409-413`), and no `--disaggregation-kv-link` flag
+exists.
+
+The physics assumption needs correcting: **#111 is not gated by this rig's
+lack of P2P.** It is a cross-instance NCCL process group over TCPStore
+rendezvous — host-staged, like every other collective here — so PHB-only
+topology does not block it. What IS rig-gated is **#110**, the P2P/NVLink
+fastpath the seam was built to accept later; it has zero implementation and
+appears only in docstrings, so it is ABSENT with no gate to cite because there
+is nothing yet to gate. The no-P2P facts are stated repeatedly in code
+(`planner/wizard_islands.py:32`, `rig_advisor.py:141`,
+`device_communicators/barlink_ucx.py:14-15`) as reasons #110 is deferred.
+
+Separately, and relevant to any future L0: **HiCache has no L0 slot.** The
+stack is three fixed attributes on `HiCacheController` — device, host, and one
+factory-resolved storage backend (`managers/cache_controller.py:209`) — not a
+tier list. Adding a device-adjacent fast tier is a structural change to that
+constructor and to the match/prefetch/write-back paths, not filling an
+extension point. Worth knowing before anyone budgets it as "register a tier".
+
+**(3) Atomic session migration — DELIVERED at session scope, with two named
+limits.** `POST /session_handover` (`entrypoints/http_server.py:1261`,
+`managers/session_handover.py`) performs live handover with **neither server
+stopped**, and the catalog records it MERGED and GPU-gate-passed, byte-identical
+to a never-moved reference with `cached_tokens=1152` on resume. #121's own
+contribution is the offline geometry umsharder (`35c8ee379e`,
+`mem_cache/hicache_migrate.py`, TP=1 -> TP=3 uneven DCP, reverse added by
+`058535dec1`) — a LIBRARY plus CLI with zero production import sites, invoked
+as a subprocess by the window harness. The draft re-sharder #261 left open is
+now DELIVERED but narrow (`mem_cache/draft_migrate.py`): EAGLE/NEXTN reshard,
+while EAGLE3/STANDALONE/DFLASH/FROZEN_KV_MTP each REFUSE by name rather than
+skipping silently.
+
+The two limits are what stop "atomic" from being the whole truth, and both are
+already named in the code rather than discovered here:
+
+* live export requires a **TP=1, PP=1 source** (`session_handover.py:418-424`:
+  "a TP>1 live export needs per-rank manifest merging and is a named follow-up
+  -- use the stop-based flow there"), so TP>1 -> TP>1 live migration is ABSENT;
+* the geometry reshape runs as an **external CLI process** between `export` and
+  `commit`, so the operation is a five-step choreography with a documented
+  rollback window, not one in-process call.
+
+### 16.3 What was built here, and what deliberately was not
+
+**Not built: an F3 pin, for either unwired mechanism** — and in both cases
+because a pin would add nothing true.
+
+* #111's seam already refuses to advertise itself:
+  `disaggregation/nccl/__init__.py` states "Deliberately NOT registered in
+  ``TransferBackend`` yet. Adding the enum member would advertise a working
+  backend, and the wire path has never run", and `NcclLink.transfer` RAISES.
+  A mechanism that cannot silently no-op is the opposite of the shape the F3
+  registry exists to catch.
+* `mem_cache/session_bundle.py` has no importer in `python/` or `test/` — not
+  even a test — but it is a superseded WIP whose successor lives on an unmerged
+  branch (#411). A pin on it would misfire the moment #411 lands and replaces
+  it, which is exactly the "widened pin" the F3 file forbids.
+
+**Built: one docstring correction in place**, the #224-(d) move.
+`session_bundle.py` opened by describing itself as a working export/import
+feature. A reader hunting for portable sessions would find `export_bundle` /
+`import_bundle` and reasonably either wire the module or build a second one
+beside it. Its header now records that it has no importer on this branch, that
+#411's `managers/session_portable.py` superseded it and is not merged here, and
+that the live path is `/session_handover` plus the external umsharder — while
+saying plainly that the DESIGN below is still sound and only its shipped-ness
+was overstated.
+
+### 16.4 Proposed rescope
+
+* **#121 CLOSES as delivered.** Its actual scope — the dual-group runtime — is
+  complete through slice D and boot-proven byte-identical. Keeping an endstate
+  task open on it misrepresents finished, measured work.
+* **The KV fabric / L0 half never belonged to #121.** It is #111, already
+  tracked, already honest about its own remainder. #121 should not carry it,
+  and closing #121 must not be read as closing #111.
+* **Session migration re-files under #261**, where the live path already lives.
+  Residue, both already named in code: TP>1 live export (per-rank manifest
+  merging) and the in-process reshape that would remove the external CLI step.
+* **#110 is the genuinely rig-gated item** — a P2P/NVLink fastpath on hardware
+  where every pair is PHB. It should be filed as hardware-gated with that
+  physics as the stated dependency, not left implied inside an endstate task
+  this rig can never close.
