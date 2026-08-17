@@ -600,9 +600,19 @@ asserted — `kv_spill_tier_selection` builds the ladder from measured capacity
 and cost, and `local_first_disagreement()` reports when the hardcoded law and
 the measured ladder diverge while deliberately NOT reordering, because a
 cheaper-looking park tier is evidence of a bad number, not a reason to move.
-Beyond that first slot, order is by measured bandwidth, not by operator
-preference. So "direction configurable" is answered as: refused, with the
-physics named and a falsifier attached.
+CORRECTION — this section's first draft said "beyond that first slot, order is
+by measured bandwidth, not by operator preference". That is wrong. Below the
+local slot the operator's configured order in `--kv-session-offload-destinations`
+IS respected; a measurement may promote a tier above it only when that tier is
+at least `PROMOTION_RATIO = 4.0` times faster (`kv_spill_park_tier.py:134`,
+applied by `_park_ranking`, `kv_session_spill_destination.py:1259-1300`). That
+ratio is a module constant exposed by no flag and no env var.
+
+So the honest answer to "direction configurable" is two-part: the first slot is
+physically fixed and refused as such, while the ORDER BELOW IT IS ALREADY
+OPERATOR-CONFIGURABLE — which means #224's "Zielliste + Richtung konfigurierbar"
+is more delivered than the first draft credited. What is not configurable is the
+promotion threshold that can override the operator's order.
 
 **(d) #407 migration state — no longer inert; §5's cuts are partly done.**
 This package's own `__init__` still said "No consumer reads any of this yet",
@@ -663,3 +673,49 @@ Recommendation: mark #224 desk-complete, carry (b) as a transport-gated item
 against those deps rather than an open feature task, and let the ladder keep
 picking between `local` and `file` — which is what it does today, by
 measurement, and which is the whole of #224 that this rig can express.
+
+### 9.5 Four refinements, verified after the first draft
+
+Added on a second pass; each re-checked at code rather than taken on report.
+
+1. **The remote row cannot reach a ladder even if someone read it.** I wrote in
+   9.1(b) that the spill path "deliberately does not read" `rig1.json`'s remote
+   rows, which is true but understates the guard. `host:rig-2` carries
+   `"health": {"reachable": false, "verdict": "warn", "reason": "... treat the
+   tier as unreachable until a probe says otherwise"}` (`rig1.json:164`), and
+   `TierRegistry` refuses on exactly that before any other rule:
+   `if tier.health.verdict == "block" or not tier.health.reachable`
+   (`registry.py:353`), with a named reason attached. So the tier is
+   enumerable via `tiers()` and can never appear in a `select()` candidate
+   list. The honesty is structural, not a convention someone must remember.
+
+2. **#286's `remote` slot is an always-refusing stub**, and says so in the
+   refusal text: `"remote: stub tier (#224 RDMA attachment point, not wired
+   yet)"` (`offload_movement.py:750`). Worth recording because #286 and #224
+   both use the word "remote" for different things — #286's is a placeholder
+   in the expert-offload ladder, not the kvso park tier.
+
+3. **The #286 registry consumer is unreachable from production.**
+   `price_park_target` is the function that actually calls
+   `registry.select(TierQuery(...))` and is annotated as the fork's first
+   memtier consumer, but its only callers are in
+   `test_short_term_offload_register.py` — it is exported and tested, never
+   invoked by a serving path. `memtier/consumers.py::expert_offload_host_targets`
+   is the same shape. So 9.1(d)'s importer list needs this qualification: seven
+   modules import memtier, but only `kv_spill_tier_selection` /
+   `kv_session_spill_destination` perform tier SELECTION on a live path; the
+   others consume type helpers or capacity numbers, and #286's selection entry
+   point has no caller. That is the #421-F3 shape again, inside #407's own
+   migration.
+
+4. **A provenance defect the profile records against itself.** `rig1.json:172`
+   carries `"line_pairing_warning": "the 3.43 GB/s and 1.47 us figures quoted
+   together in kv_session_spill_destination.destinations_error come from
+   DIFFERENT lines (100G and 40G)"`. Those paired numbers appear in the
+   `--kv-session-offload-destinations` help text as the justification for the
+   local-first law. The LAW is not in doubt — it is a D2H-staging argument, not
+   a bandwidth argument — but the numbers cited beside it are mismatched, and
+   an operator reading the flag help is reading a mixed pair. Not fixed here
+   (it is help-text prose, and the correct replacement pair needs the #266
+   run's numbers re-read, not invented), but named so the next edit of that
+   help text does not re-copy it.
