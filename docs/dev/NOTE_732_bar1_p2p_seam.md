@@ -104,3 +104,45 @@ test.
    KvLink-shaped primitive (#111) or the c10d `send`/`recv` signature is not
    settled here. `barlink_host` already implements the c10d shape, which is the
    cheaper precedent — but the choice belongs with whoever wires the consumer.
+
+
+## Per-peer binding — and the placement lever this seam does NOT own
+
+`barlink_peer_transport.py` (added `8fa8b67648`) closes the implementability
+gap this note's recommendation left open. The seam above picks a transport per
+COMMUNICATOR (`barlink.py:554`, `_select(op, nbytes)` — refined by op and size,
+never by peer), while `NOTE_732_transport_selection.md` concluded the choice is
+per PEER LINK, because the measured BAR1 standing changes sign with edge width.
+The module resolves a directed pair -> transport map once at world build, keyed
+by GPU UUID through the #397/#331 `IdentityMap`, and hands the dispatch site an
+immutable result. It moves no bytes; the BAR1 p2p kernel is still item 1 of the
+window remainder above, so on today's tree every BAR1-preferring edge degrades
+to NCCL loudly.
+
+**One lever in that survey is PLACEMENT, not transport, and this seam must not
+absorb it.** Layer 63 is the terminal full-attention layer, so it costs **one**
+crossing rather than two — every other FA layer pays an out-and-back. That makes
+its host card a free choice worth taking: with the 16 FA layers split 8/8 across
+the two 3080s, placing layer 63 on the **x4** card rather than the x8 one saves
+
+    63 on x4:  15 x 1028.0 us + 16 x 578.7 us  =  24.68 ms/pass
+    63 on x8:  16 x 1028.0 us + 15 x 578.7 us  =  25.13 ms/pass
+                                                  ----------
+                                            free:  0.45 ms/pass
+
+at **zero KV cost**, because the 8/8 balance — and therefore the 852 MiB of KV
+per FA layer — is unchanged. The rule generalises past this rig and past this
+model: **the odd crossing belongs on the slow link.** Any map with an odd number
+of crossings on an asymmetric fabric has the same lever.
+
+This is a decision for the crossing schedule (Slot-2's `DESIGN_family_fullplan
+.md`), not for the transport seam. The seam is told which pairs exist and
+answers what wire each takes; it has no opinion on which layer lives where, and
+giving it one would put two owners on the same map. Recorded here so the
+scheduler picks it up rather than rediscovering it — and so nobody implements
+placement in this module by accident.
+
+Two related figures from the same survey belong to the scheduler for the same
+reason: the 8/8 split is **not free** (it concedes 3.59 ms/pass against 12/4),
+but rebalancing costs ~4.41 GiB of KV headroom per percentage point of pass
+time, so 8/8 stays on the KV argument rather than on a transport one.

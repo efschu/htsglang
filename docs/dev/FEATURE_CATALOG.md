@@ -286,6 +286,23 @@ capturable (`put()` is a stream `memcpy_async`), recv is NOT (no device-side
 wait; a host spin in a capture raises `cudaErrorStreamCaptureUnsupported`),
 so a PP crossing over this seam is BREAKABLE and priced with #494's clock.
 `NOTE_732_bar1_p2p_seam.md`.
+**Transport binds per PEER LINK, not per communicator (#732).** `_select`
+(`barlink.py:554`) picks one transport per group, refined by op and size but
+never by peer. The measured BAR1 standing changes SIGN with edge width — it
+loses on the fast x8 pair (to 0.81x, 1-8 MiB) and wins everywhere on the x4
+pair (`FEATURES_VS_UPSTREAM.md:1349`) — so a rig whose crossings straddle that
+boundary cannot be served by one verdict. `barlink_peer_transport.py` resolves
+a directed pair -> transport map ONCE at world build, keyed by GPU UUID through
+the IdentityMap (never CUDA ordinals), default = NCCL on fast edges / BAR1 on
+x4. Width comes from the CURRENT link, not the max: max reports x16 for all
+three cards while the slots are x4/x8/x8, which would collapse every edge to
+"fast" and disable the feature on the one rig it exists for. Refusals RECORD
+rather than raise (`require_no_refusals()` is the explicit ask); absent the
+BAR1 p2p kernel every BAR1 edge degrades to NCCL with a WARNING per edge, and
+the fallback is marked UNMEASURED rather than carrying an invented delta
+(gap 8). A/B via `SGLANG_BARLINK_PEER_MAP` (rank-keyed, `all=` or `0>1=`);
+forcing an unavailable transport REFUSES instead of silently running the other
+arm. Wired into nothing. `NOTE_732_transport_selection.md`.
 **barlink is COLLECTIVE-ONLY, and that is load-bearing for placement (#732).**
 Its dispatch seams are `all_reduce` (`parallel_state.py:1100`),
 `reduce_scatter*` (`:1299`, `:1374`, `:1498`) and `all_to_all_single*`
