@@ -95,3 +95,88 @@ Ordered by what would falsify the model, not by convenience.
 - Speedups are UPPER BOUNDS (`fixed_ms = 0`).
 - No recommendation is made or implied; both rows are presented so the pick is
   the user's.
+
+---
+
+# Addendum (2026-08-17): #723 fixed the enumeration, and the decision set grew
+
+The solver defect flagged above is fixed (`prefill_frontier.py`, per-lead-depth
+Pareto set over (speed, pool) instead of the speed-argmin tail). Candidates went
+from **25 to 41**; **16 cuts were previously invisible**. Every pre-#723 row
+survives with its speedup unmoved — the fix adds rows, it does not move one.
+
+## A candidate strictly better than [30,18,16]
+
+**[31,17,16]** was never generated before and dominates the cut this ticket was
+opened for:
+
+| | [30,18,16] | **[31,17,16]** |
+|---|---|---|
+| attention split | (7,5,4) | (7,5,4) |
+| pool | 436,275 (+0.0%) | **436,275 (+0.0%)** |
+| prefill factor | 1.1111 | **1.1765** |
+| vs 14.1% noise floor | below it | **17.7% — ABOVE it** |
+| payback | 15.75 s | **10.50 s** |
+
+Same pool, faster, and — unlike [30,18,16] — **a boot could actually confirm
+it**. It clears the pool gate for the same structural reason: it keeps the
+incumbent's (7,5,4) attention split and leaves the binder PP2 untouched.
+
+## Cuts that BEAT the incumbent pool (all previously invisible)
+
+The old frontier's roomiest row *was* the incumbent. It no longer is.
+
+| cut | attn | pool | vs inc | prefill | vs noise floor | payback |
+|---|---|---|---|---|---|---|
+| [30,19,15] | (7,5,4) | 503,782 | **+15.5%** | 1.0526 | below | 31.52 s |
+| [31,18,15] | (7,5,4) | 478,888 | **+9.8%** | 1.1111 | below | 15.75 s |
+| [29,20,15] | (7,5,4) | 462,920 | **+6.1%** | 1.0000 | below (no gain) | — |
+| [31,17,16] | (7,5,4) | 436,275 | +0.0% | **1.1765** | **above** | 10.50 s |
+| [30,18,16] | (7,5,4) | 436,275 | +0.0% | 1.1111 | below | 15.75 s |
+
+All switch costs are 1575 ms (distance-independent).
+
+## The falsification: pool-neutral does NOT mean safe
+
+**[32,16,16]** also surfaced, and it is the most important row here — predicted
+pool-neutral (+0.0%) at 1.2500 with the gain above the noise floor. It is also
+the layout that was **BOOTED and FAILED its pool gate** (STAGE 1 VERDICT,
+2026-08-16).
+
+The reason is outside this solver and it invalidates a whole family's numbers.
+`available_bytes_for_cut` shifts a bracket captured at the *incumbent* by weight
+and GDN terms only (`seam_holdback.py:145-147`), so **a change in the ARMING
+FLOOR is structurally invisible to it**. [32,16,16] measured rank0's floor rise
+**1728 → 2255 MiB (+527)**. It is the only booted layout with the (8,4,4)
+attention split, and it is the only one that changed the split.
+
+Applying that measured delta to every (8,4,4) candidate:
+
+| cut | predicted pool | **with the measured (8,4,4) floor** | binder moves to |
+|---|---|---|---|
+| [32,16,16] | 436,275 (+0.0%) | **415,885 (-4.7%)** | PP0 |
+| [32,17,15] | 449,613 (+3.1%) | **415,885 (-4.7%)** | PP0 |
+| [33,15,16] | 415,859 (-4.7%) | **382,131 (-12.4%)** | PP0 |
+
+The -4.7% for [32,16,16] is consistent with its observed gate failure, so this
+is not a speculative correction — it is the model reproducing a booted result
+once the floor it cannot see is supplied.
+
+**Consequence for the morning list:** [33,15,16]'s advertised **-4.7% is
+optimistic**. Against the only measured arming floor for its own attention
+split it is **-12.4%**. The ±500 MiB caveat carried above is not an abstract
+uncertainty here; it was measured at +527 MiB and it has already failed one
+boot.
+
+**And the tidy rule does not hold:** pool-neutrality alone does not imply
+safety. [32,16,16] is predicted pool-neutral *with* the changed split. What
+separates the safe family is the **attention split being unchanged at (7,5,4)**,
+not the predicted pool. A test pins both families so the counter-example keeps
+its row.
+
+## Still no recommendation
+
+The decision set is now complete rather than filtered, which was the point. The
+(7,5,4) family trades measurability against pool; the (8,4,4) family buys more
+speed and carries a floor term with one booted failure behind it. The pick
+remains the user's.
