@@ -1652,11 +1652,68 @@ def _decide_from_load(
 
     if inp.nothing_can_run and inp.target_can_admit:
         direction = PP_TO_TP if inp.phase == PHASE_PP else TP_TO_PP
+        pending = int(inp.pending_prefill_tokens or 0)
+
+        # #759: THE ESCAPE HATCH NEEDED A FLOOR. This branch used to arm
+        # unconditionally -- "arming immediately rather than waiting for a
+        # stall timer to notice" -- and comp4 Gate A failed 3 of 3 on it:
+        # 8 small requests produced two armings 13 s apart,
+        #   06:32:37 tp_to_pp  (0 req resident,  68 tok pending)
+        #   06:32:50 pp_to_tp  (1 req resident,   0 tok pending)
+        # a flip out and straight back, funded by 68 tokens and then by
+        # nothing. Note this path never reaches the economic window at all, so
+        # #677's cost terms could not have refused it -- the floor has to live
+        # here.
+        # NOT gated on pending_prefill_tokens > 0. #689's own fixture proves
+        # that measure wrong: it expresses real queued work with
+        # ``queue_nonempty=True`` while ``pending_prefill_tokens`` is 0, so a
+        # "nothing pending means nothing to serve" rule would refuse a genuine
+        # deadlock escape. The qualifier below is PERSISTENCE, not a work
+        # count.
+        floor = int(cfg.flip_tokens or 0)
+        if pending < floor or (floor <= 0 and pending <= 0):
+            # Below the MEASURED break-even, so this flip cannot repay itself
+            # on the backlog it would carry. It is still a real escape route,
+            # so it is delayed rather than refused: a transient gap between two
+            # small requests is not a lock, and treating it as one is what
+            # produced the ping-pong. A lock that PERSISTS still gets out --
+            # refusing outright would trade Gate A's thrash for the #748 wedge.
+            if state.idle_since is None:
+                # UNOBSERVED IS NOT BRIEF. With no idle stamp there is no
+                # evidence the lock is transient, and #689's invariant --
+                # "a layout that can run NOTHING leaves at once" -- governs.
+                # Delaying on absence of evidence would convert an unproven
+                # suspicion into a wedge, which is the #748 direction.
+                return PhasePolicyDecision(
+                    direction,
+                    f"{IDLE_LOCKED}: no batch of either work class can be "
+                    f"built in the {inp.phase} layout ({inp.running_bs} req "
+                    f"resident, {pending} tok prefill pending) and the target "
+                    f"layout can run one -- below the {floor}-tok break-even "
+                    f"but with no idle observation to call it transient, so "
+                    f"the deadlock escape is not delayed",
+                )
+            idle_for = inp.now - state.idle_since
+            if idle_for < cfg.idle_dwell_s:
+                return _no(
+                    f"{IDLE_LOCKED} with {pending} tok < break-even {floor} "
+                    f"tok, and idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s "
+                    f"idle dwell: a transient gap is not a lock"
+                )
+            return PhasePolicyDecision(
+                direction,
+                f"{IDLE_LOCKED}: no batch of either work class can be built in "
+                f"the {inp.phase} layout ({inp.running_bs} req resident, "
+                f"{pending} tok prefill pending) and the target layout can run "
+                f"one. Below the {floor}-tok break-even, so it waited: idle "
+                f"{idle_for:.1f}s >= {cfg.idle_dwell_s:g}s idle dwell",
+            )
+
         return PhasePolicyDecision(
             direction,
             f"{IDLE_LOCKED}: no batch of either work class can be built in the "
             f"{inp.phase} layout ({inp.running_bs} req resident, "
-            f"{inp.pending_prefill_tokens} tok prefill pending) and the "
+            f"{pending} tok prefill pending) and the "
             f"target layout can run one -- arming immediately rather than "
             f"waiting for a stall timer to notice",
         )
