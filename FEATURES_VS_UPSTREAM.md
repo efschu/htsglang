@@ -1319,6 +1319,23 @@ boot today either — so every working boot keeps its pool slot for slot. The pa
 size or split by fixed fraction are not fitted and still refuse, but the refusal now names the
 ceiling the budget would carry instead of leaving it to be bisected.
 
+The same pool also bounds **prefix reuse**, which is not obvious from its sizing: the mamba match
+walk advances its accepted prefix length only at nodes that still own a recurrent state, and cuts
+the returned full-attention KV indices back to that node (`value = value[:best_value_len]`,
+`mamba_radix_cache.py:1588` device-only, `hi_mamba_radix_cache.py:1279` under hicache, which
+additionally accepts a host-backed anchor via `mamba_backuped`). A 12-slot recurrent pool therefore
+gates reuse of a 436k-token KV pool — catalog entry 26 records the same truncation for the
+cross-host KV-only import (#212); it applies to the ordinary radix hit too. Arithmetic at the live
+shape (task #743, `NOTE_743_mamba_slot_hitrate.md`): observed occupancy is 2 slots per running
+request, so `max_running_requests` 4 against a 12-slot pool leaves 4 slots for cached anchors —
+enough for exactly four session lineages and nothing spare, with a fifth costing its session the
+whole KV prefix rather than only its recurrent state. Not thrash: two boot captures at concurrency
+up to 4 peaked at 8 of 12 slots and never exhausted the pool. Two defects named there and not yet
+fixed: the hard-floor helper adds a pinned-checkpoint slot per request unconditionally, over-counting
+by `max_running_requests` slots whenever `mamba_checkpoint_interval` is `None` (conservative, so it
+refuses configurations that run); and no discrete slot-eviction event is logged at all, which makes
+the eviction-to-concurrency question unanswerable from logs.
+
 Two alternatives were rejected. Staging the slots (materialize beyond the start value only when
 admission rises, cold slots parked in the #104 RAM tier) does not address the target regime: at
 admission = ceiling every state set is hot, so the RAM tier is empty exactly when the ceiling is
