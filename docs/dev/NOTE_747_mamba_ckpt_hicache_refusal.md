@@ -100,11 +100,16 @@ the directive is after (8k deterministic anchors that survive on disk).
 
 * Cadence **8192** tokens per the user's <=8k tail-re-prefill budget.
   CORRECTION to this note's first draft (which called 8192 "a multiple of
-  chunked_prefill_size=512"): the validation runs the OTHER way —
-  `server_args.py` refuses an interval EXCEEDING `--chunked-prefill-size`,
-  because prefill steps are clipped to checkpoint boundaries and a chunk
-  budget below one grid unit would never reach one. Cadence 8192 therefore
-  requires `--chunked-prefill-size >= 8192`. Unset stays byte-identical.
+  chunked_prefill_size=512"): at the time the validation ran the OTHER way —
+  an interval exceeding `--chunked-prefill-size` was refused because prefill
+  steps were clipped to checkpoint boundaries. SUPERSEDED BY #750
+  (user-confirmed lift): the coupling is now a DIVISIBILITY law — above the
+  chunk budget the interval must be an exact multiple of it, the interval is
+  no longer folded into the truncation alignment, and every
+  (interval/chunk)-th full chunk end anchors while the ends between are
+  simply not cached. Cadence 8192 at the live 512 chunk budget anchors every
+  16th chunk end; the first draft's "multiple of 512" framing was the right
+  shape after all, at the wrong gate. Unset stays byte-identical.
 * Interval anchors become host-tier-eligible like any other retained node — no
   separate pin class, so the existing writeback/eviction accounting stays one
   ledger.
@@ -141,7 +146,8 @@ because evicted anchors stay matchable.
 
 The lift commit removes both `server_args.py` refusals (hierarchical cache +
 unified-radix-tree env — both guarded this same component), extends the flag
-help with the composition and the 8192 cadence (>= 8192 chunked prefill), and
+help with the composition and the 8192 cadence (#750: divisibility, not a
+chunk-budget floor), and
 flips `test_hierarchical_cache_rejected` into two composition pins (accepts,
 and still validates the grid rules).
 
@@ -163,3 +169,15 @@ deliberately boots hierarchical WITHOUT the interval):
 4. The co-location of the int8 checkpoint pool with the host tier stays
    refused (`enable_int8_mamba_checkpoint` x hierarchical is a separate,
    still-standing refusal — untouched by #747).
+
+## 9. Activation (#750): a config flip on the composite boot
+
+With #750's divisibility lift, 8k anchors need NO chunk-budget change on the
+live composition: activation is exactly `--mamba-checkpoint-interval 8192`
+added to the boot that already carries `--chunked-prefill-size 512` and
+`--enable-hierarchical-cache` (#747 composition). Every 16th full chunk end
+anchors; the sparse grid does not touch the truncation alignment, so the
+deterministic-inference lcm path and the chunk economics are unchanged. The
+composite boot is F4-r5's; the desk-provable half (validation both
+directions, the 16th-chunk-end falsifier, fold/no-fold routing) is pinned in
+`test_mamba_checkpoint_interval.py`.

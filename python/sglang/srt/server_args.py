@@ -4134,18 +4134,18 @@ class ServerArgs:
         "pool churns under mixed traffic. Setting a fixed interval makes the "
         "checkpoint grid a pure function of the token history. Must be a "
         "multiple of the page size and of the model's mamba/FLA chunk size; "
-        "overrides --mamba-track-interval to the same value. MUST NOT exceed "
-        "--chunked-prefill-size: the interval becomes the prefill truncation "
-        "alignment, and a chunk budget below one alignment unit makes the "
-        "scheduler refuse every request longer than the budget, so the server "
-        "boots, reports ready and then admits nothing (refused at startup). "
-        "Recommended: the chunked prefill size, or 2048 when the chunk budget "
-        "is at least that large. Composes with --enable-hierarchical-cache "
-        "(#747): anchors are host-tier-eligible like any other retained "
-        "node, so an interval anchor survives device eviction (it stays "
-        "matchable and loads back) and can reach disk through the storage "
-        "backend. For deterministic 8k anchors that survive on disk use "
-        "8192, which requires --chunked-prefill-size >= 8192.",
+        "overrides --mamba-track-interval to the same value. Above "
+        "--chunked-prefill-size it must be an exact MULTIPLE of it (#750): "
+        "every (interval/chunk)-th chunk end then lands on the grid and the "
+        "ends between are simply not cached; the chunk budget itself stays "
+        "untouched. At or below the chunk budget any value works (it becomes "
+        "the prefill truncation alignment as before). Composes with "
+        "--enable-hierarchical-cache (#747): anchors are host-tier-eligible "
+        "like any other retained node, so an interval anchor survives device "
+        "eviction (it stays matchable and loads back) and can reach disk "
+        "through the storage backend. For deterministic 8k anchors that "
+        "survive on disk use 8192 -- with the default 512 chunk budget that "
+        "anchors every 16th chunk end.",
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
@@ -14357,16 +14357,35 @@ class ServerArgs:
                 f"--mamba-checkpoint-interval ({interval}) must be a "
                 f"multiple of --page-size ({page_size})."
             )
+        # #750 (user-confirmed lift): an interval ABOVE the chunk budget is
+        # legal when it is an exact multiple of it -- every
+        # (interval // chunk)-th full chunk end then lands ON the grid by
+        # divisibility (8192 = 16 x 512: the 16th end, exactly), the
+        # retention rule drops the off-grid ends between, and the interval
+        # is NOT folded into the truncation alignment (the chunk budget
+        # stays what the user set; see checkpoint_truncation_align). A
+        # NON-divisible sparse interval is refused: end-donated anchors
+        # (the no_buffer strategy caches only at step ends) then land on
+        # the grid only every lcm(interval, chunk) tokens -- an anchor
+        # cadence collapse the configuration hides while looking set.
         if (
             self.chunked_prefill_size is not None
             and self.chunked_prefill_size > 0
             and interval > self.chunked_prefill_size
+            and interval % self.chunked_prefill_size != 0
         ):
+            import math as _math
+
+            _lcm = _math.lcm(interval, self.chunked_prefill_size)
             raise ValueError(
-                f"--mamba-checkpoint-interval ({interval}) must not exceed "
-                f"--chunked-prefill-size ({self.chunked_prefill_size}): "
-                "prefill steps are clipped to checkpoint boundaries and "
-                "could never reach one."
+                f"--mamba-checkpoint-interval ({interval}) exceeds "
+                f"--chunked-prefill-size ({self.chunked_prefill_size}) "
+                "without being a multiple of it: prefill chunk ends land on "
+                f"the checkpoint grid only every {_lcm} tokens (the lcm), "
+                "not every interval -- the anchor cadence silently "
+                "collapses. Use an exact multiple (e.g. "
+                f"{(interval // self.chunked_prefill_size + 1) * self.chunked_prefill_size}) "
+                "or an interval at or below the chunk budget."
             )
         if view.mamba_track_interval != interval:
             if view.mamba_track_interval != 256:
