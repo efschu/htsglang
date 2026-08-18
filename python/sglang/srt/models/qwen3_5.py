@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
+import os
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -125,6 +126,50 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+
+#: #753 INSTRUMENT. One line per layer on the FIRST forward only, naming the
+#: GLOBAL layer id, so two runs with DIFFERENT stage layouts but the same
+#: checkpoint can be diffed layer by layer to find the first divergence. That
+#: is what localizes a silently-wrong forward to a seam instead of guessing at
+#: one. Off unless the env is set, and then it costs one .item() per layer once.
+#:
+#: The shipped ``--debug-tensor-dump-output-folder`` machinery was considered
+#: first and is the wrong tool here: it writes whole tensors, and a 64-layer
+#: sweep across two boots is gigabytes to move for a scalar comparison.
+_LAYER_NORM_TRACE = os.getenv("SGLANG_LAYER_NORM_TRACE", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_layer_norm_traced: set = set()
+
+
+def _trace_layer_norms(layer_idx: int, hidden_states, residual) -> None:
+    """Log this layer's output norms once. Never raises into the forward."""
+    if layer_idx in _layer_norm_traced:
+        return
+    _layer_norm_traced.add(layer_idx)
+
+    def _n(t):
+        try:
+            if t is None or t.shape[0] == 0:
+                return float("nan")
+            return float(t[0].float().norm().item())
+        except Exception:  # noqa: BLE001 - an instrument may not break a boot
+            return float("nan")
+
+    try:
+        rows = -1 if hidden_states is None else int(hidden_states.shape[0])
+        logger.info(
+            "LAYERTRACE layer=%d rows=%d h=%.6f r=%.6f",
+            layer_idx,
+            rows,
+            _n(hidden_states),
+            _n(residual),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("LAYERTRACE layer=%d unavailable: %s", layer_idx, e)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1563,6 +1608,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             # would have carried forward itself. Identity on the contiguous
             # path.
             self.pp_crossing_wire.after_layer(layer_idx, hidden_states, residual)
+
+            if _LAYER_NORM_TRACE:
+                _trace_layer_norms(layer_idx, hidden_states, residual)
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
