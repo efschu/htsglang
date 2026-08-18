@@ -115,10 +115,12 @@ resolved.
    those regions — both are two-line gates, resolution is re-application
    by hand.
 7. **docs, cherry-picks:** `d60b11a258` (#755 determination + A/B ticket:
-   two NEW files, clean) and `d11b29d2dd` (#740 §5a:
-   `NOTE_740_prefix_cache_divergence.md` is ABSENT at the review tip —
-   the cherry-pick brings the whole note including the §4a correction;
-   clean as a new file).
+   two NEW files, clean) and #740 as a PAIR: `0480f4be27` (the original
+   note) THEN `d11b29d2dd` (the §5a residual). CORRECTED BY THE EXECUTOR'S
+   DRY-RUN SMOKE: this ledger's first draft said d11b29d2dd "lands as a
+   new file" — wrong, it is only the §5a diff and conflicts without the
+   note commit underneath it (the smoke aborted on exactly that
+   unpredicted conflict, which is the abort discipline working).
 8. **feat/753 (Slot-3, in flight)** — lands last, per Slot-3's own
    sequencing after comp4's proof; its compose base already contains
    fix/752, so the only fresh content is the wire itself.
@@ -140,6 +142,18 @@ resolved.
   in content, but superseded as merge units — their unique commits are
   the cherry-picks of (c) 4-7; the branches themselves drag divergent
   history.
+
+## Executor
+
+`scripts/merge_train_pass3.py` executes this section (c) mechanically:
+comp4-marker gate, live (a)-table re-check, mapped resolutions only
+("ours" drop / "theirs"+marker verify / "manual" resumable stop),
+LOUD ABORT on any unpredicted conflict, per-step suites, resumable JSON
+state, `--dry-run` scratch-clone smoke. The smoke already ran end to end
+against the real refs: steps 1-8 clean (the #727 gate-hunk "manual"
+predictions did NOT fire — the picks applied), and it caught the #740
+pairing error now fixed in (c)7. Nothing pushes; pass 3 still waits for
+F4-r5's COMP4_ACCEPTED marker.
 
 ## Standing rule extracted from today
 
