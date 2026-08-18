@@ -29,7 +29,7 @@ import math
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -2041,6 +2041,17 @@ def _owned_layers_for_pool():
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    #: #756 family cover: `local_slot` (:2118) reads this UNCONDITIONALLY, but
+    #: only `__init__` (:2088) assigns it -- and two subclasses
+    #: (HybridLinearKVPool, MiniMaxSparseKVPool) deliberately bypass the base
+    #: init, so the first counter-gated buffer read died with AttributeError
+    #: (comp3 06:14:18, the #752 sibling). The class attribute makes every
+    #: bypasser degenerate to the historic `layer_id - start_layer`
+    #: subtraction instead of crashing; pools that can carry a layer SET must
+    #: still build the real mapping in their own init (Hybrid and MiniMax do,
+    #: below) -- a bare None would silently mis-slot under #753's gapped
+    #: ownership.
+    _local_slot_of: Optional[Dict[int, int]] = None
 
     @abc.abstractmethod
     def __init__(
@@ -3730,6 +3741,17 @@ class HybridLinearKVPool(KVCache):
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        # #756: this pool is addressed in the GLOBAL layer frame (its own
+        # _wait_for_layer consults local_slot BEFORE _transfer_full_attention_id
+        # re-indexes), and it bypasses KVCache.__init__ -- so it must build the
+        # same ownership map the base init builds (:2088), or a layer SET
+        # (#753 gapped ownership) silently falls back to the contiguous
+        # subtraction and waits on another layer's counter slot.
+        owned = _owned_layers_for_pool()
+        if owned is not None:
+            self._local_slot_of = {
+                layer: slot for slot, layer in enumerate(sorted(owned))
+            }
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
@@ -5051,6 +5073,18 @@ class MiniMaxSparseKVPool(KVCache):
         self.head_num = self.main_pool.head_num
         self.head_dim = self.main_pool.head_dim
         self.layer_transfer_counter = None
+        # #756: same contract as HybridLinearKVPool -- this wrapper waits in
+        # the GLOBAL layer frame (_wait_for_layer below) and bypasses
+        # KVCache.__init__, so it builds the base init's ownership map itself
+        # (:2088). Without it the first counter-gated read raised
+        # AttributeError (the two pre-existing hicache-integration failures
+        # in test_minimax_sparse_pool_host_unit), and a bare None would
+        # mis-slot under #753's gapped ownership.
+        owned = _owned_layers_for_pool()
+        if owned is not None:
+            self._local_slot_of = {
+                layer: slot for slot, layer in enumerate(sorted(owned))
+            }
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: LayerDoneCounter
