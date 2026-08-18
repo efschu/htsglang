@@ -201,6 +201,36 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
+    """#706 remainder: the identity hash for a key that must be geometry-FREE.
+
+    Under ``--phase-flip-canonical-kv-page`` the stored page holds EVERY
+    attention layer at full width, so no parallel split can change its bytes.
+    The key already drops the tp and pp suffixes for exactly that reason. The
+    identity hash was not given the same treatment: its
+    ``include_parallel_vectors`` defaults to True, so ``rank_tp_ratio`` and
+    ``rank_kv_ratio`` -- which say how the KV is SPLIT across ranks, not what a
+    canonical page contains -- were still moving the key.
+
+    Live, not hypothetical: the harvest boot ran ``rank_tp_ratio=None``
+    (falsy, skipped) but ``rank_kv_ratio='coupled'`` (truthy, appended), so a
+    geometry term was in the key today. Two boots of the same model and
+    kv-dtype with different kv-ratios write byte-identical canonical pages and
+    miss each other -- which is precisely the cross-boot retention the whole
+    format exists to provide.
+
+    WHAT IS NOT DROPPED, and must never be: revision, dtype, quantization and
+    kv_cache_dtype. Those describe the BYTES, and confusing two byte formats is
+    the silent wrong hit the hash was introduced to turn into a clean miss.
+    Only the parallel tail goes, and only when the canonical format is on --
+    without it a stage's file really does hold just that stage's layers and
+    geometry belongs in the key.
+    """
+    return compute_model_identity_hash(
+        server_args, include_parallel_vectors=not canonical_page
+    )
+
+
 class HiCacheController:
 
     def __init__(
@@ -653,7 +683,10 @@ class HiCacheController:
         except ValueError:
             server_args = None
         model_identity_hash = (
-            compute_model_identity_hash(server_args)
+            canonical_identity_hash_for(
+                server_args,
+                bool(getattr(server_args, "phase_flip_canonical_kv_page", False)),
+            )
             if server_args is not None
             else None
         )
