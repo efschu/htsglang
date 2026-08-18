@@ -2336,7 +2336,28 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
-        self._pp_commit_comm_work(work=self.send_output_work)
+        # #753: UNDER A GAPPED SET THE EXCHANGE RUNS BEFORE THE FLUSH.
+        #
+        # The shipped order flushes last iteration's isends and only then posts
+        # this iteration's receives. That is safe while every rank sends before
+        # it receives, because the peer's matching receive was already posted
+        # in the same iteration as the send. The gapped ordering breaks that
+        # symmetry -- a middle rank receives first so it can forward what it
+        # just got -- and the flush then waits for a receive that this
+        # iteration has not reached yet. Every rank flushing a send that no
+        # rank has posted a receive for is a closed cycle: boot v7pp9 sat in
+        # _pp_commit_comm_work on all three ranks, three works deep, stuck on
+        # the first.
+        #
+        # Flushing AFTER the exchange keeps the property the flush actually
+        # needs -- that a send is not waited on until its peer has had the
+        # chance to take it -- rather than the accident of send-before-receive
+        # that used to supply it. The pending list is captured first because
+        # the exchange rebinds send_output_work to this iteration's work.
+        pending_output_work = self.send_output_work
+        gapped = getattr(self, "_pp_gapped_wire", False)
+        if not gapped:
+            self._pp_commit_comm_work(work=pending_output_work)
         (
             next_pp_outputs,
             next_batch_result,
@@ -2350,6 +2371,10 @@ class SchedulerPPMixin:
             self.last_rank_comm_queue,
             self.pp_outputs,
         )
+        if gapped:
+            # Now that every rank has posted this iteration's receives, last
+            # iteration's sends can be waited on without closing a cycle.
+            self._pp_commit_comm_work(work=pending_output_work)
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
