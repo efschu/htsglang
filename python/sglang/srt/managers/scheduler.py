@@ -3389,28 +3389,120 @@ class Scheduler(
         under NEXTN is a draft window per carrier rather than one row for the
         batch. Rows are counted POST-EVICT, because the cache is not a claim
         on the pool.
+
+        #748 REFAIL: WHICH CLASS A LAYOUT MAY RUN IS THE PURITY RULE'S ANSWER,
+        NOT A CONSTANT. The two sentences above were written under ``strict``
+        purity and then hardcoded, so this simulation kept answering "TP may
+        only decode" on a server booted ``--phase-flip-purity prefill_in_tp``.
+        Measured on boot_735_nohc.log, 2026-08-18 08:37:40-08:54:42: 160 armings
+        in 1022 s (9.4/min), 80 of them ``tp_to_pp`` with 0 req resident and
+        163-817 tok pending. On those rounds ``running_bs <= 0`` returned False
+        below, the policy read ``nothing_can_run=True``, and the #688 escape
+        fired -- while the SAME log carries 76 lines of the policy's own verdict
+        ``holding in tp: pending prefill 163 tok <= N=7004, running it in tp``
+        and 42 executed ``Prefill batch phase=tp``. The simulation contradicted
+        both the config and the observed batches, seconds apart.
+
+        This is why neither #748 (1cc0d24ae7 / 256fe09fab) nor #759
+        (72c1ed9c18) closed it: both fixed how the POLICY prices the escape.
+        The escape was not mispriced, it was fed a false premise from here.
+
+        THE ORACLE IS THE ONE THE BATCH BUILDER USES, not a second opinion.
+        ``prefill_suppressed_in_tp`` is what ``phase_purity.prefill_blocked_here``
+        consults before a TP prefill batch is built, and at ``running_bs == 0``
+        it lifts drain-mode suppression outright (phase_policy.py, "with
+        running_bs == 0 the bundle is finished") -- which is exactly the
+        specimen's state. Asking a different question here is how the two
+        answers diverged in the first place.
+
+        ``flip_unavailable`` is passed False deliberately: resolving it calls
+        ``flip_unavailable_reason``, which reads live seam state and logs, and
+        this must stay a pure probe. False is also the SAFE direction -- it
+        makes suppression more likely, so the simulation is more likely to say
+        "TP cannot prefill" and leave the escape armed. An error here delays
+        nothing and can never wedge.
+
+        ABSENT PURITY KEEPS TODAY'S ANSWER. A scheduler with no ``_phase_purity``
+        (flip disabled, or a unit fixture) is not evidence that the other class
+        is allowed, so the historical decode-only / prefill-only shape stands.
         """
         rows = self._post_evict_rows()
         if phase == "pp":
-            if int(pending_tokens) <= 0:
-                return False
-            chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
-            need = min(chunk, int(pending_tokens))
-            mamba = getattr(
-                getattr(self, "req_to_token_pool", None), "mamba_allocator", None
-            )
-            try:
-                slots = int(mamba.available_size()) if mamba is not None else 1
-            except Exception:  # noqa: BLE001 - a probe must not break the round
-                slots = 0
-            return rows >= need and slots >= 1
+            if self._layout_admits_prefill(rows, pending_tokens):
+                return True
+            # Decode in PP is forbidden under strict and prefill_in_tp, allowed
+            # under off, and bounded under threshold:<n> -- the rule's own
+            # answer, not this function's assumption.
+            if int(running_bs) > 0 and self._purity_allows("decode_in_pp", running_bs):
+                return self._layout_admits_decode(rows, running_bs)
+            return False
         if phase == "tp":
+            if int(pending_tokens) > 0 and self._purity_allows(
+                "prefill_in_tp", running_bs
+            ):
+                if self._layout_admits_prefill(rows, pending_tokens):
+                    return True
             if int(running_bs) <= 0:
                 return False
-            per_req = max(
-                1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
-            )
-            return rows >= int(running_bs) * per_req
+            return self._layout_admits_decode(rows, running_bs)
+        return False
+
+    def _layout_admits_prefill(self, rows: int, pending_tokens: int) -> bool:
+        """Rows and a state slot for one chunk of the pending backlog.
+
+        Factored out of ``_layout_admits`` so both layouts ask the prefill
+        question with ONE arithmetic, which is the property that docstring's
+        "ONE SIMULATION" claim rests on. It was true across the two PHASES and
+        false across the two CLASSES: TP had no prefill arm at all.
+        """
+        if int(pending_tokens) <= 0:
+            return False
+        chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
+        need = min(chunk, int(pending_tokens))
+        mamba = getattr(getattr(self, "req_to_token_pool", None), "mamba_allocator", None)
+        try:
+            slots = int(mamba.available_size()) if mamba is not None else 1
+        except Exception:  # noqa: BLE001 - a probe must not break the round
+            slots = 0
+        return rows >= need and slots >= 1
+
+    def _layout_admits_decode(self, rows: int, running_bs: int) -> bool:
+        """One decode step for the residents; under NEXTN a draft window each."""
+        if int(running_bs) <= 0:
+            return False
+        per_req = max(
+            1, int(getattr(self.server_args, "speculative_num_draft_tokens", 1) or 1)
+        )
+        return rows >= int(running_bs) * per_req
+
+    def _purity_allows(self, what: str, running_bs: int) -> bool:
+        """Does the BOOT'S purity rule permit ``what`` in the off-class layout?
+
+        Returns False when no purity rule is resolved, so a scheduler without
+        one behaves exactly as before this fix.
+        """
+        purity = getattr(self, "_phase_purity", None)
+        if purity is None:
+            return False
+        try:
+            if what == "prefill_in_tp":
+                if not purity.prefill_allowed_in_tp():
+                    return False
+                from sglang.srt.managers.phase_policy import (
+                    PHASE_TP,
+                    prefill_suppressed_in_tp,
+                )
+
+                cfg = getattr(self, "phase_policy_cfg", None)
+                if cfg is None:
+                    return True
+                return not prefill_suppressed_in_tp(
+                    cfg, PHASE_TP, flip_unavailable=False, running_bs=running_bs
+                )
+            if what == "decode_in_pp":
+                return bool(purity.decode_allowed_in_pp(running_bs))
+        except Exception:  # noqa: BLE001 - a probe must not break the round
+            return False
         return False
 
     def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):

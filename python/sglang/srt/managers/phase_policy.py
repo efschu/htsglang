@@ -1198,6 +1198,19 @@ class PhasePolicyState:
 
     last_flip_at: float = 0.0
     idle_since: Optional[float] = None
+    #: #748 REFAIL: when the CURRENT layout was first observed unable to build
+    #: a batch of either class, on the caller's clock. A SEPARATE clock from
+    #: ``idle_since`` because the two measure different states and only one of
+    #: them exists during an idle lock: ``idle_since`` needs an EMPTY box
+    #: (``running_bs == 0 and pending == 0``), while an idle lock is precisely
+    #: a box with work it cannot run. #759 keyed its persistence qualifier on
+    #: ``idle_since`` and was therefore inert on the path it was written for --
+    #: 160 of 160 armings in boot_735_nohc.log took its "unobserved" branch.
+    #: None means NOT YET OBSERVED and is read as "no evidence of transience",
+    #: which keeps #689's "a layout that can run NOTHING leaves at once".
+    #: Maintained by ``observe_idle`` only -- it is an observation, never a
+    #: verdict, so ``note_flip_armed`` deliberately does not clear it.
+    nothing_can_run_since: Optional[float] = None
     flips_armed: int = 0
     last_reason: str = ""
     #: When the CURRENT phase was entered, on the caller's clock. Distinct
@@ -1763,8 +1776,30 @@ def _decide_from_load(
             # small requests is not a lock, and treating it as one is what
             # produced the ping-pong. A lock that PERSISTS still gets out --
             # refusing outright would trade Gate A's thrash for the #748 wedge.
-            if state.idle_since is None:
-                # UNOBSERVED IS NOT BRIEF. With no idle stamp there is no
+            #
+            # #748 REFAIL: THE QUALIFIER WAS RIGHT, THE CLOCK WAS DEAD.
+            #
+            # #759 named PERSISTENCE as the qualifier and then read it off
+            # ``state.idle_since``, which ``observe_idle`` stamps only while
+            # ``running_bs == 0 and pending_prefill_tokens == 0``. An IDLE-LOCK
+            # is by definition the opposite state -- work EXISTS and this
+            # layout cannot run it -- so on this path the stamp is structurally
+            # absent. Measured on boot_735_nohc.log: of 160 IDLE-LOCK armings,
+            # ZERO had (0 resident, 0 pending), and all 160 log lines carry the
+            # "no idle observation" branch below. The floor was live and the
+            # delay was unreachable, which is why the #759 desk tests were
+            # green while the metal signature did not move.
+            #
+            # ``nothing_can_run_since`` is the clock that CAN see it: stamped by
+            # ``observe_idle`` from the same ``nothing_can_run`` term this
+            # branch is keyed on. ``idle_since`` remains the fallback so a
+            # caller that stamps only the idle clock -- every #759 fixture --
+            # keeps its exact answer.
+            lock_since = state.nothing_can_run_since
+            if lock_since is None:
+                lock_since = state.idle_since
+            if lock_since is None:
+                # UNOBSERVED IS NOT BRIEF. With no lock stamp there is no
                 # evidence the lock is transient, and #689's invariant --
                 # "a layout that can run NOTHING leaves at once" -- governs.
                 # Delaying on absence of evidence would convert an unproven
@@ -1775,10 +1810,10 @@ def _decide_from_load(
                     f"built in the {inp.phase} layout ({inp.running_bs} req "
                     f"resident, {pending} tok prefill pending) and the target "
                     f"layout can run one -- below the {floor}-tok break-even "
-                    f"but with no idle observation to call it transient, so "
+                    f"but with no lock observation to call it transient, so "
                     f"the deadlock escape is not delayed",
                 )
-            idle_for = inp.now - state.idle_since
+            idle_for = inp.now - lock_since
             if idle_for < cfg.idle_dwell_s:
                 return _no(
                     f"{IDLE_LOCKED} with {pending} tok < break-even {floor} "
@@ -2138,6 +2173,25 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     else:
         state.idle_since = None
 
+    # #748 REFAIL: THE LOCK CLOCK, and why it is not the idle clock.
+    #
+    # The clause above stamps only an EMPTY box. An idle lock is the opposite
+    # state -- work is present and this layout cannot run it -- so a qualifier
+    # keyed on ``idle_since`` can never fire during one. #759 keyed its
+    # break-even delay there and the metal signature did not move: 160 armings
+    # in boot_735_nohc.log, none of them with (0 resident, 0 pending), all 160
+    # taking the "unobserved" branch. This stamps the term the escape is
+    # actually keyed on, so persistence becomes measurable where it is used.
+    #
+    # DRIVEN BY OBSERVATION, NOT BY THE VERDICT, exactly as the idle and
+    # formation clocks are -- a clock the policy resets when it arms would
+    # restart on every arm and could never accumulate.
+    if bool(getattr(inp, "nothing_can_run", False)):
+        if state.nothing_can_run_since is None:
+            state.nothing_can_run_since = inp.now
+    else:
+        state.nothing_can_run_since = None
+
     # #689 FORMATION CLOCK. Stamped on the first round in which a PP window
     # holds a carrier but not yet a full one; cleared whenever the window is
     # full, the queue drains, or the phase is not PP. Kept HERE, in the
@@ -2321,6 +2375,11 @@ def note_flip_completed(
     state.pending_arm = None
     state.last_flip_at = now
     state.idle_since = None
+    # #748: THE LAYOUT CHANGED, so a lock measured in the layout that is gone
+    # is not evidence about the one that replaced it. Cleared here and NOT in
+    # ``note_flip_armed``, because an ARM is a request and the old layout is
+    # still up until the cutover commits.
+    state.nothing_can_run_since = None
     state.flips_completed += 1
     state.arm_refusals.pop(direction, None)
     state.arm_hold_until.pop(direction, None)
