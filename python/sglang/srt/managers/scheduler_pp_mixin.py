@@ -2809,6 +2809,21 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
+        # #753: SYNCHRONOUS UNDER A GAPPED SET, so there is nothing left to
+        # flush later. An isend defers its completion to a flush in a LATER
+        # iteration, which is a dependency on the peer reaching its next pass.
+        # Under lockstep that is precisely what cannot be assumed: v7pp11 hung
+        # with two ranks already at the iteration barrier and the third still
+        # waiting on an isend those two could only take by moving past it.
+        #
+        # The gapped exchange is already a serialized chain -- last rank sends,
+        # rank 0 receives and forwards, rank 1 receives and forwards, last rank
+        # receives -- so each send has its matching receive posted within the
+        # same iteration and a blocking send simply completes. Nothing is
+        # queued, nothing is flushed, and the barrier has no debt to wait on.
+        # The overlap an isend buys is worth nothing here anyway: the stages
+        # cannot compute concurrently.
+        async_output = not getattr(self, "_pp_gapped_wire", False)
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
@@ -2822,7 +2837,7 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
-                            async_send=True,
+                            async_send=async_output,
                             msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
@@ -2831,7 +2846,7 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
-                        async_send=True,
+                        async_send=async_output,
                         msg_type="output",
                     )
         return send_output_work
