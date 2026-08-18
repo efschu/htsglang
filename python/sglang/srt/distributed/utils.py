@@ -1730,6 +1730,11 @@ def current_stage_layer_set() -> Optional[FrozenSet[int]]:
     argument ``memory_pool._owned_layers_for_pool`` makes and which that
     function now defers to rather than restating.
     """
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        # Contiguous path: nothing to resolve, and no reason to touch the
+        # process group at all.
+        return None
     try:
         from sglang.srt.distributed import get_pp_group
     except Exception:  # pragma: no cover - import shape varies in unit tests
@@ -1738,10 +1743,44 @@ def current_stage_layer_set() -> Optional[FrozenSet[int]]:
         group = get_pp_group()
         num_layers = getattr(group, "num_hidden_layers", None)
         if num_layers is None:
-            return None
+            # No caller stamps ``num_hidden_layers`` onto the group object, so
+            # returning None here made the set form UNREACHABLE on metal and
+            # every consumer silently degraded to the span test -- exactly the
+            # 15-vs-0 PP0 arena defect this function exists to prevent
+            # (measured 2026-08-18 17:30: PP0 reserved 22.6 GiB from a
+            # cell_size=0 configurator). The layer count is recoverable from
+            # the set string itself: parse_pp_layer_sets requires the union to
+            # cover [0, N) with no gaps, so N is exactly max(layer) + 1.
+            num_layers = _num_layers_from_layer_set_raw(raw)
+            if num_layers is None:
+                return None
         return get_pp_layer_set(num_layers, group.rank_in_group, group.world_size)
     except Exception:  # pragma: no cover - no process group in unit tests
         return None
+
+
+def _num_layers_from_layer_set_raw(raw: str) -> Optional[int]:
+    """``max(layer) + 1`` over every layer named in a raw layer-set string.
+
+    Exact for every string ``parse_pp_layer_sets`` accepts (full cover of
+    ``[0, N)`` is enforced there); None on anything unparseable, so the caller
+    degrades the same way it would on a missing env.
+    """
+    highest = -1
+    try:
+        for stage in raw.split(";"):
+            for tok in stage.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if "-" in tok:
+                    _, hi = tok.split("-", 1)
+                    highest = max(highest, int(hi))
+                else:
+                    highest = max(highest, int(tok))
+    except ValueError:
+        return None
+    return highest + 1 if highest >= 0 else None
 
 
 #: "not supplied", so that an explicit ``owned=None`` can mean the CONTIGUOUS
