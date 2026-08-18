@@ -180,24 +180,25 @@ class TestThePlanMirrorsTheLedger(CustomTestCase):
             [
                 "749-order-dependence",
                 "751-preflight-boundary",
-                "754-layerset-scope-guard",
+                "745-anchor-reachability",
                 "735-arithmetic-docs",
                 "727-requant-method",
                 "727-lmhead-artifact",
                 "727-ab-runner",
+                "727-head-chain",
+                "738-pageout-verdict",
+                "535-unblock-verdict",
                 "755-determination-docs",
                 "740-scaffold-note",
                 "740-scaffold-residual",
             ],
         )
         by_name = {s.name: s for s in m3.PLAN}
-        self.assertEqual(by_name["754-layerset-scope-guard"].ref, "f384591531")
-        self.assertEqual(
-            by_name["754-layerset-scope-guard"].predicted,
-            {
-                "test/registered/unit/mem_cache/test_hicache_gdn_layer_counter_752.py": "ours"
-            },
-        )
+        # Second wave: the #754 step is RETIRED (superseded by feat/753's
+        # fold at the same seam -- ledger REFRESH (c')2); its replacement in
+        # the slot is the #745 reachability suite.
+        self.assertNotIn("754-layerset-scope-guard", by_name)
+        self.assertEqual(by_name["745-anchor-reachability"].ref, "eab1926ea8")
         self.assertEqual(
             by_name["735-arithmetic-docs"].markers[
                 "docs/dev/DESIGN_pp_layer_set.md"

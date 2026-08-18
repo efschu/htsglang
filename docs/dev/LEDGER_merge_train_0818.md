@@ -161,3 +161,72 @@ A fix branch must state its base hash in the commit message (all of
 today's do). Before pass 3 starts, re-run the (a) table against the ACTUAL
 train tip of that day — this file's outputs are frozen at 2026-08-18 and
 go stale the moment the train moves.
+
+---
+
+# REFRESH — second wave (2026-08-18, post-harvest-composite)
+
+The first map froze before today's second wave. New authority: **F4-r5's
+harvest composite, tip `59ce2d8a30`** ("[#758] The batch line names the
+rank..."), declared COMPLETE by its owner, review tip still an ancestor.
+**Pass 3 is redefined: the harvest tip is the new train base; the remaining
+unabsorbed branches cherry-pick on top.**
+
+## (a') Ancestry vs the harvest tip (`git merge-base --is-ancestor R 59ce2d8a30`)
+
+```
+ABSORBED  921d63defc  comp4 (and its whole ancestry: #756/#752/#747/#750/
+                      flip-images/#540-fix 57b04b2434)
+ABSORBED  915ce1b868  #757 (F4-r5's own, regression-verified in-composite)
+NOT       everything else listed below
+```
+
+## (b') Patch identity vs the harvest tip (`git cherry`)
+
+Absorbed as DIFFERENT commits — **do NOT merge, the desk-#752 hazard
+class**:
+
+```
+- 1cc0d24ae7  fix/748-armed-gate-scope   (absorbed=1, unabsorbed=0)
+- d3bef88e66  fix/759-arming-economy     (absorbed=1, unabsorbed=0)
+- d25b7a08c3  feat/755-slot-reorder      (absorbed=1, unabsorbed=0)
+```
+
+The #758 emitters need no branch: the harvest TIP ITSELF is a #758 commit.
+
+Genuinely pending (unabsorbed commits > 0): `9e5647706f` (#757
+independent — F4-r5's in-composite note: REVIEW against 915ce1b868, never
+merge on top), `eab1926ea8` (#745 reachability suite, 1), `2cf6a6e4b8`
+(#751, 1), `2c936ff82b` (#749, 2 — but CONTAINED in feat/753's lineage,
+self-skips once 753 lands), `082293f20b` (feat/753, 10 — Slot-3, in
+flight), `3facc4b80c` (#735 docs), the #727 lineage picks (+ head-chain
+`3682331d33`), `f199828d11` (#738), `c92e65c547` (#535), `d60b11a258`
+(#755 docs), the #740 pair, this ledger branch. `fix/706-remainder`: not
+yet visible; slot reserved.
+
+## (c'/d') New order and supersessions
+
+1. **feat/753 lands FIRST, by its owner** — it is a 10-commit in-flight
+   branch whose compose base already resolved the double-lineage, it
+   carries #749, AND it folds #754 at the same seam
+   (`dd08f8fe63`, `distributed/utils.py:1709` = its own pp_size=1
+   phase-flip handling). The executor does not automate an owner's live
+   branch; it runs AFTER 753 is on the tip.
+2. **fix/754 (`f384591531`) is SUPERSEDED by the 753 fold** — semantic,
+   not patch-identical (`git cherry 082293f20b f384591531` shows `+`):
+   merging it after 753 guarantees a conflict in `get_pp_layer_set` with
+   zero content gain. Removed from the executor plan. Same verdict class
+   as desk-#752 in the first map. My own branch; retired without regret —
+   its test file rides 753's fold or gets re-picked by the owner if their
+   fold lacks one.
+3. Executor cherry order on the post-753 tip: #745 suite, #751, #749
+   (self-skips if 753 carried it), #735 docs, the #727 quartet
+   (3f8996a1a6, 5745a545d6, d7984ab810, 3682331d33), #738, #535, #755
+   docs, the #740 pair. Conflict predictions carry over from the first
+   map where still applicable; the #754 fixture-hunk prediction is
+   retired with its step.
+4. **9e5647706f** goes to REVIEW, never merge (its owner's own
+   in-composite note names the procedure).
+
+Standing rule re-applied: these outputs freeze at the second wave;
+re-derive (a') against the actual tip on train day.

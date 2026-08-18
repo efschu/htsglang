@@ -47,7 +47,11 @@ from typing import Dict, List, Optional
 
 REVIEW_TIP = "c3fd6f6ab8"
 COMPOSITE = "c546eed923"
-DEFAULT_TIP = "921d63defc"  # comp4 = composite + fix/756
+#: Second wave: F4-r5's harvest composite (contains comp4, #757/#748'/#759/
+#: #755-reorder/#758-emitters). The train base; feat/753 lands on it BY ITS
+#: OWNER before this executor runs (ledger REFRESH (c')).
+HARVEST = "59ce2d8a30"
+DEFAULT_TIP = HARVEST
 DEFAULT_MARKER = "/spinning/evidence-665-f1/COMP4_ACCEPTED"
 
 PYTEST = [sys.executable, "-m", "pytest", "-q"]
@@ -85,18 +89,14 @@ PLAN: List[Step] = [
         note="review-based, test-only",
     ),
     Step(
-        name="754-layerset-scope-guard",
+        name="745-anchor-reachability",
         kind="cherry",
-        ref="f384591531",
-        predicted={
-            "test/registered/unit/mem_cache/test_hicache_gdn_layer_counter_752.py": "ours",
-        },
+        ref="eab1926ea8",
         suites=[
-            "test/registered/unit/distributed/test_pp_layer_set_flip_scope_754.py",
-            "test/registered/unit/mem_cache/test_hicache_gdn_layer_counter_752.py",
+            "test/registered/unit/mem_cache/test_anchor_write_reachability_745.py",
         ],
-        note="guard commit only, never the branch; the fixture hunk is "
-        "DROPPED (ledger (c)4: #756's class attribute covers it)",
+        note="test-only reachability suite; #754 step RETIRED here -- "
+        "superseded by feat/753's fold at the same seam (ledger REFRESH)",
     ),
     Step(
         name="735-arithmetic-docs",
@@ -139,6 +139,27 @@ PLAN: List[Step] = [
             "test/registered/unit/tools/test_ab_runner_727.py",
         ],
         note="trio 3/3; suites cover the whole trio",
+    ),
+    Step(
+        name="727-head-chain",
+        kind="cherry",
+        ref="3682331d33",
+        suites=[
+            "test/registered/unit/quantization/test_ct_lmhead_chain_727.py",
+        ],
+        note="trio 4/4 (second wave): the lm_head chain pins + accept-len",
+    ),
+    Step(
+        name="738-pageout-verdict",
+        kind="cherry",
+        ref="f199828d11",
+        note="probe tool + verdict note; docs+tool only",
+    ),
+    Step(
+        name="535-unblock-verdict",
+        kind="cherry",
+        ref="c92e65c547",
+        note="ticket updates only",
     ),
     Step(
         name="755-determination-docs",
@@ -199,6 +220,8 @@ def check_lineage(repo: str, tip: str) -> None:
     for must_contain, why in (
         (REVIEW_TIP, "the review lineage"),
         (COMPOSITE, "the composite (absorbed desk fixes)"),
+        (HARVEST, "the harvest composite (second wave: #757/#748'/#759/"
+         "#755-reorder/#758 emitters)"),
     ):
         r = run(repo, "merge-base", "--is-ancestor", must_contain, tip, check=False)
         if r.returncode != 0:
