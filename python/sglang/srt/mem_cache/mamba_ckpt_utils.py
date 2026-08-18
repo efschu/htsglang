@@ -98,6 +98,45 @@ def protect_deepest_anchors(
     return not host_tier_present
 
 
+def checkpoint_truncation_align(
+    existing_align: Optional[int],
+    interval: Optional[int],
+    chunked_prefill_size: Optional[int],
+) -> tuple:
+    """``(truncation_align_size, folded)`` after the checkpoint grid weighs in.
+
+    #750: the interval folds into the prefill truncation alignment ONLY
+    while ``interval <= chunked_prefill_size`` (or chunked prefill is off).
+    There the scheduler clips every step end onto the grid, which is what
+    makes every cached snapshot position an absolute interval multiple.
+
+    A SPARSE grid -- ``interval > chunked_prefill_size``, validated to be an
+    exact multiple -- needs no clipping at all: full chunk ends land at
+    ``n * chunked_prefill_size``, and every ``(interval // chunk)``-th one
+    is ON the grid by divisibility, while the retention rule
+    (``mamba_radix_cache.py``: an off-grid finish is not cached) drops the
+    ends between. Folding 8192 into the alignment would inflate the
+    truncation unit 16x past a 512 chunk budget, which is exactly the C30
+    refusal that made the old coupling a hard limit.
+
+    ``folded`` tells the caller whether the interval became part of the
+    alignment (and so belongs in the C30 sources list).
+    """
+    if interval is None:
+        return existing_align, False
+    if (
+        chunked_prefill_size is not None
+        and chunked_prefill_size > 0
+        and interval > chunked_prefill_size
+    ):
+        return existing_align, False
+    if existing_align is None:
+        return interval, True
+    import math
+
+    return math.lcm(existing_align, interval), True
+
+
 def mamba_checkpoint_track_target(
     prefix_len: int,
     extend_len: int,
@@ -110,10 +149,13 @@ def mamba_checkpoint_track_target(
     The prefill kernels expose intermediate states only at
     ``prefix_len + k * chunk_size`` (FLA chunk grid) plus the final position,
     so a target is reachable iff it lies inside ``(prefix_len, end]`` and its
-    offset from ``prefix_len`` is chunk-aligned (the final position
-    ``end == target`` is chunk-aligned by the same test, since callers
-    validate ``interval % chunk_size == 0`` and keep prefill steps ending on
-    the interval grid).
+    offset from ``prefix_len`` is chunk-aligned. Callers validate
+    ``interval % chunk_size == 0``; prefill steps end on the interval grid
+    while ``interval <= chunked_prefill_size`` (the fold arm of
+    ``checkpoint_truncation_align``), and on a #750 sparse grid
+    (``interval`` a multiple of the chunk budget) a boundary inside a full
+    step can only be the step's own end, so the final-position routing
+    serves every anchor.
     """
     end = prefix_len + extend_len
     target = end // interval * interval
