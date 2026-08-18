@@ -83,7 +83,7 @@ makes it a pure config flip — chunk budget stays 512).
 
 | item | why separate | form |
 | --- | --- | --- |
-| #727 three-arm quality A/B | 4 boots (A1, A2, B, C), only --model-path differs | `tools/ab_vocab_int8_727.py`, own window |
+| #727 three-arm quality A/B | 4 boots (A1, A2, B, C), only --model-path differs | `tools/ab_vocab_int8_727.py`, own window. Arms (models-cache root): A1/A2 `Qwen3.8-27B-INT8-yarn1.5`, B `Qwen3.8-27B-INT8-vocabint8-embed`, C `Qwen3.8-27B-INT8-vocabint8-both`; all other flags = the composite recipe unchanged (spec ON so the accept_len readout fires). GATE 0 = `INT8-VOCAB ENGAGED` count 0/0/1/2; GATE A = PP0 −1212 MiB (B, C), PP2 −1212 MiB (C only); GATE B incl. optional accept_len vs the A-vs-A floor; decision rule pre-written in TICKET_727. ARM C IS THE #735 FUNDER (lm_head sits on the 5090; slots 21-24 need its 1212 MiB). |
 | WINDOW_TICKET_755 slots A/B | 12/4 vs 6/2 changes pool geometry (confound for everything above) | 2 boots, two flags |
 | #755 metal retraction proof | needs the NOTE_755 §2 lock reorder — NOT BUILT; nothing to measure yet | future |
 | #709 uneven-TP A/B | own boot pair per its arm spec (opportunistic per ledger 11866) | owner: F4 lineage |
