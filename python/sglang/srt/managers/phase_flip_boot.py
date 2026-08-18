@@ -378,8 +378,8 @@ class PhaseFlipStacks:
             # where TP is the larger layout this is the difference between a
             # flip and a cudaErrorInvalidValue into the released tail.
             self._commit_refill_high_water()
-            arena_refill(
-                self.arena,
+            self._timed_arena_refill(
+                "pp_to_tp",
                 self.layout_tp,
                 self.image_tp,
                 restore=(self.layout_pp, self.image_pp),
@@ -411,8 +411,8 @@ class PhaseFlipStacks:
             # -- it is priced into the affordability verdict by
             # PhaseFlipRuntime._arena_tail_bytes before the flip commits.
             self._commit_refill_high_water()
-            arena_refill(
-                self.arena,
+            self._timed_arena_refill(
+                "tp_to_pp",
                 self.layout_pp,
                 self.image_pp,
                 restore=(self.layout_tp, self.image_tp),
@@ -461,6 +461,55 @@ class PhaseFlipStacks:
         return max(
             int(self.layout_pp.total_bytes), int(self.layout_tp.total_bytes)
         )
+
+    def _timed_arena_refill(self, direction: str, layout, image, restore) -> None:
+        """#758 emitter (3 of 3): PER-RANK FLIP REFILL TIME.
+
+        WHY THIS DID NOT EXIST AND HAD TO. The comp4 load ladder
+        (2026-08-18) could not accept the file-backed-image arm because the
+        acceptance asks for a refill number against the ~3.1 s pinned
+        baseline, and NOTHING in the tree emitted one -- a grep of this file
+        and weights_arena.py found no elapsed/ms line on the refill path at
+        all. The arm's whole cost model is "a pageable H2D copy while cached,
+        plus a disk read when the pages were reclaimed"; without a timer that
+        claim is unfalsifiable on metal.
+        This wraps the copy that the #690 high-water marks already bracket
+        (``_commit_refill_high_water`` immediately above every call), so the
+        number is the refill leg proper and nothing else.
+
+        PER RANK, NOT REDUCED. The flip's cost is the SLOWEST rank's copy --
+        the layouts differ in size per rank (pp 17219 / tp 16329 MiB on PP0
+        against 8977 on PP1 here), so a mean would hide exactly the rank that
+        sets the seam. Each rank logs its own; the reader takes the max.
+        """
+        import time as _time
+
+        started = _time.perf_counter()
+        arena_refill(self.arena, layout, image, restore=restore)
+        elapsed = _time.perf_counter() - started
+        try:
+            nbytes = int(layout.total_bytes)
+            logger.info(
+                "%s REFILL %s took %.3f s for %.1f MiB (%.0f MiB/s) -- %s images. "
+                "Compare against the ~3.1 s pinned baseline: this is the price the "
+                "file-backed arm pays for making the image post reclaimable.",
+                LOG_PREFIX,
+                direction,
+                elapsed,
+                nbytes / 1048576.0,
+                (nbytes / 1048576.0) / elapsed if elapsed > 0 else 0.0,
+                "file-backed" if self._images_are_file_backed() else "pinned",
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            pass
+
+    def _images_are_file_backed(self) -> bool:
+        """Report the image mode so the refill number is never read against
+        the wrong baseline (a pinned refill and a file-backed one are not
+        the same measurement)."""
+        import os as _os
+
+        return _os.environ.get("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED", "") == "1"
 
     def _commit_refill_high_water(self) -> None:
         from sglang.srt.managers import phase_flip_seam_census as seam_census

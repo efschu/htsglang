@@ -91,13 +91,49 @@ class MambaComponent(TreeComponent):
             )
 
         # HiCache: evicted + backuped (host_value present) is also a valid match
-        return lambda node, depth: is_resume_candidate(
-            depth,
-            interval,
-            has_device_value=node.component_data[ct].value is not None,
-            has_host_value=node.component_data[ct].host_value is not None,
-            device_only=False,
-        )
+        #
+        # #758 emitter (2 of 3): MAMBA HOST-BACKED RESUME.
+        #
+        # The comp4 ladder could not evidence "at least one host-backed resume"
+        # because nothing said when one happened -- 0 lines matching
+        # "host-backed" across the window, which again cannot distinguish a
+        # working host tier from an idle one. THIS predicate is the moment of
+        # truth: it is the only place an anchor is accepted on the strength of
+        # a host copy rather than a resident one.
+        #
+        # ONLY the host-accepted branch logs, and that is what keeps it cheap:
+        # this lambda runs per node in every match walk, but a match that has a
+        # device value is the overwhelmingly common case and returns before the
+        # emitter is reached. A host-only acceptance is exactly the rare event
+        # being counted, and it is the one that triggers load_back.
+        def _resume_with_host(node, depth):
+            data = node.component_data[ct]
+            has_dev = data.value is not None
+            ok = is_resume_candidate(
+                depth,
+                interval,
+                has_device_value=has_dev,
+                has_host_value=data.host_value is not None,
+                device_only=False,
+            )
+            if ok and not has_dev:
+                try:
+                    n = getattr(MambaComponent, "_host_resume_count", 0) + 1
+                    MambaComponent._host_resume_count = n
+                    if n == 1 or n % 8 == 0:
+                        logger.info(
+                            "MAMBA-HOST-RESUME n=%d: anchor accepted at depth=%d on a "
+                            "HOST-backed state (device copy evicted); this match "
+                            "triggers load_back. interval=%s",
+                            n,
+                            depth,
+                            interval,
+                        )
+                except Exception:  # noqa: BLE001 - never break a match walk
+                    pass
+            return ok
+
+        return _resume_with_host
 
     def finalize_match_result(
         self,

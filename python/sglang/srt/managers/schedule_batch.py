@@ -2697,7 +2697,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
+        # #758 emitter (1 of 3): ANCHOR WRITTEN, and the silent-inert question.
+        #
+        # The comp4 load ladder found ZERO log lines matching "anchor" across a
+        # whole 300 s window with --mamba-checkpoint-interval 8192 armed. That
+        # is indistinguishable between "the cadence is correct and silent" and
+        # "the flag is inert" -- the #742 silently-inert-flag class. This is the
+        # only place a checkpoint target is chosen, so it is where the question
+        # is settled: every anchor is counted, the FIRST is always logged (so
+        # "did any fire at all" is answerable from one grep), and thereafter one
+        # line per 16 anchors carries the position and the running count, which
+        # is what the 1-per-interval cadence is computed from.
+        # Deliberately counts TARGETS CHOSEN rather than states copied: if the
+        # copy silently no-ops the count still rises and the two disagree, which
+        # is the more useful failure to be able to see.
         if target is not None:
+            try:
+                n = getattr(type(self), "_mamba_anchor_count", 0) + 1
+                type(self)._mamba_anchor_count = n
+                if n == 1 or n % 16 == 0:
+                    logger.info(
+                        "MAMBA-ANCHOR written n=%d at abs_pos=%d "
+                        "(interval=%d, chunk=%d, prefix_len=%d, extend=%d) -- "
+                        "cadence should be one per %d tokens",
+                        n,
+                        target,
+                        ckpt_interval,
+                        mamba_cache_chunk_size,
+                        prefix_len,
+                        req.extend_range.length,
+                        ckpt_interval,
+                    )
+            except Exception:  # noqa: BLE001 - an instrument may never break a step
+                pass
             if target == end:
                 # Last position of the step: state comes from
                 # last_recurrent_state (chunk-aligned routing).
