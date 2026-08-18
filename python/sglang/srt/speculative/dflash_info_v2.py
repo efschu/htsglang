@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -49,8 +49,8 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
-    reserved_seq_lens_cpu: Optional[torch.Tensor] = None
-    reserved_seq_lens_sum: Optional[int] = None
+    nxt_kv_lens_cpu: Optional[torch.Tensor] = None
+    nxt_kv_lens_sum: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -154,7 +154,7 @@ class DFlashDraftInputV2(SpecInput):
         reserve = get_alloc_reserve_per_decode(alloc_len=block_size)
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
-        reserved_seq_lens_sum = 0
+        nxt_kv_lens_sum = 0
         num_needed_tokens = 0
         max_top_k = 1
         uniform_top_k_value = None
@@ -162,17 +162,26 @@ class DFlashDraftInputV2(SpecInput):
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
-            cur_alloc_len = int(req.kv_allocated_len)
-            reserved_len = max(cur_alloc_len, committed_len + reserve)
+            cur = int(req.kv_allocated_len)
+            # Whole-page accounting (upstream #35265, same as
+            # eagle_prepare_for_decode): the paged allocator hands out full
+            # pages, so an unaligned reserve strands the tail of the last page
+            # -- allocated but never recorded.  The reserve itself stays the
+            # #486 derived one (block + commit lag), not upstream's blanket
+            # 2 * block_size.
+            nxt = max(
+                cur,
+                (committed_len + reserve + page_size - 1) // page_size * page_size,
+            )
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur_alloc_len
-            nxt_kv_lens_cpu_t[i] = reserved_len
+            cur_kv_lens_cpu_t[i] = cur
+            nxt_kv_lens_cpu_t[i] = nxt
 
             committed_seq_lens_sum += committed_len
-            reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
+            nxt_kv_lens_sum += nxt
+            num_needed_tokens += nxt - cur
 
             if top_k > max_top_k:
                 max_top_k = top_k
@@ -245,13 +254,21 @@ class DFlashDraftInputV2(SpecInput):
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum
-        self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
-        self.reserved_seq_lens_sum = reserved_seq_lens_sum
+        self.nxt_kv_lens_cpu = nxt_kv_lens_cpu_t
+        self.nxt_kv_lens_sum = nxt_kv_lens_sum
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        if self.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
-            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+        has_been_filtered: bool = True,
+    ):
+        if self.nxt_kv_lens_cpu is not None:
+            if new_indices_cpu is not None:
+                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices_cpu]
+            else:
+                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
+            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
@@ -264,15 +281,15 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
-        if self.reserved_seq_lens_cpu is not None:
-            assert spec_info.reserved_seq_lens_cpu is not None
-            self.reserved_seq_lens_cpu = torch.cat(
-                [self.reserved_seq_lens_cpu, spec_info.reserved_seq_lens_cpu]
+        if self.nxt_kv_lens_cpu is not None:
+            assert spec_info.nxt_kv_lens_cpu is not None
+            self.nxt_kv_lens_cpu = torch.cat(
+                [self.nxt_kv_lens_cpu, spec_info.nxt_kv_lens_cpu]
             )
-            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
-        elif spec_info.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
-            self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
+        elif spec_info.nxt_kv_lens_cpu is not None:
+            self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
+            self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

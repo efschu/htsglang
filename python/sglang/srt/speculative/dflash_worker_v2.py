@@ -2249,10 +2249,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     seq_lens_cpu.copy_(batch.seq_lens_cpu)
                     seq_lens_cpu.add_(block_size)
                     draft_seq_lens_sum = int(seq_lens_cpu.sum())
-                elif draft_input.reserved_seq_lens_cpu is not None:
+                elif draft_input.nxt_kv_lens_cpu is not None:
                     # GPU-only backend: reserved is a safe over-estimate.
-                    seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                    draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+                    seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
+                    draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
                 else:
                     seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                     draft_seq_lens_sum = int(prefix_lens.sum().item())
@@ -2356,9 +2356,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_host_seq_lens = seq_lens_cpu_backup + block_size
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
