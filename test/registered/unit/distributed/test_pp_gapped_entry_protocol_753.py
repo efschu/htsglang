@@ -493,5 +493,71 @@ class TestIdleTickSendsNothing(unittest.TestCase):
         self.assertNotIn("pp_outputs if forward_now is None else", sentinel_src)
 
 
+class TestGappedForwardIsRefused(unittest.TestCase):
+    """#753: the known-wrong gapped forward may not be served by accident.
+
+    The probe that condemns it: 'The capital of France is' at temperature 0,
+    seed 735000001, returns '\\n\\n' on the gapped cut and 'Paris' on the same
+    checkpoint under a contiguous layout.
+    """
+
+    def test_refusal_fires_by_default(self):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            PP_GAPPED_KNOWN_WRONG_ENV,
+            _refuse_known_wrong_gapped_forward,
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                _refuse_known_wrong_gapped_forward()
+        msg = str(ctx.exception)
+        # The refusal must NAME the defect, not merely decline.
+        self.assertIn("REFUSED", msg)
+        self.assertIn("Paris", msg)
+        self.assertIn(PP_GAPPED_KNOWN_WRONG_ENV, msg)
+
+    def test_escape_hatch_allows_debugging(self):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            PP_GAPPED_KNOWN_WRONG_ENV,
+            _refuse_known_wrong_gapped_forward,
+        )
+
+        with mock.patch.dict(
+            os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}, clear=True
+        ):
+            _refuse_known_wrong_gapped_forward()  # must not raise
+
+    def test_falsey_values_do_not_open_the_hatch(self):
+        """'0' and '' must keep the refusal shut."""
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            PP_GAPPED_KNOWN_WRONG_ENV,
+            _refuse_known_wrong_gapped_forward,
+        )
+
+        for value in ("0", "", "false", "False"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: value}, clear=True
+                ):
+                    with self.assertRaises(ValueError):
+                        _refuse_known_wrong_gapped_forward()
+
+    def test_the_gapped_init_path_calls_the_refusal(self):
+        """The gate must sit on the path a gapped boot actually takes."""
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(m.SchedulerPPMixin.init_pp_loop_state)
+        self.assertIn("_refuse_known_wrong_gapped_forward()", src)
+
+    def test_contiguous_boots_never_reach_the_gate(self):
+        """A contiguous layout must be entirely unaffected."""
+        with mock.patch.dict(
+            os.environ,
+            {PP_LAYER_SET_ENV: CONTIGUOUS_SET, PP_CROSSING_WIRE_ENV: "1"},
+            clear=True,
+        ):
+            self.assertFalse(pp_gapped_ownership_active(3))
+
+
 if __name__ == "__main__":
     unittest.main()

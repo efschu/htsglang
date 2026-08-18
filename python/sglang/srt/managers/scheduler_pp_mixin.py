@@ -141,6 +141,62 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+#: The escape hatch for the refusal below. Set it to investigate the defect;
+#: it is the only way to reach the gapped forward, and it says in its own name
+#: that what it produces is not to be trusted.
+PP_GAPPED_KNOWN_WRONG_ENV = "SGLANG_PP_GAPPED_ALLOW_KNOWN_WRONG"
+
+
+def _refuse_known_wrong_gapped_forward() -> None:
+    """#753: a gapped layer set may not be SERVED while its forward is wrong.
+
+    MEASURED, not suspected. On 2026-08-18 the gapped cut booted, served, and
+    answered the determined-answer probe -- "The capital of France is", temp 0,
+    seed 735000001 -- with '\\n\\n' where the same checkpoint under the
+    contiguous layout answers 'Paris'. Longer generations degenerate into a
+    repeated token. The error is in the FORWARD: the very first prefill token
+    is already wrong, before any decode step or KV reuse.
+
+    This is the worst class of defect this corpus tracks, because nothing about
+    it looks like a failure -- the boot is clean, health is 200, throughput is
+    plausible, and the text is confidently wrong. The layout also has no
+    performance case left to justify the risk: measured per-GPU utilization is
+    16.6/34.7/15.0 % against 80.5/55.5/47.0 % contiguous, and 2.5x the
+    wall-clock on the same prompt, because the crossings serialize the stages
+    by construction.
+
+    So the gate is a REFUSAL rather than a warning. A warning in a boot log is
+    not a control; this configuration must not be reachable by accident.
+    """
+    import os
+
+    if os.getenv(PP_GAPPED_KNOWN_WRONG_ENV, "") not in ("", "0", "false", "False"):
+        logger.warning(
+            "#753: serving a gapped PP layer set with a KNOWN-WRONG forward "
+            "because %s is set. Output from this instance is not correct and "
+            "must not be used for anything but debugging the defect itself.",
+            PP_GAPPED_KNOWN_WRONG_ENV,
+        )
+        return
+    raise ValueError(
+        "REFUSED: a gapped PP layer set (SGLANG_PP_LAYER_SET with "
+        "non-contiguous stage ownership) produces a NUMERICALLY WRONG forward "
+        "and may not be served. Measured 2026-08-18: the determined-answer "
+        "probe 'The capital of France is' at temperature 0 returns '\\n\\n' "
+        "where the same checkpoint under a contiguous layout returns 'Paris', "
+        "and longer generations degenerate into a repeated token. The first "
+        "prefill token is already wrong, so the fault is in the forward and "
+        "not in decode or KV reuse. The crossing wire, the entry protocol, the "
+        "typed channel and the lockstep exchange are all in place and the boot "
+        "is otherwise clean -- which is exactly why this refuses rather than "
+        "warns: nothing about the failure is visible from outside. The layout "
+        "has no performance case either (per-GPU utilization 16.6/34.7/15.0 % "
+        "against 80.5/55.5/47.0 % contiguous, 2.5x the wall-clock), so there "
+        f"is nothing to trade against correctness. Set {PP_GAPPED_KNOWN_WRONG_ENV}=1 "
+        "to reach the forward anyway while debugging it."
+    )
+
+
 #: "the caller did not supply a value", so that an explicit ``None`` can mean
 #: "I received nothing this iteration" instead of collapsing into the default.
 #: A plain ``None`` default could not express both -- see ``_do_send``.
@@ -1923,6 +1979,7 @@ class SchedulerPPMixin:
         # stage's entry.
         self._pp_gapped_wire: bool = pp_gapped_ownership_active(self.ps.pp_size)
         if self._pp_gapped_wire:
+            _refuse_known_wrong_gapped_forward()
             if self.server_args.pp_async_batch_depth > 0:
                 raise ValueError(
                     "a gapped PP layer set cannot be combined with "
