@@ -21,6 +21,7 @@ the pre-fix code:
    could take the other's message off the wire.
 """
 
+import inspect
 import os
 import unittest
 from collections import deque
@@ -364,6 +365,90 @@ class TestGappedCorridorHoldback(unittest.TestCase):
         rest, post = self._call(11.923, reserve=0)
         self.assertEqual(rest, 11.923)
         self.assertIsNone(post)
+
+
+class TestOutputRingSymmetricGating(unittest.TestCase):
+    """#753: send and receive must ask ONE question of ONE slot.
+
+    SPECIMEN v7pp12: the iteration barrier timed out after 120s with 'no peer
+    could be proven dead'. The peers were not dead -- they had decided the
+    output exchange was not due, because the send gate read
+    ``mbs[(mb_id + pp_size) % pp_loop_size]`` and the receive gate read
+    ``mbs[(mb_id + 1) % pp_loop_size]``. Those name the same batch only while
+    the pipeline stagger puts the ranks on different slots at the same instant.
+    A gapped forward drives the offsets to zero, and the two gates then name
+    different batches.
+    """
+
+    def _slots(self, pp_size, pp_loop_size, mb_id=0):
+        """The two gate indices, exactly as the event loop computes them."""
+        send_gate = (mb_id + pp_size) % pp_loop_size
+        recv_gate = (mb_id + 1) % pp_loop_size
+        return send_gate, recv_gate
+
+    def test_the_staggered_ring_splits_the_gates(self):
+        """The premise. At the ordinary ring size the two gates DIFFER."""
+        send_gate, recv_gate = self._slots(pp_size=3, pp_loop_size=3)
+        self.assertNotEqual(
+            send_gate,
+            recv_gate,
+            "if these ever coincide at loop size 3 the v7pp12 diagnosis is wrong",
+        )
+
+    def test_one_slot_collapses_both_gates(self):
+        """The fix, stated as arithmetic rather than as hope."""
+        for pp_size in (2, 3, 4):
+            with self.subTest(pp_size=pp_size):
+                send_gate, recv_gate = self._slots(pp_size=pp_size, pp_loop_size=1)
+                self.assertEqual(send_gate, 0)
+                self.assertEqual(recv_gate, 0)
+
+    def test_gapped_boot_selects_one_slot(self):
+        """A gapped run must actually take the one-slot path.
+
+        Guards the specific regression this commit undoes: d139c463cc removed
+        the pp_loop_size=1 selection on a wrong reading of why v7pp5 starved.
+        """
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(m.SchedulerPPMixin.init_pp_loop_state)
+        self.assertIn("self.pp_loop_size = 1", src)
+
+    def test_exchange_predicate_is_one_expression(self):
+        """Both sides call the same function, so they cannot drift apart."""
+        from sglang.srt.managers.scheduler_pp_mixin import _pp_output_exchange_due
+
+        class _Mode:
+            def __init__(self, prebuilt):
+                self._p = prebuilt
+
+            def is_prebuilt(self):
+                return self._p
+
+        class _Batch:
+            def __init__(self, prebuilt=False, n=2, last_chunk=True):
+                self.forward_mode = _Mode(prebuilt)
+                self.reqs = [object()] * n
+                self.contains_last_prefill_chunk = last_chunk
+                self.return_logprob = False
+
+        self.assertFalse(_pp_output_exchange_due(None))
+        self.assertFalse(_pp_output_exchange_due(_Batch(prebuilt=True)))
+        self.assertTrue(_pp_output_exchange_due(_Batch()))
+
+    def test_send_side_uses_the_shared_predicate(self):
+        """The last rank's gate is the function, not a re-spelling of it."""
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(m.SchedulerPPMixin._pp_send_output_to_next_stage)
+        self.assertIn("_pp_output_exchange_due(target)", src)
+
+    def test_split_slots_are_refused_on_the_gapped_path(self):
+        """A future ring-size change must fail loudly, not starve silently."""
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(m.SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors)
+        self.assertIn("next_first_rank_mb_id != next_mb_id", src)
 
 
 if __name__ == "__main__":

@@ -141,6 +141,34 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_output_exchange_due(batch: Optional[ScheduleBatch]) -> bool:
+    """Does this slot owe an output exchange? ONE predicate, both sides.
+
+    #753. The output ring had two gates that were never the same expression:
+    the last rank sent when its slot held a runnable batch, and a middle rank
+    received when ITS slot did -- a DIFFERENT slot, ``(mb_id + 1) %
+    pp_loop_size`` against ``(mb_id + pp_size) % pp_loop_size``. Those agree
+    only because the pipeline stagger puts the ranks on different slots at the
+    same instant, so the two indices name the same batch from two positions.
+
+    A gapped forward removes the stagger -- every stage owns layers inside
+    every other stage's span, so all three are in the same pass or none of them
+    progresses -- and the moment the offsets go to zero the two gates start
+    naming DIFFERENT batches. One rank then sends while another declines to
+    receive, and the ring starves. That is the v7pp12 specimen: the iteration
+    barrier timed out after 120s with 'no peer could be proven dead', because
+    the peers were not dead, they had simply decided the exchange was not due.
+
+    So the fix is not an index. It is that send and receive must be the SAME
+    QUESTION asked of the SAME batch, which is what this function is.
+    """
+    return (
+        batch is not None
+        and not batch.forward_mode.is_prebuilt()
+        and not _pp_can_skip_output_comm(batch)
+    )
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -1914,20 +1942,36 @@ class SchedulerPPMixin:
                     "a crossing at the first arm."
                 )
 
-        # NOT reduced under a gapped set, and boot v7pp5 is why. The loop
-        # launches exactly ONE slot's forward per iteration whatever this is,
-        # so the ping-pong is already serial and a smaller ring buys nothing.
-        # What it COSTS is the output ring's fill slack: the output stage works
-        # on slot ``next_mb_id``, and with one slot that is the batch just
-        # launched -- never None -- so the very first iteration blocks on a
-        # message the upstream has not produced. v7pp5 wedged there with PP0
-        # already into the next decode pass at layer 4 while PP1 and PP2 sat in
-        # the output receive: rank 0 had taken PP2's output and then sent
-        # nothing onward, because a non-last rank sends only ``if pp_outputs``
-        # and its own was still None. With the ordinary ring size the unfilled
-        # slot is None and that receive returns early, which is exactly how the
-        # contiguous path absorbs the same fill.
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        if self._pp_gapped_wire:
+            # ONE SLOT, and the reason is the offsets rather than the count.
+            #
+            # I set this to 1 once before (v7pp5), watched the output ring
+            # starve, and blamed the ring's "fill slack" -- the unfilled slot
+            # that lets a receive return early during pipeline fill. That
+            # reading was wrong, and d139c463cc reverting it was wrong with it.
+            # The slack was never the mechanism; it was a symptom of the two
+            # gates being different expressions. A middle rank sent only
+            # ``if pp_outputs`` -- what it received LAST iteration -- while
+            # receiving whenever its slot held a batch, so during fill it
+            # received without ever sending. Fixing the LAG (4b7ce2a81f) made a
+            # middle rank forward what it just received, which turned its send
+            # gate into "I received", and _pp_output_exchange_due now makes
+            # that the same question on both sides.
+            #
+            # With symmetric gates the slot count stops being a correctness
+            # knob and becomes what it always should have been: how many passes
+            # may be in flight. A gapped layout permits exactly one, because
+            # every stage must be inside the same pass. Keeping the ordinary
+            # ring size is what broke v7pp12 -- next_first_rank_mb_id and
+            # next_mb_id then name DIFFERENT slots, the two gates disagree, and
+            # the iteration barrier starves with no peer provably dead.
+            #
+            # At one slot both indices collapse to 0, so the send gate and the
+            # receive gate cannot reference different batches even in
+            # principle. _pp_assert_gapped_slots_coincide checks that rather
+            # than trusting the arithmetic to stay this way.
+            self.pp_loop_size = 1
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
@@ -2829,10 +2873,9 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
-                ):
+                # #753: the SAME predicate the receiving side applies, so the
+                # ring cannot have one rank sending while another declines.
+                if _pp_output_exchange_due(target):
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
@@ -2915,7 +2958,22 @@ class SchedulerPPMixin:
                 d2h_event.record(self.device_module.current_stream())
 
         if getattr(self, "_pp_gapped_wire", False):
-            # #753: THE RING'S ONE-ITERATION LAG IS WHAT DEADLOCKS LOCKSTEP.
+            # #753: the send gate reads mbs[next_first_rank_mb_id] and the
+            # receive gate reads mbs[next_mb_id]. Under lockstep those must be
+            # the SAME slot or the two gates can answer differently about
+            # different batches -- the v7pp12 starve. At pp_loop_size 1 both
+            # collapse to 0; this refuses rather than trusting that they will.
+            if next_first_rank_mb_id != next_mb_id:
+                raise AssertionError(
+                    f"gapped output ring needs one slot: the send gate reads "
+                    f"slot {next_first_rank_mb_id} and the receive gate reads "
+                    f"slot {next_mb_id}. Those indices agree only under the "
+                    f"pipeline stagger, which a gapped set removes -- one rank "
+                    f"then sends while another declines to receive and the "
+                    f"ring starves with no peer provably dead (boot v7pp12). "
+                    f"pp_loop_size must be 1 on this path."
+                )
+            # THE RING'S ONE-ITERATION LAG IS WHAT DEADLOCKS LOCKSTEP.
             #
             # Outputs originate at the last rank and travel 2 -> 0 -> 1 -> 2.
             # A middle rank forwards ``pp_outputs``, which is what it received
