@@ -74,7 +74,7 @@ makes it a pure config flip — chunk budget stays 512).
 
 | acceptance | readout | pass |
 | --- | --- | --- |
-| #758-1 anchor cadence | anchor-cadence lines (comp4: 0 lines — F4-r5 is building the emitters; SILENT-INERT suspicion stands until they exist) | anchors at exact 8192-multiples, every 16th chunk end |
+| #758-1 anchor cadence | anchor-cadence lines (comp4: 0 lines — F4-r5 is building the emitters) | anchors at exact 8192-multiples, every 16th chunk end. SILENT-INERT suspicion RETIRED at the desk: the write path beneath is proven alive link by link (fix/745-anchor-reachability — grid decision at exactly the 16th/32nd chunk ends, donation → retained node → BACKUP_HOST transfer, dead-grid mutant reds the drive); the emitter is the ONLY outstanding piece |
 | NOTE_747 §8.1 composed boot serves | health + generation with interval x hierarchical | serves |
 | NOTE_747 §8.2 anchor survives to host + resumes | interval-position load_back line | >=1 at an 8192-multiple |
 | NOTE_747 §8.3 churn determinism | identical request resumes at same anchor after device eviction | same resume point |
