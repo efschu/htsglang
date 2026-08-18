@@ -1430,6 +1430,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        # #753: the mid-loop crossing wire. NoCrossingWire unless a layer set
+        # is configured AND SGLANG_PP_CROSSING_WIRE is on, so the default path
+        # gets a null object whose hooks are identity -- byte-identical, and
+        # with no branch in the loop below that could drift from the wired one.
+        from sglang.srt.distributed.pp_crossing_wire import build_wire_for_model
+
+        self.pp_crossing_wire = build_wire_for_model(config, self.pp_group)
+
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1480,6 +1488,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in owned_layer_ids(self.layers, self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
+            # #753: receive whatever a peer computed since this rank's last
+            # layer. Identity on the contiguous path.
+            hidden_states, residual = self.pp_crossing_wire.before_layer(
+                layer_idx, hidden_states, residual
+            )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -1505,6 +1518,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+            # #753: hand the result to whoever owns the next layer. After the
+            # deepstack add, so the peer receives the same tensor this rank
+            # would have carried forward itself. Identity on the contiguous
+            # path.
+            self.pp_crossing_wire.after_layer(layer_idx, hidden_states, residual)
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
