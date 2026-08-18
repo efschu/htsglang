@@ -141,8 +141,84 @@ VRAM slots, which is exactly what #745 proposes.
 * The system block and tool schemas were STUBBED with a fixed string, identical
   in both requests. This test therefore proves turn-to-turn stability within one
   agent; it does NOT test the cross-agent scaffold-sharing question. That second
-  diff is still open.
+  diff is CLOSED in §5a below.
 * The transcript's stored `thinking` blocks are empty, so deterministic thinking
   text was injected to exercise the rewrap path. Without that, the rewrap
   correctly returns `None` and the test would have silently measured nothing —
   which is exactly what it did on the first attempt.
+
+## 5a. The cross-agent scaffold diff — measured (the #740 residual)
+
+Method, same standard as §1 but with REAL scaffolds instead of stubs. Two
+fresh same-type agent sessions (`claude -p "hi" --model sonnet`, identical
+invocations, same directory) were pointed at a local capture sink via a
+`--settings` env override — necessary because `settings.json` pins every
+session's `ANTHROPIC_BASE_URL` to the router, so a plain env var never reaches
+the request path. The sink recorded the CLIENT-BUILT first-request bodies
+byte-for-byte: 3 system blocks (27,578 chars), 25 tool schemas (102,607 chars
+of JSON), 2 messages. Both bodies were then rendered through the real chain of
+the serving lineage the 30030 unit's drop-in points at (`wt-merge-r4`):
+`AnthropicServing._convert_to_chat_completion_request` with
+`_merge_inline_system` derived by the shipped `detect_inline_system_support`
+against the live template (=True), the REAL `apply_reasoning_enabled` bound
+over the live boot's `--reasoning-parser qwen3` with a real `ReasoningParser`
+detector, serving's `normalize_assistant_tool_call_arguments`, the live
+model's own `chat_template.jinja` (`Qwen3.8-27B-INT8-yarn1.5`), tokenized.
+
+Raw-body layer: **everything prompt-relevant is byte-identical across the two
+sessions.** System blocks identical (including `cache_control`), tools
+identical WITH stable ordering, even the messages identical (same prompt, same
+context attachment). The only differing field is `metadata.user_id` (embeds
+the session id), which §3 already showed never reaches the prompt. The only
+launch-variable element inside the system text is the trailing
+`<total_tokens>` budget (char 27,532 of 27,580 — the last line).
+
+Rendered layer (33,703-token first request):
+
+| pair                                        | common token prefix |
+| ---                                         | --- |
+| identical invocations (A vs B)              | **33,703 (100 %, byte-identical render)** |
+| same dir, tasks differ                      | 33,695 |
+| same dir, per-agent context AND task differ | 33,552 |
+| different working directory                 | **30,960 (91.9 %)** |
+
+The different-cwd row is the load-bearing one, and it survives for a reason
+worth recording: the live template renders the TOOL SCHEMAS FIRST — `# Tools`
+begins at ~token 41 — and the environment facts (working directory, git-repo
+flag) sit near the END of the system prose, AFTER all ~20k tool-schema
+tokens. So even two same-type agents in different worktrees share a ~31k-token
+identical prefix through the render chain. Tool-schema ordering, the suspect
+the residual named, is stable and contributes zero divergence.
+
+**Verdict line for #743: the scaffold prefix EXCEEDS the mamba-anchor reach
+requirement — cross-agent hits should occur, and their absence is an
+anchor-survival fact, not an adapter fact.** Concretely: with the live
+`chunked_prefill_size = 512`, chunk-end checkpoint donations can sit as deep
+as token 30,720 inside the 30,960-token shared prefix (60 grid positions), so
+ONE surviving anchor anywhere on that path turns a same-type agent's first
+request into a prefix hit with a bounded tail re-prefill. 4 hits in 121
+requests against a ~31k-token shared prefix therefore points at §4a's
+eviction mechanism (12 LRU slots shared by all requests and checkpoints) plus
+the split-node rule (`_split_node`: "mamba cache can not be split", the new
+branch-point node carries `mamba_value = None`) — the #743/#745 world. Not
+the adapter, not the template, not tool ordering.
+
+Honest limits of this measurement:
+
+* The captured pair is claude-model (sonnet) main-type sessions; a qwen-lane
+  pair could not be captured (serving down; spawning local-model agents is
+  barred by the sub-agent policy). The finding transfers structurally — the
+  same client code builds system/tools for every agent type, and the chain
+  under test is the one local-model requests traverse — but the qwen-lane
+  scaffold is smaller (4-tool set), so its absolute prefix length is shorter
+  than 30,960. The stability finding (byte-identical construction, stable
+  tool order, env facts after the tools) is type-independent.
+* Renders used `claude-sonnet-5` as the model string; the router would
+  rewrite it for a local target (§3: `payload["model"]`), which does not
+  enter the rendered prompt.
+* The `<total_tokens>` budget line diverges at token 31,354 (measured by
+  mutating the budget value and re-rendering). It sits AFTER the env facts in
+  render order, so for a different-cwd pair it is beyond the 30,960 boundary
+  and irrelevant; for a same-dir pair with differing consumed budgets it caps
+  the shared prefix at 31,354 instead of 33,552. Either way the shared prefix
+  stays ~31k tokens and the verdict is unchanged.
