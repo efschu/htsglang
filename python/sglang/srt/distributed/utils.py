@@ -1655,6 +1655,87 @@ def get_pp_layer_set(
     return parse_pp_layer_sets(raw, num_hidden_layers, pp_size)[pp_rank]
 
 
+def current_stage_layer_set() -> Optional[FrozenSet[int]]:
+    """This stage's owned layer ids, read from the live process group.
+
+    ``None`` on the contiguous path, which is what lets every caller degenerate
+    to the interval arithmetic it replaces. Kept HERE, next to
+    ``get_pp_layer_set``, so ownership has exactly one derivation -- the same
+    argument ``memory_pool._owned_layers_for_pool`` makes and which that
+    function now defers to rather than restating.
+    """
+    try:
+        from sglang.srt.distributed import get_pp_group
+    except Exception:  # pragma: no cover - import shape varies in unit tests
+        return None
+    try:
+        group = get_pp_group()
+        num_layers = getattr(group, "num_hidden_layers", None)
+        if num_layers is None:
+            return None
+        return get_pp_layer_set(num_layers, group.rank_in_group, group.world_size)
+    except Exception:  # pragma: no cover - no process group in unit tests
+        return None
+
+
+#: "not supplied", so that an explicit ``owned=None`` can mean the CONTIGUOUS
+#: path rather than "look it up". A plain None default could not express both.
+_ASK_THE_GROUP = object()
+
+
+def stage_owned_layer_ids(
+    all_attn_layer_ids, start_layer: int, end_layer: int, owned=_ASK_THE_GROUP
+) -> List[int]:
+    """The full-attention layers THIS stage owns. Set-aware.
+
+    THE INTERVAL IS THE SPAN, NOT THE SET, and treating it as the set is the
+    consumer error ``get_pp_indices``' own docstring warns about: under
+    ``SGLANG_PP_LAYER_SET``, ``start_layer``/``end_layer`` are ``min(owned)``
+    and ``max(owned) + 1``, so for the stage owning ``[35, 39, ..., 63]`` the
+    interval names 29 layers of which 21 belong to someone else.
+
+    MEASURED COST OF GETTING THIS WRONG, gapped boot v6, 2026-08-18 16:03:07Z.
+    The set was
+
+        PP0  0-2,4-6,...,60-62     48 GDN layers, span [0, 63)
+        PP1  3,7,11,15,19,23,27,31  8 full-attention layers
+        PP2  35,39,43,47,51,55,59,63
+
+    so the 16 full-attention layers are 3, 7, ... 63 and PP0 owns NONE of them.
+    The interval test ``0 <= i < 63`` matched FIFTEEN of them on PP0, and the
+    KV VMM arena was reserved for all fifteen:
+
+        PP0  30 buffers -> 22.56 GiB   (logged "reserved=22.6 GiB")
+        PP1  16 buffers -> 12.03 GiB   (logged "reserved=12.0 GiB")
+        PP2  16 buffers -> 12.03 GiB
+
+    On a 32.6 GiB card already holding 27.1 GiB that is 49.70 GiB, and the
+    driver refused the next ``cuMemCreate``. The sizing CHAIN was not at fault
+    and neither was the token count -- all three stages sized from the same
+    754019-token universe. The stage's own configurator had already computed
+    ``cell_size=0`` for PP0, i.e. it agreed PP0 carries no full-attention KV;
+    the pool disagreed by fifteen layers, and the pool is the one that
+    allocates. This function is what makes them agree.
+
+    A stage owning zero full-attention layers is therefore a legitimate,
+    reachable configuration, not an error: it gets an empty list, no KV
+    buffers, and an arena of one granularity page.
+
+    Byte-identical on every contiguous layout -- ``current_stage_layer_set``
+    returns ``None`` there and the interval test below is exact, because span
+    and set coincide.
+
+    ``owned`` is injectable so the resolution can be tested against the
+    specimen's own layer set without a process group; left alone it is read
+    from the live one.
+    """
+    if owned is _ASK_THE_GROUP:
+        owned = current_stage_layer_set()
+    if owned is not None:
+        return [i for i in all_attn_layer_ids if i in owned]
+    return [i for i in all_attn_layer_ids if start_layer <= i < end_layer]
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Tuple[int, int]:

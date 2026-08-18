@@ -2603,16 +2603,20 @@ class ModelRunnerKVCacheMixin:
         if self.server_args.max_speculative_num_draft_tokens is not None:
             extra_max_context_len += self.server_args.max_speculative_num_draft_tokens
 
-        mamba_layer_ids = [
-            i
-            for i in config.mamba2_cache_params.layers
-            if self.start_layer <= i < self.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in config.full_attention_layer_ids
-            if self.start_layer <= i < self.end_layer
-        ]
+        # SET-AWARE ON BOTH LISTS, for the reason spelled out at
+        # ``stage_owned_layer_ids``: under SGLANG_PP_LAYER_SET the
+        # interval is this stage's SPAN, and the gapped layout is exactly the
+        # case where span and set differ. The unified path reaches the same
+        # HybridLinearKVPool as the branch above, so leaving it on the
+        # interval would have kept half the defect alive behind a flag.
+        from sglang.srt.distributed.utils import stage_owned_layer_ids
+
+        mamba_layer_ids = stage_owned_layer_ids(
+            config.mamba2_cache_params.layers, self.start_layer, self.end_layer
+        )
+        full_attention_layer_ids = stage_owned_layer_ids(
+            config.full_attention_layer_ids, self.start_layer, self.end_layer
+        )
 
         bundle = init_unified_mamba_pools(
             device=self.device,
@@ -4115,6 +4119,10 @@ class ModelRunnerKVCacheMixin:
                 _b1_ids, _b1_size = self._decoupled_kv_pool_override(
                     config.full_attention_layer_ids, _dial_reserve
                 )
+                from sglang.srt.distributed.utils import (
+                    stage_owned_layer_ids,
+                )
+
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=_b1_size,
@@ -4134,11 +4142,11 @@ class ModelRunnerKVCacheMixin:
                         # run the FULL model: every full-attention layer.
                         if self.is_draft_pool_worker
                         and not getattr(self, "is_dual_group_lane_target", False)
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
+                        else stage_owned_layer_ids(
+                            config.full_attention_layer_ids,
+                            self.start_layer,
+                            self.end_layer,
+                        )
                     ),
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,

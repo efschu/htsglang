@@ -2024,18 +2024,10 @@ def _owned_layers_for_pool():
     replaces.
     """
     try:
-        from sglang.srt.distributed import get_pp_group
-        from sglang.srt.distributed.utils import get_pp_layer_set
+        from sglang.srt.distributed.utils import current_stage_layer_set
     except Exception:  # pragma: no cover - import shape varies in unit tests
         return None
-    try:
-        group = get_pp_group()
-        num_layers = getattr(group, "num_hidden_layers", None)
-        if num_layers is None:
-            return None
-        return get_pp_layer_set(num_layers, group.rank_in_group, group.world_size)
-    except Exception:  # pragma: no cover - no process group in unit tests
-        return None
+    return current_stage_layer_set()
 
 
 class KVCache(abc.ABC):

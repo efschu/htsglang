@@ -1064,6 +1064,42 @@ class KvVmmArena:
 _PER_BUFFER_VA_SLACK = 32 << 20
 
 
+def arena_reserve_bytes(reserved_spans: Sequence[int], granularity: int) -> int:
+    """VA bytes ``KvVmmBufferOwner`` reserves for a set of buffer spans.
+
+    EXTRACTED SO IT CAN BE ASKED WITHOUT A GPU. The arena's size is a pure
+    function of the per-buffer spans and the driver granularity, but it used to
+    be spelled inline inside ``__init__`` between two CUDA calls, so the only
+    way to learn what a configuration would reserve was to boot and read the
+    log. That is how the gapped boot spent six windows discovering a number
+    that is arithmetic:
+
+        PP0, 30 buffers (15 layers x k+v) x 754020 slots x 1024 B
+          -> 22.56 GiB, logged as "reserved=22.6 GiB", on a 32.6 GiB card
+             already holding 27.1 GiB -> cuMemCreate refused at 49.70 GiB
+        PP1/PP2, 16 buffers (8 layers) at the same token count
+          -> 12.03 GiB, logged as "reserved=12.0 GiB"
+
+    The 15 against the 8 is the defect (see ``model_runner_kv_cache_mixin``'s
+    owned-attention-layer resolution): PP0 owns ZERO full-attention layers
+    under the gapped set and was sized for fifteen. With ownership resolved
+    correctly the same expression returns ``granularity`` -- one 2 MiB page of
+    address space, which is the floor, not a 22.6 GiB reservation.
+
+    Note it is VA, not physical memory. The reservation itself is not what the
+    driver refused; it is the torch-visible ceiling this arena's MemPool then
+    commits against, which is why an over-sized reservation ends in
+    ``cuMemCreate: ... refused`` rather than in a clean sizing error.
+    """
+    gran = int(granularity)
+    if gran <= 0:
+        raise ValueError(f"granularity must be positive, got {granularity!r}")
+    total = gran
+    for span in reserved_spans:
+        total += align_up(int(span), gran) + _PER_BUFFER_VA_SLACK
+    return total
+
+
 class _BufferSpec:
     """Per-buffer placement + backing state inside the shared VA reservation."""
 
@@ -1117,7 +1153,7 @@ class KvVmmBufferOwner:
             gran = query_granularity(self.device_id)
             reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
             aligned = [align_up(s, gran) for s in reserved_spans]
-            reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
+            reserve_bytes = arena_reserve_bytes(reserved_spans, gran)
             if retain_handles and commit_chunk_bytes is None:
                 # Named loudly rather than silently tolerated: retention
                 # with one monolithic handle per buffer parks memory that
