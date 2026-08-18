@@ -32,6 +32,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Optional, Sequence, Tuple
 
+from sglang.srt.distributed.pp_typed_channel import (
+    CROSSING_KIND,
+    recv_typed_tensor_dict,
+    send_typed_tensor_dict,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -60,6 +66,10 @@ class NoCrossingWire:
     #: Kept so callers can report uniformly.
     crossings_sent = 0
     crossings_received = 0
+
+    #: The contiguous path takes its stage-entry activations from the ordinary
+    #: ``pp_proxy_tensors`` handoff, exactly as it always has.
+    provides_entry_activations = False
 
     def __bool__(self) -> bool:
         return False
@@ -91,6 +101,13 @@ class CrossingWire:
     timeout_s: float = 60.0
     crossings_sent: int = 0
     crossings_received: int = 0
+    #: True when the FIRST layer this rank owns is itself a crossing target,
+    #: i.e. the wire -- not the stage-boundary proxy handoff -- delivers this
+    #: rank's entry activations. On a gapped cut that is the case for every
+    #: rank that does not own layer 0, and it is what lets all stages enter
+    #: the forward loop together instead of queueing behind a handoff that
+    #: cannot arrive until the sender's forward has already finished.
+    provides_entry_activations: bool = False
 
     def __bool__(self) -> bool:
         return True
@@ -206,12 +223,21 @@ def build_crossing_wire(
     if not recv_before and not send_after:
         return NoCrossingWire()
 
+    # The entry question, answered from the SAME schedule rather than from a
+    # second derivation: does this rank's first owned layer arrive over the
+    # wire? If it does, this rank must not wait for a stage-boundary proxy --
+    # see ``provides_entry_activations``.
+    my_layers = owned[rank] if rank < len(owned) else frozenset()
+    entry_layer = min(my_layers) if my_layers else None
+    provides_entry = entry_layer is not None and entry_layer in recv_before
+
     wire = CrossingWire(
         rank=rank,
         link=link,
         recv_before=recv_before,
         send_after=send_after,
         timeout_s=timeout_s,
+        provides_entry_activations=provides_entry,
     )
     (log or logger).info("%s", wire.describe())
     return wire
@@ -231,16 +257,24 @@ class PpGroupLink:
     match a send to its recv without a global sequence number. The PP group's
     tensor-dict path is already ordered per peer, so it is accepted and unused
     here rather than silently dropped somewhere less visible.
+
+    TYPED, AND THAT IS NOT DECORATION. This channel already carries ``proxy``
+    and ``output`` dicts, and ``output`` rings from the last rank to rank 0 --
+    the SAME directed pair as PP2 -> PP0's crossings on the #735 cut. An
+    untyped receive here takes whichever dict arrives first and hands a token
+    tensor to a decoder layer as hidden states. Both sides therefore go through
+    ``pp_typed_channel``, whose inbox is shared with the scheduler's own
+    receive loop so that neither consumer can strand the other's message.
     """
 
     def __init__(self, pp_group):
         self.group = pp_group
 
     def send(self, dst: int, slot: int, payload, timeout_s: float) -> None:
-        self.group.send_tensor_dict(payload, dst)
+        send_typed_tensor_dict(self.group, payload, dst, CROSSING_KIND)
 
     def recv(self, src: int, slot: int, timeout_s: float):
-        return self.group.recv_tensor_dict(src)
+        return recv_typed_tensor_dict(self.group, CROSSING_KIND, src=src)
 
 
 def build_wire_for_model(config, pp_group, log=None):

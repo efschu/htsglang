@@ -1498,10 +1498,30 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
-        else:
-            assert pp_proxy_tensors is not None
+        elif pp_proxy_tensors is not None:
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        elif self.pp_crossing_wire.provides_entry_activations:
+            # #753 GAPPED ENTRY. On a gapped cut this rank's first owned layer
+            # is itself a crossing target, so its entry activations arrive over
+            # the wire inside the loop rather than as a stage-boundary handoff
+            # before it. There is deliberately nothing to seed here: the very
+            # first ``before_layer`` REPLACES both values, and seeding a zero
+            # tensor instead would make a missing crossing look like a valid
+            # forward over zeros -- silently wrong output, which is the exact
+            # failure #753 exists to eliminate.
+            hidden_states = None
+            residual = None
+        else:
+            raise AssertionError(
+                "a non-first PP stage entered the forward loop with neither "
+                "pp_proxy_tensors nor a crossing wire that delivers its entry "
+                "activations. Under contiguous ownership the stage-boundary "
+                "handoff is the only source and it did not arrive; under a "
+                "gapped layer set the wire must own the entry, which means "
+                "this rank's first owned layer is not a crossing target and "
+                "the schedule disagrees with the ownership map."
+            )
 
         aux_hidden_states = []
         # Pass through decoder layers

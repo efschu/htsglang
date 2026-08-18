@@ -1783,6 +1783,46 @@ def _num_layers_from_layer_set_raw(raw: str) -> Optional[int]:
     return highest + 1 if highest >= 0 else None
 
 
+def pp_gapped_ownership_active(pp_world_size: int) -> bool:
+    """True when THIS run needs the mid-loop crossing wire to be correct.
+
+    Three conditions, all required: a layer set is configured, the wire is
+    switched on, and at least one stage's ownership is actually non-contiguous.
+    A contiguous set expressed through the set mechanism (DESIGN §9.1 step 1)
+    is deliberately NOT gapped -- it is carried by the ordinary stage-boundary
+    transport, and reporting it as gapped would move it onto a protocol it does
+    not need.
+
+    Callers use this to choose a PROTOCOL, not merely to log, so it answers
+    False on anything it cannot parse: an unreadable set already fails loudly
+    in ``parse_pp_layer_sets`` at model build, and guessing "gapped" here would
+    disable the stage-boundary handoff for a run whose ownership is unknown.
+    """
+    if pp_world_size is None or int(pp_world_size) <= 1:
+        return False
+    if not pp_crossing_wire_enabled():
+        return False
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        return False
+    num_layers = _num_layers_from_layer_set_raw(raw)
+    if num_layers is None:
+        return False
+    try:
+        owned = parse_pp_layer_sets(
+            raw, num_layers, int(pp_world_size), allow_gapped=True
+        )
+    except Exception:  # noqa: BLE001 - see docstring: unparseable is not gapped
+        return False
+    for stage in owned:
+        if not stage:
+            continue
+        lo, hi = min(stage), max(stage)
+        if len(stage) != hi - lo + 1:
+            return True
+    return False
+
+
 #: "not supplied", so that an explicit ``owned=None`` can mean the CONTIGUOUS
 #: path rather than "look it up". A plain None default could not express both.
 _ASK_THE_GROUP = object()

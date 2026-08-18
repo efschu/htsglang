@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 import math
-import collections
 import time
 from array import array
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -17,6 +16,11 @@ from tqdm import tqdm
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.pp_typed_channel import (
+    recv_typed_tensor_dict,
+    stash_typed,
+)
+from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -1439,13 +1443,9 @@ class SchedulerPPMixin:
                 raw, ran_fn() if ran_fn is not None else set()
             )
             if action == DRAIN_STASH:
-                inbox = getattr(self, "_pp_tensor_dict_inbox", None)
-                if inbox is None:
-                    # Never discard for want of somewhere to put it -- that is
-                    # corpse S. Create the inbox instead.
-                    inbox = collections.defaultdict(collections.deque)
-                    self._pp_tensor_dict_inbox = inbox
-                inbox[kind].append(raw)
+                # Never discard for want of somewhere to put it -- that is
+                # corpse S. The inbox is created on demand by stash_typed.
+                stash_typed(self.pp_group, None, kind, raw)
                 logger.info(
                     "%s armed drain took a tensor dict off the wire and "
                     "STASHED it: kind=%s stamp=%s -- %s. (%d this window)",
@@ -1539,13 +1539,15 @@ class SchedulerPPMixin:
                 # launched before the arm and is still owed to a real
                 # consumer; stash it where `_pp_recv_typed_dict` already
                 # looks instead of destroying it.
-                self._pp_tensor_dict_inbox[kind if kind is not None else "default"].append(raw)
+                stash_typed(
+                    self.pp_group, None, kind if kind is not None else "default", raw
+                )
                 continue
             stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
             if stamp is None or live_mb_id < 0 or int(stamp[0]) == int(live_mb_id):
                 # Owed, not leftover: this is the pass the rank is about to
                 # run. Stash so the ordinary receive returns it.
-                self._pp_tensor_dict_inbox["proxy"].append(raw)
+                stash_typed(self.pp_group, None, "proxy", raw)
                 continue
             discarded += 1
             logger.info(
@@ -1835,7 +1837,55 @@ class SchedulerPPMixin:
         )
 
         carried = harvest_resident_batches(self)
+
+        # #753: which HANDOFF PROTOCOL this run uses, decided once.
+        #
+        # A gapped layer set inverts the pipeline's central assumption. With
+        # contiguous ownership a stage's layers form one uninterrupted span,
+        # so a rank can wait for its predecessor's finished hidden states and
+        # only then enter the forward loop. On a gapped cut the spans
+        # INTERLEAVE -- PP0 owns 0-2, PP1 owns 3, PP0 owns 4-6 -- so PP0's
+        # forward cannot finish until PP1 has computed layer 3, while PP1's
+        # stage-boundary receive cannot return until PP0's forward has
+        # finished. That is a closed cycle, and it is not a tuning problem:
+        # boot v7pp4 (2026-08-18) wedged in exactly it, with PP0 blocked in the
+        # wire's receive for layer 4 and PP1/PP2 blocked in
+        # `_pp_recv_typed_dict` waiting for a proxy that could never be sent.
+        #
+        # So under a gapped set the stage-boundary handoff is not merely
+        # unnecessary, it is the deadlock. Every rank enters the loop together
+        # and the crossing wire carries every activation, including each
+        # stage's entry.
+        self._pp_gapped_wire: bool = pp_gapped_ownership_active(self.ps.pp_size)
+        if self._pp_gapped_wire:
+            if self.server_args.pp_async_batch_depth > 0:
+                raise ValueError(
+                    "a gapped PP layer set cannot be combined with "
+                    f"--pp-async-batch-depth {self.server_args.pp_async_batch_depth}. "
+                    "Layer execution under a gapped set is a strict ping-pong "
+                    "between stages -- exactly one rank computes at a time -- "
+                    "so there is no idle stage for a second micro-batch to "
+                    "fill, and two in flight would interleave their crossings "
+                    "on one ordered channel with no way to tell them apart."
+                )
+            if getattr(self.server_args, "enable_phase_flip", False):
+                raise ValueError(
+                    "a gapped PP layer set cannot yet be combined with the "
+                    "phase flip. The flip's armed drain reads the tensor-dict "
+                    "wire on the assumption that a 'proxy' message is the only "
+                    "kind it may consume mid-pass; a gapped run replaces those "
+                    "with 'crossing' messages, and reconciling the two is a "
+                    "separate slice. Refused here rather than allowed to strand "
+                    "a crossing at the first arm."
+                )
+
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        if self._pp_gapped_wire:
+            # ONE slot, for the reason the async-depth refusal above gives:
+            # the stages ping-pong through a single micro-batch, so the extra
+            # slots would never hold work and their crossings would be
+            # indistinguishable on the wire.
+            self.pp_loop_size = 1
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
@@ -1854,9 +1904,11 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
-        self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
-            defaultdict(deque)
-        )
+        # #753: NOT assigned here any more. The inbox moved onto the pp_group
+        # so the crossing wire -- a second consumer of the same channel --
+        # shares it; ``_pp_tensor_dict_inbox`` below is now a read-only view of
+        # that one store, which keeps every existing reader (the flip's pending
+        # counts, the drain) working against the messages that actually exist.
         # Re-seed what the rebind above destroyed (#631 J.3). No-op unless
         # requests were resident, i.e. always a no-op at boot.
         carry_across_pp_loop_init(self, carried)
@@ -2374,6 +2426,19 @@ class SchedulerPPMixin:
             self._pp_boundary_stats_obj = stats
         return stats
 
+    @property
+    def _pp_tensor_dict_inbox(self):
+        """The shared ``(src, kind)`` inbox for this rank's PP tensor-dict wire.
+
+        A view, not a second store. Readers that only sum queue lengths -- the
+        flip's pending-message counts -- are unaffected by the richer key; the
+        two consumers that index it (this mixin's receive and the armed drain)
+        go through ``pp_typed_channel`` so the key stays in one place.
+        """
+        from sglang.srt.distributed.pp_typed_channel import typed_inbox
+
+        return typed_inbox(self.pp_group)
+
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
@@ -2381,6 +2446,15 @@ class SchedulerPPMixin:
         msg_type: str = "default",
         stamp: Optional[tuple] = None,
     ):
+        # #753: the counterpart of the receive-side skip. A gapped run has
+        # already delivered this rank's last owned layer to whoever owns the
+        # next one, over the wire, inside the loop; the hidden states sitting
+        # in the result at the end of the forward are that same tensor and the
+        # next stage has no receive posted for them. Sending anyway would leave
+        # one unmatched message per pass on the channel -- the bounded-recv
+        # corpse, from the sender's side.
+        if msg_type == "proxy" and getattr(self, "_pp_gapped_wire", False):
+            return []
         # Warn once if using default untyped messages
         if msg_type == "default":
             logger.warning_once(
@@ -2440,36 +2514,37 @@ class SchedulerPPMixin:
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
-        if expected_kind in self._pp_tensor_dict_inbox:
-            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
-            if inbox_queue:
-                return inbox_queue.popleft()
-
+        # #753: the inbox lives on the GROUP, not on this scheduler, because
+        # the crossing wire is a SECOND consumer of the same channel. Two
+        # private stashes on one wire is not a demultiplexer -- each side would
+        # hold messages the other is blocking for. See pp_typed_channel.
         stats = self._pp_boundary_stats()
-        while True:
-            started = time.perf_counter() if stats else 0.0
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+
+        def _off_the_wire(tensor_dict) -> None:
             if stats:
-                stats.record("recv", tensor_dict, time.perf_counter() - started)
+                # The elapsed time is charged to the receive that actually
+                # blocked; a message served from the inbox never reaches here.
+                stats.record("recv", tensor_dict, time.perf_counter() - started[0])
             # #631 G: counted here, off the WIRE, before the demultiplex --
             # a stashed message has still left the wire, and the upstream's
             # blocking commit is waiting on exactly that fact.
             self._pp_flip_bump_consumed(CHAN_DICT)
-            received_kind = tensor_dict.get("__msg_type__", "default")
-            if received_kind == expected_kind:
-                if received_kind == "default":
-                    logger.warning_once(
-                        f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
-                        "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
-                    )
-                return tensor_dict
-            else:
-                logger.debug(
-                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
-                )
-                self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+            started[0] = time.perf_counter()
+
+        started = [time.perf_counter()]
+        tensor_dict = recv_typed_tensor_dict(
+            self.pp_group,
+            expected_kind,
+            src=None,
+            all_gather_group=all_gather_group,
+            on_message=_off_the_wire,
+        )
+        if expected_kind == "default":
+            logger.warning_once(
+                f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
+                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+            )
+        return tensor_dict
 
     def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
         """#631 VARIANT B: the identity a proxy message carries.
@@ -2539,6 +2614,17 @@ class SchedulerPPMixin:
         starts from an identity instead of a GDN kernel 30 layers deep.
         """
         if self.pp_group.is_first_rank:
+            return None
+        if getattr(self, "_pp_gapped_wire", False):
+            # #753: under a gapped set there IS no stage-boundary handoff --
+            # every activation, this rank's entry included, crosses inside the
+            # forward loop. Returning None here is what lets all stages enter
+            # the loop together; waiting for a proxy instead is the v7pp4
+            # deadlock (see the protocol note at pp_loop_size). The model's
+            # entry branch accepts None only when its wire reports
+            # provides_entry_activations, so a set that is gapped without a
+            # crossing into some stage's first layer still fails loudly there
+            # rather than forwarding uninitialised hidden states.
             return None
         raw = self._pp_recv_typed_dict(
             expected_kind="proxy",
