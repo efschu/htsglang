@@ -1111,6 +1111,24 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.disable or mamba_num <= 0:
             return 0
 
+        # #743 INSTRUMENT, the host-tier half. Same event, same wording, same
+        # observer as the device lineage -- #747's rule (one rule, both
+        # lineages) applies to the instrument too, or the two lineages report
+        # numbers that look comparable and are not. `lineage="host-tier"`
+        # is the only difference, and it is in the line so the reader knows
+        # that an evicted anchor here may still be retrievable from host.
+        from sglang.srt.mem_cache.mamba_slot_observer import (
+            anchor_depth_tokens,
+            clock,
+            emit_lines,
+            observer_of,
+            probe_available,
+        )
+
+        obs = observer_of(self)
+        now = clock()
+        trace = [] if obs.would_emit(now) else None
+
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
         while mamba_num_evicted < mamba_num and self.mamba_lru_list.in_list(x):
@@ -1120,6 +1138,10 @@ class HiMambaRadixCache(MambaRadixCache):
             assert (
                 not x.evicted
             ), f"evicted node should not be in mamba_lru_list, {x.id=}"
+
+            if trace is not None:
+                # Before either branch destroys or tombstones it.
+                trace.append((x.id, anchor_depth_tokens(x)))
 
             if len(x.children) > 0:
                 # Internal: free device mamba only, KV stays on device (tombstone)
@@ -1143,6 +1165,21 @@ class HiMambaRadixCache(MambaRadixCache):
 
             x = x_next
 
+        emit_lines(
+            logger,
+            obs.note_eviction(
+                now=now,
+                requested=mamba_num,
+                evicted=mamba_num_evicted,
+                nodes=trace or (),
+                evictable=self.mamba_evictable_size(),
+                protected=self.mamba_protected_size(),
+                available=probe_available(
+                    getattr(self.req_to_token_pool, "mamba_allocator", None)
+                ),
+                lineage="host-tier",
+            ),
+        )
         return mamba_num_evicted
 
     def _unevict_node(self, node: TreeNode, fresh_value: torch.Tensor):
@@ -1346,13 +1383,37 @@ class HiMambaRadixCache(MambaRadixCache):
             from sglang.srt.runtime_context import get_server_args
 
             mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+            matched_tokens = sum(len(v) for v in value)
             mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
+                matched_tokens // mamba_cache_chunk_size
             ) * mamba_cache_chunk_size
             mamba_branching_seqlen = (
                 mamba_cache_chunk_aligned_seqlen
                 if mamba_cache_chunk_aligned_seqlen > 0
                 else None
+            )
+            # #743 INSTRUMENT, host-tier half. See the device lineage's note:
+            # this branch is the truncation, and it was invisible. `host-tier`
+            # is not cosmetic here -- on this lineage the missing state may be
+            # retrievable from host, so the same number means a load-back
+            # rather than a full re-prefill, and a reader must be able to tell
+            # the two apart.
+            from sglang.srt.mem_cache.mamba_slot_observer import (
+                clock,
+                emit_lines,
+                observer_of,
+            )
+
+            emit_lines(
+                logger,
+                observer_of(self).note_truncation(
+                    now=clock(),
+                    rid=getattr(req, "rid", None),
+                    matched_tokens=matched_tokens,
+                    usable_tokens=sum(len(v) for v in value[:best_value_len]),
+                    node_id=getattr(best_last_node, "id", None),
+                    lineage="host-tier",
+                ),
             )
         else:
             mamba_branching_seqlen = None
