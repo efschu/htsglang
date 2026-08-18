@@ -78,16 +78,36 @@ def _bind_phase_tag(pool) -> None:
     """
     pool._bound_tp_phase = None
     pool._stale_binding_refusals = 0
+    why = "unknown"
     try:
         from sglang.srt.runtime_context import get_server_args
 
         if not getattr(get_server_args(), "enable_phase_flip", False):
-            return
-        from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+            why = "phase flip disabled"
+        else:
+            from sglang.srt.distributed.parallel_state import (
+                phase_flip_tp_routing_active,
+            )
 
-        pool._bound_tp_phase = bool(phase_flip_tp_routing_active())
-    except Exception:  # noqa: BLE001 - never break pool construction
+            pool._bound_tp_phase = bool(phase_flip_tp_routing_active())
+    except Exception as exc:  # noqa: BLE001 - never break pool construction
         pool._bound_tp_phase = None
+        why = f"{type(exc).__name__}: {exc}"[:120]
+    # SAY WHETHER THIS GUARD IS ARMED. On 2026-08-18 the ARM I respin segfaulted
+    # on exactly the write this protects and emitted ZERO refusals -- and I could
+    # not tell whether the binding was genuinely fine or the guard was simply
+    # inert, because a None tag disables the phase check SILENTLY. That is the
+    # #742 silently-inert-flag class, which I had just spent the morning
+    # instrumenting in other people's code. A guard that cannot be seen arming is
+    # not evidence of anything.
+    logger.info(
+        "HICACHE-BINDING-TAG pool=%r armed=%s bound_phase=%s layers=%d%s",
+        getattr(pool, "pool_name", "?"),
+        pool._bound_tp_phase is not None,
+        "tp" if pool._bound_tp_phase else ("pp" if pool._bound_tp_phase is False else "-"),
+        getattr(pool, "layer_num", -1),
+        "" if pool._bound_tp_phase is not None else f" (not armed: {why})",
+    )
 
 
 def _host_binding_is_stale(pool) -> bool:
