@@ -11,13 +11,19 @@ Hermetic tests — no GPU access. Verifies that:
 from __future__ import annotations
 
 import os
-import sys
 
 # Block all GPU access — hermetic test.
 os.environ["CUDA_VISIBLE_DEVICES"] = "99"
 
-# Ensure worktree python is first on path.
-sys.path.insert(0, "/spinning/wt-prefill-graph-qwen/python")
+# #753-fold fix: this file arrived from the wt-prefill-graph-qwen worktree
+# still carrying a MODULE-LEVEL prepend of that tree. Collection imports
+# every test module, so the prepend poisoned the sys.path every LATER
+# multiprocess test's spawn children inherited -- measured: the gloo wire
+# children resolved sglang from the foreign tree and died on
+# ModuleNotFoundError for modules that exist only here. This repo's copy
+# tests THIS repo's sglang, which PYTHONPATH already provides; a test that
+# needs another worktree must scope the insert inside itself, never at
+# import time.
 
 
 def test_default_prefill_backend_is_breakable():
