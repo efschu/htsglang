@@ -163,3 +163,56 @@ middle arm exists rather than a two-arm baseline-vs-both.
 
 **Not in this arm:** any prefill-graph or cut change -- both would confound
 GATE C.
+
+## #735 dependency: WHICH arm funds the GDN slot plan
+
+`DESIGN_pp_layer_set.md` prices GDN slots 21-24 (nominal; 20-23 on the NVML
+total) on the 5090 AFTER the #727 int8 vocab saving, and marks #727
+**required**: on BF16 vocab the same card supports ~7 slots.
+`DESIGN_family_fullplan.md` §2.1 places `lm_head` on the 5090 -- so the
+tensor whose saving funds those slots is `lm_head`, and **the arm that
+satisfies #735 is arm C (`vocabint8-both`)**. Arm B leaves `lm_head` BF16
+and funds nothing on the 5090. Consequence, priced into the decision rule:
+if C fails GATE B, the 21-24 slot plan loses its funder and the full-plan
+ladder must be re-derived at ~7 slots or find another 1212 MiB.
+
+(Artifact naming: the register may call the second artifact
+`vocabint8-embed-lmhead`; the directory on disk is `vocabint8-both`, same
+content -- doc-fix over rename, the verified artifact does not churn.)
+
+## Second-artifact verification record (2026-08-18, independent re-check)
+
+Verified from the shard headers and inodes, not from the build report:
+
+* `-both/model-00003-of-00018`: `embed_tokens.weight` I8 `[248320, 5120]`
+  beside `weight_scale` BF16 `[248320, 1]` (corrected shard table: embed in
+  00003, lm_head in 00018);
+* `-both/model-00018-of-00018`: `lm_head.weight` I8 + BF16 scale, same
+  shapes;
+* `config.json` `ignore` carries NO vocab entry (both dropped);
+* hardlink economy: 17 of 18 shards inode-shared with `-embed` (including
+  the I8-embed 00003), exactly one unique rewritten shard (00018) -- the
+  arms differ in exactly one tensor, which is what makes the three-way
+  comparison attributable;
+* no upcast transient by construction: built by
+  `tools/requant_vocab_int8.py`'s row-blocked path (bit-identical to
+  whole-tensor per-row quantization, no ~8 GiB fp32 spike).
+
+## Turnkey runner (desk-smoked, window-ready)
+
+`tools/ab_vocab_int8_727.py` executes this protocol end to end: artifact
+verification BEFORE the first boot (a window spent on a wrong checkpoint is
+the most expensive way to find a build defect), then A1, A2 (the A-vs-A
+floor), B, C, with GATES 0/A/B/C per arm and the decision rule above
+applied mechanically -- including the #735 consequence in the verdict text.
+GATE 0 is now observable: `ct_embedding.py` logs `INT8-VOCAB ENGAGED` per
+loaded vocab tensor (0/1/2 lines for A/B/C).
+
+The boot/suite/perf legs are command templates the window operator fills
+(`--boot-cmd/--suite-cmd/--perf-cmd`, `{model_path}`/`{arm}` substituted);
+`--mock DIR` replaces them with fixtures. Desk-written-never-executed:
+`test_ab_runner_727.py` drives every gate in both directions, the floor
+arithmetic, the abort-on-baseline-failure branch, the verdict table, and
+two full mocked CLI runs (SHIP-BOTH and ABORT), plus the artifact verifier
+against synthetic checkpoints broken in each way it must catch -- and
+against the real artifacts on this rig.

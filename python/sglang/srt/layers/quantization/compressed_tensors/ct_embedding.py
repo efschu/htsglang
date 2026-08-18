@@ -31,12 +31,15 @@ BF16 path runs byte-identically.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+
+logger = logging.getLogger(__name__)
 
 
 def vocab_is_quantized(quant_config: Dict[str, Any], layer_name: str) -> bool:
@@ -109,6 +112,18 @@ class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
         if weight_loader is not None:
             for param in (weight, scale):
                 setattr(param, "weight_loader", weight_loader)
+        # #727 GATE 0 observable: the A/B runner greps the boot log for this
+        # line to prove the int8 path ENGAGED (0 lines = baseline, 1 = embed
+        # only, 2 = embed + lm_head). A boot that silently fell back to the
+        # dense BF16 path proves nothing about quality and shows a WORSE VRAM
+        # number -- the failure mode GATE 0 exists to catch mechanically.
+        logger.info(
+            "INT8-VOCAB ENGAGED: %d x %d int8 rows with per-row scales "
+            "(%s head)",
+            rows,
+            dim,
+            type(layer).__name__,
+        )
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         """Gather rows, then scale them. In that order, deliberately.
