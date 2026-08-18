@@ -550,7 +550,14 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
+        ) and not (
+            self.tokenizer_manager.server_args.allow_auto_truncate
+            # ``clamp_max_tokens`` callers asked for a ceiling, not a demand:
+            # the exact shrink happens downstream in TokenizerManager, where
+            # the real input length is known. Rejecting here would deny a
+            # request that is going to fit once the ceiling is lowered.
+            or request.clamp_max_tokens
+        ):
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -666,6 +673,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
             return_prompt_token_ids=request.return_prompt_token_ids,
+            clamp_max_new_tokens=request.clamp_max_tokens,
         )
 
         return adapted_request, request

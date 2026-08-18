@@ -262,6 +262,13 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Treat sampling_params["max_new_tokens"] as a CEILING rather than a demand:
+    # when input + max_new_tokens exceeds the context length, shrink
+    # max_new_tokens to what is left instead of rejecting the request. The input
+    # is never touched by this — an input that alone exceeds the context length
+    # is still an error. Off by default, so the shared pipeline keeps its
+    # reject-by-default behaviour for every caller that does not opt in.
+    clamp_max_new_tokens: bool = False
 
     # Priority for the request
     priority: Optional[int] = None

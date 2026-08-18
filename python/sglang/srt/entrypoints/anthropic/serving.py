@@ -695,6 +695,18 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            # #764: Anthropic's ``max_tokens`` is a CEILING -- "the maximum
+            # number of tokens to generate", a stop condition, not an amount the
+            # caller is asking to have produced. Clients bake in a fixed budget
+            # for the whole model family (claude-cli sends 32000 on every turn)
+            # and cannot know this server's context length, so a request whose
+            # ceiling is above it is normal traffic, not a client error. Ask the
+            # pipeline to lower the ceiling to what fits instead of returning
+            # 400; when generation actually reaches it, the completion ends with
+            # finish_reason "length", which this front already reports to the
+            # caller as stop_reason "max_tokens" -- so a shortened budget stays
+            # visible in the response rather than being silently swallowed.
+            "clamp_max_tokens": True,
         }
 
         if anthropic_request.temperature is not None:

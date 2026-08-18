@@ -1021,7 +1021,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.allow_auto_truncate:
+            # A caller that set clamp_max_new_tokens declared max_new_tokens a
+            # ceiling ("generate at most N"), not a demand ("generate N"). Such
+            # a request fits by definition — it just fits with a smaller budget.
+            # Shrinking it here and nowhere else keeps the arithmetic in the one
+            # place that knows the real input length. The input is left alone:
+            # allow_auto_truncate above also drops input tokens, this never does.
+            if getattr(obj, "clamp_max_new_tokens", False):
+                fitted = max(0, _max_req_len - input_token_num)
+                logger.info(
+                    f"Clamping max_new_tokens from {max_new_tokens} to {fitted} "
+                    f"({input_token_num} input tokens against a context length of "
+                    f"{self.context_len}); the caller declared it a ceiling. The "
+                    "completion will stop with finish_reason 'length' if it is hit."
+                )
+                obj.sampling_params["max_new_tokens"] = fitted
+            elif self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "

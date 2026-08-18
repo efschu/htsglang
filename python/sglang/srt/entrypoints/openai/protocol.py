@@ -781,6 +781,14 @@ class ChatCompletionRequest(BaseModel):
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
+    clamp_max_tokens: bool = Field(
+        default=False,
+        description="Treat max_tokens/max_completion_tokens as a CEILING rather than a "
+        "demand. When set, a value that does not fit the remaining context is shrunk to "
+        "what fits and the completion stops with finish_reason 'length', instead of the "
+        "request being rejected with 400. The input is never truncated by this. Off by "
+        "default so the reject-on-overflow behaviour stays the default for every caller.",
+    )
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
