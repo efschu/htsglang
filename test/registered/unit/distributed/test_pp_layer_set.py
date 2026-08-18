@@ -52,6 +52,12 @@ class _Env:
 
     def __enter__(self):
         self.saved = os.environ.get(PP_LAYER_SET_ENV)
+        # #753: this file's subject IS the gapped set form, so it declares the
+        # crossing wire. Without that declaration parse_pp_layer_sets refuses a
+        # gapped set -- correctly, because the forward loop would skip the peer
+        # layers in silence.
+        self.saved_wire = os.environ.get("SGLANG_PP_CROSSING_WIRE")
+        os.environ["SGLANG_PP_CROSSING_WIRE"] = "1"
         if self.value is None:
             os.environ.pop(PP_LAYER_SET_ENV, None)
         else:
@@ -63,6 +69,10 @@ class _Env:
             os.environ.pop(PP_LAYER_SET_ENV, None)
         else:
             os.environ[PP_LAYER_SET_ENV] = self.saved
+        if self.saved_wire is None:
+            os.environ.pop("SGLANG_PP_CROSSING_WIRE", None)
+        else:
+            os.environ["SGLANG_PP_CROSSING_WIRE"] = self.saved_wire
         return False
 
 
@@ -108,12 +118,12 @@ class TestTheDefaultPathIsUntouched(CustomTestCase):
 
 class TestTheSetFormParses(CustomTestCase):
     def test_ranges_and_singletons_together(self):
-        sets = parse_pp_layer_sets("0-2,4-6;3,7", 8, 2)
+        sets = parse_pp_layer_sets("0-2,4-6;3,7", 8, 2, allow_gapped=True)
         self.assertEqual(sorted(sets[0]), [0, 1, 2, 4, 5, 6])
         self.assertEqual(sorted(sets[1]), [3, 7])
 
     def test_the_full_plan_shape_parses(self):
-        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3)
+        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3, allow_gapped=True)
         self.assertEqual(len(sets[0]), 48)
         self.assertEqual(len(sets[1]), 8)
         self.assertEqual(len(sets[2]), 8)
@@ -210,7 +220,7 @@ class TestTheSpanIsNotTheCount(CustomTestCase):
     """
 
     def test_the_full_plan_fa_stage_has_a_span_that_lies(self):
-        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3)
+        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3, allow_gapped=True)
         fa_stage = sets[1]
         span = max(fa_stage) + 1 - min(fa_stage)
         self.assertEqual(len(fa_stage), 8)
@@ -218,7 +228,7 @@ class TestTheSpanIsNotTheCount(CustomTestCase):
         self.assertNotEqual(span, len(fa_stage))
 
     def test_the_second_fa_stage_spans_almost_the_whole_model(self):
-        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3)
+        sets = parse_pp_layer_sets(FULL_PLAN, 64, 3, allow_gapped=True)
         fa_stage = sets[2]
         span = max(fa_stage) + 1 - min(fa_stage)
         self.assertEqual(len(fa_stage), 8)

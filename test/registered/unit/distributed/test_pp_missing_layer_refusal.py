@@ -106,7 +106,14 @@ class TestMakeLayersArmsOnlyTheInteriorMode(CustomTestCase):
             self.assertIs(m(positions), positions)
 
     def test_set_placeholders_are_armed(self):
-        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7"}):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
+                # #753: a gapped set needs the crossing wire declared.
+                "SGLANG_PP_CROSSING_WIRE": "1",
+            },
+        ):
             mods, start, end = make_layers(
                 8, lambda idx, prefix: _Layer(idx, prefix), pp_rank=0, pp_size=2
             )
@@ -122,7 +129,14 @@ class TestMakeLayersArmsOnlyTheInteriorMode(CustomTestCase):
                     placeholders[i](torch.tensor([0, 1, 2]))
 
     def test_the_armed_error_names_its_own_layer(self):
-        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7"}):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
+                # #753: a gapped set needs the crossing wire declared.
+                "SGLANG_PP_CROSSING_WIRE": "1",
+            },
+        ):
             mods, _, _ = make_layers(
                 8, lambda idx, prefix: _Layer(idx, prefix), pp_rank=0, pp_size=2
             )

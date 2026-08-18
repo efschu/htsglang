@@ -1519,6 +1519,18 @@ def split_tensor_along_last_dim(
 #: unset, every code path below is byte-identical to what it was.
 PP_LAYER_SET_ENV = "SGLANG_PP_LAYER_SET"
 
+#: #753: the mid-loop crossing wire. A gapped layer set is only safe when the
+#: forward loop exchanges activations at every ownership boundary; without the
+#: wire a stage runs its own layers back to back and silently skips the peer's.
+#: Set this only when the wire is actually carrying the crossings.
+PP_CROSSING_WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
+
+
+def pp_crossing_wire_enabled() -> bool:
+    """True when the #753 mid-loop crossing wire is switched on."""
+    return os.getenv(PP_CROSSING_WIRE_ENV, "") not in ("", "0", "false", "False")
+
+
 
 class PPLayerSetError(ValueError):
     """A layer-set map that cannot be used. Always names the offending layers."""
@@ -1556,7 +1568,7 @@ def _parse_layer_spec(spec: str) -> List[int]:
 
 
 def parse_pp_layer_sets(
-    raw: str, num_hidden_layers: int, pp_size: int
+    raw: str, num_hidden_layers: int, pp_size: int, *, allow_gapped: bool = False
 ) -> List[FrozenSet[int]]:
     """Parse and VALIDATE the per-stage layer sets.
 
@@ -1565,6 +1577,20 @@ def parse_pp_layer_sets(
     silent: a duplicated layer just costs time, and a missing one is a
     placeholder pass-through that returns its input unchanged. So every failure
     below names the exact layers involved.
+
+    CONTIGUITY (#753). A stage may own a NON-CONTIGUOUS set only when the
+    caller passes ``allow_gapped=True``, which is how the mid-loop crossing
+    wire declares it can carry one. The default refuses, and the default is
+    the safe reading rather than the convenient one:
+    ``qwen3_5.py:1466-1518`` exchanges ``pp_proxy_tensors`` ONCE per rank, at
+    the stage boundary. A rank owning ``{2, 4}`` therefore runs layer 2
+    straight into layer 4 with layer 3 -- computed on a peer -- never
+    exchanged. Nothing raises. The model returns fluent, confidently wrong
+    output, which is the failure shape this whole file exists to prevent.
+
+    ``allow_gapped`` deliberately relaxes ONLY contiguity. Coverage, range and
+    single-ownership hold either way: a gapped set is admissible with the wire,
+    a set that loses or duplicates a layer never is.
     """
     stages = [seg for seg in raw.split(";")]
     if len(stages) != pp_size:
@@ -1607,6 +1633,32 @@ def parse_pp_layer_sets(
             f"An unowned layer is a pass-through placeholder at run time, so "
             f"the model would answer with that layer silently skipped."
         )
+
+    if not allow_gapped:
+        gapped = []
+        for rank, layers in enumerate(parsed):
+            ordered = sorted(layers)
+            if not ordered:
+                continue
+            holes = sorted(set(range(ordered[0], ordered[-1] + 1)) - set(ordered))
+            if holes:
+                gapped.append((rank, ordered[0], ordered[-1], holes))
+        if gapped:
+            detail = "; ".join(
+                f"stage {rank} spans {lo}-{hi} but does not own "
+                f"{holes if len(holes) <= 8 else holes[:8] + ['...']}"
+                for rank, lo, hi, holes in gapped
+            )
+            raise PPLayerSetError(
+                f"{PP_LAYER_SET_ENV}: a stage's layers must be CONTIGUOUS "
+                f"without the mid-loop crossing wire, but {detail}. #753: the "
+                f"forward loop exchanges pp_proxy_tensors once per rank, at the "
+                f"stage boundary, so the layers this stage does not own are "
+                f"never received -- it would run its own layers back to back "
+                f"and answer fluently with the peer layers silently skipped. "
+                f"Refusing is the only safe reading until the wire lands; the "
+                f"wire enables this by passing allow_gapped=True."
+            )
 
     return [frozenset(layers) for layers in parsed]
 
@@ -1652,7 +1704,11 @@ def get_pp_layer_set(
     raw = os.getenv(PP_LAYER_SET_ENV, None)
     if raw is None or not raw.strip():
         return None
-    return parse_pp_layer_sets(raw, num_hidden_layers, pp_size)[pp_rank]
+    # #753: a gapped set is admissible only when the crossing wire is on.
+    # The refusal lives in parse_pp_layer_sets and names why.
+    return parse_pp_layer_sets(
+        raw, num_hidden_layers, pp_size, allow_gapped=pp_crossing_wire_enabled()
+    )[pp_rank]
 
 
 def get_pp_indices(
