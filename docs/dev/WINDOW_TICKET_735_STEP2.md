@@ -51,7 +51,7 @@ wire. One precondition, two reasons.
 | item | status |
 | --- | --- |
 | COMP4_ACCEPTED marker | GATE — written by F4-r5 after the harvest acceptances |
-| feat/753 wire + gapped-refusal lift + #754 fold | **ABSENT from composite tip b7e6a4110b — THE blocking precondition** (lands by its owner; provides both the transport and the flip-scope legality) |
+| feat/753 wire + gapped-refusal lift + #754 fold | **PREPARED(branch): `fix/753-on-harvest@8f2094f62b`** — all three commits cherry-picked clean onto tip b7e6a4110b, plus the root-caused fix of the gloo children's foreign-sglang flake (a collection-time sys.path prepend in test_prefill_graph_barlink.py, removed) ; 105/0 on the distributed selection vs the tip's 75/0 baseline, byte-gates + 31-crossing pin + 3-process gloo all green. F4-r5 merges one branch. |
 | #757 fold (armed liveness) | PRESENT (5e2c121595 merged at f8368f7208) |
 | #756 local_slot family | PRESENT (comp4 ancestry) |
 | #760 hicache binding refusal | PRESENT (e4fe5e28a8) |
