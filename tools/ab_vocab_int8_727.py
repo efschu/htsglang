@@ -201,12 +201,18 @@ class Floor:
     #: OPTIONAL: None when either baseline boot did not report it, and then
     #: gate B skips the comparison rather than inventing a bound.
     accept_len: Optional[float] = None
+    #: Perplexity on the fixed probe set. LOWER is better -- the delta
+    #: direction is inverted relative to score. Same optionality contract.
+    ppl: Optional[float] = None
 
     @classmethod
     def from_arms(cls, a1: Dict, a2: Dict, eps_score: float, eps_perf_frac: float):
         accept = None
         if a1.get("accept_len") is not None and a2.get("accept_len") is not None:
             accept = abs(a1["accept_len"] - a2["accept_len"])
+        ppl = None
+        if a1.get("ppl") is not None and a2.get("ppl") is not None:
+            ppl = abs(a1["ppl"] - a2["ppl"])
         return cls(
             score=abs(a1["score"] - a2["score"]),
             determined=abs(a1["determined"] - a2["determined"]),
@@ -215,6 +221,7 @@ class Floor:
             eps_score=eps_score,
             eps_perf_frac=eps_perf_frac,
             accept_len=accept,
+            ppl=ppl,
         )
 
 
@@ -230,6 +237,16 @@ def gateB_quality(metrics: Dict, a1: Dict, floor: Floor, arm: str) -> None:
     # Accept-length: compared only when the baseline established a floor for
     # it AND this arm reports it (spec decode on). meta_info is the source of
     # truth per the acceptance-measurement rule, never spec_ema_accept_len.
+    # Perplexity: LOWER is better, so "worse" is the arm ABOVE the baseline.
+    if floor.ppl is not None and metrics.get("ppl") is not None:
+        delta = metrics["ppl"] - a1["ppl"]  # positive = worse (higher ppl)
+        if delta > floor.ppl + floor.eps_score:
+            raise GateFailure(
+                f"GATE B [{arm}]: perplexity rose {delta:.4f} above arm A, "
+                f"outside the A-vs-A floor {floor.ppl:.4f} -- the int8 logit "
+                "error is measurable in the probability mass, not only in "
+                "argmax flips."
+            )
     if floor.accept_len is not None and metrics.get("accept_len") is not None:
         delta = a1["accept_len"] - metrics["accept_len"]
         if delta > floor.accept_len + floor.eps_score:
@@ -391,7 +408,8 @@ def main():
         default=None,
         help="Template running the club-3090 suite + determined probes "
         "against the running arm; must print JSON with keys score, "
-        "determined, vram{pp0,pp1,pp2}; OPTIONAL accept_len (mean spec "
+        "determined, vram{pp0,pp1,pp2}; OPTIONAL ppl (perplexity on the "
+        "fixed probe set, lower is better) and OPTIONAL accept_len (mean spec "
         "accept length from meta_info -- never spec_ema_accept_len) when "
         "the arm serves with speculative decoding.",
     )

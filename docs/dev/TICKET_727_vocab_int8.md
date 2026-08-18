@@ -242,3 +242,16 @@ acceptance-measurement rule): near-tie flips decay accept before the suite
 score moves, which makes it the sharpest logit-sensitivity instrument the
 serving stack already exposes. Absent on either baseline boot, the
 comparison is skipped, never invented.
+
+## Third-pass note (2026-08-18): perplexity joins GATE B
+
+Task re-issue verified the standing state intact (artifact re-verified
+live from shard headers + inodes, head chain pins green, runner
+mock-smoke green) and added the one new element: optional `ppl` in the
+suite JSON (perplexity on the fixed probe set, LOWER is better — the
+delta direction is inverted relative to score, pinned both ways incl.
+a ppl DROP never failing). Same optionality contract as `accept_len`:
+skipped when either baseline boot lacks it, never invented. The
+`-both` artifact name stands for the register's "vocabint8-full/
+embed-lmhead" per the doc-fix-over-rename rule — same content, no
+churn of a verified artifact.

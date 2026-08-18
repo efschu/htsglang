@@ -222,6 +222,29 @@ class TestAcceptLengthReadout(CustomTestCase):
         floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
         ab.gateB_quality(self._m(0.80, 3.22), a1, floor, "C")
 
+    def test_ppl_rise_beyond_the_floor_fails_and_direction_is_inverted(self):
+        """Perplexity is lower-is-better: the failing arm is the one ABOVE
+        the baseline, and a ppl DROP must never fail."""
+        a1, a2 = self._m(0.80), self._m(0.80)
+        a1["ppl"], a2["ppl"] = 6.20, 6.24
+        floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
+        bad = self._m(0.80)
+        bad["ppl"] = 6.40
+        with self.assertRaises(ab.GateFailure) as ctx:
+            ab.gateB_quality(bad, a1, floor, "C")
+        self.assertIn("perplexity", str(ctx.exception))
+        good = self._m(0.80)
+        good["ppl"] = 6.10  # better than baseline: must pass
+        ab.gateB_quality(good, a1, floor, "C")
+
+    def test_missing_ppl_is_skipped_not_failed(self):
+        a1, a2 = self._m(0.80), self._m(0.80)
+        floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
+        self.assertIsNone(floor.ppl)
+        m = self._m(0.80)
+        m["ppl"] = 9.9  # arm reports it, baseline floor absent: skipped
+        ab.gateB_quality(m, a1, floor, "B")
+
     def test_missing_accept_is_skipped_not_failed(self):
         """A no-spec boot reports no accept_len; the gate must not fail on
         absence and must not compare against a floor that was never
