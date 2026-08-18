@@ -89,6 +89,24 @@ PLAN: List[Step] = [
         note="review-based, test-only",
     ),
     Step(
+        name="757-armed-liveness-fold",
+        kind="cherry",
+        ref="194c3ea284",
+        suites=[
+            "test/registered/unit/managers/test_flip_mb_race_757.py",
+            "test/registered/unit/managers/test_pp_flip_leftover_proxy_757.py",
+        ],
+        note="review verdict (b): armed-time classifier folded onto the "
+        "disarm-time drain -- complementary halves (ledger RESOLVED "
+        "section); the probe commit 5e2c121595 rides the same branch",
+    ),
+    Step(
+        name="757-liveness-probe",
+        kind="cherry",
+        ref="5e2c121595",
+        note="the gloo liveness measurement tool + evidence",
+    ),
+    Step(
         name="745-anchor-reachability",
         kind="cherry",
         ref="eab1926ea8",

@@ -180,6 +180,8 @@ class TestThePlanMirrorsTheLedger(CustomTestCase):
             [
                 "749-order-dependence",
                 "751-preflight-boundary",
+                "757-armed-liveness-fold",
+                "757-liveness-probe",
                 "745-anchor-reachability",
                 "735-arithmetic-docs",
                 "727-requant-method",

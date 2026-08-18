@@ -277,3 +277,26 @@ cherry-picked bare.
 Until the review lands: `9e5647706f` stays OUT of the executor plan
 (unchanged), and the review is a NAMED PRECONDITION of pass 3 alongside
 feat/753.
+
+## REVIEW ITEM RESOLVED: double-#757 — verdict (b), COMPLEMENTARY, fold shipped
+
+The named question was measured (`tools/probe_757_gloo_liveness.py`, 2-rank
+gloo, CVD=99): gloo posts an isend instantly but `wait()` blocks until the
+peer posts its recv — size-independent (proxy-4KiB: 3000.3 ms stall for a
+3 s armed window vs 0.2 ms with immediate recv; output-8MiB: 3003.4 vs
+3.9). The in-tree sender is exactly that shape
+(`_pp_send_dict_to_next_stage` posts async, `_pp_commit_comm_work`
+waits). **So the disarm-time form alone stalls an abandoned upstream at
+its commit for the remainder of the downstream's armed window** (bounded
+by the park/presence deadlines at ~30 s — not a deadlock, but a real
+per-occurrence pipeline stall). Verdict (b): complementary halves.
+
+Fold shipped as `fix/757-armed-liveness` (`194c3ea284` cherry of
+`9e5647706f` onto the harvest tip, one predicted-shape conflict resolved
+to BOTH mechanisms with the measurement quoted at the seam, plus the
+probe commit `5e2c121595`). Both suites + the corrected #631 pin green
+together (28); managers selection 633 passed vs the pristine tip's 625
+with the IDENTICAL 2 pre-existing order-dependent failures — 0 new.
+`9e5647706f` itself is now SUPERSEDED by the fold (never merged raw).
+The executor gains the fold step; the pass-3 precondition list drops the
+review and keeps only feat/753.
