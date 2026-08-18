@@ -2357,6 +2357,57 @@ def rung_can_pay(scheduler: Any) -> bool:
     return row_bytes > 0
 
 
+def flip_pending_from_live_fn(live_fn, armed_fn) -> tuple:
+    """``(rows, max_row_id)`` the flip has parked. ``(-1, -1)`` = UNKNOWN.
+
+    #748: THE IDLE BOX IS NOT UNKNOWN, and reading it as unknown is what
+    wedged comp4 (2026-08-18 06:36Z: "no KV provider" x9, "IDLE-LOCK" x5,
+    pp_to_tp relief "returned NOTHING ... evicted 0 rows over 0 shrinks").
+
+    ``phase_flip_runtime`` sets ``last_req_extent`` only when
+    ``split["req_rows"] > 0``. On an idle box no enumeration ever sees a
+    resident request, so the attribute is never set -- and the previous
+    version read that absence as UNKNOWN, which made the ceiling refuse
+    wholesale. It therefore refused hardest in exactly the case with nothing
+    parked and nothing to protect: 407k pending, 0 running, no funding, wedge.
+
+    ``req_rows == 0`` is the #717 ambiguity one level out -- two opposite
+    states with one encoding:
+
+    * nothing has EVER been resident (an idle box): nothing to protect;
+    * resident but quiesced for the flip (parked): protect it.
+
+    They are separable from data already on hand, which is why this needs no
+    new enumeration. If any enumeration ever saw a resident request the sticky
+    extent EXISTS and answers. If an enumeration has merely RUN, the split is
+    readable and its ``req_rows == 0`` is positive evidence rather than
+    absence of it. Only a split that was never readable at all is genuinely
+    unknown, and that alone still refuses.
+    """
+    try:
+        if not armed_fn():
+            return (0, -1)
+    except Exception:  # noqa: BLE001 - an unreadable flip is not an idle one
+        return (-1, -1)
+
+    extent = getattr(live_fn, "last_req_extent", None)
+    if extent:
+        return (int(extent[0]), int(extent[1]))
+
+    split = getattr(live_fn, "last_split", None)
+    if split is not None:
+        try:
+            if int(split.get("req_rows", -1)) == 0:
+                # An enumeration ran and found nothing resident. Nothing is
+                # parked, so the extent excludes nothing and the rung is free
+                # to fund the flip it is armed for.
+                return (0, -1)
+        except Exception:  # noqa: BLE001 - a malformed split is unknown
+            return (-1, -1)
+
+    return (-1, -1)
+
+
 def kv_backing_provider(
     scheduler: Any,
     *,
@@ -2461,9 +2512,12 @@ def kv_backing_provider(
         funding path is untouched. While armed and with no enumeration on
         record yet, the honest answer is UNKNOWN -- which blocks.
         """
-        if not _flip_armed():
-            return (0, -1)
-        return getattr(live_fn, "last_req_extent", None) or (-1, -1)
+        # #748: delegated to a module-level function so the decision is
+        # testable without a pool, an allocator and a live-set function. The
+        # previous inline form could only be exercised by building the whole
+        # rung, which is why the idle-box case went unnoticed until comp4
+        # wedged on it.
+        return flip_pending_from_live_fn(live_fn, _flip_armed)
 
     return KvBackingRelief(
         pool,
