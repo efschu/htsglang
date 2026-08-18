@@ -50,7 +50,7 @@ COMPOSITE = "c546eed923"
 #: Second wave: F4-r5's harvest composite (contains comp4, #757/#748'/#759/
 #: #755-reorder/#758-emitters). The train base; feat/753 lands on it BY ITS
 #: OWNER before this executor runs (ledger REFRESH (c')).
-HARVEST = "59ce2d8a30"
+HARVEST = "da818719fe"  # tip moved: contains 59ce2d8a30 + the ladder absorption
 DEFAULT_TIP = HARVEST
 DEFAULT_MARKER = "/spinning/evidence-665-f1/COMP4_ACCEPTED"
 

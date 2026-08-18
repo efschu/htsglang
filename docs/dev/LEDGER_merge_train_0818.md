@@ -230,3 +230,50 @@ yet visible; slot reserved.
 
 Standing rule re-applied: these outputs freeze at the second wave;
 re-derive (a') against the actual tip on train day.
+
+## ADDENDUM: the double-#757 adjudication, and the tip moved again
+
+**Harvest tip correction:** the composite advanced while the refresh was
+being written — authority is now `da818719fe` (hicache PP-election fix),
+which contains `59ce2d8a30` (#758 phase-tag) AND `caca35264d` (F4-r5
+absorbed WINDOW_LADDER_0818 + its runner into the harvest). Both fresh
+commits are absorbed by construction; the executor's HARVEST constant is
+bumped.
+
+**Double-#757 verdict: SEMANTICALLY DIFFERENT — LOUD REVIEW ITEM, not a
+supersession.** The double-#754 template does NOT apply. Both fixes attack
+the same root (corpse-S drain disabled; rank-local disarm routes; in-flight
+dict-wire messages from before the arm) but at DIFFERENT intervention
+points:
+
+* `915ce1b868` (F4-r5, IN the harvest, regression-verified under load):
+  the pre-arm leftover is **drained at DISARM** — the rank-local abandon
+  routes clear the channel before control returns to the loop.
+* `9e5647706f` (Slot-3, independent): the **ARMED drain re-enabled,
+  demultiplexed** — a pure 4-way classifier
+  (`output -> STASH / never-ran proxy -> DISCARD / ran proxy -> STASH /
+  unstamped -> STASH`) handles messages AT ARRIVAL while armed, and its
+  commit states the liveness property the disarm-time form does not have:
+  "the message leaves the WIRE either way — the upstream's blocking commit
+  waits on exactly that."
+
+The review question, stated sharply: **during a long armed window, does an
+upstream's blocking send on the dict wire stall the group under
+`915ce1b868` (messages stay on the wire until the downstream disarms),
+which `9e5647706f`'s arrival-time consumption would prevent?** If yes, the
+two are COMPLEMENTARY halves (arrival-time demultiplex + disarm-time
+sweep), not duplicates, and the merge form is Slot-3's classifier reviewed
+against — and possibly layered onto — the harvest's fix rather than either
+discarded. If no, `915ce1b868` stands and `9e5647706f` retires with its
+test ideas re-hosted.
+
+Test-coverage union (either way worth keeping): Slot-3's suite carries the
+hermetic 3-process gloo repro (a stub cannot prove a message left on a real
+blocking wire), 4 killed mutants, specimen numbers verbatim, and the
+#631-pin correction. Its tests bind to `classify_armed_drain_message`
+(their impl), so the tests ride the review verdict — they cannot be
+cherry-picked bare.
+
+Until the review lands: `9e5647706f` stays OUT of the executor plan
+(unchanged), and the review is a NAMED PRECONDITION of pass 3 alongside
+feat/753.
