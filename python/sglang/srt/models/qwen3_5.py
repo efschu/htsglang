@@ -694,6 +694,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
+            # #588(b): the dense down_proj all_reduce is PRODUCER-OWNED
+            # (reduce_results=True) and its output flows VERBATIM into a
+            # join-first communicator consumer -- Qwen2MoeMLP.forward returns
+            # down_proj(x) untouched, and this layer's forward hands it
+            # straight to postprocess_layer (join_deferred at entry) or, on
+            # the fuse_mlp_allreduce seam, sets only an attribute before the
+            # NEXT layer's prepare_attn joins. Nothing between the reduce
+            # site and the join reads the values, which is the #597 safety
+            # property established by trace (commit message has the chain).
+            # o_proj is DELIBERATELY not opted in: this model builds it with
+            # reduce_results=False -- its reduce belongs to the communicator,
+            # the designed-refusal case of DESIGN_588 par.2.
+            self.mlp.down_proj.defer_all_reduce_ok = True
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
@@ -979,6 +992,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
+            # #588(b): the dense down_proj all_reduce is PRODUCER-OWNED
+            # (reduce_results=True) and its output flows VERBATIM into a
+            # join-first communicator consumer -- Qwen2MoeMLP.forward returns
+            # down_proj(x) untouched, and this layer's forward hands it
+            # straight to postprocess_layer (join_deferred at entry) or, on
+            # the fuse_mlp_allreduce seam, sets only an attribute before the
+            # NEXT layer's prepare_attn joins. Nothing between the reduce
+            # site and the join reads the values, which is the #597 safety
+            # property established by trace (commit message has the chain).
+            # o_proj is DELIBERATELY not opted in: this model builds it with
+            # reduce_results=False -- its reduce belongs to the communicator,
+            # the designed-refusal case of DESIGN_588 par.2.
+            self.mlp.down_proj.defer_all_reduce_ok = True
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False

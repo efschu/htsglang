@@ -488,3 +488,146 @@ def test_communicator_entry_points_join_first():
     ):
         source = inspect.getsource(method)
         assert "join_deferred(hidden_states)" in source, method.__name__
+
+
+# --------------------------------------------------------------------------
+# #588(b): the DENSE producer-owned site (RowParallelLinear, opt-in)
+# --------------------------------------------------------------------------
+
+
+def _dense_fake(group, opted_in: bool):
+    """A RowParallelLinear-shaped carrier for the real unbound forward.
+
+    Mirrors the MoE coverage fake: only what the reduce region reads. The
+    quant_method's apply returns this rank's partial sum, exactly like
+    ``forward_local`` in the MoE pattern.
+    """
+    return types.SimpleNamespace(
+        input_is_parallel=True,
+        tp_rank=0,
+        tp_size=WORLD,
+        skip_bias_add=True,
+        bias=None,
+        reduce_results=True,
+        use_dp_attention_reduce=False,
+        defer_all_reduce_ok=opted_in,
+        output_size=HIDDEN,
+        quant_method=types.SimpleNamespace(
+            apply=lambda module, x, bias=None: group.local()
+        ),
+    )
+
+
+def _drive_dense(monkeypatch, group, fake):
+    from contextlib import nullcontext
+
+    from sglang.srt.layers import linear as linear_mod
+
+    monkeypatch.setattr(
+        linear_mod, "tensor_model_parallel_all_reduce", group.all_reduce
+    )
+    monkeypatch.setattr(
+        linear_mod, "use_symmetric_memory", lambda *a, **k: nullcontext()
+    )
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: None, raising=False)
+    monkeypatch.setattr(linear_mod, "should_skip_mlp_all_reduce", lambda: False)
+    out, out_bias = linear_mod.RowParallelLinear.forward(
+        fake, torch.zeros(TOKENS, HIDDEN)
+    )
+    assert out_bias is None
+    return out
+
+
+def test_coverage_dense_issue_fires_on_an_opted_in_row_parallel(
+    backend, monkeypatch
+):
+    """#588(b) coverage: the lever FIRES on the dense producer-owned site.
+
+    The #578 armed-never-executing form is the enemy: a hook that never
+    fires measures the baseline twice. deferred_issued must go to 1 and the
+    double-reduce counter must stay 0 -- the old-site half of the boot
+    acceptance (deferred_issued>0 AND site_hits==0), hermetic edition.
+    """
+    group = CountingGroup()
+    with (
+        envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(True),
+        envs.SGLANG_TP_AR_PIPELINE_DENSE.override(True),
+        envs.SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.override(256),
+    ):
+        tap.reset_tp_ar_pipeline_state()
+        tap.set_deferred_backend_for_test(backend)
+        out = _drive_dense(monkeypatch, group, _dense_fake(group, opted_in=True))
+        assert tap.has_deferred_handle(out), (
+            "the dense issue did not fire on an opted-in RowParallelLinear"
+        )
+        assert tap.tp_ar_pipeline_stats()["deferred_issued"] == 1
+        assert tap.tp_ar_pipeline_stats()["deferred_reduce_site_hits"] == 0
+
+        from sglang.srt.layers import communicator as comm_mod
+
+        joined = comm_mod.join_deferred(out)
+    assert not tap.has_deferred_handle(joined)
+    assert tap.tp_ar_pipeline_stats()["deferred_joined"] == 1
+    assert group.calls == 1
+    assert torch.equal(joined, group.reference())
+
+
+def test_coverage_dense_can_fail_without_the_opt_in(backend, monkeypatch):
+    """The blast-radius pin: a RowParallelLinear that did NOT opt in (vision
+    towers, draft heads -- consumers that never join) must take the ordinary
+    reduce even with both flags on."""
+    group = CountingGroup()
+    with (
+        envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(True),
+        envs.SGLANG_TP_AR_PIPELINE_DENSE.override(True),
+    ):
+        tap.reset_tp_ar_pipeline_state()
+        tap.set_deferred_backend_for_test(backend)
+        out = _drive_dense(monkeypatch, group, _dense_fake(group, opted_in=False))
+    assert not tap.has_deferred_handle(out)
+    assert tap.tp_ar_pipeline_stats()["deferred_issued"] == 0
+    assert group.calls == 1
+    assert torch.equal(out, group.reference())
+
+
+def test_dense_flag_off_is_byte_identical(backend, monkeypatch):
+    """Default off: with SGLANG_TP_AR_PIPELINE_DENSE unset the opted-in
+    module takes the exact pre-#588(b) path -- ordinary reduce, no handle.
+    And the dense flag WITHOUT the #597 infrastructure flag is equally
+    inert: the extension rides on top, never around."""
+    for deferred, dense in ((True, False), (False, True), (False, False)):
+        group = CountingGroup()
+        with (
+            envs.SGLANG_TP_AR_PIPELINE_DEFERRED.override(deferred),
+            envs.SGLANG_TP_AR_PIPELINE_DENSE.override(dense),
+        ):
+            tap.reset_tp_ar_pipeline_state()
+            tap.set_deferred_backend_for_test(backend)
+            out = _drive_dense(
+                monkeypatch, group, _dense_fake(group, opted_in=True)
+            )
+        assert not tap.has_deferred_handle(out), (deferred, dense)
+        assert tap.tp_ar_pipeline_stats()["deferred_issued"] == 0
+        assert group.calls == 1
+        assert torch.equal(out, group.reference())
+
+
+def test_dense_optins_are_exactly_the_traced_modules():
+    """The per-instance opt-in exists ONLY where the trace was done: the two
+    dense Qwen2MoeMLP down_proj constructions in qwen3_5 (o_proj is
+    reduce_results=False there -- communicator-owned, the designed refusal).
+    A third opt-in appearing anywhere in the tree without a trace is a
+    review item, and this pin makes it one."""
+    import pathlib
+    import subprocess
+
+    repo = pathlib.Path(__file__).resolve().parents[4]
+    out = subprocess.run(
+        ["grep", "-rn", "defer_all_reduce_ok = True", str(repo / "python")],
+        capture_output=True,
+        text=True,
+    )
+    hits = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    assert len(hits) == 2, hits
+    for h in hits:
+        assert "models/qwen3_5.py" in h, h

@@ -25,8 +25,11 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.distributed.tp_ar_pipeline import (
+    issue_deferred_all_reduce,
     pipelined_row_all_reduce,
+    tp_ar_deferred_enabled,
     tp_ar_pipeline_enabled,
 )
 from sglang.srt.distributed.utils import (
@@ -1983,6 +1986,39 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+def _dense_deferred_eligible(module, output_parallel) -> bool:
+    """#588(b): may THIS dense reduce defer to the comm stream?
+
+    The #597 deferred issue extended to the producer-owned dense site
+    (DESIGN_588_collective_floor par.4b). Four gates, every one
+    group-uniform (module config, envs, tensor shape shared across TP):
+
+    * ``defer_all_reduce_ok`` -- a PER-INSTANCE opt-in set only where the
+      downstream path is TRACED to reach a ``join_deferred`` consumer
+      before anything reads the values (qwen3_5: o_proj -> prepare_mlp
+      joins at communicator.py:675-shape entry; down_proj ->
+      postprocess_layer / next prepare_attn). A generic hook would also
+      defer vision towers and draft heads whose consumers never join --
+      unreduced activations, silently.
+    * the #597 infrastructure flag AND the dense extension flag -- default
+      off, byte-identical path otherwise.
+    * dim/min-token gates identical to the MoE site.
+
+    The communicator-owned site (communicator.py:1204-shape) is
+    DELIBERATELY not in reach: this helper is consulted only where the
+    call that would have reduced is the call that defers, which is the
+    whole of #597's safety argument. No suppression exists anywhere.
+    """
+    return (
+        getattr(module, "defer_all_reduce_ok", False)
+        and tp_ar_deferred_enabled()
+        and envs.SGLANG_TP_AR_PIPELINE_DENSE.get()
+        and output_parallel.dim() == 2
+        and output_parallel.shape[0]
+        >= int(envs.SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.get())
+    )
+
+
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -2336,6 +2372,13 @@ class RowParallelLinear(LinearBase):
                 )
                 if quantize_communications:
                     output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                elif _dense_deferred_eligible(self, output_parallel):
+                    # #588(b): same single reduction, issued on the comm
+                    # stream and joined by the first communicator consumer.
+                    # Safety per instance: see _dense_deferred_eligible.
+                    output = issue_deferred_all_reduce(
+                        output_parallel, tensor_model_parallel_all_reduce
+                    )
                 else:
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:

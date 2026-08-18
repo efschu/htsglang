@@ -880,6 +880,14 @@ class Envs:
     # Minimum token count for the deferred issue. Below it the collective is
     # too small for the handle bookkeeping to pay for itself.
     SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS = EnvInt(256)
+    # #588(b): extend the deferred issue to the DENSE producer-owned reduce
+    # (RowParallelLinear with reduce_results), targeting the ~1.18 s prefill
+    # collective floor a dense/hybrid model pays where #597's one MoE site
+    # cannot fire. Opt-in on TOP of SGLANG_TP_AR_PIPELINE_DEFERRED, and only
+    # modules whose downstream path is TRACED join-first opt in per instance
+    # (defer_all_reduce_ok) -- a generic hook would also defer vision towers
+    # and draft heads whose consumers never join. Default off: byte-identical.
+    SGLANG_TP_AR_PIPELINE_DENSE = EnvBool(False)
     # Number of independent UCX contexts/workers per rank for the collective
     # plane (task #266). 2 splits the flat exchange's peers over the two
     # workers by the symmetric (rank + peer) % ways rule, so no rank has all
