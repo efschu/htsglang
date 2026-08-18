@@ -40,6 +40,7 @@ proven rows basis), file-backed flip images
 | acceptance | readout | pass |
 | --- | --- | --- |
 | #713 TTFT<3s idle box | timed single small completion against 30030 | TTFT < 3s |
+| #540 effort arms (3 requests via 30099) | explicit `xhigh` / omitted / explicit `max` | xhigh: 200 with thinking (post-57b04b2434 pass-through); omit: 200; max on Qwen3.8: honest refusal, never a silent rewrite (deferred here from the desk pass — serving was down) |
 | boot health | `/health` 200, one real generation correct | 200 + sane text |
 | corridor idle | NVML free per card | >= ~1024 MiB/card target (WARNING below, not fail) |
 

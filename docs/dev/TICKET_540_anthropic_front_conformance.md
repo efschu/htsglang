@@ -186,3 +186,32 @@ git apply /tmp/anthropic_fix.patch
    default-off. That is consistent, but it means a `count_tokens` estimate for
    a thinking-enabled request is only accurate if the caller passes `thinking`
    there too.
+
+---
+
+## Effort-collapse verification (2026-08-18, second pass — prior-art verdict)
+
+The re-issued remedy task found the remedy SHIPPED and contained:
+
+* `57b04b2434` ("xhigh is passed through: the collapse rewrote a supported
+  request", branch `fix/540-effort-collapse`, held by its owner's worktree)
+  is an ancestor of comp4 `921d63defc`. Default: `xhigh` passes through
+  verbatim — and the OpenAI protocol Literal gained `xhigh`, so the value
+  reaches the Qwen3.8 template, which ACCEPTS it explicitly (the 500s are
+  on explicit `high`/`max` only). The collapse survives strictly as the
+  opt-in `SGLANG_ANTHROPIC_XHIGH_EFFORT` for templates whose top tier is
+  named `max`, logged, never silent. `test_effort_passthrough_540.py`:
+  8 tests, re-run green on comp4 here.
+* The LIVE router (30099, wt-anthropic-front) independently normalizes
+  client efforts onto the omit-encoding — its module doc states the
+  reality and the running code carries it — so live traffic was already
+  protected at the router layer; the front-side fix removes the hazard for
+  direct-to-serving clients and rides the next composite boot.
+* The live SERVING lineage (wt-merge-r4, currently DOWN) still carries the
+  OLD collapse at its `serving.py:730-739`; it is retired by deployment,
+  not by an edit to a running tree.
+
+**Deferred, serving-down:** the one-real-request-per-arm probe through
+30099 (explicit `xhigh` → 200 with thinking; omit → 200; explicit `max`
+against Qwen3.8 → the template's refusal, surfaced honestly). Belongs in
+the harvest boot's idle phase; a WINDOW_LADDER_0818 line carries it.
