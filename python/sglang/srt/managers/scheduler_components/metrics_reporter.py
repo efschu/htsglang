@@ -46,6 +46,44 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _active_phase_field() -> str:
+    """#758 emitter (4 of 4): say which PHASE the batch actually ran in.
+
+    THE TRAP THIS CLOSES, caught live on 2026-08-18. Every batch line is
+    prefixed with the rank name -- ``PP0]``, ``PP1]``, ``PP2]`` -- and that
+    name is the RANK, not the layout. It survives the flip unchanged, so a
+    decode executed in the TP layout still prints under ``PP0]`` and a log
+    reader sees "PP decode". Measured on the known-good boot of that morning:
+    95 of 95 decode batches ran in the TP phase and 0 in PP, tracked across
+    135 PHASE-FLIP DONE lines -- the doctrine (prefill in PP, decode in TP)
+    held perfectly while the labelling said the opposite. Reading phase
+    behaviour off these lines was therefore wrong in the one direction nobody
+    would question, because the wrong answer is the one the reader expects.
+
+    SAME AUTHORITY AS THE ROUTING. The field is sourced from
+    ``phase_flip_tp_routing_active()`` -- the function the model code itself
+    consults to decide where a batch is routed -- so the label cannot drift
+    from the behaviour it describes. A second source of truth here would just
+    be a new way to lie.
+
+    SILENT WHEN THERE IS NO FLIP. With ``--enable-phase-flip`` off there is
+    only one layout, the question is meaningless, and the line stays
+    byte-identical to what every non-flip boot has always printed.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        if not getattr(get_server_args(), "enable_phase_flip", False):
+            return ""
+        from sglang.srt.distributed.parallel_state import (
+            phase_flip_tp_routing_active,
+        )
+
+        return " phase=tp" if phase_flip_tp_routing_active() else " phase=pp"
+    except Exception:  # noqa: BLE001 - a label may never break the stats line
+        return ""
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -903,7 +941,7 @@ class SchedulerMetricsReporter:
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
-            f"Prefill batch{iter_msg}, "
+            f"Prefill batch{iter_msg}{_active_phase_field()}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
@@ -1094,7 +1132,10 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}{_active_phase_field()}, "
+            f"#running-req: {num_running_reqs}, {token_usage_msg}"
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
