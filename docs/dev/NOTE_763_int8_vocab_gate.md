@@ -95,3 +95,50 @@ fix (AssertionError at `vocab_parallel_embedding.py:584`).
 
 End-to-end confirmation that the requantized checkpoint now serves coherently
 under TP=3 requires a boot and is NOT claimed here.
+
+## Boot-proof, 2026-08-18 23:12Z
+
+Plain TP=3 uneven-DCP, `--model-path Qwen3.8-27B-INT8-vocabint8-embed`, on the
+fixed tree (`1d1363cbc6`). All three acceptance criteria met:
+
+1. **Coherent.** Greedy `'The capital of France is'` ->
+   `' Paris.\nThe capital of Germany is Berlin.'`, and a prose prompt returned a
+   correct Rayleigh-scattering sentence. This is the same checkpoint and the
+   same layout that answered `' a a a a a a'` before the fix.
+2. **The scale loads.** `weight_scale not found in params_dict` occurs **0**
+   times (it occurred 3 times, once per rank, on the pre-fix boot).
+3. **The saving materialized**, within 1 MiB of the arithmetic:
+
+| rank | bf16 vocab (yarn1.5) | int8 vocab | saved |
+|---|---|---|---|
+| 0 | 14.930 GiB | 14.535 GiB | 404.5 MiB |
+| 1 | 10.186 GiB | 9.793 GiB | 402.4 MiB |
+| 2 | 9.504 GiB | 9.109 GiB | 404.5 MiB |
+| | | **total** | **1211.4 MiB** |
+
+Predicted 1212 MiB (BF16 2425.0 -> INT8 1212.5 + 0.5 scale). The split is even
+across the three TP ranks because `--rank-vocab-ratio` is unset; a dense BF16
+path cannot produce this reduction, which is what makes the number proof that
+`CompressedTensorsEmbeddingMethod` is the method actually in use. Note that no
+log line names the class -- the code never logs its embedding method, so the
+absent warning plus the exact byte saving is the available evidence.
+
+## The PP/TP contradiction, resolved
+
+The open question was why the same checkpoint was reported coherent under PP=3.
+The boot logs answer it: the defect is present under BOTH layouts and is not
+layout-dependent at all.
+
+`boot_735_v7tr_ctg.log` (vocabint8-embed, `tp_size=1, pp_size=3`) carries
+`Parameter model.embed_tokens.weight_scale not found in params_dict` three
+times -- exactly like the TP=3 bench. On PP the embedding lives only on stage 0,
+and PP0's line is the SCALE alone (PP1/PP2 report the weight missing too simply
+because they do not own the embedding at all -- the same benign pair appears in
+`boot_knowngood_r14.log`, which is healthy). By contrast the yarn1.5 known-good
+shows `weight_scale not found` **zero** times, because that checkpoint has no
+scale tensor to place.
+
+So the embed-owning rank behaved identically in both layouts: int8 rows loaded
+into a BF16 dense parameter, scale discarded. The layout cannot be what made
+the difference, and any coherent PP probe on this checkpoint must be explained
+by something other than the embedding path.
