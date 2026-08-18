@@ -414,6 +414,47 @@ class TestCardBusyIsForeignUsageNotCarveOut(CustomTestCase):
         # produce no refusal at all.
         self.assertEqual(names, [])
 
+    def test_the_threshold_measures_foreign_bytes_alone(self):
+        """#751: THE BOUNDARY CELL where the old and new computation
+        disagree, pinned in both directions with the shipped threshold 512.
+
+        foreign=500 with carve-out 518: total-minus-free reads 1018 MiB
+        (the old computation refuses), but only 500 MiB belong to a tenant
+        -- under the threshold, must PASS. foreign=600, same carve-out:
+        over the threshold by its own weight, must REFUSE. Together these
+        pin that the allowance prices GENUINE foreign bytes and never the
+        hardware constant beneath them."""
+        c = cfg()  # card_busy_mib defaults to 512
+        for foreign_mib, want_busy in ((500, False), (600, True)):
+            with self.subTest(foreign_mib=foreign_mib):
+                cards = self._idle_cards()
+                free = (
+                    self._5090_TOTAL
+                    - self._5090_CARVE
+                    - foreign_mib * (1 << 20)
+                )
+                cards[1] = PF.CardObs(
+                    U2,
+                    "RTX 5090",
+                    self._5090_TOTAL,
+                    free,
+                    reserved_bytes=self._5090_CARVE,
+                )
+                names = [
+                    r.name
+                    for r in PF.run_all(
+                        c,
+                        probes(
+                            cards=lambda: cards,
+                            procs_on=lambda u: {777: foreign_mib << 20},
+                        ),
+                    )
+                ]
+                if want_busy:
+                    self.assertIn(RF.REFUSE_CARD_BUSY, names)
+                else:
+                    self.assertNotIn(RF.REFUSE_CARD_BUSY, names)
+
     def test_a_genuinely_occupied_card_still_refuses(self):
         """The check must not be defanged: a real tenant is still foreign
         occupancy even after its card's carve-out is discounted."""
