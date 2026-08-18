@@ -61,6 +61,100 @@ if _is_cuda or _is_hip:
 logger = logging.getLogger(__name__)
 
 
+def _bind_phase_tag(pool) -> None:
+    """#760: record which flip phase a host pool's device binding was taken in.
+
+    Host pools capture ``device_buffers`` (and derive ``layer_num`` from it) ONCE
+    at construction, and nothing rebinds them. Under ``--enable-phase-flip`` the
+    flip snapshots the outgoing layout's weights and FREES THEIR DEVICE STORAGES,
+    so after a flip those pointers name memory the allocator has taken back. The
+    host write path hands them straight to ``cudaMemcpyBatchAsync`` as src_ptrs.
+
+    That killed the ARM I harvest boot (2026-08-18 07:48:42Z): SIGSEGV in
+    ``transfer_kv_all_layer_direct_lf_pf``, 100 GiB host memory free, ``phase=tp``
+    on all three ranks and NO flip in progress -- a stable TP phase writing
+    through a binding taken in PP. The layer counts differ too (7/5/4 per PP stage
+    against 16 in TP), so the extent is wrong as well as the pointers.
+    """
+    pool._bound_tp_phase = None
+    pool._stale_binding_refusals = 0
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        if not getattr(get_server_args(), "enable_phase_flip", False):
+            return
+        from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+
+        pool._bound_tp_phase = bool(phase_flip_tp_routing_active())
+    except Exception:  # noqa: BLE001 - never break pool construction
+        pool._bound_tp_phase = None
+
+
+def _host_binding_is_stale(pool) -> bool:
+    """Would writing through this binding hand freed device memory to CUDA?
+
+    Two independent tells, either sufficient:
+
+    1. THE EXTENT MOVED -- ``len(device_buffers)`` no longer matches the
+       ``layer_num`` derived from it at construction. This is the #719 shape
+       mismatch and it makes the copy walk past the end of the vector even where
+       the pointers happen to survive.
+    2. THE PHASE MOVED -- the binding was taken in one layout and
+       ``phase_flip_tp_routing_active()`` (the same authority the model uses to
+       route a batch, so it cannot drift from reality) now reports the other.
+
+    Refusing costs a cache miss, which this tier is built to tolerate: an
+    unwritten page is simply re-read from the device. Not refusing cost a SIGSEGV.
+    That asymmetry is the whole argument, and it is why this is a refusal rather
+    than an attempt to rebind a live pool mid-flight.
+
+    Logged once per pool then counted -- a torn binding is a steady state, not an
+    event, so it would otherwise print on every page of every write.
+    Safe on any pool: without a recorded tag it returns False and changes nothing.
+    """
+    bufs = getattr(pool, "device_buffers", None) or ()
+    layer_num = getattr(pool, "layer_num", -1)
+    name = getattr(pool, "pool_name", "?")
+    if layer_num >= 0 and len(bufs) != layer_num:
+        pool._stale_binding_refusals = getattr(pool, "_stale_binding_refusals", 0) + 1
+        if pool._stale_binding_refusals == 1:
+            logger.error(
+                "HICACHE-WRITE REFUSED (#760): host pool %r was bound to %d device "
+                "layer buffer(s) but now sees %d. Writing would run "
+                "cudaMemcpyBatchAsync past the end of the vector. Refusing the host "
+                "write -- the page stays a device-tier hit.",
+                name,
+                layer_num,
+                len(bufs),
+            )
+        return True
+    bound = getattr(pool, "_bound_tp_phase", None)
+    if bound is None:
+        return False
+    try:
+        from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+
+        active = bool(phase_flip_tp_routing_active())
+    except Exception:  # noqa: BLE001 - if we cannot tell, do not block IO
+        return False
+    if active == bound:
+        return False
+    pool._stale_binding_refusals = getattr(pool, "_stale_binding_refusals", 0) + 1
+    if pool._stale_binding_refusals == 1:
+        logger.error(
+            "HICACHE-WRITE REFUSED (#760): host pool %r bound its device buffers in "
+            "phase=%s and the active phase is now %s. The flip frees the outgoing "
+            "layout's device storages, so these src_ptrs name memory the allocator "
+            "has taken back -- this is the write that SIGSEGV'd in "
+            "transfer_kv_all_layer_direct_lf_pf on 2026-08-18. Refusing the host "
+            "write; the page stays a device-tier hit until the pool is rebound.",
+            name,
+            "tp" if bound else "pp",
+            "tp" if active else "pp",
+        )
+    return True
+
+
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -766,6 +860,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.lock = threading.RLock()
 
         self.device_buffers = device_buffers
+        _bind_phase_tag(self)
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
@@ -973,6 +1068,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 page_size=1,
             )
         elif io_backend == "direct" and self.layout == "page_first_direct":
+            if _host_binding_is_stale(self):
+                return
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_buffers,
                 dst_ptrs=[self.kv_buffer],
