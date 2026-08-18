@@ -1433,22 +1433,29 @@ class Qwen3_5ForCausalLM(nn.Module):
             # non-GGUF quantization keeps quant_config=None here, i.e. the
             # default path is byte-identical. SGLANG_GGUF_DENSE_VOCAB=1
             # restores the legacy dense embed for GGUF too.
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                is_compressed_tensors_config,
+            )
+
             embedding_quant_config = None
             if quant_config is not None and quant_config.get_name() == "gguf":
                 from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
 
                 if not gguf_dense_vocab():
                     embedding_quant_config = quant_config
-            elif (
-                quant_config is not None
-                and quant_config.get_name() == "compressed-tensors"
-            ):
+            elif is_compressed_tensors_config(quant_config):
                 # #727: only when the checkpoint ACTUALLY quantized the vocab.
                 # Every checkpoint we serve today lists embed_tokens in
                 # quantization_config.ignore, so this stays None and the dense
                 # BF16 path runs byte-identically. A requantized checkpoint
                 # (tools/requant_vocab_int8.py) drops that entry, and then the
                 # int8 rows are dequantized on gather instead of materialized.
+                #
+                # #763: the family test used to be a bare == "compressed-tensors"
+                # here, but the config names itself "compressed_tensors", so it
+                # never matched and a requantized checkpoint silently took the
+                # dense path -- int8 rows into a BF16 embedding, scales orphaned
+                # ("weight_scale not found in params_dict"), output = token soup.
                 from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
                     vocab_is_quantized,
                 )

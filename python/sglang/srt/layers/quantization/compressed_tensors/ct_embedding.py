@@ -37,6 +37,37 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+from sglang.srt.utils import set_weight_attrs
+
+
+def is_compressed_tensors_config(quant_config: Any) -> bool:
+    """#763: does this config belong to the compressed-tensors family?
+
+    The family answers ``get_name()`` with the UNDERSCORE spelling
+    (``compressed_tensors``, see ``CompressedTensorsConfig.get_name``), while
+    the checkpoint's ``quant_method`` field and most prose use the HYPHEN
+    spelling. #727's model-side gate compared against the hyphen, so it never
+    matched a real config and the int8 vocab silently kept the dense path --
+    loading int8 rows into a BF16 embedding with no scale applied, which is
+    what token soup looks like from the outside.
+
+    Matching on the normalized name rather than one literal is what keeps a
+    second spelling from re-opening this. The predicate lives here, beside the
+    method it selects, so it can be unit-tested against the real config object
+    instead of being duplicated as a bare string in a model file.
+    """
+    if quant_config is None:
+        return False
+    getter = getattr(quant_config, "get_name", None)
+    if not callable(getter):
+        return False
+    try:
+        name = getter()
+    except Exception:  # a config that cannot name itself is not a match
+        return False
+    if not isinstance(name, str):
+        return False
+    return name.strip().lower().replace("-", "_") == "compressed_tensors"
 
 
 def vocab_is_quantized(quant_config: Dict[str, Any], layer_name: str) -> bool:
@@ -104,11 +135,27 @@ class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
         scale = torch.nn.Parameter(
             torch.empty(rows, 1, dtype=torch.float32), requires_grad=False
         )
+        # #763: BOTH parameters must declare that the vocab rows are dim 0.
+        # VocabParallelEmbedding.weight_loader reads `output_dim` to decide
+        # whether to narrow the checkpoint tensor to this rank's row range;
+        # a parameter without it takes the "copy onto all gpus" branch meant
+        # for shard-invariant tensors (gptq's g_idx), which for a vocab
+        # matrix is the wrong contract entirely. It is silent at tp_size 1 --
+        # the whole vocab IS the local shard, so PP=3 serving is correct --
+        # and only bites once the vocab is row-sharded across TP ranks.
+        # The scale carries one entry PER ROW, so it shards on dim 0 exactly
+        # like the rows it belongs to; slicing one without the other would
+        # pair each row with a stranger's scale.
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(scale, {"output_dim": 0})
         layer.register_parameter("weight", weight)
         layer.register_parameter("weight_scale", scale)
         if weight_loader is not None:
             for param in (weight, scale):
                 setattr(param, "weight_loader", weight_loader)
+        if extra:
+            for param in (weight, scale):
+                set_weight_attrs(param, extra)
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         """Gather rows, then scale them. In that order, deliberately.
