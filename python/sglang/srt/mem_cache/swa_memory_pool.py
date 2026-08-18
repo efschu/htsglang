@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
+    mark_as_sub_pool,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
@@ -76,6 +77,10 @@ class SWAKVPool(BaseSWAKVPool):
             layer_num=self.full_layer_nums,
             **kwargs,
         )
+        # Both sub-pools are addressed with SWA/full-local ids, not global
+        # layer ids, so neither carries a global ownership map.
+        mark_as_sub_pool(self.swa_kv_pool)
+        mark_as_sub_pool(self.full_kv_pool)
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -120,6 +125,11 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_kv_pool.register_layer_transfer_counter(None)
 
     def _wait_for_layer(self, layer_id: int):
+        # NOT routed through `KVCache.local_slot`, deliberately: this class
+        # pins `start_layer = 0` above and never calls `super().__init__`, so
+        # the expression is an identity on a GLOBAL layer id and the accessor's
+        # ownership map is never built here. Converting it would be the wrong
+        # conversion. Making this pool PP-aware is a separate question.
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 

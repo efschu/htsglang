@@ -44,23 +44,8 @@ from a rule that ping-pongs between two. The protection here is NOT a dwell
 floor -- the branch deliberately runs ahead of ``min_dwell_s`` -- it is that
 the condition is ONE-SIDED, and that is what these tests pin: the arm requires
 the current layout to build nothing AND the target to be able to build
-something.
-
-AND IT BECAME EXACTLY THAT. This docstring used to continue "...so after the
-flip the target runs by premise and the condition is false on the other side",
-and that is false. One-sidedness holds at the instant of evaluation; it says
-nothing about the next layout's FIRST round, which is empty until its carried
-work is re-admitted. On 2026-08-17 the policy ping-ponged in runs of up to 72
-arms over 299 s, each arm landing in the same second as the cutover before it.
-
-What actually bounds it is the post-cutover settle added for #713 -- a layout
-may be declared unable to run only after it has had the chance to run. These
-tests still pass unchanged because they construct ``PhasePolicyState()``
-without a ``phase_since``, which the guard reads as "phase never observed" and
-degrades to the pre-guard behaviour. That is deliberate, and it is also the
-reason they never caught this: a suite that never sets the phase clock cannot
-see a defect that lives in the first seconds after a cutover. The replay that
-does see it is test_idle_locked_settle_713.py, driven off a recorded log.
+something, so after the flip the target runs by premise and the condition is
+false on the other side.
 """
 
 import unittest

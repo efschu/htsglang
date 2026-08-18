@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -28,7 +29,6 @@ from sglang.srt.layers.attention.flashinfer_workspace import (
     WORKSPACE_ARCH_MIB,
     WORKSPACE_DETERMINISTIC_MIB,
 )
-from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -36,14 +36,14 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dcp import (
     build_dcp_weighted_kv_indices,
     cp_all_gather_heads_uneven,
-    dcp_weighted_write_slots,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     dcp_even_write_mask,
-    dcp_host_even_total,
     dcp_fresh_host_lens,
+    dcp_host_even_total,
     dcp_host_lens,
     dcp_host_total_tokens,
+    dcp_weighted_write_slots,
     get_dcp_lens,
 )
 from sglang.srt.layers.dcp.lockstep import (
@@ -373,6 +373,7 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     num_kv_heads = mc.get_num_kv_heads(tp_size, rank=tp_rank)
     return num_qo_heads, num_kv_heads
 
+
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
@@ -531,9 +532,7 @@ def _tag_adaptive_int_workspace(wrapper, share_key=None):
     if share_key is not None:
         shared = mgr.get_shared_state_tensor(share_key)
         if shared is not None and shared.untyped_storage().nbytes() == nbytes:
-            wrapper.reset_workspace_buffer(
-                wrapper._float_workspace_buffer, shared
-            )
+            wrapper.reset_workspace_buffer(wrapper._float_workspace_buffer, shared)
             return wrapper
     with adaptive_graph_memory.tagged_state_alloc(nbytes=nbytes):
         new_int = torch.zeros_like(old)
@@ -698,9 +697,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # token-sharded pool (store_cache row mismatch, first real-metal
         # flip boot 2026-08-08). Same is_draft_worker-ride family as the
         # attention-registry MTP shortcut.
-        _is_draft = bool(
-            getattr(model_runner, "is_draft_worker", False)
-        ) and not bool(getattr(model_runner, "is_phase_flip_tp_stack", False))
+        _is_draft = bool(getattr(model_runner, "is_draft_worker", False)) and not bool(
+            getattr(model_runner, "is_phase_flip_tp_stack", False)
+        )
         _draft_replicated = draft_pool_is_replicated(
             _is_draft, getattr(model_runner, "server_args", None)
         )
@@ -725,9 +724,7 @@ class FlashInferAttnBackend(AttentionBackend):
         #   (L // cp_S) * cp_ratio + (L % cp_S - cp_lo)
         # which is an injective, ratio-proportional packing (reduces EXACTLY to
         # the even L // dcp_size when ratios are all 1). False -> even modulo.
-        self.uneven_dcp_weighted = self.uneven_dcp and uneven_dcp_active(
-            self.dcp_size
-        )
+        self.uneven_dcp_weighted = self.uneven_dcp and uneven_dcp_active(self.dcp_size)
         if self.uneven_dcp_weighted:
             _cp_prefix = cp_token_prefix(self.dcp_size)
             self.cp_S = _cp_prefix[-1]
@@ -784,9 +781,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.dcp_q_head_counts = weightless_head_counts(
                     mc.num_attention_heads, attn_tp_size
                 )
-                self.dcp_kv_head_counts = weightless_head_counts(
-                    total_kv, attn_tp_size
-                )
+                self.dcp_kv_head_counts = weightless_head_counts(total_kv, attn_tp_size)
                 # Compute dtype for the weightless worker's empty [T,0,D]
                 # contributions -- must match the head rank's projected Q/K/V
                 # dtype so the padded all-gather shapes/dtypes agree.
@@ -833,9 +828,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 # by construction (a pure function of the broadcast slot ids);
                 # all moves are rank-local memcpys on the current stream -- the
                 # cross-rank collective count is untouched.
-                self._wl_spill_active = bool(
-                    getattr(model_runner, "_wl_spill_phys_tokens", 0)
-                ) and not model_runner.is_draft_worker
+                self._wl_spill_active = (
+                    bool(getattr(model_runner, "_wl_spill_phys_tokens", 0))
+                    and not model_runner.is_draft_worker
+                )
                 if self._wl_spill_active:
                     assert self._wl_chunk_block_size > 0, (
                         "weightless-KV host spill requires the B0 block loop "
@@ -886,9 +882,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.dcp_kv_head_counts = (
                     [total_kv] * attn_tp_size
                     if self.dcp_kv_replicated_heads
-                    else tp_partition_sizes(
-                        total_kv, attn_tp_size, units=total_kv
-                    )
+                    else tp_partition_sizes(total_kv, attn_tp_size, units=total_kv)
                 )
             # FULL gathered counts the paged wrappers are planned with.
             self.dcp_full_qo_heads = mc.num_attention_heads
@@ -1018,9 +1012,7 @@ class FlashInferAttnBackend(AttentionBackend):
             set(model_runner.model_config.hf_config.architectures)
             & HIGH_WORKSPACE_ARCHITECTURES
         ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
-                WORKSPACE_ARCH_MIB * 1024 * 1024
-            )
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(WORKSPACE_ARCH_MIB * 1024 * 1024)
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -1532,8 +1524,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     None
                     if seq_lens_cpu is None
                     else [
-                        int(s) - self.dllm_config.block_size
-                        for s in seq_lens_cpu[:bs]
+                        int(s) - self.dllm_config.block_size for s in seq_lens_cpu[:bs]
                     ]
                 ),
             )
@@ -1669,9 +1660,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # and therefore issues the same per-layer collective sequence.
             self._sess_prefill_spill = (
                 self._sess_prefill_prepare(forward_batch)
-                if bool(
-                    getattr(forward_batch, "kv_session_prefill_spill", False)
-                )
+                if bool(getattr(forward_batch, "kv_session_prefill_spill", False))
                 else None
             )
             # DECOUPLE S3: route THIS forward's DCP collectives to comm B when
@@ -2284,8 +2273,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_draft_extend_v2(),
             )
             return self._forward_extend_dcp(
-                q, k, v, layer, forward_batch, prefill_wrapper_paged, cache_loc,
-                logits_soft_cap, save_kv_cache, force_prefix=force_prefix,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                prefill_wrapper_paged,
+                cache_loc,
+                logits_soft_cap,
+                save_kv_cache,
+                force_prefix=force_prefix,
             )
 
         if not self.forward_metadata.use_ragged:
@@ -2844,11 +2841,20 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _wl_full_layer_idx(self, layer):
         """Raw index of ``layer`` into the full-attention sub-pool's per-layer
-        k/v buffer lists (the HybridLinearKVPool translation, minus the sub-
-        pool's own start_layer offset). Both the host tier's transfer methods
-        and the raw D2H spill write index the buffers with this."""
+        k/v buffer lists. Both the host tier's transfer methods and the raw D2H
+        spill write index the buffers with this.
+
+        Two hops (DESIGN_pp_layer_set.md §8.2). ``layer.layer_id`` is a GLOBAL
+        model layer id; ``_transfer_full_attention_id`` re-indexes it into the
+        sub-pool's DENSE full-attention frame; the sub-pool then resolves that
+        to a buffer slot. The second hop goes through the pool's own accessor
+        so the FRAME is chosen by the pool rather than assumed here -- for a
+        sub-pool that is the plain offset (its ``start_layer`` is 0, since
+        HybridLinearKVPool builds it without one), which is what this line has
+        always computed.
+        """
         mapped = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
-        return mapped - getattr(self._wl_full_pool, "start_layer", 0)
+        return self._wl_full_pool.local_slot(mapped)
 
     def _wl_stage_host_slots(self, blk_indices, layer):
         """B1 block SOURCE swap: for every HOST-resident slot in this block,
@@ -2973,13 +2979,11 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.token_to_kv_pool_allocator.size, self._sess_S
         )
         scratch = getattr(model_runner, "_kv_sess_scratch_slot", None)
-        assert scratch is not None, (
-            "kv-session-offload: scratch row missing from the KV pool"
-        )
+        assert (
+            scratch is not None
+        ), "kv-session-offload: scratch row missing from the KV pool"
         dev = self._sess_full_pool.k_buffer[0].device
-        self._sess_scratch_loc = torch.tensor(
-            [scratch], dtype=torch.int64, device=dev
-        )
+        self._sess_scratch_loc = torch.tensor([scratch], dtype=torch.int64, device=dev)
         proto = self._sess_full_pool.k_buffer[0]
         # S2: TWO block-sized staging regions (double buffer). Region r
         # occupies staging rows [r*B, (r+1)*B); the H2D copy of streamed
@@ -3320,13 +3324,21 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _sess_full_layer_idx(self, layer):
         """Index of ``layer`` into the full-attention pool's per-layer k/v
-        buffer lists (and the host pool's parallel k_data_refs)."""
+        buffer lists (and the host pool's parallel k_data_refs).
+
+        The two branches index DIFFERENT pools, so they are not one site twice
+        (DESIGN_pp_layer_set.md §8.2). With a wrapper, ``_sess_full_pool`` is
+        the SUB-pool and the id is re-indexed into its dense frame first.
+        Without one, ``_sess_full_pool`` falls back to the MAIN pool and the id
+        is still GLOBAL -- an ordinary global -> local translation, which under
+        a non-contiguous layer set is a rank lookup rather than a subtraction.
+        Routing both through the pool's accessor lets the pool decide.
+        """
         pool = self._sess_pool
         if hasattr(pool, "_transfer_full_attention_id"):
-            return pool._transfer_full_attention_id(layer.layer_id) - getattr(
-                self._sess_full_pool, "start_layer", 0
-            )
-        return layer.layer_id - getattr(self._sess_full_pool, "start_layer", 0)
+            mapped = pool._transfer_full_attention_id(layer.layer_id)
+            return self._sess_full_pool.local_slot(mapped)
+        return self._sess_full_pool.local_slot(layer.layer_id)
 
     def _sess_prepare_step(self, forward_batch):
         """Derive the per-step spill state from replicated inputs only:
@@ -3358,12 +3370,12 @@ class FlashInferAttnBackend(AttentionBackend):
         # _sess_blockwise_prefix_return_lse builds its own block loop). The
         # plain decode spill tick keeps its full path below (byte-identical).
         is_verify = forward_batch.forward_mode.is_target_verify()
-        assert forward_batch.forward_mode.is_decode() or is_verify, (
-            "kv-session-offload: spill tick must be a decode or target-verify batch"
-        )
-        assert forward_batch.batch_size == 1, (
-            "kv-session-offload: exactly one spilled session per tick"
-        )
+        assert (
+            forward_batch.forward_mode.is_decode() or is_verify
+        ), "kv-session-offload: spill tick must be a decode or target-verify batch"
+        assert (
+            forward_batch.batch_size == 1
+        ), "kv-session-offload: exactly one spilled session per tick"
         from sglang.srt.managers.kv_session_offload import owned_device_indices
 
         # S3: order this tick after any in-flight wave-back H2D so the device
@@ -3461,7 +3473,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Positional ownership: the sentinel encodes its absolute
                 # position as (slot - host_base) // S; count this rank's owned
                 # host positions directly (position-set, not a [0,L) prefix diff).
-                pos = (host_slots.to(torch.int64) - self._sess_host_base) // self._sess_S
+                pos = (
+                    host_slots.to(torch.int64) - self._sess_host_base
+                ) // self._sess_S
                 counts = [int((pos % dcp == r).sum().item()) for r in range(dcp)]
             else:
                 counts = [n_host]
@@ -3522,9 +3536,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             slot.count_cache = (L, tuple(counts))
             res_cur = new_token_residue(L - 1, self._sess_S)
-            cur_owned = (
-                self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
-            )
+            cur_owned = self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
         elif self._sess_mode == "even":
             full = owned_counts_even(L, dcp)
             headc = owned_counts_even(boundary, dcp)
@@ -3872,12 +3884,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 # stream, ordered after the owner-write by stream order.
                 dst = region * B + (e_row - 1 - s_row)
                 sc = self._sess_scratch_i
-                self._sess_staging_k[dst].copy_(
-                    self._sess_full_pool.k_buffer[fl][sc]
-                )
-                self._sess_staging_v[dst].copy_(
-                    self._sess_full_pool.v_buffer[fl][sc]
-                )
+                self._sess_staging_k[dst].copy_(self._sess_full_pool.k_buffer[fl][sc])
+                self._sess_staging_v[dst].copy_(self._sess_full_pool.v_buffer[fl][sc])
             wrapper = self._sess_plan_block(
                 e_row - s_row, region, num_qo_heads, num_kv_heads, head_dim
             )
@@ -3906,9 +3914,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # cross-rank cp_lse merge stays balanced (same as the _wl loop).
             w = self._sess_get_wrapper(("empty",))
             if w._sess_planned != 0:
-                empty_indptr = torch.zeros(
-                    2, dtype=torch.int32, device=st.device
-                )
+                empty_indptr = torch.zeros(2, dtype=torch.int32, device=st.device)
                 w.plan(
                     empty_indptr,
                     self._sess_stage_arange32[:0],
@@ -4310,9 +4316,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 # PASS well under that, FAIL on gross (wrong mask/merge/read).
                 ok = (not nan) and rel < 5e-2
                 verdict = (
-                    "NAN" if nan
-                    else ("MACHINE_ZERO" if md == 0.0
-                          else f"{'PASS' if ok else 'FAIL'} maxd={md:.3e} rel={rel:.3e}")
+                    "NAN"
+                    if nan
+                    else (
+                        "MACHINE_ZERO"
+                        if md == 0.0
+                        else f"{'PASS' if ok else 'FAIL'} maxd={md:.3e} rel={rel:.3e}"
+                    )
                 )
                 rows.append((R, tail_n, head_n, verdict))
         finally:
@@ -4507,7 +4517,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._sess_open_slot(rpi, region_base=0)
                 # row = [real head slots] ++ [tail sentinels for [head, L)]
                 tail_res = torch.arange(head, L, device=dev, dtype=torch.int64) % S
-                tail_sent = make_sentinels(self._sess_host_base, S, tail_res, start=head)
+                tail_sent = make_sentinels(
+                    self._sess_host_base, S, tail_res, start=head
+                )
                 self._sess_req_pool.req_to_token[rpi, :L] = torch.cat(
                     [head_slots, tail_sent]
                 ).to(torch.int32)
@@ -4550,8 +4562,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._sess_graph_replay_blocks = None
                 md = float((o_e - o_g).abs().max().item())
                 nan = bool(torch.isnan(o_g).any() or torch.isnan(o_e).any())
-                verdict = "MACHINE_ZERO" if md == 0.0 else (
-                    "NAN" if nan else f"maxd={md:.3e}"
+                verdict = (
+                    "MACHINE_ZERO"
+                    if md == 0.0
+                    else ("NAN" if nan else f"maxd={md:.3e}")
                 )
                 rows.append(
                     (self._sess_spill.graph_rung, self._sess_spill.n_own, verdict)
@@ -4629,9 +4643,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # fallback on every tick). The tail host rows are dense [base,
         # base+n_own), so no contiguity check is needed (unlike _wl).
         L = int(forward_batch.seq_lens_cpu[0].item())
-        row = self._sess_req_pool.req_to_token[
-            forward_batch.req_pool_indices[0], :L
-        ]
+        row = self._sess_req_pool.req_to_token[forward_batch.req_pool_indices[0], :L]
         boundary = int((row < self._sess_host_base).sum().item())
         dcp = len(self._sess_prefix) - 1
         if self._sess_mode == "weighted":
@@ -4671,8 +4683,8 @@ class FlashInferAttnBackend(AttentionBackend):
             wrappers=[],
             indptr_dev=[],
             indptr_host=[],
-            stage_ids=[],       # host source rows per block (refilled at replay)
-            stage_dst=[],       # staging destination slots (fixed)
+            stage_ids=[],  # host source rows per block (refilled at replay)
+            stage_dst=[],  # staging destination slots (fixed)
             head_wrapper=None,
             head_indices=torch.zeros(head_max, dtype=torch.int32, device=dev),
             head_indptr_dev=torch.zeros(2, dtype=torch.int32, device=dev),
@@ -4729,8 +4741,10 @@ class FlashInferAttnBackend(AttentionBackend):
         replay refills real counts via fast_decode_plan (capture-at-max /
         replay-below)."""
         iu = self.indices_updater_decode
-        num_qo_heads = sum(self.dcp_q_head_counts) if self.uneven_dcp else (
-            self.indices_updater_decode.num_qo_heads
+        num_qo_heads = (
+            sum(self.dcp_q_head_counts)
+            if self.uneven_dcp
+            else (self.indices_updater_decode.num_qo_heads)
         )
         num_kv_heads = iu.num_kv_heads
         head_dim = iu.head_dim
@@ -4743,23 +4757,39 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture:
             rung = self._sess_graph_capture_blocks
             assert rung is not None, "spill-graph capture without a rung set"
-            synth_indptr = torch.tensor([0, B], dtype=torch.int32, device=last_page.device)
+            synth_indptr = torch.tensor(
+                [0, B], dtype=torch.int32, device=last_page.device
+            )
             synth_indices = torch.zeros(B, dtype=torch.int32, device=last_page.device)
             for j in range(rung):
                 w = st.wrappers[j]
                 w.plan(
-                    synth_indptr, synth_indices, last_page,
-                    num_qo_heads, num_kv_heads, head_dim, 1,
-                    q_data_type=iu.q_data_type, kv_data_type=iu.data_type,
+                    synth_indptr,
+                    synth_indices,
+                    last_page,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    1,
+                    q_data_type=iu.q_data_type,
+                    kv_data_type=iu.data_type,
                 )
                 w.begin_forward = partial(fast_decode_plan, w)
             # Dev-head captured at max.
             hmax = int(st.head_indices.numel())
-            head_synth = torch.tensor([0, hmax], dtype=torch.int32, device=last_page.device)
+            head_synth = torch.tensor(
+                [0, hmax], dtype=torch.int32, device=last_page.device
+            )
             st.head_wrapper.plan(
-                head_synth, st.head_indices, last_page,
-                num_qo_heads, num_kv_heads, head_dim, 1,
-                q_data_type=iu.q_data_type, kv_data_type=iu.data_type,
+                head_synth,
+                st.head_indices,
+                last_page,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
             )
             st.head_wrapper.begin_forward = partial(fast_decode_plan, st.head_wrapper)
             return
@@ -4767,9 +4797,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # ---- replay prep: refill from _sess_spill's out-of-graph plan ----
         spill = self._sess_spill
         rung = self._sess_graph_replay_blocks
-        assert rung is not None and spill is not None, (
-            "spill-graph replay prep without admission (can_replay first)"
-        )
+        assert (
+            rung is not None and spill is not None
+        ), "spill-graph replay prep without admission (can_replay first)"
         plan = spill.graph_plan  # list of {cnt, host_rows, indptr} (per block)
         for j in range(rung):
             w = st.wrappers[j]
@@ -4785,10 +4815,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             st.indptr_dev[j].copy_(ic, non_blocking=True)
             w.begin_forward(
-                st.indptr_dev[j], w._paged_kv_indices_buf[:cnt], last_page,
-                num_qo_heads, num_kv_heads, head_dim, 1,
-                data_type=iu.data_type, q_data_type=iu.q_data_type,
-                non_blocking=True, fixed_split_size=None,
+                st.indptr_dev[j],
+                w._paged_kv_indices_buf[:cnt],
+                last_page,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                data_type=iu.data_type,
+                q_data_type=iu.q_data_type,
+                non_blocking=True,
+                fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
                 global_override_indptr_cpu=ic,
             )
@@ -4799,10 +4836,17 @@ class FlashInferAttnBackend(AttentionBackend):
             st.head_indices[:n_head].copy_(spill.dev_head_idx, non_blocking=True)
         st.head_indptr_dev.copy_(st.head_indptr_host, non_blocking=True)
         st.head_wrapper.begin_forward(
-            st.head_indptr_dev, st.head_indices[:n_head], last_page,
-            num_qo_heads, num_kv_heads, head_dim, 1,
-            data_type=iu.data_type, q_data_type=iu.q_data_type,
-            non_blocking=True, fixed_split_size=None,
+            st.head_indptr_dev,
+            st.head_indices[:n_head],
+            last_page,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+            data_type=iu.data_type,
+            q_data_type=iu.q_data_type,
+            non_blocking=True,
+            fixed_split_size=None,
             disable_split_kv=self.disable_cuda_graph_kv_split,
             global_override_indptr_cpu=st.head_indptr_host,
         )
@@ -4840,9 +4884,12 @@ class FlashInferAttnBackend(AttentionBackend):
         o_acc = lse_acc = empty_acc = None
         # Device head partial (real pool) -- first merge source.
         oh, lh = st.head_wrapper.forward_return_lse(
-            q_full, real_kv,
-            sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+            q_full,
+            real_kv,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
         )
         hlen = st.head_indptr_dev[1:] - st.head_indptr_dev[:-1]
         hem = hlen == 0
@@ -4871,9 +4918,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 item_size=host.token_stride_size,
             )
             o_b, lse_b = st.wrappers[j].forward_return_lse(
-                q_full, kv,
-                sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+                q_full,
+                kv,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
             )
             lens = st.indptr_dev[j][1:] - st.indptr_dev[j][:-1]
             em = lens == 0
@@ -4903,8 +4953,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
         st = self._sess_graph_bucket
         self._sess_pool.set_kv_buffer(
-            layer, self._sess_scratch_loc, k_full.clone(), v_full.clone(),
-            layer.k_scale, layer.v_scale,
+            layer,
+            self._sess_scratch_loc,
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
         )
         fl = self._sess_full_layer_idx(layer)
         host = self._sess_host_pool
@@ -5027,8 +5081,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             if not bool(torch.equal(row, ident)):
                 return self._wl_graph_log_fallback(
-                    "non-contiguous KV slot layout (allocator reuse/"
-                    "fragmentation)"
+                    "non-contiguous KV slot layout (allocator reuse/" "fragmentation)"
                 )
             self._wl_graph_loc_offset = loc_offset
             # Rank-uniform rung covering every rank's LAST owned slot
@@ -5242,9 +5295,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # bs == 1 + offset-linear layout (verified by wl_graph_can_replay):
             # this rank's owned slots are CONTIGUOUS [s0, s0 + owned).
             owned = int(indptr_host[1])
-            s0 = (
-                self._wl_graph_loc_offset + self.dcp_rank
-            ) // self.dcp_size
+            s0 = (self._wl_graph_loc_offset + self.dcp_rank) // self.dcp_size
             if s0 + owned > dev_limit + self._wl_host_slots:
                 raise RuntimeError(
                     "weightless-KV block-decode graph: owned shard "
@@ -5417,9 +5468,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 st.run_ev[j].record(main_stream)
             lens = st.indptr_dev[j][1:] - st.indptr_dev[j][:-1]
             em = lens == 0
-            lse_b = torch.where(
-                em.unsqueeze(1), torch.full_like(lse_b, neg_inf), lse_b
-            )
+            lse_b = torch.where(em.unsqueeze(1), torch.full_like(lse_b, neg_inf), lse_b)
             o_b = torch.where(em.view(-1, 1, 1), torch.zeros_like(o_b), o_b)
             if o_acc is None:
                 o_acc, lse_acc, empty_acc = o_b, lse_b, em
@@ -5469,9 +5518,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # row(s) ABOVE both H2D regions (carve 2B + 1), so the side stream's
         # early cross-layer block copies (which fill [base, base + 2B)) never
         # collide with it. Without prefetch: the original base rows (#136a).
-        st = self._wl_graph_state.get(
-            getattr(self, "_wl_graph_active_bucket", None)
-        )
+        st = self._wl_graph_state.get(getattr(self, "_wl_graph_active_bucket", None))
         prefetch = st is not None and getattr(st, "prefetch", False)
         scratch_base = self._wl_stage_base
         if prefetch:
@@ -5901,16 +5948,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     self._dcp_write_scatter(
                         layer, forward_batch, cache_loc, k_full_seq, v_full_seq
                     )
-                return o_cur.contiguous().view(
-                    -1, layer.tp_q_head_num * layer.head_dim
-                )
+                return o_cur.contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
             # 3. Prefix: paged DCP read over this rank's OWNED prefix slots with
             #    the FULL gathered q-heads (non-causal: all prefix keys precede
             #    every current query). Combine the per-rank partials across the
             #    DCP group and slice back to this rank's local heads.
-            q_full = cp_all_gather_heads_uneven(
-                q_local, group, self.dcp_q_head_counts
-            )
+            q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
             if self._sess_verify_active():
                 # C4 (spec-in-spill-tick): this rank's committed prefix lives on
                 # host (kv-session-offload spill) -- stream it blockwise via the
@@ -5941,7 +5984,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     v_scale=layer.v_scale_float,
                 )
             o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
-                o_pre_raw, lse_pre_raw, group, self.dcp_q_head_counts,
+                o_pre_raw,
+                lse_pre_raw,
+                group,
+                self.dcp_q_head_counts,
                 return_lse=True,
             )
             if do_write and _scatter_late:
@@ -5952,7 +5998,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._dcp_write_scatter(
                     layer, forward_batch, cache_loc, k_full_seq, v_full_seq
                 )
-            return self._dcp_extend_final_merge(q, layer, o_cur, lse_cur, o_pre, lse_pre)
+            return self._dcp_extend_final_merge(
+                q, layer, o_cur, lse_cur, o_pre, lse_pre
+            )
 
         # ================= OVERLAPPED SCHEDULING (#128) =================
         # Two-lane schedule. The per-layer collective ISSUE ORDER on the DCP
@@ -6002,12 +6050,8 @@ class FlashInferAttnBackend(AttentionBackend):
             if not _reorder_only:
                 cur_stream.wait_stream(comm_stream)
             if do_write:
-                self._dcp_write_scatter(
-                    layer, forward_batch, cache_loc, k_full, v_full
-                )
-            return o_cur.contiguous().view(
-                -1, layer.tp_q_head_num * layer.head_dim
-            )
+                self._dcp_write_scatter(layer, forward_batch, cache_loc, k_full, v_full)
+            return o_cur.contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
 
         # main lane waits for B (and transitively A) before the paged read.
         if not _reorder_only:
@@ -6054,16 +6098,17 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         with _merge_ctx:
             o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
-                o_pre_raw, lse_pre_raw, group, self.dcp_q_head_counts,
+                o_pre_raw,
+                lse_pre_raw,
+                group,
+                self.dcp_q_head_counts,
                 return_lse=True,
             )
         # main lane: the masked scatter-write targets the current chunk's
         # out_cache_loc slots, disjoint from the paged prefix read above and
         # untouched by the merge -> overlaps C/merge/D.
         if do_write:
-            self._dcp_write_scatter(
-                layer, forward_batch, cache_loc, k_full, v_full
-            )
+            self._dcp_write_scatter(layer, forward_batch, cache_loc, k_full, v_full)
         # join: the merged prefix partials must be complete before the final
         # local merge consumes them (the attention output is consumed by
         # o_proj right after this returns).
@@ -6178,9 +6223,7 @@ class FlashInferAttnBackend(AttentionBackend):
             torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
         ).unsqueeze(-1)
         o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
-        return o.to(q.dtype).contiguous().view(
-            -1, layer.tp_q_head_num * layer.head_dim
-        )
+        return o.to(q.dtype).contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -6528,9 +6571,8 @@ class FlashInferIndicesUpdaterDecode:
         # Host-side kv indptr for the DCP cuda-graph replay plan (see below);
         # None on every non-DCP / non-graph path.
         dcp_graph_indptr_host: Optional[torch.Tensor] = None
-        if (
-            self.attn_backend.uneven_dcp
-            and (spec_info is None or getattr(spec_info, "kv_indptr", None) is None)
+        if self.attn_backend.uneven_dcp and (
+            spec_info is None or getattr(spec_info, "kv_indptr", None) is None
         ):
             # Uneven-DCP decode: this rank's paged read sees only the token
             # slots it OWNS (even-modulo owner rule pos % dcp_size == dcp_rank,
@@ -7051,9 +7093,7 @@ class FlashInferIndicesUpdaterPrefill:
                 # its exact mirror and seq_lens_sum the check on it -- via the
                 # freshness guard, since a gpu_only batch's seq_lens_cpu is
                 # stale rather than absent and would mis-size the buffer.
-                paged_kernel_lens_cpu = dcp_fresh_host_lens(
-                    seq_lens_cpu, seq_lens_sum
-                )
+                paged_kernel_lens_cpu = dcp_fresh_host_lens(seq_lens_cpu, seq_lens_sum)
             else:
                 # cross attention
                 paged_kernel_lens = encoder_lens
@@ -7360,9 +7400,7 @@ class FlashInferIndicesUpdaterPrefill:
             # race and was sigquit'd before it got there, which made this look
             # shadow-rank-specific).
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
-                assert (
-                    getattr(spec_info, "ragged_verify_layout", None) is None
-                ), (
+                assert getattr(spec_info, "ragged_verify_layout", None) is None, (
                     "uneven DCP + DFLASH target-verify does not support the "
                     "ragged-verify layout (variable per-request verify lens); "
                     "the DCP split assumes a uniform draft_token_num per "

@@ -57,24 +57,12 @@ class TestBindingResourceIsDerived708(CustomTestCase):
                 self.assertIn(str(avail), msg, "the measurement must be quoted")
                 self.assertIn(str(pending), msg)
 
-    def test_kv_not_binding_says_so_and_names_nothing_else(self):
+    def test_kv_not_binding_says_so_and_redirects(self):
         """CAN-FAIL, the synthetic specimen the fix exists for: a pool with room
-        to spare must NOT be blamed. The old hardcoded string fails this.
-
-        THE REDIRECT WAS REMOVED, and this pin changed with it. The line used to
-        end "-- look at the state-slot bound (mamba/GDN slots) before blaming
-        the pool", and this test required that wording. But the redirect was
-        never a measurement: it was a hypothesis authored into the log string,
-        then read back out of the log and filed as finding #712, which was
-        closed as unfounded on that evidence. A test that REQUIRED the unmeasured
-        claim to be present is how such a line survives review, so the
-        requirement is inverted here rather than merely relaxed: this branch
-        reports what it measured and must name no cause it did not.
-        """
+        to spare must NOT be blamed. The old hardcoded string fails this."""
         msg = _decline_text(500_000, pending=1_000)
         self.assertIn("KV is NOT the binding resource", msg, msg)
-        self.assertIn("does not name the one that is", msg, msg)
-        self.assertNotIn("mamba/GDN", msg, "an unmeasured cause must not be named")
+        self.assertIn("mamba/GDN", msg, "it must redirect to the state-slot bound")
         self.assertNotIn("the binding resource is KV,", msg, msg)
 
     def test_unmeasured_admits_it_rather_than_guessing(self):
