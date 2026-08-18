@@ -130,6 +130,27 @@ POS
   row UNOBS "602-instrument-lines" "slot reserved; owner supplies the grep patterns"
 fi
 
+# ---------------- ARM III: the 735 step-2 gapped boot (WINDOW_TICKET_735_STEP2)
+if [ "$ARM" = "III" ]; then
+  # A: gapped set accepted
+  n=$(lc "PPLayerSetError")
+  if [ "$n" -eq 0 ]; then row PASS "735s2-A-set-accepted" "no PPLayerSetError"; else row FAIL "735s2-A-set-accepted" "$n refusal(s)"; fi
+  # B: crossing count EXACTLY 31
+  cnt=$(grep -oE "crossings?[ =:]+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+  if [ "${cnt:-x}" = "31" ]; then row PASS "735s2-B-crossings" "31 exactly"; elif [ -z "$cnt" ]; then row UNOBS "735s2-B-crossings" "no crossing-count line (emitter?)"; else row FAIL "735s2-B-crossings" "counted $cnt, expected exactly 31 -- wrong map, abort window"; fi
+  # D: the deliberate refusal probes (operator runs them pre-boot; lines land in the same log)
+  n=$(lc "must be CONTIGUOUS")
+  if [ "$n" -ge 1 ]; then row PASS "735s2-D-refusal-fired" "$n contiguity refusal(s) observed"; else row UNOBS "735s2-D-refusal-fired" "refusal probe not run in this log"; fi
+  # G: no 737 wedge
+  n=$(lc "ack-wait|ACK WAIT HANG")
+  if [ "$n" -eq 0 ]; then row PASS "735s2-G-no-737-wedge" "0 ack hangs"; else row FAIL "735s2-G-no-737-wedge" "$n"; fi
+  # H: GDN slot ceiling readout (record, never fail)
+  slots=$(grep -oE "mamba slots?[ =:]+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+  if [ -n "$slots" ]; then row PASS "735s2-H-slot-readout" "recorded $slots slots (compare vs 20-23 with arm C / ~7 without)"; else row UNOBS "735s2-H-slot-readout" "no slot line"; fi
+  row UNOBS "735s2-C-text-identity" "operator row: greedy probe vs step-1 reference outputs"
+  row UNOBS "735s2-E-throughput" "operator row: soak-load comparison + #706 across-a-flip cached-token form"
+fi
+
 echo
 echo "== summary: PASS=$PASS FAIL=$FAIL UNOBS/DRY=$UNOBS"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
