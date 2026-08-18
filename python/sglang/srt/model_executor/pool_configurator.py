@@ -231,15 +231,29 @@ class MemoryPoolConfigurator:
     # to nothing on the strength of a stage that does not use it (and
     # MemoryPoolConfig refuses <= 0 outright).
     #
-    # THE MAGNITUDE IS CHOSEN, not arbitrary. It must be far above any universe
-    # a real stage can bound (this rig's attention stages solve to ~7.5e5
-    # tokens, two orders below), and it must stay ALLOCATION-SAFE, because
-    # max_total_num_tokens does not only get compared -- index structures are
-    # sized from it. math.inf is unusable for the same reason: it flows into
-    # integer arithmetic (`// page_size`, MemoryPoolConfig fields) with no float
-    # path. 2**24 satisfies both; something like 2**40 would satisfy the first
-    # and turn any index allocation into an out-of-memory of its own.
-    _KVLESS_STAGE_TOKENS = 1 << 24
+    # THE MAGNITUDE IS CHOSEN, and the choice was corrected by a boot rather
+    # than reasoned into place. Two requirements pull against each other:
+    #
+    #   NON-BINDING   it must exceed the largest universe a real stage can
+    #                 bound, or it becomes the minimum and caps the pipeline.
+    #                 Measured on this rig: 845279 tokens.
+    #   ALLOCATABLE   max_total_num_tokens is not only COMPARED. Structures are
+    #                 sized from it on this rank too, and they do not all scale
+    #                 with the (zero) KV cell.
+    #
+    # 2**24 was tried first, on the assumption that a zero cell meant zero
+    # allocation. It does not: the kvless stage went to `torch reserved
+    # 49.70 GiB` on a 32.6 GiB card and died on cuMemCreate -- roughly
+    # 16.7M tokens x ~1 KiB of per-token structure that is not the KV cell.
+    # 2**20 clears the measured 845279 by 1.24x and costs about a sixteenth of
+    # that allocation, which fits the headroom a GDN-only stage actually has.
+    #
+    # math.inf is unusable regardless: the value flows into integer arithmetic
+    # (`// page_size`, MemoryPoolConfig fields) with no float path.
+    #
+    # IF A STAGE UNIVERSE EVER EXCEEDS THIS, the symptom is a silently capped
+    # pool, so it is asserted rather than left to be noticed later.
+    _KVLESS_STAGE_TOKENS = 1 << 20
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

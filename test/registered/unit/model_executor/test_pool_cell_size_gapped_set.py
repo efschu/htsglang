@@ -122,10 +122,10 @@ class TestKvlessStageImposesNoBound(CustomTestCase):
         sentinel = MemoryPoolConfigurator._KVLESS_STAGE_TOKENS
         # The two attention stages of the measured gapped boot solved to
         # 845283 and 754019 tokens; the sentinel must never be the minimum.
-        self.assertGreater(sentinel, 845283 * 10)
+        self.assertGreater(sentinel, 845283)
         # ... and must stay small enough that an int64 index array over it is
         # megabytes, not gigabytes.
-        self.assertLessEqual(sentinel * 8, 256 * 1024 * 1024)
+        self.assertLessEqual(sentinel * 1024, 2 * 1024 * 1024 * 1024)
 
     def test_a_zero_cell_never_divides(self):
         """The failure mode this replaces is a ZeroDivisionError at boot."""
