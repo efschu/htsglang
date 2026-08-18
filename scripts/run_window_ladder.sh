@@ -11,7 +11,15 @@
 # Usage:
 #   run_window_ladder.sh --log /var/log/htsglang/boot.log \
 #       [--url http://127.0.0.1:30030] [--phase idle|loaded|all] \
-#       [--arm I|II] [--dry-run <fixture-dir>]
+#       [--arm I|II] [--leg-seconds 22.5] [--dry-run <fixture-dir>]
+#
+# --leg-seconds is the measured refill-leg cost of the regime the boot under
+# test actually ran. GATE A's hard ceiling is 60/leg_seconds flips per minute,
+# so it is NOT a constant: 22.5 s (the file-backed arm, NOTE_690 §1) gives
+# 2.67/min, while the pinned regime's ~3.1 s marks line gives ~19/min. Default
+# 22.5 matches the arm this ladder was written for; pass the boot's own number
+# when it differs, and the runner reprices the ceiling rather than baking one
+# regime into the bar.
 #
 # Dry-run: <fixture-dir>/log.txt replaces the boot log, curl checks are
 # skipped (marked DRY), proving the mechanics without a server.
@@ -22,6 +30,7 @@ LOG=""
 PHASE="all"
 ARM="I"
 DRY=""
+LEG_S="22.5"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -29,6 +38,7 @@ while [ $# -gt 0 ]; do
     --url) URL="$2"; shift 2 ;;
     --phase) PHASE="$2"; shift 2 ;;
     --arm) ARM="$2"; shift 2 ;;
+    --leg-seconds) LEG_S="$2"; shift 2 ;;
     --dry-run) DRY="$2"; shift 2 ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
@@ -55,12 +65,55 @@ row() { # status name detail
 # count occurrences of a pattern in the log
 lc() { grep -cE "$1" "$LOG" 2>/dev/null || true; }
 
+# effective value of a server_args field, read off the boot's own
+# `server_args=ServerArgs(...)` line. The point of reading it back rather than
+# trusting the command line is server_args' silent rewrites -- see the #760
+# rewrite trap in WINDOW_LADDER_0818.md.
+sa() { grep -m1 -oE "$1=[^,)]*" "$LOG" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+
 echo "== WINDOW_LADDER_0818  arm=$ARM phase=$PHASE log=$LOG"
 echo
 
 # ---------------- phase 0/boot observations (always evaluated from log)
 n=$(lc "images .* host \(file-backed reclaimable\)")
 if [ "$n" -ge 1 ]; then row PASS "flip-images-file-backed" "$n boot summary line(s)"; else row FAIL "flip-images-file-backed" "no file-backed summary line"; fi
+
+# host ledger: the gate decides on EARNED terms. The dirty-page transient is
+# reported, not charged (host_ledger.sh:113 hardcodes FLIP_DIRTY_GB=0 after the
+# term failed its own discrimination test), so a REFUSE here is a real refusal
+# on priced bytes, and the dirty window is a risk note beside it -- never read
+# the note as part of the gate.
+nref=$(lc "\[HOST-LEDGER [^]]*\].*-> REFUSE")
+nok=$(lc "\[HOST-LEDGER [^]]*\].*-> OK")
+if [ "$nref" -ge 1 ]; then row FAIL "host-ledger-verdict" "$nref REFUSE line(s) on earned terms"
+elif [ "$nok" -ge 1 ]; then row PASS "host-ledger-verdict" "$nok OK line(s); dirty-page transient reported, not charged"
+else row UNOBS "host-ledger-verdict" "no HOST-LEDGER pre/post line in this log"; fi
+
+# #760: page_first_direct segfaults inside the copy on this rig with the shape
+# guard armed and shapes MATCHING (specimen 2026-08-18T0903Z). Read the
+# EFFECTIVE layout, because page_first + direct io is silently rewritten to
+# page_first_direct (server_args.py:16464-16471).
+layout=$(sa "hicache_mem_layout")
+iob=$(sa "hicache_io_backend")
+case "$layout" in
+  *page_first_direct*) row FAIL "760-layout-gated" "effective layout $layout (io $iob): kernel proven broken on this rig -- boot must not run it" ;;
+  "") row UNOBS "760-layout-gated" "no server_args line in this log" ;;
+  *) row PASS "760-layout-gated" "effective layout $layout (io $iob): not the broken kernel path" ;;
+esac
+narm=$(lc "KV-TRANSFER-GUARD ARMED")
+nmis=$(lc "KvTransferShapeMismatch")
+if [ "$narm" -ge 1 ]; then row PASS "760-guard-armed" "$narm ARMED line(s), $nmis mismatch refusal(s) -- silence without an ARMED line is not evidence"
+else row UNOBS "760-guard-armed" "0 ARMED lines: guard inert, absent, or this boot predates 9ba46eb31a"; fi
+
+# ARM II precondition: the flag must be ON the boot. server_args returns early
+# when the interval is None, so a forgotten flag is byte-identical to ARM I and
+# every ARM II row below would read UNOBS while looking like a measurement.
+if [ "$ARM" = "II" ]; then
+  ck=$(sa "mamba_checkpoint_interval")
+  if [ "$ck" = "8192" ]; then row PASS "armII-precondition-interval" "mamba_checkpoint_interval=8192"
+  elif [ -z "$ck" ]; then row UNOBS "armII-precondition-interval" "no server_args line in this log"
+  else row FAIL "armII-precondition-interval" "mamba_checkpoint_interval=$ck -- this is NOT ARM II; its rows are void, not failed"; fi
+fi
 
 # ---------------- phase idle
 if [ "$PHASE" = "idle" ] || [ "$PHASE" = "all" ]; then
@@ -126,6 +179,72 @@ POS
     n=$(lc "anchor")
     if [ "$n" -ge 1 ]; then row PASS "758-1-anchor-cadence" "$n line(s) -- verify 8192-multiples by hand"; else row UNOBS "758-1-anchor-cadence" "0 lines: emitters missing (F4-r5 building) or grid silent-inert"; fi
   fi
+  # ---- GATE A, as a RATE. The 135 flips/15 min baseline is retired as a bar
+  # (it is 9.0/min, 3.4x above the physical ceiling -- a diagnosis of aborting
+  # or overlapping arms, not a target). Bar: sustained < 1/min; hard fail at or
+  # above the ceiling 60/leg_seconds, regardless of backlog.
+  # Only PP0 emits `PHASE-POLICY arming`, so one line is one arm.
+  read -r ARMS WMIN PEAK <<EOF
+$(awk -v ts='^\\[[0-9][0-9-]+ [0-9][0-9:]+' '
+  function ep(s,  a) { if (match(s, ts) == 0) return -1;
+    a = substr(s, RSTART+1, 19); gsub(/[-:]/, " ", a); return mktime(a) }
+  { e = ep($0); if (e < 0) next; last = e
+    if (first_policy == 0 && /PHASE-POLICY armed:/) first_policy = e
+    if (/PHASE-POLICY arming/) { n++; t[n] = e } }
+  END {
+    win = (first_policy > 0 && last > first_policy) ? (last - first_policy)/60.0 : 0
+    peak = 0
+    for (i = 1; i <= n; i++) { c = 0
+      for (j = i; j <= n; j++) if (t[j] - t[i] < 60) c++
+      if (c > peak) peak = c }
+    printf "%d %.3f %d", n+0, win, peak }' "$LOG")
+EOF
+  CEIL=$(awk -v l="$LEG_S" 'BEGIN{ printf "%.2f", (l>0)? 60.0/l : 0 }')
+  if [ "${WMIN:-0}" = "0.000" ] || [ "${ARMS:-0}" -eq 0 ]; then
+    if [ "${ARMS:-0}" -eq 0 ]; then
+      row PASS "gate-a-flip-rate" "0 arming lines (bar: sustained < 1/min; ceiling ${CEIL}/min at ${LEG_S}s/leg)"
+    else
+      row UNOBS "gate-a-flip-rate" "$ARMS arm(s) but no policy-live window (no 'PHASE-POLICY armed:' line)"
+    fi
+  else
+    RATE=$(awk -v a="$ARMS" -v w="$WMIN" 'BEGIN{printf "%.2f", a/w}')
+    DET="$ARMS arm(s) / ${WMIN} min = ${RATE}/min sustained, peak ${PEAK} in any 60s; ceiling ${CEIL}/min at ${LEG_S}s/leg"
+    if awk "BEGIN{exit !($RATE >= $CEIL)}"; then
+      row FAIL "gate-a-flip-rate" "HARD FAIL (sustained at/above ceiling) regardless of backlog -- $DET"
+    elif awk "BEGIN{exit !($PEAK >= $CEIL)}"; then
+      row FAIL "gate-a-flip-rate" "HARD FAIL (60s burst at/above ceiling: more arms than the seam can physically complete, so arms aborted or overlapped -- the 135-flip diagnosis) -- $DET"
+    elif awk "BEGIN{exit !($RATE < 1.0)}"; then
+      row PASS "gate-a-flip-rate" "$DET"
+    else
+      row FAIL "gate-a-flip-rate" "above the < 1/min bar -- $DET"
+    fi
+  fi
+  # ---- GATE A arm mix: WHICH path churns. Informational, never a FAIL: an
+  # economic count at or near zero is EXPECTED on this workload (the soak
+  # driver's 48000-char cap keeps total backlog at or below the ~49250-token
+  # break-even), and IDLE-LOCK is the one arm that bypasses both the #688
+  # layout-hold verdict and the #689 formation gate by construction.
+  nidle=$(grep -E "PHASE-POLICY arming" "$LOG" 2>/dev/null | grep -c "IDLE-LOCKED" || true)
+  necon=$((${ARMS:-0} - nidle))
+  row UNOBS "gate-a-arm-mix" "$nidle idle-lock / $necon economic of ${ARMS:-0} -- 0 economic is expected here, not a defect"
+  # ---- cache reuse ACROSS A FLIP (#706), not absolute hit rate: the soak
+  # driver truncates to hist[-48000:], so an absolute rate is invalid by
+  # construction. Mechanical half only -- the runner cannot resolve session
+  # identity, so the operator confirms the request came from a session that
+  # already ran a turn BEFORE the flip.
+  fl=$(grep -nE "PHASE-POLICY arming" "$LOG" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -z "$fl" ]; then
+    row UNOBS "706-cache-across-flip" "no flip in this log"
+  else
+    nhit=$(tail -n +"$fl" "$LOG" | grep -cE "#cached-token: [1-9]" || true)
+    if [ "$nhit" -ge 1 ]; then
+      row PASS "706-cache-across-flip" "$nhit post-flip request(s) with cached-token > 0 -- OPERATOR confirms one is a session with a pre-flip turn"
+    else
+      row FAIL "706-cache-across-flip" "0 post-flip requests with cached-token > 0"
+    fi
+  fi
+  # ---- #743 agent-soak prefix reuse: PREREQUISITE, not a row that can pass.
+  row UNOBS "743-slot-eviction-instrument" "PREREQUISITE ABSENT: no discrete slot-eviction event is logged (NOTE_743 2.2); cc4ac02321 is docs-only, the counter at evict_mamba:1161 is proposed, not built"
   # 602 placeholder: owner fills the grep
   row UNOBS "602-instrument-lines" "slot reserved; owner supplies the grep patterns"
 fi
