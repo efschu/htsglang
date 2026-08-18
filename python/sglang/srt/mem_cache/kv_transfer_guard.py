@@ -39,9 +39,14 @@ prevent -- and absence is not a mismatch.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional, Sequence
 
 __all__ = ["KvTransferShapeMismatch", "validate_kv_transfer"]
+
+
+logger = logging.getLogger(__name__)
+_ARMED_SEAMS: set = set()
 
 
 class KvTransferShapeMismatch(RuntimeError):
@@ -98,6 +103,37 @@ def validate_kv_transfer(
     ``*_ptr_vectors`` is the per-pool list of per-layer pointer vectors (k and
     v are separate vectors), which is exactly what the kernel indexes by layer.
     """
+
+    # SAY, ONCE PER SEAM, THAT THIS GUARD IS ON THE PATH.
+    #
+    # A guard that is silent when shapes match cannot be distinguished from a
+    # guard that was never reached -- and that is not hypothetical here: the
+    # previous #760 guard sat in DeepSeekV4PagedHostPool, covered 2 of 74
+    # callsites and ZERO on the live class, and its silence was read for hours
+    # as "the binding is sound". The callsite census is what settled it, after
+    # two boots had already been spent.
+    #
+    # So the first call at each seam logs the shapes it actually saw. That turns
+    # "the guard is armed on the live path" from an assumption into a line an
+    # operator can grep for BEFORE trusting a clean run -- which is exactly how
+    # this boot is being judged.
+    global _ARMED_SEAMS
+    if where not in _ARMED_SEAMS:
+        _ARMED_SEAMS.add(where)
+        logger.info(
+            "KV-TRANSFER-GUARD ARMED at %s: src layer-vectors=%s dst layer-vectors=%s "
+            "src_capacity=%s dst_capacity=%s%s",
+            where or "a transfer seam",
+            [_len_or_none(v) for v in src_ptr_vectors],
+            [_len_or_none(v) for v in dst_ptr_vectors],
+            src_capacity,
+            dst_capacity,
+            (
+                f" | #719 generation src={src_generation} dst={dst_generation}"
+                if (src_generation is not None or dst_generation is not None)
+                else ""
+            ),
+        )
 
     def _stamps() -> str:
         if src_generation is None and dst_generation is None:
