@@ -90,6 +90,8 @@ makes it a pure config flip — chunk budget stays 512).
 | #735 Step-2 gapped layout | new PP cut (48 GDN -> 5090) = new boot | after Step-1 on the harvest boot if cheap |
 | #602 instrument lines | detail held by its owner (not recoverable from the register at desk today) — slot reserved, runner has a placeholder check | owner fills the grep |
 | #536/#537 | not found in the swept sources with acceptance shape — explicitly NOT consolidated rather than invented | owners to file |
+| #470 Boot A/B(/C) | own residency-cut pricing + spec config; three comparable boots in one window | TICKET_470 §3/§6 (#535: Boot B unblocked, pure flags; Boot C carries a NAMED EAGLE-publish refusal hazard) |
+| #462-F2 breakable route | breakable-vs-eager needs its own capture boots | TICKET_462_RESULT §4 (#535: LPO branch landed, pure flags; first hardware verdict on the 43-crossings figure) |
 
 ## Runner
 
