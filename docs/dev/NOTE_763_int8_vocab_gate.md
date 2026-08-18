@@ -139,6 +139,29 @@ shows `weight_scale not found` **zero** times, because that checkpoint has no
 scale tensor to place.
 
 So the embed-owning rank behaved identically in both layouts: int8 rows loaded
-into a BF16 dense parameter, scale discarded. The layout cannot be what made
-the difference, and any coherent PP probe on this checkpoint must be explained
-by something other than the embedding path.
+into a BF16 dense parameter, scale discarded.
+
+The generation artifacts close it. Every arm booted on `vocabint8-embed`
+produced garbage, PP included -- `v7pp10`, `v7pp17`, `v7pp18`, `v7pp19`,
+`v7pp20`, `v7tr_gap`. Every arm booted on `yarn1.5` produced correct answers --
+`arm1`, `armA`, `armA2`, `armB2`, `comp4`, `disc`, `nohc`, and both of today's
+`step1ctg` arms. There was never a coherent probe on the requantized checkpoint
+under any layout, so the prediction holds without an exception to explain.
+
+WHY IT LOOKED LIKE THERE WAS ONE, and this is the part worth keeping: the
+garbage does not appear where a reader looks. `CONTENT` is the EMPTY STRING and
+the token soup sits in `reasoning_content`:
+
+    CONTENT: ''
+    REASONING: ' The wordirikao...EventManager_pars...'
+    FINISH: length
+
+The model never emits a closing think marker, so the qwen3 reasoning parser
+takes the entire degenerate stream as reasoning and leaves the content field
+empty. A probe that prints `content` alone shows `''`, which reads as "no
+output" or "empty answer" rather than "the model is broken" -- and `FINISH:
+length` means it ran to max_tokens instead of stopping. Any check that judges
+coherence from the content field alone is blind to exactly this failure, which
+is the same blindness that let a GATE 0 the ticket had already specified go
+unrun. Coherence probes must read `reasoning_content` too, or use the native
+`/generate` route, which has no parser in front of it.
