@@ -313,16 +313,43 @@ def test_the_armed_drain_is_bounded():
     assert r.recv_calls == 64
 
 
-def test_the_armed_drain_discards_any_kind_without_demultiplexing():
-    """Rank 0's upstream wire carries the OUTPUT return, not proxies.
+def test_the_armed_drain_TAKES_an_output_off_the_wire_but_KEEPS_it():
+    """#757 REPLACES the "both kinds are equally void" pin.
 
-    Routing a discard through the demultiplexer would make it hunt for an
-    expected kind and block; while armed both kinds are equally void.
+    That sentence was falsified ON METAL and the production code records the
+    refutation next to the function: "the upstream wire MULTIPLEXES the proxy
+    forward and the output return, and an output belongs to work launched
+    BEFORE the arm. This function ate one (kind=output, PP1, 07:33:30Z) and
+    PP1 then blocked for ever waiting for it." The drain was disabled because
+    of that -- which removed the prevention half and let #757's
+    PROXY LEFTOVER REFUSED fire under load on comp4.
+
+    So the invariant this file pins is unchanged in the part that matters --
+    the message still leaves the WIRE, because the upstream's blocking commit
+    waits on exactly that -- and corrected in the part metal disproved: it is
+    stashed for its consumer instead of destroyed.
     """
     out = {"next_token_ids": torch.zeros(2), "__msg_type__": "output"}
     r = _ArmedRank(wire=[out], posted=1)
     assert r.pp_flip_drain_tensor_dicts() == 1
     assert r.recv_calls == 1
+    # ...and it is still reachable by the consumer that is owed it.
+    assert list(r._pp_tensor_dict_inbox["output"]) == [out]
+
+
+def test_the_armed_drain_still_DROPS_a_void_proxy():
+    """The #757 half: a proxy for a pass this rank never ran is void.
+
+    Leaving it on the wire is what strands it and puts every later receive off
+    by one -- the specimen's mb_id=2 seq=151 rows=512 arriving on a rank at
+    mb_id=1.
+    """
+    proxy = {"hidden_states": torch.zeros(2), "__msg_type__": "proxy",
+             "__stamp__": (2, 151, 512)}
+    r = _ArmedRank(wire=[proxy], posted=1)
+    assert r.pp_flip_drain_tensor_dicts() == 1
+    assert r.recv_calls == 1
+    assert not list(getattr(r, "_pp_tensor_dict_inbox", {}).get("proxy", []))
 
 
 # -- THE STAMP MUST NOT REACH MODEL COMPUTE ------------------------------------

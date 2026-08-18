@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import collections
 import time
 from array import array
 from collections import defaultdict, deque
@@ -199,6 +200,68 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
             pool.free(req)
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("[PP Dynamic Chunk] probe req-slot release failed: %s", exc)
+
+
+#: #757: what the ARMED drain may do with one message off the wire.
+DRAIN_STASH = "stash"
+DRAIN_DISCARD = "discard"
+
+
+def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
+    """``(action, kind, why)`` for one message taken while ARMED.
+
+    #757. The armed drain used to be kind-BLIND and discard everything, which
+    is corpse S: the upstream wire MULTIPLEXES the proxy forward and the output
+    return, an output belongs to work launched BEFORE the arm, and eating one
+    blocked PP1 for ever. Disabling the drain then left only the receive-side
+    guard, and comp4 hit it under load:
+
+        #631 PROXY LEFTOVER REFUSED: proxy mb_id=2 seq=151 rows=512 arrived
+        while this rank is on mb_id=1 -- sent by an upstream that resumed
+        while this rank was still armed
+
+    Both failures are the same missing distinction, so this function makes it
+    once and the drain applies it:
+
+    * ``output`` -- ALWAYS stashed. It is owed to a real consumer that already
+      looks in the inbox. Discarding it destroys a microbatch's results and
+      strands every rank behind it. This is the corpse-S half.
+    * ``proxy`` for a microbatch this rank NEVER RAN -- discarded. There is no
+      batch it could pair with, now or later, so leaving it on the wire is what
+      strands it and puts every later receive off by one. This is the #757 half.
+    * ``proxy`` for a microbatch this rank DID run -- stashed. It was launched
+      before the arm and is still owed. The design note flagged exactly this
+      case as "the same question a second time"; the stamp answers it.
+    * anything unstamped or of unknown kind -- stashed. An unidentifiable
+      message is not evidence of a void pass, and discarding on absence of
+      evidence is how the corpse-S class is re-entered.
+
+    Pure and module-level so the decision is testable without a scheduler, a
+    process group or a boot -- which is what the previous inline form was not.
+    """
+    if not isinstance(msg, dict):
+        return (DRAIN_STASH, "default", "not a dict; unidentifiable, so kept")
+    kind = msg.get("__msg_type__", "default")
+    if kind != "proxy":
+        return (DRAIN_STASH, kind, f"kind={kind} is owed to a real consumer")
+    stamp = msg.get("__stamp__")
+    if stamp is None:
+        return (DRAIN_STASH, kind, "proxy carries no stamp; cannot prove it void")
+    try:
+        mb_id = int(stamp[0])
+    except Exception:  # noqa: BLE001 - a malformed stamp proves nothing
+        return (DRAIN_STASH, kind, "proxy stamp unreadable; cannot prove it void")
+    if mb_id in set(ran_mb_ids or ()):
+        return (
+            DRAIN_STASH,
+            kind,
+            f"proxy mb_id={mb_id} names a pass this rank DID run; still owed",
+        )
+    return (
+        DRAIN_DISCARD,
+        kind,
+        f"proxy mb_id={mb_id} names a pass this rank never ran; void while armed",
+    )
 
 
 class SchedulerPPMixin:
@@ -1343,22 +1406,68 @@ class SchedulerPPMixin:
             self._pp_flip_bump_consumed(CHAN_DICT)
             drained += 1
             stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
-            logger.info(
-                "%s armed drain took a tensor dict off the wire and "
-                "discarded it: kind=%s stamp=%s. This rank is armed and "
-                "launching nothing, so the message names a pass it never "
-                "ran; leaving it on the wire is what used to strand it and "
-                "put every later receive off by one. (%d this window)",
-                "#631",
-                raw.get("__msg_type__", "default") if isinstance(raw, dict) else "?",
-                stamp,
-                drained,
+            # #757: DEMULTIPLEX, then decide. Kind-blind discarding is corpse
+            # S -- it ate an `output` owed to a real consumer and blocked PP1
+            # for ever. The message stays off the wire either way (the
+            # upstream's blocking commit waits on exactly that), but only a
+            # provably void proxy is dropped; everything else is handed to the
+            # inbox its consumer already reads.
+            # getattr: this method is bound UNBOUND against stubs by
+            # test_pp_proxy_stamp_631, which carries only what the old drain
+            # touched. A missing accessor means "no slots known", which is the
+            # conservative reading anyway.
+            ran_fn = getattr(self, "_pp_ran_mb_ids", None)
+            action, kind, why = classify_armed_drain_message(
+                raw, ran_fn() if ran_fn is not None else set()
             )
+            if action == DRAIN_STASH:
+                inbox = getattr(self, "_pp_tensor_dict_inbox", None)
+                if inbox is None:
+                    # Never discard for want of somewhere to put it -- that is
+                    # corpse S. Create the inbox instead.
+                    inbox = collections.defaultdict(collections.deque)
+                    self._pp_tensor_dict_inbox = inbox
+                inbox[kind].append(raw)
+                logger.info(
+                    "%s armed drain took a tensor dict off the wire and "
+                    "STASHED it: kind=%s stamp=%s -- %s. (%d this window)",
+                    "#757",
+                    kind,
+                    stamp,
+                    why,
+                    drained,
+                )
+            else:
+                logger.info(
+                    "%s armed drain took a tensor dict off the wire and "
+                    "discarded it: kind=%s stamp=%s -- %s. Leaving it on the "
+                    "wire is what used to strand it and put every later "
+                    "receive off by one. (%d this window)",
+                    "#757",
+                    kind,
+                    stamp,
+                    why,
+                    drained,
+                )
         if drained:
             self._pp_flip_drained_total = (
                 getattr(self, "_pp_flip_drained_total", 0) + drained
             )
         return drained
+
+    def _pp_ran_mb_ids(self: Scheduler) -> set:
+        """Microbatch ids this rank has a slot for -- i.e. passes it can own.
+
+        A proxy stamped with one of these was launched before the arm and is
+        still owed; one stamped with anything else names a pass this rank never
+        ran. ``mbs`` is the per-slot resident set, so its indices are exactly
+        the ids this rank can legitimately pair with.
+        """
+        try:
+            mbs = getattr(self, "mbs", None) or ()
+            return {i for i, b in enumerate(mbs) if b is not None}
+        except Exception:  # noqa: BLE001 - an unreadable slot set proves nothing
+            return set()
 
     def pp_flip_service(self: Scheduler) -> None:
         """One turn of the armed service loop: consume, then flush.
@@ -1400,7 +1509,22 @@ class SchedulerPPMixin:
         # (stash 'output' in the inbox, where its consumer already looks) and
         # then decide about 'proxy' alone -- for which in-flight microbatches
         # launched before the arm raise the same question a second time.
-        # self.pp_flip_drain_tensor_dicts()  # corpse S
+        # #757: RE-ENABLED. Corpse S killed the KIND-BLIND drain, and the note
+        # above states the repair exactly -- "one that discards must
+        # demultiplex first (stash 'output' in the inbox, where its consumer
+        # already looks) and then decide about 'proxy' alone". That is now
+        # `classify_armed_drain_message`, and the in-flight-proxy question the
+        # note raised a second time is answered by the stamp: a proxy for a
+        # microbatch this rank DID run is stashed, not dropped.
+        #
+        # The guard at `_pp_recv_proxy_tensors` STAYS. It refused correctly on
+        # comp4 and it is the only thing standing between this race and silent
+        # cross-microbatch corruption; this drain is the prevention half that
+        # should keep it from ever firing.
+        try:
+            self.pp_flip_drain_tensor_dicts()
+        except Exception as exc:  # noqa: BLE001 - a drain may never kill a flip
+            logger.error("%s armed drain failed: %s", "#757", exc)
         try:
             self.pp_flip_flush_drained_sends()
         except Exception as exc:  # noqa: BLE001
