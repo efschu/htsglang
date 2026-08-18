@@ -52,6 +52,7 @@ from sglang.srt.model_executor.weights_arena import (
     allocate_arena,
     arena_refill,
     bind_arena_views,
+    host_image_mode,
     image_from_tensors,
     pack_into_arena,
     plan_arena_layout,
@@ -993,15 +994,20 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     bind_arena_views(layout_pp, arena, rebind=list(pp_named.items()))
     arena_refill(arena, layout_pp, image_pp)
 
+    # The mode qualifier keeps this line honest for the host ledger: a
+    # file-backed image (SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED) is reclaimable
+    # page cache, and calling it "pinned" here is exactly how a ledger learns
+    # to charge bytes that are not actually locked.
     logger.info(
         "%s TP stack built: vector %s, arena %.2f MiB (pp %.2f / tp %.2f), "
-        "images pinned %.2f MiB host",
+        "images %.2f MiB host (%s)",
         LOG_PREFIX,
         vec,
         arena.numel() / 1048576.0,
         layout_pp.total_bytes / 1048576.0,
         layout_tp.total_bytes / 1048576.0,
         (image_pp.numel() + image_tp.numel()) / 1048576.0,
+        host_image_mode(),
     )
     return PhaseFlipStacks(
         tp_worker=tp_worker,
