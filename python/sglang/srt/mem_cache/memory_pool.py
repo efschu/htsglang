@@ -1572,8 +1572,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        # #752: the hicache layer transfer counter is DELIBERATELY not
+        # consulted here. It instruments the one transfer that overlaps the
+        # forward -- the layer-by-layer full-attention KV load-back -- and
+        # the cache controller wires it to the full-attention pool alone
+        # (cache_controller.py unwraps HybridLinearKVPool to full_kv_pool
+        # for every layer-wise op). Mamba states move as WHOLE blobs through
+        # the mamba component's PoolTransfer and are complete before the
+        # batch launches, so there is no per-layer mamba progress the
+        # counter could report: a wait keyed by a mamba layer id is a
+        # category error (and on the local_slot form of this method it was
+        # the AttributeError that killed the first GDN forward under
+        # --enable-hierarchical-cache; see
+        # test_hicache_gdn_layer_counter_752.py). The KV pools' own
+        # get_key_buffer/get_kv_buffer waits are untouched.
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
