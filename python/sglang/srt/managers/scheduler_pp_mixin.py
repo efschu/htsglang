@@ -1862,11 +1862,15 @@ class SchedulerPPMixin:
                 raise ValueError(
                     "a gapped PP layer set cannot be combined with "
                     f"--pp-async-batch-depth {self.server_args.pp_async_batch_depth}. "
-                    "Layer execution under a gapped set is a strict ping-pong "
-                    "between stages -- exactly one rank computes at a time -- "
-                    "so there is no idle stage for a second micro-batch to "
-                    "fill, and two in flight would interleave their crossings "
-                    "on one ordered channel with no way to tell them apart."
+                    "Layer execution under a gapped set is a strict ping-pong: "
+                    "every stage must be inside the SAME forward at the same "
+                    "time, because each one's next layer is another's previous "
+                    "one. The ordinary ring is safe -- it still launches "
+                    "exactly one forward per iteration -- but async depth "
+                    "commits the output stage BEFORE that launch so a rank can "
+                    "enter the next forward while a peer is still in the last "
+                    "one's output exchange. Their crossings then share one "
+                    "ordered channel with nothing to tell the passes apart."
                 )
             if getattr(self.server_args, "enable_phase_flip", False):
                 raise ValueError(
@@ -1879,13 +1883,20 @@ class SchedulerPPMixin:
                     "a crossing at the first arm."
                 )
 
+        # NOT reduced under a gapped set, and boot v7pp5 is why. The loop
+        # launches exactly ONE slot's forward per iteration whatever this is,
+        # so the ping-pong is already serial and a smaller ring buys nothing.
+        # What it COSTS is the output ring's fill slack: the output stage works
+        # on slot ``next_mb_id``, and with one slot that is the batch just
+        # launched -- never None -- so the very first iteration blocks on a
+        # message the upstream has not produced. v7pp5 wedged there with PP0
+        # already into the next decode pass at layer 4 while PP1 and PP2 sat in
+        # the output receive: rank 0 had taken PP2's output and then sent
+        # nothing onward, because a non-last rank sends only ``if pp_outputs``
+        # and its own was still None. With the ordinary ring size the unfilled
+        # slot is None and that receive returns early, which is exactly how the
+        # contiguous path absorbs the same fill.
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
-        if self._pp_gapped_wire:
-            # ONE slot, for the reason the async-depth refusal above gives:
-            # the stages ping-pong through a single micro-batch, so the extra
-            # slots would never hold work and their crossings would be
-            # indistinguishable on the wire.
-            self.pp_loop_size = 1
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
