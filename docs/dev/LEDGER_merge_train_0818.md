@@ -300,3 +300,31 @@ with the IDENTICAL 2 pre-existing order-dependent failures — 0 new.
 `9e5647706f` itself is now SUPERSEDED by the fold (never merged raw).
 The executor gains the fold step; the pass-3 precondition list drops the
 review and keeps only feat/753.
+
+## feat/753 PREPARED: fix/753-on-harvest@8f2094f62b — hand-over to the router
+
+The pass-3 sole remaining precondition is now a branch, same discipline as
+the #757-liveness fold (scratch from the composite tip, owner's semantics
+preserved, composite untouched): all three #753 commits
+(`0882c7ae02`/`dd08f8fe63`/`082293f20b`) cherry-picked CLEAN onto
+`b7e6a4110b` — zero conflicts; the #754 seam had no competing resolution on
+the tip, exactly as this ledger adjudicated.
+
+The zero-new-fails gate EARNED ITS KEEP again: the picked gloo suite failed
+2 under the broad selection (tip baseline 75/0). Root, measured via an
+instrumented child: `test_prefill_graph_barlink.py` — a file that arrived
+from the wt-prefill-graph-qwen worktree — prepended that FOREIGN tree to
+sys.path at COLLECTION-time import, and every later multiprocess test's
+spawn children inherited it and resolved sglang from the wrong worktree
+(ModuleNotFoundError on modules that exist only here). Fixed at both ends:
+the foreign prepend removed (its own suite stays green against this tree),
+and the picked gloo test hardened with a module-top `__file__`-derived pin
+so its children are immune to any future collection-time prepend. After:
+distributed selection 105/0 vs the 75/0 baseline; byte-gates (wire OFF =
+NoCrossingWire = identity, both directions), the 31-crossing pin, the
+can-fail (a dropped crossing changes the answer), and the 3-process gloo
+progress test all green on the fold.
+
+Routing: F4-r5 merges `fix/753-on-harvest` (one branch). The executor's
+precondition list is then EMPTY; WINDOW_TICKET_735_STEP2's blocker row
+reads PREPARED(branch) in both copies.
