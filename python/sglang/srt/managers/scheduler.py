@@ -16,7 +16,6 @@
 import dataclasses
 import faulthandler
 import logging
-import math
 import os
 import re
 import signal
@@ -2160,12 +2159,21 @@ class Scheduler(
                 get_int_env_var(env_var, default_size) if env_var else None
             )
 
-        # --mamba-checkpoint-interval: chunked prefill steps must end on the
-        # checkpoint grid. A resumed prefix is on the grid (match is capped
-        # to grid checkpoints), so making every chunk a multiple of the
-        # interval keeps all chunk ends — and thus every cached mamba
-        # snapshot — on absolute interval positions, independent of the
-        # traffic-dependent token budget of each round.
+        # --mamba-checkpoint-interval: while the interval fits inside the
+        # chunk budget, chunked prefill steps are clipped to end on the
+        # checkpoint grid (a resumed prefix is on the grid, so aligning
+        # every chunk keeps all snapshot positions absolute). #750: a
+        # SPARSE grid (interval an exact multiple of the chunk budget,
+        # validated) is NOT folded in -- full chunk ends land on the grid
+        # every (interval // chunk)-th step by divisibility, the retention
+        # rule drops the ends between, and the chunk budget stays what the
+        # user set. One shared rule decides which case this boot is
+        # (mamba_ckpt_utils.checkpoint_truncation_align), so the
+        # validation's promise and this fold cannot drift apart.
+        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+            checkpoint_truncation_align,
+        )
+
         ckpt_interval = self.server_args.mamba_checkpoint_interval
         sources = []
         if self.truncation_align_size is not None:
@@ -2173,14 +2181,27 @@ class Scheduler(
                 f"--enable-deterministic-inference on the "
                 f"{self.server_args.attention_backend} backend"
             )
-        if ckpt_interval is not None:
+        self.truncation_align_size, _ckpt_folded = checkpoint_truncation_align(
+            self.truncation_align_size,
+            ckpt_interval,
+            self.server_args.chunked_prefill_size,
+        )
+        if _ckpt_folded:
+            # Part of the alignment -> part of the C30 sources list. A
+            # sparse interval is deliberately absent here: it contributes
+            # nothing to the alignment, and naming it would make a C30
+            # refusal blame a flag that did not cause it.
             sources.append(f"--mamba-checkpoint-interval={ckpt_interval}")
-            if self.truncation_align_size is None:
-                self.truncation_align_size = ckpt_interval
-            else:
-                self.truncation_align_size = math.lcm(
-                    self.truncation_align_size, ckpt_interval
-                )
+        elif ckpt_interval is not None:
+            logger.info(
+                "mamba checkpoint interval %d exceeds the chunk budget %s "
+                "(#750 sparse grid): every %d-th full chunk end lands on "
+                "the grid and is anchored; ends between are not cached. "
+                "The chunk budget and truncation alignment are unchanged.",
+                ckpt_interval,
+                self.server_args.chunked_prefill_size,
+                ckpt_interval // self.server_args.chunked_prefill_size,
+            )
 
         # C30: refuse a chunk budget that can never satisfy the alignment just
         # derived. Checked HERE because this is the only point where BOTH

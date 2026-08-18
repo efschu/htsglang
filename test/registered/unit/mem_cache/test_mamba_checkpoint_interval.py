@@ -799,10 +799,180 @@ class TestCheckpointIntervalValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             args._handle_mamba_checkpoint_interval(self._view(args))
 
-    def test_exceeding_chunked_prefill_size_rejected(self):
-        args = self._args(16384, chunked_prefill_size=8192)
-        with self.assertRaises(ValueError):
+    def test_a_divisible_interval_above_the_chunk_budget_is_accepted(self):
+        """#750, the user-confirmed lift: snapshot-every-8k only needs
+        ``interval % chunked_prefill_size == 0`` -- with 8192 = 16 x 512
+        every 16th chunk end lands exactly ON the grid, and the retention
+        rule (mamba_radix_cache.py: an off-grid finish is NOT cached at
+        all) cleanly drops the fifteen ends between. The old <= gate
+        refused exactly this configuration."""
+        args = self._args(8192, chunked_prefill_size=512)
+        args._handle_mamba_checkpoint_interval(self._view(args))  # must not raise
+        args2 = self._args(16384, chunked_prefill_size=8192)
+        args2._handle_mamba_checkpoint_interval(self._view(args2))
+
+    def test_a_non_divisible_interval_above_the_chunk_budget_refuses(self):
+        """The other direction: 8000 % 512 = 320, so NO chunk end ever
+        lands on the grid and no anchor could ever be written -- the flag
+        would be silently inert (the #742 class). Refused, naming the law."""
+        args = self._args(8000, chunked_prefill_size=512)
+        with self.assertRaises(ValueError) as ctx:
             args._handle_mamba_checkpoint_interval(self._view(args))
+        self.assertIn("multiple", str(ctx.exception))
+        self.assertIn("chunked-prefill-size", str(ctx.exception))
+
+    def test_an_interval_at_or_below_the_chunk_budget_keeps_the_old_arm(self):
+        """interval <= chunk folds into the truncation alignment exactly as
+        before #750 -- divisibility is not required there because the
+        scheduler clips every step END to the interval itself."""
+        args = self._args(2048, chunked_prefill_size=8192)
+        args._handle_mamba_checkpoint_interval(self._view(args))
+        args2 = self._args(2048, chunked_prefill_size=2048)
+        args2._handle_mamba_checkpoint_interval(self._view(args2))
+
+
+class TestSparseGridFalsifikator(unittest.TestCase):
+    """#750 FALSIFIKATOR: interval=8192 at chunk=512 writes an anchor at
+    EXACTLY the 16th chunk end and NONE between.
+
+    Driven through the real tracking arithmetic
+    (``mamba_checkpoint_track_target``) over 32 consecutive full prefill
+    steps, plus the retention rule that guards the cache side. Both
+    directions: the grid position must be reachable (a target that never
+    fires would make the whole lift a silently-inert flag), and no
+    off-grid end may produce one.
+    """
+
+    INTERVAL = 8192
+    PREFILL_CHUNK = 512
+
+    def test_anchor_exactly_at_the_16th_chunk_end_and_none_between(self):
+        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+            mamba_checkpoint_track_target,
+        )
+
+        targets = []
+        for step in range(32):
+            prefix = step * self.PREFILL_CHUNK
+            t = mamba_checkpoint_track_target(
+                prefix, self.PREFILL_CHUNK, self.INTERVAL, FLA_CHUNK_SIZE
+            )
+            if t is not None:
+                targets.append((step, t))
+        self.assertEqual(
+            targets,
+            [(15, 8192), (31, 16384)],
+            "expected an anchor target at exactly the 16th and 32nd chunk "
+            "ends and none between",
+        )
+
+    def test_every_target_is_the_step_end_itself(self):
+        """With a divisible interval > chunk, a grid boundary inside a step
+        can only be the step's END (the only 512-multiple in a 512-token
+        window), so the scheduler's last-position routing
+        (last_recurrent_state) serves every anchor and the mid-step
+        ``+1``/intermediate-h arm is never needed."""
+        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+            mamba_checkpoint_track_target,
+        )
+
+        for step in range(64):
+            prefix = step * self.PREFILL_CHUNK
+            end = prefix + self.PREFILL_CHUNK
+            t = mamba_checkpoint_track_target(
+                prefix, self.PREFILL_CHUNK, self.INTERVAL, FLA_CHUNK_SIZE
+            )
+            if t is not None:
+                self.assertEqual(t, end)
+
+    def test_off_grid_ends_are_refused_by_the_retention_rule(self):
+        """The cache half of the falsifier: all fifteen intermediate chunk
+        ends are off-grid and the retention rule drops them; only 8192
+        itself is a legal anchor position."""
+        for n in range(1, 16):
+            self.assertFalse(is_on_interval(n * self.PREFILL_CHUNK, self.INTERVAL))
+        self.assertTrue(is_on_interval(16 * self.PREFILL_CHUNK, self.INTERVAL))
+
+    def test_a_non_divisible_interval_collapses_the_end_anchor_cadence(self):
+        """WHY the validation refuses 8000@512. The END-donation path (the
+        live ``no_buffer`` strategy caches only at step ends) anchors a
+        chunk end only where ``n * 512`` is an 8000-multiple -- every
+        lcm(8000, 512) = 64,000 tokens, an 8x collapse below the requested
+        cadence. The user asked for anchors every ~8k; 8000@512 silently
+        delivers one per 64k while LOOKING configured. (The extra_buffer
+        tracking arm could still hit mid-step targets where the offset is
+        FLA-aligned, which is exactly why this is refused at validation
+        rather than left as a strategy-dependent surprise.)"""
+        import math
+
+        lcm = math.lcm(8000, self.PREFILL_CHUNK)
+        self.assertEqual(lcm, 64000)
+        on_grid_ends = [
+            n
+            for n in range(1, lcm // self.PREFILL_CHUNK + 1)
+            if is_on_interval(n * self.PREFILL_CHUNK, 8000)
+        ]
+        self.assertEqual(
+            on_grid_ends,
+            [lcm // self.PREFILL_CHUNK],
+            "chunk ends land on an 8000 grid only at the lcm -- one end "
+            "anchor per 64k tokens instead of per 8k",
+        )
+
+
+class TestCheckpointTruncationAlign(unittest.TestCase):
+    """#750 (2): the interval folds into the prefill truncation alignment
+    ONLY while interval <= chunk; a divisible sparse grid leaves the chunk
+    budget alone (512 stays 512) and the deterministic-inference alignment
+    untouched."""
+
+    def _fold(self, existing, interval, chunk):
+        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+            checkpoint_truncation_align,
+        )
+
+        return checkpoint_truncation_align(existing, interval, chunk)
+
+    def test_small_interval_folds_exactly_as_before(self):
+        align, folded = self._fold(None, 2048, 8192)
+        self.assertEqual((align, folded), (2048, True))
+
+    def test_sparse_interval_does_not_fold(self):
+        align, folded = self._fold(None, 8192, 512)
+        self.assertEqual((align, folded), (None, False))
+
+    def test_det_inference_lcm_still_applies_when_folded(self):
+        align, folded = self._fold(4096, 2048, 8192)
+        self.assertEqual((align, folded), (4096, True))  # lcm(4096, 2048)
+
+    def test_det_inference_align_survives_a_sparse_interval_untouched(self):
+        """Both sources present, interval > chunk: the deterministic-
+        inference alignment stays exactly what the backend set -- folding
+        an 8192 interval in would inflate it 16x and starve the chunk
+        budget (the C30 refusal the old coupling forced)."""
+        align, folded = self._fold(4096, 8192, 4096)
+        self.assertEqual((align, folded), (4096, False))
+
+    def test_no_interval_is_identity(self):
+        self.assertEqual(self._fold(4096, None, 512), (4096, False))
+        self.assertEqual(self._fold(None, None, 512), (None, False))
+
+    def test_chunked_prefill_off_keeps_the_old_fold(self):
+        """Without chunked prefill there is no chunk budget to preserve and
+        the pre-#750 behaviour (align to the interval) stands."""
+        align, folded = self._fold(None, 8192, None)
+        self.assertEqual((align, folded), (8192, True))
+
+    def test_the_scheduler_routes_through_the_helper(self):
+        """Source pin, the #747 discipline: the fold decision must live in
+        ONE place or the validation's promise and the scheduler's behaviour
+        drift apart."""
+        import inspect
+
+        from sglang.srt.managers import scheduler as sched_mod
+
+        src = inspect.getsource(sched_mod)
+        self.assertIn("checkpoint_truncation_align(", src)
 
 
 class TestDisableRadixJointFit(unittest.TestCase):

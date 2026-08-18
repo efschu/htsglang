@@ -249,18 +249,17 @@ def test_the_scheduler_refuses_at_boot_for_both_alignment_sources():
     # reject this working configuration.
     assert _run(enable_deterministic_inference=True, chunked_prefill_size=4096) == 4096
 
-    # SOURCE 2: the mamba checkpoint grid alone, no deterministic inference
-    # anywhere. The trap is armed here too, which is why the refusal cannot
-    # live behind a deterministic-inference condition.
-    try:
-        _run(mamba_checkpoint_interval=4096)
-        raise AssertionError(
-            "--mamba-checkpoint-interval=4096 with --chunked-prefill-size 256 "
-            "was accepted; it arms the identical wedge with no deterministic "
-            "inference involved"
-        )
-    except ValueError as e:
-        assert "mamba-checkpoint-interval" in str(e)
+    # SOURCE 2, REWRITTEN BY #750: the mamba checkpoint grid ALONE can no
+    # longer arm the wedge at all. A divisible interval above the chunk
+    # budget (4096 = 16 x 256) is a sparse grid that is NOT folded into the
+    # alignment -- every 16th full chunk end anchors, the ends between are
+    # not cached, and the truncation alignment stays untouched, so C30 has
+    # nothing to refuse. (An interval AT or BELOW the budget folds, but its
+    # fold equals the interval and therefore always fits the budget; a
+    # non-divisible sparse interval is refused earlier, at server_args
+    # validation, for collapsing the anchor cadence.) The trap now needs a
+    # SECOND alignment source -- which is exactly the lcm case below.
+    assert _run(mamba_checkpoint_interval=4096) is None
 
     # BOTH sources: the alignment is their lcm, and the guard sees the lcm
     # rather than either input. 4096 and 768 -> 12288, which a 4096-token
