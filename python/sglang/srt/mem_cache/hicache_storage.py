@@ -689,9 +689,32 @@ class HiCacheFile(HiCacheStorage):
                 # cost disk, and the free-space watchdog still sees them.
                 logger.warning("Could not sweep canonical partial files: %s", e)
 
+        # THE "ONLY RANK 0 CREATES IT" GUARD DOES NOT COVER PIPELINE PARALLELISM.
+        #
+        # Measured 2026-08-18 07:37Z: the ARM I harvest boot died before health with
+        #
+        #     FileExistsError: [Errno 17] File exists: '/tmp/hicache'
+        #
+        # on a pp_size=3, tp_size=1 deployment. The condition below elects a single
+        # creator by TP and attention-CP rank, which is exactly right when the fan-out
+        # is TP -- but with pure PP every stage has tp_rank == 0 and attn_cp_rank == 0,
+        # so all three ranks elect THEMSELVES, and the losers of the race raise. The
+        # directory found afterwards was empty and stamped with the boot's own minute:
+        # not a stale leftover, the boot's own first rank.
+        #
+        # exist_ok also closes the TOCTOU that was always here regardless of rank: the
+        # exists() check and the makedirs() are two steps, so even a correctly elected
+        # single creator races against anything else on the box using the same path.
+        # Creating a directory that already exists is precisely the no-op we want, so
+        # the election is not worth defending -- the idempotent call is.
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
-            os.makedirs(self.file_path)
+            os.makedirs(self.file_path, exist_ok=True)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+        elif not os.path.exists(self.file_path):
+            # A non-electing rank still needs the directory to exist before it writes
+            # into it; under PP the elected rank may simply be a different process
+            # that has not run yet.
+            os.makedirs(self.file_path, exist_ok=True)
 
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
