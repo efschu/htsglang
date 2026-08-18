@@ -227,6 +227,7 @@ def note_capture_end() -> None:
 def _resolve_identity(model_runner) -> Optional[dict]:
     """Card UUID, rig fingerprint and activation profile for the dump."""
     global _identity
+    # (see _global_rank below for why this is not tp_rank)
     if _identity is not None:
         return _identity or None
     try:
@@ -248,12 +249,36 @@ def _resolve_identity(model_runner) -> Optional[dict]:
             "card_uuid": registry_nvml.current_device_uuid(),
             "hw_fingerprint": live[0] if live else "",
             "profile_canonical": profile.canonical(),
-            "rank": int(getattr(model_runner, "tp_rank", 0) or 0),
+            "rank": _global_rank(model_runner),
         }
     except Exception as e:  # pragma: no cover - NVML/config availability
         logger.warning("phase footprint probe cannot identify this rank: %s", e)
         _identity = {}
     return _identity or None
+
+
+def _global_rank(model_runner) -> int:
+    """The rank that makes this dump's FILENAME unique.
+
+    NOT ``tp_rank``. Under pure pipeline parallelism -- pp_size 3, tp_size 1 --
+    every rank's tp_rank is 0, so all three wrote
+    ``phase_footprint_rank0.json`` over one another and the ingest saw a single
+    card. The dumps were never wrong, only two of the three were destroyed, and
+    the ledger then went on refusing the terms it had in fact measured: boot
+    v7pp5 left exactly one file behind for three cards.
+
+    The distributed rank is unique across the job by definition, which is the
+    property the filename needs. tp_rank is kept as the fallback for a run with
+    no process group, where it is 0 and correct because there is one process.
+    """
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:  # noqa: BLE001 - identity may never break the probe
+        pass
+    return int(getattr(model_runner, "tp_rank", 0) or 0)
 
 
 def record_prefill_peak(model_runner, num_tokens: int) -> None:

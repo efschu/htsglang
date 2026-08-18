@@ -2812,12 +2812,15 @@ class SchedulerPPMixin:
         # XPU: even ranks send first, odd ranks recv first.
         send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
-        def _do_send():
+        def _do_send(forward_now: Optional[PPProxyTensors] = None):
+            # ``forward_now`` is the gapped path's lag removal: forward what
+            # this rank received THIS iteration instead of last iteration's
+            # ``pp_outputs``. None keeps the shipped behaviour exactly.
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
                 last_rank_comm_queue,
-                pp_outputs,
+                pp_outputs if forward_now is None else forward_now,
             )
 
         def _do_recv():
@@ -2840,7 +2843,38 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if getattr(self, "_pp_gapped_wire", False):
+            # #753: THE RING'S ONE-ITERATION LAG IS WHAT DEADLOCKS LOCKSTEP.
+            #
+            # Outputs originate at the last rank and travel 2 -> 0 -> 1 -> 2.
+            # A middle rank forwards ``pp_outputs``, which is what it received
+            # LAST iteration -- so on the first pass rank 0 has nothing to
+            # forward and rank 1 blocks on a send that will not come until rank
+            # 0 has been round again. The contiguous path hides this because
+            # the proxy chain gates each stage's forward, so a downstream rank
+            # cannot reach its output receive before the upstream has been
+            # through its own. Take the chain away and the lag is exposed:
+            # boot v7pp6 wedged with PP0 already at layer 4 of the next decode
+            # pass while PP1 and PP2 sat in the output receive.
+            #
+            # Under a gapped set the stages are in lockstep by construction --
+            # the crossings ARE a rendezvous -- so there is no stagger to
+            # absorb a lag, and the fix is to remove the lag rather than to
+            # reintroduce a stagger that the layout cannot have. A middle rank
+            # receives FIRST and forwards what it just received, in the same
+            # iteration. The last rank still sends first: it is the source, it
+            # already holds this pass's outputs, and its send is what starts
+            # the chain.
+            #
+            # 2 sends -> 0 receives -> 0 forwards -> 1 receives -> 1 forwards
+            # -> 2 receives. One pass, no debt carried across iterations.
+            if self.pp_group.is_last_rank:
+                send_output_work = _do_send()
+                _do_recv()
+            else:
+                _do_recv()
+                send_output_work = _do_send(forward_now=next_pp_outputs)
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
