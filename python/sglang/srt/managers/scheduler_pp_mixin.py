@@ -1040,6 +1040,24 @@ class SchedulerPPMixin:
             return
         self._pp_flip_armed_passes = None
         arm_mb = getattr(self, "_pp_flip_arm_mb_id", None)
+
+        # #757: THE FALLING EDGE IS THE ONLY PLACE EVERY DISARM PASSES THROUGH.
+        # Disarm has three routes and two of them are purely rank-local --
+        # `_abandon_no_quorum` (phase_flip_runtime.py:3885) and
+        # `_abandon_unjoined_flip` (:3949) both clear `_pending` with no
+        # collective and no channel re-check, then hand control straight back
+        # to the ordinary loop. `pp_flip_channels_empty` is consulted only
+        # BEFORE this rank's own entry (:3682, :3748), never on the way out.
+        # So an upstream can abandon on its own clock, resume launching, and
+        # post a proxy into a downstream that is still armed -- and the
+        # emptiness proof that was supposed to prevent it is a SAMPLE taken
+        # earlier, not a barrier. Draining here catches the in-flight
+        # leftover on the way back to the pass loop, on every route out.
+        try:
+            self.pp_flip_drain_leftover_dicts(mb_id)
+        except Exception as exc:  # noqa: BLE001 - a drain may never break the loop
+            logger.error("%s #757 leftover drain failed: %s", "PHASE-FLIP", exc)
+
         if counters is None:
             return
         try:
@@ -1359,6 +1377,97 @@ class SchedulerPPMixin:
                 getattr(self, "_pp_flip_drained_total", 0) + drained
             )
         return drained
+
+    def pp_flip_drain_leftover_dicts(self: Scheduler, live_mb_id: int) -> int:
+        """#757: clear pre-arm leftovers at DISARM, without eating an output.
+
+        THIS IS CORPSE S DONE CORRECTLY, and the difference is not courage --
+        it is that two things exist now which did not on 2026-08-09.
+
+        WHAT WENT WRONG BEFORE. ``pp_flip_drain_tensor_dicts`` above is
+        kind-blind: it logs ``kind=`` and ``stamp=`` and then discards
+        whatever it took. The upstream wire MULTIPLEXES the proxy forward
+        and the output return, so it ate an OUTPUT (PP1, 07:33:30Z) that
+        belonged to work launched BEFORE the arm and was still owed; PP1
+        then blocked for ever waiting for what it had itself destroyed.
+        Its own comment names the repair: a drain that discards "must
+        demultiplex first (stash 'output' in the inbox, where its consumer
+        already looks) and then decide about 'proxy' alone".
+
+        WHAT MAKES THAT REPAIR EXPRESSIBLE NOW.
+          1. ``_pp_tensor_dict_inbox`` (a defaultdict(deque)) and the
+             demultiplexing ``_pp_recv_typed_dict``, which POPS from that
+             inbox before touching the wire. So a message stashed here is
+             not discarded -- it is delivered to its real consumer later.
+          2. ``__stamp__`` on every proxy. Corpse S had no way to tell a
+             void proxy from an owed one; the stamp names the pass, so
+             "belongs to a pass this rank is not on" is now a FACT rather
+             than the assumption that sank the first attempt.
+
+        WHY THIS IS THE #757 FIX. Measured on 2026-08-18 (comp4, crash at
+        06:36:29, specimen SPECIMEN-2026-08-18T0636Z-comp4-proxy-leftover-
+        underload.log): all six PASS-CLOCK verdicts read AGREED with group
+        RESUME SLOTS [1,1,1], so the ranks did NOT diverge and #631 defect Q
+        did not happen. The proxy that killed it was stamped mb_id=2 and
+        arrived one second after a CLEAN tp_to_pp commit -- an in-flight
+        message from before the arm, exactly the case the corpse-S comment
+        flagged as unresolved ("in-flight microbatches launched before the
+        arm raise the same question a second time"). Nothing drained it,
+        because the only drain was switched off.
+
+        NOTHING IS DISCARDED EXCEPT A PROVABLY VOID PROXY: wrong-kind
+        messages are stashed for their own consumer, and a proxy whose
+        stamp matches the pass this rank is about to run is stashed too --
+        it is owed, not leftover. The #631 receive guard is untouched and
+        stays the backstop; if this drain is ever wrong, the guard still
+        refuses rather than mispairs.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return 0
+        discarded = 0
+        # Bounded for the same reason the corpse is: a counter that runs
+        # away must not pin the rank here.
+        for _ in range(64):
+            posted = counters.sent(CHAN_DICT, self._pp_flip_upstream())
+            if counters.local_consumed(CHAN_DICT) >= posted:
+                break
+            raw = self.pp_group.recv_tensor_dict(
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                )
+            )
+            self._pp_flip_bump_consumed(CHAN_DICT)
+            kind = raw.get("__msg_type__", "default") if isinstance(raw, dict) else None
+            if kind != "proxy":
+                # THE CORPSE-S LESSON, ENCODED. An output belongs to work
+                # launched before the arm and is still owed to a real
+                # consumer; stash it where `_pp_recv_typed_dict` already
+                # looks instead of destroying it.
+                self._pp_tensor_dict_inbox[kind if kind is not None else "default"].append(raw)
+                continue
+            stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
+            if stamp is None or live_mb_id < 0 or int(stamp[0]) == int(live_mb_id):
+                # Owed, not leftover: this is the pass the rank is about to
+                # run. Stash so the ordinary receive returns it.
+                self._pp_tensor_dict_inbox["proxy"].append(raw)
+                continue
+            discarded += 1
+            logger.info(
+                "%s #757 drained a LEFTOVER proxy at disarm: stamp=%s while this "
+                "rank resumes on mb_id=%s. It names a pass launched before the arm "
+                "that this rank never ran, so no batch can ever pair with it. "
+                "(%d this window)",
+                "PHASE-FLIP",
+                stamp,
+                live_mb_id,
+                discarded,
+            )
+        if discarded:
+            self._pp_flip_leftovers_dropped = (
+                getattr(self, "_pp_flip_leftovers_dropped", 0) + discarded
+            )
+        return discarded
 
     def pp_flip_service(self: Scheduler) -> None:
         """One turn of the armed service loop: consume, then flush.
