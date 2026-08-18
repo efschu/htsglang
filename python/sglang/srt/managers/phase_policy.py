@@ -104,6 +104,7 @@ by reading one function.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -567,6 +568,90 @@ DEFAULT_MIN_DWELL_S = 10.0
 # it), while any real inter-request gap does. Nothing waits on this flip,
 # so its cost is not in anyone's latency path.
 DEFAULT_IDLE_DWELL_S = 3.0
+
+
+class FlipCostEstimator:
+    """#677: the flip cost, MEASURED, not believed.
+
+    ``DEFAULT_FLIP_COST_S = 3.2`` was derived from 997/1246/1720 ms in the
+    PINNED-image era. The file-backed arm measures 22-24 s per leg (5 flips x 3
+    ranks, ``NOTE_690_refill_commit_split.md``), and the live boot's own policy
+    line still reads ``break-even 3.2s ... N=7004`` against a true break-even of
+    ~49,250 tokens. Flips were priced **7.03x too cheaply**, which also makes
+    #759's IDLE-LOCK floor -- itself ``flip_tokens`` -- 7x too permissive.
+
+    A constant cannot survive a regime change it does not know about, so the
+    cost is estimated from the seam's own marks instead. Four properties, each
+    pinned by ``test_flip_cost_calibration_677.py``:
+
+    * **a measurement beats the seed OUTRIGHT.** The first observation replaces
+      the config value rather than being averaged with it. Blending evidence
+      with a belief is exactly how a 3.2 s constant would survive several 22 s
+      flips.
+    * **EMA thereafter**, so a regime change (pinned <-> file-backed) is tracked
+      in both directions rather than latched.
+    * **BOUNDED per sample.** One pathological reading is clamped into a band
+      around the current estimate. An unbounded estimator would let a single
+      600 s outlier price the break-even so high that flipping stops -- which is
+      not a conservative failure, it is a different one.
+    * **inert until it measures.** With no observation, ``value()`` is the seed,
+      so an un-instrumented path is byte-identical to before.
+
+    Non-finite and negative samples are REJECTED rather than clamped: they are
+    not implausible readings, they are not readings.
+    """
+
+    #: Deliberately brisk. The regime change this exists for is a step, not
+    #: drift, and a slow filter would spend a dozen mispriced flips converging.
+    ALPHA = 0.3
+    #: Per-sample clamp, as a multiple of the current estimate, both ways.
+    OUTLIER_BAND = 3.0
+
+    def __init__(self, seed_s: float, alpha: float = ALPHA):
+        self.seed_s = float(seed_s)
+        self.alpha = float(alpha)
+        self._ema: Optional[float] = None
+        self.samples = 0
+
+    @property
+    def calibrated(self) -> bool:
+        return self._ema is not None
+
+    def value(self) -> float:
+        return self.seed_s if self._ema is None else self._ema
+
+    def observe(self, seconds) -> None:
+        try:
+            x = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(x) or x < 0.0:
+            return
+        if self._ema is None:
+            # First measurement REPLACES the seed. See the class docstring.
+            self._ema = x
+            self.samples = 1
+            return
+        lo = self._ema / self.OUTLIER_BAND
+        hi = self._ema * self.OUTLIER_BAND
+        x = min(max(x, lo), hi)
+        self._ema += self.alpha * (x - self._ema)
+        self.samples += 1
+
+
+#: Process-wide, because the seam that measures a flip and the policy that
+#: prices the next one are different modules on the same rank.
+_FLIP_COST_ESTIMATOR: Optional[FlipCostEstimator] = None
+
+
+def observe_flip_cost(seconds) -> None:
+    """Feed one measured flip-leg duration to the estimator (#677)."""
+    if _FLIP_COST_ESTIMATOR is not None:
+        _FLIP_COST_ESTIMATOR.observe(seconds)
+
+
+def flip_cost_estimator() -> Optional[FlipCostEstimator]:
+    return _FLIP_COST_ESTIMATOR
 
 
 class PhasePolicyError(ValueError):
@@ -2308,7 +2393,15 @@ def config_from_env(
     # [7004, 19430, 21589, 22669, 23316]: rung 0 did not move at all, because
     # the seam knob never reached it. A solved number silently replaced by a
     # constant is exactly the provenance defect this policy exists to avoid.
-    seam_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
+    # #677: SEED, then measure. The env/constant is what the policy uses until
+    # the seam reports a real flip; from the first measurement on, the estimate
+    # wins. The live harvest boot priced 22-24 s flips at 3.2 s and derived
+    # N=7004 against a true break-even of ~49,250 -- 7.03x too cheap.
+    global _FLIP_COST_ESTIMATOR
+    _seed_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
+    if _FLIP_COST_ESTIMATOR is None or _FLIP_COST_ESTIMATOR.seed_s != _seed_s:
+        _FLIP_COST_ESTIMATOR = FlipCostEstimator(seed_s=_seed_s)
+    seam_s = _FLIP_COST_ESTIMATOR.value()
     tp_tok_s = _env_float(ENV_TP_TOK_S, DEFAULT_TP_PREFILL_TOK_S)
     pp_tok_s = _env_float(ENV_PP_TOK_S, DEFAULT_PP_PREFILL_TOK_S)
 
