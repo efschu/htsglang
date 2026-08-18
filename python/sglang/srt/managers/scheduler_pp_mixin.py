@@ -411,6 +411,37 @@ class SchedulerPPMixin:
                     # pipeline on the slot it left it on.
                     if self._pp_flip_hold_slot():
                         continue
+
+                # #753: THE LOCKSTEP THE GAPPED LAYOUT REQUIRES, MADE EXPLICIT.
+                #
+                # A gapped forward is not a pipeline. Every stage owns layers
+                # INSIDE every other stage's span, so a pass can only be
+                # computed with all three ranks inside it at once, handing the
+                # activation back and forth. The crossings enforce that WITHIN
+                # a pass -- each one is a rendezvous -- but nothing enforced it
+                # ACROSS passes, and the stages do not finish together: PP1's
+                # last owned layer is 31 and PP0's is 62, so both leave the
+                # forward well before PP2 computes 63. Whoever leaves first
+                # reaches the next pass first.
+                #
+                # Four boots died of that drift, each one stage further along:
+                # v7pp5/v7pp6 with PP0 already at layer 4 of the next pass
+                # while the others sat in the output receive, v7pp9 with all
+                # three flushing sends nobody had posted a receive for, and
+                # v7pp10 with PP0 a whole pass ahead, blocked in a crossing
+                # SEND to peers that were still in the previous pass's output
+                # exchange. Each fix removed one way to drift; none removed
+                # drift itself, because the loop simply has no statement that
+                # the passes are collective.
+                #
+                # This is that statement. One barrier per iteration, on the
+                # path that already cannot overlap passes, so it costs a
+                # rendezvous the layout was paying for anyway -- and it makes
+                # the boundary a place where a peer cannot be a pass behind.
+                if self._pp_gapped_wire:
+                    with torch.profiler.record_function("pp_gapped_lockstep"):
+                        self.pp_group.barrier()
+
                 mb_id += 1
 
             # When the server is idle, self-check and re-init some states
