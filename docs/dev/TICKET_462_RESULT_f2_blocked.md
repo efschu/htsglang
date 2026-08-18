@@ -175,3 +175,24 @@ from `a_base`'s own floor; it is retained as the formally-defensible bound, but
 the better-supported estimate is a small real cost. Either way the conclusion
 for the R1 gate is unchanged: the cost side is small enough that any positive
 return from a working draft arm clears it.
+
+---
+
+## 4. #535 UNBLOCK VERDICT (2026-08-18): F2 is a pure window ticket
+
+The §2 blocker branch is BUILT and contained in the comp4 lineage
+(`921d63defc`, ancestry verified): `d64cf27147` adds the
+`LogitsProcessorOutput` branch exactly as the desk pass above specified —
+the five-field allowlist (`_LPO_TOKEN_DIM_FIELDS`), by-name refusal of the
+host-side parts, refusal on leading-dimension disagreement — plus the
+second row-budget defect (batch-sized buffer under token-indexed output).
+`test_bcg_logits_output_buffer_462.py`: 18 passed here.
+
+F2 re-run needs NO code. Window form: the §1 eager control recipe
+(`--disable-cuda-graph`, the corrected control) against the breakable arm;
+acceptances: capture completes past `_alloc_full_buffer` (the §2 traceback
+absent), the #494 break-cost clock emits per-crossing numbers
+(`breakable_cuda_graph` census), determined-answer identity vs the eager
+control (the byte-identity falsifier the desk pass demanded), ms/round
+within the window's own A-vs-A floor discipline. The `43 crossings/round`
+desk figure gets its first hardware verdict.

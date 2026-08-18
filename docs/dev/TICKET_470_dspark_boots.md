@@ -206,3 +206,41 @@ Nothing below has run on a card. All of it is desk-written.
 6. Whether ~11 GiB is the right ask at all. It is arithmetic
    (`ANALYSE_463` §4.4), not a measurement; the "~4 GiB short" figure it
    replaces was itself never persisted anywhere.
+
+---
+
+## 6 — #535 UNBLOCK VERDICT (2026-08-18): Boot B is a pure window ticket
+
+Prior-art gate result: both blockers this ticket's first boot hit are BUILT
+and contained in the comp4 lineage (`921d63defc`), verified by ancestry and
+by running their falsifiers here:
+
+* **Draft-args -> runtime context**: `14a0fe35b8` publishes the draft
+  ServerArgs copy into the process-wide context for the build window
+  (`draft_worker_common.py`, the `#470 Boot B: PUBLISH` block), on top of
+  the solo per-rank-vector neutralisation. The first boot's refusal
+  ("resident-fraction vector has 3 entries ... but tensor parallelism
+  is 1") is the pinned specimen.
+  `test_draft_args_context_publication.py`: 8 passed here.
+* **Marlin runner flag reach** (`draft_worker_common.py:75-79`) and the
+  solo refusal on `is_dspark()` were already in place per §3.
+
+Boot B therefore needs NO code: the §3 flags plus the §3.1 checks 1-4 ARE
+the window ticket. Log-greppable acceptances, runner-compatible
+(WINDOW_LADDER_0818 separate-windows table):
+
+| check | grep | pass |
+| --- | --- | --- |
+| solo placement took | `Draft-solo placement: rank .* HOSTS` | 1 host + 2 shadows |
+| markov_w2 opt disabled | §3.1 check 2 line | present |
+| marlin reached the draft | `Preparing MXFP4 experts for Marlin backend` | present for draft layers |
+| no collective hang | short greedy generation completes | completes (py-spy before any kill) |
+
+**Boot C hazard, named ahead of the window:** the publish block does NOT
+cover EAGLE-family workers (they hand the target's ServerArgs straight to
+TpModelWorker — `draft_worker_common.py` states this and names the three
+call sites). Boot C runs EAGLE3 under the same solo placement; if its
+draft build validates the target's per-rank vectors in a weight-TP=1
+context, it will refuse with the SAME resident-fraction signature. That
+refusal is the KNOWN GAP, not a new defect: log it, skip the arm, and the
+EAGLE publish extension becomes its own ticket with its own boot evidence.
