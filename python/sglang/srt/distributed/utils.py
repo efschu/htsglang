@@ -1704,6 +1704,16 @@ def get_pp_layer_set(
     raw = os.getenv(PP_LAYER_SET_ENV, None)
     if raw is None or not raw.strip():
         return None
+    # #754, folded into #753 because it is the SAME resolution seam. The env is
+    # process-wide, but this function is called again by the TP stack during a
+    # phase flip -- with pp_size=1, where a 3-stage string is not merely
+    # inapplicable but invalid, and parse_pp_layer_sets refused it by stage
+    # count ("3 stage(s) given but pp_size is 1"). A single stage owns every
+    # layer, so the set form has nothing to express: answering None hands the
+    # caller back to get_pp_indices, which is the correct contiguous answer
+    # rather than a suppressed error.
+    if pp_size <= 1:
+        return None
     # #753: a gapped set is admissible only when the crossing wire is on.
     # The refusal lives in parse_pp_layer_sets and names why.
     return parse_pp_layer_sets(

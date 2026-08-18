@@ -94,3 +94,49 @@ class TestGappedSetsAreRefused(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPpSizeOneIsNotAnError754(CustomTestCase):
+    """#754, folded into #753: it is the same resolution seam.
+
+    ``SGLANG_PP_LAYER_SET`` is process-wide, but ``get_pp_layer_set`` is called
+    again by the TP stack during a phase flip -- with ``pp_size=1``. A 3-stage
+    string is then not merely inapplicable but INVALID, and the parser refused
+    it by stage count ("3 stage(s) given but pp_size is 1"), taking down a flip
+    that had nothing to do with layer sets.
+
+    A single stage owns every layer, so the set form has nothing to express.
+    ``None`` hands the caller back to ``get_pp_indices`` -- the correct
+    contiguous answer, not a suppressed error.
+    """
+
+    RAW = "0-30;31-47;48-63"
+
+    def _get(self, pp_rank, pp_size):
+        import os
+        from unittest.mock import patch
+
+        from sglang.srt.distributed.utils import get_pp_layer_set
+
+        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": self.RAW}):
+            return get_pp_layer_set(N, pp_rank, pp_size)
+
+    def test_pp_size_one_answers_none_instead_of_raising(self):
+        self.assertIsNone(self._get(0, 1))
+
+    def test_the_real_pp_size_still_resolves(self):
+        """CAN-FAIL GUARD: the pp_size=1 exit must not swallow the real path."""
+        owned = self._get(1, 3)
+        self.assertIsNotNone(owned)
+        self.assertEqual(sorted(owned)[0], 31)
+
+    def test_a_genuinely_wrong_stage_count_is_still_refused(self):
+        """The exit is for pp_size=1 only, not a blanket amnesty."""
+        import os
+        from unittest.mock import patch
+
+        from sglang.srt.distributed.utils import get_pp_layer_set
+
+        with patch.dict(os.environ, {"SGLANG_PP_LAYER_SET": self.RAW}):
+            with self.assertRaises(PPLayerSetError):
+                get_pp_layer_set(N, 0, 2)
