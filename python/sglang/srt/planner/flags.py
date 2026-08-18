@@ -1426,19 +1426,37 @@ def _c_rank_tp_ratio_placement(values: dict, model_cfg) -> Optional[Tuple[str, s
     return None
 
 
+#: Host layouts a hybrid/mamba model can actually run.
+#:
+#: This list USED to be page_first_direct alone, on the grounds that
+#: "MambaPoolHost rejects every other layout". That was true of the pool's old
+#: constructor guard and is no longer true of anything: MambaPoolHost accepts
+#: layer_first, and every one of its methods already carried a layer-first
+#: branch. Keeping the old rule would have made the planner -- the config
+#: authority in this repo -- steer hybrid models onto page_first_direct, the one
+#: route whose host write-back segfaults on CUDA (#760), and refuse the layout
+#: the server itself falls back to. A constraint that contradicts the runtime is
+#: worse than no constraint, because it is believed.
+#:
+#: page_first stays out: it is the value that arms the write-back staging
+#: kernel MambaPoolHost cannot drive. page_head stays out on #441a's evidence.
+_HYBRID_HICACHE_LAYOUTS = ("layer_first", "page_first_direct")
+
+
 def _c_hicache_hybrid_layout(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
-    # MambaPoolHost (hybrid/mamba models) only supports page_first_direct.
     if not values.get("enable_hierarchical_cache"):
         return None
     if not model_is_hybrid(model_cfg):
         return None
-    if values.get("hicache_mem_layout") == "page_first_direct":
+    if values.get("hicache_mem_layout") in _HYBRID_HICACHE_LAYOUTS:
         return None
     return (
         "hicache_mem_layout",
         "the hierarchical cache on a hybrid/mamba model requires "
-        "--hicache-mem-layout page_first_direct: MambaPoolHost rejects every "
-        f"other layout (got {values.get('hicache_mem_layout')!r}).",
+        f"--hicache-mem-layout one of {list(_HYBRID_HICACHE_LAYOUTS)}: "
+        "MambaPoolHost cannot drive the write-back staging kernel that "
+        "page_first arms, and page_head takes the lf_ph route #441a refuses "
+        f"(got {values.get('hicache_mem_layout')!r}).",
     )
 
 
@@ -2642,15 +2660,30 @@ def profiles(
         s = _base_settings()
         s.update(base_clean)
         s.update(overrides)
-        # hicache on a hybrid/mamba model: MambaPoolHost accepts ONLY the
-        # page_first_direct host layout -- force it (verified rule).
+        # hicache on a hybrid/mamba model: only some host layouts are drivable.
+        # The forced value is layer_first, NOT page_first_direct as it was:
+        # page_first_direct's host write-back reaches
+        # transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which
+        # segfaulted on three separate boots (#760), and ServerArgs now falls
+        # back away from it on CUDA. A profile emitting the layout the server
+        # then rewrites is a profile nobody can validate against the boot.
         if s.get("enable_hierarchical_cache") and hybrid:
-            if s.get("hicache_mem_layout") != "page_first_direct":
-                s["hicache_mem_layout"] = "page_first_direct"
+            if s.get("hicache_mem_layout") not in _HYBRID_HICACHE_LAYOUTS:
+                s["hicache_mem_layout"] = "layer_first"
                 info.append(
                     "hicache on a hybrid/mamba model: forced "
-                    "--hicache-mem-layout page_first_direct (MambaPoolHost "
-                    "rejects every other layout)."
+                    "--hicache-mem-layout layer_first (page_first arms the "
+                    "staging kernel MambaPoolHost cannot drive; page_head "
+                    "takes the route #441a refuses)."
+                )
+            elif s.get("hicache_mem_layout") == "page_first_direct":
+                s["hicache_mem_layout"] = "layer_first"
+                info.append(
+                    "hicache on a hybrid/mamba model: moved "
+                    "--hicache-mem-layout page_first_direct -> layer_first; "
+                    "its host write-back segfaults on CUDA (#760) and the "
+                    "server gates it anyway, so the profile now states what "
+                    "the boot will actually run."
                 )
         # compressed-tensors checkpoints boot with the explicit
         # --quantization compressed-tensors (the validated matrix flag);

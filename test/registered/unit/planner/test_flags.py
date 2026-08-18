@@ -148,7 +148,7 @@ _REF_ARGV = [
     "--enable-hierarchical-cache",
     "--hicache-size", "20",
     "--hicache-storage-backend", "file",
-    "--hicache-mem-layout", "page_first_direct",
+    "--hicache-mem-layout", "layer_first",
 ]
 
 
@@ -788,20 +788,30 @@ class TestCrossConstraints(CustomTestCase):
             )
             self.assertIsNone(res["rank_gpu_id"]["error"], sentinel)
 
-    def test_hicache_hybrid_needs_page_first_direct(self):
+    def test_hicache_hybrid_layout_is_restricted_but_not_to_one_value(self):
+        """page_first is still refused; layer_first is NOT (#760).
+
+        This test used to assert that page_first_direct was the ONLY drivable
+        layout. MambaPoolHost's constructor guard has since been relaxed --
+        every one of its methods already had a layer-first branch -- and
+        page_first_direct is the route whose host write-back segfaults on CUDA,
+        so pinning the planner to it steered configs onto the broken kernel.
+        """
         hybrid_cfg = dict(_REF_CFG)
         res = flags.resolve(
             {"enable_hierarchical_cache": True,
              "hicache_mem_layout": "page_first"},
             hybrid_cfg,
         )
-        self.assertIn("page_first_direct", res["hicache_mem_layout"]["error"])
-        res = flags.resolve(
-            {"enable_hierarchical_cache": True,
-             "hicache_mem_layout": "page_first_direct"},
-            hybrid_cfg,
-        )
-        self.assertIsNone(res["hicache_mem_layout"]["error"])
+        self.assertIn("layer_first", res["hicache_mem_layout"]["error"])
+        for layout in ("page_first_direct", "layer_first"):
+            with self.subTest(layout=layout):
+                res = flags.resolve(
+                    {"enable_hierarchical_cache": True,
+                     "hicache_mem_layout": layout},
+                    hybrid_cfg,
+                )
+                self.assertIsNone(res["hicache_mem_layout"]["error"])
         # non-hybrid models keep the free layout choice.
         res = flags.resolve(
             {"enable_hierarchical_cache": True,
@@ -1248,7 +1258,12 @@ class TestParseThroughServerArgs(CustomTestCase):
         self.assertTrue(ns.enable_hierarchical_cache)
         self.assertEqual(ns.hicache_size, 20)
         self.assertEqual(ns.hicache_storage_backend, "file")
-        self.assertEqual(ns.hicache_mem_layout, "page_first_direct")
+        # layer_first, not page_first_direct: the reference profile is a
+        # hybrid/mamba checkpoint with hicache, and #760 moved that rule off the
+        # layout whose host write-back segfaults on CUDA. The profile must state
+        # what the boot will actually run -- ServerArgs gates page_first_direct
+        # away, so a profile emitting it could never be validated against a log.
+        self.assertEqual(ns.hicache_mem_layout, "layer_first")
         self.assertEqual(ns.host, "0.0.0.0")
         self.assertEqual(ns.port, 30000)
         # the reference passes NO dcp size and NO mem fraction.
