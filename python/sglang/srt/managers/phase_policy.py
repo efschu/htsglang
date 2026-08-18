@@ -265,7 +265,6 @@ def layout_hold_verdict(
     return False, f"unknown phase {phase!r}: no decision"
 
 
-
 PP_TO_TP = "pp_to_tp"
 #: Reason prefix of the #688 deadlock escape. A CONSTANT, because #689's
 #: formation gate must recognise that decision and refuse to hold it, and a
@@ -606,12 +605,45 @@ class FlipCostEstimator:
     ALPHA = 0.3
     #: Per-sample clamp, as a multiple of the current estimate, both ways.
     OUTLIER_BAND = 3.0
+    #: Absolute floor under the estimate, so the BAND can never collapse.
+    #:
+    #: The band is multiplicative, so an estimate near zero has a near-zero
+    #: band and every later reading is clamped back into it. Measured on the
+    #: pre-fix code: a first sample of 1e-6 s -- a no-op refill leg -- priced
+    #: break-even at ZERO tokens (every pending prefill funds a flip, #748's
+    #: churn signature from the other end) and needed 40 samples to recover,
+    #: which at 22.5 s a leg is a quarter of an hour.
+    #:
+    #: 50 ms is 20x below the fastest per-rank leg this rig has ever measured
+    #: (997 ms, the pinned era quoted in this docstring), so it cannot bind on
+    #: a genuine reading. A floor that could would be a second wrong constant,
+    #: not a guard -- pinned by
+    #: test_flip_cost_clamp_directions_677.test_the_floor_is_far_below_any_real_measurement.
+    MIN_ESTIMATE_S = 0.05
+    #: Consecutive out-of-band samples ON THE SAME SIDE that make a regime.
+    #:
+    #: THE CLAMP BOUNDS AN OUTLIER, NOT A REGIME, and conflating the two is
+    #: what made this estimator slow. Its stated purpose is that "one
+    #: pathological reading" must not price flipping out -- ONE. Rate-limiting
+    #: a SUSTAINED change is the EMA's job, and doing it a second time in the
+    #: clamp cost eight samples on a step the seam had already reported twice
+    #: (measured: 3.1 -> 22.5 took 8 samples, 2.4 -> 22.5 took 8, 22.5 -> 3.1
+    #: took 13). A second consecutive reading on the same side is no longer a
+    #: pathology, it is the new cost, and it is taken on the same rule the
+    #: first sample is: evidence beats the current belief outright.
+    #:
+    #: The counter RESETS on any in-band sample, so two outliers an hour apart
+    #: never read as a regime.
+    REGIME_CONFIRM_SAMPLES = 2
 
     def __init__(self, seed_s: float, alpha: float = ALPHA):
         self.seed_s = float(seed_s)
         self.alpha = float(alpha)
         self._ema: Optional[float] = None
         self.samples = 0
+        #: Length and sign of the current run of out-of-band samples.
+        self._out_of_band = 0
+        self._out_of_band_dir = 0
 
     @property
     def calibrated(self) -> bool:
@@ -625,17 +657,56 @@ class FlipCostEstimator:
             x = float(seconds)
         except (TypeError, ValueError):
             return
-        if not math.isfinite(x) or x < 0.0:
+        # A ZERO-SECOND LEG IS NOT A FAST FLIP, IT IS A BROKEN TIMER, and the
+        # module's own rule for a non-reading is to ignore it rather than
+        # clamp it. The leg brackets a multi-GiB arena refill
+        # (phase_flip_boot, arena_refill), so zero is only reachable when the
+        # copy was skipped or short-circuited -- which says nothing about what
+        # a flip costs. Measured on the pre-fix code: `observe(0.0)` as the
+        # FIRST sample set the estimate to 0.0, collapsed the band to [0, 0],
+        # and LATCHED there -- 50 subsequent 22.5 s flips moved it not at all
+        # -- after which `break_even_tokens` raises "flip cost must be
+        # positive" from inside config construction. The mid-stream zero was
+        # already guarded by the clamp; only the first one was not, because
+        # sample one takes the "measurement beats the seed outright" path
+        # before any clamp exists.
+        if not math.isfinite(x) or x <= 0.0:
             return
         if self._ema is None:
             # First measurement REPLACES the seed. See the class docstring.
-            self._ema = x
+            self._ema = max(x, self.MIN_ESTIMATE_S)
             self.samples = 1
             return
         lo = self._ema / self.OUTLIER_BAND
         hi = self._ema * self.OUTLIER_BAND
-        x = min(max(x, lo), hi)
-        self._ema += self.alpha * (x - self._ema)
+        if x > hi:
+            direction = 1
+        elif x < lo:
+            direction = -1
+        else:
+            direction = 0
+        if direction == 0:
+            # In band: whatever run was building is over. Resetting HERE is
+            # what keeps two outliers an hour apart from reading as a regime.
+            self._out_of_band = 0
+            self._out_of_band_dir = 0
+        else:
+            if direction == self._out_of_band_dir:
+                self._out_of_band += 1
+            else:
+                self._out_of_band_dir = direction
+                self._out_of_band = 1
+            if self._out_of_band >= self.REGIME_CONFIRM_SAMPLES:
+                # CONFIRMED. The seam has now reported the same new cost twice
+                # running; it is the regime, not a pathology, and it is taken
+                # outright for the same reason the first sample is.
+                self._ema = max(x, self.MIN_ESTIMATE_S)
+                self.samples += 1
+                self._out_of_band = 0
+                self._out_of_band_dir = 0
+                return
+            x = min(max(x, lo), hi)
+        self._ema = max(self.MIN_ESTIMATE_S, self._ema + self.alpha * (x - self._ema))
         self.samples += 1
 
 
@@ -939,7 +1010,7 @@ def _demand_outweighs_a_retry(
     saved_s = inp.pending_prefill_tokens * (1.0 / tp - 1.0 / pp) - 2.0 * cfg.flip_cost_s
     k = max(1, state.arm_refusals.get(TP_TO_PP, 1))
     base_s = solved_tp_decode_floor_s(cfg) if cfg.flip_cost_s > 0 else cfg.min_dwell_s
-    waited_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+    waited_s = min(base_s * (2**k), cfg.refusal_backoff_cap_s)
     return saved_s > waited_s
 
 
@@ -1585,11 +1656,9 @@ def _decide_rules(
         # threshold term, and exactly the wrong one here, where the failure
         # mode is an arm storm against an unfundable seam.
         base_s = (
-            solved_tp_decode_floor_s(cfg)
-            if cfg.flip_cost_s > 0
-            else cfg.min_dwell_s
+            solved_tp_decode_floor_s(cfg) if cfg.flip_cost_s > 0 else cfg.min_dwell_s
         )
-        floor_s = min(base_s * (2 ** k), cfg.refusal_backoff_cap_s)
+        floor_s = min(base_s * (2**k), cfg.refusal_backoff_cap_s)
         since = inp.now - last_abandon
         if floor_s > 0 and since < floor_s:
             return _no(
@@ -2470,9 +2539,7 @@ def config_from_env(
         source = f"{ENV_FLIP_TOKENS}={explicit}"
     elif tp_tok_s > 0:
         flip_tokens = break_even_tokens(seam_s, tp_tok_s, pp_tok_s)
-        source = (
-            f"break-even {seam_s:g}s / (1/{tp_tok_s:g} - 1/{pp_tok_s:g})"
-        )
+        source = f"break-even {seam_s:g}s / (1/{tp_tok_s:g} - 1/{pp_tok_s:g})"
     elif enabled:
         raise PhasePolicyError(
             "the phase policy is enabled but has no threshold: set "
@@ -2508,12 +2575,8 @@ def config_from_env(
         # The measured counterfactual. With it the surcharge prices a flip
         # against what NOT flipping costs the same decodes; without it the
         # old one-sided form is kept, unchanged.
-        decode_contention=_env_float(
-            ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION
-        ),
-        decode_stall_slo_s=_env_float(
-            ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S
-        ),
+        decode_contention=_env_float(ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION),
+        decode_stall_slo_s=_env_float(ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
         # Passed in rather than read from env: it is a runtime fact of THIS
         # scheduler, and the armed line below prices the seam from it -- so it
