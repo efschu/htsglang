@@ -142,14 +142,32 @@ _LAYER_NORM_TRACE = os.getenv("SGLANG_LAYER_NORM_TRACE", "") not in (
     "false",
     "False",
 )
-_layer_norm_traced: set = set()
+_layer_norm_traced: dict = {}
+#: How many passes per layer to trace. The FIRST forward of a boot is the KV
+#: memory-profiling dummy -- on a PP layout its later stages receive zeros, so
+#: a one-pass trace records `h=0.000000` for every layer past stage 0 and can
+#: localize nothing. Tracing more than one pass lets the profiling forward be
+#: pass=0 and the actual probe prompt be pass=1, which is the one to diff.
+_LAYER_NORM_TRACE_PASSES = max(1, int(os.getenv("SGLANG_LAYER_NORM_TRACE_PASSES", "1")))
 
 
 def _trace_layer_norms(layer_idx: int, hidden_states, residual) -> None:
-    """Log this layer's output norms once. Never raises into the forward."""
-    if layer_idx in _layer_norm_traced:
+    """Log this layer's output norms. Never raises into the forward."""
+    seen = _layer_norm_traced.get(layer_idx, 0)
+    if seen >= _LAYER_NORM_TRACE_PASSES:
         return
-    _layer_norm_traced.add(layer_idx)
+    # A norm is a .item(), i.e. a device-to-host sync, which is ILLEGAL inside a
+    # CUDA graph capture and invalidates it (cudaErrorStreamCaptureInvalidated,
+    # taking the boot down with it). The original one-pass trace never met a
+    # capture because the profiling forward precedes it; a multi-pass trace does.
+    # Skipping a captured pass costs nothing -- capture replays a shape, it is
+    # not the forward whose numerics we are localizing.
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:  # noqa: BLE001 - an instrument may not break a boot
+        pass
+    _layer_norm_traced[layer_idx] = seen + 1
 
     def _n(t):
         try:
@@ -162,7 +180,8 @@ def _trace_layer_norms(layer_idx: int, hidden_states, residual) -> None:
     try:
         rows = -1 if hidden_states is None else int(hidden_states.shape[0])
         logger.info(
-            "LAYERTRACE layer=%d rows=%d h=%.6f r=%.6f",
+            "LAYERTRACE pass=%d layer=%d rows=%d h=%.6f r=%.6f",
+            seen,
             layer_idx,
             rows,
             _n(hidden_states),
