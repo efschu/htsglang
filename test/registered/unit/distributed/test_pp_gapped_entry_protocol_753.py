@@ -451,5 +451,47 @@ class TestOutputRingSymmetricGating(unittest.TestCase):
         self.assertIn("next_first_rank_mb_id != next_mb_id", src)
 
 
+class TestIdleTickSendsNothing(unittest.TestCase):
+    """#753: receiving nothing must mean sending nothing.
+
+    SPECIMEN v7pp17. The server fired up, warmed up symmetrically on all three
+    ranks, went idle, and the iteration barrier then timed out after 120s with
+    'no peer could be proven dead'. No request was ever scheduled. The peer was
+    not dead: a middle rank still held pp_outputs from the last pass that DID
+    exchange, and on an idle tick it sent them to a peer whose receive had
+    early-returned for want of a batch. Gapped sends are synchronous, so that
+    unmatched send blocked for ever and the rank never reached the barrier.
+    """
+
+    def test_none_is_distinguishable_from_not_supplied(self):
+        """The sentinel exists and is not None.
+
+        A None default cannot express both 'no value given' and 'the value is
+        nothing', which is precisely the conflation that stalled v7pp17.
+        """
+        from sglang.srt.managers.scheduler_pp_mixin import _NOT_SUPPLIED
+
+        self.assertIsNotNone(_NOT_SUPPLIED)
+
+    def test_do_send_defaults_to_the_sentinel(self):
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(
+            m.SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors
+        )
+        self.assertIn("forward_now=_NOT_SUPPLIED", src)
+        self.assertIn("forward_now is _NOT_SUPPLIED", src)
+
+    def test_stale_outputs_are_not_reachable_when_nothing_was_received(self):
+        """Forwarding an explicit None must not fall back to pp_outputs."""
+        sentinel_src = inspect.getsource(
+            __import__(
+                "sglang.srt.managers.scheduler_pp_mixin", fromlist=["x"]
+            ).SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors
+        )
+        # The fallback must be keyed on the sentinel, never on `is None`.
+        self.assertNotIn("pp_outputs if forward_now is None else", sentinel_src)
+
+
 if __name__ == "__main__":
     unittest.main()

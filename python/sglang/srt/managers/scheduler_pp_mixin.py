@@ -141,6 +141,12 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+#: "the caller did not supply a value", so that an explicit ``None`` can mean
+#: "I received nothing this iteration" instead of collapsing into the default.
+#: A plain ``None`` default could not express both -- see ``_do_send``.
+_NOT_SUPPLIED = object()
+
+
 def _pp_output_exchange_due(batch: Optional[ScheduleBatch]) -> bool:
     """Does this slot owe an output exchange? ONE predicate, both sides.
 
@@ -2926,15 +2932,31 @@ class SchedulerPPMixin:
         # XPU: even ranks send first, odd ranks recv first.
         send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
-        def _do_send(forward_now: Optional[PPProxyTensors] = None):
+        def _do_send(forward_now=_NOT_SUPPLIED):
             # ``forward_now`` is the gapped path's lag removal: forward what
             # this rank received THIS iteration instead of last iteration's
-            # ``pp_outputs``. None keeps the shipped behaviour exactly.
+            # ``pp_outputs``.
+            #
+            # THE SENTINEL IS THE WHOLE POINT, and its absence cost boot
+            # v7pp17. Defaulting to None made "no exchange was due, I received
+            # nothing" indistinguishable from "not supplied", so the gapped
+            # path fell back to the STALE pp_outputs from the last pass that
+            # did exchange. On an idle tick that is an unmatched send -- the
+            # peer's receive early-returns because its slot is empty -- and
+            # since gapped sends are synchronous it blocks for ever. The rank
+            # never reaches the iteration barrier, and the barrier reports what
+            # it can see: 'made no progress for 120s and no peer could be
+            # proven dead'. The peer was not dead, it was holding a send that
+            # nobody had any reason to take.
+            #
+            # With the sentinel, receiving nothing means sending nothing, which
+            # is the same predicate the receiving side used to decide it had
+            # nothing to receive.
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
                 last_rank_comm_queue,
-                pp_outputs if forward_now is None else forward_now,
+                pp_outputs if forward_now is _NOT_SUPPLIED else forward_now,
             )
 
         def _do_recv():
