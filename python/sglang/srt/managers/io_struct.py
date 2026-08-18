@@ -738,6 +738,9 @@ class GenerateReqInput:
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            # Whole-request property, like ``stream``: every item of a batch
+            # carries the same ceiling semantics the caller declared.
+            clamp_max_new_tokens=self.clamp_max_new_tokens,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)

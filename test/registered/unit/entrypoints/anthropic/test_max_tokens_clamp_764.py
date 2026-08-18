@@ -196,6 +196,19 @@ class TestPlumbing(unittest.TestCase):
     def test_generate_req_input_defaults_to_no_clamp(self):
         self.assertFalse(GenerateReqInput(text="hi").clamp_max_new_tokens)
 
+    def test_batch_items_inherit_the_ceiling(self):
+        # A batch is split into per-item requests before validation, and it is
+        # the item that reaches the gate. A flag dropped here would be a
+        # silently ignored opt-in for every batched caller.
+        batch = GenerateReqInput(
+            text=["a", "b"],
+            sampling_params={"max_new_tokens": 32000},
+            clamp_max_new_tokens=True,
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertTrue(batch[0].clamp_max_new_tokens)
+        self.assertTrue(batch[1].clamp_max_new_tokens)
+
     def test_chat_completion_request_defaults_to_no_clamp(self):
         self.assertFalse(
             ChatCompletionRequest(
