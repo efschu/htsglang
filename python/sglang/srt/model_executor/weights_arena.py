@@ -314,6 +314,88 @@ def _alloc_with_host_register(dims, dtype, device, pin_memory, allocator):
     return alloc_with_host_register(dims, dtype, device, pin_memory, allocator)
 
 
+def host_image_mode() -> str:
+    """The host-image allocation mode boot logs report. Read per call."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.get():
+        return "file-backed reclaimable"
+    return "pinned"
+
+
+def _file_backed_image(total: int) -> torch.Tensor:
+    """Flip host image as a FILE-BACKED shared mapping -- reclaimable, not
+    pinned.
+
+    WHY. The pinned images are the flip world's single largest host post
+    (68.7 GiB on the 2026-08-18 review composition, non-reclaimable, against
+    a 118-GiB swapless container -- SPECIMEN-2026-08-18T0516Z-*). The pin
+    buys DMA speed for ``arena_refill``'s one contiguous H2D copy at flip
+    time (#690: 9,614.9 MiB per rank). A file-backed mapping trades that
+    for reclaimability: after write-back the pages are CLEAN page cache the
+    kernel may drop under pressure and refault from disk at the next flip.
+    Flip cost, honestly: a pageable H2D copy (roughly half DMA bandwidth)
+    when the pages are still cached, plus a disk read bounded by the pool's
+    sequential rate when they were reclaimed -- #89's hibernate restore
+    (8-14 s for a full weight set on this same pool) is the same-medium
+    cold anchor. That price is why this arm is OPT-IN and the default stays
+    pinned and byte-identical.
+
+    REFUSES rather than falls back: an enabled arm that quietly pinned
+    would claim reclaimability the host ledger then plans on (the #742
+    silently-inert-flag class). Volatile filesystems (tmpfs/ramfs) are
+    refused by the same #407 verdict the hibernate dir uses -- RAM-backed
+    files are exactly the non-reclaimable post this arm exists to remove.
+
+    The file is UNLINKED after mapping: the inode (and with it write-back
+    and refault) lives as long as the mapping, and a crash leaves no
+    stale multi-GiB files behind. Fresh file pages read zero by the
+    filesystem's own rule, which the image checksum contract requires of
+    alignment gaps. NOT registered as a pinned host post -- the registry
+    sums non-reclaimable bytes.
+    """
+    import os
+    import uuid
+
+    from sglang.srt.environ import envs
+
+    image_dir = envs.SGLANG_PHASE_FLIP_IMAGE_DIR.get()
+    if not image_dir:
+        raise WeightsArenaError(
+            "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED=1 needs "
+            "SGLANG_PHASE_FLIP_IMAGE_DIR pointing at persistent storage; "
+            "refusing rather than silently allocating a pinned image the "
+            "host ledger would then double-count as reclaimable."
+        )
+    if not os.path.isdir(image_dir):
+        raise WeightsArenaError(
+            f"SGLANG_PHASE_FLIP_IMAGE_DIR {image_dir!r} does not exist or "
+            "is not a directory."
+        )
+    from sglang.srt.memtier.hibernate_tier import hibernate_dir_verdict
+
+    verdict = hibernate_dir_verdict(image_dir)
+    if verdict.known and not verdict.persistent:
+        raise WeightsArenaError(
+            f"SGLANG_PHASE_FLIP_IMAGE_DIR {image_dir!r} is on a "
+            f"{verdict.fs_type} filesystem: RAM-backed files cannot be "
+            "reclaimed to disk, which is the entire point of the "
+            "file-backed image arm. Point it at persistent storage."
+        )
+    path = os.path.join(image_dir, f"flip-image-{os.getpid()}-{uuid.uuid4().hex}.img")
+    image = torch.from_file(path, shared=True, size=total, dtype=torch.uint8)
+    os.unlink(path)
+    logger.info(
+        "flip host image FILE-BACKED (reclaimable): %d bytes mapped from "
+        "%s (unlinked; pages are page cache and may be written back and "
+        "reclaimed under pressure; the next flip refaults them). Not "
+        "charged to the pinned-host registry.",
+        total,
+        path,
+    )
+    return image
+
+
 def _torch_pinned_zeros(total: int) -> torch.Tensor:
     """The pre-#695 allocation, kept as the fallback. See below."""
     return torch.zeros(total, dtype=torch.uint8, pin_memory=True)
@@ -448,6 +530,17 @@ def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
         if zero:
             return torch.zeros(total, dtype=torch.uint8)
         return torch.empty(total, dtype=torch.uint8)
+    # File-backed opt-in arm (see _file_backed_image): reclaimable page
+    # cache, so it is NOT a pinned post and must not reach the registry
+    # below. Read per call, like the #695 opt-out, and checked BEFORE the
+    # registration so a refused misconfiguration never leaves a phantom
+    # post behind. Takes precedence over SGLANG_PHASE_FLIP_EXACT_PIN: both
+    # of that flag's arms allocate pinned RAM, which is what this arm
+    # replaces.
+    from sglang.srt.environ import envs as _fb_envs
+
+    if _fb_envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.get():
+        return _file_backed_image(total)
     # #695: make the bytes VISIBLE to the one registry that sums host posts.
     # These images never registered, so `pinned_host_budget` -- which exists
     # precisely because "two independently plausible budgets can be jointly
