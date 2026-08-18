@@ -825,6 +825,16 @@ class ModelRunnerKVCacheMixin:
                     / 1024,
                 )
             rest_memory = available_gpu_memory - slack_gb
+            # #753: the corridor is owed on this branch too. A gapped boot that
+            # lets the ledger size it from free VRAM -- rather than being
+            # handed a per-rank MiB budget -- must still keep the user's free
+            # column, or it simply spends the whole card instead of the whole
+            # budget and reaches the same OOM by the other road.
+            rest_memory, _auto_reserve_post = self._gapped_corridor_holdback(
+                rest_memory
+            )
+            if _auto_reserve_post is not None:
+                budget_posts.append(_auto_reserve_post)
         if self.mambaish_config is not None:
             before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
