@@ -87,6 +87,37 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _guard_kv_transfer(host_pool, device_pool, host_indices, device_indices, *, where):
+    """#760 seam guard. Metadata only -- O(layers) integer comparisons.
+
+    Fails OPEN on anything it cannot read: absence is not a mismatch, and a
+    defense-in-depth layer that refuses paths it does not understand becomes
+    the outage it was added to prevent.
+    """
+    try:
+        from sglang.srt.mem_cache.kv_transfer_guard import validate_kv_transfer
+
+        validate_kv_transfer(
+            src_ptr_vectors=[
+                getattr(device_pool, "k_data_ptrs", None),
+                getattr(device_pool, "v_data_ptrs", None),
+            ],
+            dst_ptr_vectors=[
+                getattr(host_pool, "k_data_ptrs", None),
+                getattr(host_pool, "v_data_ptrs", None),
+            ],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            src_item_size=getattr(device_pool, "token_stride_size", None),
+            dst_item_size=getattr(host_pool, "token_stride_size", None),
+            src_generation=getattr(device_pool, "_binding_generation", None),
+            dst_generation=getattr(host_pool, "_binding_generation", None),
+            where=where,
+        )
+    except ImportError:  # pragma: no cover - guard module absent
+        return
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool
 
@@ -354,6 +385,15 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        # #760: refuse a mis-shaped transfer HERE rather than inside the
+        # kernel. This is the live class (model_runner_kv_cache_mixin.py:2766)
+        # and it had zero guard callsites, which is why the existing
+        # binding-staleness guard in DeepSeekV4PagedHostPool emitted nothing
+        # across both crashes -- it was never on this path.
+        _guard_kv_transfer(
+            self, device_pool, host_indices, device_indices,
+            where="MHATokenToKVPoolHost.backup_from_device_all_layer",
+        )
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
