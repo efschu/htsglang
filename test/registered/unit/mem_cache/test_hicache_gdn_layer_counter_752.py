@@ -107,6 +107,9 @@ class TestKvPathStillWaits(CustomTestCase):
         pool = object.__new__(MHATokenToKVPool)
         pool.layer_transfer_counter = counter
         pool.start_layer = 0
+        # Contiguous ownership (no SGLANG_PP_LAYER_SET): local_slot then
+        # reduces to layer_id - start_layer, the pre-layer-set arithmetic.
+        pool._local_slot_of = None
         pool.dtype = torch.float16
         pool.store_dtype = torch.float16
         pool.k_buffer = [torch.zeros(1, 1, 1, dtype=torch.float16)]

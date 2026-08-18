@@ -1648,9 +1648,26 @@ def get_pp_layer_set(
 
     ``None`` is the default and means "ask ``get_pp_indices``" -- it is what
     keeps the contiguous path byte-identical.
+
+    #754: resolution is bound to the SCOPE, not to the bare global env. The
+    phase flip builds a second, TP-only stack (pp_size=1) in the same
+    process, and parsing a multi-stage set there raised PPLayerSetError
+    ("N stage(s) given but pp_size is 1") -- which killed every layer-set
+    boot's flip, and with it PP+spec. Inside the flip's TP scope the layer
+    set is INAPPLICABLE (the TP stack owns every layer locally), so it is
+    declaratively skipped here, at the one funnel every consumer resolves
+    through, rather than masked per call site. A pp_size=1 boot OUTSIDE
+    the flip scope with the env set still refuses: that is a user error
+    the scope does not excuse. Same discipline as the sibling
+    SGLANG_PP_LAYER_PARTITION handling and the #752 counter skip.
     """
     raw = os.getenv(PP_LAYER_SET_ENV, None)
     if raw is None or not raw.strip():
+        return None
+    # Imported lazily: parallel_state imports this module at import time.
+    from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+
+    if phase_flip_tp_routing_active():
         return None
     return parse_pp_layer_sets(raw, num_hidden_layers, pp_size)[pp_rank]
 
