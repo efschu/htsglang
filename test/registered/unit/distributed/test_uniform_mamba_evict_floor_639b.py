@@ -359,6 +359,9 @@ def _match_len(nodes):
     not paraphrase the predicate it is about.
     """
     component = object.__new__(MambaComponent)
+    # #747: validators take (node, depth) and gate on the checkpoint grid;
+    # this test is about lock floors, not the grid, so the grid is off.
+    component.mamba_checkpoint_interval = None
     mamba_validator = MambaComponent.create_match_validator(
         component, match_device_only=True
     )
@@ -368,7 +371,7 @@ def _match_len(nodes):
 
     matched = 0
     for node in nodes:
-        if not (full_validator(node) and mamba_validator(node)):
+        if not (full_validator(node) and mamba_validator(node, matched + node.length)):
             break
         matched += node.length
     return matched

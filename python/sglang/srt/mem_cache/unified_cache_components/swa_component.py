@@ -116,7 +116,7 @@ class SWAComponent(TreeComponent):
 
     def create_match_validator(
         self, match_device_only: bool = False
-    ) -> Callable[[UnifiedTreeNode], bool]:
+    ) -> Callable[[UnifiedTreeNode, int], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -127,7 +127,9 @@ class SWAComponent(TreeComponent):
             self._swa_kv_pool_host is None and self.cache.cache_controller is not None
         )
 
-        def validator(node: UnifiedTreeNode) -> bool:
+        def validator(node: UnifiedTreeNode, depth: int) -> bool:
+            # `depth` (#747) is unused: the SWA window is relative, not
+            # anchored to absolute positions.
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.

@@ -4140,7 +4140,12 @@ class ServerArgs:
         "scheduler refuse every request longer than the budget, so the server "
         "boots, reports ready and then admits nothing (refused at startup). "
         "Recommended: the chunked prefill size, or 2048 when the chunk budget "
-        "is at least that large.",
+        "is at least that large. Composes with --enable-hierarchical-cache "
+        "(#747): anchors are host-tier-eligible like any other retained "
+        "node, so an interval anchor survives device eviction (it stays "
+        "matchable and loads back) and can reach disk through the storage "
+        "backend. For deterministic 8k anchors that survive on disk use "
+        "8192, which requires --chunked-prefill-size >= 8192.",
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
@@ -5815,7 +5820,9 @@ class ServerArgs:
         "Release the page cache behind each safetensors shard after loading it, "
         "via the #408 MADV_PAGEOUT ladder (posix_fadvise(DONTNEED) alone is a "
         "no-op on ZFS and is only the fallback). Cuts the weights-load page-cache "
-        "spike that can OOM a container before reclaim catches up.",
+        "spike that can OOM a container before reclaim catches up. Refused with "
+        "--load-format fastsafetensors (#742): that path reads via GPU Direct "
+        "Storage and never populates a page cache to release.",
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
@@ -14320,18 +14327,18 @@ class ServerArgs:
                 "--mamba-checkpoint-interval requires the (mamba) radix "
                 "cache; remove --disable-radix-cache."
             )
-        if self.enable_hierarchical_cache:
-            raise ValueError(
-                "--mamba-checkpoint-interval does not support "
-                "--enable-hierarchical-cache yet (HiMambaRadixCache has its "
-                "own match/evict paths)."
-            )
-        if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-            raise ValueError(
-                "--mamba-checkpoint-interval does not support the unified "
-                "radix tree yet (its mamba component has its own match/"
-                "branching path)."
-            )
+        # #747: --enable-hierarchical-cache and the unified radix tree
+        # compose with the checkpoint grid. The unified mamba component
+        # mirrors the grid at every decision MambaRadixCache makes (match
+        # gating, retention, cache_len, branching, eviction -- shared rules
+        # in mamba_ckpt_utils.py, seam map in
+        # docs/dev/NOTE_747_mamba_ckpt_hicache_refusal.md). Under a host
+        # tier, interval anchors are host-tier-eligible like any other
+        # retained node: an evicted anchor stays a valid match and loads
+        # back, so the anchors survive device eviction and can reach disk.
+        # (The refusals that stood here blamed HiMambaRadixCache, a class
+        # with no construction site; the real gap was the then-unbuilt grid
+        # support in the unified component.)
         if interval <= 0:
             raise ValueError(
                 f"--mamba-checkpoint-interval must be positive, got {interval}."
@@ -16518,6 +16525,30 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.load_format = "gguf"
+
+        # #742 CONTRACT HONESTY. Every loader branch forwards
+        # weight_loader_drop_cache_after_load except the FASTSAFETENSORS one
+        # (model_loader/loader.py: fastsafetensors_weights_iterator takes the
+        # file list and nothing else), so the flag was silently dropped there
+        # while the help promised the page cache would be released.
+        #
+        # This is refused rather than passed through, because passing it
+        # through would be theatre: that iterator reads via GPU Direct
+        # Storage, which BYPASSES the page cache, so there is nothing behind
+        # those shards to release. An impossibility is named as one -- see
+        # #547 -> #550 on refusals that describe instead of explaining.
+        if (
+            self.load_format == "fastsafetensors"
+            and self.weight_loader_drop_cache_after_load
+        ):
+            raise ValueError(
+                "--weight-loader-drop-cache-after-load cannot be honoured with "
+                "--load-format fastsafetensors: that loader reads through GPU "
+                "Direct Storage (GDS), which bypasses the page cache, so there "
+                "is no page cache behind the shards to release. Drop one of the "
+                "two flags -- the combination has never done anything, and this "
+                "refusal replaces silently ignoring it."
+            )
 
         # #89 hibernate: mutual-requirement + auto-detect. A valid manifest in
         # --hibernate-dir that coarse-matches the launch args (model, quant,

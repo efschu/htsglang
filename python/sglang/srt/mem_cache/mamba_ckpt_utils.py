@@ -38,6 +38,66 @@ def is_on_interval(pos: int, interval: Optional[int]) -> bool:
     return pos % interval == 0
 
 
+def is_resume_candidate(
+    depth: int,
+    interval: Optional[int],
+    has_device_value: bool,
+    has_host_value: bool = False,
+    device_only: bool = True,
+) -> bool:
+    """Is a node at absolute token position ``depth`` a valid mamba resume
+    anchor for the prefix match?
+
+    The compound rule both match walks apply (``mamba_radix_cache.py``'s
+    ``_match_prefix_helper`` and the unified component's match validators):
+    the node must CARRY a state, and with ``--mamba-checkpoint-interval`` set
+    it must SIT on the grid -- off-grid checkpoints (legacy entries, storage
+    written by a non-interval run, unaligned edge paths) would re-introduce
+    traffic-dependent resume points.
+
+    ``device_only=False`` additionally accepts a host-backed state
+    (``has_host_value``): under HiCache an evicted-but-backuped anchor is a
+    valid match that triggers ``load_back``. The grid applies to those
+    equally -- surviving on the host tier does not legalise an off-grid
+    position.
+
+    ``interval=None`` degenerates to the pure presence test, byte-identical
+    to the pre-#747 behaviour of both walks.
+    """
+    present = has_device_value or (not device_only and has_host_value)
+    return present and is_on_interval(depth, interval)
+
+
+def protect_deepest_anchors(
+    interval: Optional[int], host_tier_present: bool = False
+) -> bool:
+    """Should eviction spare the deepest checkpoint anchors of every path?
+
+    ``MambaRadixCache`` protects them (``mamba_radix_cache.py:1092-1105``)
+    because "losing the deepest one silently moves the resume point of
+    identical requests and re-introduces run-to-run drift". The protection is
+    not about capacity, it is about DETERMINISM.
+
+    That premise holds only while an evicted anchor is a LOST anchor, which is
+    true of a device-only pool. With a host tier the node stays a valid match
+    after its device value is dropped and is loaded back on the next hit
+    (``unified_cache_components/mamba_component.py:71-74`` and ``:139-144``),
+    so the resume point does not move and there is nothing to protect against.
+
+    Hence the branch, stated once here rather than diverging per lineage:
+
+    * ``host_tier_present=False`` -> protect, exactly as today;
+    * ``host_tier_present=True``  -> do not protect; spilling an anchor is
+      allowed because it can be matched and reloaded.
+
+    No interval means no grid, so there are no anchors either way -- the same
+    ``interval is not None`` test the device-only path already used.
+    """
+    if interval is None:
+        return False
+    return not host_tier_present
+
+
 def mamba_checkpoint_track_target(
     prefix_len: int,
     extend_len: int,

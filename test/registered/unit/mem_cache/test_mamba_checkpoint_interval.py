@@ -782,8 +782,20 @@ class TestCheckpointIntervalValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             args._handle_mamba_checkpoint_interval(self._view(args))
 
-    def test_hierarchical_cache_rejected(self):
+    def test_hierarchical_cache_composes(self):
+        """#747: the interval x hierarchical-cache refusal is lifted -- the
+        unified mamba component now mirrors the checkpoint grid at every
+        decision MambaRadixCache makes (seam map in NOTE_747), so the
+        combination is accepted and the tracking grid is still unified."""
         args = self._args(2048, enable_hierarchical_cache=True)
+        view = self._view(args)
+        args._handle_mamba_checkpoint_interval(view)  # must not raise
+        self.assertEqual(args.mamba_track_interval, 2048)
+
+    def test_hierarchical_cache_composition_still_validates_the_grid(self):
+        """Lifting the refusal must not have widened the grid rules: an
+        off-chunk interval stays rejected WITH hierarchical cache on."""
+        args = self._args(FLA_CHUNK_SIZE + 1, enable_hierarchical_cache=True)
         with self.assertRaises(ValueError):
             args._handle_mamba_checkpoint_interval(self._view(args))
 

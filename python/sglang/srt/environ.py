@@ -252,6 +252,17 @@ class Envs:
     # NOT disable the host-post registration or the shmem pricing from the same
     # commit -- those are correct under either allocator.
     SGLANG_PHASE_FLIP_EXACT_PIN = EnvBool(True)
+    # Flip host images as FILE-BACKED shared mappings instead of page-locked
+    # RAM: the pages become reclaimable page cache (written back to disk under
+    # pressure, refaulted at the next flip) and the ~tens-of-GiB image post
+    # leaves the pinned-host ledger. Opt-in: the flip's H2D refill then runs
+    # pageable instead of DMA, plus a disk refault when the box was actually
+    # under pressure (#89's hibernate restore, 8-14 s for a full weight set on
+    # the same pool, is the cold-read anchor; #690 measured the pinned DMA
+    # refill at 9,614.9 MiB/rank). Requires SGLANG_PHASE_FLIP_IMAGE_DIR on a
+    # persistent filesystem; refuses (never silently pins) otherwise.
+    SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
+    SGLANG_PHASE_FLIP_IMAGE_DIR = EnvStr("")
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
