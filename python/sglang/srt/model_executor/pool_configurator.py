@@ -220,6 +220,27 @@ class MemoryPoolConfigurator:
     to be filled by the consumer).
     """
 
+    # A pipeline stage can legitimately hold NO full-attention layers, and then
+    # its KV cell is 0 bytes per token. That is not a degenerate config: on a
+    # gapped layer set over a hybrid model, the stage carrying only GDN/linear
+    # layers keeps its state in the mamba pool and needs no KV cache at all.
+    #
+    # Such a stage must impose NO KV bound on the pipeline. Dividing by its cell
+    # is a ZeroDivisionError; reporting 0 would be worse -- the pipeline's token
+    # universe is the MINIMUM across stages, so a 0 here would collapse the pool
+    # to nothing on the strength of a stage that does not use it (and
+    # MemoryPoolConfig refuses <= 0 outright).
+    #
+    # THE MAGNITUDE IS CHOSEN, not arbitrary. It must be far above any universe
+    # a real stage can bound (this rig's attention stages solve to ~7.5e5
+    # tokens, two orders below), and it must stay ALLOCATION-SAFE, because
+    # max_total_num_tokens does not only get compared -- index structures are
+    # sized from it. math.inf is unusable for the same reason: it flows into
+    # integer arithmetic (`// page_size`, MemoryPoolConfig fields) with no float
+    # path. 2**24 satisfies both; something like 2**40 would satisfy the first
+    # and turn any index allocation into an out-of-memory of its own.
+    _KVLESS_STAGE_TOKENS = 1 << 24
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
@@ -487,10 +508,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return cell_size
 
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            self._KVLESS_STAGE_TOKENS
+            if self._cell_size == 0
+            else available_bytes // self._cell_size
+        )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         # #704: emit the LAST link of the sizing chain.
         #
@@ -654,7 +680,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = int(available_bytes // self._cell_size)
+        max_total_num_tokens = int(
+            self._KVLESS_STAGE_TOKENS
+            if self._cell_size == 0
+            else available_bytes // self._cell_size
+        )
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(

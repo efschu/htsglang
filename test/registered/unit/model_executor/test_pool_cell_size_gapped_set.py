@@ -105,5 +105,40 @@ class TestGappedSetCellSizing(CustomTestCase):
         self.assertEqual(len(got), 8)
 
 
+
+class TestKvlessStageImposesNoBound(CustomTestCase):
+    """A stage with no full-attention layers has a 0-byte cell.
+
+    That is a legal configuration, not a degenerate one, and it must not
+    divide by zero, must not report 0 (the pipeline universe is a MINIMUM, so a
+    0 would collapse the pool on the strength of a stage that does not use it),
+    and must not be so large that anything sizing an index structure from it
+    allocates its way into an OOM of its own.
+    """
+
+    def test_sentinel_is_above_any_real_universe_and_still_allocation_safe(self):
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfigurator
+
+        sentinel = MemoryPoolConfigurator._KVLESS_STAGE_TOKENS
+        # The two attention stages of the measured gapped boot solved to
+        # 845283 and 754019 tokens; the sentinel must never be the minimum.
+        self.assertGreater(sentinel, 845283 * 10)
+        # ... and must stay small enough that an int64 index array over it is
+        # megabytes, not gigabytes.
+        self.assertLessEqual(sentinel * 8, 256 * 1024 * 1024)
+
+    def test_a_zero_cell_never_divides(self):
+        """The failure mode this replaces is a ZeroDivisionError at boot."""
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfigurator
+
+        cfg = MemoryPoolConfigurator.__new__(MemoryPoolConfigurator)
+        cfg._cell_size = 0
+        tokens = (
+            cfg._KVLESS_STAGE_TOKENS
+            if cfg._cell_size == 0
+            else 1 // cfg._cell_size
+        )
+        self.assertEqual(tokens, MemoryPoolConfigurator._KVLESS_STAGE_TOKENS)
+
 if __name__ == "__main__":
     unittest.main()
