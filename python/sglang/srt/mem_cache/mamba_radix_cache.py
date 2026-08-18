@@ -517,6 +517,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        # #755: the lock reorder. Read from the SAME predicate that decides the
+        # floor, so the runtime and mamba_pool_floor cannot disagree about how
+        # many slots a request may hold -- a disagreement in that direction is
+        # the #581 late assert.
+        self.mamba_slot_reorder = bool(
+            getattr(params, "mamba_slot_reorder", False)
+        )
+        #: Counted, because a persistent refusal stream means write-through is
+        #: not keeping up and the reduced floor is buying nothing.
+        self._mamba_reorder_refusals = 0
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.kv_event_queue = []
 
@@ -836,6 +846,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # keeps computing and simply misses the cache later). Every allocation
         # that can fail is done BEFORE any request-visible mutation, so a skip
         # never leaves the ping-pong buffer half-swapped.
+        # #755: only the no_buffer arm below performs the lock reorder. The
+        # other arms keep the original order, so the release stays at the tail
+        # for them -- initialised here so the tail reads one variable rather
+        # than re-deriving which arm ran.
+        early_release = False
+
         if self.int8_ckpt_pool is not None:
             # int8 path: quantize the to-be-cached active state into an int8 slot
             # (strategy-agnostic donate hook).
@@ -868,8 +884,55 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, new_slot
             )
         else:
+            # #755: THE LOCK REORDER. Default order is
+            #   alloc -> copy -> insert -> dec(old) -> inc(new)
+            # which holds the OLD pin across the alloc, so a request owns
+            # active + donated + pinned = 3 slots at this instant. The donated
+            # slot BECOMES the next pin, so the double-count exists only
+            # because of the overlap. Releasing first makes it 2.
+            #
+            # SAFE ONLY WITH A HOST-BACKED ANCHOR, per node and at THIS moment
+            # (NOTE_755 section 3). Between the release and the new pin the old
+            # node is evictable; with a host copy that degrades to load_back or
+            # re-prefill, without one it is a DEAD anchor. So the config
+            # predicate is not enough -- the node is asked too.
+            early_release = self._mamba_early_release_admissible(req.last_node)
+            if early_release:
+                self.dec_lock_ref(req.last_node)
+            elif self.mamba_slot_reorder:
+                # The config promised the reduced floor, but THIS anchor is not
+                # backed. Reverting to the 3-slot order here would claim a slot
+                # the pool no longer reserves -- the #581 late-assert class. So
+                # skip the insert instead: that path holds active + old pin = 2
+                # and stays inside the budget. Loud, and counted.
+                self._mamba_reorder_refusals += 1
+                if self._mamba_reorder_refusals in (1, 10) or (
+                    self._mamba_reorder_refusals % 100 == 0
+                ):
+                    logger.warning(
+                        "#755: skipping the mamba cache insert for rid=%s -- "
+                        "the resume anchor is not host-backed at release time, "
+                        "and the reduced floor has no third slot to fall back "
+                        "on. The request keeps computing; only this checkpoint "
+                        "is not cached. (%d so far; a persistent count means "
+                        "write-through is not keeping up.)",
+                        getattr(req, "rid", "?"),
+                        self._mamba_reorder_refusals,
+                    )
+                return _skip_cache_unfinished_req(req)
+
             mamba_value_donated = self._alloc_mamba_slot()
             if mamba_value_donated is None:
+                if early_release:
+                    # The window opened and the alloc failed. The anchor is
+                    # host-backed (that is what admitted the release), so the
+                    # request resumes via load_back rather than losing state.
+                    logger.warning(
+                        "#755: mamba slot alloc failed inside the release "
+                        "window for rid=%s; the old anchor was host-backed, so "
+                        "the resume path is load_back / re-prefill.",
+                        getattr(req, "rid", "?"),
+                    )
                 return _skip_cache_unfinished_req(req)
             # mamba_pool is a pure PHYSICAL store; translate both slot ids
             # virtual->physical (identity for the non-unified memory pool) before the copy.
@@ -926,7 +989,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(req.last_node)
+        # #755: the release already happened before the alloc when the reorder
+        # was admitted. Releasing again here would double-decrement the ref.
+        if not early_release:
+            self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -1368,6 +1434,30 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     ##### Internal Helper Functions #####
+
+    def _mamba_early_release_admissible(self, node) -> bool:
+        """#755: may this node's pin be released BEFORE the donation alloc?
+
+        Two questions, both required, and deliberately asked separately:
+
+        * is the reorder configured at all (``mamba_slot_reorder``) -- the
+          config-level predicate that also decided the floor;
+        * is THIS node host-backed RIGHT NOW (``mamba_backuped``) -- because
+          the release opens a window in which the node is evictable, and the
+          whole safety argument is that an eviction there costs a
+          ``load_back`` rather than the anchor.
+
+        A config-only check would be the formula-only edit NOTE_755 refuses:
+        it would release pins for nodes whose backup does not exist yet.
+        """
+        if not self.mamba_slot_reorder:
+            return False
+        if node is None or node is getattr(self, "root_node", None):
+            # The root is never evicted and carries no mamba value to lose;
+            # releasing early buys nothing and the pin bookkeeping is simpler
+            # kept uniform.
+            return False
+        return bool(getattr(node, "mamba_backuped", False))
 
     def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary.

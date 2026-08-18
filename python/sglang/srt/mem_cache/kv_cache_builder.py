@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+def _mamba_slot_reorder_active(server_args) -> bool:
+    """#755, imported lazily to keep this module's import graph unchanged."""
+    from sglang.srt.mem_cache.mamba_pool_floor import mamba_slot_reorder_active
+
+    return mamba_slot_reorder_active(server_args)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KVCacheBuildResult:
     is_hybrid_swa: bool
@@ -227,6 +234,7 @@ def build_kv_cache(
         enable_session_radix_cache=server_args.enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        mamba_slot_reorder=_mamba_slot_reorder_active(server_args),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
