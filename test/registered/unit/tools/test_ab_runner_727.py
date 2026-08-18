@@ -198,6 +198,42 @@ class TestFloorAndGateB(CustomTestCase):
         ab.gateB_quality(_metrics(0.85, 0.95), a1, floor, "B")
 
 
+class TestAcceptLengthReadout(CustomTestCase):
+    """The spec accept length is the sharpest logit-sensitivity readout:
+    near-tie flips decay it before the suite score moves. Optional by
+    contract -- absent on either baseline boot, the comparison is SKIPPED,
+    never invented."""
+
+    def _m(self, score, accept=None):
+        m = _metrics(score, 0.90)
+        if accept is not None:
+            m["accept_len"] = accept
+        return m
+
+    def test_accept_decay_beyond_the_floor_fails(self):
+        a1, a2 = self._m(0.80, 3.30), self._m(0.80, 3.25)
+        floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
+        with self.assertRaises(ab.GateFailure) as ctx:
+            ab.gateB_quality(self._m(0.80, 2.90), a1, floor, "C")
+        self.assertIn("accept_len", str(ctx.exception))
+
+    def test_accept_within_the_floor_passes(self):
+        a1, a2 = self._m(0.80, 3.30), self._m(0.80, 3.20)
+        floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
+        ab.gateB_quality(self._m(0.80, 3.22), a1, floor, "C")
+
+    def test_missing_accept_is_skipped_not_failed(self):
+        """A no-spec boot reports no accept_len; the gate must not fail on
+        absence and must not compare against a floor that was never
+        established."""
+        a1, a2 = self._m(0.80), self._m(0.80)
+        floor = ab.Floor.from_arms(a1, a2, eps_score=0.0, eps_perf_frac=0.0)
+        self.assertIsNone(floor.accept_len)
+        ab.gateB_quality(self._m(0.80), a1, floor, "B")
+        # and an arm that reports it against a floor that lacks it: skipped.
+        ab.gateB_quality(self._m(0.80, 1.0), a1, floor, "B")
+
+
 class TestGateC(CustomTestCase):
     def test_perf_within_floor_passes(self):
         a1, a2 = _metrics(0.8, 0.9, 800, 20.0), _metrics(0.8, 0.9, 850, 19.5)

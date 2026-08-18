@@ -216,3 +216,29 @@ arithmetic, the abort-on-baseline-failure branch, the verdict table, and
 two full mocked CLI runs (SHIP-BOTH and ABORT), plus the artifact verifier
 against synthetic checkpoints broken in each way it must catch -- and
 against the real artifacts on this rig.
+
+## Head-chain closure (2026-08-18, second pass)
+
+The module's "nothing here selects it" note for `lm_head` is retired: the
+chain exists end to end on this lineage and is now PINNED in both
+directions (`test_ct_lmhead_chain_727.py`, mutation-proven):
+
+1. `qwen3_vl.py:1298` hands the compressed-tensors quant_config to
+   `ParallelLMHead` unconditionally;
+2. `get_quant_method` matches the head via
+   `isinstance(layer, VocabParallelEmbedding)` gated on the checkpoint's
+   own ignore list — the arm-B/C discriminator (`-embed` keeps `lm_head`
+   ignored -> dense; `-both` drops it -> int8), both directions pinned;
+3. `create_weights` fires the GATE-0 `INT8-VOCAB ENGAGED` line with the
+   layer class name (0/1/2 lines for A/B/C);
+4. `should_apply_lm_head_quant_method`'s default arm routes the head
+   matmul through `apply()` — pinned against the silent-garbage refactor
+   (listing the method as unquantized reds 2 tests), and `apply()` is
+   bit-identical to the dense reference on exact-int8 rows.
+
+The A/B runner additionally reads the MTP **accept length** per arm
+(optional `accept_len` in the suite JSON, sourced from `meta_info` per the
+acceptance-measurement rule): near-tie flips decay accept before the suite
+score moves, which makes it the sharpest logit-sensitivity instrument the
+serving stack already exposes. Absent on either baseline boot, the
+comparison is skipped, never invented.

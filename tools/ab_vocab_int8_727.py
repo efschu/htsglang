@@ -195,9 +195,18 @@ class Floor:
     decode_tps: float
     eps_score: float = 0.0
     eps_perf_frac: float = 0.0
+    #: MTP/spec accept length -- the sharpest logit-sensitivity readout the
+    #: serving stack already exposes (a per-channel error that flips
+    #: near-ties shows up as accept decay before the suite score moves).
+    #: OPTIONAL: None when either baseline boot did not report it, and then
+    #: gate B skips the comparison rather than inventing a bound.
+    accept_len: Optional[float] = None
 
     @classmethod
     def from_arms(cls, a1: Dict, a2: Dict, eps_score: float, eps_perf_frac: float):
+        accept = None
+        if a1.get("accept_len") is not None and a2.get("accept_len") is not None:
+            accept = abs(a1["accept_len"] - a2["accept_len"])
         return cls(
             score=abs(a1["score"] - a2["score"]),
             determined=abs(a1["determined"] - a2["determined"]),
@@ -205,6 +214,7 @@ class Floor:
             decode_tps=abs(a1["decode_tps"] - a2["decode_tps"]),
             eps_score=eps_score,
             eps_perf_frac=eps_perf_frac,
+            accept_len=accept,
         )
 
 
@@ -216,6 +226,17 @@ def gateB_quality(metrics: Dict, a1: Dict, floor: Floor, arm: str) -> None:
                 f"GATE B [{arm}]: {key} fell {delta:.4f} below arm A, outside "
                 f"the A-vs-A floor {bound:.4f} (+eps {floor.eps_score}). "
                 "The quality delta is real at this suite's resolution."
+            )
+    # Accept-length: compared only when the baseline established a floor for
+    # it AND this arm reports it (spec decode on). meta_info is the source of
+    # truth per the acceptance-measurement rule, never spec_ema_accept_len.
+    if floor.accept_len is not None and metrics.get("accept_len") is not None:
+        delta = a1["accept_len"] - metrics["accept_len"]
+        if delta > floor.accept_len + floor.eps_score:
+            raise GateFailure(
+                f"GATE B [{arm}]: spec accept_len fell {delta:.3f} below arm "
+                f"A, outside the A-vs-A floor {floor.accept_len:.3f} -- the "
+                "int8 logit error is flipping near-ties the draft relied on."
             )
 
 
@@ -370,7 +391,9 @@ def main():
         default=None,
         help="Template running the club-3090 suite + determined probes "
         "against the running arm; must print JSON with keys score, "
-        "determined, vram{pp0,pp1,pp2}.",
+        "determined, vram{pp0,pp1,pp2}; OPTIONAL accept_len (mean spec "
+        "accept length from meta_info -- never spec_ema_accept_len) when "
+        "the arm serves with speculative decoding.",
     )
     p.add_argument(
         "--perf-cmd",
