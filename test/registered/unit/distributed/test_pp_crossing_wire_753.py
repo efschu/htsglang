@@ -16,6 +16,8 @@ two layers in the wrong order all produce different results. A commutative
 stand-in would let a real defect pass.
 """
 
+import os
+import types
 import unittest
 
 from sglang.srt.distributed.pp_crossing_schedule import crossing_schedule
@@ -340,3 +342,55 @@ class TestThePpGroupLink(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWireIsScopedToRealPipelines(CustomTestCase):
+    """#754 seam, second call site.
+
+    SGLANG_PP_LAYER_SET is process-wide, but a phase flip builds a SECOND model
+    -- the TP stack -- in the same process with pp world size 1. get_pp_layer_set
+    already answers None there; build_wire_for_model called parse_pp_layer_sets
+    raw and inherited its by-stage-count refusal instead, killing a gapped boot
+    at 163s inside build_phase_flip_tp_stack.
+    """
+
+    GAPPED = (
+        "0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44-46,"
+        "48-50,52-54,56-58,60-62;3,7,11,15,19,23,27,31;35,39,43,47,51,55,59,63"
+    )
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        os.environ["SGLANG_PP_LAYER_SET"] = self.GAPPED
+        os.environ["SGLANG_PP_CROSSING_WIRE"] = "1"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    @staticmethod
+    def _cfg():
+        cfg = types.SimpleNamespace()
+        cfg.num_hidden_layers = 64
+        return cfg
+
+    def test_tp_stack_gets_the_null_object_not_a_refusal(self):
+        from sglang.srt.distributed.pp_crossing_wire import (
+            NoCrossingWire,
+            build_wire_for_model,
+        )
+
+        group = types.SimpleNamespace(world_size=1, rank_in_group=0)
+        wire = build_wire_for_model(self._cfg(), group)
+        self.assertIsInstance(wire, NoCrossingWire)
+
+    def test_a_real_pipeline_still_gets_a_real_wire(self):
+        """The guard must not disarm the wire it was added next to."""
+        from sglang.srt.distributed.pp_crossing_wire import (
+            NoCrossingWire,
+            build_wire_for_model,
+        )
+
+        group = types.SimpleNamespace(world_size=3, rank_in_group=0)
+        wire = build_wire_for_model(self._cfg(), group)
+        self.assertNotIsInstance(wire, NoCrossingWire)

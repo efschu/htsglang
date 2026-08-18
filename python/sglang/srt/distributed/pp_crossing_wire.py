@@ -265,6 +265,25 @@ def build_wire_for_model(config, pp_group, log=None):
     if raw is None or not raw.strip() or not pp_crossing_wire_enabled():
         return NoCrossingWire()
 
+    # #754 SEAM, and this call site was missed by the fold that fixed the other
+    # one. SGLANG_PP_LAYER_SET is process-wide, but a phase flip builds a
+    # SECOND model -- the TP stack -- inside the same process with
+    # pp_group.world_size == 1. A 3-stage string is then not merely
+    # inapplicable but invalid, and parse_pp_layer_sets refuses it by stage
+    # count: "3 stage(s) given but pp_size is 1".
+    #
+    # get_pp_layer_set already carries exactly this guard, for exactly this
+    # reason. Calling parse_pp_layer_sets raw here reintroduced the bug the
+    # guard exists to prevent, and it did so at a point far enough into the
+    # boot to look like a wire defect: the gapped boot loaded the PP stack,
+    # reached build_phase_flip_tp_stack, and died there on 2026-08-18 at 163s.
+    #
+    # A single stage owns every layer, so there is nothing for a set to express
+    # and nothing for a wire to carry -- the null object is the correct answer,
+    # not an error.
+    if pp_group.world_size <= 1:
+        return NoCrossingWire()
+
     owned = parse_pp_layer_sets(
         raw,
         config.num_hidden_layers,

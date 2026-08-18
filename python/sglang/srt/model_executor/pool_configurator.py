@@ -248,11 +248,52 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def __init__(self, mr: ModelRunner):
         # Determine effective number of layers for KV cache
         if mambaish := mr.mambaish_config:
-            effective_layer_ids = [
-                i
-                for i in mambaish.full_attention_layer_ids
-                if mr.start_layer <= i < mr.end_layer
-            ]
+            # #pp-layer-set: [start_layer, end_layer) is the stage's SPAN, and
+            # the span equals the owned set only while a stage is a contiguous
+            # interval. Under SGLANG_PP_LAYER_SET it does not. The same
+            # distinction was already fixed for ``num_effective_layers``
+            # (model_runner.py, "end - start is the SPAN, which equals the
+            # COUNT only while a stage is a contiguous interval") -- and the
+            # non-mambaish branch below inherits that fix for free by reading
+            # num_effective_layers. This branch does not, so it kept sizing
+            # from the span.
+            #
+            # MEASURED COST OF THE OMISSION, 2026-08-18, gapped set [48, 8, 8]
+            # on a 64-layer hybrid with full_attention_interval=4: stage 0 owns
+            # all 48 GDN layers and ZERO full-attention layers, but spans
+            # [0, 63), so the span admitted 15 of the 16 full-attention layers.
+            # Its cell came out 30720 bytes instead of 0, it reserved 3.3 GiB
+            # of KV it can never address on the one card that is already
+            # holding 25.7 GiB of weights, and the boot died with cuMemCreate
+            # CUDA_ERROR_OUT_OF_MEMORY. Sizing unpinned instead of dying, the
+            # same stage then bound the whole pipeline's token universe to
+            # 57925 tokens against 845283 and 754019 on the two stages that
+            # actually hold the attention layers.
+            #
+            # Stages 1 and 2 were correct by luck, not by construction: their
+            # gapped sets happen to contain every full-attention layer inside
+            # their own span. That is exactly the kind of accident that keeps a
+            # span-based rule looking right until a layout moves.
+            owned = getattr(mr, "owned_layer_ids", None)
+            if owned is None:
+                from sglang.srt.distributed.utils import get_pp_layer_set
+
+                owned = get_pp_layer_set(
+                    mr.model_config.num_hidden_layers, mr.pp_rank, mr.pp_size
+                )
+            if owned is not None:
+                effective_layer_ids = [
+                    i for i in mambaish.full_attention_layer_ids if i in owned
+                ]
+            else:
+                # Contiguous stage (and the no-PP case): byte-identical to the
+                # previous behaviour, deliberately -- get_pp_layer_set returns
+                # None whenever the set form is unused.
+                effective_layer_ids = [
+                    i
+                    for i in mambaish.full_attention_layer_ids
+                    if mr.start_layer <= i < mr.end_layer
+                ]
             num_layers = len(effective_layer_ids)
         else:
             num_layers = mr.num_effective_layers
