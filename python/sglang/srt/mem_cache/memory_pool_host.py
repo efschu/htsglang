@@ -207,13 +207,31 @@ class MambaPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = 1
 
-        # TODO: Mamba pool is currently incompatible with write-back staging
-        # kernel; only allow 'page_first_direct' + 'direct' for now.
-        # Relax this restriction once the staging bug is fixed.
-        if layout != "page_first_direct":
+        # The restriction here is the WRITE-BACK STAGING kernel, and that is the
+        # whole of it. `_init_write_back_staging_buffers` returns immediately
+        # unless the layout is exactly 'page_first', so 'page_first' is the one
+        # value that would arm the staging path this pool cannot drive.
+        #
+        # 'layer_first' IS SUPPORTED and was already implemented on every method
+        # of this class -- init_kv_buffer builds (num_layers, size, *shape)
+        # buffers, _iter_page_tensors, load_to_device_per_layer and
+        # backup_from_device_all_layer each carry a layer-first branch, and that
+        # branch dispatches to `transfer_kv_direct`, a straight per-layer copy.
+        # The blanket 'page_first_direct only' refusal predated those branches
+        # and locked the pool onto the ONE route that is known broken: under
+        # 'direct', page_first_direct sends this pool through
+        # transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, the same
+        # symbols that took three SIGSEGVs on 2026-08-18 (#760). Leaving the
+        # refusal in place would mean a hybrid-mamba model could not have a
+        # hicache host tier at all once that kernel is gated in server_args.
+        #
+        # page_head is not offered: its transfers reach the lf_ph kernel that
+        # #441a refuses on its own evidence.
+        if layout not in ("page_first_direct", "layer_first"):
             raise ValueError(
-                f"MambaPoolHost only supports layout='page_first_direct', "
-                f"got '{layout}'."
+                f"MambaPoolHost supports layout='page_first_direct' or "
+                f"'layer_first', got '{layout}'. 'page_first' would arm the "
+                f"write-back staging kernel, which this pool cannot drive."
             )
 
         self.layout = layout

@@ -4257,6 +4257,19 @@ class ServerArgs:
             ],
         ),
     ] = None
+    hicache_allow_page_first_direct: A[
+        bool,
+        Arg(
+            help=(
+                "Keep --hicache-mem-layout page_first_direct on CUDA instead of "
+                "falling back. Its host write-back reaches "
+                "transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which "
+                "segfaulted on three separate boots of this build (#760, #441a "
+                "family); the server otherwise substitutes layer_first and says so. "
+                "Set this only to retest that route against a rebuilt sgl_kernel."
+            ),
+        ),
+    ] = False
     hicache_storage_prefetch_policy: A[
         str,
         Arg(
@@ -8280,13 +8293,20 @@ class ServerArgs:
             # transfer_kv_all_layer_lf_ph, which segfaults. A checkpoint
             # writes a whole session to the host tier, so it would take that
             # route for every page rather than occasionally.
+            # The recommendation below used to name page_first_direct as a safe
+            # alternative. It is not: on 2026-08-18 its write-back
+            # (transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync) took
+            # three SIGSEGVs on this build with the transfer shapes proven
+            # matched (#760). Both broken routes are the layout-CONVERTING ones,
+            # so the advice now points at the one that converts nothing.
             raise ValueError(
                 "--enable-session-checkpoints is incompatible with "
                 "--hicache-mem-layout page_head: its host write-back takes "
                 "the transfer_kv_all_layer_lf_ph route, which segfaults "
-                "(#441a). Use page_first / page_first_direct (direct IO "
-                "reaches transfer_kv_all_layer_direct_lf_pf, #436) or "
-                "layer_first."
+                "(#441a). Use layer_first, whose write-back is a straight "
+                "per-layer copy. Do not substitute page_first_direct: its "
+                "batch-copy write-back segfaults too (#760), and the server "
+                "now falls back away from it on CUDA."
             )
         for name in (
             "session_checkpoint_vram_max_age_s",
@@ -16437,6 +16457,9 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
+        3) Broken-kernel gate, which must run LAST -- see
+           ``_gate_broken_host_transfer_kernels`` for why the order is
+           load-bearing rather than incidental.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -16450,6 +16473,116 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
+
+        # Step 3: Refuse the host write-back kernels this build cannot run.
+        self._gate_broken_host_transfer_kernels()
+
+    def _gate_broken_host_transfer_kernels(self):
+        """#760: keep hicache off the sgl_kernel batch-copy routes that segfault.
+
+        WHAT IS BROKEN, AND HOW WE KNOW. ``page_first_direct`` selects
+        ``transfer_kv_all_layer_direct_lf_pf`` for the host write-back
+        (``pool_host/mha.py``, the ``io_backend == "direct"`` branch of
+        ``backup_from_device_all_layer``). On this build that route dies inside
+        ``transfer_kv_page_first_direct_impl -> cudaMemcpyBatchAsync``: three
+        boots on 2026-08-18 (07:48, 08:08, 09:03 UTC) took a SIGSEGV in the
+        scheduler with the same three symbols, each about 2.5 minutes into load,
+        with 100+ GiB of host memory free at the moment of death -- so it is not
+        memory pressure.
+
+        IT IS NOT A CALLER BUG, which is the only reason this gate is a gate and
+        not a workaround for our own mistake. The 09:03 boot ran with the #760
+        shape guard proven armed on the live seam (``KV-TRANSFER-GUARD ARMED at
+        MHATokenToKVPoolHost.backup_from_device_all_layer`` on all three ranks,
+        src layer-vectors equal to dst on every rank), it refused zero
+        transfers, and it segfaulted anyway. Matched shapes plus a crash puts
+        the fault below the Python seam.
+
+        SAME FAMILY AS #441a, which already refuses ``page_head`` because its
+        write-back takes ``transfer_kv_all_layer_lf_ph`` and segfaults. Both
+        broken routes are the LAYOUT-CONVERTING ones -- host layout differs from
+        device layout, so the copy is a gathered batch rather than a contiguous
+        run. The fallback below is chosen to need no conversion at all.
+
+        WHY ``layer_first``. Host layout equals device layout, so the write-back
+        is a straight copy: ``transfer_kv_direct`` under direct IO,
+        ``transfer_kv_all_layer`` under kernel IO. Neither is in the batch-copy
+        family. It is also the value BOTH host pools can take: on a hybrid-mamba
+        model the same server arg configures ``MambaPoolHost``, whose
+        ``page_first_direct`` branch calls the identical crashing symbol, and
+        whose layer-first branch reaches ``transfer_kv_direct`` per layer. Gating
+        the KV pool alone would have left the mamba host tier on the broken
+        route -- and the #760 shape guard only ever watched the KV pool, so a
+        crash originating in the mamba pool would have looked exactly like the
+        three we saw. It is also the only value that survives step 1 untouched --
+        ``page_first`` + ``direct`` is rewritten straight back to
+        ``page_first_direct`` by ``_resolve_layout_io_compatibility``, which is
+        exactly how an earlier isolation attempt nearly tested the crashing
+        layout while believing it had avoided it.
+
+        WHY THIS RUNS AFTER STEP 2 rather than inside step 1: with the mooncake
+        storage backend, ``_resolve_storage_layout_compatibility`` rewrites
+        ``layer_first`` + ``direct`` back into ``page_first_direct``. A fallback
+        applied before that rule would be silently undone. Mooncake therefore
+        gets the other non-converting-enough option, ``page_first`` + ``kernel``,
+        which that rule leaves alone.
+
+        SCOPE. CUDA only. ROCm/NPU/XPU reach different kernels (and step 1
+        already diverts ROCm's ``page_first`` case), so refusing there would gate
+        a path this evidence says nothing about.
+
+        The gate is overridable with ``--hicache-allow-page-first-direct`` for
+        whoever rebuilds sgl_kernel and wants to retest the route; it warns
+        loudly rather than passing quietly, because a knob that re-arms a known
+        segfault should be visible in the log of the boot that then dies.
+        """
+        if self.hicache_mem_layout != "page_first_direct":
+            return
+        if not is_cuda():
+            return
+
+        if self.hicache_allow_page_first_direct:
+            logger.warning(
+                "HICACHE-LAYOUT-GATE OVERRIDDEN: keeping --hicache-mem-layout "
+                "page_first_direct although its host write-back "
+                "(transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync) "
+                "took a SIGSEGV on three separate boots of this build (#760, "
+                "#441a family). If this boot dies in the scheduler a few "
+                "minutes in, that is the reason."
+            )
+            return
+
+        if self.hicache_storage_backend == "mooncake":
+            # layer_first is unavailable here: _resolve_storage_layout_compatibility
+            # would convert it straight back into page_first_direct.
+            new_layout, new_io = "page_first", "kernel"
+            why = (
+                "the mooncake storage backend refuses layer_first, so the "
+                "fallback is the upstream default pair -- note a hybrid-mamba "
+                "model will then be refused by MambaPoolHost, which drives "
+                "neither page_first nor the kernel backend"
+            )
+        else:
+            new_layout, new_io = "layer_first", self.hicache_io_backend
+            why = (
+                "layer_first needs no layout conversion on write-back, so it "
+                "does not reach the batch-copy kernel"
+            )
+
+        logger.warning(
+            "HICACHE-LAYOUT-GATE: --hicache-mem-layout page_first_direct is "
+            "refused on CUDA -- its host write-back takes "
+            "transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which "
+            "segfaults in this sgl_kernel build (#760, same family as the "
+            "#441a page_head refusal). Falling back to layout %s with io "
+            "backend %s: %s. Pass --hicache-allow-page-first-direct to keep "
+            "the crashing route.",
+            new_layout,
+            new_io,
+            why,
+        )
+        self.hicache_mem_layout = new_layout
+        self.hicache_io_backend = new_io
 
     def _resolve_layout_io_compatibility(self):
         if (
