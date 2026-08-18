@@ -35,6 +35,10 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    #: #755: opt-in lock reorder (dec -> alloc -> copy -> insert -> inc).
+    #: Decided by mamba_pool_floor.mamba_slot_reorder_active, which also
+    #: decides the floor -- one predicate, so the two cannot disagree.
+    mamba_slot_reorder: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

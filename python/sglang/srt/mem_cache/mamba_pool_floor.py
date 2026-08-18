@@ -72,6 +72,45 @@ def mamba_ping_pong_slots(server_args: "ServerArgs") -> int:
     return 1 if server_args.disable_overlap_schedule else 2
 
 
+#: #755: the env that opts into the lock reorder. Default OFF, so the floor and
+#: the runtime are byte-identical to before this existed unless asked for.
+MAMBA_SLOT_REORDER_ENV = "SGLANG_MAMBA_SLOT_REORDER"
+
+
+def mamba_slot_reorder_active(server_args: "ServerArgs") -> bool:
+    """True when the #755 lock reorder may drop the donation/pin double-count.
+
+    THREE CONDITIONS, all necessary, and the reason each is necessary is the
+    reason the floor may move:
+
+    1. the radix cache is on -- without it there is no donation and no pin to
+       share, and the floor is already 1 + ping-pong;
+    2. hierarchical cache is on AND the write policy is write-through -- the
+       reorder releases the OLD anchor before allocating the new slot, so a
+       failed alloc or an eviction inside that window must degrade to
+       ``load_back`` rather than to a dead anchor (NOTE_755 section 3). A
+       device-only pool cannot offer that, and write-around/write-back cannot
+       promise the backup EXISTS at release time;
+    3. the operator opted in.
+
+    The predicate is CONFIG-level and decides the floor. The per-node question
+    -- is THIS anchor backed up right now -- is asked again at the site, and a
+    node that is not backed takes the skip path rather than silently reverting
+    to the 3-slot order the floor no longer reserves. That split is the whole
+    safety argument: the floor may only drop if EVERY path under this config
+    stays within the reduced budget.
+    """
+    import os
+
+    if server_args.disable_radix_cache:
+        return False
+    if not getattr(server_args, "enable_hierarchical_cache", False):
+        return False
+    if getattr(server_args, "hicache_write_policy", None) != "write_through":
+        return False
+    return os.getenv(MAMBA_SLOT_REORDER_ENV, "") not in ("", "0", "false", "False")
+
+
 def mamba_slots_per_running_req(server_args: "ServerArgs") -> int:
     """Mamba slots one running request can hold simultaneously."""
     slots = MAMBA_FLOOR_ACTIVE_SLOTS
@@ -80,6 +119,17 @@ def mamba_slots_per_running_req(server_args: "ServerArgs") -> int:
         # only ever owns its active state slot.
         return slots
     slots += mamba_ping_pong_slots(server_args)
+    if mamba_slot_reorder_active(server_args):
+        # #755: the donated slot BECOMES the next pinned checkpoint. The
+        # double-count existed only because the old pin was held across the
+        # alloc; releasing it first makes the two terms one. NOT a formula-only
+        # edit -- mamba_radix_cache's insert flow performs the matching reorder
+        # and refuses (skips the insert) for any node it cannot release safely,
+        # so no path under this config exceeds the reduced budget. Changing
+        # this constant alone would under-floor the pool and resurrect the #581
+        # late assert (NOTE_755 section 3).
+        slots += MAMBA_FLOOR_DONATION_SLOTS
+        return slots
     slots += MAMBA_FLOOR_DONATION_SLOTS
     slots += MAMBA_FLOOR_PINNED_CHECKPOINT_SLOTS
     return slots
@@ -101,6 +151,14 @@ def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -
     pp = mamba_ping_pong_slots(server_args)
     if server_args.disable_radix_cache:
         terms = f"{MAMBA_FLOOR_ACTIVE_SLOTS} active (radix cache disabled)"
+    elif mamba_slot_reorder_active(server_args):
+        terms = (
+            f"{MAMBA_FLOOR_ACTIVE_SLOTS} active"
+            f" + {pp} ping-pong"
+            f" + {MAMBA_FLOOR_DONATION_SLOTS} donation/pinned checkpoint"
+            f" (#755 reorder: the donated slot BECOMES the pin, so the two"
+            f" share)"
+        )
     else:
         terms = (
             f"{MAMBA_FLOOR_ACTIVE_SLOTS} active"
