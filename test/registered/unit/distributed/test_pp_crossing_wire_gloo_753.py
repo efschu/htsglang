@@ -24,6 +24,18 @@ import multiprocessing as mp
 import socket
 import unittest
 
+# Spawn children re-execute this module with the PARENT'S sys.path at spawn
+# time; a foreign entry earlier in that list (any collection-time prepend
+# elsewhere) would shadow this repo's sglang in the CHILD only. Pin the repo
+# root derived from THIS FILE, before any sglang import, so the children are
+# immune to selection order (the Worktree-PYTHONPATH trap).
+import pathlib as _pl
+import sys as _sys
+
+_REPO_PY = str(_pl.Path(__file__).resolve().parents[4] / "python")
+if _sys.path[:1] != [_REPO_PY]:
+    _sys.path.insert(0, _REPO_PY)
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
