@@ -790,6 +790,9 @@ class ModelRunnerKVCacheMixin:
             used_by_me_gb = pre_model_load_memory - available_gpu_memory
             rest_memory = budget_gb - used_by_me_gb
             budget_posts.append(("weights + runtime state", used_by_me_gb))
+            rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)
+            if _reserve_post is not None:
+                budget_posts.append(_reserve_post)
             # #260: the budget is ABSOLUTE, so a co-resident process must
             # never shrink it -- but it does bound what this rank can
             # physically allocate. That bound gets its own check and its own
@@ -2475,6 +2478,61 @@ class ModelRunnerKVCacheMixin:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
+
+    def _gapped_corridor_holdback(self: ModelRunner, rest_memory: float):
+        """Hold back the user reserve on a gapped cut. Returns (rest, post).
+
+        ``rank_user_reserve_mib`` is the corridor headroom -- the free column a
+        card is meant to keep for the user -- and it had exactly ONE consumer,
+        ``phase_flip_runtime``. A plain PP boot driven by
+        ``--rank-gpu-memory-mib`` therefore spent the budget to the last MiB:
+        boot v7pp8 priced PP2 at weights 6.248 + mamba 0.384 + pool 11.923 GiB
+        against an 18.55 GiB budget and left 0.15 GB free, then died on a
+        32 MiB decode allocation. The pool was not mis-priced; there was simply
+        nothing left for the transients the price does not cover.
+
+        GATED TO THE GAPPED PATH ON PURPOSE. Every shipped configuration was
+        solved against today's arithmetic, and silently moving the reserve into
+        the posts would shrink every one of their KV pools by a gigabyte per
+        card -- a change to solved, measured configurations that no boot here
+        has evidence for. The gapped cut is the new path and the one with the
+        demonstrated OOM, so it is the only one whose sizing moves.
+
+        The corridor is a TARGET and not a hard floor (softened 2026-08-16:
+        undershoot is allowed with a warning, the hard rule is OOM avoidance),
+        so this holds back at most what is actually available and never drives
+        the pool negative.
+        """
+        try:
+            from sglang.srt.distributed.utils import pp_gapped_ownership_active
+
+            pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
+            if not pp_gapped_ownership_active(pp_size):
+                return rest_memory, None
+            # None means "unset, take the default"; 0 means "the operator asked
+            # for no holdback". The ``or`` idiom conflates the two and would
+            # make the reserve impossible to switch off.
+            configured = getattr(self.server_args, "rank_user_reserve_mib", None)
+            reserve_mib = 1024 if configured is None else int(configured)
+            if reserve_mib <= 0:
+                return rest_memory, None
+            reserve_gb = reserve_mib / 1024.0
+            if reserve_gb >= rest_memory:
+                # Never negative: a budget this tight is a configuration
+                # problem, and it is reported by the exhausted-budget path
+                # with its own words rather than disguised as a tiny pool.
+                logger.warning(
+                    "gapped corridor holdback of %.3f GiB exceeds the %.3f GiB "
+                    "left for KV on this rank; holding back nothing and "
+                    "letting the budget check speak for itself.",
+                    reserve_gb,
+                    rest_memory,
+                )
+                return rest_memory, None
+            return rest_memory - reserve_gb, ("gapped corridor holdback", reserve_gb)
+        except Exception as e:  # noqa: BLE001 - sizing may never die on this
+            logger.warning("gapped corridor holdback skipped: %s", e)
+            return rest_memory, None
 
     @property
     def post_capture_kv_active(self: ModelRunner) -> bool:

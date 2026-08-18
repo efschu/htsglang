@@ -310,5 +310,61 @@ class TestCrossingsAndOutputsShareOneChannel(unittest.TestCase):
         self.assertEqual(payload["__msg_type__"], CROSSING_KIND)
 
 
+class TestGappedCorridorHoldback(unittest.TestCase):
+    """The reserve a gapped rank keeps back, and who it must not touch.
+
+    v7pp8 priced PP2 at weights 6.248 + mamba 0.384 + pool 11.923 GiB against
+    an 18.55 GiB budget, left 0.15 GB free, and died on a 32 MiB decode
+    allocation. ``rank_user_reserve_mib`` existed for exactly this and had one
+    consumer, on the phase-flip path.
+    """
+
+    def _call(self, rest, *, layer_set=GAPPED_SET, wire="1", reserve=1024, pp=3):
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        class _SA:
+            pp_size = pp
+            rank_user_reserve_mib = reserve
+
+        class _Stub:
+            server_args = _SA()
+
+        env = {PP_CROSSING_WIRE_ENV: wire}
+        if layer_set is not None:
+            env[PP_LAYER_SET_ENV] = layer_set
+        with mock.patch.dict(os.environ, env, clear=True):
+            return ModelRunnerKVCacheMixin._gapped_corridor_holdback(_Stub(), rest)
+
+    def test_gapped_rank_holds_the_reserve_back(self):
+        rest, post = self._call(11.923)
+        self.assertAlmostEqual(rest, 10.923, places=6)
+        self.assertIsNotNone(post)
+        self.assertAlmostEqual(post[1], 1.0, places=6)
+
+    def test_contiguous_boot_sizing_is_untouched(self):
+        """Every shipped configuration must price exactly as before."""
+        rest, post = self._call(11.923, layer_set=CONTIGUOUS_SET)
+        self.assertEqual(rest, 11.923)
+        self.assertIsNone(post)
+
+    def test_boot_without_a_layer_set_is_untouched(self):
+        rest, post = self._call(11.923, layer_set=None)
+        self.assertEqual(rest, 11.923)
+        self.assertIsNone(post)
+
+    def test_reserve_never_drives_the_pool_negative(self):
+        """A budget tighter than the reserve is reported, not disguised."""
+        rest, post = self._call(0.5)
+        self.assertEqual(rest, 0.5)
+        self.assertIsNone(post)
+
+    def test_reserve_can_be_switched_off(self):
+        rest, post = self._call(11.923, reserve=0)
+        self.assertEqual(rest, 11.923)
+        self.assertIsNone(post)
+
+
 if __name__ == "__main__":
     unittest.main()
