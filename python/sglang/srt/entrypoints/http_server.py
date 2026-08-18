@@ -430,6 +430,19 @@ async def lifespan(fast_api_app: FastAPI):
     # a watchdog on its response.
     liveness_config = install_client_liveness(server_args)
 
+    # #305 request-path binding. Off unless SGLANG_REQUEST_BINDING names a
+    # control plane, and installed here -- before the handlers -- because the
+    # switch it flips is the module-global that every handler's
+    # ``handle_request`` reads. A boot without it is byte-for-byte the boot
+    # this server did before #305: one model, no registry, no lookup.
+    from sglang.srt.entrypoints.openai import request_binding  # noqa: PLC0415
+
+    if request_binding.init_binding_from_env():
+        logger.info(
+            "#305: request-path binding is ON; every request resolves its "
+            "model through the engine registry."
+        )
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager

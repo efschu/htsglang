@@ -39,6 +39,7 @@ def build_app(
     *,
     api_key: str | None = None,
     admin_api_key: str | None = None,
+    control_tick: Any = None,
 ):
     """A FastAPI app over one registry. Imported lazily; the core needs no web.
 
@@ -63,6 +64,10 @@ def build_app(
 
     app = FastAPI(title="htsglang engine registry", version="1")
     app.state.registry = registry
+    # #305 control tick. None means no background tick was configured; the
+    # routes below still answer, they just report it as off and build a
+    # disabled one on demand so "what would it do" stays a dry-run away.
+    app.state.control_tick = control_tick
 
     def _error(status: int, payload: dict[str, Any]) -> JSONResponse:
         return JSONResponse(payload, status_code=status)
@@ -145,6 +150,84 @@ def build_app(
             allow_eviction=bool(body.get("allow_eviction", True)),
         )
         return instance.to_json()
+
+    @app.post("/registry/engines/{engine_id}/acquire")
+    async def post_acquire(engine_id: str, body: dict = Body(default={})):
+        """§7.5 admission, for the SERVING path rather than for an operator.
+
+        Deliberately distinct from ``/state``: that route is an operator saying
+        where a model should sit, this one is a request saying it needs the
+        model now. The difference is the in-flight count -- an acquire is held
+        until the matching release, and the control tick will not step an
+        engine down while anything is in flight against it. An operator's
+        ``/state`` call carries no such claim and must not be turned into one.
+
+        Refusals keep the shape the request path can forward: 404 unregistered,
+        409 the transition to HOT is not implemented for this engine's class,
+        503 it is implemented but cannot be funded now (with the projected wait
+        and the eviction list in the body).
+        """
+        from sglang.srt.registry.ladder import LadderRefusal  # noqa: PLC0415
+
+        wait = (body or {}).get("max_promotion_wait_ms")
+        try:
+            instance = registry.acquire_for_request(
+                engine_id,
+                max_promotion_wait_ms=None if wait is None else float(wait),
+            )
+        except LadderRefusal as exc:
+            return _error(409, {"error": "ladder_edge_unbuilt", "message": str(exc)})
+        payload = instance.to_json()
+        payload["inflight"] = registry.inflight(engine_id)
+        return payload
+
+    @app.post("/registry/engines/{engine_id}/release")
+    async def post_release(engine_id: str, body: dict = Body(default={})):
+        """Give back one in-flight slot. Idempotent-ish and never an error.
+
+        A release that arrives for an engine nobody acquired is logged and
+        answered 200: this is called from a ``finally`` on a request path that
+        has already produced its response, and a 4xx here would only turn a
+        served request into a client-side error after the fact.
+        """
+        return {
+            "engine_id": engine_id,
+            "inflight": registry.release_after_request(engine_id),
+        }
+
+    @app.post("/registry/tick")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def post_tick(body: dict = Body(default={})):
+        """Run one control-tick evaluation now, and report every decision.
+
+        Present whether or not the background tick is enabled, because the
+        operator question "what would it do" must be answerable without turning
+        it on. ``{"dry_run": true}`` decides and moves nothing.
+        """
+        tick = getattr(app.state, "control_tick", None)
+        if tick is None:
+            from sglang.srt.registry.tick import ControlTick  # noqa: PLC0415
+
+            tick = ControlTick(registry)
+            app.state.control_tick = tick
+        if bool((body or {}).get("dry_run", False)):
+            return tick.evaluate().to_json()
+        return tick.run_once().to_json()
+
+    @app.get("/registry/tick")
+    async def get_tick():
+        """The last tick's report, and whether one runs on its own."""
+        tick = getattr(app.state, "control_tick", None)
+        return {
+            "enabled": bool(tick is not None and tick.enabled),
+            "interval_s": float(getattr(tick, "interval_s", 0.0) or 0.0),
+            "idle_after_s": float(getattr(tick, "idle_after_s", registry.idle_after_s)),
+            "last_report": (
+                tick.last_report.to_json()
+                if tick is not None and tick.last_report is not None
+                else None
+            ),
+        }
 
     @app.post("/registry/engines/{engine_id}/pin")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)

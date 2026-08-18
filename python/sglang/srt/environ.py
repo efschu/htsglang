@@ -445,6 +445,14 @@ class Envs:
     # inc/dec_lock_ref traffic per call site since the previous line. 0 = off
     # (default; the traced path is not entered at all).
     SGLANG_MAMBA_PIN_TRACE = EnvInt(0)
+    # #743 slot instrument: SUSTAINED lines per second for MAMBA-SLOT EVICT /
+    # TRUNCATED. Successful mamba slot eviction and mamba-caused prefix
+    # truncation were both silent, so slot pressure destroying reusable prefix
+    # could not be read from a boot log. Per-event while pressure is
+    # occasional; a SUPPRESSED rollup carrying the totals takes over above
+    # this rate. The bucket's CAPACITY is decoupled (8) so a burst inside one
+    # scheduler step is still reported in full. 0 turns the instrument off.
+    SGLANG_MAMBA_SLOT_LOG_RATE = EnvFloat(2.0)
     # Zero the attention KV data buffers on /flush_cache (default ON, set 0
     # to opt out): a flushed server must match a fresh boot bit-for-bit even
     # if some kernel folds residual bytes beyond the valid region into its

@@ -1169,19 +1169,54 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if self.disable or mamba_num <= 0:
             return 0
+        # #743 INSTRUMENT: a SUCCESSFUL eviction was the silent event. The
+        # starvation emitter below covers the pool failing to yield; nothing
+        # covered it yielding by destroying a cached anchor, which is the
+        # event that costs prefix reuse. The per-node anchor depths cost a
+        # walk to the root each, so they are collected ONLY when the rate
+        # limiter will actually print them.
+        from sglang.srt.mem_cache.mamba_slot_observer import (
+            clock,
+            emit_lines,
+            observer_of,
+            probe_available,
+        )
+
+        obs = observer_of(self)
+        now = clock()
+        trace = [] if obs.would_emit(now) else None
         # #747: one rule, both lineages. MambaRadixCache is device-only, so
         # an evicted anchor is a lost anchor and the protection stays on.
         protect = protect_deepest_anchors(
             self.mamba_checkpoint_interval, host_tier_present=False
         )
-        mamba_num_evicted = self._evict_mamba_pass(mamba_num, protect_window=protect)
+        mamba_num_evicted = self._evict_mamba_pass(
+            mamba_num, protect_window=protect, trace=trace
+        )
         if protect and mamba_num_evicted < mamba_num:
             mamba_num_evicted += self._evict_mamba_pass(
-                mamba_num - mamba_num_evicted, protect_window=False
+                mamba_num - mamba_num_evicted, protect_window=False, trace=trace
             )
+        emit_lines(
+            logger,
+            obs.note_eviction(
+                now=now,
+                requested=mamba_num,
+                evicted=mamba_num_evicted,
+                nodes=trace or (),
+                evictable=self.mamba_evictable_size(),
+                protected=self.mamba_protected_size(),
+                available=probe_available(
+                    getattr(self.req_to_token_pool, "mamba_allocator", None)
+                ),
+                lineage="device",
+            ),
+        )
         return mamba_num_evicted
 
-    def _evict_mamba_pass(self, mamba_num: int, protect_window: bool) -> int:
+    def _evict_mamba_pass(
+        self, mamba_num: int, protect_window: bool, trace: Optional[List] = None
+    ) -> int:
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -1197,6 +1232,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if protect_window and self._in_ckpt_live_window(x):
                 x = self.mamba_lru_list.get_prev_no_lock(x)
                 continue
+
+            if trace is not None:
+                # BEFORE the node is destroyed. A leaf is removed from the
+                # tree by `_evict_leaf_node`, so its depth is unrecoverable
+                # afterwards; recording both branches here keeps the two
+                # cases reporting the same quantity.
+                from sglang.srt.mem_cache.mamba_slot_observer import (
+                    anchor_depth_tokens,
+                )
+
+                trace.append((x.id, anchor_depth_tokens(x)))
 
             if len(x.children) > 0:
                 # 1. an internal node, free mamba tokens.
@@ -1702,11 +1748,34 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # re-established checkpoints stay on the deterministic grid.
         if len(value) > best_value_len:
             branch_grid = self.mamba_checkpoint_interval or self.mamba_cache_chunk_size
-            chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // branch_grid
-            ) * branch_grid
+            matched_tokens = sum(len(v) for v in value)
+            chunk_aligned_seqlen = (matched_tokens // branch_grid) * branch_grid
             mamba_branching_seqlen = (
                 chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
+            )
+            # #743 INSTRUMENT: this branch IS the truncation. `value` is what
+            # the radix matched; `value[:best_value_len]` is what a surviving
+            # mamba state can back. Until now the difference was invisible,
+            # so a cache doing its job behind a slot pool that is too small
+            # read in the logs exactly like a cache that never had the
+            # prefix. Costs nothing on the healthy path: the whole block is
+            # already conditional on a truncation having happened.
+            from sglang.srt.mem_cache.mamba_slot_observer import (
+                clock,
+                emit_lines,
+                observer_of,
+            )
+
+            emit_lines(
+                logger,
+                observer_of(self).note_truncation(
+                    now=clock(),
+                    rid=getattr(req, "rid", None),
+                    matched_tokens=matched_tokens,
+                    usable_tokens=sum(len(v) for v in value[:best_value_len]),
+                    node_id=getattr(last_node, "id", None),
+                    lineage="device",
+                ),
             )
         else:
             mamba_branching_seqlen = None

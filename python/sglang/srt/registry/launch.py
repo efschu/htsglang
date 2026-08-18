@@ -114,6 +114,19 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", default=None, help="where tenant logs go")
     parser.add_argument("--idle-after-s", type=float, default=900.0)
     parser.add_argument(
+        "--tick-interval-s",
+        type=float,
+        default=None,
+        help=(
+            "#305: seconds between control-tick evaluations, which step idle "
+            "tenants one rung down the residency ladder. DEFAULT OFF (0): "
+            "without it, idle demotion stays operator-driven via "
+            "POST /registry/idle and nothing about an existing deployment "
+            "changes. Falls back to $SGLANG_REGISTRY_TICK_INTERVAL_S. The tick "
+            "only demotes -- promotion belongs to the request path."
+        ),
+    )
+    parser.add_argument(
         "--print-plan",
         action="store_true",
         help="register, print the plan and the derived M, then exit",
@@ -137,11 +150,22 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn  # noqa: PLC0415
 
     from sglang.srt.registry.http_api import build_app  # noqa: PLC0415
+    from sglang.srt.registry.tick import build_tick  # noqa: PLC0415
 
-    app = build_app(registry, api_key=args.api_key, admin_api_key=args.admin_api_key)
+    tick = build_tick(
+        registry, interval_s=args.tick_interval_s, idle_after_s=args.idle_after_s
+    )
+    tick.start()  # a no-op that logs, unless an interval was configured
+    app = build_app(
+        registry,
+        api_key=args.api_key,
+        admin_api_key=args.admin_api_key,
+        control_tick=tick,
+    )
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
+        tick.stop()
         registry.shutdown()
     return 0
 

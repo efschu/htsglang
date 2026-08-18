@@ -55,6 +55,27 @@ MAMBA_FLOOR_ACTIVE_SLOTS = 1
 #: checkpoint the request is pinned to (`inc_lock_ref(req.last_node)`). Both
 #: exist only when the radix cache is on.
 MAMBA_FLOOR_DONATION_SLOTS = 1
+#: THE GATE IS THE RADIX CACHE, NOT `--mamba-checkpoint-interval`. #743's
+#: determination note proposed dropping this term when
+#: `mamba_checkpoint_interval is None`, to recover max_running_requests slots.
+#: REFUTED, and recorded here rather than only in the note, because the
+#: proposal is plausible enough to be tried again by the next reader:
+#:
+#: * `mamba_ckpt_utils.is_on_interval` returns True unconditionally for
+#:   `interval is None`, so the grid check never rejects with the flag unset;
+#: * `mamba_radix_cache` therefore inserts a real mamba_value on the ORDINARY
+#:   path and pins it via `inc_lock_ref(new_last_node)`, which increments
+#:   `mamba_lock_ref` for any node carrying a value;
+#: * the admission-side pin of `req.last_node` (`schedule_policy`, every
+#:   prefill add) has no interval gate at all.
+#:
+#: The slot is genuinely held with the interval unset, so removing this term
+#: would UNDER-FLOOR the pool and resurrect the #581 late assert -- the same
+#: failure the #755 note below warns about for the donation term. The
+#: interval gates WHERE resume points may fall, never WHETHER a state is
+#: cached or pinned. Full derivation in docs/dev/NOTE_743_slot_observability.md
+#: §3; the correct axis is already pinned by
+#: test_mamba_pool_floor.py's `test_radix_disabled_only_charges_the_active_slot`.
 MAMBA_FLOOR_PINNED_CHECKPOINT_SLOTS = 1
 
 
