@@ -10,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.openai import request_binding
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.liveness import EndpointClass, guard_generate_stream
@@ -22,6 +23,21 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+async def _release_after_stream(body_iterator, hold):
+    """Pass a stream through, then give the engine back -- on any ending.
+
+    ``finally`` rather than a trailing call, because the ending that matters is
+    the one nobody plans: a client that stops reading raises
+    ``GeneratorExit``/``CancelledError`` into this generator, and a hold that
+    leaked there would pin the engine hot until the process restarted.
+    """
+    try:
+        async for chunk in body_iterator:
+            yield chunk
+    finally:
+        hold.release()
 
 
 # Base class for specific endpoint handlers
@@ -78,6 +94,57 @@ class OpenAIServingBase(ABC):
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
         """
+        # #305 request-path binding. ``binding_enabled()`` is a single
+        # module-global boolean read and it is False unless a control plane was
+        # configured, so the single-model boot -- which is every boot on this
+        # rig today -- reaches ``_serve`` with nothing between it and the old
+        # code, pays no registry lookup, and returns the same bytes as before.
+        if not request_binding.binding_enabled():
+            return await self._serve(request, raw_request)
+        return await self._serve_bound(request, raw_request)
+
+    async def _serve_bound(
+        self, request: OpenAIServingRequest, raw_request: Request
+    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+        """Acquire the named engine, serve, release when the response is done.
+
+        The hold outlives this frame for a stream: a generation is in flight
+        until its last chunk, and the control tick reads exactly this count
+        when it decides whether an engine may step down a rung. Releasing at
+        ``return`` would let a long generation be demoted mid-stream.
+        """
+        try:
+            hold = request_binding.acquire(getattr(request, "model", "") or "")
+        except request_binding.BindingRefused as refusal:
+            logger.info(
+                "request binding: refusing %s (%s): %s",
+                refusal.detail.get("engine_id", "?"),
+                refusal.code,
+                refusal.message,
+            )
+            return self.create_error_response(
+                message=refusal.message,
+                err_type=refusal.err_type,
+                status_code=refusal.status_code,
+            )
+        released = False
+        try:
+            response = await self._serve(request, raw_request)
+        except BaseException:
+            released = True
+            hold.release()
+            raise
+        if isinstance(response, StreamingResponse):
+            response.body_iterator = _release_after_stream(response.body_iterator, hold)
+            return response
+        if not released:
+            hold.release()
+        return response
+
+    async def _serve(
+        self, request: OpenAIServingRequest, raw_request: Request
+    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+        """The request path itself, unchanged by #305."""
         received_time = monotonic_time()
         # One float store, on the one path every OpenAI-shaped generation
         # request goes through. The idle training tenant (#341) reads it to

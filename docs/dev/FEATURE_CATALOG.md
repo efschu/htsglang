@@ -2941,6 +2941,48 @@ rebind on hot) is filed, and the live bindings are window items. Latency is repo
 SPLIT: time-to-first-serve vs time-to-full-restore. `--never-park` is the hard
 override. GPU verification of the nvidia-smi drop and the wake numbers is
 BOOT-PENDING (NOTE_546 §6).
+**#305 request-path binding and the control tick (2026-08-18, desk +
+hermetic).** The determination `VERDICT_305_multi_model.md` found the control
+plane BUILT and the binding ABSENT — `arbiter.acquire_for_request`
+(`registry/arbiter.py:911` at the time) had ZERO callers and every
+state-changing verb was admin-HTTP or startup-file only. Both named remainders
+are now code. **Binding**: `entrypoints/openai/request_binding.py` +
+`serving_base.handle_request`, model name -> registry lookup -> acquire ->
+hold for the request's lifetime -> release, with two interchangeable binders
+(`InProcessBinder` over an `EngineRegistry`, `HttpBinder` over the control
+plane's new `POST /registry/engines/{id}/acquire|release`). Four NAMED
+refusals, never a hang: 404 `model_not_found`, 409 `ladder_edge_unbuilt`
+(waiting cannot help — the rung does not exist for that class), 503
+`engine_not_wakeable` carrying the arbiter's projected wait and eviction list,
+503 `registry_unreachable`. The anti-hang rule is structural: a FINITE
+`max_promotion_wait_ms` (default 30 s) makes the arbiter refuse an expensive
+promotion up front instead of starting it, and the HTTP binder's socket
+timeout bounds the conversation. **Off by default and free when off**:
+`binding_enabled()` is one module-global boolean, false unless
+`SGLANG_REQUEST_BINDING` names a control plane, and the fast path returns the
+object `_serve` produced — pinned as identity, and by a counting binder that
+must record zero calls. Streaming holds release only after the last chunk,
+including on `GeneratorExit` from a client that stops reading. **Tick**:
+`registry/tick.py`, the periodic idle-set evaluation `return_to_idle`'s own
+docstring names as missing. It is NOT `return_to_idle` on a timer: that
+actuator goes straight to COLD and throws away the middle rung on the only
+class that implements it. Every step is an edge `ladder.py` declares
+reachable (`step_down_target` scans downward for the first rung the class
+HAS — adjacency is not reachability), a rung stepped over is reported in the
+decision, an undeclared class is REFUSED with a log line and left where it
+is, and it NEVER promotes (that would be cut 4, whose #375 gate is recorded
+UNFULFILLED). Default off behind `--tick-interval-s` /
+`$SGLANG_REGISTRY_TICK_INTERVAL_S`. It does not touch #286's
+`RealMovementBackend` — pinned by source inspection. **Defect found and fixed
+on the way**: `ensure_state` routed on the TARGET's name, so HOT -> WARM_GPU
+went into `_promote`, where Class 1 refuses it outright ("no promotion path
+HOT -> WARM_GPU", `adapters/class1_srt.py`) — the TEIL-HOT rung was
+unreachable DOWNWARD for the only class that has it. It now routes on
+direction via `_RESIDENCY_RANK`, pinned against `ladder.RUNG_ORDER`. New:
+in-flight accounting (`acquire_for_request` / `release_after_request` /
+`inflight`, also in `snapshot()`), which is what stops the tick demoting
+mid-generation — `last_used_ts` alone says when a request STARTED. 54 tests,
+zero new failures against a 660-passed baseline.
 **The language pair is never in the code**: the supported set is derived at
 runtime as ASR x MT x TTS (`/api/translator/languages` also returns the
 per-stage sets, so a missing language is attributable to a checkpoint rather

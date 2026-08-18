@@ -81,13 +81,63 @@ The declaration is pinned against the adapters' own refusal text, so it cannot
 drift from the code it describes (a mutation adding a rung the adapter refuses
 turns 7 tests red).
 
+## Built since: the binding and the tick (2026-08-18, Slot-2)
+
+Remainders 1 and 2 below are now code. Desk + hermetic; the GPU leg is still
+open (see "Still open" further down).
+
+| piece | where | what it does |
+|---|---|---|
+| **request-path binding** | `entrypoints/openai/request_binding.py`; `serving_base.py` `handle_request` / `_serve_bound` / `_serve` | model name -> registry lookup -> acquire -> hold for the request lifetime -> release. Two binders behind one contract: `InProcessBinder` (an `EngineRegistry` in this process) and `HttpBinder` (the control plane's new `POST /registry/engines/{id}/acquire` and `/release`). |
+| **control tick** | `registry/tick.py`; `--tick-interval-s` in `launch.py`; `POST` and `GET /registry/tick` | the periodic idle-set evaluation `return_to_idle`'s docstring names as missing. Steps idle tenants ONE rung down, only along edges `ladder.py` declares reachable. |
+
+**Refusal, never a hang.** Four named errors: 404 `model_not_found`, 409
+`ladder_edge_unbuilt` (waiting cannot help — the rung does not exist for that
+class), 503 `engine_not_wakeable` carrying the arbiter's own projected wait and
+eviction list, 503 `registry_unreachable`. The anti-hang property is
+structural, not a timeout bolted on: a FINITE `max_promotion_wait_ms` (30 s
+default) makes the arbiter refuse an expensive promotion up front rather than
+start it, and the HTTP binder's socket timeout bounds the conversation.
+
+**The single-model fast path pays nothing.** `binding_enabled()` is one
+module-global boolean, false unless `SGLANG_REQUEST_BINDING` names a control
+plane. Pinned two ways: the fast path returns the object `_serve` produced
+(identity, not equality), and a counting binder must record zero calls.
+
+**The tick is not `return_to_idle` on a timer.** That actuator takes everything
+outside `default_hot` straight to COLD, discarding the middle rung on the only
+class that implements it. The tick asks `ladder.step_down_target` which rung
+the class can actually reach next — adjacency is not reachability — reports any
+rung it stepped over, refuses an undeclared class loudly and leaves it where it
+is, and NEVER promotes (that would be cut 4, gate UNFULFILLED per #375). It
+does not touch #286's `RealMovementBackend`; that is pinned by source
+inspection, so a later edit that reached for the mover turns red.
+
+**Defect found on the way, and fixed.** `ensure_state` routed on the TARGET's
+name (`if target in (HOT, WARM_GPU): _promote`), so HOT -> WARM_GPU went into
+`_promote`, where Class 1 refuses it outright ("no promotion path HOT ->
+WARM_GPU", `adapters/class1_srt.py`). **The TEIL-HOT rung was unreachable
+downward for the only class that has it** — the rung this determination calls
+the valuable one could be entered from COLD but never from HOT. It now routes
+on direction (`_RESIDENCY_RANK`, pinned against `ladder.RUNG_ORDER`).
+
+**In-flight accounting** is new on the arbiter (`acquire_for_request` /
+`release_after_request` / `inflight`, and in `snapshot()`). It is what stops
+the tick demoting mid-generation: `last_used_ts` records when a request
+STARTED, which is not enough for a generation longer than the idle threshold.
+
+Tests: `test/registered/unit/entrypoints/openai/test_request_binding_305.py`
+(31) and `test/registered/unit/registry/test_control_tick_305.py` (23). 54 new,
+zero new failures against a 660-passed baseline at the harvest tip.
+
 ## Honest remainder — what is genuinely open
 
-1. **The binding.** Every state-changing verb is admin-HTTP or startup-file
-   only. Wiring the request path to `acquire_for_request` is the single change
-   that would make #305 autonomous — and it is a serving-path change needing a
-   boot, not desk work.
-2. **The tick.** `return_to_idle()` needs a caller. Also boot-gated.
+1. ~~**The binding.**~~ BUILT (above). What remains is the GPU leg: no boot has
+   yet driven a real promotion through the request path, so promotion LATENCY
+   under a live request is unmeasured.
+2. ~~**The tick.**~~ BUILT (above), default off. Its steps have never been
+   executed against a real Class-1 adapter, so the TEIL-HOT park's actual
+   reclaim is still the card window's question.
 3. **Registry persistence** for runtime-added specs (design cut 5).
 4. **Cut 4 (autonomous promotion policy) should NOT be built**: its gate is
    recorded UNFULFILLED in #375 — the objective divergence that would justify it

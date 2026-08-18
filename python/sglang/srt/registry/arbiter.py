@@ -221,6 +221,17 @@ class HotCapacity:
         }
 
 
+#: Descending residency, most resident first. Only used to tell a promotion
+#: from a demotion; the ladder's own ordering lives in ``ladder.RUNG_ORDER``
+#: and this is pinned against it by test.
+_RESIDENCY_RANK: dict[ResidencyState, int] = {
+    ResidencyState.HOT: 0,
+    ResidencyState.WARM_GPU: 1,
+    ResidencyState.WARM_HOST: 2,
+    ResidencyState.COLD: 3,
+}
+
+
 @dataclass
 class _Transition:
     engine_id: str
@@ -268,6 +279,13 @@ class EngineRegistry:
         self._default_hot: tuple[str, ...] = tuple(default_hot)
         self._history: list[_Transition] = []
         self.thrash_events: list[dict[str, Any]] = []
+        #: #305 request-path binding: how many requests are being served by
+        #: each engine right now. ``acquire_for_request`` raises it,
+        #: ``release_after_request`` lowers it. The control tick reads it, and
+        #: that is the whole reason it exists: ``last_used_ts`` says when a
+        #: request STARTED, which is not enough to keep a long generation from
+        #: being demoted out from under itself.
+        self._inflight: dict[str, int] = {}
 
     # -- introspection -----------------------------------------------------
 
@@ -764,7 +782,14 @@ class EngineRegistry:
             if instance.state == target:
                 instance.last_used_ts = self._clock()
                 return instance
-            if target in (ResidencyState.HOT, ResidencyState.WARM_GPU):
+            # Direction decides, not the target's name. WARM_GPU is a
+            # promotion when reached from COLD and a demotion when reached
+            # from HOT; routing on the target alone sent HOT -> WARM_GPU into
+            # ``_promote``, where Class 1's adapter refuses it outright ("no
+            # promotion path HOT -> WARM_GPU", ``class1_srt.py:244-247``). The
+            # TEIL-HOT rung was therefore unreachable downward for the class
+            # that is the only one implementing it.
+            if _RESIDENCY_RANK[target] < _RESIDENCY_RANK[instance.state]:
                 return self._promote(
                     instance, adapter, target, max_promotion_wait_ms, allow_eviction
                 )
@@ -911,14 +936,78 @@ class EngineRegistry:
     def acquire_for_request(
         self, engine_id: str, *, max_promotion_wait_ms: float | None = None
     ) -> EngineInstance:
-        """§7.5's admission path: make this engine serve, or say why not."""
+        """§7.5's admission path: make this engine serve, or say why not.
+
+        Three refusals, all before any actuator runs, all naming themselves:
+
+        * ``UnknownEngineError`` -- the model is not registered here.
+        * ``LadderRefusal`` -- the engine IS registered but the edge from where
+          it currently sits up to HOT is not implemented for its class. This is
+          the ``ladder.py`` gate, and it is checked here rather than left to the
+          adapter so the caller is refused instead of discovering an
+          ``AdapterError`` mid-promotion.
+        * ``PromotionRejected`` -- the edge exists but the rig cannot fund it
+          now, or funding it would cost more than the caller's budget. Carries
+          the projected wait and the eviction list.
+
+        On success the in-flight count for this engine rises by one and stays
+        up until :meth:`release_after_request`. A caller that acquires and
+        never releases pins the engine hot, which is why the request path
+        releases in a ``finally``.
+        """
+        from sglang.srt.registry import ladder  # noqa: PLC0415 - avoid a cycle
+
+        with self._lock:
+            instance = self.instance(engine_id)
+            current = ladder.rung_of_state(instance.state)
+            klass = instance.spec.adapter
+            if current != ladder.HOT:
+                ladder.check_transition(klass, current, ladder.HOT)
         instance = self.ensure_state(
             engine_id,
             ResidencyState.HOT,
             max_promotion_wait_ms=max_promotion_wait_ms,
         )
-        instance.last_used_ts = self._clock()
+        with self._lock:
+            instance.last_used_ts = self._clock()
+            self._inflight[engine_id] = self._inflight.get(engine_id, 0) + 1
         return instance
+
+    def release_after_request(self, engine_id: str) -> int:
+        """Give back one in-flight slot. Returns what is still in flight.
+
+        Never raises for an unknown or over-released engine: this runs in a
+        ``finally`` on the request path, and turning a release into an error
+        would replace a completed response with a 500. It floors at zero and
+        says so in the log instead.
+        """
+        with self._lock:
+            current = self._inflight.get(engine_id, 0)
+            if current <= 0:
+                logger.warning(
+                    "registry: release_after_request(%s) with nothing in flight; "
+                    "an acquire was lost or a release ran twice",
+                    engine_id,
+                )
+                self._inflight.pop(engine_id, None)
+                return 0
+            remaining = current - 1
+            if remaining:
+                self._inflight[engine_id] = remaining
+            else:
+                self._inflight.pop(engine_id, None)
+            instance = self._instances.get(engine_id)
+            if instance is not None:
+                # Stamp on RELEASE as well as on acquire: last_used_ts must
+                # mean "last moment this engine was busy", or a generation
+                # longer than idle_after_s looks idle while it is still
+                # producing tokens.
+                instance.last_used_ts = self._clock()
+            return remaining
+
+    def inflight(self, engine_id: str) -> int:
+        with self._lock:
+            return self._inflight.get(engine_id, 0)
 
     # -- idle --------------------------------------------------------------
 
@@ -1005,6 +1094,7 @@ class EngineRegistry:
                 "hot_capacity": self.hot_capacity().to_json(),
                 "idle_after_s": self.idle_after_s,
                 "thrash_events": list(self.thrash_events),
+                "inflight": dict(self._inflight),
             }
 
     def refresh_measured(self) -> None:
