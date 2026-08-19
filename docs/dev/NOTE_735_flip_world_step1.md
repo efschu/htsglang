@@ -96,3 +96,40 @@ decision. What is shown: the Step-1 cut survives the flip world on the
 requantized checkpoint, keeps its prefill advantage, and flips repeatedly and
 cleanly; the open questions are the one-rank seam concentration and the 550000
 pool being a carried constant rather than a solved one.
+
+## #767 — the early release fired against an in-flight copy (fixed), and the poison outlived the boot
+
+Root: `_mamba_early_release_admissible` accepted `mamba_backuped`, which reads
+`mamba_host_value is not None`. The write-through path publishes that value in
+the same block that HANDS the transfer to the cache controller and records the
+node in `ongoing_write_through` / `_write_through_inflight`
+(`hi_mamba_radix_cache.py:412-432`). Between queue and ack the anchor is an
+intention, not a copy, so #755 released the pin against it and the node became
+evictable before its bytes landed. The predicate now also requires the copy to
+have LANDED (`_mamba_host_copy_complete`, overridden on the hierarchical pool).
+
+Measured with salted greedy "capital of France" probes, so no probe could be
+served from a cache key:
+
+| arm | degenerate |
+|---|---|
+| full boot, reorder ON, pre-fix | **9 / 10** |
+| bisect: `SGLANG_MAMBA_SLOT_REORDER=0`, pre-fix | 1 / 10 |
+| full boot, reorder ON, post-fix | **0 / 10**, then 1 / 10 on a later run |
+
+TWO SILENT SYMPTOMS CONFIRMED IT: zero #755 refusals were ever logged (every
+node claimed to be backed) while there were zero completed-backup markers, and a
+deliberate prefix repeat reported `cached=None`. A contract that never refuses
+and never completes is not being met.
+
+**THE POISON IS DURABLE, AND THE FIX ALONE DOES NOT CLEAR IT.** With the fix in
+place the SALTED probes were clean while the CACHED prompt stayed degenerate on
+all 4 attempts -- deterministically, which is what a stored bad entry looks
+like. `hicache_storage_backend=file` persists to `/tmp/hicache`: 3.5 GB, 19642
+files, 14187 of them written during the defective boots. Pointing the next boot
+at a fresh store (`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`) returned the cached
+path to `' Paris.'` on 5 of 5. So any rig that ran the defective build must have
+its disk tier purged; correctness does not come back with the patch alone.
+
+Residual: about 1 in 10 salted probes still degenerates. Smaller than the
+original defect and NOT closed -- next item, alongside #768.
