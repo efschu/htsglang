@@ -56,13 +56,21 @@ class TestTheEvictionProtectionBranch(CustomTestCase):
     def test_a_host_tier_relaxes_it(self):
         self.assertFalse(protect_deepest_anchors(CADENCE, host_tier_present=True))
 
-    def test_no_interval_means_no_protection_either_way(self):
-        """Matches `protect = self.mamba_checkpoint_interval is not None`
-        (mamba_radix_cache.py:1101): without the grid there are no anchors to
-        protect, host tier or not."""
-        for host in (False, True):
-            with self.subTest(host_tier_present=host):
-                self.assertFalse(protect_deepest_anchors(None, host_tier_present=host))
+    def test_without_an_interval_a_device_only_pool_still_protects(self):
+        """#767 CORRECTED THE PREMISE THIS TEST ENCODED.
+
+        It used to assert `protect = interval is not None` -- "without the grid
+        there are no anchors to protect". There are: the no_buffer path donates
+        a checkpoint for every finished request at `cache_len = len(token_ids)`,
+        grid or no grid, and evict_mamba's own docstring says losing the deepest
+        one "silently moves the resume point of identical requests and
+        re-introduces run-to-run drift". Measured on the short-prompt gate at 48
+        slots: 1 distinct over 10 probes idle, 2 over 20, 7 under 4-way load.
+
+        The HOST-TIER half of the branch is unchanged and still asserted below:
+        a spilled anchor stays matchable and reloads, so it may go."""
+        self.assertTrue(protect_deepest_anchors(None, host_tier_present=False))
+        self.assertFalse(protect_deepest_anchors(None, host_tier_present=True))
 
     def test_the_relaxation_is_documented_where_it_happens(self):
         """A silent relaxation is the failure mode; the reason must sit at the

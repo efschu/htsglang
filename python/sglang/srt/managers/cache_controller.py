@@ -111,6 +111,13 @@ class CacheOperation:
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
+        # #760: EVERY op carries the binding it was built against, stamped at
+        # construction rather than at one enqueue site -- an op created by any
+        # other path would otherwise be unstamped, and an unstamped op must be
+        # refused, which would silently drop legitimate write-backs.
+        from sglang.srt.mem_cache.hicache_phase_binding import current_generation
+
+        self.binding_generation = current_generation()
         self.data = None
 
         self.id = CacheOperation.counter
@@ -872,6 +879,44 @@ class HiCacheController:
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
+
+        # #760: CHECK THE STAMP AT CONSUME TIME, THE ONLY TIME THAT MATTERS. A
+        # write-back queued before a cutover carries a pointer table into the
+        # pool it was built from; after the rebind that table describes memory
+        # this phase no longer owns, and the copy walks it below the Python
+        # seam. check_shapes cannot see it -- under layer_first a stale binding
+        # is shape-IDENTICAL to the live one, which is why #760 records the
+        # shape guard armed on three ranks, refusing zero, and a SIGSEGV anyway.
+        #
+        # Refusing costs a cache MISS later, the same cheap failure the #718
+        # disarm already accepts. Proceeding costs the scheduler.
+        from sglang.srt.mem_cache.hicache_phase_binding import (
+            write_back_stamp_is_current,
+        )
+
+        fresh = [
+            o
+            for o in self.write_queue
+            if write_back_stamp_is_current(getattr(o, "binding_generation", None))
+        ]
+        if len(fresh) != len(self.write_queue):
+            dropped = len(self.write_queue) - len(fresh)
+            self._writeback_stamp_refusals = (
+                getattr(self, "_writeback_stamp_refusals", 0) + dropped
+            )
+            n = self._writeback_stamp_refusals
+            if n <= 3 or n % 200 == 0:
+                logger.warning(
+                    "#760 WRITE-BACK REFUSED: %d queued host write-back(s) were "
+                    "stamped against an older binding generation and are dropped "
+                    "rather than consumed after the rebind. Those prefixes miss "
+                    "later. (%d so far.)",
+                    dropped,
+                    n,
+                )
+            self.write_queue = fresh
+            if not self.write_queue:
+                return
 
         op = CacheOperation.merge_ops(self.write_queue)
         # Kernel write-back keeps host indices on CPU only for page_first AND only

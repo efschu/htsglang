@@ -318,3 +318,28 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
     generation = rebind(readers, incoming)
     coherence_check(readers)
     return generation
+
+
+def current_generation() -> int:
+    """#760/#719: the generation a host write-back must still be riding.
+
+    THE STAMP HAS TO BE READ TWICE, and the second read is the point. A
+    write-back is ENQUEUED against one binding and CONSUMED later; the flip
+    rebinds in between. Both crash specimens died three seconds AFTER a
+    ``pp_to_tp`` cutover completed, which is an already-queued copy reaching a
+    pointer table that no longer describes the pool it was built from.
+
+    ``check_shapes`` cannot catch that one. Under ``layer_first`` the host
+    layout equals the device layout, so a stale binding is SHAPE-IDENTICAL to
+    the live one -- the shape guard passes by construction and stays silent,
+    which is exactly what the #760 evidence records (guard armed on three
+    ranks, zero refusals, SIGSEGV anyway).
+    """
+    return binding_state().generation
+
+
+def write_back_stamp_is_current(stamped: int) -> bool:
+    """True when a write-back stamped at ``stamped`` may still be consumed."""
+    if stamped is None:
+        return False
+    return int(stamped) == int(current_generation())

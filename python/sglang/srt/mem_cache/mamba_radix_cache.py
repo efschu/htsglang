@@ -1214,7 +1214,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 n = self._mamba_evict_pass2
                 if n <= 3 or n % 200 == 0:
-                    logger.warning(
+                    # INFO, not WARNING: the second pass is documented as
+                    # legitimate ("best effort -- a second pass ignores it when
+                    # the pool must yield"), and anchor eviction was later
+                    # FALSIFIED as the cause of the drift this counter was added
+                    # to chase. It stays as an accounting line, not an alarm.
+                    logger.info(
                         "#767 SECOND-PASS EVICTION: dropped %d protected "
                         "anchor(s) because the first pass freed %d of %d "
                         "needed (pass1 total %d, pass2 total %d, evictable %d). "
