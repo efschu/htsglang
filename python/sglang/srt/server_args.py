@@ -14214,6 +14214,7 @@ class ServerArgs:
             return
 
         self._handle_mamba_checkpoint_interval(view)
+        self._refuse_hicache_x_checkpoint_interval(view)
         self._validate_max_mamba_cache_size(view)
         self._validate_gdn_resident_state_slots(view)
 
@@ -14221,6 +14222,50 @@ class ServerArgs:
             self._validate_mamba_extra_buffer(view, model_arch)
         else:
             self._validate_mamba_no_buffer(view, model_arch)
+
+    def _refuse_hicache_x_checkpoint_interval(self, view) -> None:
+        """#767: refuse --mamba-checkpoint-interval together with a host tier.
+
+        THE PAIR DEGENERATES; NEITHER FLAG ALONE DOES. Measured as a 2x2 on the
+        short-prompt gate (identical temperature-0 requests, scored for
+        repetition rather than for wording):
+
+            hierarchical off, interval off -> 0/16 REP, 2 distinct
+            hierarchical off, interval ON  -> 0/16 REP, 1 distinct  (full pass)
+            hierarchical ON,  interval off -> 0/16 REP, 6 distinct
+            hierarchical ON,  interval ON  -> 10/16 REP
+
+        The failure is REPETITION -- ' France is France is France is' -- and it
+        is permanent once it starts, so it is a correctness fault rather than
+        the run-to-run drift the #412 certificate documents as expected.
+
+        WHY A REFUSAL AND NOT A FIX, FOR NOW. The visible half of the split is
+        understood and repaired: the branching-state fill now runs under a host
+        tier, so the interval's grid-gated inserts and its anchor-establishing
+        fill are no longer separated. That did NOT clear the REP (6/16 with the
+        fill in, against 6-11 run to run), and neither did dropping the affected
+        matches outright, so the match-time mismatch is a symptom of a producer
+        that is still unidentified. Until it is, this combination must not ship
+        silently wrong: a wrong answer that looks confident is the worst class
+        this corpus tracks.
+
+        SCAFFOLDING, NOT THE END STATE. Both features are wanted together; this
+        refusal exists to be deleted by the commit that finds the producer.
+        """
+        if getattr(view, "mamba_checkpoint_interval", None) is None:
+            return
+        if not getattr(view, "enable_hierarchical_cache", False):
+            return
+        raise ValueError(
+            "--mamba-checkpoint-interval with --enable-hierarchical-cache is "
+            "refused (#767): the pair produces permanent repetition degeneration "
+            "(measured 10 of 16 identical temperature-0 probes), while either "
+            "flag alone is clean -- interval alone is in fact the only "
+            "configuration that passes the determinism gate outright. Run "
+            "either one, not both. This refusal is scaffolding and will be "
+            "removed once the producer is identified; the branching-state fill "
+            "half of the split is already repaired."
+        )
 
     def _validate_max_mamba_cache_size(self, view) -> None:
         """Refuse a `--max-mamba-cache-size` below the hard demand floor.
