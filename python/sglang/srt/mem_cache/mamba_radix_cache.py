@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     requests_forced_host_write_through,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -866,7 +867,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     req, new_slot
                 )
                 self.int8_ckpt_pool.store_from_active(
-                    self.req_to_token_pool.mamba_pool, src_active, ckpt_slot
+                    active_mamba_state_pool(self), src_active, ckpt_slot
                 )
                 mamba_value_donated = ckpt_slot
                 self.req_to_token_pool.mamba_allocator.free(src_active)
@@ -937,7 +938,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # mamba_pool is a pure PHYSICAL store; translate both slot ids
             # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
-            self.req_to_token_pool.mamba_pool.copy_from(
+            # #767: the state bytes live in the ACTIVE phase's pool -- the
+            # bound pool is the primary stack's forever under a phase-flip
+            # build. See mem_cache/mamba_state_pool.py.
+            active_mamba_state_pool(self).copy_from(
                 translate(req.mamba_pool_idx.unsqueeze(0)),
                 translate(mamba_value_donated),
             )
@@ -1672,8 +1676,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ckpt_slot = self._alloc_int8_ckpt_slot()
         if ckpt_slot is None:
             return None
+        # #767: read the active slots from the computing stack's pool.
         self.int8_ckpt_pool.store_from_active(
-            self.req_to_token_pool.mamba_pool, active_slots, ckpt_slot
+            active_mamba_state_pool(self), active_slots, ckpt_slot
         )
         return ckpt_slot
 

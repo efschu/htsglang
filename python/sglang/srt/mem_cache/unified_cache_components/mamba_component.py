@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import peer_needs_mamba_evict
+from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -514,8 +515,10 @@ class MambaComponent(TreeComponent):
         ckpt_slot = self._alloc_int8_ckpt_slot()
         if ckpt_slot is None:
             return None
+        # #767: read the active slots from the computing stack's pool (see
+        # the donate-copy site below; same wrong-pool class).
         self.int8_ckpt_pool.store_from_active(
-            self.cache.req_to_token_pool.mamba_pool,
+            active_mamba_state_pool(self.cache),
             active_slots.view(-1),
             ckpt_slot,
         )
@@ -626,7 +629,7 @@ class MambaComponent(TreeComponent):
                         )
                     )
                     self.int8_ckpt_pool.store_from_active(
-                        self.cache.req_to_token_pool.mamba_pool,
+                        active_mamba_state_pool(self.cache),
                         src_active.view(-1),
                         ckpt_slot,
                     )
@@ -654,7 +657,15 @@ class MambaComponent(TreeComponent):
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
+                # #767: THE STATE BYTES LIVE IN THE ACTIVE PHASE'S POOL.
+                # Under a phase-flip build the bound pool is the primary PP
+                # stack's; copying there while the TP stack computes
+                # duplicated whatever stale bytes the PP tensors still held
+                # at the request's slot into the checkpoint (measured as a
+                # foreign request's essay resumed into a fresh prompt).
+                # Bookkeeping (allocator, translate) stays on the bound
+                # pool; only the byte copy follows the computing stack.
+                active_mamba_state_pool(self.cache).copy_from(
                     translate(req.mamba_pool_idx.unsqueeze(0)),
                     translate(mamba_value_donated),
                 )

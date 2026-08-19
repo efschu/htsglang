@@ -593,6 +593,71 @@ def resident_mamba_slots(scheduler) -> "torch.Tensor":
     return torch.tensor(sorted(set(vals)), dtype=torch.int64)
 
 
+def flip_mamba_slots(scheduler) -> torch.Tensor:
+    """Resident requests' mamba slots UNION the radix tree's checkpoints.
+
+    THE ASYMMETRY THAT POISONED THE CACHE (#767 residual, measured
+    2026-08-19). The KV leg enumerates "radix tree values UNION resident
+    requests' rows" (build_flip_live_slots_fn); this leg enumerated only
+    the resident set, so every mamba checkpoint the tree held -- cached
+    prefix states, #745/#755 anchor donors -- kept its slot NUMBER across
+    the cutover while its slot CONTENT was never translated into the new
+    layout's pool. A later prefix hit COWed that untranslated slot into a
+    fresh request's state (model_runner._maybe_execute_deferred_mamba_cow
+    _and_clear), which is how salted probes looped after one sentence and
+    one probe answered with a FOREIGN request's topic while the flip-off
+    arm stayed clean. The host tier then archived the same stale bytes
+    (PP-phase write-backs read the PP pool), which is why a device-side
+    cache flush did not cure it.
+
+    A tree cache that cannot report its mamba values is refused loudly:
+    under a flip build a silent no-op here IS the corruption above, and
+    every mamba-carrying tree in this repo exposes the API
+    (MambaRadixCache.all_mamba_values_flatten, unified_radix_cache's
+    override; the KV leg refuses the same way for all_values_flatten).
+    """
+    resident = resident_mamba_slots(scheduler)
+    tree = getattr(scheduler, "tree_cache", None)
+    values_fn = getattr(tree, "all_mamba_values_flatten", None)
+    if values_fn is None:
+        raise KvReshardError(
+            f"{LOG_PREFIX} tree cache {type(tree).__name__} does not expose "
+            f"all_mamba_values_flatten -- refusing to flip past mamba "
+            f"checkpoints that could not be enumerated (a tree-held slot "
+            f"left behind is served to a later prefix hit as garbage)"
+        )
+    tree_vals = values_fn()
+    if tree_vals is None or tree_vals.numel() == 0:
+        return resident
+    tree_vals = tree_vals.detach().to("cpu", torch.int64).reshape(-1)
+    return torch.unique(torch.cat([resident, tree_vals]))
+
+
+def install_phase_aware_mamba_state_pool(scheduler) -> None:
+    """Point the tree cache's mamba STATE-byte operations at the pool of
+    the phase that is actually computing (#767 residual).
+
+    Slot bookkeeping stays single-authority on the primary pool; only the
+    byte copies (checkpoint donation copy, int8 store) follow the active
+    stack. ``phase_flip_active_stack`` is unset until the first cutover,
+    during which the primary stack computes -- the fallback is correct by
+    construction. See mem_cache/mamba_state_pool.py for the read side.
+    """
+    primary_pool = scheduler.req_to_token_pool.mamba_pool
+    tp_pool = (
+        scheduler.phase_flip_stacks.tp_worker.model_runner.req_to_token_pool.mamba_pool
+    )
+
+    def _active_mamba_pool():
+        from sglang.srt.managers.phase_flip_runtime import PHASE_TP
+
+        if getattr(scheduler, "phase_flip_active_stack", None) == PHASE_TP:
+            return tp_pool
+        return primary_pool
+
+    scheduler.tree_cache.phase_active_mamba_pool = _active_mamba_pool
+
+
 def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
     """Production pre_cutover_fn: preconditions re-validated per flip,
     slots from the replicated running batch, exchange over the flip
@@ -629,7 +694,9 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
         )
 
     def _slots() -> torch.Tensor:
-        return resident_mamba_slots(scheduler)
+        return flip_mamba_slots(scheduler)
+
+    install_phase_aware_mamba_state_pool(scheduler)
 
     flip_tp = get_phase_flip_group("tp")
     device = pp_req_pool.mamba_pool.mamba_cache.temporal.device
