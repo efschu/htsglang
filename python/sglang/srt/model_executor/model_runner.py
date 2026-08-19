@@ -4311,9 +4311,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         COW/clear only happen at prefix match on extend.
         """
         pool = self.req_to_token_pool
+        # #767: the skip predicate is is_draft_model_runner, NOT the raw
+        # is_draft_worker flag. The phase-flip TP TARGET is built with
+        # is_draft_worker=True (phase_flip_boot.py, deliberate init reuse),
+        # and the raw flag dropped every TP-phase extend's pending clear/COW
+        # -- fresh requests then decoded on the previous slot occupant's GDN
+        # state (metal 2026-08-19: probes answered the WARMUP's questions).
+        # The REAL draft runner must keep skipping: it shares the target's
+        # pool and runs after the target wrote fresh state.
         if (
             not isinstance(pool, HybridReqToTokenPool)
-            or self.is_draft_worker
+            or self.is_draft_model_runner
             or not forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
