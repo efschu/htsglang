@@ -90,11 +90,27 @@ def protect_deepest_anchors(
     * ``host_tier_present=True``  -> do not protect; spilling an anchor is
       allowed because it can be matched and reloaded.
 
-    No interval means no grid, so there are no anchors either way -- the same
-    ``interval is not None`` test the device-only path already used.
+    #767: THE INTERVAL IS NOT A PRECONDITION, and treating it as one is what
+    made identical requests drift. This read "no interval means no grid, so
+    there are no anchors either way" and returned False. There ARE anchors: the
+    ``no_buffer`` path donates a checkpoint for every finished request at
+    ``cache_len = len(token_ids)``, grid or no grid, and the deepest one is the
+    resume point whether or not an operator configured an interval. The
+    interval only adds MORE anchors on top.
+
+    Measured on one commit with the short-prompt determinism gate (identical
+    temp-0 requests, which must return identical bytes): 48 slots idle over 10
+    probes = 1 distinct, over 20 probes = 2, under 4-way load = 7 distinct with
+    a degenerate one; 12 slots idle = 3. Divergence tracks slot pressure, which
+    is exactly what eviction responds to -- so the protection has to hold
+    whenever an evicted anchor is a LOST anchor, which is the device-only case
+    and has nothing to do with the interval.
+
+    THE CAPACITY TRADE IS REAL AND IS NOT THIS FUNCTION'S TO MAKE. Sparing
+    anchors reduces the evictable set, so a pool that was only just large
+    enough gets tighter. That is a SIZING answer (the slot count is a planner
+    post), not a reason to hand back determinism.
     """
-    if interval is None:
-        return False
     return not host_tier_present
 
 
