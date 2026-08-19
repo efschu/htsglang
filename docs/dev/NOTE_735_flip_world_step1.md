@@ -133,3 +133,42 @@ its disk tier purged; correctness does not come back with the patch alone.
 
 Residual: about 1 in 10 salted probes still degenerates. Smaller than the
 original defect and NOT closed -- next item, alongside #768.
+
+## #767 round 2: the reader fix was real but not the whole defect
+
+The early-release fix (queue-vs-ack) held: salted probes went 9/10 -> 0/10. It
+did NOT close #767. Re-verification found the CACHED prompt degenerate again,
+and an over-time run localized why.
+
+**A measurement error had to be fixed first.** The original falsifier asked
+"does the answer contain 'Paris'", which flags a coherent continuation that
+simply says something else first -- ' France, repeated multiple times.', ' a
+major global city and the largest city in F'. What distinguishes the failure is
+REPETITION (' France is France is France is', ' is is is is'), so `degen.py`
+tests that instead. Three of the three "failures" in the no-HiCache arm were
+this artifact, i.e. the old metric would have condemned a healthy config.
+
+**Over-time results, 20 cached probes with interleaved load and flips:**
+
+| arm | result |
+|---|---|
+| full (HiCache host+disk, anchor, reorder) | probes 00-03 OK, **04-16 degenerate, permanently**; `store=0` |
+| anchor interval OFF | probes 00-03 OK, then **SEGFAULT** (x3) and watchdog kill; store grew 912 -> 9285 |
+| HiCache OFF entirely | **0/14 and 0/10 truly degenerate** over 415s and 252s, 15 and 25 flips |
+
+Three things follow. The trigger is the same in both HiCache arms and lands at
+the same place -- the fourth cached hit -- but the failure mode differs, which
+says one path with two ways to fail rather than two defects. `store=0` in the
+full arm proves the DISK tier is not required: the poisoned entry lives in the
+in-memory host/radix state, and disk only carries it across reboots. And the
+corruption is permanent per prefix once it happens: eleven consecutive bad
+probes across ten further flips, none of which cleared it.
+
+So the carrier is the HiCache cached-resume path (#758/#747 family), not the
+#755 early release that round 1 fixed.
+
+**Standing state:** the full set MINUS HiCache, which is correct over time
+(0/10). HiCache is OFF carrying two measured citations -- permanent output
+corruption on resume, and a segfault -- per the rule that an OFF needs a
+measured net-negative. That is a correctness hold, not a perf preference, and
+it is the next thing to fix.
