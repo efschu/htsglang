@@ -461,6 +461,14 @@ class ReqToTokenPool:
         self.req_to_token.zero_()
 
 
+_M767_FORCE_CLEAR = os.getenv("SGLANG_767_FORCE_CLEAR", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -1505,7 +1513,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
         fresh_pingpong_reqs: list[Req] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
-                pass
+                # #767 INSTRUMENT + FALSIFIER. This branch keeps a slot the
+                # request already owns and skips the clear, which is correct
+                # for a LEGITIMATE carrier (a chunked continuation holding its
+                # own in-progress state, or a COW resume whose copy fills the
+                # slot) and silently wrong for a request that arrived with a
+                # recycled slot nobody filled. The two are indistinguishable
+                # here today, so count them and name whether a copy is
+                # actually pending.
+                self._m767_carry_total = getattr(self, "_m767_carry_total", 0) + 1
+                if getattr(req, "mamba_cow_src_index", None) is None:
+                    self._m767_carry_nocopy = (
+                        getattr(self, "_m767_carry_nocopy", 0) + 1
+                    )
+                    n = self._m767_carry_nocopy
+                    if n <= 3 or n % 500 == 0:
+                        logger.warning(
+                            "#767 carry-without-copy #%d: rid=%s slot=%s "
+                            "needs_clear=%s -- kept a slot with no pending COW "
+                            "and no clear; legitimate only if this request "
+                            "already wrote that state itself.",
+                            n,
+                            getattr(req, "rid", "?"),
+                            getattr(req, "mamba_pool_idx", None),
+                            getattr(req, "mamba_needs_clear", None),
+                        )
+                    if _M767_FORCE_CLEAR:
+                        # Falsifier arm only: prove the defect is dirty initial
+                        # state. NOT a fix -- a blanket clear would also wipe a
+                        # legitimate carrier's own in-progress state.
+                        req.mamba_needs_clear = True
             else:
                 mid = self._alloc_mamba_slots_or_evict(1)
                 if mid is None:
