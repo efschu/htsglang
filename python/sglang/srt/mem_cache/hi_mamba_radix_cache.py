@@ -2435,6 +2435,29 @@ class HiMambaRadixCache(MambaRadixCache):
             )
         ]
 
+    def _mamba_host_copy_complete(self, node: TreeNode) -> bool:
+        """#767: True only once the D->H copy for this node has been ACKED.
+
+        ``mamba_backup_commit`` publishes ``mamba_host_value`` in the same
+        block that hands the transfer to the cache controller and records the
+        node in ``ongoing_write_through`` -- so ``mamba_backuped`` goes True
+        while the bytes are still in flight. #755 then released the pin
+        against an anchor that did not exist yet, the node became evictable
+        inside that window, and a resume off the dead anchor produced
+        degenerate output (9/10 salted greedy probes on the full boot).
+
+        Reading the in-flight bookkeeping is what makes the predicate's own
+        "host-backed RIGHT NOW" literally true. A node still in flight simply
+        takes the documented #755 refusal path: the insert is skipped, the
+        request keeps computing, and the counter says write-through is behind.
+        """
+        node_id = getattr(node, "id", None)
+        if node_id is None:
+            return False
+        if self._write_through_inflight.get(node_id, 0) > 0:
+            return False
+        return node_id not in self.ongoing_write_through
+
     def mamba_backup_commit(
         self, node: TreeNode, transfers: list[PoolTransfer]
     ) -> None:

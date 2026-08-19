@@ -1495,6 +1495,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         A config-only check would be the formula-only edit NOTE_755 refuses:
         it would release pins for nodes whose backup does not exist yet.
+
+        Also required: the copy must be COMPLETE, not merely queued (#767).
+        ``mamba_backuped`` reads ``mamba_host_value is not None``, and the
+        write-through path sets that the moment the transfer is HANDED to the
+        cache controller -- the same block then records the node in
+        ``ongoing_write_through``. Between those two facts the anchor exists
+        as an intention only, so a release there is precisely the dead anchor
+        this predicate exists to prevent.
         """
         if not self.mamba_slot_reorder:
             return False
@@ -1503,7 +1511,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # releasing early buys nothing and the pin bookkeeping is simpler
             # kept uniform.
             return False
-        return bool(getattr(node, "mamba_backuped", False))
+        if not bool(getattr(node, "mamba_backuped", False)):
+            return False
+        return self._mamba_host_copy_complete(node)
+
+    def _mamba_host_copy_complete(self, node) -> bool:
+        """#767: has this node's host copy actually LANDED?
+
+        The device-only pool has no asynchronous write-through, so a node that
+        carries a host value carries a finished one and the answer is True.
+        The hierarchical subclass overrides this, because there the value is
+        published when the transfer is queued.
+        """
+        return True
 
     def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary.
