@@ -1158,6 +1158,54 @@ class HiCacheController:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
 
+    def quiesce_device_io(self, reason: str) -> float:
+        """#760: finish every in-flight device-tier copy, bounded by the copies.
+
+        Called by the flip runtime at the seam's no-return point, BEFORE any
+        pool byte moves. The copies on ``write_stream`` / ``load_stream`` were
+        enqueued while the pools they name were live, so FINISHING them is
+        correct -- they become durable cache entries -- while letting them ride
+        into the seam races the release of the outgoing phase's backing, which
+        is the SIGSEGV both #760 crash specimens died of (3 s after a
+        pp_to_tp cutover, inside backup_from_device_all_layer, below the
+        Python seam). No Python-side predicate can close that window: the
+        enqueue-time and consume-time checks both pass legitimately, the copy
+        is torn by the STREAM's asynchrony.
+
+        The wait is bounded by construction: a stream synchronize completes
+        when the already-enqueued copies do (PCIe transfer time of the
+        backlog), and this thread is the only producer of device-tier I/O, so
+        nothing refills the streams while it waits. Not a collective -- each
+        rank drains its own streams -- so it cannot wedge the group (#630).
+
+        Returns the wait in seconds; the caller logs it into the seam record
+        so a slow drain is attributable instead of vanishing into the flip's
+        residual (#690).
+        """
+        t0 = time.perf_counter()
+        for name in ("write_stream", "load_stream"):
+            stream = getattr(self, name, None)
+            if stream is None:
+                continue
+            try:
+                stream.synchronize()
+            except Exception as e:  # noqa: BLE001 - a dead stream must be loud
+                logger.error(
+                    "#760 quiesce (%s): synchronizing %s failed (%s). "
+                    "In-flight copies on it may still race the seam.",
+                    reason,
+                    name,
+                    e,
+                )
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "#760 device-tier I/O quiesced for %s in %.1f ms (write and load "
+            "streams drained while their pools are still live).",
+            reason,
+            elapsed * 1000.0,
+        )
+        return elapsed
+
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")

@@ -48,7 +48,8 @@ in one place, on purpose.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import weakref
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,64 @@ LOG_PREFIX = "[#718 hicache-phase-guard]"
 # One line per direction per process. The condition persists for a whole phase,
 # so logging per operation would bury the log at decode rates.
 _WARNED: set[str] = set()
+
+# #760: the flip controller's authoritative phase, when one is running.
+#
+# The parallel_state routing global answers "which group set do collectives
+# route to". That is toggled INSIDE the cutover, one step among many -- so for
+# the whole seam (waves moving KV rows, movers releasing the outgoing weight
+# and KV backing, the cutover rebuilding topology) it names one of the two
+# phases while pool bytes are in motion. The guard's question is different:
+# "may device-tier HiCache I/O touch the pools right now". During the seam the
+# answer is NO regardless of what the routing global says, and the only
+# component that knows the seam's extent is the flip runtime itself -- the
+# same object whose ``_phase`` field the PHASE-FLIP DONE line reports.
+#
+# So the runtime registers itself here (weakly: a dead runtime must never gate
+# I/O) and the guard asks IT first, falling back to the routing global on
+# deployments that never built a flip runtime -- which keeps every
+# non-flipping deployment byte-identical, the same no-flag argument the #718
+# docstring makes.
+_FLIP_AUTHORITY: Optional[Any] = None  # weakref.ref to the flip runtime
+
+#: The phase name the authority reports while a flip is executing. Not a
+#: phase: it means "between phases, nothing may bind".
+SEAM = "seam"
+
+
+def register_flip_phase_authority(runtime: Any) -> None:
+    """Called by PhaseFlipRuntime at construction. Last registration wins."""
+    global _FLIP_AUTHORITY
+    _FLIP_AUTHORITY = weakref.ref(runtime)
+    logger.info(
+        "%s flip phase authority registered (%s); the guard now reads the "
+        "flip controller's own phase state instead of the routing global.",
+        LOG_PREFIX,
+        type(runtime).__name__,
+    )
+
+
+def clear_flip_phase_authority() -> None:
+    """Test hook: forget the registered authority."""
+    global _FLIP_AUTHORITY
+    _FLIP_AUTHORITY = None
+
+
+def _authority_phase() -> Optional[str]:
+    """The registered flip runtime's phase, or None when there is none."""
+    ref = _FLIP_AUTHORITY
+    if ref is None:
+        return None
+    runtime = ref()
+    if runtime is None:
+        return None
+    try:
+        if getattr(runtime, "hicache_seam_active", False):
+            return SEAM
+        phase = getattr(runtime, "phase", None)
+    except Exception:  # pragma: no cover - never let the authority break I/O
+        return None
+    return phase if phase in ("pp", "tp") else None
 
 
 def flip_routing_active() -> bool:
@@ -79,8 +138,36 @@ def flip_routing_active() -> bool:
 
 
 def active_phase() -> str:
-    """The phase the model is computing in right now."""
-    return "tp" if flip_routing_active() else "pp"
+    """The phase the model is computing in right now, or SEAM mid-flip.
+
+    Asks the flip runtime first (#760): it is the authority on its own seam,
+    and its ``_phase`` field is the value the PHASE-FLIP DONE line reports.
+    The routing global remains the fallback for processes without a runtime.
+    A disagreement between the two sources outside the seam is exactly the
+    #754 shape (a consumer re-deriving phase state from a source the flip
+    does not own), so it is logged once per pairing -- that log line is the
+    instrument that settles whether the routing global can be trusted here.
+    """
+    auth = _authority_phase()
+    routed = "tp" if flip_routing_active() else "pp"
+    if auth is None:
+        return routed
+    if auth != SEAM and auth != routed:
+        key = f"disagree:{auth}:{routed}"
+        if key not in _WARNED:
+            _WARNED.add(key)
+            logger.warning(
+                "%s PREDICATE DISAGREEMENT (#760): the flip runtime reports "
+                "phase=%s while the parallel_state routing global reports "
+                "phase=%s. The runtime is the authority and the guard follows "
+                "it; this line existing at all means the routing global is a "
+                "stale source for this consumer (the #754 shape) and every "
+                "reader still using it directly should be audited.",
+                LOG_PREFIX,
+                auth,
+                routed,
+            )
+    return auth
 
 
 def device_tier_disarmed(direction: Optional[str] = None) -> bool:
@@ -94,10 +181,33 @@ def device_tier_disarmed(direction: Optional[str] = None) -> bool:
     it was moved to, and this returns False there.
 
     ``direction`` only labels the log line ("write" / "load").
+
+    #760: while the flip runtime reports its SEAM, the answer is no for every
+    binding -- pool bytes are in motion and the outgoing phase's backing is
+    about to be (or being) released, so a copy enqueued now would race the
+    release even when the phase it was enqueued in was legitimate. Both crash
+    specimens died exactly there: copies against the pre-cutover binding,
+    consumed while or after the seam moved the pools under them.
     """
     from sglang.srt.mem_cache.hicache_phase_binding import bound_phase
 
-    if active_phase() == bound_phase():
+    phase = active_phase()
+    if phase == SEAM:
+        key = f"seam:{direction}"
+        if key not in _WARNED:
+            _WARNED.add(key)
+            logger.warning(
+                "%s device-tier HiCache %s REFUSED during the flip seam "
+                "(#760): the flip is executing, pool bytes are in motion, and "
+                "the outgoing phase's backing is scheduled for release. A "
+                "refused copy is a cache miss; a copy racing the release was "
+                "the SIGSEGV. One line per direction; later seam refusals are "
+                "silent.",
+                LOG_PREFIX,
+                direction,
+            )
+        return True
+    if phase == bound_phase():
         return False
     if direction is not None:
         warn_once(direction)

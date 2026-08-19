@@ -2590,6 +2590,36 @@ class PhaseFlipRuntime:
         #: #631 J: read-only handle for the pool census. Set by the
         #: builder; absent in unit stubs, where the census is a no-op.
         self._census_scheduler = None
+        #: #760: True from the seam's no-return point until the cutover has
+        #: installed the new phase. Read by the HiCache phase guard through
+        #: the authority registration below: while True, device-tier HiCache
+        #: I/O is refused outright -- pool bytes are in motion and the
+        #: outgoing phase's backing is scheduled for release, so a copy
+        #: enqueued now races the release whatever phase it names.
+        self.hicache_seam_active = False
+        # #760: hand the guard THIS object as its phase authority. The
+        # routing global (parallel_state) toggles INSIDE the cutover, one
+        # step among many, so it cannot express the seam; this runtime's
+        # ``_phase`` is what the PHASE-FLIP DONE line reports, which the
+        # 3s-lag crash correlation proves truthful. Registration is weak, so
+        # a discarded runtime (hermetic tests build many) never gates I/O.
+        # A failed registration is LOGGED, not swallowed silently -- an
+        # inert guard that cannot be seen failing to arm is the #742 class.
+        try:
+            from sglang.srt.mem_cache.hicache_phase_guard import (
+                register_flip_phase_authority,
+            )
+
+            register_flip_phase_authority(self)
+        except Exception as e:  # noqa: BLE001 - never break runtime construction
+            logger.error(
+                "%s #760 flip phase authority registration FAILED (%s); the "
+                "HiCache phase guard falls back to the routing global, which "
+                "cannot see the seam. Device-tier I/O is NOT seam-protected "
+                "in this process.",
+                LOG_PREFIX,
+                e,
+            )
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
@@ -3386,7 +3416,43 @@ class PhaseFlipRuntime:
             )
             return None
         self._last_hold_reason = None
-        return self._execute()
+        try:
+            return self._execute()
+        finally:
+            # #760 insurance: a raise anywhere in the seam must not leave the
+            # guard reporting a seam forever -- that would silently kill the
+            # device tier for the life of the process, the #742 inert-state
+            # class. On the ordinary path the cutover already cleared it.
+            self.hicache_seam_active = False
+
+    def _quiesce_hicache(self, direction: str) -> None:
+        """#760: drain the cache controller's device-tier streams at the seam.
+
+        Reaches the controller through the census scheduler handle (absent in
+        unit stubs, where this is a no-op like the census itself). A failure
+        is logged, never raised: with requests parked, a raise here takes the
+        instance down, and the seam guard above still refuses NEW I/O -- only
+        already-in-flight copies remain exposed, which is the pre-fix state,
+        not a new hazard.
+        """
+        scheduler = getattr(self, "_census_scheduler", None)
+        controller = getattr(
+            getattr(scheduler, "tree_cache", None), "cache_controller", None
+        )
+        quiesce = getattr(controller, "quiesce_device_io", None)
+        if quiesce is None:
+            return
+        try:
+            quiesce(f"phase flip {direction}")
+        except Exception as e:  # noqa: BLE001 - the seam must not die here
+            logger.error(
+                "%s #760 HiCache stream quiesce failed (%s); in-flight "
+                "device-tier copies may still race this seam's backing "
+                "release. The flip continues -- new I/O is refused by the "
+                "seam guard regardless.",
+                LOG_PREFIX,
+                e,
+            )
 
     def _pool_census(self, when: str, direction: str) -> None:
         """#631 defect J: the allocator's own view, straddling the cutover.
@@ -6917,6 +6983,31 @@ class PhaseFlipRuntime:
             self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
         self._seam_retry_at_arm[direction] = 0
 
+        # #760: THE NO-RETURN POINT IS WHERE THE SEAM BEGINS for HiCache.
+        # From here on, bytes move and the outgoing phase's backing is on its
+        # way out. Two things must both hold before the first wave:
+        #
+        #   1. no NEW device-tier HiCache I/O -- the guard refuses it while
+        #      ``hicache_seam_active`` is up (this thread is the only producer,
+        #      so the flag is a statement, not a race);
+        #   2. no OLD device-tier HiCache I/O still in flight -- copies
+        #      enqueued legitimately before the seam ride the controller's
+        #      private streams and outlive their Python call by seconds under
+        #      load. Both #760 crash specimens are exactly such a copy
+        #      reaching pool memory the seam had released, 3 s after the
+        #      cutover. So the streams are DRAINED here, while every pointer
+        #      they hold still names live memory -- finishing them is correct
+        #      and bounded; dropping them would only trade durable cache
+        #      entries for nothing.
+        #
+        # Order matters against the #703 writeback hook above: that hook
+        # ENQUEUES device->host staging copies (that is its job, and this
+        # phase is the one its bindings belong to), so the seam must arm
+        # after it and the drain must cover it.
+        self.hicache_seam_active = True
+        self._quiesce_hicache(direction)
+        seam_census.mark("hicache_quiesce")
+
         # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
         #
         # Pack, exchange, read the retained leg, swap THIS WAVE's backing,
@@ -7194,6 +7285,12 @@ class PhaseFlipRuntime:
         self._pool_census("post-cutover", direction)
         cutover_ms = (self._clock() - t_cutover0) * 1000.0
         self._phase = _PHASE_AFTER[direction]
+        # #760: the seam is over -- the phase above is now the truth the
+        # guard's authority reports. Cleared AFTER the phase update so the
+        # guard never sees a gap in which the seam is down but the phase is
+        # still the outgoing one. (The caller's finally is the insurance for
+        # a raise anywhere above; this is the ordinary exit.)
+        self.hicache_seam_active = False
         self._pending = None
         self._armed_at = None
         self._epoch += 1
