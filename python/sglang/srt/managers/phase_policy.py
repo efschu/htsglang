@@ -1911,7 +1911,18 @@ def _decide_from_load(
     # branch below can bypass the thrash bound. It is the only guarantee
     # that survives an adversarial arrival pattern.
     since_flip = inp.now - state.last_flip_at
-    if state.last_flip_at > 0 and since_flip < cfg.min_dwell_s:
+    # #768: the dwell is a THRASH bound, and thrashing needs work in flight.
+    # With nothing running and prefill pending, holding protects no throughput
+    # -- there is none to protect -- and nothing can end the wait either: the
+    # request that would restart the clock is the one the hold refuses to
+    # admit. That is a livelock, not a bound. It wedged serving for 464s
+    # ("ADMISSION-WEDGE: 1 queued, 0 running, and NO first token", 41 of them)
+    # on the specimen numbers 5813 tok pending / 0 running / "0.0s since last
+    # flip < 3s", with health still answering 200 the whole time.
+    starved = int(getattr(inp, "running_bs", 0) or 0) == 0 and (
+        int(getattr(inp, "pending_prefill_tokens", 0) or 0) > 0
+    )
+    if state.last_flip_at > 0 and since_flip < cfg.min_dwell_s and not starved:
         return _no(
             f"min dwell: {since_flip:.1f}s since last flip < {cfg.min_dwell_s:g}s"
         )
