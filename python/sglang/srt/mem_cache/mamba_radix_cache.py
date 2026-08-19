@@ -1193,10 +1193,39 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_num_evicted = self._evict_mamba_pass(
             mamba_num, protect_window=protect, trace=trace
         )
+        self._mamba_evict_pass1 = getattr(self, "_mamba_evict_pass1", 0) + int(
+            mamba_num_evicted
+        )
         if protect and mamba_num_evicted < mamba_num:
-            mamba_num_evicted += self._evict_mamba_pass(
+            second = self._evict_mamba_pass(
                 mamba_num - mamba_num_evicted, protect_window=False, trace=trace
             )
+            mamba_num_evicted += second
+            # #767 ACCEPTANCE COUNTER. The second pass is the one that drops a
+            # protected anchor, which is what moves a resume point. It exists so
+            # protection can never deadlock an allocation and is correct; but at
+            # the acceptance load it must not be REACHED, because every anchor it
+            # takes is a determinism loss the first pass was supposed to prevent.
+            # A non-zero count here says the pool is too small for the protected
+            # set -- a SIZING answer -- or that the protected set is too broad.
+            if second > 0:
+                self._mamba_evict_pass2 = getattr(self, "_mamba_evict_pass2", 0) + int(
+                    second
+                )
+                n = self._mamba_evict_pass2
+                if n <= 3 or n % 200 == 0:
+                    logger.warning(
+                        "#767 SECOND-PASS EVICTION: dropped %d protected "
+                        "anchor(s) because the first pass freed %d of %d "
+                        "needed (pass1 total %d, pass2 total %d, evictable %d). "
+                        "Every one of these moves a resume point.",
+                        second,
+                        mamba_num_evicted - second,
+                        mamba_num,
+                        getattr(self, "_mamba_evict_pass1", 0),
+                        n,
+                        self.mamba_evictable_size(),
+                    )
         emit_lines(
             logger,
             obs.note_eviction(
