@@ -4318,6 +4318,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+                logger.warning(
+                    "#767-TRACE cow_and_clear SKIP: hybrid=%s draft=%s mode=%s "
+                    "clear=%s cow_src=%s",
+                    isinstance(pool, HybridReqToTokenPool),
+                    self.is_draft_worker,
+                    forward_batch.forward_mode,
+                    None
+                    if forward_batch.mamba_clear_indices is None
+                    else forward_batch.mamba_clear_indices.tolist(),
+                    None
+                    if forward_batch.mamba_cow_src_indices is None
+                    else forward_batch.mamba_cow_src_indices.tolist(),
+                )
             return
         if (
             forward_batch.mamba_clear_indices is not None
