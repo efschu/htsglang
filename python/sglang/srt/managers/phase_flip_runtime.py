@@ -2130,6 +2130,25 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
                         (f"pool @ {int(frac * 100)}%", int(pool_slots * frac))
                     )
             runtime.log_staging_projection(points=tuple(points))
+            # #771: STASH THE THRESHOLD FIGURE FOR THE POOL SOLVE. The
+            # projection is exact but is only computable here, AFTER the pool
+            # has been sized -- so this boot cannot spend it and records it for
+            # the next one instead (write_seam_reserve carries it). The
+            # THRESHOLD point is the basis on purpose: it is the floor of the
+            # range and the same live set the gate's own arming threshold uses,
+            # so it is the minimum a seam needs to ENTER. A rig that intends to
+            # flip at high pool occupancy needs the larger figure, which the
+            # lines just logged above give directly.
+            try:
+                runtime._staging_ask_at_threshold = int(
+                    runtime.project_staging_bytes(PP_TO_TP, int(base))
+                )
+            except Exception as exc:  # a projection may never fail a boot
+                logger.warning(
+                    "%s staging ask not recorded for the pool solve: %r",
+                    LOG_PREFIX,
+                    exc,
+                )
     except Exception as exc:
         logger.warning("%s staging projection skipped: %r", LOG_PREFIX, exc)
     return runtime

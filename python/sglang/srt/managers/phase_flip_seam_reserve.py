@@ -325,6 +325,13 @@ class SeamReserve:
     #: "guaranteed zero is fine" -- the arming floor treats the two the same
     #: way on purpose, by declining to excuse anything.
     rung_guaranteed_bytes: int = 0
+    #: #771: the seam's MANDATORY staging ask for the FUNDABLE leg (pp_to_tp),
+    #: as `project_staging_bytes` computed it on the boot that wrote this
+    #: record. Carried warm for the same reason the seam reserve is: the
+    #: number is exact but is only computable AFTER the pool is sized, so the
+    #: boot that measures it cannot spend it. A record without it reads 0,
+    #: which sizes the pool exactly as it was before this term existed.
+    staging_ask_bytes: int = 0
     provenance: str = PROVENANCE_COLD
     written_at: Optional[str] = None
     detail: str = ""
@@ -714,6 +721,7 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             rec = json.load(fh)
         return SeamReserve(
             fixed_bytes=int(rec["fixed_bytes"]),
+            staging_ask_bytes=int(rec.get("staging_ask_bytes", 0) or 0),
             # Absent in records written before #656 MERGE-R9 12.4. Absent
             # means "this boot did not separate the two floors", and the
             # zero it defaults to reproduces that record's own arithmetic
@@ -754,6 +762,7 @@ def write_seam_reserve(
     free_at_measure_bytes: int = 0,
     rung_fund_bytes: int = 0,
     rung_guaranteed_bytes: int = 0,
+    staging_ask_bytes: int = 0,
 ) -> Optional[str]:
     """Persist this boot's measurement for the next one. Never raises.
 
@@ -810,6 +819,7 @@ def write_seam_reserve(
         "fixed_bytes": int(fixed_bytes),
         "arena_fixed_bytes": int(arena_fixed_bytes),
         "worst_leg_fixed_bytes": int(worst_leg_fixed_bytes),
+        "staging_ask_bytes": int(staging_ask_bytes),
         "free_at_measure_bytes": int(free_at_measure_bytes),
         "rung_fund_bytes": int(rung_fund_bytes),
         "rung_guaranteed_bytes": int(rung_guaranteed_bytes),
@@ -1613,6 +1623,7 @@ def measure_and_record(scheduler, runtime) -> None:
         worst_leg_fixed_bytes=worst_leg,
         free_at_measure_bytes=free_bytes,
         rung_fund_bytes=rung_fund,
+        staging_ask_bytes=int(getattr(runtime, "_staging_ask_at_threshold", 0) or 0),
     )
     logger.info(
         "%s MEASURED (rank %d): floor %.0f MiB (%.0f arena tail ADDITIVE "

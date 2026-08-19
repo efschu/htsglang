@@ -6088,15 +6088,26 @@ class ModelRunnerKVCacheMixin:
             self, "_phase_flip_runtime", None
         )
         project = getattr(runtime, "project_staging_bytes", None) if runtime else None
-        if not callable(project):
-            return 0, "no projection at sizing time -- pool solved without it"
-        try:
-            from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+        if callable(project):
+            try:
+                from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
 
-            slots = int(getattr(self.server_args, "max_running_requests", 0) or 0)
-            return int(project(PP_TO_TP, slots)), f"projected pp_to_tp @ {slots} slots"
-        except Exception as exc:  # a projection must never fail a boot
-            return 0, f"projection unavailable ({type(exc).__name__})"
+                slots = int(getattr(self.server_args, "max_running_requests", 0) or 0)
+                return (
+                    int(project(PP_TO_TP, slots)),
+                    f"projected pp_to_tp @ {slots} slots",
+                )
+            except Exception as exc:  # a projection must never fail a boot
+                return 0, f"projection unavailable ({type(exc).__name__})"
+        # WARM RECORD, for the same reason the seam reserve has one. The
+        # projection is exact but only computable once the layouts exist, which
+        # is AFTER the pool is sized -- so the boot that measures it cannot
+        # spend it, and the next one does. A record without the field reads 0
+        # and sizes exactly as before, which is the cold case, stated.
+        warm = int(getattr(self._seam_reserve(), "staging_ask_bytes", 0) or 0)
+        if warm > 0:
+            return warm, "warm seam record (measured on a previous boot)"
+        return 0, "cold: no projection at sizing time and none recorded yet"
 
     def _seam_adjusted_budget(
         self: ModelRunner, budget_bytes: int, configurator
