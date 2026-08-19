@@ -23,6 +23,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -365,6 +366,18 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        # #760: THE OVERRIDE IS THE HOLE THE CRASH WENT THROUGH. The base
+        # class asks device_tier_disarmed at enqueue; this override did not,
+        # so the guard's every metal reading on a Unified/hybrid deployment
+        # was vacuously zero while TP-phase inserts (cache_finished_req ->
+        # insert -> _inc_hit_count -> write_backup -> here) enqueued copies
+        # against the PP-bound pools -- the exact stack of the 2026-08-19
+        # 20:40 specimen, SIGSEGV in transfer_kv_direct seconds after a
+        # pp_to_tp cutover, with zero refusal lines. Same contract as the
+        # base: a refused write is a prefix that misses later, which is the
+        # cheap failure.
+        if device_tier_disarmed("write"):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -454,6 +467,13 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        # #760: mirror of write() above -- the base class refuses a load while
+        # the active phase is not the one the bindings belong to (it would
+        # fill rows the model does not read while the tree marks the prefix
+        # resident); this override skipped that question entirely. A refused
+        # load is a prefetch that does not land: a miss now, recomputed.
+        if device_tier_disarmed("load"):
+            return None
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(

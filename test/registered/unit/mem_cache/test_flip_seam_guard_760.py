@@ -120,6 +120,59 @@ class TestADeadAuthorityNeverGates(_GuardCase):
         self.assertFalse(guard.device_tier_disarmed("write"))
 
 
+class _AllocMustNotRun:
+    """A pool whose alloc failing loudly proves the guard ran FIRST."""
+
+    def alloc(self, n):
+        raise AssertionError(
+            "the guard must refuse before the host/device pool is touched"
+        )
+
+
+class TestHybridControllerIsGuardedToo(_GuardCase):
+    """#760: the metal specimen of 2026-08-19 20:40 went through
+    HybridCacheController.write -- an OVERRIDE of the guarded base method
+    that never asked the guard. These pin both overrides to the same
+    contract as the base class: refuse (return None) while disarmed,
+    BEFORE touching any pool."""
+
+    def _seam(self):
+        # Held on self: the registration is weak by design, so a discarded
+        # runtime would fall back to the routing global mid-test.
+        self._rt = _FakeRuntime(phase="pp", seam=True)
+        guard.register_flip_phase_authority(self._rt)
+
+    def test_hybrid_write_refuses_while_disarmed(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        self._seam()
+        cc = object.__new__(HybridCacheController)
+        cc.mem_pool_host = _AllocMustNotRun()
+        self.assertIsNone(HybridCacheController.write(cc, _FakeTensor()))
+
+    def test_hybrid_load_refuses_while_disarmed(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        self._seam()
+        cc = object.__new__(HybridCacheController)
+        cc.mem_pool_device_allocator = _AllocMustNotRun()
+        self.assertIsNone(HybridCacheController.load(cc, _FakeTensor()))
+
+
+class _FakeTensor:
+    """Just enough tensor for the pre-guard surface of write()/load()."""
+
+    def __len__(self):
+        return 4
+
+    def numel(self):
+        return 4
+
+
 class _RecordingStream:
     def __init__(self, log, name):
         self._log = log
