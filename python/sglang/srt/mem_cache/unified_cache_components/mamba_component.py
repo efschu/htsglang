@@ -173,49 +173,22 @@ class MambaComponent(TreeComponent):
                 effective_best_len = 0
                 zeroed_by_strict_resume = True
 
-        # #767 HiCache: A KV MATCH DEEPER THAN ITS MAMBA STATE IS NOT USABLE.
+        # #767: THE FILL RUNS UNDER A HOST TIER TOO. This was gated on
+        # `cache_controller is None` with the note that branching-state fill was
+        # "temporarily" skipped in that mode. The gate split the checkpoint
+        # interval's contract in half: inserts stay grid-gated (an off-grid
+        # finish caches nothing) while the fill that ESTABLISHES the grid anchor
+        # never runs, so a match can reach a depth its recurrent state never
+        # did. Measured as a clean 2x2 on the short-prompt gate -- HiCache off /
+        # interval off: 0 REP; interval alone: 0 REP and 1 distinct (a full
+        # pass); HiCache alone: 0 REP; HiCache AND interval: 10/16 REP. Neither
+        # flag alone does it, which is the signature of a contract split rather
+        # than of either feature.
         #
-        # The line below skips branching-state fill whenever a cache_controller
-        # is present ("temporarily ... can add a HiCache-aware branching policy
-        # later"). Under a host tier that left a THIRD path open: the match is
-        # returned with `len(value_chunks) > effective_best_len`, no fill to
-        # establish the missing recurrent state, and -- unlike the device-only
-        # lineage, which truncates with `value = value[:best_value_len]`
-        # (mamba_radix_cache.py:1878) -- nothing trims the KV half. The request
-        # then resumes attention KV at a depth its mamba state never reached.
-        #
-        # Measured: HiCache ON gives 10/16 then 11/12 REP-degenerate answers on
-        # a short greedy probe ('France is France is ...'), permanent once it
-        # starts, against 0 REP on the identical configuration with HiCache OFF.
-        #
-        # The rule is the one this corpus already states at the COW-starvation
-        # path: "Reusing the KV prefix without the matching mamba state would be
-        # silently wrong, so the full-KV match is dropped as well." Dropping the
-        # match costs prefix reuse and returns a cache MISS, which is a
-        # throughput cost; serving a mismatched state is a correctness one. Once
-        # a HiCache-aware branching policy exists this becomes reachable again.
-        if (
-            self.cache.cache_controller is not None
-            and len(value_chunks) > effective_best_len
-            and not zeroed_by_strict_resume
-        ):
-            self._hicache_short_mamba_drops = (
-                getattr(self, "_hicache_short_mamba_drops", 0) + 1
-            )
-            n = self._hicache_short_mamba_drops
-            if n <= 3 or n % 500 == 0:
-                logger.warning(
-                    "#767: dropping a prefix match whose KV depth (%d chunks) "
-                    "exceeds its mamba depth (%d) under a host tier -- no "
-                    "branching fill exists in this mode, and resuming the KV "
-                    "half without the matching recurrent state is silently "
-                    "wrong. Re-prefilling instead. (%d so far.)",
-                    len(value_chunks),
-                    effective_best_len,
-                    n,
-                )
-            return zero_match_result(self.cache, result)
-        if self.cache.cache_controller is None and len(value_chunks) > effective_best_len:
+        # branch_grid keeps the same semantics in both modes (interval when one
+        # is configured, else the FLA chunk size), so the two lineages cannot
+        # drift apart again the way #747 records them doing before.
+        if len(value_chunks) > effective_best_len:
             # #747: the branching position must sit on the CHECKPOINT grid when
             # one is configured, not merely on the FLA chunk grid. Mirrors
             # mamba_radix_cache.py:1614 (`branch_grid = interval or chunk_size`)
