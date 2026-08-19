@@ -1703,3 +1703,54 @@ def describe(reserve: SeamReserve, path: str) -> str:
         f"boot and writes the record, so the NEXT identical boot is the "
         f"seam-safe one. Watch for 'FLIP ABANDONED' on this boot."
     )
+
+
+def staging_post_bytes(
+    projected_ask_bytes: int = 0, entry_margin_bytes: int = 0
+) -> int:
+    """#771: the seam's MANDATORY staging ask, charged into the pool solve.
+
+    THE THIRD TERM, and it is not either of the two above it. The seam reserve
+    is what a flip COSTS WHILE IT RUNS and is only knowable by measurement. The
+    arming floor is a LEVEL THE GATE COMPARES AGAINST, derived from the stated
+    corridor law. This one is what the KV rung must be ABLE TO FUND for the
+    seam to enter at all -- a per-rank, per-leg quantity that
+    ``project_staging_bytes`` computes exactly, because "the plan's only
+    live-set input is the slot count, and everything else is static layout".
+
+    WHY THE POOL MUST CHARGE IT. ``collective_kv_backing_relief`` is
+    deliberately all-or-nothing: it grants nothing when the mandatory ask
+    exceeds what the rung can return above its admission floor, on the
+    reasoning that laundering a short ask into a seam that then does not fit
+    is worse than a clean abandon. That rule is correct and is not touched
+    here. But it turns any sizing shortfall into a PERMANENT one: measured on
+    this rig, the rung reported it could return 1902-2037 MiB, granted 0, and
+    logged ``evicted 0 rows over 0 shrinks so far`` 72 times in a single boot
+    while the flip never happened. Sizing the pool so ``mandatory <=
+    fundable`` holds by construction is what keeps that rule from ever firing.
+
+    AN UNKNOWN ASK CHARGES ZERO, LOUDLY -- never a fabricated constant. A
+    projection that could not be computed is a missing measurement, and
+    inventing a number here would be the ``derived_provenance`` defect this
+    module already names: it would make a guess indistinguishable from the
+    exact figure ``project_staging_bytes`` returns. The caller logs which of
+    the two it charged.
+    """
+    ask = max(0, int(projected_ask_bytes or 0))
+    if ask <= 0:
+        return 0
+    return ask + max(0, int(entry_margin_bytes or 0))
+
+
+def pool_flip_posts_bytes(
+    arming_floor_bytes: int = 0, staging_post_bytes_: int = 0
+) -> int:
+    """Every flip term the POOL SOLVE owes, summed in one place.
+
+    ADDITIVE, because the two are needed at the same instant and for different
+    things: the gate refuses unless the arming floor is free, and the rung then
+    has to find the staging ask on top of it. A pool that reserved only the
+    larger of the two would satisfy whichever term is quoted in the log and
+    still abandon on the other.
+    """
+    return max(0, int(arming_floor_bytes or 0)) + max(0, int(staging_post_bytes_ or 0))

@@ -6068,6 +6068,36 @@ class ModelRunnerKVCacheMixin:
         )
         return dataclasses.replace(reserve, per_row_bytes=float(slope))
 
+    def _seam_staging_ask_bytes(self: ModelRunner):
+        """#771: this rank's MANDATORY staging ask, or 0 with its reason.
+
+        Returns ``(bytes, provenance)``. The provenance string is logged, so an
+        operator can tell an exact projection from a cold zero without reading
+        the code -- the distinction that matters, because a cold zero means the
+        pool is sized as it was before this term existed and the rung's
+        all-or-nothing rule can still fire.
+
+        THE FUNDABLE LEG ONLY. ``pp_to_tp`` is the leg the rung may shrink for
+        and the leg whose refusal is fatal under strict purity; ``tp_to_pp``
+        abstains by design, because its pool is about to become active again
+        and ``recover_kv_backing`` would undo the shrink inside the same flip.
+        Charging the pool for a leg that never shrinks would hold back memory
+        against a payment nobody makes.
+        """
+        runtime = getattr(self, "phase_flip_runtime", None) or getattr(
+            self, "_phase_flip_runtime", None
+        )
+        project = getattr(runtime, "project_staging_bytes", None) if runtime else None
+        if not callable(project):
+            return 0, "no projection at sizing time -- pool solved without it"
+        try:
+            from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+
+            slots = int(getattr(self.server_args, "max_running_requests", 0) or 0)
+            return int(project(PP_TO_TP, slots)), f"projected pp_to_tp @ {slots} slots"
+        except Exception as exc:  # a projection must never fail a boot
+            return 0, f"projection unavailable ({type(exc).__name__})"
+
     def _seam_adjusted_budget(
         self: ModelRunner, budget_bytes: int, configurator
     ) -> int:
@@ -6114,6 +6144,37 @@ class ModelRunnerKVCacheMixin:
         already_reserved = seam.seam_solve_reserved_free_bytes(reserve)
         floor_charge = seam.arming_floor_subtrahend_bytes(
             arming_floor, already_reserved
+        )
+        # #771: THE STAGING ASK IS A POST TOO, and leaving it out is what made
+        # the KV rung's all-or-nothing rule permanent. The rung refuses to
+        # grant anything when the MANDATORY ask exceeds what it can return
+        # above its admission floor -- correct, and untouched here -- so a pool
+        # sized without this term produces a rung that reports 1902-2037 MiB
+        # available, grants 0, and logs "evicted 0 rows over 0 shrinks" while
+        # the seam abandons. Measured 72 times in one boot, 38 flips that each
+        # had to find their bytes somewhere else.
+        #
+        # EXACT OR ZERO, NEVER INVENTED. `project_staging_bytes` is the same
+        # `_staging_bytes` the gate itself calls, so when it is reachable this
+        # is the real number; when it is not, this charges nothing and says so,
+        # because a fabricated constant here would be indistinguishable from
+        # the exact one and is the `derived_provenance` defect by another name.
+        staging_ask, staging_src = self._seam_staging_ask_bytes()
+        staging_charge = seam.staging_post_bytes(staging_ask)
+        if flips_on:
+            logger.info(
+                "%s (rank %d): STAGING POST %d MiB (%s) charged to the pool so "
+                "the KV rung's mandatory ask stays inside what it can fund "
+                "above its admission floor. The rung grants all-or-nothing by "
+                "design; this term is what keeps that rule from firing.",
+                seam.LOG_PREFIX,
+                self._seam_world_rank(),
+                staging_charge >> 20,
+                staging_src,
+            )
+        floor_charge = seam.pool_flip_posts_bytes(
+            arming_floor_bytes=floor_charge,
+            staging_post_bytes_=staging_charge if flips_on else 0,
         )
         if floor_charge or arming_floor:
             logger.info(
