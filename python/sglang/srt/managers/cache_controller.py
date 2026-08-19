@@ -894,6 +894,36 @@ class HiCacheController:
             write_back_stamp_is_current,
         )
 
+        # #760: RE-ASK THE PHASE QUESTION AT CONSUME TIME. write() asks it at
+        # ENQUEUE, and gets the right answer there -- the copy is queued while
+        # the model computes in PP, which IS the phase these pools are bound
+        # to, so the enqueue is legitimate. Nothing re-asked afterwards, and
+        # the cutover lands in between: both crash specimens died three seconds
+        # AFTER a pp_to_tp cutover completed (14:08:14 -> 14:08:17 epoch 27;
+        # 07:12:09 -> 07:12:12 epoch 3, seven hours apart).
+        #
+        # The generation stamp below cannot cover this case on its own: with
+        # --phase-flip-rebind-hicache off the binding never advances, so every
+        # stamp matches by construction and the check is dead code. The phase
+        # predicate is the one that already knows, and it only had to be asked
+        # a second time.
+        if device_tier_disarmed("write"):
+            self._writeback_phase_refusals = (
+                getattr(self, "_writeback_phase_refusals", 0) + len(self.write_queue)
+            )
+            n = self._writeback_phase_refusals
+            if n <= 3 or n % 200 == 0:
+                logger.warning(
+                    "#760 WRITE-BACK REFUSED AT CONSUME: the phase moved after "
+                    "these %d copies were queued, so their device indices name "
+                    "the pool of a phase that is no longer computing. Dropping "
+                    "them; those prefixes miss later. (%d so far.)",
+                    len(self.write_queue),
+                    n,
+                )
+            self.write_queue.clear()
+            return
+
         fresh = [
             o
             for o in self.write_queue
