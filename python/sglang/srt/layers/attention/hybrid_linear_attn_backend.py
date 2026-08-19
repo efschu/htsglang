@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, Union
 
 import torch
@@ -1109,6 +1110,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+            import logging as _logging
+
+            _tl = _logging.getLogger(__name__)
+            _slots = state_indices_tensor.tolist()
+            _pre = [float(ssm_states[:, s].float().abs().sum()) for s in _slots]
+            _tl.warning(
+                "#767-TRACE mtp_commit: slots=%s steps=%s ssm_pre=%s "
+                "inter_shape=%s ssm_shape=%s",
+                _slots,
+                last_correct_step_indices.tolist(),
+                [round(x, 1) for x in _pre],
+                tuple(intermediate_state_cache.shape),
+                tuple(ssm_states.shape),
+            )
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,

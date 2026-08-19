@@ -4345,6 +4345,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
+        if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+            logger.warning(
+                "#767-TRACE cow_and_clear: mode=%s bs=%s clear=%s cow_src=%s "
+                "cow_dst=%s prefix_lens=%s",
+                forward_batch.forward_mode,
+                int(forward_batch.batch_size),
+                None
+                if forward_batch.mamba_clear_indices is None
+                else forward_batch.mamba_clear_indices.tolist(),
+                None
+                if forward_batch.mamba_cow_src_indices is None
+                else forward_batch.mamba_cow_src_indices.tolist(),
+                None
+                if forward_batch.mamba_cow_dst_indices is None
+                else forward_batch.mamba_cow_dst_indices.tolist(),
+                None
+                if forward_batch.extend_prefix_lens_cpu is None
+                else list(forward_batch.extend_prefix_lens_cpu),
+            )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

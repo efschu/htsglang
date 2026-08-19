@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -255,6 +256,23 @@ class MambaComponent(TreeComponent):
         if cd.value is None and cd.host_value is not None:
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
+            )
+
+        if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+            logger.warning(
+                "#767-TRACE match: rid=%s match_tokens=%s best_len=%s "
+                "effective=%s cow=%s mamba_value=%s cow_src=%s pool_idx=%s "
+                "host_hit=%s zeroed=%s",
+                getattr(req, "rid", None),
+                sum(len(v) for v in value_chunks),
+                best_value_len,
+                effective_best_len,
+                cow_mamba,
+                None if mamba_value is None else mamba_value.tolist(),
+                getattr(req, "mamba_cow_src_index", None),
+                getattr(req, "mamba_pool_idx", None),
+                result.mamba_host_hit_length,
+                zeroed_by_strict_resume,
             )
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
