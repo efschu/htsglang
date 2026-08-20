@@ -152,6 +152,44 @@ SHORTFALL_DECAY_DEN = 2
 #: instead of leaving a long tail that still moves the floor.
 SHORTFALL_FORGET_BYTES = 16 << 20
 
+#: #782: the width of the band inside which a re-solve is NOISE rather than a
+#: correction, and the id space therefore does not move.
+#:
+#: WHY THIS EXISTS AT ALL. ``floor_allowed_tokens`` solves the id space from a
+#: free column the PREVIOUS boot measured, and this boot then measures its own
+#: and records it for the next one. That is a first-order recurrence,
+#:
+#:     T(n+1) = T(n) + (free_measured(n) - floor) / cell
+#:
+#: whose fixed point is "the boot measured exactly the floor it solved for".
+#: The model is good but not exact, so the residual never reaches zero and the
+#: sequence never repeats a value: measured on this rig at cut (31,16,17) /
+#: attn (7,4,5), the binding rank went 430000 (cold) -> 146390 -> 161378 with
+#: IDENTICAL argv on an identical commit, and the last step was a 6 MiB
+#: residual on a 4808 MiB baseline. Capacity that moves every boot for reasons
+#: absent from the command line is the #188 complaint, arriving through the
+#: seam record instead of the measured-budget registry (#782).
+#:
+#: WHAT IT DOES. A correction this small buys tokens nobody asked for and costs
+#: reproducibility, so it is not taken and the id space stays where the last
+#: boot put it. The recurrence then has an EXACT fixed point rather than an
+#: asymptotic one, and two boots of the same configuration report the same
+#: capacity.
+#:
+#: DIRECTIONAL, and that asymmetry is the safety argument: only GROWTH is
+#: latched. A re-solve that comes out LOWER means the rank can no longer hold
+#: its arming floor at the current size, which is a constraint violation and is
+#: always taken however small it is. Refusing a small growth can never breach a
+#: floor; refusing a small shrink can.
+#:
+#: SIZE. It must sit above the per-boot allocator noise it exists to absorb
+#: (6-7 MiB measured on the binding rank across the boots above) and far below
+#: any change that matters to a corridor verdict (the band's half-width is
+#: 205 MiB). 64 MiB is an order of magnitude over the former and a factor of
+#: three under the latter. It is a noise floor, not a rig-specific pin: nothing
+#: about it is derived from this rig's card sizes or layout.
+POOL_LATCH_TOLERANCE_BYTES = 64 << 20
+
 @dataclasses.dataclass(frozen=True)
 class SizingPin:
     """A shipped pool size WITH the regime it was derived under (#678).
@@ -1219,7 +1257,35 @@ def floor_allowed_tokens(
     if free_m <= 0 or t_m <= 0:
         return None
     target = max(0, int(floor_target_bytes))
-    return max(0, t_m + (free_m - target) // cell)
+    solved = max(0, t_m + (free_m - target) // cell)
+    # #782 NOISE LATCH: the recurrence gets an exact fixed point instead of an
+    # asymptotic one. See POOL_LATCH_TOLERANCE_BYTES for why capacity moved
+    # every boot without it, and why only growth is latched.
+    growth_bytes = (solved - t_m) * cell
+    if 0 < growth_bytes <= POOL_LATCH_TOLERANCE_BYTES:
+        logger.info(
+            "%s POOL LATCH (#782): the re-solve wants %d tokens against the "
+            "%d this configuration last ran, a correction of %d MiB. That is "
+            "inside the %d MiB noise band, so the id space does NOT move and "
+            "stays at %d. Provenance of the inputs: free column %d MiB "
+            "measured by a previous boot at an id space of %d (%s), arming "
+            "floor target %d MiB, cell %d B/token. Taking a correction this "
+            "small is what made capacity differ between two boots of the same "
+            "command line.",
+            LOG_PREFIX,
+            solved,
+            t_m,
+            growth_bytes >> 20,
+            POOL_LATCH_TOLERANCE_BYTES >> 20,
+            t_m,
+            free_m >> 20,
+            t_m,
+            reserve.provenance,
+            target >> 20,
+            cell,
+        )
+        return int(t_m)
+    return solved
 
 
 def seam_adjusted_budget_bytes(
@@ -1704,15 +1770,30 @@ def describe(reserve: SeamReserve, path: str) -> str:
             f"seam reserve {reserve.fixed_bytes / mib:.0f} MiB fixed + "
             f"{reserve.per_row_bytes:.1f} B/row, MEASURED BY A PREVIOUS BOOT "
             f"({path}, written {reserve.written_at}). {reserve.detail} "
-            f"Identical commands against a different record state will size "
-            f"differently; pin --max-total-tokens for a reproducible pool."
+            f"This record is a SIZING INPUT that the command line does not "
+            f"show: the id space is solved from the free column recorded "
+            f"here, at {reserve.id_space} tokens. Since #782 a re-solve that "
+            f"differs by less than "
+            f"{POOL_LATCH_TOLERANCE_BYTES >> 20} MiB is treated as noise and "
+            f"the id space does not move, so two boots of the same command "
+            f"line against a settled record report the SAME capacity without "
+            f"pinning --max-total-tokens. A record in a different state -- "
+            f"cold, or written under a different layout -- still sizes "
+            f"differently, and that difference is legitimate rather than "
+            f"noise."
         )
     return (
         f"seam reserve is COLD (no record at {path}): this boot sizes with NO "
         f"flip-seam term and may produce an instance whose flips cannot be "
         f"funded (#656 boot E). It measures the seam at the end of the flip "
         f"boot and writes the record, so the NEXT identical boot is the "
-        f"seam-safe one. Watch for 'FLIP ABANDONED' on this boot."
+        f"seam-safe one. Watch for 'FLIP ABANDONED' on this boot. "
+        f"THIS BOOT'S CAPACITY IS NOT THE CONFIGURATION'S CAPACITY and will "
+        f"not be reproduced (#782): with no record the arena tail prices at 0, "
+        f"so this rank's arming floor is understated and its pool is "
+        f"correspondingly too large -- measured at 4.4x on the binding rank "
+        f"of cut (31,16,17). Do not accept a cold boot's pool as an "
+        f"acceptance figure; boot the same command line again."
     )
 
 
