@@ -4225,6 +4225,50 @@ class TestUnifiedRadixCacheMambaCheckpointGridRetention(CustomTestCase):
         self.assertEqual(retained, 64)
         self.assertEqual(matched, 0)
 
+    def test_resume_stops_at_the_position_the_state_was_taken(self):
+        """#767 direction: a hit must resume where the state actually sits.
+
+        The corruption #767 named is a resume whose KV and recurrent state
+        belong to DIFFERENT positions -- it surfaced as a foreign request's
+        text continuing into a fresh prompt. Widening a match is exactly how
+        that is re-introduced, so the fixes here are pinned from both sides:
+        the previous tests require that an anchorless node is never served,
+        and this one requires that an anchored node is served no DEEPER than
+        the raw position its state was snapshotted at.
+
+        Deeper KV must really BE there, or the assertion is vacuous, so the
+        tree is built in two steps with interval 64:
+          A: 128 raw tokens -- on-grid, so it files an anchor at raw 128
+          B: 168 raw tokens extending A -- off-grid, so the retention fix
+             keeps its KV but files NO anchor (a tombstone)
+        The path now carries 167 bigrams of KV while the deepest position
+        whose recurrent state was actually snapshotted is raw 128. A query
+        for B's full token list must resume at 127 bigrams (raw 128), not at
+        167: the 40 tokens beyond the anchor have KV but no state.
+        """
+        cfg = replace(self.cfg, is_eagle=True, kv_size=512, max_context_len=512)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        cache.components[ComponentType.MAMBA].mamba_checkpoint_interval = 64
+        anchored = list(range(1000, 1000 + 128))
+        self._cache_finished(cache, allocator, req_to_token_pool, anchored)
+
+        deeper = anchored + list(range(9000, 9040))
+        self._cache_finished(cache, allocator, req_to_token_pool, deeper)
+        # The deeper, anchorless KV is genuinely retained -- otherwise the
+        # assertion below could not tell a correct stop from an empty tree.
+        self.assertEqual(
+            cache.total_size()[0], 167, "the off-grid tail must be retained"
+        )
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", deeper), None, is_bigram=True))
+        )
+        self.assertEqual(
+            int(match.device_indices.numel()),
+            127,
+            "the resume point must be the raw position the state was taken at",
+        )
+
 
 _CONFIGS: list[CacheConfig] = [
     CacheConfig(page_size=1, components=(ComponentType.FULL,)),
