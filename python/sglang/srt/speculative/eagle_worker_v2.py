@@ -683,6 +683,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        # A QUANTIZED VOCAB IS ITS WEIGHT *AND* ITS SCALE (#774).
+        #
+        # ``set_embed_and_head`` hands over ``.weight`` and nothing else. On a
+        # vocab-quantized checkpoint the rows are int8 and are meaningless
+        # without their per-row scale, and the draft's own embed module is
+        # NEVER LOADED -- ``set_embed_and_head_modules`` says so in as many
+        # words. So the drafter dequantized the target's int8 rows with
+        # whatever happened to be in its uninitialized scale tensor.
+        #
+        # That is not a latent risk, it is what the rig was doing. Measured
+        # 2026-08-20, same commit, same seed, only --max-running-requests
+        # changed, read at the share point before any decode:
+        #
+        #   cap 4: draft scale norm 0.127293 (stale bytes that happened to be
+        #          the target's) -> spec accept len 4.00
+        #   cap 8: draft scale norm 0.000000 (a zeroed block)
+        #          -> spec accept len 1.14, one constant token proposed forever
+        #
+        # The healthy case was an ACCIDENT of allocation, not a working path.
+        # Sharing the scale the same way the weight is shared makes the draft's
+        # embedding mean what the target's means, by construction, at any cap.
+        self._share_vocab_quant_companions(target_model)
+
     # ------------------------------------------------------------------
     # Draft-solo placement helpers (--speculative-draft-placement solo)
     # ------------------------------------------------------------------
@@ -702,6 +725,70 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 attn_tp_rank=0,
             )
         return contextlib.nullcontext()
+
+    # Everything a quantized vocab needs BESIDES `.weight` to mean anything.
+    # Named rather than discovered so an unrelated module attribute can never
+    # be re-pointed at the target by accident; extend it when a quantization
+    # adds a companion.
+    _VOCAB_QUANT_COMPANIONS = (
+        "weight_scale",
+        "weight_scale_inv",
+        "weight_zero_point",
+        "weight_offset",
+        "weight_g_idx",
+    )
+
+    def _share_vocab_quant_companions(self, target_model) -> None:
+        """Point the draft's vocab quant companions at the target's (#774).
+
+        No-op on an unquantized vocab: the attributes simply do not exist, and
+        the default path stays byte-identical. Shares the TENSOR rather than
+        copying it, exactly as ``set_embed_and_head`` shares ``.weight``, so the
+        two cannot drift and no second copy is paid for.
+        """
+        draft_model = getattr(self.draft_runner, "model", None)
+        if draft_model is None or target_model is None:
+            return
+
+        def _embed_of(m):
+            inner = getattr(m, "model", None)
+            return getattr(inner, "embed_tokens", None) if inner is not None else None
+
+        pairs = (
+            ("embed_tokens", _embed_of(draft_model), _embed_of(target_model)),
+            (
+                "lm_head",
+                getattr(draft_model, "lm_head", None),
+                getattr(target_model, "lm_head", None),
+            ),
+        )
+        shared = []
+        for what, dst, src in pairs:
+            if dst is None or src is None or dst is src:
+                # `dst is src` == the module was already shared wholesale
+                # (the GGUF path), which carries its companions by construction.
+                continue
+            for name in self._VOCAB_QUANT_COMPANIONS:
+                tensor = getattr(src, name, None)
+                if tensor is None or getattr(dst, name, None) is tensor:
+                    continue
+                # Drop the existing registration first. torch refuses to
+                # assign a plain Tensor over a registered Parameter (and vice
+                # versa), and a companion is a Parameter on one quantization
+                # and a buffer on the next -- so clear the slot rather than
+                # assume which kind the destination happens to hold.
+                dst._parameters.pop(name, None)
+                dst._buffers.pop(name, None)
+                setattr(dst, name, tensor)
+                shared.append(f"{what}.{name}")
+        if shared:
+            logger.info(
+                "#774 shared the target's vocab quantization companions with "
+                "the draft: %s. Without these the draft dequantizes the "
+                "target's rows with an uninitialized scale, which decides "
+                "acceptance and is invisible until the allocation changes.",
+                ", ".join(shared),
+            )
 
     def _solo_init_lm_head(self):
         """Solo variant of ``init_lm_head``: assemble FULL (unsharded)
