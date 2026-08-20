@@ -549,6 +549,12 @@ class Scheduler(
                 getattr(server_args, "enable_phase_flip", False)
                 and getattr(server_args, "phase_flip_policy", "manual") == "auto"
             ),
+            # #781: hand the whole ServerArgs over so the tuning knobs resolve
+            # from FLAGS first and fall back to their deprecated env vars only
+            # when a flag is unset. ServerArgs is pickled into this subprocess
+            # (entrypoints/engine.py), so the flag value is already here -- no
+            # env round-trip is needed to carry it across the fork.
+            server_args=server_args,
         )
         self.phase_policy_state = None
         if self.phase_policy_cfg.enabled:

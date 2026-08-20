@@ -5560,6 +5560,126 @@ class ServerArgs:
             "fallback SGLANG_PHASE_FLIP_SPILL_DEPTH.",
         ),
     ] = None
+
+    # ------------------------------------------------------------------
+    # #781: PROMOTED FROM ENV. These were SGLANG_* environment variables
+    # assembled into the systemd unit by concatenating a captured shell
+    # environment, a heredoc and EXTRA_ENV. That is not a configuration
+    # mechanism, and it failed as one: SGLANG_UNEVEN_TOKEN_VECTOR was set and
+    # then silently cleared by an empty override appended later, disabling
+    # uneven token sharding for a day; SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S
+    # was 10 in one half and 8 in the other, and the 10 had been dead the whole
+    # time with nobody aware. "Last one wins" is not a diagnostic anyone reads.
+    #
+    # A flag cannot fail those ways: argparse rejects a typo that env silently
+    # ignores, there is one definition instead of a name matched by string in N
+    # places, the value is visible in `ps` and the boot log, it cannot be
+    # written twice, and the planner can solve it.
+    #
+    # DEFAULTS ARE None ON PURPOSE. None means "not specified", so the existing
+    # environment fallback still resolves and behaviour is byte-identical for
+    # anyone who has not moved to the flags yet. Each consumer prefers the flag
+    # and warns when it falls back, via _warn_deprecated_env_to_cli_flag.
+    phase_policy_drain_mode: A[
+        Optional[bool],
+        Arg(
+            help="Pure-drain phase policy: PP prefills until the backlog is "
+            "empty, then TP decodes the carried batch, then back. Promoted "
+            "from SGLANG_PHASE_POLICY_DRAIN_MODE (#781). Unset falls back to "
+            "that env var, which is deprecated.",
+        ),
+    ] = None
+    phase_policy_min_dwell_s: A[
+        Optional[float],
+        Arg(
+            help="Minimum seconds a phase must hold before it may flip again. "
+            "Promoted from SGLANG_PHASE_POLICY_MIN_DWELL_S (#781).",
+        ),
+    ] = None
+    phase_policy_tp_decode_floor_s: A[
+        Optional[float],
+        Arg(
+            help="Minimum seconds the TP decode phase holds once entered. "
+            "Promoted from SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S (#781). NOTE: "
+            "this knob was set to two different values in two halves of the "
+            "boot env (10 and 8); 8 won silently. Every phase-policy timing "
+            "record taken before 2026-08-20 describes an 8-second floor.",
+        ),
+    ] = None
+    phase_policy_pp_window_s: A[
+        Optional[float],
+        Arg(
+            help="PP prefill window in seconds. Promoted from "
+            "SGLANG_PHASE_POLICY_PP_WINDOW_S (#781). The in-code default is a "
+            "MEASURED retreat to 0: non-zero 15/10-second defaults killed "
+            "three boots.",
+        ),
+    ] = None
+    phase_policy_decode_stall_slo_s: A[
+        Optional[float],
+        Arg(
+            help="Upper bound in seconds on how long decode may stall before "
+            "the policy forces progress. NOT a fairness knob: it exists only "
+            "to break the blocked-admission wedge, where PP cannot admit "
+            "pending prefill because every state slot is held by a carried "
+            "decode, so DRAINED can never fire. 0 disables the cap. Promoted "
+            "from SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (#781).",
+        ),
+    ] = None
+    phase_policy_decode_contention: A[
+        Optional[float],
+        Arg(
+            help="Decode contention weight in [0,1], the measured "
+            "counterfactual used to price a flip against what NOT flipping "
+            "costs the same decodes. Promoted from "
+            "SGLANG_PHASE_POLICY_DECODE_CONTENTION (#781).",
+        ),
+    ] = None
+    seam_entry_margin_mib: A[
+        Optional[int],
+        Arg(
+            help="Free-VRAM margin in MiB a rank must hold before it may enter "
+            "the phase-flip seam. Promoted from SGLANG_SEAM_ENTRY_MARGIN_MIB "
+            "(#781).",
+        ),
+    ] = None
+    seam_entry_delay_budget_s: A[
+        Optional[int],
+        Arg(
+            help="Seconds a rank may wait for seam entry conditions before "
+            "giving up on the flip. Promoted from "
+            "SGLANG_SEAM_ENTRY_DELAY_BUDGET (#781).",
+        ),
+    ] = None
+    flip_seam_chunk_mib: A[
+        Optional[int],
+        Arg(
+            help="Copy chunk size in MiB for seam staging transfers. Promoted "
+            "from SGLANG_FLIP_SEAM_CHUNK_MIB (#781).",
+        ),
+    ] = None
+    collective_census_interval: A[
+        Optional[int],
+        Arg(
+            help="Scheduler iterations between collective-census samples. "
+            "Promoted from SGLANG_COLLECTIVE_CENSUS_INTERVAL (#781). Note the "
+            "old env was read once at MODULE IMPORT into a global, so a later "
+            "change was invisible; the flag is read per scheduler.",
+        ),
+    ] = None
+    phase_flip_corridor_floor_mib: A[
+        Optional[int],
+        Arg(
+            help="Corridor floor in MiB used by the phase-flip spill planner. "
+            "Promoted from SGLANG_CORRIDOR_FLOOR_MIB (#781), which was REMOVED "
+            "from the boot env because it silently overrode the corridor law "
+            "that lives in code (corridor_guard.CORRIDOR_LAW_MIB = 1024, band "
+            "819-1229): measurements were being judged against a band the "
+            "server did not use. Unset means the code law governs, which is "
+            "the intended state; set it only for a deliberate experiment.",
+        ),
+    ] = None
+
     phase_flip_canonical_kv_page: A[
         bool,
         Arg(

@@ -2508,18 +2508,56 @@ def _env_int(name: str, default: int) -> int:
 ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
 
 
+def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
+    """Resolve one knob: the CLI FLAG wins, the env var is a deprecated bridge.
+
+    #781. These knobs used to come from the environment only. The boot env was
+    assembled by concatenating a captured shell environment, a heredoc and
+    EXTRA_ENV, which silently resolved a key written twice as "last one wins" --
+    SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S was 10 in one half and 8 in the other,
+    and the 10 had been dead the whole time with nobody aware.
+
+    So the flag is authoritative. The env is still read when the flag is unset,
+    which keeps every existing deployment byte-identical, and warns so the
+    remaining users are visible instead of silent.
+    """
+    value = getattr(server_args, field, None) if server_args is not None else None
+    if value is not None:
+        return value
+    if os.environ.get(env_name) not in (None, ""):
+        try:
+            from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
+
+            _warn_deprecated_env_to_cli_flag(
+                env_name, "--" + field.replace("_", "-")
+            )
+        except Exception:
+            # A missing/renamed helper must never cost a boot: the warning is
+            # advisory, the value below is what matters.
+            pass
+    return env_reader(env_name, default)
+
+
 def config_from_env(
-    enabled: bool, chunk_tokens: int = 0, formation_target: int = 0
+    enabled: bool,
+    chunk_tokens: int = 0,
+    formation_target: int = 0,
+    server_args=None,
 ) -> PhasePolicyConfig:
     """Build the boot configuration.
 
-    ``enabled`` comes from the server arg; the tuning knobs come from the
-    environment so a running deployment can be re-tuned without a code
-    change, and so the acceptance run can exercise a short dwell without
-    shipping a short dwell as the default.
+    ``enabled`` comes from the server arg. The tuning knobs now come from
+    SERVER ARGS FIRST (#781) and fall back to the environment only when the
+    corresponding flag is unset -- see ``_flag_or_env``. ``server_args`` is
+    optional so the many existing unit tests that build a config without a
+    ServerArgs keep working unchanged; when it is None every knob resolves
+    exactly as it did before.
     """
     rest_state = os.environ.get(ENV_REST_STATE) or REST_DECODE
-    min_dwell = _env_float(ENV_MIN_DWELL, DEFAULT_MIN_DWELL_S)
+    min_dwell = _flag_or_env(
+        server_args, "phase_policy_min_dwell_s", ENV_MIN_DWELL, _env_float,
+        DEFAULT_MIN_DWELL_S,
+    )
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
 
     # THE THREE MEASUREMENTS THE WHOLE LADDER RESTS ON, resolved from the
@@ -2565,13 +2603,21 @@ def config_from_env(
 
     cfg = PhasePolicyConfig(
         enabled=enabled,
-        drain_mode=_env_flag(ENV_DRAIN_MODE, False),
+        drain_mode=_flag_or_env(
+            server_args, "phase_policy_drain_mode", ENV_DRAIN_MODE, _env_flag, False
+        ),
         flip_tokens=flip_tokens,
         min_dwell_s=min_dwell,
         idle_dwell_s=idle_dwell,
         rest_state=rest_state,
-        pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
-        tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
+        pp_window_s=_flag_or_env(
+            server_args, "phase_policy_pp_window_s", ENV_PP_WINDOW, _env_float,
+            DEFAULT_PP_WINDOW_S,
+        ),
+        tp_decode_floor_s=_flag_or_env(
+            server_args, "phase_policy_tp_decode_floor_s", ENV_TP_FLOOR,
+            _env_float, DEFAULT_TP_DECODE_FLOOR_S,
+        ),
         # #689: the caller passes max_running_requests; the env can override
         # it, and 0/1 disables the gate and restores the previous behaviour.
         formation_target=int(
@@ -2586,8 +2632,14 @@ def config_from_env(
         # The measured counterfactual. With it the surcharge prices a flip
         # against what NOT flipping costs the same decodes; without it the
         # old one-sided form is kept, unchanged.
-        decode_contention=_env_float(ENV_DECODE_CONTENTION, DEFAULT_DECODE_CONTENTION),
-        decode_stall_slo_s=_env_float(ENV_DECODE_STALL_SLO, DEFAULT_DECODE_STALL_SLO_S),
+        decode_contention=_flag_or_env(
+            server_args, "phase_policy_decode_contention", ENV_DECODE_CONTENTION,
+            _env_float, DEFAULT_DECODE_CONTENTION,
+        ),
+        decode_stall_slo_s=_flag_or_env(
+            server_args, "phase_policy_decode_stall_slo_s", ENV_DECODE_STALL_SLO,
+            _env_float, DEFAULT_DECODE_STALL_SLO_S,
+        ),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
         # Passed in rather than read from env: it is a runtime fact of THIS
         # scheduler, and the armed line below prices the seam from it -- so it
