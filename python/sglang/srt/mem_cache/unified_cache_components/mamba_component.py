@@ -80,6 +80,26 @@ class MambaComponent(TreeComponent):
         # indistinguishable from idle traffic in the logs.
         self._off_grid_retention_declines = 0
 
+    def _raw_token_pos(self, key_units: int) -> int:
+        """Absolute RAW-token position of a node measured in KEY units.
+
+        #783: the checkpoint grid is a statement about how many tokens the
+        recurrent state has consumed, so every grid test must be evaluated in
+        raw tokens. Two of the three test sites were not: retention measures
+        `token_ids_len` (raw), while the insert backstop measures
+        `len(params.key)` and the match walk accumulates `cum_tokens`, both of
+        which are KEY units. Under EAGLE the radix key is a bigram view, where
+        k bigrams span k+1 raw tokens, so the two unit systems disagree by one
+        and `interval | n` and `interval | (n-1)` can never hold together --
+        making an anchor that retention certified unacceptable on match, for
+        EVERY request length. EAGLE plus --mamba-checkpoint-interval therefore
+        could not produce a single prefix hit. Identity outside EAGLE, where
+        key units already are raw tokens.
+        """
+        if key_units <= 0:
+            return 0
+        return key_units + 1 if self.cache.is_eagle else key_units
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode, int], bool]:
@@ -90,9 +110,10 @@ class MambaComponent(TreeComponent):
         # same call MambaRadixCache._match_prefix_helper makes, so the two
         # lineages cannot drift. With interval=None this is byte-identical
         # to the old pure presence test.
+        raw_pos = self._raw_token_pos
         if match_device_only:
             return lambda node, depth: is_resume_candidate(
-                depth,
+                raw_pos(depth),
                 interval,
                 has_device_value=node.component_data[ct].value is not None,
             )
@@ -117,7 +138,7 @@ class MambaComponent(TreeComponent):
             data = node.component_data[ct]
             has_dev = data.value is not None
             ok = is_resume_candidate(
-                depth,
+                raw_pos(depth),
                 interval,
                 has_device_value=has_dev,
                 has_host_value=data.host_value is not None,
@@ -316,14 +337,18 @@ class MambaComponent(TreeComponent):
         # the donated state would sit DEEPER than the key it is filed under.
         # `mamba_exist=True` routes the donated value into the caller's
         # existing duplicate-cleanup, which frees it.
-        if not is_on_interval(len(params.key), self.mamba_checkpoint_interval):
+        # #783: in RAW tokens, like every other grid test -- `len(params.key)`
+        # is a bigram count under EAGLE and would refuse the very anchor the
+        # retention gate just certified. See `_raw_token_pos`.
+        key_raw_pos = self._raw_token_pos(len(params.key))
+        if not is_on_interval(key_raw_pos, self.mamba_checkpoint_interval):
             self._off_grid_insert_refusals += 1
             count = self._off_grid_insert_refusals
             if count <= 3 or count % 1000 == 0:
                 logger.warning(
                     "mamba checkpoint interval: refusing off-grid insert at "
-                    "%d (interval %d), occurrence=%d",
-                    len(params.key),
+                    "raw token position %d (interval %d), occurrence=%d",
+                    key_raw_pos,
                     self.mamba_checkpoint_interval,
                     count,
                 )

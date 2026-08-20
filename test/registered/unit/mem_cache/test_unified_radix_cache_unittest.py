@@ -4156,16 +4156,19 @@ class TestUnifiedRadixCacheMambaCheckpointGridRetention(CustomTestCase):
         req.last_node = cache.root_node
         cache.cache_finished_req(req, is_insert=True)
 
-    def _insert_then_match(self, interval, n_tokens):
+    def _insert_then_match(self, interval, n_tokens, is_eagle=False):
         """Cache one finished request, then look the identical key back up."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cfg = replace(self.cfg, is_eagle=is_eagle) if is_eagle else self.cfg
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         # The component latches the interval at construction time.
         cache.components[ComponentType.MAMBA].mamba_checkpoint_interval = interval
         tokens = list(range(1000, 1000 + n_tokens))
         self._cache_finished(cache, allocator, req_to_token_pool, tokens)
         retained = cache.total_size()[0]
         match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens), None))
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens), None, is_bigram=is_eagle)
+            )
         )
         return retained, int(match.device_indices.numel())
 
@@ -4194,6 +4197,33 @@ class TestUnifiedRadixCacheMambaCheckpointGridRetention(CustomTestCase):
         retained, matched = self._insert_then_match(interval=None, n_tokens=64)
         self.assertEqual(retained, 64)
         self.assertEqual(matched, 64)
+
+    def test_eagle_on_grid_end_matches(self):
+        """#783 second defect: the grid must be read in RAW tokens, not key units.
+
+        Under EAGLE the radix key is a bigram view -- 64 raw tokens are 63
+        bigrams. Retention certifies the anchor at raw position 64 while the
+        insert backstop and the match walk measured 63, so `interval | n` and
+        `interval | (n - 1)` had to hold at once. They cannot, for any interval
+        above 1, so EAGLE plus --mamba-checkpoint-interval produced no prefix
+        hit at ANY request length -- which is the rig's own configuration
+        (--speculative-algorithm NEXTN).
+        """
+        retained, matched = self._insert_then_match(
+            interval=64, n_tokens=64, is_eagle=True
+        )
+        self.assertEqual(retained, 63, "63 bigrams span the 64 raw tokens")
+        self.assertEqual(
+            matched, 63, "an on-grid EAGLE anchor must be accepted on match"
+        )
+
+    def test_eagle_off_grid_end_retains_without_anchor(self):
+        """The same EAGLE key one token past the grid: retained, not resumable."""
+        retained, matched = self._insert_then_match(
+            interval=64, n_tokens=65, is_eagle=True
+        )
+        self.assertEqual(retained, 64)
+        self.assertEqual(matched, 0)
 
 
 _CONFIGS: list[CacheConfig] = [
