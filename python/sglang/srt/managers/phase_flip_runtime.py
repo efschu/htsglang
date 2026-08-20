@@ -2070,6 +2070,13 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         # turn reaps the handle once the downstream's counter proves the
         # message consumed, where the pump could only ever fail to.
         owes_send_fn=getattr(scheduler, "pp_owes_chain_send", None),
+        # #787 sender-side half: reap/count anything already posted on
+        # CHAN_DICT one last time before an abandon clears local flip
+        # state. See PhaseFlipRuntime.__init__'s flush_pending_sends_fn
+        # docstring and _abandon_no_quorum / _abandon_unjoined_flip.
+        flush_pending_sends_fn=getattr(
+            scheduler, "pp_flip_flush_pending_dict_sends", None
+        ),
         exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
         pp_pool_view=pp_view,
         tp_pool_view=tp_view,
@@ -2492,6 +2499,19 @@ class PhaseFlipRuntime:
         # else a human-readable reason. Flip-commit hygiene: a message in
         # flight across the re-formation misframes the post-flip stream.
         channels_empty_fn: Optional[Callable[[], Optional[str]]] = None,
+        # #787 SENDER-SIDE HALF. Called synchronously by _abandon_no_quorum
+        # and _abandon_unjoined_flip, strictly BEFORE local flip state is
+        # cleared -- i.e. before this rank is free to resume launching new
+        # admissions and race ahead of a downstream peer's own disarm-time
+        # drain settle window (DRAIN_SETTLE_BUDGET_S in scheduler_pp_mixin.
+        # py). It reaps/counts anything this rank has ALREADY posted on the
+        # CHAN_DICT wire one final time, closing the gap between the most
+        # recent ordinary service turn and the abandon decision. It does
+        # NOT and cannot force an in-flight forward computation to finish
+        # early -- that send lands whenever it actually completes, same as
+        # before -- which is exactly why the receiver-side settle window
+        # exists as the complementary half; neither half alone is sound.
+        flush_pending_sends_fn: Optional[Callable[[], None]] = None,
         presence_deadline_s: float = DEFAULT_PRESENCE_DEADLINE_S,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         exchange: Optional[
@@ -2580,6 +2600,7 @@ class PhaseFlipRuntime:
         self._owes_send_fn = owes_send_fn
         self._service_fn = service_fn
         self._channels_empty_fn = channels_empty_fn
+        self._flush_pending_sends_fn = flush_pending_sends_fn
         #: Diagnostics: how often presence was withheld because a channel
         #: was not yet empty, and how often the entry check actually
         #: caught a non-empty channel at the gate (which should be never).
@@ -3965,7 +3986,25 @@ class PhaseFlipRuntime:
         on a collective this rank owes. Disarms and returns to normal
         cycling; the policy may re-arm, which mints a NEW epoch, so the
         stale flags of this one are never consulted again.
+
+        #787 SENDER-SIDE HALF: before local state clears, give this rank
+        one last chance to reap/count anything it already posted on the
+        CHAN_DICT wire. Without this, a send that completed moments ago
+        can still be un-bumped when a downstream peer's disarm-time
+        settle window (pp_flip_drain_leftover_dicts) already gave up and
+        closed -- the exact race #787 exploits. This does not delay the
+        abandon on anything unfinished; it only catches up bookkeeping
+        for work that is already done.
         """
+        if self._flush_pending_sends_fn is not None:
+            try:
+                self._flush_pending_sends_fn()
+            except Exception as exc:  # noqa: BLE001 - flush is best effort
+                logger.warning(
+                    "%s #787 pre-abandon send flush failed (no quorum): %s",
+                    LOG_PREFIX,
+                    exc,
+                )
         direction = self._pending
         self._pending = None
         self._armed_at = None
@@ -4029,7 +4068,22 @@ class PhaseFlipRuntime:
         return to serving, and NEVER raise -- the flip is optional, the
         requests are not. The policy may re-arm at its next evaluation,
         so a transient skew costs one logged retry.
+
+        #787 SENDER-SIDE HALF: same reasoning as in ``_abandon_no_quorum``
+        -- flush/count anything already posted on CHAN_DICT before this
+        rank's local state clears, so a peer's disarm-time settle window
+        is not racing against bookkeeping this rank could have closed out
+        itself.
         """
+        if self._flush_pending_sends_fn is not None:
+            try:
+                self._flush_pending_sends_fn()
+            except Exception as exc:  # noqa: BLE001 - flush is best effort
+                logger.warning(
+                    "%s #787 pre-abandon send flush failed (unjoined): %s",
+                    LOG_PREFIX,
+                    exc,
+                )
         direction = self._pending
         self._pending = None
         self._armed_at = None
