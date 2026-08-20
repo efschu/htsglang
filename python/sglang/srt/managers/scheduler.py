@@ -4692,6 +4692,26 @@ class Scheduler(
         local_avail = int(alloc.available_size())
         grp = getattr(self, "tp_cpu_group", None)
         if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            # #788: SAY IT ONCE, LOUDLY, THAT THE FLOORS ARE OFF.
+            #
+            # The comment below ("nothing to diverge from") is true for TP and
+            # FALSE for PP. This reduce group is tp_cpu_group, so on a
+            # TP=1/PP=3 boot it has one member on every rank and all three
+            # uniformity floors switch off -- while three PP ranks go on
+            # deriving admission from purely local availability and prefix
+            # matches. That is the measured cause of a pipeline deadlock, so
+            # the condition should be readable from the boot log rather than
+            # inferred from source months later.
+            if not getattr(self, "_uniform_floor_scope_logged", False):
+                self._uniform_floor_scope_logged = True
+                logger.info(
+                    "#788 UNIFORM-FLOOR SCOPE: tp_cpu_group world=%d -> floors OFF "
+                    "(evict/host/mamba). pp_size=%d tp_size=%d. With pp_size>1 the "
+                    "ranks that must agree are NOT in this reduce group.",
+                    0 if grp is None else int(torch.distributed.get_world_size(grp)),
+                    int(getattr(self.server_args, "pp_size", 1) or 1),
+                    int(getattr(self.server_args, "tp_size", 1) or 1),
+                )
             self._uniform_min_avail = local_avail
             self._uniform_budget_deficit = 0
             # One rank: nothing to diverge from, so the floor stays OFF and
@@ -6249,7 +6269,69 @@ class Scheduler(
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
+        if envs.SGLANG_PP_ADMISSION_TRACE.get():
+            self._trace_pp_admission_verdict(ret)
+
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _trace_pp_admission_verdict(self, ret: Optional[ScheduleBatch]) -> None:
+        """#788: record THIS rank's admission verdict and the inputs behind it.
+
+        WHY THIS EXISTS. Under PP the ranks are N independent schedulers that
+        agree only by determinism: the request is chain-forwarded to every
+        stage unconditionally, but each stage re-derives admission from its
+        OWN queue and radix state, and the proxy send to the next stage is
+        gated on this rank's own batch. So one rank declining while another
+        admits is a silent, unbounded pipeline deadlock -- the admitting rank
+        blocks for a proxy nobody will ever send. We have that deadlock
+        measured, and a mechanism proof for its cause (#616g's uniformity
+        floors are scoped to tp_cpu_group and switch OFF entirely when that
+        group has one member, which is every rank of a TP=1/PP=3 boot), but
+        no captured value showing the ranks actually disagreeing. One
+        instrumented boot with this on turns that into evidence -- or
+        falsifies it honestly, which is just as useful.
+
+        HOST-SIDE VALUES ONLY, and that is not a style preference. #790 was
+        exactly this shape: a diagnostic passed a CUDA tensor as a logging
+        argument, the %s formatting forced a D2H copy and a stream sync inside
+        logging.emit, and the scheduler sat there for 25 minutes. So every
+        value below is an int already resident on the host. len() on a tensor
+        reads its shape and does NOT synchronize, which is why prefix length
+        is taken that way rather than by reading the tensor.
+        """
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            if ret is None:
+                verdict = "DECLINE"
+                rids = ""
+                prefix_lens = ""
+            else:
+                verdict = "ADMIT"
+                # Truncated on purpose: this is a divergence signal, not a
+                # batch dump. A flood here has cost this feature a self-kill
+                # before (see the origin guard in request_receiver).
+                rids = ",".join(r.rid for r in ret.reqs[:4])
+                prefix_lens = ",".join(
+                    str(len(getattr(r, "prefix_indices", []) or []))
+                    for r in ret.reqs[:4]
+                )
+            logger.info(
+                "#788 PP-ADMISSION verdict=%s n_reqs=%d rids=%s prefix_lens=%s "
+                "avail=%d evictable=%d queue=%d running=%d chunked=%d",
+                verdict,
+                0 if ret is None else len(ret.reqs),
+                rids,
+                prefix_lens,
+                int(alloc.available_size()),
+                int(self.tree_cache.evictable_size()),
+                len(self.waiting_queue),
+                len(self.running_batch.reqs) if self.running_batch else 0,
+                1 if self.chunked_req is not None else 0,
+            )
+        except Exception as e:  # noqa: BLE001
+            # An instrument must never be able to kill the scheduler it is
+            # measuring -- that is the #790 lesson generalised.
+            logger.warning("#788 PP-ADMISSION trace unavailable: %s", type(e).__name__)
 
     def _drain_prefetch_progress(self) -> Dict[str, bool]:
         """Advance EVERY queued request's HiCache storage prefetch, and return

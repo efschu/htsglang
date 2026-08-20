@@ -527,6 +527,18 @@ class Envs:
     # default's derivation and rationale.
     SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(-1)
 
+    # #788: per-rank admission-verdict trace. OFF by default -- it exists to
+    # convert a MECHANISM proof into a captured value on one instrumented
+    # boot, not to run permanently. Under PP every rank re-derives the
+    # admission verdict locally, and a rank that declines forwards the request
+    # but can never send the proxy its downstream blocks on. This trace prints
+    # each rank's verdict and the host-side inputs behind it so a divergence
+    # is visible in one grep instead of a py-spy hunt. It logs ONLY host-side
+    # integers: no device tensor may reach a log argument here (see #790,
+    # where exactly that stringification synced inside logging.emit and wedged
+    # the scheduler for 25 minutes).
+    SGLANG_PP_ADMISSION_TRACE = EnvBool(False)
+
     # Load snapshot backend
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
 
