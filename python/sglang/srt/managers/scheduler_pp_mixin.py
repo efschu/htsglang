@@ -485,6 +485,17 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
+                # #788: flush THIS pass's request-chain send only after
+                # everything else this rank owed its peers this iteration is
+                # already posted (proxy isend above, output commit above).
+                # See _pp_commit_pending_req_work and the comment at the
+                # #788 send site in _pp_forward_and_process_input_requests
+                # for why the old top-of-pass position could close a cycle.
+                # Guarded the same way the send site is: the last rank never
+                # posts a chain send, so it has nothing to flush here either.
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_pending_req_work()
+
                 # #631 phase-flip round hook, deferred from
                 # get_next_batch_to_run: every send of this iteration is
                 # flushed above (output dict committed, proxy isend issued,
@@ -1004,6 +1015,40 @@ class SchedulerPPMixin:
                 # condition that can be REACHED.
                 self.pp_flip_service()
             else:
+                # #788: THIS LINE IS UNCHANGED, AND THAT IS THE POINT.
+                #
+                # The wedge was this commit blocking BEFORE the rank had
+                # posted anything else it owed its peers for the iteration:
+                # the proxy tensor-dict send and the output-ring send both
+                # come later in _event_loop_pp_body, so a downstream whose
+                # progress needs one of them was waiting on a rank that was
+                # itself waiting on that downstream. Specimen WEDGE_788: two
+                # ranks parked in this exact commit while the last rank
+                # waited on a proxy neither had sent yet.
+                #
+                # The fix is NOT to move this call. It is to make it a
+                # no-op in the loop where the hazard lives, by flushing the
+                # handle at the END of the iteration instead -- see
+                # _pp_commit_pending_req_work and its call site in
+                # _event_loop_pp_body. By the time that loop returns here,
+                # send_req_work has already been waited on and cleared, so
+                # this commit finds an empty list.
+                #
+                # Leaving the call in place is what keeps the other two
+                # callers -- event_loop_pp_disagg_prefill (:618) and
+                # event_loop_pp_disagg_decode (:765), neither of which runs
+                # the end-of-iteration commit -- on exactly their previous
+                # behaviour, and it is what keeps the #633 ordering contract
+                # this function's docstring documents literally intact:
+                # commit, then forward, then process, with send_req_work
+                # holding THIS pass's handle on return. Staging the send
+                # into a second slot instead broke that contract and the
+                # test that pins it (test_scheduler_pp_request_order_633).
+                #
+                # #753's a7ff250dc8 made the same "flush after the exchange,
+                # not before it" move for the OUTPUT channel. This is that
+                # fix for the REQUEST-CHAIN channel, and it is not gated to
+                # the gapped layout: the hazard is not gapped-specific.
                 self._pp_commit_comm_work(self.send_req_work)
                 with torch.profiler.record_function("send_reqs_to_next_stage"):
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -1022,6 +1067,39 @@ class SchedulerPPMixin:
         # (i): arm in this same pass; the flip hook at the end of this
         # microbatch iteration then joins without an intervening recv.
         self.process_input_requests(recv_reqs)
+
+    def _pp_commit_pending_req_work(self: Scheduler) -> None:
+        """#788: flush the outstanding request-chain send from the END of
+        the iteration, not the top of the next pass.
+
+        Called once per iteration from ``_event_loop_pp_body``, after the
+        proxy send and the output commit, before the phase-flip round hook.
+        That position is load-bearing, not incidental: everything this rank
+        owed a peer for this pass is already posted by the time this blocks,
+        so the wait here can only be on a peer that has no reason left to be
+        waiting on THIS rank -- the same property the round hook's own
+        comment (a few lines below this call site) already relies on for
+        the collective it runs.
+
+        IT FLUSHES ``send_req_work`` ITSELF, and introduces no second slot.
+        Staging the send into a separate ``_pp_pending_req_work`` was the
+        first shape of this fix and it was wrong twice over: it broke the
+        #633 ordering contract (``send_req_work`` must hold THIS pass's
+        handle on return from _pp_forward_and_process_input_requests, pinned
+        by test_scheduler_pp_request_order_633), and it left the two
+        disaggregation loops -- which never call this method -- overwriting
+        a live Work handle every pass. With no second slot there is nothing
+        to leak and nothing for a scheduler stand-in to grow a field for.
+
+        The list is safe to wait on unconditionally: ``_pp_commit_comm_work``
+        clears it, an armed pass reaps it through ``pp_flip_service``
+        instead, and ``init_pp_loop_state`` seeds it empty -- so on any pass
+        that posted nothing this is a wait on an empty list, and the commit
+        at the top of the next pass then finds it already cleared -- which
+        is precisely what makes that older call site harmless rather than
+        the place the group deadlocks.
+        """
+        self._pp_commit_comm_work(self.send_req_work)
 
     def pp_pump_send_req_work(self: Scheduler) -> None:
         """#631: MEASURED DEAD. Reaps nothing on this build, ever.

@@ -75,10 +75,24 @@ class _GlooWire:
     Only the TRANSPORT is adapted here -- pickle to bytes, bytes over gloo.
     The demultiplexing, the stamp check and the drain are the shipped
     functions. Mirrors the `pp_group` surface the code under test touches.
+
+    HARNESS REPAIR (interface drift, no assertion touched). `pp_typed_
+    channel.resolve_src` -- reached from `stash_typed`/`take_typed` on the
+    #757 demultiplex path -- now derives the peer identity from
+    `group.rank_in_group` / `group.world_size` instead of taking a bare
+    `src`, and the shipped `recv_typed_tensor_dict` now always passes `src`
+    positionally into `group.recv_tensor_dict(...)`. Neither existed on
+    this wire when this file was written; both are added here, transport-
+    only, so the wire matches the CURRENT shipped call shape. This ring is
+    a straight line UPSTREAM(0) -> VICTIM(1) -> DOWNSTREAM(2), the same
+    numbering as the real global rank here, so `rank_in_group` is just
+    `rank`.
     """
 
     def __init__(self, rank: int, src: int, dst: int):
         self.rank = rank
+        self.rank_in_group = rank
+        self.world_size = WORLD
         self.src = src
         self.dst = dst
         self.is_first_rank = rank == 0
@@ -90,7 +104,11 @@ class _GlooWire:
         dist.send(size, dst=self.dst)
         dist.send(torch.frombuffer(bytearray(buf), dtype=torch.uint8), dst=self.dst)
 
-    def recv_tensor_dict(self, all_gather_group=None):
+    def recv_tensor_dict(self, src=None, all_gather_group=None):
+        # `src` is accepted and ignored: this wire already has exactly one
+        # fixed peer per direction, set at construction. The shipped
+        # `recv_typed_tensor_dict` sometimes passes it positionally (as
+        # `None`); the old signature here rejected that call shape.
         size = torch.zeros(1, dtype=torch.long)
         dist.recv(size, src=self.src)
         buf = torch.zeros(int(size.item()), dtype=torch.uint8)

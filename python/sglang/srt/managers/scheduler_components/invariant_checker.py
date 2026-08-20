@@ -629,6 +629,42 @@ def admission_wedge_verdict(
 #: never more than one poll interval late.
 ADMISSION_WEDGE_POLL_SECONDS: float = ADMISSION_WEDGE_SECONDS / 2
 
+#: #788: seconds a CONFIRMED admission-wedge (i.e. ``admission_wedge_verdict``
+#: has already been alarming for this long) must persist before the watchdog
+#: attempts recovery, on top of already having crossed ``ADMISSION_WEDGE_
+#: SECONDS`` to alarm at all.
+#:
+#: HAND PIN #770: unlike ``ADMISSION_WEDGE_SECONDS`` (anchored to the #713
+#: specimen's own 11.87s-62.65s spread), this number has no independent
+#: measurement behind it -- no specimen recorded how long recovery should
+#: wait once the report has already fired. It is set to 3x the report
+#: threshold (60s) so a forced action never fires on the FIRST poll that
+#: alarms, or on a borderline age that a single missed poll interval could
+#: have produced: by the time this fires, the wedge has been confirmed,
+#: independently, on at least ADMISSION_WEDGE_RECOVERY_SECONDS /
+#: ADMISSION_WEDGE_POLL_SECONDS - 1 = 5 separate polls. "Default
+#: conservative" here means biased toward NOT acting rather than toward
+#: acting fast; a wrong choice in this direction costs a slower recovery,
+#: never a spurious one. Override with SGLANG_ADMISSION_WEDGE_RECOVERY_
+#: SECONDS if a future specimen shows this is wrong in either direction.
+ADMISSION_WEDGE_RECOVERY_SECONDS: float = 3.0 * ADMISSION_WEDGE_SECONDS
+
+
+def _admission_wedge_recovery_threshold() -> float:
+    """The configured recovery threshold, env-overridable, default conservative.
+
+    A non-positive override (including the env var's own unset sentinel, -1)
+    falls back to the documented default rather than being taken literally --
+    a recovery action that fires on EVERY poll the moment the report itself
+    does is not "conservative" under any reading of that word, and a 0 or
+    negative override is far more likely to be a misconfiguration than a
+    deliberate request for that behaviour.
+    """
+    override = envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.get()
+    if override is not None and override > 0:
+        return float(override)
+    return ADMISSION_WEDGE_RECOVERY_SECONDS
+
 
 def check_admission_wedge_once(
     scheduler: Scheduler,
@@ -692,17 +728,100 @@ def create_admission_wedge_watchdog(
     polls ``check_admission_wedge_once``, which reads queue/running counts
     and the first-token-progress clock.
 
-    Log-only in this slice, by design: there is no SIGQUIT path here. Restart
-    policy on a confirmed wedge is a separate decision with its own review.
+    Log-only for the REPORT, still, by design: there is no SIGQUIT path here
+    and this thread does not decide to restart anything. #788 adds exactly
+    one bounded action on top of the report: once a wedge has stayed
+    continuously alarming past ``_admission_wedge_recovery_threshold()`` (see
+    that function; env-overridable, default conservative, always well above
+    the report threshold itself), this loop makes ONE forced-admission
+    recovery attempt for that episode and logs the attempt loudly whichever
+    way it goes. "Episode" means a maximal run of consecutive alarming
+    polls; the attempt flag resets the moment a poll reports no alarm, so a
+    wedge that recurs later gets its own attempt.
+
+    The action reuses ``corridor_admission.guard_prefill_admission`` --
+    the SAME spill-before-alloc actuator normal prefill admission already
+    calls before building a chunk -- rather than inventing a new subsystem,
+    per #699/#788's own instruction to reuse what exists. It is best-effort
+    and admittedly narrow: ``guard_prefill_admission`` no-ops when phase-flip
+    is off (see its own docstring), and even when it runs, it only relieves
+    VRAM pressure at the admission site. A wedge whose cause is elsewhere --
+    the #788 PP comms deadlock this file's own ADMISSION_WEDGE docstring
+    calls "broader than that path" is exactly such a case -- will not be
+    moved by it, and the report keeps firing on every subsequent poll
+    regardless of whether the attempt ran.
+
+    CROSS-THREAD CAVEAT, named rather than assumed away: this watchdog
+    thread already reads scheduler.waiting_queue and scheduler.running_batch
+    unsynchronized (see check_admission_wedge_once), which this codebase
+    already treats as an accepted read-only risk. Calling
+    guard_prefill_admission from here goes further -- it can touch CUDA
+    allocator state (torch.cuda.memory_reserved/allocated, an empty_cache
+    provider on the relief ladder) concurrently with the scheduler's own
+    forward thread. That is a real, new concurrency shape, not a hazard this
+    change removes; it is accepted here because the alternative -- wiring a
+    new cross-thread signal/flag into the scheduler's own loop so the
+    scheduler thread runs the actuator itself -- is the "new subsystem"
+    #788 was explicit about not building for this slice.
     """
 
+    recovery_attempted_this_episode = False
+
+    def _attempt_recovery(age: float, threshold: float) -> None:
+        logger.error(
+            "%s RECOVERY: wedge has been continuously alarming for %.1fs "
+            "(>= %.1fs recovery threshold). Making ONE forced-admission "
+            "attempt for this episode via corridor_admission."
+            "guard_prefill_admission before reporting again.",
+            ADMISSION_WEDGE,
+            age,
+            threshold,
+        )
+        try:
+            from sglang.srt.managers.corridor_admission import (
+                guard_prefill_admission,
+            )
+
+            verdict = guard_prefill_admission(scheduler, tokens=0)
+        except Exception as e:  # noqa: BLE001 - recovery must not kill the watchdog
+            logger.error("%s RECOVERY: forced attempt raised: %s", ADMISSION_WEDGE, e)
+            return
+        logger.error(
+            "%s RECOVERY: forced-admission attempt returned %s (None means "
+            "the gate is off or inert on this boot -- see guard_prefill_"
+            "admission's own docstring; this does not mean the wedge is "
+            "resolved either way, only that the attempt ran)",
+            ADMISSION_WEDGE,
+            verdict,
+        )
+
     def _loop() -> None:
+        nonlocal recovery_attempted_this_episode
         while True:
             time.sleep(poll_interval)
             try:
-                check_admission_wedge_once(scheduler, log_on_alarm=True)
+                alarm, _detail = check_admission_wedge_once(
+                    scheduler, log_on_alarm=True
+                )
             except Exception as e:  # noqa: BLE001 - a watchdog must not die
                 logger.error(f"admission-wedge watchdog check failed: {e}")
+                continue
+            if not alarm:
+                recovery_attempted_this_episode = False
+                continue
+            if recovery_attempted_this_episode:
+                continue
+            threshold = _admission_wedge_recovery_threshold()
+            age = time.perf_counter() - scheduler.last_first_token_progress_time
+            if age < threshold:
+                continue
+            recovery_attempted_this_episode = True
+            try:
+                _attempt_recovery(age, threshold)
+            except Exception as e:  # noqa: BLE001 - a watchdog must not die
+                logger.error(
+                    "%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e
+                )
 
     t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
     t.start()

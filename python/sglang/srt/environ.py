@@ -520,6 +520,13 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
 
+    # #788: seconds a confirmed ADMISSION-WEDGE (invariant_checker.py) must
+    # persist, on top of the report threshold, before the watchdog fires ONE
+    # forced-admission recovery attempt for that episode. See
+    # ADMISSION_WEDGE_RECOVERY_SECONDS in invariant_checker.py for the
+    # default's derivation and rationale.
+    SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(-1)
+
     # Load snapshot backend
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
 
