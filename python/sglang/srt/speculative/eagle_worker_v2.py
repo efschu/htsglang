@@ -746,6 +746,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         copying it, exactly as ``set_embed_and_head`` shares ``.weight``, so the
         two cannot drift and no second copy is paid for.
         """
+        import os as _os
+
+        if _os.environ.get("SGLANG_774_NEUTER_VOCAB_COMPANIONS") == "1":
+            # CAN-FAIL PROOF ONLY (#779). Restores the pre-4e1b940900 defect on
+            # purpose -- the draft keeps its own uninitialized scale -- so the
+            # spec-accept gate can be shown to FAIL against a genuinely dead
+            # drafter. A gate that has never been observed failing is not a gate.
+            logger.warning(
+                "#774 CAN-FAIL PROOF: vocab quant companion sharing NEUTERED by "
+                "SGLANG_774_NEUTER_VOCAB_COMPANIONS=1. The drafter will run on an "
+                "uninitialized scale. NEVER set this outside a gate proof."
+            )
+            return
+
         draft_model = getattr(self.draft_runner, "model", None)
         if draft_model is None or target_model is None:
             return
