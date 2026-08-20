@@ -4109,6 +4109,93 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
 
+class TestUnifiedRadixCacheMambaCheckpointGridRetention(CustomTestCase):
+    """#783: an off-grid mamba end must not veto the full-attention KV insert.
+
+    ``--mamba-checkpoint-interval`` pins mamba resume anchors to an absolute
+    grid. A request whose end lands off that grid has no anchor it may donate
+    -- but its full-attention KV does not depend on the mamba grid and must
+    still be retained, exactly as the int8 pool-exhaustion path already does
+    ("the node is then inserted without a mamba value ... so the KV stays
+    cached and only the mamba resume point is lost").
+
+    Before the fix the component answered such an end with ``cache_len = 0``.
+    ``UnifiedRadixCache.cache_finished_req`` min()s every component's answer
+    into one ``effective_cache_len``, so mamba's 0 collapsed the shared length
+    and the insert cached NOTHING. With an interval coarser than the traffic
+    (the rig ran 8192 against ~6k-token prompts) no request ever lands on the
+    grid, so the whole instance silently retained nothing and every prefill
+    read ``#cached-token: 0`` -- 2892 of 2892 batches on boot_735_standS.
+    """
+
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        mamba_cache_size=8,
+        kv_size=256,
+        max_context_len=256,
+    )
+
+    def _cache_finished(self, cache, allocator, req_to_token_pool, tokens):
+        req = Req(
+            rid="grid-retention",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = array("q")
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.mamba_last_track_seqlen = len(tokens)
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.last_node = cache.root_node
+        cache.cache_finished_req(req, is_insert=True)
+
+    def _insert_then_match(self, interval, n_tokens):
+        """Cache one finished request, then look the identical key back up."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # The component latches the interval at construction time.
+        cache.components[ComponentType.MAMBA].mamba_checkpoint_interval = interval
+        tokens = list(range(1000, 1000 + n_tokens))
+        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        retained = cache.total_size()[0]
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens), None))
+        )
+        return retained, int(match.device_indices.numel())
+
+    def test_off_grid_end_retains_full_kv(self):
+        """The repro: end at 64 with interval 8192 is off-grid."""
+        retained, matched = self._insert_then_match(interval=8192, n_tokens=64)
+        self.assertEqual(
+            retained,
+            64,
+            "an off-grid mamba end must not discard the full-attention KV",
+        )
+        # Retained, but deliberately NOT resumable: the node carries no mamba
+        # anchor, so the match walk must refuse to hand the prefix back. This
+        # is the #767 direction (corrupt resume on cache-hit) staying shut --
+        # retention and resume-eligibility are separate decisions.
+        self.assertEqual(
+            matched, 0, "a tombstoned node must never serve as a resume anchor"
+        )
+
+    def test_on_grid_end_retains_and_matches(self):
+        retained, matched = self._insert_then_match(interval=64, n_tokens=64)
+        self.assertEqual(retained, 64)
+        self.assertEqual(matched, 64)
+
+    def test_grid_disabled_retains_and_matches(self):
+        retained, matched = self._insert_then_match(interval=None, n_tokens=64)
+        self.assertEqual(retained, 64)
+        self.assertEqual(matched, 64)
+
+
 _CONFIGS: list[CacheConfig] = [
     CacheConfig(page_size=1, components=(ComponentType.FULL,)),
     CacheConfig(page_size=4, components=(ComponentType.FULL,)),

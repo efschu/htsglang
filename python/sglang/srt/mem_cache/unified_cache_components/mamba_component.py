@@ -74,6 +74,11 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_interval = get_server_args().mamba_checkpoint_interval
         self.mamba_ckpt_strict_resume = envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.get()
         self._off_grid_insert_refusals = 0
+        # #783: request ends that carried no on-grid state to file. Counted
+        # because a grid coarser than the traffic makes EVERY end decline,
+        # which leaves the tree anchor-free -- a state that is otherwise
+        # indistinguishable from idle traffic in the logs.
+        self._off_grid_retention_declines = 0
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -284,7 +289,22 @@ class MambaComponent(TreeComponent):
         params: InsertParams,
         result: InsertResult,
     ) -> None:
-        assert params.mamba_value is not None
+        # #783: NO STATE TO DONATE IS A TOMBSTONE, NOT AN ERROR. Two producers
+        # legitimately reach this with `mamba_value=None`: the int8 checkpoint
+        # pool exhausted with nothing evictable (see `prepare_for_caching_req`,
+        # which already documents "the node is then inserted without a mamba
+        # value ... so the KV stays cached and only the mamba resume point is
+        # lost"), and an off-grid request end, which has no on-grid state to
+        # file. Both keep the full-attention KV and drop only the anchor. The
+        # `assert` that stood here contradicted that documented contract and
+        # made the tombstone path a crash, which is why the off-grid case had
+        # to be bought off earlier with `cache_len = 0` -- the veto that
+        # emptied the whole tree. `mamba_exist=True` routes the (absent)
+        # donation into the caller's cleanup, which frees the request's own
+        # mamba slot exactly as an uncached step would.
+        if params.mamba_value is None:
+            result.mamba_exist = True
+            return
         # #747 retention backstop: mamba is leaf-only data, so the target
         # node's absolute position is the full inserted key length. An
         # off-grid commit is refused (the node keeps a tombstone) instead of
@@ -561,20 +581,35 @@ class MambaComponent(TreeComponent):
             # :795-809): the tracked position is on the checkpoint grid by
             # construction (prefill targets and decode tracking both use the
             # interval); enforce it so an off-grid state can never enter the
-            # tree. Off-grid -> this step caches NOTHING. Never floor: rounding
-            # the retained key down while donating a deeper state would pair
-            # state and key at different positions (silent corruption).
+            # tree. Off-grid -> NO MAMBA ANCHOR. Never floor: rounding the
+            # retained key down while donating a deeper state would pair state
+            # and key at different positions (silent corruption).
+            #
+            # #783: declining the anchor is a MAMBA decision, so it returns
+            # `None` ("no constraint from me"), not 0. The shared
+            # `effective_cache_len` in `UnifiedRadixCache.cache_finished_req`
+            # is a `min` across components; a 0 here collapsed it and threw
+            # away the full-attention KV too, which does not depend on the
+            # mamba grid at all. The node is inserted at full length with a
+            # mamba tombstone, and the match walk still refuses it as a resume
+            # anchor because the MAMBA validator sees no state.
             if cache_len is not None and not is_on_interval(
                 cache_len, self.mamba_checkpoint_interval
             ):
-                logger.warning(
-                    "mamba checkpoint interval: off-grid tracked position %d "
-                    "(interval %d), skipping cache, rid=%s",
-                    cache_len,
-                    self.mamba_checkpoint_interval,
-                    req.rid,
-                )
-                return 0
+                self._off_grid_retention_declines += 1
+                count = self._off_grid_retention_declines
+                if count <= 3 or count % 1000 == 0:
+                    logger.warning(
+                        "mamba checkpoint interval: off-grid tracked position "
+                        "%d (interval %d), caching KV without a mamba anchor, "
+                        "occurrence=%d, rid=%s",
+                        cache_len,
+                        self.mamba_checkpoint_interval,
+                        count,
+                        req.rid,
+                    )
+                insert_params.mamba_value = None
+                return None
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
@@ -593,12 +628,34 @@ class MambaComponent(TreeComponent):
             # #747 retention seam (mirrors mamba_radix_cache.py:652-659 and
             # :795-809): the donated state sits exactly at `cache_len`; there
             # is no mechanism to snapshot an earlier position, so an off-grid
-            # end is not cached at all. Silent like the device lineage: a
-            # no_buffer end lands off-grid legitimately on edge paths, while
-            # an extra_buffer tracked target SHOULD be on-grid (hence the
-            # warning above). The cursor reset above must still happen.
+            # end gets NO ANCHOR. The cursor reset above must still happen.
+            #
+            # #783: this is the branch the rig actually ran (no
+            # --enable-mamba-extra-buffer), and it was BOTH a total veto and
+            # silent -- the two properties that made an instance-wide dark
+            # cache survive 2892 prefill batches without one log line. An
+            # interval coarser than the traffic (8192 against ~6k-token
+            # prompts) puts EVERY request end off-grid, so `return 0` meant
+            # the tree never retained anything and every prefill read
+            # `#cached-token: 0`. Retention now survives the missing anchor
+            # (see the extra_buffer branch above for the full rationale), and
+            # the decline is counted so a structurally dark grid announces
+            # itself instead of looking like idle traffic.
             if not is_on_interval(cache_len, self.mamba_checkpoint_interval):
-                return 0
+                self._off_grid_retention_declines += 1
+                count = self._off_grid_retention_declines
+                if count <= 3 or count % 1000 == 0:
+                    logger.warning(
+                        "mamba checkpoint interval: off-grid end %d (interval "
+                        "%d), caching KV without a mamba anchor, "
+                        "occurrence=%d, rid=%s",
+                        cache_len,
+                        self.mamba_checkpoint_interval,
+                        count,
+                        getattr(req, "rid", None),
+                    )
+                insert_params.mamba_value = None
+                return None
 
         if is_finished:
             if cache_len is None:
