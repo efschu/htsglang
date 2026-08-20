@@ -300,6 +300,23 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
 DRAIN_STASH = "stash"
 DRAIN_DISCARD = "discard"
 
+#: #787: bounded settle window for ``pp_flip_drain_leftover_dicts``.
+#:
+#: These are ENGINEERING TOLERANCES, not planner/capacity quantities -- do
+#: not fold them into the #770 pins-audit as if they sized anything about
+#: KV, VRAM, or batching. They exist to absorb ordinary local-fabric /
+#: shared-counter arrival latency (the gap between a peer's isend and this
+#: rank's next poll of the shared /dev/shm sent-counter) AFTER the #787
+#: sender-side ordering guarantee (``_abandon_no_quorum`` /
+#: ``_abandon_unjoined_flip`` flushing pending sends before local flip
+#: state clears) is in place. The settle window is NOT a substitute for
+#: that guarantee and is not sound on its own: it cannot observe a send
+#: that has not been issued yet, only one that has been issued but has not
+#: yet been counted. Widening it papers over a missing sender-side flush
+#: rather than fixing it.
+DRAIN_SETTLE_BUDGET_S = 0.75
+DRAIN_SETTLE_STEP_S = 0.02
+
 
 def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
     """``(action, kind, why)`` for one message taken while ARMED.
@@ -1561,6 +1578,47 @@ class SchedulerPPMixin:
                 continue
             self._pp_commit_comm_work(work)
 
+    def pp_flip_flush_pending_dict_sends(self: Scheduler) -> None:
+        """#787 SENDER-SIDE HALF: last-chance reap/count before an abandon.
+
+        Wired as ``flush_pending_sends_fn`` into ``PhaseFlipRuntime`` and
+        called synchronously by ``_abandon_no_quorum`` and
+        ``_abandon_unjoined_flip``, strictly BEFORE either clears this
+        rank's local flip state (``self._pending = None``). It is the
+        complementary half of the receiver-side settle window added to
+        ``pp_flip_drain_leftover_dicts`` above: that window can only find
+        a message that was already sent and merely not yet counted; it
+        is powerless against a send this rank had not yet issued when a
+        downstream peer's settle window expired. This function closes
+        that gap from the sending side -- it reaps and counts anything
+        THIS rank has already posted, so the downstream's own
+        ``counters.sent()`` reading reflects reality before this rank is
+        free to resume and race ahead.
+
+        Deliberately just ``pp_flip_flush_drained_sends()``: that call is
+        already bounded (gated on the downstream's published CONSUMED
+        count, so it never blocks on an unfinished peer) and already the
+        correct reap primitive for CHAN_DICT and CHAN_REQ alike. This
+        wrapper exists so the call site in ``phase_flip_runtime.py`` names
+        the #787 contract explicitly, independent of whatever
+        ``pp_flip_flush_drained_sends`` is used for elsewhere.
+
+        HONEST SCOPE: this cannot and does not force an in-flight forward
+        computation to complete early -- a send that has not been issued
+        yet still lands whenever it actually completes, unaffected by
+        this call. What it guarantees is that any send ALREADY POSTED by
+        this rank is reaped and counted before disarm, closing exactly
+        the ordering gap #787 exploits (a downstream's one-shot drain
+        snapshot running before an upstream's already-completed send was
+        counted).
+        """
+        try:
+            self.pp_flip_flush_drained_sends()
+        except Exception as exc:  # noqa: BLE001 - best effort, abandon must not raise
+            logger.warning(
+                "%s #787 pre-abandon send flush failed: %s", "PHASE-FLIP", exc
+            )
+
     def pp_flip_drain_tensor_dicts(self: Scheduler) -> int:
         """Consume the tensor-dict wire while ARMED, and discard what comes.
 
@@ -1715,23 +1773,70 @@ class SchedulerPPMixin:
         it is owed, not leftover. The #631 receive guard is untouched and
         stays the backstop; if this drain is ever wrong, the guard still
         refuses rather than mispairs.
+
+        #787 -- THE RECEIVER-SIDE HALF, ADDED HERE. The paragraphs above
+        describe a ONE-SHOT snapshot of ``counters.sent()``: it fires
+        exactly once at the falling edge of the pass tick, on this rank's
+        own clock, with no collective re-check against the upstream. #787
+        is that snapshot missing a message the upstream posts strictly
+        AFTER this rank's single sweep already ran and returned -- the
+        rank disarms, resumes launching, and later receives that stale
+        proxy at the ordinary #631-guarded receive site instead of here,
+        where it would have been recognised as leftover and dropped.
+        The fix is a BOUNDED SETTLE WINDOW: when the snapshot currently
+        reads "nothing new", re-poll the SAME local SHM counter a few
+        more times (``DRAIN_SETTLE_STEP_S`` apart, up to
+        ``DRAIN_SETTLE_BUDGET_S`` total) before actually breaking out of
+        the loop, so a send that is landing right now has a chance to be
+        seen and drained here instead of downstream. This is deliberately
+        a poll of the counter this loop already reads -- NEVER a
+        timing-out ``Work.wait()`` on the gloo handle, which would tear
+        apart the sender/receiver pairing on the wire (the corpse-F
+        lesson threaded through this module: ``is_completed()``/timed
+        waits do not behave sanely on this transport). The settle window
+        alone is NOT a fix -- it only closes a receiver-side race BY
+        finding a message that was already sent; it cannot see one that
+        has not been sent yet. That is why #787 also adds a sender-side
+        ordering guarantee (``_abandon_no_quorum`` /
+        ``_abandon_unjoined_flip`` in ``phase_flip_runtime.py``, via
+        ``pp_flip_flush_pending_dict_sends`` below): flush and count
+        every pending old-pass send BEFORE this rank's own peer flips to
+        abandoned/resumed. Neither half ships alone.
         """
         counters = getattr(self, "pp_flip_counters", None)
         if counters is None:
             return 0
         discarded = 0
+        drained_messages = 0
+        settle_deadline = None
         # Bounded for the same reason the corpse is: a counter that runs
-        # away must not pin the rank here.
-        for _ in range(64):
+        # away must not pin the rank here. The cap counts actual messages
+        # taken off the wire, not settle-window polls -- a long settle
+        # wait must not eat into the 64-message drain budget.
+        while drained_messages < 64:
             posted = counters.sent(CHAN_DICT, self._pp_flip_upstream())
             if counters.local_consumed(CHAN_DICT) >= posted:
-                break
+                # #787: nothing new by this reading -- but that is exactly
+                # the one-shot snapshot #787 exploits. Give a bounded
+                # settle window for an in-flight send to land and be
+                # counted before actually giving up.
+                now = time.monotonic()
+                if settle_deadline is None:
+                    settle_deadline = now + DRAIN_SETTLE_BUDGET_S
+                if now >= settle_deadline:
+                    break
+                time.sleep(DRAIN_SETTLE_STEP_S)
+                continue
+            # A message is provably available now; the settle window only
+            # ever applies to the gap AFTER the last provably real one.
+            settle_deadline = None
             raw = self.pp_group.recv_tensor_dict(
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 )
             )
             self._pp_flip_bump_consumed(CHAN_DICT)
+            drained_messages += 1
             kind = raw.get("__msg_type__", "default") if isinstance(raw, dict) else None
             if kind != "proxy":
                 # THE CORPSE-S LESSON, ENCODED. An output belongs to work
