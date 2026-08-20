@@ -6,7 +6,7 @@ import os
 import time
 from array import array
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,6 +39,11 @@ from sglang.srt.managers.phase_flip_counters import (
     CHAN_SLOT,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.pp_admission_congruence import (
+    PPAdmissionDecision,
+    PPAdmissionEntry,
+    reconcile_pp_admission_decision,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -62,6 +67,95 @@ if TYPE_CHECKING:
 
 
 _PP_STATS_UNSET = object()
+
+# #791 PP ADMISSION UNIFORMITY.
+#
+# Each PP rank is an independent scheduler that re-derives its own admission
+# verdict from its own local radix-cache state (scheduler.py's
+# `_get_new_batch_prefill_raw`). Requests are chain-forwarded unconditionally
+# regardless of what any rank decided, and the proxy send/receive that carries
+# the actual hidden-state tensor is gated on the RECEIVING rank's OWN
+# independently-derived `cur_batch` -- so two ranks disagreeing about which
+# requests are admitted, or how much prefix a given request reuses, is not a
+# quality issue: `ScheduleBatch.prepare_for_extend` sizes the cross-stage
+# tensor directly off `len(req.prefix_indices)` per request, so a length
+# disagreement is a SHAPE disagreement, and an admission disagreement is a
+# ROW-COUNT disagreement -- either wedges the pipeline or corrupts the wire.
+#
+# `pp_admission_congruence.py` (#791 + #630) is the pure decision/reconcile
+# logic; this module is its only wiring. See that module's docstring for the
+# full design authority (WHAT CROSSES THE WIRE, THE TWO FAILURE SHAPES, THE
+# CONGRUENCE GUARD, NO COLLECTIVE, NO HAND-PINNED NUMBERS).
+#
+# Rides the SAME typed tensor-dict channel as "proxy"/"output" -- `kind` is a
+# plain string there, not a closed enum (pp_typed_channel.py), so this needs
+# zero changes to that file. It shares the wire's single CHAN_DICT
+# sent/consumed counters with those two kinds by construction (both are
+# always demultiplexed by `__msg_type__` AFTER coming off the wire -- see
+# `_pp_recv_typed_dict`), which is correct: a rank calling the wire "empty"
+# while an admission_decision message was still on it would be the same bug
+# class as miscounting a proxy or output message.
+ADMISSION_DECISION_KIND = "admission_decision"
+
+# The single non-tensor payload key the decision travels under. Riding a
+# plain python object inside the tensor dict is established practice on this
+# wire -- `__msg_type__` and `__stamp__` (`_pp_send_dict_to_next_stage`) do
+# exactly this already.
+_ADMISSION_DECISION_PAYLOAD_KEY = "__admission_decision__"
+
+
+def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, object]:
+    """#791: serialize a PPAdmissionDecision for the typed tensor-dict wire.
+
+    Plain tuples, not the dataclasses themselves -- keeps the wire payload
+    independent of dataclass identity/pickling details and easy to inspect
+    on the receiving side without importing anything beyond this module.
+    """
+    return {
+        _ADMISSION_DECISION_PAYLOAD_KEY: (
+            int(decision.mb_id),
+            tuple(
+                (
+                    e.rid,
+                    int(e.prefix_len),
+                    int(e.extend_len),
+                    bool(e.admitted),
+                    bool(e.retracted),
+                    e.retracted_by_rank,
+                    e.observed_local,
+                )
+                for e in decision.entries
+            ),
+        )
+    }
+
+
+def pp_admission_decision_from_wire(
+    message: Dict[str, object]
+) -> PPAdmissionDecision:
+    """#791: inverse of pp_admission_decision_to_wire."""
+    mb_id, raw_entries = message[_ADMISSION_DECISION_PAYLOAD_KEY]
+    entries = tuple(
+        PPAdmissionEntry(
+            rid=rid,
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+            admitted=admitted,
+            retracted=retracted,
+            retracted_by_rank=retracted_by_rank,
+            observed_local=observed_local,
+        )
+        for (
+            rid,
+            prefix_len,
+            extend_len,
+            admitted,
+            retracted,
+            retracted_by_rank,
+            observed_local,
+        ) in raw_entries
+    )
+    return PPAdmissionDecision(mb_id=int(mb_id), entries=entries)
 
 
 class PPBoundaryStats:
@@ -483,6 +577,31 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                 self._pp_forward_and_process_input_requests(recv_reqs)
+                # #791 PP ADMISSION UNIFORMITY. Consume THIS pass's inbound
+                # admission decision before this rank derives its own batch,
+                # so the admission loop below (scheduler.py's
+                # `_get_new_batch_prefill_raw`) can be DRIVEN by
+                # `self._pp_admission_incoming_effective` instead of
+                # independently re-deriving a verdict that might disagree
+                # with PP0's. Unconditional -- never gated on this rank's
+                # own local state, see `_pp_recv_admission_decision`'s
+                # docstring -- and strictly BEFORE `get_next_batch_to_run` /
+                # `_pp_recv_proxy_tensors` / `_pp_wait_for_proxy_readiness`
+                # (#789), so an ordinary prefix-length divergence is
+                # degraded here and the #789 contract's raise path stays
+                # unfired on a healthy pass (the #791 task's ordering
+                # requirement). PP0 has nothing to consume here -- it is the
+                # one BUILDING the decision, inside the call below.
+                self._pp_admission_incoming_effective = None
+                self._pp_admission_amended_to_forward = None
+                if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
+                    with torch.profiler.record_function("pp_admission_decision_recv"):
+                        incoming_decision = self._pp_recv_admission_decision()
+                        effective, amended = self._pp_reconcile_incoming_admission(
+                            incoming_decision
+                        )
+                        self._pp_admission_incoming_effective = effective
+                        self._pp_admission_amended_to_forward = amended
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -559,6 +678,52 @@ class SchedulerPPMixin:
                 # posts a chain send, so it has nothing to flush here either.
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_pending_req_work()
+
+                # #791 PP ADMISSION UNIFORMITY: emit/forward this pass's
+                # admission decision. Placed after every other send this
+                # iteration owed its peers (proxy isend, output commit,
+                # request-chain flush above), the same "flush own sends
+                # last" position #788 established for the request chain --
+                # this send does not gate on any of them, but keeping it
+                # here keeps every per-iteration outbound flush in one
+                # place. UNGATED by is_last_rank (unlike the proxy send
+                # above): the whole point is that it keeps travelling past
+                # the last stage and wraps back to PP0.
+                if self.ps.pp_size > 1:
+                    if self.pp_group.is_first_rank:
+                        raw = getattr(self, "_pp_admission_last_built_decision", None)
+                        self._pp_admission_last_built_decision = None
+                        fresh_decision = (
+                            replace(raw, mb_id=mb_id)
+                            if raw is not None
+                            else PPAdmissionDecision(mb_id=mb_id, entries=())
+                        )
+                        self._pp_send_admission_decision(fresh_decision)
+                        self._pp_admission_pending_sends.append(mb_id)
+                        # Defer the wraparound receive until at least one
+                        # full ring lap could plausibly have completed --
+                        # see the field's docstring in init_pp_loop_state.
+                        # A blocking receive attempted every pass from pass
+                        # 0 would make PP0 wait for ITS OWN pass's full
+                        # round trip before it could ever move on to the
+                        # next one, destroying pipelining; this bounds how
+                        # stale the wraparound receive can be instead of
+                        # eliminating the wait (still a blocking p2p recv,
+                        # like every other stage-boundary receive in this
+                        # loop -- never a collective).
+                        if len(self._pp_admission_pending_sends) >= self.ps.pp_size:
+                            self._pp_admission_pending_sends.popleft()
+                            with torch.profiler.record_function(
+                                "pp_admission_decision_return_trip"
+                            ):
+                                returned = self._pp_recv_admission_decision()
+                            if returned is not None:
+                                self._pp_admission_guard.record_return_trip(returned)
+                    else:
+                        amended = self._pp_admission_amended_to_forward
+                        if amended is None:
+                            amended = PPAdmissionDecision(mb_id=mb_id, entries=())
+                        self._pp_send_admission_decision(amended)
 
                 # #631 phase-flip round hook, deferred from
                 # get_next_batch_to_run: every send of this iteration is
@@ -2283,6 +2448,22 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
+
+        # #791 PP ADMISSION UNIFORMITY. Per-pass scratch, filled and drained
+        # every iteration of _event_loop_pp_body -- not part of the resident
+        # carry above, since a request excluded on the pass this loop is
+        # (re-)entered on simply reappears on the next pass's admission loop
+        # (self.waiting_queue is never mutated for a skipped req).
+        # `_pp_admission_pending_sends` is PP0-only: a rolling count of
+        # decisions PP0 has sent but not yet consumed the ring's wraparound
+        # for. It exists so the wraparound RECEIVE is deferred until at
+        # least one full lap could plausibly have completed, rather than
+        # PP0 blocking on THIS pass's own wraparound immediately -- see
+        # _event_loop_pp_body's #791 block for why the latter would
+        # re-serialize the pipeline one pass at a time.
+        self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
+        self._pp_admission_amended_to_forward: Optional[PPAdmissionDecision] = None
+        self._pp_admission_pending_sends: deque = deque()
         # #753: NOT assigned here any more. The inbox moved onto the pp_group
         # so the crossing wire -- a second consumer of the same channel --
         # shares it; ``_pp_tensor_dict_inbox`` below is now a read-only view of
@@ -2949,6 +3130,100 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         return tensor_dict
+
+    def _pp_send_admission_decision(
+        self: Scheduler, decision: PPAdmissionDecision
+    ) -> None:
+        """#791: forward this pass's admission decision to the next stage.
+
+        UNLIKE the proxy send (`_pp_send_dict_to_next_stage(..., msg_type=
+        "proxy")` above, gated on `not self.pp_group.is_last_rank`), this is
+        never gated on rank position. The whole point of this wire is that
+        it keeps travelling past the last stage and wraps back to PP0 --
+        `pp_group.send_tensor_dict`'s default `dst=None` already resolves to
+        "next rank in the ring", which lands on PP0 from the last rank the
+        same way the output ring wraps -- so PP0 can close the #630 learning
+        loop via `PPAdmissionCongruenceGuard.record_return_trip`.
+
+        SENT EVERY PASS, EVEN WHEN EMPTY (`entries=()`). Withholding it
+        whenever a rank's own verdict is empty would recreate exactly the
+        defect this module exists to close: a downstream rank's receive
+        gated on ITS OWN cur_batch rather than on what upstream actually
+        decided (`_event_loop_pp_body`'s `if cur_batch: ... _pp_recv_proxy_
+        tensors(mb_id)`, the root defect this whole feature targets).
+
+        Fire-and-forget async: nothing on the admission path may block on a
+        peer (scheduler.py's `_get_new_batch_prefill_raw` NO COLLECTIVE
+        note -- the 2026-08-17 deadlock family this must not repeat).
+        """
+        if self.ps.pp_size <= 1:
+            return
+        tensor_dict = pp_admission_decision_to_wire(decision)
+        self._pp_send_dict_to_next_stage(
+            tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
+        )
+
+    def _pp_recv_admission_decision(self: Scheduler) -> Optional[PPAdmissionDecision]:
+        """#791: this pass's inbound admission decision (blocking receive).
+
+        Always issued, never gated on this rank's own local state -- see
+        `_pp_send_admission_decision`'s docstring for why that gating would
+        be the defect, not the fix. Positioned in `_event_loop_pp_body`
+        strictly BEFORE `get_next_batch_to_run`, so this rank's own
+        admission loop can be DRIVEN by the decision instead of
+        independently re-deriving one that might disagree with it -- and
+        strictly before `_pp_recv_proxy_tensors` / `_pp_wait_for_proxy_
+        readiness` (#789), so an ordinary prefix-length divergence is
+        degraded here and never has to reach that contract's raise path
+        (the #791 task's ordering requirement).
+        """
+        if self.ps.pp_size <= 1:
+            return None
+        message = self._pp_recv_typed_dict(expected_kind=ADMISSION_DECISION_KIND)
+        return pp_admission_decision_from_wire(message)
+
+    def _pp_reconcile_incoming_admission(
+        self: Scheduler, decision: PPAdmissionDecision
+    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
+        """#791: this (downstream) rank's reconciliation of a received
+        decision against its OWN local radix-cache state.
+
+        For every named, still-admitted rid, freshly matches it against
+        THIS rank's own tree_cache (`req.init_next_round_input` -- safe to
+        call again here even though the admission loop below calls it again
+        too, per the idempotency already relied on for this exact call by
+        schedule_policy.py's pre-admission priority pass) to get a real
+        local candidate length, then hands everything to the pure
+        `reconcile_pp_admission_decision` (#791/#630) for the actual
+        safe-truncate / unsafe-retract verdict and the exactly-once warning.
+
+        A rid the decision names that is not (yet, or any more) in this
+        rank's own waiting_queue is treated as a local match of 0 --
+        physically indistinguishable from "this rank's cache has nothing
+        for it", which is exactly what "local < told" already means; it
+        needs no special case.
+        """
+        pp_size = self.ps.pp_size
+        if pp_size <= 1:
+            return {}, decision
+        by_rid = {req.rid: req for req in self.waiting_queue}
+        local_match_lens: Dict[str, int] = {}
+        for entry in decision.entries:
+            if not entry.admitted or entry.retracted:
+                continue
+            req = by_rid.get(entry.rid)
+            if req is None:
+                local_match_lens[entry.rid] = 0
+                continue
+            req.init_next_round_input(self.tree_cache)
+            local_match_lens[entry.rid] = len(req.prefix_indices)
+        return reconcile_pp_admission_decision(
+            decision,
+            local_match_lens,
+            rank=self.ps.pp_rank,
+            pp_size=pp_size,
+            log=logger,
+        )
 
     def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
         """#631 VARIANT B: the identity a proxy message carries.

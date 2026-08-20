@@ -199,6 +199,10 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
+from sglang.srt.managers.pp_admission_congruence import (
+    PPAdmissionCongruenceGuard,
+    build_pp_admission_decision,
+)
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -1558,6 +1562,25 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        # #791 PP ADMISSION UNIFORMITY. PP0-side memory of downstream
+        # admission shortfalls (#630's learned-floor guard) -- PROCESS
+        # LIFETIME state, deliberately not reset by init_pp_loop_state
+        # (which can re-run mid-session, e.g. the phase-flip topology
+        # swap): a floor learned from an earlier retract must survive a
+        # loop re-init or it would just be re-taught the same way again.
+        # None (not merely idle) when PP is not in use, so the guard costs
+        # nothing on the non-PP default path. See
+        # pp_admission_congruence.py's PPAdmissionCongruenceGuard docstring
+        # for the well-founded strictly-decreasing termination argument.
+        self._pp_admission_guard: Optional[PPAdmissionCongruenceGuard] = (
+            PPAdmissionCongruenceGuard() if self.ps.pp_size > 1 else None
+        )
+        # Filled by the admission loop in _get_new_batch_prefill_raw below
+        # (PP0 only) and drained every iteration by
+        # scheduler_pp_mixin.py's _event_loop_pp_body, which stamps in the
+        # real mb_id (unknown to this method) via dataclasses.replace.
+        self._pp_admission_last_built_decision = None
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -6759,6 +6782,57 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+
+            # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
+            # re-derives its own admission verdict from its own local radix
+            # state; nothing forwards the DECISION alongside the
+            # chain-forwarded requests, so two stages can disagree about
+            # which requests are admitted or how much prefix each one
+            # reuses -- and since `prepare_for_extend` (below, via
+            # ScheduleBatch.init_new) sizes the cross-stage tensor directly
+            # off `len(req.prefix_indices)`, a length disagreement is a
+            # SHAPE disagreement (pp_admission_congruence.py's module
+            # docstring: WHAT CROSSES THE WIRE). Applied HERE, strictly
+            # BEFORE `adder.add_one_req` commits `extend_range` against
+            # whatever `req.prefix_indices` currently is -- `prepare_for_
+            # extend` is not safe to call a second time (fresh KV
+            # allocation, asserted invariants each call), so there is no
+            # later point at which a mismatch could still be corrected
+            # without a second pass over an already-committed batch.
+            #
+            # NO COLLECTIVE: `told` below is either this rank's own
+            # guard-clamped candidate (PP0, via the #630 learned floor) or a
+            # value that already crossed the wire earlier THIS pass
+            # (downstream, via scheduler_pp_mixin.py's pre-loop reconcile) --
+            # never a new blocking op introduced on this path (see the
+            # 2026-08-17 deadlock family this must not repeat, referenced
+            # throughout this method).
+            if self.ps.pp_size > 1:
+                if self.ps.pp_rank == 0:
+                    told = self._pp_admission_guard.prefix_len_for(
+                        req.rid, len(req.prefix_indices)
+                    )
+                    if told < len(req.prefix_indices):
+                        req.prefix_indices = req.prefix_indices[:told]
+                elif self._pp_admission_incoming_effective is not None:
+                    told = self._pp_admission_incoming_effective.get(req.rid)
+                    if told is None:
+                        # Not named by PP0's decision this pass: excluded by
+                        # PP0's own verdict, retracted by an earlier rank's
+                        # reconcile, or simply not visible to PP0 yet.
+                        # Uniform membership means this rank must not admit
+                        # it either. Left unmutated in self.waiting_queue
+                        # (never added to can_run_set below), so it is
+                        # reconsidered on a later pass -- the same
+                        # requeue-for-free mechanism this loop already
+                        # relies on for a capacity-driven rejection.
+                        continue
+                    # reconcile_pp_admission_decision's own contract
+                    # guarantees told <= this rank's local match, i.e.
+                    # len(req.prefix_indices) >= told always holds here.
+                    if len(req.prefix_indices) > told:
+                        req.prefix_indices = req.prefix_indices[:told]
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -6806,6 +6880,25 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+
+        # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
+        # decision here; scheduler_pp_mixin.py's _event_loop_pp_body drains
+        # `self._pp_admission_last_built_decision`, stamps in the real
+        # mb_id (unknown to this method -- get_next_batch_to_run takes no
+        # mb_id parameter), and sends it. Built from `can_run_list` AFTER
+        # the loop above has already applied any guard clamp, so
+        # `len(req.prefix_indices)` here is already the value this rank is
+        # really using: `build_pp_admission_decision`'s own guard
+        # application is therefore an idempotent re-confirmation, not a
+        # second clamp (`prefix_len_for` on an already-clamped candidate
+        # returns that same candidate).
+        if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+            self._pp_admission_last_built_decision = build_pp_admission_decision(
+                0,  # placeholder mb_id; stamped with the real one downstream
+                can_run_list,
+                pp_size=self.ps.pp_size,
+                guard=self._pp_admission_guard,
+            )
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
