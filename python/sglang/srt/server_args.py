@@ -5680,6 +5680,30 @@ class ServerArgs:
         ),
     ] = None
 
+    uneven_token_vector: A[
+        Optional[str],
+        Arg(
+            help="KV TOKEN ownership split across the DECODE layout's ranks, "
+            "comma-separated positive integers, one per DCP rank. Promoted "
+            "from SGLANG_UNEVEN_TOKEN_VECTOR (#781). "
+            "THIS IS THE DECODE-PHASE ENTRY. Under --enable-phase-flip this "
+            "instance runs two layouts -- PP in prefill, TP in decode -- and "
+            "the uneven split needs an entry per phase, not one value that "
+            "silently names only one of them. The PREFILL side is carried by "
+            "--pp-stage-ratio and --pp-attn-stage-ratio; this flag is the "
+            "decode side. "
+            "It is also distinct from the WEIGHT shard split "
+            "(--phase-flip-tp-vector): the weight shard follows compute, the "
+            "token split follows each rank's memory left after its weights "
+            "land, so the two legitimately differ. "
+            "NOT interchangeable with --rank-kv-ratio, which refuses an "
+            "explicit vector unless a non-uniform --rank-tp-ratio plan is "
+            "installed -- a precondition a PP-prefill boot does not meet. "
+            "Prefer the value the runtime's own calibration prints as its "
+            "restart hint: it is the measured per-rank profiled capacity, "
+            "not a guess.",
+        ),
+    ] = None
     barlink: A[
         Optional[bool],
         Arg(help="Enable barlink. Promoted from SGLANG_BARLINK (#781)."),
@@ -17267,6 +17291,13 @@ class ServerArgs:
         def _b(value) -> str:
             return "1" if value else "0"
 
+        if self.uneven_token_vector is not None:
+            # The decode-phase KV token split. Published rather than read from
+            # a ServerArgs field by the consumer because the resolver runs
+            # inside the flip's SECOND stack build, where the geometry is TP
+            # and not the boot-time PP -- exactly the scope split the #754 fix
+            # is about. Publishing keeps one value visible to both stacks.
+            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = str(self.uneven_token_vector)
         if self.barlink is not None:
             os.environ["SGLANG_BARLINK"] = _b(self.barlink)
         if self.barlink_transport is not None:
