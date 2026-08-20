@@ -668,25 +668,28 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
-                # #788: flush THIS pass's request-chain send only after
-                # everything else this rank owed its peers this iteration is
-                # already posted (proxy isend above, output commit above).
-                # See _pp_commit_pending_req_work and the comment at the
-                # #788 send site in _pp_forward_and_process_input_requests
-                # for why the old top-of-pass position could close a cycle.
-                # Guarded the same way the send site is: the last rank never
-                # posts a chain send, so it has nothing to flush here either.
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_pending_req_work()
-
                 # #791 PP ADMISSION UNIFORMITY: emit/forward this pass's
-                # admission decision. Placed after every other send this
-                # iteration owed its peers (proxy isend, output commit,
-                # request-chain flush above), the same "flush own sends
-                # last" position #788 established for the request chain --
-                # this send does not gate on any of them, but keeping it
-                # here keeps every per-iteration outbound flush in one
-                # place. UNGATED by is_last_rank (unlike the proxy send
+                # admission decision.
+                #
+                # THIS RUNS BEFORE THE REQUEST-CHAIN FLUSH, AND THE ORDER IS
+                # THE WHOLE POINT. The first shape of this wiring put the
+                # send after the flush, with the reasoning that it "does not
+                # gate on any of them" so all outbound flushes could live in
+                # one place. That reasoning was wrong and it deadlocked the
+                # boot on the first request: downstream ranks block in
+                # _pp_recv_admission_decision waiting for THIS message, so
+                # they never return to the top of their pass, so the chain
+                # flush below -- which needs exactly that -- never completes,
+                # so this send is never reached. PP0 in
+                # _pp_commit_pending_req_work, PP1 and PP2 both in
+                # _pp_recv_admission_decision, zero GPU utilisation.
+                #
+                # It is the same invariant #788 was landed for, and the same
+                # one its own commit message states: a rank must satisfy
+                # everything a peer can be blocked on BEFORE it blocks on
+                # that peer. Grouping sends by tidiness violates it; ordering
+                # them by what peers are waiting for is what keeps the ring
+                # live. UNGATED by is_last_rank (unlike the proxy send
                 # above): the whole point is that it keeps travelling past
                 # the last stage and wraps back to PP0.
                 if self.ps.pp_size > 1:
@@ -724,6 +727,22 @@ class SchedulerPPMixin:
                         if amended is None:
                             amended = PPAdmissionDecision(mb_id=mb_id, entries=())
                         self._pp_send_admission_decision(amended)
+
+                # #788: flush THIS pass's request-chain send only after
+                # everything else this rank owed its peers this iteration is
+                # already posted -- proxy isend, output commit, AND the #791
+                # admission decision above. This is the last outbound act of
+                # the iteration precisely because it is the one that blocks
+                # on a peer reaching the top of its next pass; anything a
+                # peer might still be waiting on must already be on the wire
+                # by the time we get here. See _pp_commit_pending_req_work
+                # and the #788 send site in
+                # _pp_forward_and_process_input_requests for why the old
+                # top-of-pass position closed a cycle. Guarded the same way
+                # the send site is: the last rank never posts a chain send,
+                # so it has nothing to flush here either.
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_pending_req_work()
 
                 # #631 phase-flip round hook, deferred from
                 # get_next_batch_to_run: every send of this iteration is
