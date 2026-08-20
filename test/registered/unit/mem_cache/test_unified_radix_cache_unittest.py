@@ -4225,6 +4225,67 @@ class TestUnifiedRadixCacheMambaCheckpointGridRetention(CustomTestCase):
         self.assertEqual(retained, 64)
         self.assertEqual(matched, 0)
 
+    def test_off_grid_unfinished_step_conserves_pool_slots(self):
+        """#783: retention is safe on FINISH, not mid-flight.
+
+        `cache_unfinished_req` inserts and then immediately re-matches, and
+        transfers ownership on the strength of that match
+        (`req.cache_protected_len = len(new_indices)`). An anchorless node is
+        deliberately unmatchable, so retaining one there leaves the tree
+        holding KV the request also still owns, and the slots go unaccounted
+        -- the first boot of this branch died on exactly that
+        ("pool memory leak detected! [full] total=161378, available=40952,
+        evictable=130", 122 slots missing after a 122-token off-grid step).
+
+        Ownership is the assertion. The slots are NOT expected back in the
+        allocator here -- the live request still holds them, which the running
+        ledger counts as `uncached`. What must hold is that the tree did not
+        ALSO claim them: the step caches nothing, so the request remains the
+        single owner. With the bug the tree takes 121 of the 122 slots the
+        request keeps using, and the double claim is what the pool ledger
+        later reports as a leak.
+        """
+        cfg = replace(self.cfg, is_eagle=True, kv_size=512, max_context_len=512)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        cache.components[ComponentType.MAMBA].mamba_checkpoint_interval = 512
+        tokens = list(range(1000, 1000 + 122))  # 122 % 512 != 0 -> off-grid
+
+        req = Req(
+            rid="unfinished-off-grid",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.mamba_last_track_seqlen = len(tokens)
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.last_node = cache.root_node
+
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(
+            cache.total_size()[0],
+            0,
+            "an off-grid mid-flight step must cache nothing: an anchorless "
+            "node cannot be matched back, so the tree would claim slots the "
+            "request still owns",
+        )
+        self.assertEqual(
+            allocator.available_size(),
+            512 - 122,
+            "the request keeps its own slots; none are double-claimed",
+        )
+
     def test_resume_stops_at_the_position_the_state_was_taken(self):
         """#767 direction: a hit must resume where the state actually sits.
 

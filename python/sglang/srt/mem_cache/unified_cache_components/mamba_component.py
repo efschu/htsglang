@@ -50,6 +50,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _decline_retention(is_finished: bool) -> Optional[int]:
+    """Answer for "mamba has no on-grid state to file at this position".
+
+    #783: the answer differs by CALLER, because the two callers hand KV
+    ownership over differently.
+
+    FINISHED (``None``, no constraint): the request is over and the tree takes
+    its KV outright. Retaining it under a mamba tombstone is safe and is the
+    whole point -- the full-attention KV does not depend on the mamba grid,
+    and a 0 here would collapse the shared ``effective_cache_len`` and cache
+    nothing at all.
+
+    UNFINISHED (``0``, cache nothing this step): ``cache_unfinished_req``
+    inserts and then IMMEDIATELY re-matches, handing ownership over on the
+    strength of what the match returns
+    (``req.cache_protected_len = len(new_indices)``). An anchorless node is
+    deliberately unmatchable, so that round trip comes back EMPTY: the tree
+    would hold the KV while the request kept using -- and later freeing --
+    the same slots, with ``cache_protected_len`` falling back to 0. Measured
+    as exactly that on the first boot of this branch: a 122-token off-grid
+    step left 122 slots unaccounted ("pool memory leak detected! [full]
+    total=161378, available=40952, evictable=130"). Mid-flight steps
+    therefore keep the pre-existing "cache nothing" behaviour; the KV stays
+    with the request until it finishes, where the FINISHED branch retains it.
+    """
+    return None if is_finished else 0
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -634,7 +662,7 @@ class MambaComponent(TreeComponent):
                         req.rid,
                     )
                 insert_params.mamba_value = None
-                return None
+                return _decline_retention(is_finished)
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
@@ -680,7 +708,7 @@ class MambaComponent(TreeComponent):
                         getattr(req, "rid", None),
                     )
                 insert_params.mamba_value = None
-                return None
+                return _decline_retention(is_finished)
 
         if is_finished:
             if cache_len is None:
