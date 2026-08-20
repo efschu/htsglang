@@ -141,7 +141,11 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    ReqToTokenPool,
+    sync_free_tensor_repr,
+)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -4327,18 +4331,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+                # #790 sweep: this fires on EVERY extend forward pass on a
+                # mamba/hybrid model once the trace flag is set -- far
+                # hotter than the #790 site itself. `.tolist()` forces a D2H
+                # copy + stream sync per call; see `sync_free_tensor_repr`.
                 logger.warning(
                     "#767-TRACE cow_and_clear SKIP: hybrid=%s draft=%s mode=%s "
                     "clear=%s cow_src=%s",
                     isinstance(pool, HybridReqToTokenPool),
                     self.is_draft_worker,
                     forward_batch.forward_mode,
-                    None
-                    if forward_batch.mamba_clear_indices is None
-                    else forward_batch.mamba_clear_indices.tolist(),
-                    None
-                    if forward_batch.mamba_cow_src_indices is None
-                    else forward_batch.mamba_cow_src_indices.tolist(),
+                    sync_free_tensor_repr(forward_batch.mamba_clear_indices),
+                    sync_free_tensor_repr(forward_batch.mamba_cow_src_indices),
                 )
             return
         if (
@@ -4368,20 +4372,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
         if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+            # #790 sweep, same reasoning as the SKIP branch above:
+            # `.tolist()` on a device tensor here forces a D2H copy + stream
+            # sync on every extend forward pass while the trace flag is on.
+            # `extend_prefix_lens_cpu` is untouched -- it is already host
+            # resident (the `_cpu` suffix), so `list(...)` on it is a
+            # metadata-only op with no device sync.
             logger.warning(
                 "#767-TRACE cow_and_clear: mode=%s bs=%s clear=%s cow_src=%s "
                 "cow_dst=%s prefix_lens=%s",
                 forward_batch.forward_mode,
                 int(forward_batch.batch_size),
-                None
-                if forward_batch.mamba_clear_indices is None
-                else forward_batch.mamba_clear_indices.tolist(),
-                None
-                if forward_batch.mamba_cow_src_indices is None
-                else forward_batch.mamba_cow_src_indices.tolist(),
-                None
-                if forward_batch.mamba_cow_dst_indices is None
-                else forward_batch.mamba_cow_dst_indices.tolist(),
+                sync_free_tensor_repr(forward_batch.mamba_clear_indices),
+                sync_free_tensor_repr(forward_batch.mamba_cow_src_indices),
+                sync_free_tensor_repr(forward_batch.mamba_cow_dst_indices),
                 None
                 if forward_batch.extend_prefix_lens_cpu is None
                 else list(forward_batch.extend_prefix_lens_cpu),

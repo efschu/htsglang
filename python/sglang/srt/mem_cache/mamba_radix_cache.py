@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, sync_free_tensor_repr
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -748,12 +748,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             mamba_exist = result.mamba_exist
             if self.ckpt_debug:
+                # #790 sweep: `int(mamba_value[0].item())` forces a D2H copy
+                # + stream sync on `cache_finished`, once per request, while
+                # `SGLANG_MAMBA_CKPT_DEBUG` is set. Same family as #790's
+                # `alloc_for_extend` site; see `sync_free_tensor_repr`.
                 logger.info(
                     "mamba-ckpt cache_finished: rid=%s cache_len=%d slot=%s "
                     "mamba_exist=%s last_track=%s total_len=%d",
                     req.rid,
                     cache_len,
-                    int(mamba_value[0].item()),
+                    sync_free_tensor_repr(mamba_value[0]),
                     mamba_exist,
                     req.mamba_last_track_seqlen,
                     kv_committed_len,
@@ -957,12 +961,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if self.ckpt_debug:
+            # #790 sweep: same `.item()`-in-a-log-argument shape as the
+            # `cache_finished` site above; see `sync_free_tensor_repr`.
             logger.info(
                 "mamba-ckpt cache_unfinished: rid=%s cache_len=%d slot=%s "
                 "mamba_exist=%s fill_len=%d",
                 req.rid,
                 cache_len,
-                int(mamba_value_donated[0].item()),
+                sync_free_tensor_repr(mamba_value_donated[0]),
                 mamba_exist,
                 len(token_ids),
             )
@@ -1888,10 +1894,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.ckpt_debug:
             # Per-request resume attribution (see debug env): with the
             # interval set, resume_tokens MUST be an interval multiple.
+            # #790 sweep: this `match()` runs on the prefix-match/admission
+            # hot path for every request; `int(...[0].item())` here used to
+            # force a D2H copy + stream sync inside that path whenever
+            # `ckpt_debug` is on. See `sync_free_tensor_repr`.
             full_match_tokens = sum(len(v) for v in value)
             resume_tokens = sum(len(v) for v in value[:best_value_len])
             slot = (
-                int(last_node.mamba_value[0].item())
+                sync_free_tensor_repr(last_node.mamba_value[0])
                 if last_node.mamba_value is not None
                 else None
             )

@@ -331,13 +331,29 @@ class DraftKVSlotMapper:
         victims = cand[order[:take]]
         self.reclaim_events += 1
         self.reclaimed_slots_total += take
+        # #790 sweep: this call is unconditional (no debug/trace gate) and
+        # sits on the decode-time draft-slot allocation path
+        # (`translate_write` -> `_reclaim`), so it runs under real load, not
+        # only when a human opted into extra tracing. The previous line read
+        # `self._slot_epoch[victims].max().item()` -- an `.item()` inside a
+        # log argument is exactly the #790 shape: a D2H copy + stream sync
+        # whose only purpose is a diagnostic string. `victims` are drawn
+        # from the ASCENDING argsort's low end (the oldest, untouched
+        # entries), so their epoch is bounded above by `self._epoch` (the
+        # current round, already a plain host int -- see `self._epoch += 1`
+        # a few lines above the caller) by construction: nothing here can be
+        # "younger" than the round being evicted at. Reporting `self._epoch`
+        # instead of the exact per-victim max is a tight, zero-cost stand-in
+        # -- "reclaimed at round X" rather than "victims' newest round was
+        # X" -- without ever reading `_slot_epoch`'s device values.
         logger.warning(
             "DFLASH small solo pool: LRU reclaim of %d draft slots "
-            "(event #%d; radix prefixes older than round %d lose their "
-            "draft KV -- accept rate degrades on their next hit).",
+            "(event #%d, at round %d; radix prefixes untouched since before "
+            "this round lose their draft KV -- accept rate degrades on "
+            "their next hit).",
             take,
             self.reclaim_events,
-            int(self._slot_epoch[victims].max().item()),
+            self._epoch,
         )
         self.map[self._slot_global[victims]] = -1
         self._slot_global[victims] = -1

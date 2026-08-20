@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import peer_needs_mamba_evict
 from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
+from sglang.srt.mem_cache.memory_pool import sync_free_tensor_repr
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -313,6 +314,16 @@ class MambaComponent(TreeComponent):
             )
 
         if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
+            # #790 sweep: this trace is opt-in (off by default), but it is
+            # reached on every prefix match on the admission path -- exactly
+            # the hot path that wedged for 25+ min in the #790 incident, and
+            # an operator turning this flag on during a live #767 debugging
+            # session is the least convenient moment for that wedge to
+            # recur. `mamba_value.tolist()` and the two bare tensor args
+            # below used to force a D2H sync + stream sync inside
+            # `logging.emit` (`.tolist()`, and `%s` on a raw CUDA tensor
+            # calling `Tensor.__repr__`); see `sync_free_tensor_repr` for
+            # why the values themselves are not read here.
             logger.warning(
                 "#767-TRACE match: rid=%s match_tokens=%s best_len=%s "
                 "effective=%s cow=%s mamba_value=%s cow_src=%s pool_idx=%s "
@@ -322,9 +333,9 @@ class MambaComponent(TreeComponent):
                 best_value_len,
                 effective_best_len,
                 cow_mamba,
-                None if mamba_value is None else mamba_value.tolist(),
-                getattr(req, "mamba_cow_src_index", None),
-                getattr(req, "mamba_pool_idx", None),
+                sync_free_tensor_repr(mamba_value),
+                sync_free_tensor_repr(getattr(req, "mamba_cow_src_index", None)),
+                sync_free_tensor_repr(getattr(req, "mamba_pool_idx", None)),
                 result.mamba_host_hit_length,
                 zeroed_by_strict_resume,
             )

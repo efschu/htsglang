@@ -469,6 +469,49 @@ _M767_FORCE_CLEAR = os.getenv("SGLANG_767_FORCE_CLEAR", "") not in (
 )
 
 
+def sync_free_tensor_repr(value: Any) -> str:
+    """A log-argument-safe stand-in for a value that may be a device tensor
+    OR a plain python object, without ever reading the tensor's VALUE.
+
+    #790. `mamba_pool_idx` is a 1-element CUDA tensor (see
+    `Req.mamba_pool_idx`, shape (1)). Printing its value -- via `%s`/`str()`/
+    `repr()`, `.item()`, `.cpu()`, `.tolist()`, `float()`/`int()`, or f-string
+    interpolation -- all force a D2H copy and a stream synchronize, because
+    that is the only way to materialize the number on the host. The #790
+    incident hit exactly this: `logger.warning("... slot=%s ...",
+    req.mamba_pool_idx)` on the `alloc_for_extend` admission path called
+    `Tensor.__repr__` inside `logging.emit`, and when the device happened to
+    be occupied by a spinning kernel the sync never returned -- PP0's
+    MainThread sat inside `logging.emit` for 25+ minutes while PP1/PP2
+    starved on `pp_chain_receiver.recv` for a chain send PP0 never reached.
+    Zero "#767 carry-without-copy" lines ever reached the log, because the
+    record died mid-format. The #790 sweep found the identical shape at other
+    sites in the mamba carry/COW/checkpoint family (mamba_component.py's
+    `#767-TRACE match`, model_runner.py's `#767-TRACE cow_and_clear`,
+    mamba_radix_cache.py's `ckpt_debug` line) and this helper is shared by
+    all of their fixes, not just the original site.
+
+    So this helper deliberately does NOT return the tensor's VALUE -- that is
+    the value the trap is hiding behind. What it returns instead costs
+    nothing (metadata already resident on the host, or the python object
+    itself):
+      - a tensor: shape/dtype/device (confirms *that* a slot/index is held,
+        and on which device, without ever reading its contents) plus `id()`
+        of the Tensor object, which is still useful to a reader correlating
+        two log lines about the same in-memory tensor handle across this
+        process's lifetime, even though it is not the tensor's contents.
+      - anything else (a plain int, a list already materialized on the host,
+        None, ...): just str(value) -- no tensor, no sync, safe to print
+        directly.
+    """
+    if isinstance(value, torch.Tensor):
+        return (
+            f"<tensor shape={tuple(value.shape)} dtype={value.dtype} "
+            f"device={value.device} id={id(value)}>"
+        )
+    return str(value)
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -1528,6 +1571,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     )
                     n = self._m767_carry_nocopy
                     if n <= 3 or n % 500 == 0:
+                        # #790: `mamba_pool_idx` is a device tensor -- do NOT
+                        # pass it (or `.item()`/`.cpu()`/an f-string of it)
+                        # to a log call. Any of those synchronize the stream
+                        # to materialize the value, and this line sits on the
+                        # admission hot path (`alloc` <- `alloc_for_extend`
+                        # <- `prepare_for_extend` <- `get_new_batch_prefill`).
+                        # A wedge on this exact call is the #790 metal
+                        # incident: PP0's MainThread stuck inside
+                        # `logging.emit` for 25+ minutes because the device
+                        # was busy and the sync never returned, starving
+                        # PP1/PP2 on `pp_chain_receiver.recv`. Log a sync-free
+                        # stand-in (shape/dtype/device + object id) instead --
+                        # see `sync_free_tensor_repr` for why the slot NUMBER
+                        # itself is deliberately not printed.
                         logger.warning(
                             "#767 carry-without-copy #%d: rid=%s slot=%s "
                             "needs_clear=%s -- kept a slot with no pending COW "
@@ -1535,7 +1592,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                             "already wrote that state itself.",
                             n,
                             getattr(req, "rid", "?"),
-                            getattr(req, "mamba_pool_idx", None),
+                            sync_free_tensor_repr(getattr(req, "mamba_pool_idx", None)),
                             getattr(req, "mamba_needs_clear", None),
                         )
                     if _M767_FORCE_CLEAR:
