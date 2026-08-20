@@ -277,6 +277,14 @@ def _victim(rank, wire):
         "_pp_recv_typed_dict",
         "_pp_recv_proxy_tensors",
         "pp_flip_drain_leftover_dicts",
+        # #789 HARNESS REPAIR (interface drift, no assertion touched, same
+        # category as the resolve_src repair documented in
+        # test_pp_flip_leftover_proxy_757.py): _pp_recv_proxy_tensors now
+        # calls self._pp_wait_for_proxy_readiness(mb_id) before its
+        # existing receive. With pp_flip_counters=None above, the bound
+        # method's own "if counters is None: return" fast path makes this
+        # a true no-op -- restoring, not changing, this file's behaviour.
+        "_pp_wait_for_proxy_readiness",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h

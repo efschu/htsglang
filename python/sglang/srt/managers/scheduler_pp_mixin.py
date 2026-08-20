@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from array import array
 from collections import deque
@@ -18,7 +19,9 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.distributed.pp_typed_channel import (
     recv_typed_tensor_dict,
+    resolve_src,
     stash_typed,
+    typed_inbox,
 )
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.environ import envs
@@ -316,6 +319,50 @@ DRAIN_DISCARD = "discard"
 #: rather than fixing it.
 DRAIN_SETTLE_BUDGET_S = 0.75
 DRAIN_SETTLE_STEP_S = 0.02
+
+#: #789: bounded backstop for the proxy-receive readiness gate,
+#: ``_pp_wait_for_proxy_readiness`` (used by ``_pp_recv_proxy_tensors``
+#: immediately below it). See that function's docstring for the full
+#: contract; in short, THIS IS NOT THE DECISION MECHANISM -- the decision
+#: is a positive reading of the CHAN_DICT sent/consumed counters (the
+#: upstream provably posted a message this rank has not yet consumed),
+#: checked on every poll and acted on the instant it becomes true. This
+#: budget only bounds how long the gate is willing to wait for that
+#: counter to move at all before concluding, loudly, that no upstream
+#: scheduled work for this slot.
+#:
+#: HAND PIN #789: unlike DRAIN_SETTLE_BUDGET_S above (whose 0.75s is
+#: chosen to absorb ordinary counter-publish latency, not compute time),
+#: this number has to be generous enough to survive a LEGITIMATELY slow
+#: upstream forward pass (a large prefill chunk, heavy batching, spec
+#: decode verification) without mistaking it for "upstream chose not to
+#: schedule this slot" -- and no specimen on this rig has independently
+#: measured that worst case. It is set by analogy to the nearest existing
+#: precedents for the same shape of question -- "how long may a
+#: legitimately slow peer operation run before a wedge-shaped wait gives
+#: up" -- DEFAULT_PARK_DEADLINE_S (30s) and DEFAULT_JOIN_DEADLINE_S (45s)
+#: in phase_flip_runtime.py. Override with SGLANG_PP_PROXY_READINESS_
+#: BUDGET_S if a future specimen shows this is wrong in either direction.
+DEFAULT_PROXY_READINESS_BUDGET_S = 30.0
+#: Poll interval for the same gate. Matches DRAIN_SETTLE_STEP_S's pacing
+#: rationale exactly: prompt when the counter moves, cheap while it does
+#: not.
+PROXY_READINESS_POLL_STEP_S = 0.02
+#: Env override for DEFAULT_PROXY_READINESS_BUDGET_S. Unset or a
+#: non-positive value falls back to the documented default, mirroring
+#: phase_flip_runtime.py's ENV_PARK_DEADLINE convention.
+ENV_PROXY_READINESS_BUDGET = "SGLANG_PP_PROXY_READINESS_BUDGET_S"
+
+
+def _pp_proxy_readiness_budget_s() -> float:
+    raw = os.environ.get(ENV_PROXY_READINESS_BUDGET)
+    if raw is None:
+        return DEFAULT_PROXY_READINESS_BUDGET_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_PROXY_READINESS_BUDGET_S
+    return value if value > 0 else DEFAULT_PROXY_READINESS_BUDGET_S
 
 
 def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
@@ -2920,6 +2967,173 @@ class SchedulerPPMixin:
             pass
         return (int(mb_id), int(self._pp_proxy_seq), rows)
 
+    def _pp_wait_for_proxy_readiness(self: Scheduler, mb_id: int) -> None:
+        """#789: refuse to enter the blocking proxy receive until there is
+        POSITIVE evidence a message is actually coming.
+
+        THE DEFECT THIS CLOSES. Measured py-spy specimen (evidence-665-f1,
+        2026-08-20, PP=3 with --enable-phase-flip): PP0 and PP1 both idle
+        (cur_batch=None, server_is_idle=True), parked in
+        ``_pp_commit_pending_req_work``; PP2 (cur_batch not None) blocked in
+        the plain gloo receive inside ``_pp_recv_typed_dict``, forever -- an
+        unbounded wait for a proxy that no upstream ever scheduled. WHY the
+        two upstreams never scheduled a batch for this slot is a
+        request-admission question, out of scope here (a separate
+        investigation thread owns it); this function's only job is to make
+        the wait BOUNDED and LOUD instead of silent, without changing
+        anything about a healthy pass.
+
+        NOT A TIMING-OUT WAIT ON THE TRANSPORT. A timed-out gloo
+        ``Work.wait()`` on this build DESTROYS the pair (measured: the peer
+        then sees "Connection closed by peer") -- corpse F, see the module
+        docstring of ``phase_flip_counters`` and ``pp_flip_drain_leftover_
+        dicts`` above. This function never touches the tensor-dict wire at
+        all; it only polls the SAME pollable, out-of-band ``/dev/shm`` side
+        channel ``pp_flip_drain_leftover_dicts`` already uses for exactly
+        this kind of question -- ``PhaseFlipCounters``' CHAN_DICT
+        sent/consumed counters, which are populated on EVERY ordinary
+        proxy/output send (``_pp_send_dict_to_next_stage``), not only while
+        a flip is armed.
+
+        THE POSITIVE SIGNAL, NOT A GUESS FROM SILENCE. ``counters.sent(
+        CHAN_DICT, upstream)`` is published by the upstream STRICTLY AFTER
+        its isend is posted (the ordering law in ``phase_flip_counters``'s
+        module docstring); once it exceeds this rank's own ``counters.
+        local_consumed(CHAN_DICT)``, a message is PROVABLY already posted,
+        and this function returns immediately so the caller's ordinary
+        blocking receive -- now bounded by transfer time alone, not by peer
+        scheduling -- proceeds exactly as it always has. That
+        immediate-return-on-presence is what keeps a healthy boot
+        unchanged: on any pass where the upstream has already posted (the
+        common case, since this rank only reaches here after deciding it
+        has a batch to run), the very first poll already sees the counter
+        ahead and this function costs one counter read.
+
+        THE BOUNDED BACKSTOP IS NOT THE DECISION (#630 lesson). If the
+        counter shows nothing new, this polls again -- up to
+        ``DEFAULT_PROXY_READINESS_BUDGET_S``, at
+        ``PROXY_READINESS_POLL_STEP_S`` intervals -- because the upstream
+        may simply still be inside a legitimately slow forward pass and has
+        not posted its isend yet: the counter cannot lie, but it also
+        cannot show a message that has not been sent. Only once that
+        budget is entirely exhausted with the counter having NEVER moved
+        does this raise. This is deliberately different from "wait N
+        seconds then give up regardless": the loop acts the INSTANT the
+        counter proves a message is in flight, on every single poll, and
+        the deadline exists purely to bound how long it is willing to wait
+        for that proof to arrive -- never as the trigger for the decision
+        itself.
+
+        ONLY GATES WHEN THE SIGNAL EXISTS. If ``pp_flip_counters`` is
+        ``None`` (the ordinary non-phase-flip boot, including the
+        reference regression launch command), there is no side channel to
+        poll and this function is a no-op -- the caller's receive is
+        unchanged from before this function existed. This is deliberate
+        scope, not laziness: without ``--enable-phase-flip`` there is no
+        per-rank publish/consume identity this function could read without
+        new production wiring, and the defect this closes is only measured
+        on boots that DO have ``--enable-phase-flip`` set (see
+        WEDGE_788_specimen.note).
+
+        AN ALREADY-STASHED MESSAGE IS ALSO A POSITIVE SIGNAL (#753
+        interaction, found by test_pp_drain_completeness_787.py's own
+        cutover case going red under this gate). ``pp_flip_drain_leftover_
+        dicts`` can take a "proxy" message fully off the wire and, if it is
+        the one this rank actually owes, ``stash_typed`` it in
+        ``pp_typed_channel``'s per-``(src, kind)`` inbox for its real
+        consumer -- this function's caller -- to pick up next, with no
+        further wire activity. ``_pp_flip_bump_consumed`` already fired
+        when that message left the wire (#631 G: counted off the wire,
+        before the demultiplex), so by the time this gate runs,
+        ``local_consumed`` has ALREADY caught up to ``sent`` for that
+        message -- the counter-only check above would misread that as
+        "nothing new" and wait out the whole budget for a message that is
+        already sitting here, ready. So: check the inbox FIRST, exactly
+        the same ``(src, kind)`` key ``recv_typed_tensor_dict`` itself will
+        check a moment later (non-destructively -- this only peeks; the
+        real, consuming read stays in ``_pp_recv_typed_dict``, unchanged).
+        A non-empty queue is checked before, and takes priority over, the
+        counter poll below.
+
+        TRANSPORT COVERAGE, AND ITS LIMIT. This gate sits BEFORE
+        ``_pp_recv_typed_dict`` is called at all -- before the gloo
+        metadata phase AND before whatever device-payload phase would
+        follow it for a matched message. A rank that never observes
+        "upstream posted" never enters ``_pp_recv_typed_dict``, so it can
+        never reach either transport's blocking call on THIS wire, for
+        THIS slot. And because ``bump_sent`` fires only after the
+        upstream's ``send_tensor_dict`` call returns, a sender that is
+        itself stuck mid-send (metadata not yet posted, or a device-level
+        payload send not yet posted) also never advances its counter --
+        this rank's poll sees the same "nothing new" either way, so a
+        stuck SENDER is covered identically to a sender that never
+        intended to send at all. What this gate does NOT cover: a send
+        whose ``isend`` call has already returned (so ``bump_sent`` already
+        fired and this gate already let the receive proceed) but whose
+        underlying transfer then stalls mid-flight on the wire -- e.g. a
+        device kernel that has started but not completed. That is a
+        different failure shape (a message provably WAS posted, not "no
+        message was ever posted"), needs a receipt/completion signal this
+        rank does not have today, and is out of scope for this first
+        slice, which targets the specific, measured, currently-reproducible
+        defect: "the last rank enters an unbounded blocking wait for a
+        proxy that will never be sent" (never posted at all, not posted
+        and stalled).
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return
+        upstream = self._pp_flip_upstream()
+        src = resolve_src(self.pp_group, None)
+        deadline = None
+        while True:
+            if typed_inbox(self.pp_group).get((src, "proxy")):
+                # Already fully off the wire and stashed for this exact
+                # consumer -- the ordinary receive below will find it with
+                # no further wire activity. Return immediately rather than
+                # trust the counters, which -- for a stashed message --
+                # already read "caught up" (see the docstring section
+                # above) and would otherwise wait out the whole budget for
+                # something already delivered.
+                return
+            posted = counters.sent(CHAN_DICT, upstream)
+            consumed = counters.local_consumed(CHAN_DICT)
+            if consumed < posted:
+                # Positive presence signal: the upstream provably posted a
+                # message this rank has not yet taken off the wire. Return
+                # immediately -- the caller's ordinary receive is next, and
+                # from here it is bounded by transfer time, not by whether
+                # the upstream ever schedules anything.
+                return
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + _pp_proxy_readiness_budget_s()
+            if now < deadline:
+                time.sleep(PROXY_READINESS_POLL_STEP_S)
+                continue
+            budget = _pp_proxy_readiness_budget_s()
+            logger.error(
+                "%s #789 PROXY READINESS TIMEOUT: mb_id=%s -- this rank's "
+                "upstream (rank %s) has posted %d dict message(s) on CHAN_DICT "
+                "and this rank has consumed %d; no new message appeared within "
+                "%.1fs. No upstream scheduled work for this slot -- refusing "
+                "to enter the blocking proxy receive rather than wedge.",
+                "PHASE-FLIP",
+                mb_id,
+                upstream,
+                posted,
+                consumed,
+                budget,
+            )
+            raise RuntimeError(
+                f"#789 PROXY READINESS TIMEOUT: mb_id={mb_id}: this rank's "
+                f"upstream (rank {upstream}) posted {posted} dict message(s) "
+                f"on CHAN_DICT, this rank has consumed {consumed}, and no new "
+                f"message appeared within {budget:.1f}s. No upstream scheduled "
+                f"work for this slot; refusing to enter an unbounded blocking "
+                f"receive. See #789."
+            )
+
     def _pp_recv_proxy_tensors(
         self: Scheduler, mb_id: int = -1
     ) -> Optional[PPProxyTensors]:
@@ -2983,6 +3197,11 @@ class SchedulerPPMixin:
             # crossing into some stage's first layer still fails loudly there
             # rather than forwarding uninitialised hidden states.
             return None
+        # #789: prove a message is actually coming before entering the
+        # blocking receive below. See _pp_wait_for_proxy_readiness's
+        # docstring for the full contract; it is a no-op when
+        # pp_flip_counters is None (unchanged behaviour on such boots).
+        self._pp_wait_for_proxy_readiness(mb_id)
         raw = self._pp_recv_typed_dict(
             expected_kind="proxy",
             all_gather_group=(
