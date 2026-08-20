@@ -6688,6 +6688,41 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
+        # #786: PUBLISH THE #781 FLAGS BEFORE ANYTHING PRICES THEM, not only
+        # at _handle_environment_variables time near the end of this method.
+        #
+        # The VRAM ledger's NCCL term asks "does this launch build an NCCL
+        # communicator at all?" through
+        # parallel_state.should_build_barlink(), which reads
+        # envs.SGLANG_BARLINK. Before #781 that env var was set by the boot
+        # script, so it was already true when the ledger ran. #781 made
+        # --barlink the source of truth and the environment an internal
+        # detail this process publishes from its own argv -- but the publish
+        # happened at line ~6892 while the ledger runs at ~6745, so the
+        # ledger read an UNSET variable and concluded that every group builds
+        # a PyNccl communicator.
+        #
+        # Measured on this rig 2026-08-20, boot 735-standT: the ledger
+        # refused with "NCCL communicator buffers ... NCCL-owned group(s): pp,
+        # flip_tp, flip_dcp (should_build_pynccl(..., barlink_active=False) is
+        # True)" while the same boot logged "barlink enabled for group 'pp:0':
+        # requested=bar1, ACHIEVED=bar1" for all four groups. Those buffers
+        # are never allocated, so three of the nine unbounded terms were
+        # PHANTOM -- the ledger refused to price memory that does not exist,
+        # and a refusal costs the whole full-demand path.
+        #
+        # ONLY THE ONE VARIABLE THE LEDGER READS, deliberately.
+        # `_publish_promoted_781_flags` is 145 lines and also resolves
+        # debug-cuda-graph and custom-all-reduce; hoisting all of it here to
+        # fix one env read would move far more behaviour than the defect
+        # warrants and would emit its warnings twice. This publishes barlink
+        # ownership and nothing else, and the full publisher calls the SAME
+        # helper later, so there is one definition and the two cannot diverge.
+        # Same remedy shape as the #596 comment in
+        # ledger_full_demand_per_gpu: resolve what the ledger reads BEFORE the
+        # ledger reads it.
+        self._publish_barlink_ownership_env()
+
         # Validate heterogeneous rank placement / uneven TP flags. Must run
         # before _handle_gpu_memory_settings so an explicitly passed
         # --mem-fraction-static is still distinguishable (None = unset).
@@ -17258,6 +17293,36 @@ class ServerArgs:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         self._publish_promoted_781_flags()
 
+    def _publish_barlink_ownership_env(self):
+        """``SGLANG_BARLINK``, and nothing else. Idempotent, mutates no field.
+
+        SPLIT OUT OF :meth:`_publish_promoted_781_flags` FOR AN ORDERING
+        REASON (#786). ``parallel_state.should_build_barlink`` is
+        ``bool(envs.SGLANG_BARLINK.get()) and world_size > 1``, and the VRAM
+        ledger's NCCL term calls it at ARGUMENT PARSE time to ask whether this
+        launch builds an NCCL communicator at all. The full publisher runs in
+        ``_handle_environment_variables``, near the end of ``__post_init__``;
+        the ledger runs in ``_handle_gpu_memory_settings``, well before it. So
+        the ledger read an UNSET variable and concluded that every group
+        constructs a PyNccl communicator.
+
+        Measured on this rig 2026-08-20 (boot 735-standT): the ledger refused
+        the whole full-demand path over "NCCL communicator buffers ...
+        NCCL-owned group(s): pp, flip_tp, flip_dcp", while the same boot
+        logged ``barlink enabled for group 'pp:0': requested=bar1,
+        ACHIEVED=bar1`` for all four groups. Barlink owned every group, so
+        those buffers were never allocated -- three of the nine unbounded
+        terms were PHANTOM, and a refusal is not a warning: it costs the
+        entire priced reserve.
+
+        Before #781 the boot script exported this variable, so it was already
+        true when the ledger ran. Making the flag the source of truth moved
+        the publish after the read; this moves the read's input back in front
+        of it without moving anything else.
+        """
+        if self.barlink is not None:
+            os.environ["SGLANG_BARLINK"] = "1" if self.barlink else "0"
+
     def _publish_promoted_781_flags(self):
         """Publish the #781 promoted flags to the consumers that read env.
 
@@ -17298,8 +17363,9 @@ class ServerArgs:
             # and not the boot-time PP -- exactly the scope split the #754 fix
             # is about. Publishing keeps one value visible to both stacks.
             os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = str(self.uneven_token_vector)
-        if self.barlink is not None:
-            os.environ["SGLANG_BARLINK"] = _b(self.barlink)
+        # One definition, called from here and from the early hoist in
+        # __post_init__ that the VRAM ledger depends on (#786).
+        self._publish_barlink_ownership_env()
         if self.barlink_transport is not None:
             os.environ["SGLANG_BARLINK_TRANSPORT"] = str(self.barlink_transport)
         if self.barlink_bar1_cap_cycles is not None:
