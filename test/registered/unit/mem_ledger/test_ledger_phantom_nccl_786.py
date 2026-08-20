@@ -125,9 +125,9 @@ def test_the_full_publisher_delegates_rather_than_duplicating():
     """
     src = inspect.getsource(sa_mod.ServerArgs._publish_promoted_781_flags)
     assert "_publish_barlink_ownership_env()" in src
-    assert 'os.environ["SGLANG_BARLINK"]' not in src, (
-        "the barlink publish is duplicated instead of delegated"
-    )
+    assert (
+        'os.environ["SGLANG_BARLINK"]' not in src
+    ), "the barlink publish is duplicated instead of delegated"
 
 
 # ---------------------------------------------------------------------------

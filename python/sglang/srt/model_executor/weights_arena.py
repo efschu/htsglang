@@ -209,22 +209,119 @@ def _check_v1_scope(name: str, t: torch.Tensor) -> int:
 
 
 def plan_arena_layout(
-    named: Dict[str, torch.Tensor], exclude: Optional[Set[str]] = None
+    named: Dict[str, torch.Tensor],
+    exclude: Optional[Set[str]] = None,
+    alias_of: Optional[Dict[str, str]] = None,
 ) -> ArenaLayout:
     """Deterministic slot layout for a named-tensor set.
 
     Order is sorted(name) -- replicated on every boot by construction.
     Tensors sharing one storage get one slot under the FIRST (sorted)
-    name; later names become aliases."""
+    name; later names become aliases.
+
+    ``alias_of`` (#785) SUPPLIES THE ALIAS RELATION INSTEAD OF INFERRING IT,
+    as ``{alias_name: canonical_name}``. Everything this function needs is
+    metadata -- ``shape``, ``stride``, ``dtype``, ``storage_offset`` and the
+    storage size -- and all of it is correct on a META tensor. Exactly one
+    input is not: ``data_ptr()`` is 0 for every meta tensor, so the storage
+    identity used to detect aliasing collapses the entire model into ONE slot
+    and returns a total that is wrong by orders of magnitude while looking
+    perfectly well-formed.
+
+    That matters because #785 needs ``layout_tp.total_bytes`` at KV-SIZING
+    time, and the TP stack does not exist yet then -- it is built later, in
+    ``phase_flip_boot``, which is precisely why the flip seam has had to carry
+    its arena tail between boots in a cached record (#782). Laying out a
+    meta-device TP parameter set answers the same question without allocating
+    a byte, provided the aliasing comes from the caller.
+
+    So the inference path REFUSES on meta input rather than guessing: a silent
+    wrong total here would be charged straight into the pool solve.
+    """
     exclude = exclude or set()
     slots = []
     aliases = []
     by_storage: Dict[int, str] = {}
     offset = 0
-    for name in sorted(named):
-        if name in exclude:
-            continue
+    considered = [n for n in sorted(named) if n not in exclude]
+    if alias_of is None:
+        # #785: data_ptr() cannot separate "aliases" from "has no storage".
+        meta = [n for n in considered if named[n].is_meta]
+        if meta:
+            raise WeightsArenaError(
+                f"{len(meta)} tensor(s) are on the meta device "
+                f"(e.g. {meta[0]!r}) and alias_of= was not supplied. Meta "
+                f"tensors all report data_ptr()==0, so storage-identity "
+                f"aliasing would fold them into a single slot and return a "
+                f"total that is far too small but structurally valid. Pass "
+                f"the alias relation explicitly to lay out a meta set."
+            )
+        # The same trap for any storage-less tensor with real extent.
+        ghosts = [
+            n
+            for n in considered
+            if named[n].numel() > 0 and named[n].untyped_storage().data_ptr() == 0
+        ]
+        if len(ghosts) > 1:
+            raise WeightsArenaError(
+                f"{len(ghosts)} non-empty tensor(s) report data_ptr()==0 "
+                f"(e.g. {ghosts[0]!r}); they cannot be distinguished from "
+                f"one another by storage identity. Pass alias_of= explicitly."
+            )
+    else:
+        unknown = set(alias_of) - set(considered)
+        if unknown:
+            raise WeightsArenaError(
+                f"alias_of names tensor(s) not in the set: {sorted(unknown)}"
+            )
+        bad_target = {
+            a: c for a, c in alias_of.items() if c not in named or c in exclude
+        }
+        if bad_target:
+            raise WeightsArenaError(
+                f"alias_of points at absent canonical tensor(s): {bad_target}"
+            )
+        # A canonical that is itself an alias would leave the chain's real
+        # slot unallocated, so the arena would be short by that tensor.
+        chained = {a: c for a, c in alias_of.items() if c in alias_of}
+        if chained:
+            raise WeightsArenaError(
+                f"alias_of is chained: {chained}. Point every alias directly "
+                f"at the tensor that owns the slot; a chain leaves the owning "
+                f"tensor unslotted and undersizes the arena."
+            )
+    for name in considered:
         t = named[name]
+        if alias_of is not None:
+            canon = alias_of.get(name)
+            if canon is not None:
+                canon_t = named[canon]
+                if (
+                    t.shape != canon_t.shape
+                    or t.stride() != canon_t.stride()
+                    or t.dtype != canon_t.dtype
+                ):
+                    raise WeightsArenaError(
+                        f"{name!r} is declared an alias of {canon!r} but has a "
+                        f"different view (shape/stride/dtype); the arena "
+                        f"preserves aliasing only for identical views "
+                        f"(V1 scope)"
+                    )
+                aliases.append((name, canon))
+                continue
+            nbytes = _check_v1_scope(name, t)
+            slots.append(
+                ArenaSlot(
+                    name=name,
+                    offset=offset,
+                    nbytes=nbytes,
+                    shape=tuple(t.shape),
+                    stride=tuple(t.stride()),
+                    dtype=t.dtype,
+                )
+            )
+            offset += _align(nbytes)
+            continue
         key = t.untyped_storage().data_ptr()
         if key in by_storage:
             canon = by_storage[key]
