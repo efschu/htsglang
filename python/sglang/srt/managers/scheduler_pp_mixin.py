@@ -103,6 +103,31 @@ ADMISSION_DECISION_KIND = "admission_decision"
 # exactly this already.
 _ADMISSION_DECISION_PAYLOAD_KEY = "__admission_decision__"
 
+# 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
+# not required for this iteration's forward progress" family. PP0's ring
+# wraparound receive for the admission decision (feeding
+# `PPAdmissionCongruenceGuard.record_return_trip`, a pure learning step) was
+# a plain blocking p2p recv inside the per-iteration loop: once PP0 had
+# `pp_size` sends outstanding it stopped sending entirely until a full ring
+# lap returned, and the downstream ranks that would have had to complete
+# that lap were themselves blocked at the top of their own pass waiting for
+# PP0's NEXT forward send. Closed ring, zero GPU utilisation, no
+# ADMISSION-WEDGE marker (the detector did not know this shape). See
+# `_pp_try_recv_admission_decision`'s docstring for the fix and
+# `_PP_ADMISSION_PENDING_SENDS_CAP` below for the one bookkeeping
+# consequence of making the receive opportunistic instead of blocking.
+#
+# PURE MEMORY/STALENESS BOUND, NEVER A CORRECTNESS ONE. The PP0-only
+# `self._pp_admission_pending_sends` deque (see its docstring in
+# `init_pp_loop_state`) exists only to gate WHEN `_event_loop_pp_body`
+# opportunistically peeks for an already-arrived wraparound lap -- it holds
+# no data that is read back out, so forgetting its oldest entry loses no
+# information about what is actually in flight on the wire (which is
+# unbounded and always was). Without a cap, a run where wraparounds stay
+# unavailable for a long stretch would grow this deque by one entry every
+# pass forever; this caps it instead.
+_PP_ADMISSION_PENDING_SENDS_CAP = 64
+
 
 def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, object]:
     """#791: serialize a PPAdmissionDecision for the typed tensor-dict wire.
@@ -703,25 +728,57 @@ class SchedulerPPMixin:
                         )
                         self._pp_send_admission_decision(fresh_decision)
                         self._pp_admission_pending_sends.append(mb_id)
-                        # Defer the wraparound receive until at least one
-                        # full ring lap could plausibly have completed --
-                        # see the field's docstring in init_pp_loop_state.
-                        # A blocking receive attempted every pass from pass
-                        # 0 would make PP0 wait for ITS OWN pass's full
-                        # round trip before it could ever move on to the
-                        # next one, destroying pipelining; this bounds how
-                        # stale the wraparound receive can be instead of
-                        # eliminating the wait (still a blocking p2p recv,
-                        # like every other stage-boundary receive in this
-                        # loop -- never a collective).
-                        if len(self._pp_admission_pending_sends) >= self.ps.pp_size:
+                        # Capped, not unbounded -- see
+                        # _PP_ADMISSION_PENDING_SENDS_CAP's docstring. What
+                        # falls off here is only a bookkeeping marker for
+                        # WHEN to opportunistically peek below; nothing on
+                        # the wire is touched or forgotten by dropping it.
+                        while (
+                            len(self._pp_admission_pending_sends)
+                            > _PP_ADMISSION_PENDING_SENDS_CAP
+                        ):
                             self._pp_admission_pending_sends.popleft()
+                        # Attempt the wraparound only once at least one full
+                        # ring lap could plausibly have completed -- see the
+                        # field's docstring in init_pp_loop_state -- and,
+                        # critically, ONLY OPPORTUNISTICALLY: this used to be
+                        # an unconditional BLOCKING receive here, which is
+                        # the fourth deadlock of the "a rank must never block
+                        # on a peer for something not required for this
+                        # iteration's forward progress" family (see
+                        # `_PP_ADMISSION_PENDING_SENDS_CAP`'s docstring
+                        # above for the measured specimen).
+                        # `record_return_trip` is a pure learning step
+                        # (teaches `PPAdmissionCongruenceGuard` the coverage
+                        # a lap observed; never required for this iteration
+                        # to make progress), so the receive that feeds it
+                        # must never be allowed to block this iteration on a
+                        # peer. `_pp_try_recv_admission_decision` only
+                        # consumes a lap that is ALREADY in hand and returns
+                        # None immediately otherwise -- see its docstring.
+                        if len(self._pp_admission_pending_sends) >= self.ps.pp_size:
                             with torch.profiler.record_function(
                                 "pp_admission_decision_return_trip"
                             ):
-                                returned = self._pp_recv_admission_decision()
+                                returned = self._pp_try_recv_admission_decision()
                             if returned is not None:
+                                self._pp_admission_pending_sends.popleft()
                                 self._pp_admission_guard.record_return_trip(returned)
+                            # else: no lap already in hand this pass -- skip
+                            # it. `_pp_admission_pending_sends` is left at
+                            # its current (capped) length, still >= pp_size,
+                            # so every following pass retries this same
+                            # cheap opportunistic check (one inbox peek, no
+                            # wire touch) until a lap does show up. The
+                            # skipped lap itself is never lost: see
+                            # `_pp_try_recv_admission_decision`'s docstring
+                            # for why it stays consumable later. The one
+                            # user-visible consequence is that the learned
+                            # floor `record_return_trip` clears LATER --
+                            # whenever a lap next happens to already be in
+                            # hand -- instead of at a fixed
+                            # pass; this only delays reuse recovery for a
+                            # retracted rid, nothing else.
                     else:
                         amended = self._pp_admission_amended_to_forward
                         if amended is None:
@@ -2474,12 +2531,16 @@ class SchedulerPPMixin:
         # (re-)entered on simply reappears on the next pass's admission loop
         # (self.waiting_queue is never mutated for a skipped req).
         # `_pp_admission_pending_sends` is PP0-only: a rolling count of
-        # decisions PP0 has sent but not yet consumed the ring's wraparound
-        # for. It exists so the wraparound RECEIVE is deferred until at
-        # least one full lap could plausibly have completed, rather than
-        # PP0 blocking on THIS pass's own wraparound immediately -- see
-        # _event_loop_pp_body's #791 block for why the latter would
-        # re-serialize the pipeline one pass at a time.
+        # decisions PP0 has sent but not yet opportunistically consumed the
+        # ring's wraparound for. It exists so the wraparound CHECK is
+        # deferred until at least one full lap could plausibly have
+        # completed, rather than PP0 checking for THIS pass's own wraparound
+        # immediately -- see _event_loop_pp_body's #791 block for why the
+        # latter would re-serialize the pipeline one pass at a time. Capped
+        # at `_PP_ADMISSION_PENDING_SENDS_CAP` (see that constant's
+        # docstring) so it cannot grow unboundedly on a run where
+        # wraparounds stay unavailable for a long stretch -- a memory bound
+        # only, never a correctness one.
         self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
         self._pp_admission_amended_to_forward: Optional[PPAdmissionDecision] = None
         self._pp_admission_pending_sends: deque = deque()
@@ -3200,6 +3261,75 @@ class SchedulerPPMixin:
             return None
         message = self._pp_recv_typed_dict(expected_kind=ADMISSION_DECISION_KIND)
         return pp_admission_decision_from_wire(message)
+
+    def _pp_try_recv_admission_decision(
+        self: Scheduler,
+    ) -> Optional[PPAdmissionDecision]:
+        """PP0's OPPORTUNISTIC counterpart to `_pp_recv_admission_decision`,
+        used ONLY for the ring wraparound check in `_event_loop_pp_body`
+        (never for the ordinary forward receive non-first ranks issue at
+        the top of the loop -- those genuinely need to block to make
+        progress, and are unaffected by this method).
+
+        THE DEADLOCK THIS CLOSES -- the fourth of the "a rank must never
+        block on a peer for something not required for this iteration's
+        forward progress" family, measured live 2026-08-20: boot reached
+        health, froze on the first request, zero GPU utilisation on all
+        ranks. py-spy on all three: PP0 blocked in exactly the wraparound
+        receive this method replaces; PP1 and PP2 both blocked at the
+        forward receive (`_event_loop_pp_body`'s #791 block, non-first-rank
+        branch) waiting for PP0's NEXT decision. Closed ring: PP0 would not
+        send again until its wraparound receive returned, and the only
+        ranks that could complete that lap were the ones waiting on PP0's
+        next send.
+
+        `record_return_trip` (`PPAdmissionCongruenceGuard`) is a pure
+        LEARNING step -- it teaches the guard the downstream coverage a lap
+        actually observed and clears a rid's learned floor early. Nothing
+        about THIS iteration's forward progress depends on it, so the
+        receive that feeds it must never be allowed to block this
+        iteration on a peer.
+
+        NON-BLOCKING BY CONSTRUCTION, NOT BY TIMEOUT. This never calls the
+        underlying blocking gloo receive itself. It only PEEKS
+        `pp_typed_channel.typed_inbox` for an already-stashed
+        `(src, ADMISSION_DECISION_KIND)` message -- the exact precedent
+        `_pp_wait_for_proxy_readiness` set (see its docstring: "AN
+        ALREADY-STASHED MESSAGE IS ALSO A POSITIVE SIGNAL") for gating a
+        blocking receive on inbox presence rather than trusting silence --
+        and only when one is already there does it call
+        `_pp_recv_admission_decision`, whose own fast path
+        (`recv_typed_tensor_dict`'s `take_typed` at the top, in
+        pp_typed_channel.py) then pops it with no further wire activity.
+        The peek and the pop use the identical `(src, kind)` key, computed
+        the same way (`resolve_src`), so there is no window between them
+        for a second message to arrive and be mistaken for this one.
+
+        WHY A LAP CAN ALREADY BE PRESENT WITHOUT THIS RANK EVER HAVING
+        ISSUED A DEDICATED BLOCKING RECEIVE FOR IT. PP0's mandatory
+        per-iteration "output" receive (`_pp_recv_dict_from_prev_stage`)
+        reads from the SAME directed pair -- the last rank, ring-wrapped to
+        PP0 -- that the amended admission decision also travels on.
+        `recv_typed_tensor_dict` drains messages off that wire until it
+        finds the kind it asked for ("output"), stashing every other kind
+        it passes over -- including ADMISSION_DECISION_KIND -- into the
+        inbox along the way. So a lap that arrived interleaved with an
+        "output" message is typically already sitting here by the time
+        this runs, discovered as a side effect of a receive the loop was
+        going to issue anyway, at no extra wire cost. If it is not there
+        yet, this iteration simply carries on without it -- see the call
+        site in `_event_loop_pp_body` for what that costs.
+
+        Returns None immediately, touching nothing, when `pp_size <= 1`
+        (matching `_pp_recv_admission_decision`'s own no-op contract) or
+        when no lap is already in hand.
+        """
+        if self.ps.pp_size <= 1:
+            return None
+        src = resolve_src(self.pp_group, None)
+        if not typed_inbox(self.pp_group).get((src, ADMISSION_DECISION_KIND)):
+            return None
+        return self._pp_recv_admission_decision()
 
     def _pp_reconcile_incoming_admission(
         self: Scheduler, decision: PPAdmissionDecision
