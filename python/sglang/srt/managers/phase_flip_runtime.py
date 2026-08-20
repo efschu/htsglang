@@ -3996,9 +3996,16 @@ class PhaseFlipRuntime:
         abandon on anything unfinished; it only catches up bookkeeping
         for work that is already done.
         """
-        if self._flush_pending_sends_fn is not None:
+        # #787 REGRESSION REPAIR: getattr, and for the reason this codebase
+        # already documents at scheduler.py:9286 -- these paths are driven in
+        # tests by STAND-INS that carry only the fields the logic reads. A
+        # stand-in without this hook must behave exactly as before rather than
+        # raise AttributeError from inside the abandon path. Direct attribute
+        # access here broke 6 phase-policy cases the moment the hook was added.
+        flush_fn = getattr(self, "_flush_pending_sends_fn", None)
+        if flush_fn is not None:
             try:
-                self._flush_pending_sends_fn()
+                flush_fn()
             except Exception as exc:  # noqa: BLE001 - flush is best effort
                 logger.warning(
                     "%s #787 pre-abandon send flush failed (no quorum): %s",
@@ -4075,9 +4082,16 @@ class PhaseFlipRuntime:
         is not racing against bookkeeping this rank could have closed out
         itself.
         """
-        if self._flush_pending_sends_fn is not None:
+        # #787 REGRESSION REPAIR: getattr, and for the reason this codebase
+        # already documents at scheduler.py:9286 -- these paths are driven in
+        # tests by STAND-INS that carry only the fields the logic reads. A
+        # stand-in without this hook must behave exactly as before rather than
+        # raise AttributeError from inside the abandon path. Direct attribute
+        # access here broke 6 phase-policy cases the moment the hook was added.
+        flush_fn = getattr(self, "_flush_pending_sends_fn", None)
+        if flush_fn is not None:
             try:
-                self._flush_pending_sends_fn()
+                flush_fn()
             except Exception as exc:  # noqa: BLE001 - flush is best effort
                 logger.warning(
                     "%s #787 pre-abandon send flush failed (unjoined): %s",
