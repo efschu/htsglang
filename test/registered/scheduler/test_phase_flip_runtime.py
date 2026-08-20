@@ -2270,3 +2270,118 @@ class TestTheWrapperCannotDropTheSpanSurface(CustomTestCase):
         w.full_kv_pool = NS()
         self.assertFalse(w.supports_backing_spans)
         self.assertEqual(w.backing_commit_chunk_bytes, 0)
+
+
+class _RecordingFlush:
+    """#787 SENDER-SIDE HALF pin: records, at the moment it fires, whether
+    the runtime's flip was still pending -- i.e. whether the flush ran
+    BEFORE local flip state was cleared.
+
+    The runtime object does not exist yet when this stub is built (it is
+    passed INTO the ``PhaseFlipRuntime`` constructor), so the reference is
+    bound after construction via ``.runtime = rt`` rather than captured at
+    stub-creation time.
+    """
+
+    def __init__(self):
+        self.runtime = None
+        self.pending_at_call = []
+
+    def __call__(self):
+        rt = self.runtime
+        self.pending_at_call.append(None if rt is None else rt.pending)
+
+
+class TestAbandonFlushesPendingSendsBeforeClearing787(CustomTestCase):
+    """#787 sender-side half, pinned directly (no drain/settle window in
+    sight -- that receiver-side half is covered elsewhere, this class only
+    watches the abandon paths' ordering promise).
+
+    ``_abandon_no_quorum`` and ``_abandon_unjoined_flip`` both claim, in a
+    code comment, that they flush/count pending CHAN_DICT sends BEFORE
+    clearing local flip state (``self._pending = None``). A comment is not
+    a pin (#505b): this class constructs a real ``PhaseFlipRuntime``, wires
+    a recording ``flush_pending_sends_fn`` into it, drives each abandon path
+    directly, and asserts both that the hook fired and that the flip was
+    still pending at the moment it fired.
+    """
+
+    def _armed_runtime(self, flush):
+        _, live, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 100, seed=61
+        )
+        rt = PhaseFlipRuntime(
+            n_ranks=3,
+            rank=0,
+            layer_map=MAP_625,
+            n_layers=N_LAYERS,
+            tp_vector=VEC,
+            boot_phase=PHASE_PP,
+            collective_min=lambda vals: list(vals),
+            exchange=lambda o, i: {},
+            pp_pool_view=pp_views[0],
+            tp_pool_view=tp_views[0],
+            live_slots_fn=lambda: live,
+            ready_fn=lambda: True,
+            cutover_fn=lambda d: None,
+            flush_pending_sends_fn=flush,
+        )
+        flush.runtime = rt
+        ok, msg = rt.arm(PP_TO_TP, source="test")
+        self.assertTrue(ok, msg)
+        self.assertEqual(rt.pending, PP_TO_TP, "precondition: the flip is armed")
+        return rt
+
+    def test_no_quorum_abandon_flushes_before_clearing(self):
+        flush = _RecordingFlush()
+        rt = self._armed_runtime(flush)
+        rt._abandon_no_quorum(epoch=0, missing=(1, 2), waited=3.5)
+
+        self.assertEqual(len(flush.pending_at_call), 1, "hook must fire exactly once")
+        self.assertEqual(
+            flush.pending_at_call[0],
+            PP_TO_TP,
+            "the flush ran while the flip was still pending -- i.e. BEFORE "
+            "the abandon cleared local state, not after",
+        )
+        self.assertIsNone(rt.pending, "the abandon must still clear afterwards")
+
+    def test_unjoined_abandon_flushes_before_clearing(self):
+        flush = _RecordingFlush()
+        rt = self._armed_runtime(flush)
+        rt._abandon_unjoined_flip(why="synthetic join timeout")
+
+        self.assertEqual(len(flush.pending_at_call), 1, "hook must fire exactly once")
+        self.assertEqual(
+            flush.pending_at_call[0],
+            PP_TO_TP,
+            "the flush ran while the flip was still pending -- i.e. BEFORE "
+            "the abandon cleared local state, not after",
+        )
+        self.assertIsNone(rt.pending, "the abandon must still clear afterwards")
+
+    def test_missing_hook_is_tolerated(self):
+        """Contrast: an unset hook (the default) must not be required --
+        callers that never wired one keep working exactly as before."""
+        _, live, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 100, seed=62
+        )
+        rt = PhaseFlipRuntime(
+            n_ranks=3,
+            rank=0,
+            layer_map=MAP_625,
+            n_layers=N_LAYERS,
+            tp_vector=VEC,
+            boot_phase=PHASE_PP,
+            collective_min=lambda vals: list(vals),
+            exchange=lambda o, i: {},
+            pp_pool_view=pp_views[0],
+            tp_pool_view=tp_views[0],
+            live_slots_fn=lambda: live,
+            ready_fn=lambda: True,
+            cutover_fn=lambda d: None,
+        )
+        ok, msg = rt.arm(PP_TO_TP, source="test")
+        self.assertTrue(ok, msg)
+        rt._abandon_no_quorum(epoch=0, missing=(1,), waited=1.0)
+        self.assertIsNone(rt.pending)
