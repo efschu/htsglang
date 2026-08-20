@@ -2517,12 +2517,29 @@ class ModelRunnerKVCacheMixin:
             from sglang.srt.distributed.utils import pp_gapped_ownership_active
 
             pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
-            if not pp_gapped_ownership_active(pp_size):
-                return rest_memory, None
             # None means "unset, take the default"; 0 means "the operator asked
             # for no holdback". The ``or`` idiom conflates the two and would
             # make the reserve impossible to switch off.
             configured = getattr(self.server_args, "rank_user_reserve_mib", None)
+            # AN EXPLICIT FLAG IS NEVER SILENTLY DROPPED (#774).
+            #
+            # The gapped gate below exists to keep SHIPPED configurations
+            # byte-identical -- they never set this flag, so they are unaffected
+            # either way. But an operator who passes --rank-user-reserve-mib is
+            # answering the exact question this holdback asks, and on a boot
+            # driven by --pp-stage-ratio (no PP layer set in the environment)
+            # the gate is False, so the value was discarded without a word.
+            #
+            # Measured 2026-08-20: a pp=3 --rank-gpu-memory-mib boot with no
+            # --max-total-tokens sized the KV pool to the last MiB of the
+            # budget (19.24 of 19.58 GiB) and then died on the phase flip's
+            # 810 MiB draft lm_head restore. Raising the reserve is the correct
+            # answer to that OOM and it did nothing, because the flag never
+            # reached the arithmetic. A reserve that is asked for and ignored
+            # is worse than one that does not exist: it reads as "I already
+            # tried that".
+            if configured is None and not pp_gapped_ownership_active(pp_size):
+                return rest_memory, None
             reserve_mib = 1024 if configured is None else int(configured)
             if reserve_mib <= 0:
                 return rest_memory, None
