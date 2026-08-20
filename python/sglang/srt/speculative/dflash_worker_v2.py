@@ -15,6 +15,7 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     accept_sampling,
 )
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -940,19 +941,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None:
             return _eager("no target lm_head")
-        if not hasattr(lm_head, "weight"):
-            # Quantized-resident head (GGUF: packed qweight, no dense weight).
-            # It is sampled through its quant kernel, which allocates a dequant
-            # workspace and cannot be folded into the static graph matmul.
-            return _eager("quantized-resident lm_head")
-        if not torch.is_floating_point(lm_head.weight):
-            # Quantized lm_head (FP8/INT) would break the static matmul.
-            return _eager("quantized lm_head")
 
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
+            # A gate-admitted quantized head is capture-safe: the target's own
+            # logits path already runs the same kernel under CUDA graphs.
+            if not is_dense_head_weight(
+                getattr(lm_head, "weight", None)
+            ) and not should_apply_lm_head_quant_method(
+                lm_head, getattr(lm_head, "quant_method", None)
+            ):
+                return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
-            if self.ps.tp_rank == 0:
+            if self.tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode (greedy + sampling) folded into the "
                     "draft cuda graph."
@@ -963,6 +964,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
             )
+        if not hasattr(lm_head, "weight"):
+            return _eager("quantized lm_head has no dense weight")
+        if not is_dense_head_weight(lm_head.weight):
+            # Quantized lm_head (FP8/INT) would break the static matmul.
+            return _eager("quantized lm_head")
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             num_org = int(lm_head.weight.shape[0])
