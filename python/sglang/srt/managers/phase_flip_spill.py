@@ -400,6 +400,50 @@ def draft_model_of(draft_worker: Any) -> Optional[Any]:
     return getattr(runner, "model", None)
 
 
+def target_model_of(draft_worker: Any) -> Optional[Any]:
+    """The TARGET's ``torch.nn.Module``, or None.
+
+    Mirror of :func:`draft_model_of`, reached just as defensively. Needed
+    because "what the drafter exclusively owns" cannot be decided from the
+    drafter's tensors alone: the drafter SHARES whole modules with the target
+    (``EAGLEWorkerV2.init_lm_head`` hands over the embed/lm_head modules
+    wholesale), and a shared tensor is indistinguishable from an owned one
+    until it is compared against the target's own storages.
+    """
+    if draft_worker is None:
+        return None
+    target_worker = getattr(draft_worker, "target_worker", None)
+    runner = getattr(target_worker, "model_runner", None)
+    if runner is None:
+        runner = getattr(target_worker, "draft_runner", None)
+    return getattr(runner, "model", None)
+
+
+def _storage_ptrs(model: Any) -> set:
+    """Every distinct storage address the model's tensors sit on.
+
+    Parameters AND buffers: a quantized embedding keeps its row scales in a
+    buffer on some builds, and a scale that is missed here is a scale the
+    drafter will hand to the arena and release out from under the target.
+    """
+    ptrs = set()
+    if model is None:
+        return ptrs
+    for getter in ("named_parameters", "named_buffers"):
+        it = getattr(model, getter, None)
+        if it is None:
+            continue
+        for _name, t in it():
+            if t is None:
+                continue
+            data = getattr(t, "data", t)
+            try:
+                ptrs.add(data.untyped_storage().data_ptr())
+            except Exception:  # pragma: no cover - exotic tensor types
+                continue
+    return ptrs
+
+
 def allocate_carrier_tensor(arena: Any, nbytes: int, device_index: int):
     """A flat uint8 tensor occupying ``nbytes`` of ``arena``'s reservation.
 
@@ -489,9 +533,14 @@ class VmmDraftWeightCarrier:
         device_index: int,
         *,
         arena: Any = None,
+        foreign_storage_ptrs: Optional[set] = None,
     ) -> None:
         from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
+        # Storages owned by someone else (the target). A draft parameter that
+        # sits on one of these is shared, however small it is -- see the
+        # ownership block below. Empty/None keeps the pre-#774 classification.
+        self._foreign_storage_ptrs = foreign_storage_ptrs
         self._named = checkpoint_param_dict(model)
         if not self._named:
             raise PhaseFlipSpillError(
@@ -527,16 +576,48 @@ class VmmDraftWeightCarrier:
         # delta includes the shared bytes. The real spillable payload is
         # smaller and is logged below per rank -- do not quote 1925 without
         # re-reading the installed figure.
+        # WHOLE-TENSOR SHARING IS ALSO SHARING (#774).
+        #
+        # `storage > own` only catches a PARTIAL view of a larger storage. It
+        # catches `lm_head.weight` and `model.embed_tokens.weight`, which slice
+        # the target's 16 GiB arena -- and misses their companions. On a
+        # vocab-quantized build the drafter also shares
+        # `model.embed_tokens.weight_scale`: the module is handed over WHOLESALE
+        # (`EAGLEWorkerV2.init_lm_head`), so the scale is the target's tensor,
+        # but its storage is exactly its own bytes and `storage > own` is False.
+        # It was therefore classified exclusive, moved onto the carrier, and its
+        # pages RELEASED for the whole PP phase while the target still read it.
+        #
+        # That is a use-after-free, and it reads as one: whether the freed page
+        # still holds the old bytes depends on allocation pressure, so the
+        # defect is INVISIBLE at a low concurrency cap and fatal at a higher
+        # one. Measured 2026-08-20 on the standing shape, same commit, same
+        # seed, only `--max-running-requests` changed:
+        #
+        #   cap 4: embed_tokens.weight_scale norm 0.1273 -> accept len 4.00
+        #   cap 8: embed_tokens.weight_scale norm 0.0000 -> accept len 1.14
+        #
+        # A zeroed scale kills the drafter's input embedding, so it proposed one
+        # constant token forever and speculation became pure verify overhead.
+        #
+        # Ownership is therefore decided by STORAGE IDENTITY against the target,
+        # which is the question actually being asked, and not by a size
+        # heuristic standing in for it. Derived from the live model objects: no
+        # size threshold, no parameter-name list to drift.
+        foreign = self._foreign_storage_ptrs or set()
         shared = {}
         exclusive = {}
         for name, p in self._named.items():
             t = p.data
             own = t.numel() * t.element_size()
             try:
-                storage = t.untyped_storage().nbytes()
+                untyped = t.untyped_storage()
+                storage = untyped.nbytes()
+                ptr = untyped.data_ptr()
             except Exception:  # pragma: no cover - exotic tensor types
                 storage = own
-            if storage > own:
+                ptr = None
+            if storage > own or (ptr is not None and ptr in foreign):
                 shared[name] = (own, storage)
             else:
                 exclusive[name] = p
@@ -849,7 +930,21 @@ def install_draft_weight_carrier(
             f"and fault, so this combination is refused at boot rather than "
             f"at the first threshold decode."
         )
-    carrier = VmmDraftWeightCarrier(model, device_index, arena=arena)
+    # #774: the drafter shares whole modules with the target, so ownership can
+    # only be decided against the target's storages. Collected here, at boot,
+    # where both models are in hand.
+    foreign = _storage_ptrs(target_model_of(draft_worker))
+    if not foreign:
+        logger.warning(
+            "%s could not reach the target model's storages; draft-parameter "
+            "ownership falls back to the partial-view test alone, which does "
+            "NOT catch a wholly-shared tensor (#774). A shared scale released "
+            "here reads as zeros under memory pressure.",
+            LOG_PREFIX,
+        )
+    carrier = VmmDraftWeightCarrier(
+        model, device_index, arena=arena, foreign_storage_ptrs=foreign
+    )
     setattr(draft_worker, CARRIER_ATTR, carrier)
     return carrier
 
