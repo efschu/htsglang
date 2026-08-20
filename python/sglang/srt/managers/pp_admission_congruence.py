@@ -125,6 +125,30 @@ identity pass-through when it is `<= 1`; see
 NO HAND-PINNED NUMBERS. There are none in this module: every comparison below
 is between two already-materialised local integers (`told` vs `local`), never
 a heuristic constant.
+
+#630: THE RETRY LIVELOCK, AND WHY THE DEGRADE ABOVE IS NOT BY ITSELF ENOUGH.
+The degrade in "TWO FAILURE SHAPES" excludes an unhonourable request and
+expects it to be re-queued and re-admitted on a LATER pass. Nothing in that
+sentence forces the later pass to ask for less. Left alone: PP0 re-derives
+`told` from its own unchanged local state, tells the downstream rank the
+same too-long length, that rank retracts again -- a deterministic cycle with
+no forward progress. That IS #630's family (see
+`test_pp_disk_hicache_guard_630.py`'s history of this exact codebase's prior
+livelock: "a bounded/degrading path that makes no forward progress is the
+livelock defect," rooted there in a bounded wait that polled a REPORT
+(`is_completed()`) instead of ever consuming a DRIVING signal, so two
+polling peers never advanced). "It degrades gracefully" is not sufficient;
+the degrade must strictly advance the request's state. `PPAdmissionCongruenceGuard`
+below closes this: it remembers each retraction's ACTUAL observed local
+match (`observed_local`, always `< told` by construction, since a retraction
+only fires on that branch) and clamps the NEXT `told` PP0 offers for that
+rid to at most that remembered value, so the second pass cannot repeat the
+identical failure -- it can only repeat a STRICTER one, and a strictly
+decreasing sequence of non-negative integers is well-founded. It is
+rank-local state, mutated only from the same `amended_decision` values
+`reconcile_pp_admission_decision` already produces for forwarding, so it
+adds no new send/recv and no new synchronisation point -- see NO COLLECTIVE
+above, which continues to hold with this class in play.
 """
 
 from __future__ import annotations
@@ -154,6 +178,17 @@ class PPAdmissionEntry:
     admitted: bool = True
     retracted: bool = False
     retracted_by_rank: Optional[int] = None
+    observed_local: Optional[int] = None
+    """Set only on a newly-retracted entry (see `reconcile_pp_admission_decision`):
+    the retracting rank's ACTUAL local match length, i.e. the value that made
+    `told` unhonourable (`observed_local < prefix_len` always holds when this
+    is set -- that inequality is exactly what triggered the retraction).
+    `None` for every non-retracted entry, and for an entry that was already
+    retracted by an EARLIER rank (that rank's `observed_local` is preserved
+    unchanged; a later rank must not overwrite it with its own, unrelated,
+    local state -- see `reconcile_pp_admission_decision`'s pass-through
+    branch). This is the signal `PPAdmissionCongruenceGuard` (#630) learns
+    from -- never a guess, never a timeout, always a real observed shortfall."""
 
 
 @dataclass(frozen=True)
@@ -174,11 +209,117 @@ class PPAdmissionDecision:
         return {e.rid: e for e in self.entries}
 
 
+class PPAdmissionCongruenceGuard:
+    """PP0-side memory of downstream shortfalls -- closes the #630 retry
+    livelock without a collective. See the module docstring's "#630: THE
+    RETRY LIVELOCK" section for the defect and why this shape was chosen
+    over a one-shot `told=0` pin.
+
+    WHY "PP0 LEARNS" OVER "ONE-SHOT told=0 PIN" (the two shapes the task
+    required evaluating). A pin that forces `told=0` on the very next retry
+    also terminates the loop -- an empty prefix is always `<= any local
+    match`, so a second retraction for that rid becomes impossible -- but it
+    throws away every byte of that rid's reuse, on every rank, forever after
+    a single one-token shortfall. Learning the shortfall's ACTUAL value
+    (`observed_local`, never zero) and clamping `told` to it is the same
+    shape of state (one int per outstanding rid) and no harder to build; the
+    difference is entirely in what it buys: the degrade stays RARE (a rid
+    that was one token short of `told` loses exactly one token of reuse, the
+    next pass, not all of it) instead of merely TERMINATING. Chosen:
+    PP0-learns-coverage.
+
+    RID-SCOPED, ONE-SHOT, CLEARS ON SUCCESS. `_learned_floor[rid]` exists
+    only while `rid` has an outstanding, unresolved shortfall. The instant a
+    pass admits `rid` with NO retraction anywhere in the chain -- observed
+    via `record_return_trip` on the fully chain-reconciled decision, the same
+    value already threaded rank-to-rank as `amended_decision` -- the entry is
+    deleted. A rid that was once short is not permanently capped once its
+    cache state (on whichever rank was short) has moved on; this is the
+    "clears once served" requirement the one-shot-pin shape would also have
+    had to satisfy, met here for a learned value instead of a boolean.
+
+    NO COLLECTIVE. Rank-local mutable state, read and written only by the
+    rank that calls `build_pp_admission_decision` (PP0) and fed only by
+    decisions that already crossed the wire through the EXISTING retraction
+    mechanism. No new send, no new recv, no new synchronisation point -- see
+    NO COLLECTIVE in the module docstring.
+
+    TERMINATION (well-founded, not merely bounded). A retraction only fires
+    when `local < told` (by construction of `reconcile_pp_admission_decision`),
+    so every NEW retraction for `rid` sets `_learned_floor[rid]` to a value
+    strictly less than the `told` that just failed. The next cycle's `told`
+    for that rid is clamped to `<= _learned_floor[rid]`, so it is strictly
+    less than the `told` that just failed -- a strictly decreasing sequence
+    of non-negative integers, which cannot cycle and cannot decrease forever.
+    It terminates in at most `told_initial` cycles, and in practice within at
+    most `pp_size - 1` (each cycle can only discover a floor from a rank that
+    has not yet reconciled this rid this pass).
+    """
+
+    def __init__(self) -> None:
+        self._learned_floor: Dict[str, int] = {}
+
+    def prefix_len_for(self, rid: str, candidate_prefix_len: int) -> int:
+        """What PP0 should tell downstream ranks for `rid` this pass.
+
+        `candidate_prefix_len` is PP0's own fresh local match -- what
+        `build_pp_admission_decision` would tell without this guard.
+        Clamped to the learned floor if one is outstanding for `rid`;
+        returned unchanged otherwise (a rid with no retraction history is
+        not constrained by this guard at all).
+        """
+        floor = self._learned_floor.get(rid)
+        if floor is None:
+            return candidate_prefix_len
+        return min(candidate_prefix_len, floor)
+
+    def record_return_trip(self, decision: PPAdmissionDecision) -> None:
+        """Consume a fully chain-reconciled decision on its way back to PP0.
+
+        For every entry:
+          * retracted this pass -> learn `_learned_floor[rid] = observed_local`,
+            tightening (never widening) any floor already outstanding -- a
+            stricter rank's finding must never be overwritten by a looser one.
+          * admitted, not retracted -> the rid was served this pass with no
+            shortfall anywhere in the chain; clear any outstanding floor.
+          * neither (excluded before this module ever saw it, e.g. by PP0's
+            own local admission control) -> not this guard's concern, left
+            untouched.
+
+        Performs no distributed communication and never blocks: this is a
+        plain dict update over already-local data, the same
+        `amended_decision` value the caller already has in hand for
+        forwarding.
+        """
+        for entry in decision.entries:
+            if entry.retracted:
+                observed = entry.observed_local
+                if observed is None:
+                    # Defensive: a retraction without an observed value
+                    # cannot safely tighten a floor -- leave any existing
+                    # floor as-is rather than guess. Every retraction this
+                    # module itself produces always sets observed_local, so
+                    # this branch guards a malformed/foreign decision, not
+                    # an expected path.
+                    continue
+                existing = self._learned_floor.get(entry.rid)
+                self._learned_floor[entry.rid] = (
+                    observed if existing is None else min(existing, observed)
+                )
+            elif entry.admitted:
+                self._learned_floor.pop(entry.rid, None)
+
+    def outstanding_rids(self) -> Tuple[str, ...]:
+        """Diagnostic/test hook: rids currently carrying a learned floor."""
+        return tuple(self._learned_floor)
+
+
 def build_pp_admission_decision(
     mb_id: int,
     reqs: Sequence,
     *,
     pp_size: int,
+    guard: Optional[PPAdmissionCongruenceGuard] = None,
 ) -> PPAdmissionDecision:
     """PP0's (or, under `pp_size<=1`, the only rank's) committed decision.
 
@@ -188,23 +329,52 @@ def build_pp_admission_decision(
     already computed locally while building its batch. Emits only integers;
     `prefix_indices` itself never leaves this function.
 
-    `pp_size<=1`: still returns a decision (there is no reason not to -- it
-    is cheap and harmless), but nothing downstream is obligated to consult
-    it, and `reconcile_pp_admission_decision` is a pure pass-through in that
-    regime regardless of what this returns. See DEFAULT PATH above.
+    `guard`, when given and `pp_size > 1`: clamps `prefix_len` to any
+    learned floor outstanding for that rid (#630 -- see
+    `PPAdmissionCongruenceGuard`), and correspondingly INCREASES `extend_len`
+    by the same amount so `prefix_len + extend_len` still equals the
+    request's true total length. This is the same physical token count
+    either way; clamping `told` down does not shorten the request, it only
+    reclassifies some of its tokens from "reused prefix" to "freshly
+    computed extend" -- exactly the same accounting
+    `reconcile_pp_admission_decision`'s safe-truncate branch already relies
+    on implicitly (there, the caller's own downstream scheduling absorbs the
+    difference; here, the wire decision must state it explicitly, since it
+    is computed before any downstream rank sees it).
+
+    `guard=None` (the default) or `pp_size<=1`: behaviour is byte-identical
+    to before this parameter existed -- see DEFAULT PATH above, still true
+    with a guard object in play as long as it is never passed a `pp_size<=1`
+    caller's decisions to learn from.
     """
     entries = []
     for req in reqs:
-        prefix_len = len(getattr(req, "prefix_indices", None) or [])
-        extend_len = getattr(req, "extend_input_len", None)
-        if extend_len is None:
+        raw_prefix_len = len(getattr(req, "prefix_indices", None) or [])
+        raw_extend_len = getattr(req, "extend_input_len", None)
+        if raw_extend_len is None:
             fill_ids = getattr(req, "full_untruncated_fill_ids", None)
-            extend_len = max(0, len(fill_ids) - prefix_len) if fill_ids is not None else 0
+            raw_extend_len = (
+                max(0, len(fill_ids) - raw_prefix_len) if fill_ids is not None else 0
+            )
+        raw_prefix_len = int(raw_prefix_len)
+        raw_extend_len = int(raw_extend_len)
+
+        if guard is not None and pp_size > 1:
+            told = guard.prefix_len_for(req.rid, raw_prefix_len)
+        else:
+            told = raw_prefix_len
+
+        # told <= raw_prefix_len always (prefix_len_for only ever clamps
+        # down): the shortfall moves from "prefix" to "extend", the total
+        # (the only quantity the request's own token count constrains)
+        # stays put.
+        extend_len = raw_extend_len + (raw_prefix_len - told)
+
         entries.append(
             PPAdmissionEntry(
                 rid=req.rid,
-                prefix_len=int(prefix_len),
-                extend_len=int(extend_len),
+                prefix_len=told,
+                extend_len=extend_len,
                 admitted=True,
             )
         )
@@ -283,7 +453,13 @@ def reconcile_pp_admission_decision(
             local,
         )
         amended.append(
-            replace(entry, admitted=False, retracted=True, retracted_by_rank=rank)
+            replace(
+                entry,
+                admitted=False,
+                retracted=True,
+                retracted_by_rank=rank,
+                observed_local=local,
+            )
         )
         # Deliberately absent from `effective`: see the docstring above on
         # why "missing" must mean "do not admit", not "assume 0 is safe".
