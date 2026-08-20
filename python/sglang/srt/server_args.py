@@ -5680,6 +5680,96 @@ class ServerArgs:
         ),
     ] = None
 
+    barlink: A[
+        Optional[bool],
+        Arg(help="Enable barlink. Promoted from SGLANG_BARLINK (#781)."),
+    ] = None
+    barlink_transport: A[
+        Optional[str],
+        Arg(
+            help="Barlink transport ('device', 'bar1', ...). Promoted from "
+            "SGLANG_BARLINK_TRANSPORT (#781). NOTE: the consumer at "
+            "device_communicators/barlink.py caches this at MODULE IMPORT, so "
+            "the value must be settled before that import -- which a flag "
+            "guarantees and a mid-process env write does not.",
+        ),
+    ] = None
+    barlink_bar1_window_mib: A[
+        Optional[str],
+        Arg(
+            help="BAR1 aperture window in MiB. Either a bare integer (applies "
+            "to every group) or a comma-separated list mixing a bare default "
+            "with GROUP=VALUE overrides, e.g. "
+            "'24,PP_0=96,FLIP_TP_0=48,FLIP_DCP_0=32'. Promoted from "
+            "SGLANG_BARLINK_BAR1_WINDOW_MIB and its per-group suffixed "
+            "variants (#781). These are TIGHT: the two 3080s expose only 256 "
+            "MiB of BAR1 each, so a departing tenant holding ~211 MiB of that "
+            "aperture is the difference between a boot and a refusal.",
+        ),
+    ] = None
+    barlink_bar1_cap_cycles: A[
+        Optional[int],
+        Arg(help="BAR1 direct-path cycle cap. Promoted from "
+            "SGLANG_BARLINK_BAR1_CAP_CYCLES (#781)."),
+    ] = None
+    mamba_slot_reorder: A[
+        Optional[bool],
+        Arg(help="Reorder mamba pool slots. Promoted from "
+            "SGLANG_MAMBA_SLOT_REORDER (#781)."),
+    ] = None
+    uneven_dcp: A[
+        Optional[bool],
+        Arg(help="Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). "
+            "Superseded in most cases by --rank-kv-ratio."),
+    ] = None
+    uneven_dcp_weighted: A[
+        Optional[bool],
+        Arg(help="Enable weighted uneven DCP. Promoted from "
+            "SGLANG_UNEVEN_DCP_WEIGHTED (#781)."),
+    ] = None
+    kv_backing_relief: A[
+        Optional[bool],
+        Arg(help="Enable KV backing relief. Promoted from "
+            "SGLANG_KV_BACKING_RELIEF (#781). Default is ON."),
+    ] = None
+    phase_flip_image_file_backed: A[
+        Optional[bool],
+        Arg(
+            help="Keep phase-flip weight images as file-backed reclaimable "
+            "page cache instead of pinned anon-shared memory. Promoted from "
+            "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED (#781). Without this the "
+            "images are ~68.7 GiB of unreclaimable host RAM on a swapless "
+            "box and the boot is OOM-killed during init.",
+        ),
+    ] = None
+    corridor_rebalance: A[
+        Optional[bool],
+        Arg(help="Enable the corridor rebalance lender. Promoted from "
+            "SGLANG_CORRIDOR_REBALANCE (#781)."),
+    ] = None
+    enable_tp_memory_imbalance_check: A[
+        Optional[bool],
+        Arg(
+            help="Run the post-weight-load TP memory balance check. Promoted "
+            "from SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK (#781). Beware the "
+            "polarity: the retired predecessor SGL_DISABLE_... was INVERTED, "
+            "so a careless rename silently flips the sense. This flag is "
+            "positive: True runs the check. Uneven TP deliberately gives "
+            "ranks different memory, which is what the check flags, so this "
+            "rig turns it off.",
+        ),
+    ] = None
+    enable_health_endpoint_generation: A[
+        Optional[bool],
+        Arg(
+            help="Let /health run a real generation instead of answering as a "
+            "pure liveness probe. Promoted from "
+            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION (#781). Off here "
+            "because a generating probe consumes a running-request slot and "
+            "spec budget on every poll.",
+        ),
+    ] = None
+
     phase_flip_canonical_kv_page: A[
         bool,
         Arg(
@@ -17142,6 +17232,103 @@ class ServerArgs:
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        self._publish_promoted_781_flags()
+
+    def _publish_promoted_781_flags(self):
+        """Publish the #781 promoted flags to the consumers that read env.
+
+        WHY THIS EXISTS RATHER THAN 30 CALL-SITE EDITS. These knobs are read in
+        modules that are never handed a ServerArgs -- the barlink transport, the
+        weights arena, the KV backing relief ladder, the corridor rebalance
+        lender. Rewriting each read site to acquire a ServerArgs would be a much
+        larger change to a live serving stack than the defect warrants, so this
+        follows the mechanism the codebase already uses for exactly this
+        situation: `mamba_ssm_dtype` publishes itself into the typed registry a
+        few lines above.
+
+        WHAT IT DOES AND DOES NOT FIX. It makes the FLAG the single source of
+        truth and the operator-facing surface -- argparse validates it, `ps`
+        shows it, the planner can solve it, and it cannot be written twice. The
+        environment becomes an INTERNAL propagation detail set by this process
+        from its own argv, never something a human or a boot script writes.
+        That is what lets the unit environment go identity-only and the boot env
+        gate refuse any SGLANG_* it finds there.
+
+        It does NOT convert the consumers to reading ServerArgs directly. Those
+        remain env reads, and the deeper rewiring -- per the #754 template, via
+        each family's funnel function -- is tracked as follow-up. Stating that
+        plainly matters: this is a real narrowing of the blast radius, not a
+        claim that every consumer was threaded.
+
+        Only set values are published. An unset flag leaves the environment
+        untouched, so behaviour is byte-identical for anyone who has not moved.
+        """
+
+        def _b(value) -> str:
+            return "1" if value else "0"
+
+        if self.barlink is not None:
+            os.environ["SGLANG_BARLINK"] = _b(self.barlink)
+        if self.barlink_transport is not None:
+            os.environ["SGLANG_BARLINK_TRANSPORT"] = str(self.barlink_transport)
+        if self.barlink_bar1_cap_cycles is not None:
+            os.environ["SGLANG_BARLINK_BAR1_CAP_CYCLES"] = str(
+                self.barlink_bar1_cap_cycles
+            )
+        if self.barlink_bar1_window_mib is not None:
+            # Either a bare integer (every group) or a mix of a bare default
+            # with GROUP=VALUE overrides. The consumer builds
+            # SGLANG_BARLINK_BAR1_WINDOW_MIB_{GROUP} from the live group name,
+            # so the per-group keys are reproduced here rather than invented.
+            for part in str(self.barlink_bar1_window_mib).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "=" in part:
+                    group, _, value = part.partition("=")
+                    key = f"SGLANG_BARLINK_BAR1_WINDOW_MIB_{group.strip().upper()}"
+                    os.environ[key] = value.strip()
+                else:
+                    os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB"] = part
+        if self.seam_entry_margin_mib is not None:
+            os.environ["SGLANG_SEAM_ENTRY_MARGIN_MIB"] = str(self.seam_entry_margin_mib)
+        if self.seam_entry_delay_budget_s is not None:
+            os.environ["SGLANG_SEAM_ENTRY_DELAY_BUDGET"] = str(
+                self.seam_entry_delay_budget_s
+            )
+        if self.flip_seam_chunk_mib is not None:
+            os.environ["SGLANG_FLIP_SEAM_CHUNK_MIB"] = str(self.flip_seam_chunk_mib)
+        if self.collective_census_interval is not None:
+            os.environ["SGLANG_COLLECTIVE_CENSUS_INTERVAL"] = str(
+                self.collective_census_interval
+            )
+        if self.mamba_slot_reorder is not None:
+            os.environ["SGLANG_MAMBA_SLOT_REORDER"] = _b(self.mamba_slot_reorder)
+        if self.uneven_dcp is not None:
+            os.environ["SGLANG_UNEVEN_DCP"] = _b(self.uneven_dcp)
+        if self.uneven_dcp_weighted is not None:
+            os.environ["SGLANG_UNEVEN_DCP_WEIGHTED"] = _b(self.uneven_dcp_weighted)
+        if self.kv_backing_relief is not None:
+            os.environ["SGLANG_KV_BACKING_RELIEF"] = _b(self.kv_backing_relief)
+        if self.phase_flip_image_file_backed is not None:
+            os.environ["SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED"] = _b(
+                self.phase_flip_image_file_backed
+            )
+        if self.corridor_rebalance is not None:
+            os.environ["SGLANG_CORRIDOR_REBALANCE"] = _b(self.corridor_rebalance)
+        if self.enable_tp_memory_imbalance_check is not None:
+            # POLARITY IS POSITIVE HERE. The retired predecessor
+            # SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK was inverted, and the
+            # surviving env is the positive ENABLE_ form, so this maps straight
+            # through. Getting this backwards silently disables a correctness
+            # check, which is why it is called out rather than left to reading.
+            os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = _b(
+                self.enable_tp_memory_imbalance_check
+            )
+        if self.enable_health_endpoint_generation is not None:
+            os.environ["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = _b(
+                self.enable_health_endpoint_generation
+            )
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )

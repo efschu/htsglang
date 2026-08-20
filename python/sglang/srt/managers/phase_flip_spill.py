@@ -1863,14 +1863,30 @@ def get_corridor_guard(scheduler: Any):
     # that 512 MiB was supposed to be the seam's whole draw -- and the
     # measured draw was 1814-1852 MiB, so the gap between the two numbers was
     # exactly where five corridor breaches lived, unseen.
-    # NOTE the getattr is a no-op today: there is no
-    # `--phase-flip-corridor-floor-mib` server arg, so this attribute never
-    # exists and the fallback is always taken. Kept because it is the hook a
-    # flag would land on, and NOT advertised in the log line below -- naming
-    # a flag that does not exist sends an operator looking for it.
-    configured = os.environ.get(CORRIDOR_FLOOR_ENV) or getattr(
-        server_args, "phase_flip_corridor_floor_mib", None
-    )
+    # #781: THE FLAG NOW EXISTS AND WINS. `--phase-flip-corridor-floor-mib` is
+    # a real ServerArgs field, so the hook this comment was left for is live and
+    # the precedence is the right way round: flag first, env only as a
+    # deprecated bridge.
+    #
+    # The order mattered more than it looks. SGLANG_CORRIDOR_FLOOR_MIB=1536 rode
+    # in the boot env and silently overrode the corridor law that lives in code
+    # (corridor_guard.CORRIDOR_LAW_MIB = 1024, band 819-1229) -- which is the
+    # "armed at 1536, judged at 1024" split described just above. The env has
+    # been removed from the boot env entirely; unset means the code law governs,
+    # which is the intended state.
+    configured = getattr(server_args, "phase_flip_corridor_floor_mib", None)
+    if configured is None:
+        _env_floor = os.environ.get(CORRIDOR_FLOOR_ENV)
+        if _env_floor:
+            try:
+                from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
+
+                _warn_deprecated_env_to_cli_flag(
+                    CORRIDOR_FLOOR_ENV, "--phase-flip-corridor-floor-mib"
+                )
+            except Exception:
+                pass
+            configured = _env_floor
     law_mib = cg.corridor_law_mib()
     # #662: THE RESERVE IS A MEASURED DRAW WHERE ONE EXISTS, and this rig has
     # one. `arming_floor_mib`'s own docstring says the reserve is "the MEASURED
@@ -1916,7 +1932,12 @@ def get_corridor_guard(scheduler: Any):
         floor_mib,
         floor_mib - law_mib,
         (
-            f" (set by {CORRIDOR_FLOOR_ENV})"
+            # #781: name the FLAG, since that is now the supported way to set
+            # it. The env is still honoured as a deprecated bridge, but telling
+            # an operator to go looking for an env var they should not be using
+            # is how the 1536-vs-1024 split stayed alive.
+            " (set by --phase-flip-corridor-floor-mib"
+            f"/{CORRIDOR_FLOOR_ENV})"
             if configured and int(configured) >= derived_mib
             else (
                 f" (derived from this rank's MEASURED seam draw of "
