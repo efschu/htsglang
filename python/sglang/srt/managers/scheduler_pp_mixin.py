@@ -634,89 +634,54 @@ class SchedulerPPMixin:
                     self.running_batch = plan.running_batch
                     self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
-                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                self.cur_batch_for_debug = cur_batch
-                if cur_batch:
-                    server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
-                next_pp_outputs = None
-                next_batch_result = None
-                d2h_event = None
-                if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                self._pp_commit_comm_work(self.send_proxy_work)
-                if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-                if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                # #631 defect R: OUTSIDE the block above, deliberately. See
-                # _pp_record_slot_last_batch -- nesting this under "did the
-                # slot run something" is the resident-carry leak.
-                self._pp_record_slot_last_batch(next_mb_id)
-                if not self.pp_group.is_last_rank:
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
-                                stamp=self._pp_proxy_stamp(mb_id, result),
-                            )
 
-                self.pp_outputs = next_pp_outputs
-
-                # #791 PP ADMISSION UNIFORMITY: emit/forward this pass's
-                # admission decision.
+                # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
+                # pass's admission decision HERE, immediately after
+                # `get_next_batch_to_run`, and strictly BEFORE `_pp_launch_
+                # batch` below -- not after it, as #791 originally placed it.
                 #
-                # THIS RUNS BEFORE THE REQUEST-CHAIN FLUSH, AND THE ORDER IS
-                # THE WHOLE POINT. The first shape of this wiring put the
-                # send after the flush, with the reasoning that it "does not
-                # gate on any of them" so all outbound flushes could live in
-                # one place. That reasoning was wrong and it deadlocked the
-                # boot on the first request: downstream ranks block in
-                # _pp_recv_admission_decision waiting for THIS message, so
-                # they never return to the top of their pass, so the chain
-                # flush below -- which needs exactly that -- never completes,
-                # so this send is never reached. PP0 in
-                # _pp_commit_pending_req_work, PP1 and PP2 both in
-                # _pp_recv_admission_decision, zero GPU utilisation.
-                #
-                # It is the same invariant #788 was landed for, and the same
-                # one its own commit message states: a rank must satisfy
-                # everything a peer can be blocked on BEFORE it blocks on
-                # that peer. Grouping sends by tidiness violates it; ordering
-                # them by what peers are waiting for is what keeps the ring
-                # live. UNGATED by is_last_rank (unlike the proxy send
-                # above): the whole point is that it keeps travelling past
-                # the last stage and wraps back to PP0.
+                # WHY THIS MOVED AGAIN, MEASURED (test_pp_admission_chain_
+                # flush_deadlock_795.py). #791 already established "send
+                # before the chain flush" and that fix is real and still
+                # correct -- but it left this send positioned after `_pp_
+                # launch_batch`, and under a gapped layer set (`--pp-stage-
+                # ratio`) `_pp_launch_batch` is not merely local compute: it
+                # is where the mid-forward CROSSING wire (pp_crossing_wire.py)
+                # rendezvous-exchanges activations with peer ranks, on the
+                # SAME `pp_group` typed-channel demultiplexer this decision
+                # travels on (pp_crossing_wire.py:270-277). A rank that owns
+                # a crossing TARGET (this rig: PP0, per #753's "crossings
+                # from BOTH PP1 (after layer 31) and PP2 (after layer 35)")
+                # blocks inside `_pp_launch_batch` waiting for a peer's
+                # crossing SEND -- and that peer cannot reach its own
+                # crossing send without first deriving a non-empty batch from
+                # THIS rank's admission decision, which (before this move)
+                # this rank had not sent yet, because the send was still
+                # ordered after its own `_pp_launch_batch`. PP0 blocked
+                # waiting on a peer that is blocked waiting on PP0: the
+                # fifth deadlock of the "never block on a peer for something
+                # not required for this iteration's forward progress" family,
+                # one channel below the one #791 fixed, sharing its
+                # demultiplexer. Reproduced hermetically (three real gloo
+                # processes, the shipped `_pp_send_admission_decision` /
+                # `_pp_recv_admission_decision` and the shipped
+                # `send_typed_tensor_dict` / `recv_typed_tensor_dict` the
+                # crossing wire itself uses) in test_fixed_ordering_with_
+                # crossing_channel; test_send_before_launch_fixes_crossing_
+                # deadlock proves this relocation removes it. No collective
+                # is introduced -- still the same point-to-point decision
+                # send/forward #791 built, just moved earlier. The decision
+                # CONTENT is unchanged and already fully known at this point:
+                # PP0's `self._pp_admission_last_built_decision` is built
+                # inside `get_next_batch_to_run` above (scheduler.py:6896),
+                # and downstream's `self._pp_admission_amended_to_forward`
+                # was set even earlier, at line 621-629, before `get_next_
+                # batch_to_run` even ran. Nothing below this point that used
+                # to run before the old send site (`cur_batch` derivation,
+                # proxy receive, `_pp_launch_batch`, output processing, the
+                # proxy send) is read by this block or writes anything this
+                # block reads, so moving it here changes WHEN the message
+                # goes out, never WHAT it contains.
                 if self.ps.pp_size > 1:
                     if self.pp_group.is_first_rank:
                         raw = getattr(self, "_pp_admission_last_built_decision", None)
@@ -785,15 +750,76 @@ class SchedulerPPMixin:
                             amended = PPAdmissionDecision(mb_id=mb_id, entries=())
                         self._pp_send_admission_decision(amended)
 
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
+                    server_is_idle = False
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                next_pp_outputs = None
+                next_batch_result = None
+                d2h_event = None
+                if self.server_args.pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                self._pp_commit_comm_work(self.send_proxy_work)
+                if cur_batch:
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+                if self.server_args.pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                if self.mbs[next_mb_id] is not None:
+                    d2h_event.synchronize()
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            next_batch_result,
+                        )
+                # #631 defect R: OUTSIDE the block above, deliberately. See
+                # _pp_record_slot_last_batch -- nesting this under "did the
+                # slot run something" is the resident-carry leak.
+                self._pp_record_slot_last_batch(next_mb_id)
+                if not self.pp_group.is_last_rank:
+                    if cur_batch:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        with torch.profiler.record_function(
+                            "send_proxy_dict_to_next_stage"
+                        ):
+                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                async_send=True,
+                                msg_type="proxy",
+                                stamp=self._pp_proxy_stamp(mb_id, result),
+                            )
+
+                self.pp_outputs = next_pp_outputs
+
                 # #788: flush THIS pass's request-chain send only after
                 # everything else this rank owed its peers this iteration is
-                # already posted -- proxy isend, output commit, AND the #791
-                # admission decision above. This is the last outbound act of
-                # the iteration precisely because it is the one that blocks
-                # on a peer reaching the top of its next pass; anything a
-                # peer might still be waiting on must already be on the wire
-                # by the time we get here. See _pp_commit_pending_req_work
-                # and the #788 send site in
+                # already posted -- proxy isend, output commit, AND the #791/
+                # #795 admission decision (sent earlier THIS pass, right
+                # after `get_next_batch_to_run`, strictly before `_pp_launch_
+                # batch` -- see the comment there for why it moved). This is
+                # the last outbound act of the iteration precisely because it
+                # is the one that blocks on a peer reaching the top of its
+                # next pass; anything a peer might still be waiting on must
+                # already be on the wire by the time we get here. See
+                # _pp_commit_pending_req_work and the #788 send site in
                 # _pp_forward_and_process_input_requests for why the old
                 # top-of-pass position closed a cycle. Guarded the same way
                 # the send site is: the last rank never posts a chain send,
