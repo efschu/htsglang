@@ -200,6 +200,12 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
+# #791b: imported AS A MODULE, not from-imported: the admission loop resolves
+# `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
+# which is what lets a test neuter exactly that one function in a child
+# process without touching anything else (the instr-boot can-fail
+# discipline).
+from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
@@ -4714,6 +4720,13 @@ class Scheduler(
             # `update_dcp_admission_state`; `get_new_batch_prefill` reads it
             # from there, so nothing is stored here.
             self._uniform_budget_deficit = 0
+            # #791b: NAMED GAP, same shape as the #639 host floor above --
+            # this branch's contract is that it takes no reduce of its own,
+            # so the prefetch ballot stays OFF under kv-session-offload and
+            # admission keeps its rank-local prefetch verdict there. The
+            # right close is to widen `update_dcp_admission_state`'s packed
+            # reduce, where the reduce already lives.
+            self._uniform_prefetch_ballot = None
             return
 
         alloc = self.token_to_kv_pool_allocator
@@ -4748,6 +4761,9 @@ class Scheduler(
             self._publish_uniform_evict_floor(None)
             self._publish_uniform_host_floor(None)
             self._publish_uniform_mamba_floor(None)
+            # #791b: one rank -- nothing to diverge from, ballot off, the
+            # local prefetch verdict is already the group verdict.
+            self._uniform_prefetch_ballot = None
             return
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
@@ -4826,8 +4842,50 @@ class Scheduler(
         # checkpoint.
         local_mamba_avail = self._local_mamba_avail()
         vals = vals + [local_mamba_avail, -local_mamba_avail]
+        # #791b: THE PREFETCH BALLOT rides the SAME reduce (instr22/instr23:
+        # the admission loop's rank-local prefetch verdict split the TP
+        # replicas -- one rank admitted a batch its peers declined, three
+        # lockstep families crossed, barlink aborted the group 150 s later).
+        # The drain that feeds the local verdicts is pulled forward to HERE
+        # -- rank-local, no collective, and this site runs exactly once per
+        # TP-loop iteration -- and memoised for `_get_new_batch_prefill_raw`
+        # to consume once, so the pass still drains exactly once. Appended
+        # AFTER the mamba pair, so every existing index below keeps its
+        # meaning. See prefetch_ballot.py for the layout and the MIN==AND
+        # argument.
+        _ballot_verdicts = self._drain_prefetch_progress()
+        self._pass_prefetch_verdicts = _ballot_verdicts
+        _ballot_rids = [
+            req.rid
+            for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
+        ]
+        vals = vals + prefetch_ballot.build_prefetch_ballot_payload(
+            _ballot_rids, _ballot_verdicts
+        )
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
+        self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
+            t[_ballot_at:].tolist(), _ballot_rids
+        )
+        if (
+            self._uniform_prefetch_ballot is None
+            and not getattr(self, "_prefetch_ballot_mismatch_logged", False)
+        ):
+            # A divergent queue HEAD is a deeper breakage than a divergent
+            # prefetch verdict; say so once and fall back to the local
+            # verdict (the status quo ante) rather than papering over it.
+            self._prefetch_ballot_mismatch_logged = True
+            logger.warning(
+                "#791b PREFETCH-BALLOT digest mismatch: the TP ranks disagree "
+                "about the first %d rids of waiting_queue (this rank digest=%d, "
+                "group min=%d max=%d). Ballot void for this pass; admission "
+                "falls back to the rank-local prefetch verdict.",
+                prefetch_ballot.PREFETCH_BALLOT_SLOTS,
+                prefetch_ballot.prefetch_ballot_digest(_ballot_rids),
+                int(t[_ballot_at].item()),
+                -int(t[_ballot_at + 1].item()),
+            )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
         self._uniform_budget_deficit = (
@@ -6677,9 +6735,12 @@ class Scheduler(
         no new assumption about which ranks reach this line is introduced.
 
         Cost: unchanged in the common case. A request with no registered
-        prefetch returns at the ``req_id not in self.ongoing_prefetch`` guard
-        without any collective, and ``ongoing_prefetch`` is exactly the set
-        the participation vote already keeps rank-uniform. Off HiCache storage
+        prefetch returns at the tree cache's ``req_id not in
+        ongoing_prefetch`` guard without any collective, and
+        ``ongoing_prefetch`` is exactly the set the participation vote
+        already keeps rank-uniform. (That set lives on the TREE CACHE, not
+        on the scheduler -- the 610 drift guard reads ``self.``-qualified
+        names in this method's source as scheduler surface.) Off HiCache storage
         this returns an empty map and touches nothing -- byte-identical.
 
         Behavioural note, deliberately named: under
@@ -6791,7 +6852,17 @@ class Scheduler(
         # and deadlocked on 2026-08-17 (PP0/PP1 in the drain, PP2 in the
         # pipeline recv); it is now rank-local. Anything added above that needs
         # GROUP agreement needs a pipeline-aligned point, not this one.
-        prefetch_verdicts = self._drain_prefetch_progress()
+        # #791b: the TP loop's uniform-budget site already ran this drain
+        # (once per iteration, before packing the prefetch ballot) and
+        # memoised it -- consume it ONCE here so the pass drains exactly
+        # once. The pop is what keeps a PP-loop pass (which never runs the
+        # budget site) from reading a stale TP memo: absent memo means this
+        # path drains for itself, byte-identical to before. The ballot is
+        # popped with the same consume-once discipline for the same reason.
+        prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
+        if prefetch_verdicts is None:
+            prefetch_verdicts = self._drain_prefetch_progress()
+        _prefetch_ballot = self.__dict__.pop("_uniform_prefetch_ballot", None)
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -7086,10 +7157,32 @@ class Scheduler(
                 # predicates above; do NOT call into the tree cache here. The
                 # call carries collectives and this point is only reachable on
                 # the ranks whose own pool let them get this far.
-                prefetch_done = self._prefetch_done_for(req, prefetch_verdicts)
+                _local_prefetch_done = self._prefetch_done_for(
+                    req, prefetch_verdicts
+                )
+                # #791b: THE GROUP VERDICT, not the local one. instr22/23:
+                # the storage backend finishes each rank's load at that
+                # rank's own speed, so the local verdict split the TP
+                # replicas -- one rank admitted, its peers declined, and the
+                # crossed collectives took the group down. MIN==AND: this
+                # can only ever DELAY an admission (group-done implies
+                # locally done), never force one on an unfinished rank.
+                # Resolved through the module so the can-fail test can
+                # neuter exactly this application in a child process.
+                prefetch_done = prefetch_ballot.prefetch_done_under_ballot(
+                    _local_prefetch_done, req.rid, _prefetch_ballot
+                )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    _note_skip("prefetch_pending", req.rid)
+                    if (
+                        _prefetch_ballot is not None
+                        and req.rid not in _prefetch_ballot
+                    ):
+                        _note_skip("prefetch_ballot_uncovered", req.rid)
+                    elif _local_prefetch_done:
+                        _note_skip("prefetch_pending_group", req.rid)
+                    else:
+                        _note_skip("prefetch_pending", req.rid)
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)

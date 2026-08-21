@@ -100,6 +100,10 @@ except ImportError:  # pragma: no cover - registration is a CI-time marker
         return None
 
 
+from sglang.srt.managers.prefetch_ballot import (
+    PREFETCH_BALLOT_SLOTS,
+    build_prefetch_ballot_payload,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.common import (
     peer_needs_mamba_evict,
@@ -285,6 +289,11 @@ class _FakeScheduler:
         self.tp_cpu_group = object() if world else None
         self.server_args = types.SimpleNamespace(dcp_size=1)
         self.ps = types.SimpleNamespace(tp_size=len(world or [1]))
+        # #791b: the reduce now also carries the prefetch ballot; empty
+        # queue + storage off = neutral contribution, quantities under
+        # test untouched.
+        self.waiting_queue = []
+        self.enable_hicache_storage = False
 
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
     _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
@@ -296,6 +305,8 @@ class _FakeScheduler:
     _local_mamba_avail = Scheduler._local_mamba_avail
     uniform_min_avail = Scheduler.uniform_min_avail
     uniform_budget_deficit = Scheduler.uniform_budget_deficit
+    # #791b: and the PREFETCH BALLOT, same reason one release later again.
+    _drain_prefetch_progress = Scheduler._drain_prefetch_progress
 
 
 class _FakeDist:
@@ -328,6 +339,9 @@ class _FakeDist:
             -absent,
             mamba_avail,
             -mamba_avail,
+            # #791b: the prefetch ballot rides behind the mamba pair;
+            # neutral on every fixture rank (empty queue).
+            *build_prefetch_ballot_payload([], {}),
         ]
 
     def all_reduce(self, t, op=None, group=None):
@@ -558,7 +572,10 @@ class UniformMambaEvictFloorTest(CustomTestCase):
             _, _, fake = _publish_for(rank)
             self.assertEqual(fake.calls, 1, "exactly one all_reduce per iteration")
             widths.update(fake.widths)
-        self.assertEqual(widths, {6})
+        # #791b: the prefetch ballot appended (digest pair + slot verdicts)
+        # to the same reduce; still one collective, still a width that
+        # depends on no per-rank quantity.
+        self.assertEqual(widths, {6 + 2 + PREFETCH_BALLOT_SLOTS})
 
     def test_the_616g_and_639_quantities_are_unchanged(self):
         """The mamba pair was APPENDED. The device and host floors must still

@@ -97,6 +97,7 @@ except ImportError:  # pragma: no cover - registration is a CI-time marker
         return None
 
 
+from sglang.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
 from sglang.test.test_utils import CustomTestCase
@@ -165,6 +166,13 @@ class _FakeScheduler:
         self.tree_cache = tree_cache
         self.tp_cpu_group = object() if world else None
         self.server_args = types.SimpleNamespace(dcp_size=1)
+        # #791b: the reduce now also carries the prefetch ballot; model the
+        # two inputs it reads. Storage off makes the SHIPPED drain (bound
+        # below) return {} without touching a tree cache, so the ballot
+        # contributes only neutral slots and the quantities under test stay
+        # untouched.
+        self.waiting_queue = []
+        self.enable_hicache_storage = False
         self.ps = types.SimpleNamespace(tp_size=len(world or [1]))
 
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
@@ -180,6 +188,8 @@ class _FakeScheduler:
     _local_host_avail = Scheduler._local_host_avail
     uniform_min_avail = Scheduler.uniform_min_avail
     uniform_budget_deficit = Scheduler.uniform_budget_deficit
+    # #791b: and the PREFETCH BALLOT, same reason one release later again.
+    _drain_prefetch_progress = Scheduler._drain_prefetch_progress
 
 
 class _FakeDist:
@@ -211,6 +221,9 @@ class _FakeDist:
             -host_avail,
             m_absent,
             -m_absent,
+            # #791b: the prefetch ballot rides behind the mamba pair;
+            # neutral on every fixture rank (empty queue).
+            *build_prefetch_ballot_payload([], {}),
         ]
 
     def all_reduce(self, t, op=None, group=None):

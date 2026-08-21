@@ -399,7 +399,15 @@ class TheDrainSitsAboveEveryRankLocalPredicate(unittest.TestCase):
     def test_the_admission_loop_does_not_call_the_progress_check_itself(self):
         src = "\n".join(self._source())
         self.assertNotIn("self.tree_cache.check_prefetch_progress(", src)
-        self.assertIn("self._prefetch_done_for(req, prefetch_verdicts)", src)
+        # #791b reformatted the call (the local verdict now feeds the group
+        # ballot); the pin follows the shape but keeps its meaning: the loop
+        # reads the DRAINED verdict, never the live progress check.
+        self.assertIn("self._prefetch_done_for(", src)
+        self.assertIn("req, prefetch_verdicts", src)
+        # ...and the decision the loop consumes is the BALLOT's, resolved
+        # through the module (instr22/23: the local verdict split the TP
+        # replicas; see prefetch_ballot.py).
+        self.assertIn("prefetch_ballot.prefetch_done_under_ballot(", src)
 
     def test_the_drain_reads_no_pool_state(self):
         import inspect

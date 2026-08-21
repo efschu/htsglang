@@ -488,6 +488,14 @@ class BudgetHarness:
     _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
     _local_mamba_avail = Scheduler._local_mamba_avail
     _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
+    # #791b: the reduce grew the PREFETCH BALLOT, the same way #616g, #639
+    # and #639b grew theirs -- found by the drift guard below, which is the
+    # guard doing precisely what its #639b comment promised. This harness
+    # has the storage flag off, so the SHIPPED drain returns {} and the
+    # ballot rides neutrally; the queue is empty for the same reason.
+    waiting_queue: list = []
+    enable_hicache_storage = False
+    _drain_prefetch_progress = Scheduler._drain_prefetch_progress
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
     if hasattr(Scheduler, "uniform_budget_deficit"):

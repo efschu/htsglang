@@ -65,6 +65,14 @@ class _FakeScheduler:
         # (scheduler.py:3503) to decide whether the uneven DCP lane is active.
         # dcp_size=1 means even TP (no uneven DCP), the default path.
         self.server_args = types.SimpleNamespace(dcp_size=1)
+        # #791b: the reduce now also carries the prefetch ballot, so the
+        # stub models the two inputs the ballot reads -- an empty waiting
+        # queue and the storage flag off, under which the SHIPPED drain
+        # (bound below) returns {} without touching a tree cache. The
+        # ballot then contributes only neutral slots and the #603
+        # quantities under test stay untouched.
+        self.waiting_queue = []
+        self.enable_hicache_storage = False
 
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
     uniform_min_avail = Scheduler.uniform_min_avail
@@ -86,6 +94,9 @@ class _FakeScheduler:
     _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
     _local_mamba_avail = Scheduler._local_mamba_avail
     _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
+    # #791b: and the PREFETCH BALLOT, same reason one release later again.
+    # The shipped drain no-ops with the storage flag off (set in __init__).
+    _drain_prefetch_progress = Scheduler._drain_prefetch_progress
 
 
 class _FakeDist:

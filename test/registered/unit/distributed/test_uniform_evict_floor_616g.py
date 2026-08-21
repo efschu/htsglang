@@ -32,6 +32,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
@@ -79,6 +80,13 @@ class _FakeScheduler:
         self.tree_cache = tree_cache
         self.tp_cpu_group = object() if world_avails else None
         self.server_args = types.SimpleNamespace(dcp_size=1)
+        # #791b: the reduce now also carries the prefetch ballot; model the
+        # two inputs it reads. Storage off makes the SHIPPED drain (bound
+        # below) return {} without touching a tree cache, so the ballot
+        # contributes only neutral slots and the quantities under test stay
+        # untouched.
+        self.waiting_queue = []
+        self.enable_hicache_storage = False
         self.ps = types.SimpleNamespace(tp_size=len(world_avails or [1]))
 
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
@@ -100,6 +108,8 @@ class _FakeScheduler:
     _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
     _local_mamba_avail = Scheduler._local_mamba_avail
     _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
+    # #791b: and the PREFETCH BALLOT, same reason one release later again.
+    _drain_prefetch_progress = Scheduler._drain_prefetch_progress
 
 
 class _FakeDist:
@@ -124,6 +134,10 @@ class _FakeDist:
         absent = Scheduler._HOST_AVAIL_ABSENT
         m_absent = Scheduler._MAMBA_AVAIL_ABSENT
         tail = [absent, -absent, m_absent, -m_absent]
+        # #791b: the prefetch ballot rides behind the mamba pair; every
+        # fixture rank has an empty queue, so its contribution is the
+        # neutral one -- digest-0 pair plus all-done slots.
+        tail = tail + build_prefetch_ballot_payload([], {})
         if self.pin_admission:
             return [avail, avail, -avail] + tail
         return [avail, -avail] + tail
