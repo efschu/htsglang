@@ -4731,6 +4731,13 @@ class Scheduler(
             # right close is to widen `update_dcp_admission_state`'s packed
             # reduce, where the reduce already lives.
             self._uniform_prefetch_ballot = None
+            # #794: NAMED GAP, same shape as the #639 host floor above. This
+            # branch takes no reduce of its own, so the corridor width stays
+            # unreduced and the consumer declines to narrow rather than narrow
+            # on a rank-local reading. The right close is one more term in
+            # `update_dcp_admission_state`'s packed reduce, where it already
+            # lives.
+            self._uniform_corridor_width = None
             return
 
         alloc = self.token_to_kv_pool_allocator
@@ -4768,6 +4775,9 @@ class Scheduler(
             # #791b: one rank -- nothing to diverge from, ballot off, the
             # local prefetch verdict is already the group verdict.
             self._uniform_prefetch_ballot = None
+            # #794: one rank in this group -- the local corridor decision IS
+            # the group decision, taken at the call site.
+            self._uniform_corridor_width = None
             return
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
@@ -4846,6 +4856,33 @@ class Scheduler(
         # checkpoint.
         local_mamba_avail = self._local_mamba_avail()
         vals = vals + [local_mamba_avail, -local_mamba_avail]
+        # #794: THE CORRIDOR WIDTH CEILING rides this reduce too, and it has to.
+        #
+        # The flip changes the topology under this scheduler AT RUNTIME. In the
+        # PP phase this group has world 1 and PP0 decides the pass geometry for
+        # the ring; in the TP phase the SAME process reads pp_size=1 and
+        # tp_cpu_group world=3, every rank builds its own prefill batch, and a
+        # rank-local width cut would split the group. The first metal run of the
+        # actuator printed exactly that, from all three ranks:
+        #     #794 CORRIDOR WIDTH ACTUATOR OFF on this topology:
+        #     tp_cpu_group world=3 with pp_size=1
+        # -- i.e. the actuator switched itself off in the phase where this fork
+        # runs prefill (--phase-flip-purity prefill_in_tp) and where the
+        # 2026-08-21 17:33 OOM actually happened, inside the first flip. A gap
+        # that swallows the whole use case is not a gap, it is an outage.
+        #
+        # ONE MORE INT ON A REDUCE THAT ALREADY RUNS, which is what the gap note
+        # itself named as the right close. Contributed UNCONDITIONALLY so the
+        # payload width never depends on a per-rank capability: a rank that
+        # cannot price, or has no guard, contributes the configured width and is
+        # therefore never the binding vote. MIN, because the group may take on
+        # only what its tightest card can fund.
+        #
+        # Placed BETWEEN the mamba pair and the ballot on purpose: everything
+        # above is indexed from the head and the ballot is indexed from the
+        # TAIL, so inserting here leaves both readings intact.
+        _corridor_at = len(vals)
+        vals = vals + [self._local_corridor_width_ceiling()]
         # #791b: THE PREFETCH BALLOT rides the SAME reduce (instr22/instr23:
         # the admission loop's rank-local prefetch verdict split the TP
         # replicas -- one rank admitted a batch its peers declined, three
@@ -4868,6 +4905,9 @@ class Scheduler(
         )
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        # #794: the group's tightest corridor width, read back before the
+        # ballot so a later change to the ballot layout cannot silently move it.
+        self._uniform_corridor_width = int(t[_corridor_at])
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
             t[_ballot_at:].tolist(), _ballot_rids
@@ -6375,6 +6415,45 @@ class Scheduler(
             int(history_len),
         )
 
+    def _local_corridor_width_ceiling(self) -> int:
+        """#794: the widest prefill chunk THIS card can fund, for the reduce.
+
+        Contributed unconditionally and computed from the CONFIGURED width, not
+        from this pass's dynamic one: the reduce runs before the pass picks a
+        width, and a payload whose meaning varied per rank would be worse than
+        no payload at all. The consumer takes ``min(requested, reduced)``, so a
+        dynamic width narrower than the configured one still wins.
+
+        NEVER RAISES AND NEVER RETURNS SOMETHING SMALLER THAN IT MEANS. Every
+        failure path -- no gate, no guard, no price, an exception -- returns the
+        configured width, which makes this rank a non-binding vote rather than
+        one that silently narrows the whole group.
+        """
+        configured = int(getattr(self, "chunked_prefill_size", 0) or 0)
+        if configured <= 0:
+            return 1 << 30
+        try:
+            gate = get_prefill_admission_gate(self)
+            if gate is None:
+                return configured
+            granted = int(gate.granted_width(configured))
+        except Exception as e:  # noqa: BLE001
+            if not getattr(self, "_corridor_width_probe_failed", False):
+                self._corridor_width_probe_failed = True
+                logger.error("#794 corridor width ceiling failed to price: %s", e)
+            return configured
+        if granted <= 0 or granted > configured:
+            return configured
+        return granted
+
+    def uniform_corridor_width(self):
+        """The group's tightest corridor width this iteration, or None.
+
+        None means the reduce did not run (world size 1, or the offload branch),
+        in which case the local decision IS the group decision.
+        """
+        return getattr(self, "_uniform_corridor_width", None)
+
     def _corridor_granted_prefill_width(self, chunked_prefill_size: int) -> int:
         """#794: narrow this pass's chunk to what this card's corridor funds.
 
@@ -6425,19 +6504,33 @@ class Scheduler(
             except Exception:  # noqa: BLE001
                 world = 0
             if world > 1:
-                if not getattr(self, "_corridor_width_gap_logged", False):
-                    self._corridor_width_gap_logged = True
+                # THE GROUP'S WIDTH, NOT THIS RANK'S. Every rank in this group
+                # builds its own prefill batch, so the width must be one number
+                # for all of them: the MIN reduced once this iteration in
+                # `_update_uniform_pool_budget`, pre-branch, no collective here.
+                reduced = self.uniform_corridor_width()
+                if reduced is None:
+                    # The reduce did not run this iteration (offload branch).
+                    # Do not narrow on a rank-local reading in a group that
+                    # would not narrow with us.
+                    return chunked_prefill_size
+                reduced = int(reduced)
+                if reduced <= 0 or reduced >= requested:
+                    return chunked_prefill_size
+                if reduced != getattr(self, "_corridor_width_group_logged", None):
+                    self._corridor_width_group_logged = reduced
                     logger.warning(
-                        "#794 CORRIDOR WIDTH ACTUATOR OFF on this topology: "
-                        "tp_cpu_group world=%d with pp_size=1, so every rank "
-                        "builds its own prefill batch and a rank-local cut "
-                        "would split the group. The width stays at the "
-                        "configured %d tokens; the close is one more term in "
-                        "_update_uniform_pool_budget's packed MIN reduce.",
-                        world,
+                        "#794 GROUP-NARROWED this prefill chunk from %d to %d "
+                        "tokens: %d ranks share this admission decision and "
+                        "the tightest card's corridor funds %d. Every rank "
+                        "cuts to the same number, so no rank admits work its "
+                        "peers declined.",
                         requested,
+                        reduced,
+                        world,
+                        reduced,
                     )
-                return chunked_prefill_size
+                return reduced
         gate = get_prefill_admission_gate(self)
         if gate is None:
             return chunked_prefill_size

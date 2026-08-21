@@ -496,6 +496,16 @@ class BudgetHarness:
     waiting_queue: list = []
     enable_hicache_storage = False
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
+    # #794: the reduce grew the CORRIDOR WIDTH CEILING, the same way #616g,
+    # #639, #639b and #791b grew theirs, and the drift guard below caught it
+    # the same way again -- the fifth time this guard has paid for itself.
+    # This harness has no scheduler-side admission gate, so the SHIPPED
+    # ceiling function finds no gate and contributes the configured width,
+    # i.e. it rides as a non-binding vote exactly as it does on a rank that
+    # cannot price.
+    chunked_prefill_size = 4096
+    _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    uniform_corridor_width = Scheduler.uniform_corridor_width
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
     if hasattr(Scheduler, "uniform_budget_deficit"):

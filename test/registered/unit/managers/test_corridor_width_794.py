@@ -503,3 +503,102 @@ def test_a_widened_answer_is_refused(monkeypatch):
         lambda _s: Widening(),
     )
     assert WIDTH(scheduler_stub(pp_size=3, pp_rank=0), 4096) == 4096
+
+
+# --------------------------------------------------------------------------
+# 8. THE TP PHASE. The flip changes the topology under the same process: in
+#    the PP phase PP0 decides for the ring, in the TP phase every rank builds
+#    its own batch and the width must be MIN-reduced. The first metal run
+#    printed "ACTUATOR OFF ... tp_cpu_group world=3 with pp_size=1" -- in the
+#    phase where this fork runs prefill and where the OOM happened.
+# --------------------------------------------------------------------------
+
+
+def tp_scheduler_stub(reduced, chunked=4096):
+    stub = types.SimpleNamespace(
+        ps=types.SimpleNamespace(pp_size=1, pp_rank=0),
+        tp_cpu_group=object(),
+        chunked_prefill_size=chunked,
+        _uniform_corridor_width=reduced,
+    )
+    # The REAL getter, not a stand-in: its "None means the reduce did not run"
+    # contract is half of what these tests are about.
+    stub.uniform_corridor_width = lambda: Scheduler.uniform_corridor_width(stub)
+    return stub
+
+
+def _world3(monkeypatch):
+    import sglang.srt.managers.scheduler as sched
+
+    monkeypatch.setattr(
+        sched.torch.distributed, "get_world_size", lambda _g: 3, raising=False
+    )
+
+
+def test_the_tp_phase_narrows_to_the_groups_tightest_card(monkeypatch):
+    _world3(monkeypatch)
+    assert WIDTH(tp_scheduler_stub(reduced=1024), 4096) == 1024
+
+
+def test_the_tp_phase_does_not_narrow_when_the_group_is_not_short(monkeypatch):
+    _world3(monkeypatch)
+    assert WIDTH(tp_scheduler_stub(reduced=4096), 4096) == 4096
+    assert WIDTH(tp_scheduler_stub(reduced=8192), 4096) == 4096
+
+
+def test_an_unreduced_iteration_never_narrows_on_a_local_reading(monkeypatch):
+    """The offload branch takes no reduce. Narrowing there would be a
+    rank-local cut in a group that would not cut with us."""
+    _world3(monkeypatch)
+    assert WIDTH(tp_scheduler_stub(reduced=None), 4096) == 4096
+
+
+def test_a_nonsense_reduced_width_is_ignored(monkeypatch):
+    _world3(monkeypatch)
+    assert WIDTH(tp_scheduler_stub(reduced=0), 4096) == 4096
+    assert WIDTH(tp_scheduler_stub(reduced=-5), 4096) == 4096
+
+
+CEILING = Scheduler._local_corridor_width_ceiling
+
+
+def test_the_contributed_ceiling_is_never_a_silent_narrowing(monkeypatch):
+    """Every failure path contributes the CONFIGURED width, which makes this
+    rank a non-binding vote instead of one that narrows the whole group."""
+
+    class Exploding:
+        def granted_width(self, requested):
+            raise RuntimeError("no guard")
+
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        lambda _s: Exploding(),
+    )
+    stub = types.SimpleNamespace(chunked_prefill_size=4096)
+    assert CEILING(stub) == 4096
+
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        lambda _s: None,
+    )
+    assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == 4096
+
+
+def test_the_contributed_ceiling_carries_a_real_cut(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        lambda _s: CuttingGate(),
+    )
+    assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == MIN_CHUNK_TOKENS
+
+
+def test_a_widened_ceiling_is_refused(monkeypatch):
+    class Widening:
+        def granted_width(self, requested):
+            return requested * 4
+
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        lambda _s: Widening(),
+    )
+    assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == 4096
