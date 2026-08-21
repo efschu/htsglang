@@ -2110,6 +2110,28 @@ class KvBackingRelief:
         self._rebind()
         return int(self._current_rows())
 
+    def live_floor_rows(self) -> int:
+        """The lowest row level this rank's allocator may be capped to.
+
+        #792. The same number ``cap_proposal`` puts on the wire as its second
+        field, as a public reading, because the RECOVERY levelling needs it
+        too and had no way to ask for it. Returns :data:`_UNBOUNDED_ROWS` when
+        the live set cannot be read: an unknown live set is not an empty one,
+        and every caller of this reading must decline rather than guess -- the
+        same direction ``_shrink_to`` takes when ``_max_live_row`` comes back
+        negative.
+
+        IT COSTS ONE LIVE-SET ENUMERATION, which is the same price
+        ``cap_proposal`` already pays on every seam round. The callers are the
+        cutover legs, once each, so this at most doubles a cost the seam
+        already carries -- and the alternative is a cap engaged below the live
+        set, which cannot be paid off at any price.
+        """
+        max_live = self._max_live_row()
+        if max_live < 0:
+            return _UNBOUNDED_ROWS
+        return int(self._floor_rows(max_live))
+
     def level_recovery_to(self, target: int) -> int:
         """#656 C22-e: cap this rank's ID SPACE to the group's, after a grow.
 
@@ -2235,6 +2257,75 @@ class KvBackingRelief:
         # request different row ids -- a divergent live slot set, and a
         # divergent wire frame, with the pool census identical on every rank.
         level = min(target, backed)
+        # #792: AND THE LIMIT WINS HERE TOO, WHICH IT DID NOT.
+        #
+        # ``collective_cap_target`` already states this law for the seam's
+        # agreement -- it returns None when the group's MAX floor is above the
+        # MIN capable, because "the poorest rank cannot expose the rows a
+        # peer's live set requires". The RECOVERY levelling
+        # (``phase_flip_spill.recover_kv_backing``) reaches this same actuator
+        # through :meth:`level_recovery_to` and reduced only ``[backed,
+        # -backed]``, so it could hand a target the live set forbids -- and
+        # this method engaged it without a word.
+        #
+        # Measured, boot instr12 2026-08-21, on all three ranks::
+        #
+        #   05:28:17  KV-BACKING released 160 MiB by backing 137233 rows
+        #             instead of 161792 (highest live row 136720,
+        #             24145 ids withheld from the allocator)
+        #   05:28:21  KV-BACKING cap agreement: exposed rows 137233 -> 40960
+        #             (group level 40960, backed 49152)
+        #   05:28:21  PHASE-FLIP-SPILL KV recovery levelled to the group ...
+        #   05:29:28  RuntimeError: Out of memory. Try to allocate 512 tokens.
+        #             Available full tokens: 67935 (full_available_size=261
+        #             + full_evictable_size_=67674)
+        #             EVICTION UNDER-DELIVERED: asked for 512 tokens, the pool
+        #             received 94 ... A RESIDENCY CAP IS ENGAGED and is
+        #             holding 63641 slot ids
+        #
+        # 63641 withheld ids is the proof that the cap at the death was the
+        # LEVELLED one and not the shrink's: above a cap of 137233 the id
+        # space holds only 161792 - 137233 = 24559 ids in total, so 63641 is
+        # arithmetically impossible there and perfectly possible above 40960.
+        # The levelling had put the cap 95760 rows BELOW the highest live row,
+        # and from that instant every id a peel freed above 40960 went
+        # straight into ``_withheld``. The tree emptied and the pool was never
+        # paid.
+        #
+        # A cap below the live set is not a conservative cap -- it is an
+        # unpayable pool, because the ids the tree is holding are exactly the
+        # ids the cap confiscates. Declining costs the group a levelled id
+        # space, which the flip's frame ballot then refuses: a lost flip,
+        # never a rank, and precisely the trade ``collective_cap_target``
+        # already makes one function above.
+        #
+        # Nothing is touched on the decline -- not the cap, not the free list
+        # order. The order stays a function of membership because
+        # ``normalize_free_lists`` runs on every rank on every seam round
+        # regardless of what this method decides.
+        #
+        # ONE enumeration, read for both the verdict and the line that
+        # explains it: asking twice would double the seam's live-set cost for
+        # a log field.
+        max_live = self._max_live_row()
+        floor = _UNBOUNDED_ROWS if max_live < 0 else int(self._floor_rows(max_live))
+        if level < floor:
+            logger.error(
+                "%s DECLINED to level this rank to %d rows: its live set "
+                "needs %d (highest live row %d + margin + admission reserve). "
+                "Capping below the live set would withhold every id the radix "
+                "tree is holding, so eviction would free the TREE and pay the "
+                "POOL nothing -- the pool becomes unpayable and the next "
+                "prefill raises out-of-memory with a full evictable tree "
+                "(#792). The ranks stay on different id spaces and the seam's "
+                "frame ballot refuses the flip until a recovery closes the "
+                "gap: a lost flip, never a dead rank.",
+                LOG_PREFIX,
+                level,
+                floor,
+                max_live,
+            )
+            return 0
         ceiling = (
             int(self._rows_at_boot)
             if self._rows_at_boot is not None

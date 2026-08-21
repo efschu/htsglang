@@ -621,12 +621,20 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         )
 
     def test_recover_kv_backing_reduces_the_backing_and_levels(self):
-        """The payload is [backed, -backed] and the group MIN decides."""
+        """The payload is ``[backed, -backed, -floor]`` and the group MIN decides.
+
+        #792 widened it by the third field: the level this decides is applied
+        to the ID SPACE, so the group's live set has to be able to veto it. See
+        ``test_residency_cap_flip_levelling_792.py`` for what the two-field
+        payload agreed to on metal.
+        """
         from sglang.srt.managers import phase_flip_spill as pfs
 
         fleet = self._fleet()
         backed = self._recover_all(fleet)
         group_min = min(backed)
+        floors = [r.live_floor_rows() for r in fleet]
+        self.assertLess(max(floors), group_min, "fixture: an idle live set cannot veto")
         seen = []
 
         levelled = []
@@ -636,7 +644,7 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
 
             def reduce_fn(vals, _own=own):
                 seen.append(list(vals))
-                return [group_min, -max(backed)]
+                return [group_min, -max(backed), -max(floors)]
 
             levelled.append(pfs.recover_kv_backing(sched, reduce_fn=reduce_fn))
 
@@ -648,6 +656,13 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
             "physically mapped",
         )
         self.assertEqual([v[1] for v in seen], [-b for b in backed])
+        self.assertEqual(
+            [v[2] for v in seen],
+            [-f for f in floors],
+            "each rank must also propose the level its own live set forbids "
+            "going below, or the group can agree to confiscate the ids the "
+            "radix tree is holding (#792)",
+        )
         self.assertEqual(
             {r.exposed_rows() for r in fleet},
             {group_min},

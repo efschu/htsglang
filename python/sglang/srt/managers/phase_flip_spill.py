@@ -1142,6 +1142,18 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
     already states -- under pure PP every rank holds the SAME token rows, so
     rows above the group minimum could never have been admitted against.
 
+    #792: AND THE LEVEL MAY NEVER SIT BELOW THE GROUP'S LIVE SET. What the
+    levelling above prevents is a rank exposing ids its peers cannot map; what
+    it must not do in exchange is expose FEWER ids than the group's live set
+    already occupies. Every id at or above the cap that a peel frees is taken
+    straight back by ``KvRowCap``'s free listener, so a cap under the live
+    high-water mark makes the pool unpayable: the tree empties, the allocator
+    never moves, and the next prefill raises out-of-memory against a full
+    evictable tree. The payload therefore carries each rank's floor, and the
+    group declines when the MAX floor is above the MIN backing -- the same
+    verdict ``kv_backing_relief.collective_cap_target`` already reaches for the
+    same condition, on the seam's half of this mechanism.
+
     ``reduce_fn`` is the seam's element-wise MIN channel. Entered on the
     tp->pp post-cutover hook, which every rank reaches exactly once per
     tp->pp cutover -- the cutover itself is unanimous, so this is not a
@@ -1166,10 +1178,59 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
         return grown
     try:
         backed = int(relief.backed_rows())
-        reduced = list(reduce_fn([backed, -backed]))
+        # #792: THE FLOOR RIDES ALONG, because the level this decides is
+        # applied to the ID SPACE and the live set is what the id space owes.
+        # The payload was [backed, -backed] -- how many rows each rank has
+        # mapped, and nothing about the rows already in use -- so the group
+        # could and did agree a level BELOW its own live high-water mark.
+        # Sent negated, so the same MIN channel yields the group's MAX floor:
+        # the most-loaded rank sets the limit, exactly as it does for
+        # ``collective_cap_target``.
+        floor = int(relief.live_floor_rows())
+        reduced = list(reduce_fn([backed, -backed, -floor]))
         group_min = int(reduced[0])
         group_max = -int(reduced[1])
-        if group_min > 0 and group_min < group_max:
+        # A channel that truncated (or a peer on an older tree) leaves the
+        # floor UNKNOWN, and an unknown floor is not a low one: it declines
+        # exactly as a floor above the level would.
+        floor_known = len(reduced) > 2
+        group_floor = -int(reduced[2]) if floor_known else -1
+        unlevel = group_min > 0 and group_min < group_max
+        if unlevel and (not floor_known or group_floor > group_min):
+            # THE ONE STATE THAT CANNOT BE ANSWERED, and the levelling used to
+            # answer it anyway. The poorest rank cannot expose the rows the
+            # group's live set already occupies, so there is no honest level:
+            # capping to the group minimum withholds ids the radix tree is
+            # holding, and every eviction after it frees the TREE and pays the
+            # POOL nothing (boot instr12, 2026-08-21: cap levelled to 40960
+            # against a highest live row of 136720; 63641 ids confiscated; the
+            # next prefill raised out-of-memory with 67674 evictable tokens in
+            # the tree).
+            #
+            # Declining leaves the ranks on different id spaces, which the
+            # seam's frame ballot refuses -- a lost flip, never a rank. That is
+            # the identical trade ``collective_cap_target`` makes for the same
+            # condition (``max_floor > capable``), and this path is the one
+            # place in the chain that did not make it.
+            logger.error(
+                "%s DECLINED to level the recovery: the group's poorest rank "
+                "backs %d rows while the group's live set needs %d "
+                "(this rank backs %d, its own floor is %d). Capping the "
+                "allocator to %d would withhold every id at or above it -- "
+                "including the ones the radix tree is holding -- so eviction "
+                "would pay the pool nothing and the next prefill would raise "
+                "out-of-memory against a full evictable tree (#792). The id "
+                "spaces stay apart and the frame ballot refuses the flip "
+                "until a recovery closes the gap: a lost flip, never a dead "
+                "rank",
+                LOG_PREFIX,
+                group_min,
+                group_floor,
+                backed,
+                floor,
+                group_min,
+            )
+        elif unlevel:
             moved = int(relief.level_recovery_to(group_min))
             logger.warning(
                 "%s KV recovery levelled to the group: this rank backs %d "
