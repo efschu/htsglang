@@ -229,9 +229,71 @@ def corridor_band_ceiling_mib() -> int:
 
     The second half of "best-filled", and the one a boot-time gate needs in
     order to refuse a configuration that leaves gibibytes idle.
+
+    WHAT "BUYING NO TOKENS" MEANS, because the flip made it ambiguous (#784).
+    This ceiling grades the USER-FREE column, not the raw NVML free field. An
+    armed phase-flip boot holds an arming floor above the band floor on every
+    rank; those MiB are working capital the guard actively defends so a flip
+    can arm, so they buy the flip and are not idle. Grade
+    :func:`net_free_mib`, never the raw reading -- see that function for why
+    the raw comparison is unsatisfiable by construction.
+
+    ROUNDED, NOT TRUNCATED. ``int()`` gave 1228 here while the acceptance
+    verdict (``corridor_verdict_774.sh``) computed ``int(round(...))`` = 1229,
+    so the code and the gate that decides pass/fail disagreed by 1 MiB on the
+    number under test. Rounding is also the symmetric choice: the floor's
+    ``int(819.2)`` and ``round(819.2)`` are the same 819, so only this side
+    ever moved.
     """
     law = corridor_law_mib()
-    return int(law + law * CORRIDOR_BAND_FRACTION)
+    return int(round(law + law * CORRIDOR_BAND_FRACTION))
+
+
+def committed_arming_mib(arming_mib: int) -> int:
+    """The part of an arming floor that is CHARGED, not free.
+
+    An arming floor is ``corridor_band_floor_mib() + seam draw + margin``. The
+    band floor half belongs to the user -- it is the external headroom the
+    corridor law promises. Everything ABOVE it is internal demand: working
+    capital the flip spends while it runs, which the guard reclaims and spills
+    to defend. Under the reserve semantics a reserve is the user's external
+    free space and internal demand is booked exactly, in the ledger, so this
+    part is a ledger post and must not be graded as free VRAM.
+
+    Returns 0 for any floor at or below the band floor: such a rank holds
+    nothing on the flip's behalf. Never negative.
+    """
+    return max(0, int(arming_mib) - corridor_band_floor_mib())
+
+
+def net_free_mib(free_mib: int, arming_mib: int) -> int:
+    """The quantity the corridor band actually grades: free MINUS the credit.
+
+    THE DEFECT THIS EXISTS FOR (#784). The shipped constants make the raw
+    comparison unsatisfiable. The smallest arming floor any rig can ask for is
+    ``819 + 512 + 192 = 1523`` MiB -- the band floor, the shipped seam entry
+    allowance and the arming margin -- while the ceiling a boot is graded
+    against is 1229 MiB. ``1523 > 1229`` on every rank, unconditionally, so an
+    armed phase-flip boot was graded against a threshold its own arming rule
+    forbade it to reach, and no gate said so: this module's only pair check
+    refused an arming floor BELOW the law and never looked at the ceiling
+    side, and :func:`corridor_band_ceiling_mib` had no production consumer.
+
+    Crediting the committed part resolves the pair rather than widening the
+    band: a rank resting exactly at its arming floor reads exactly the band
+    floor and is in band, whatever its measured seam draw. This is the
+    Option-A formula the acceptance verdict has documented since 2026-07-22
+    (``net = free_min - sum(registered posts)``) and never implemented.
+
+    IT CANNOT MANUFACTURE A PASS, which is the whole risk of the change. The
+    credit is a rank's own floor and nothing more, so a rank resting far above
+    that floor keeps every stranded MiB visible: boot instr9's ranks 0 and 1
+    rest at 5229 / 6612 MiB against a 1523 MiB floor and still read 4525 /
+    5908 MiB net, still far over the ceiling, still a failed acceptance. The
+    credit makes the grading honest; the capacity defect stays the planner's
+    to solve.
+    """
+    return int(free_mib) - committed_arming_mib(arming_mib)
 
 
 def corridor_band_mib():
@@ -263,15 +325,51 @@ def arming_floor_mib(
     return corridor_band_floor_mib() + max(0, int(seam_entry_reserve_mib))
 
 
-def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> None:
+def check_threshold_pair(
+    arming_mib: int,
+    law_mib: int = CORRIDOR_LAW_MIB,
+    band_floor_mib: Optional[int] = None,
+    band_ceiling_mib: Optional[int] = None,
+) -> None:
     """Refuse a pair that cannot mean what it says.
 
     An arming floor below the law lets the gate return "no reclaim needed"
     for an allocation that ends under the corridor -- the guard would be
     laundering a breach as a passed check, which is the one thing its own
     refusal message says it must never do.
+
+    THE CEILING SIDE (#784). The floor check alone let a second unsatisfiable
+    pair through in silence: a band whose floor sits above its own ceiling has
+    no feasible region at all, so every boot graded under it fails an
+    acceptance no configuration could pass. The band is inverted exactly when
+    the fraction exceeds 1.0, which no shipped value does -- but the pair was
+    accepted without a word when it happened, and "accepted in silence" is the
+    same failure mode the floor side exists to prevent.
+
+    The arming floor itself is deliberately NOT compared against the ceiling.
+    It exceeds it by construction on every rig (1523 > 1229 with the shipped
+    constants) and that is not an error: the excess is charged working
+    capital, credited by :func:`net_free_mib`, not idle VRAM. Refusing it here
+    would refuse every armed flip boot.
+
+    ``band_floor_mib`` / ``band_ceiling_mib`` override the derived band for
+    tests that need to construct an inverted one; production passes neither.
     """
-    if int(arming_mib) < corridor_band_floor_mib():
+    floor = corridor_band_floor_mib() if band_floor_mib is None else int(band_floor_mib)
+    ceiling = (
+        corridor_band_ceiling_mib()
+        if band_ceiling_mib is None
+        else int(band_ceiling_mib)
+    )
+    if floor > ceiling:
+        raise ValueError(
+            f"corridor band is INVERTED: floor {floor} MiB is above ceiling "
+            f"{ceiling} MiB, so the band has no feasible region and no boot "
+            f"can ever be graded against it. The band is the law "
+            f"{law_mib} MiB plus and minus {CORRIDOR_BAND_FRACTION:.0%}; a "
+            f"fraction above 100 % inverts it."
+        )
+    if int(arming_mib) < floor:
         raise ValueError(
             f"corridor arming floor {arming_mib} MiB is BELOW the corridor "
             f"law {law_mib} MiB. The gate would clear allocations the law "

@@ -72,7 +72,14 @@ class TestTheDeclaredPair(CustomTestCase):
         floor, centre, ceiling = cg.corridor_band_mib()
         self.assertEqual(centre, cg.corridor_law_mib())
         self.assertEqual(floor, int(centre - centre * cg.CORRIDOR_BAND_FRACTION))
-        self.assertEqual(ceiling, int(centre + centre * cg.CORRIDOR_BAND_FRACTION))
+        # ROUNDED on the ceiling side since #784. It used to truncate, which
+        # put the code at 1228 while the acceptance verdict that decides
+        # pass/fail (corridor_verdict_774.sh) computed int(round(...)) = 1229
+        # -- the two disagreed by 1 MiB on the very number under test. The
+        # floor is unaffected: int(819.2) and round(819.2) are both 819.
+        self.assertEqual(
+            ceiling, int(round(centre + centre * cg.CORRIDOR_BAND_FRACTION))
+        )
         self.assertLess(floor, centre)
         self.assertGreater(ceiling, centre)
         # The measured cutover transient on this rig sits inside it.
