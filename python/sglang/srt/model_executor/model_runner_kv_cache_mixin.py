@@ -6428,12 +6428,35 @@ class ModelRunnerKVCacheMixin:
         pool is sized as it was before this term existed and the rung's
         all-or-nothing rule can still fire.
 
-        THE FUNDABLE LEG ONLY. ``pp_to_tp`` is the leg the rung may shrink for
-        and the leg whose refusal is fatal under strict purity; ``tp_to_pp``
-        abstains by design, because its pool is about to become active again
-        and ``recover_kv_backing`` would undo the shrink inside the same flip.
-        Charging the pool for a leg that never shrinks would hold back memory
-        against a payment nobody makes.
+        BOTH LEGS, and the reason the previous rule was wrong (#796). This used
+        to charge ``pp_to_tp`` ONLY, on the argument that ``tp_to_pp``'s pool is
+        about to become active again and ``recover_kv_backing`` would undo the
+        shrink inside the same flip, so charging for it holds memory against a
+        payment nobody makes.
+
+        THAT ARGUMENT ASSUMES RECOVERY CAN ALWAYS PAY, AND IT CANNOT.
+        ``KvBackingRelief.recover`` is bounded by the corridor law, not by what
+        the seam needs (``kv_backing_relief.py``: ``headroom = self._free_bytes()
+        - self._law_floor_bytes``), so once the pool has been sized to rest near
+        that law floor -- which is exactly what happens when nothing reserved
+        slack for this leg -- recovery has nothing left to give and says so:
+        "recovery deferred: N MiB free leaves nothing above the 1024 MiB
+        corridor law to re-commit with, so the pool stays at X of X rows". The
+        un-funded leg then cannot arm, at sizing time or at flip time.
+
+        Observed end-to-end on this rig (boot_restore_797.log, #796): eight
+        consecutive ``tp_to_pp`` attempts abandoned at a stable shortfall of
+        127-164 MiB -- "staging 2068 MiB needed but only 1911 MiB is spendable"
+        -- followed by "SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN". All three
+        ranks had logged the recovery-deferred line first. The instance was then
+        pinned in one layout for the rest of its life and began refusing
+        long-context requests outright.
+
+        So both directions are projected and the LARGER is charged. ``max`` and
+        not a sum: only one direction stages at a time, so the pool must cover
+        the worse leg, not both at once -- unlike the arming-floor + staging
+        pair, which ``pool_flip_posts_bytes`` adds precisely because those two
+        are needed at the same instant.
         """
         runtime = getattr(self, "phase_flip_runtime", None) or getattr(
             self, "_phase_flip_runtime", None
@@ -6441,12 +6464,21 @@ class ModelRunnerKVCacheMixin:
         project = getattr(runtime, "project_staging_bytes", None) if runtime else None
         if callable(project):
             try:
-                from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+                from sglang.srt.managers.phase_flip_runtime import (
+                    PP_TO_TP,
+                    TP_TO_PP,
+                )
 
                 slots = int(getattr(self.server_args, "max_running_requests", 0) or 0)
+                legs = {
+                    "pp_to_tp": int(project(PP_TO_TP, slots)),
+                    "tp_to_pp": int(project(TP_TO_PP, slots)),
+                }
+                worst = max(legs, key=lambda name: legs[name])
                 return (
-                    int(project(PP_TO_TP, slots)),
-                    f"projected pp_to_tp @ {slots} slots",
+                    legs[worst],
+                    f"projected {worst} @ {slots} slots (worst of "
+                    f"pp_to_tp={legs['pp_to_tp']}, tp_to_pp={legs['tp_to_pp']} B)",
                 )
             except Exception as exc:  # a projection must never fail a boot
                 return 0, f"projection unavailable ({type(exc).__name__})"
