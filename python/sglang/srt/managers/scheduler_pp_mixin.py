@@ -60,7 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import Range, get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +495,96 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
         logger.warning("[PP Dynamic Chunk] probe req-slot release failed: %s", exc)
 
 
+def _park_chunked_prefill_chunk(scheduler, req) -> bool:
+    """#797b: un-do ONE prepared-but-never-run chunk. True iff it parked one.
+
+    THE CRASH THIS CLOSES, boot instr19 08:47:27, all three ranks within one
+    second of each other:
+
+        AttributeError: 'NoneType' object has no attribute 'end'
+          scheduler.py  get_next_batch_to_run
+            if self.chunked_req.extend_range.end > len(...prefix_indices):
+
+    `self.chunked_req` is SCHEDULER-owned and lives across rounds, but it is
+    also a member of the batch the round builds, so #797's void handed it to
+    `_release_dynamic_chunk_probe` + `reset_for_retract` like any other
+    admitted request. `reset_for_retract` sets `extend_range = None`
+    (schedule_batch.py) and the next round dereferences it. With
+    `--chunked-prefill-size 512` against ~17000-token prompts a chunked
+    request is in flight essentially always, so the void hit it on its first
+    try: health at 08:46:48, dead at 08:47:41.
+
+    A VOID IS A PARK, NOT A RETRACTION, and the park is not a new concept
+    here -- `PrefillAdder.add_chunked_req` already has it (schedule_policy.py,
+    the #679 zero-budget branch: "the request stays the chunked request, is
+    retried next round, and nothing leaks"), and the scheduler already
+    documents its shape at the stash site: "a parked chunk leaves
+    `extend_range.end == len(prefix_indices)`, so there is nothing new to
+    cache and stashing would be a no-op". That is exactly the state a voided
+    pass must leave behind, so this reconstructs it:
+
+      * FREE ONLY WHAT THIS ROUND ALLOCATED, `[len(prefix_indices):
+        extend_range.end]`. Never `[:end]`, which is what
+        `_release_dynamic_chunk_probe` frees -- that helper was written for a
+        synthetic dynamic-chunk PROBE whose whole range is its own, whereas a
+        chunked request's `[:len(prefix_indices)]` is the RADIX TREE's, held
+        under a lock ref by every chunk already stashed. Returning those to
+        the allocator is a double free, not a leak.
+      * PARK `extend_range`, so the next round's stash is a no-op on a chunk
+        no rank downstream of the retraction ever computed. Leaving the
+        prepared range in place would insert it into THIS rank's tree only,
+        and the next offer for that prefix would be unhonourable -- the #630
+        livelock, one voided pass per chunk.
+      * GIVE BACK THE ADMISSION'S `inflight_middle_chunks` INCREMENT
+        (scheduler.py, right after `new_chunked_req`). Its matching decrement
+        lives in `process_batch_result_prefill`, which never runs for a
+        voided pass, and the counter gates `req.finished()` -- a leaked
+        increment is a request that can never report finished.
+
+    NOT re-queued and NOT reset: the chunked request is not in
+    `waiting_queue` (``add_chunked_req`` re-admits it from
+    ``self.chunked_req`` directly), so appending it would put it in the batch
+    twice, and resetting it would throw away the `prefix_indices` / `last_node`
+    handles for every chunk already stashed.
+
+    Idempotent and never raises, on the same argument
+    `_release_dynamic_chunk_probe` makes: this runs while cleaning up after a
+    divergence, and an instrument that can raise there turns one defect into
+    two.
+    """
+    if req is None:
+        return False
+    extend_range = getattr(req, "extend_range", None)
+    end = getattr(extend_range, "end", None)
+    if end is None:
+        # Already parked, already reset, or never prepared -- nothing this
+        # round allocated, so nothing to give back.
+        return False
+    prefix_indices = getattr(req, "prefix_indices", None)
+    start = 0 if prefix_indices is None else len(prefix_indices)
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    try:
+        if (
+            pool is not None
+            and getattr(req, "req_pool_idx", None) is not None
+            and int(end) > int(start)
+        ):
+            kv_indices = pool.req_to_token[req.req_pool_idx, int(start) : int(end)]
+            scheduler.token_to_kv_pool_allocator.free(kv_indices)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("#797b parked-chunk KV release failed: %s", exc)
+    try:
+        req.extend_range = Range(int(start), int(start))
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("#797b parked-chunk extend_range reset failed: %s", exc)
+    try:
+        if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+            req.inflight_middle_chunks -= 1
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning("#797b parked-chunk inflight accounting failed: %s", exc)
+    return True
+
+
 #: #757: what the ARMED drain may do with one message off the wire.
 DRAIN_STASH = "stash"
 DRAIN_DISCARD = "discard"
@@ -878,6 +968,106 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     return True
 
 
+def pp_chunked_local_match(req) -> Optional[int]:
+    """#797c: how much of THIS request this rank has already computed.
+
+    THE FALSE NEGATIVE THAT CAUSED THE LIVELOCK. Boot instr19 retracted the
+    same rid three times in one second with `told` GROWING by exactly one
+    chunk each time and `local` pinned at 0:
+
+        08:47:26 PP1 unhonourable prefix: rid=d4f59edf... told=512  local=0
+        08:47:27 PP1 unhonourable prefix: rid=d4f59edf... told=1024 local=0
+        08:47:27 PP1 unhonourable prefix: rid=d4f59edf... told=1536 local=0
+
+    PP1 had computed that prefix. It admitted the request's FIRST chunk
+    itself, congruently, one second earlier (`verdict=ADMIT n_reqs=1
+    rids=d4f59edf... prefix_lens=0` on all three ranks). `local=0` was never a
+    measurement: `_pp_reconcile_incoming_admission` looks a rid up in
+    `self.waiting_queue`, scheduler.py drops every admitted request out of
+    that queue (`self.waiting_queue = [x for x in self.waiting_queue if x not
+    in can_run_set]`), and a CHUNKED request then lives in `self.chunked_req`
+    instead -- so the lookup misses by construction on every round after the
+    first, and the miss defaults to 0. The reconcile's own docstring rests on
+    "not in this rank's waiting_queue is physically indistinguishable from
+    'this rank's cache has nothing for it'", which is true for every request
+    EXCEPT the one that is guaranteed to be mid-prefill.
+
+    So the retraction was spurious, and with `--chunked-prefill-size 512`
+    against ~17000-token prompts it is spurious for essentially every large
+    request, on every round but its first. Before #797 that produced a
+    narrowed pass -- a silent same-width mispair, which is very likely where
+    the bulk of instr15/16/17's 661/1651/1718 events came from. After #797 it
+    produces a voided pass, which is what instr19 measured.
+
+    WHY `extend_range.end` AND NOT A RADIX RE-MATCH. `told` asks "how many of
+    this request's leading tokens do you have KV for". For a chunked request
+    that is exactly `extend_range.end` -- `Req.get_fill_ids` is
+    `full_untruncated_fill_ids[:extend_range.end]`, so the range's end IS the
+    absolute index this rank has computed up to. A radix match would answer a
+    DIFFERENT question and answer it late: the completed chunk is not handed
+    to the tree until the top of the next round (`stash_chunked_request`),
+    which on a downstream rank has not run yet when this reconcile happens.
+    The rank holds the KV in `req_to_token` either way; a number that says
+    otherwise is the same false negative one stash later.
+
+    CONGRUENT BY CONSTRUCTION, which is what makes the retraction stop firing
+    rather than merely fire less. Every rank advances the chunked request
+    through the same `add_chunked_req` sequence, so after every COMPLETED
+    round every rank's `extend_range.end` is the same number; and a round
+    that does not complete is parked on the ranks that prepared it
+    (`_park_chunked_prefill_chunk`), which restores that same number. PP0's
+    `told` is its own count of the same quantity, so `local >= told` holds --
+    the predicate is an equality test between two ranks' progress on one
+    request, not a cache-warmth guess.
+
+    `None` when the request is not usable as a chunked source (no request, no
+    range), which every caller reads as "nothing known", i.e. the behaviour
+    that shipped before this function.
+    """
+    if req is None:
+        return None
+    end = getattr(getattr(req, "extend_range", None), "end", None)
+    if end is None:
+        return None
+    return max(0, int(end))
+
+
+def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
+    """#797/#797b: is this batch member SCHEDULER-owned rather than round-owned?
+
+    A voided pass hands its batch's requests back -- KV, mamba slot, req-pool
+    row -- and re-queues them, which is right for a request the round itself
+    admitted and wrong, in two different ways, for a request that outlives the
+    round:
+
+      * RESIDENT DECODE REQUEST (`running_mbs[mb_id]`). It keeps decoding from
+        the very pages `_release_dynamic_chunk_probe` would return to the
+        allocator, so freeing them corrupts another request's cache, and
+        re-queueing it puts it in the batch twice. The pass simply did not
+        run; it decodes again next pass from the state it still holds.
+      * THE CHUNKED REQUEST (`self.chunked_req`). `reset_for_retract` sets
+        `extend_range = None` and the next round dereferences
+        `self.chunked_req.extend_range.end` -- boot instr19, 53 seconds, all
+        three ranks. It is also not in `waiting_queue` (``add_chunked_req``
+        re-admits it from `self.chunked_req` directly), so appending it
+        duplicates it, and resetting it discards the tree handles for every
+        chunk already stashed. It is parked instead, by
+        `_park_chunked_prefill_chunk`.
+
+    A SEPARATE, NAMED PREDICATE for the same reason `pp_pass_should_void` is:
+    it is the one thing a can-fail proof must be able to neuter on its own.
+    Blinding it to False is exactly the disposal that shipped before these two
+    guards existed, while the put-back and the park still run their own
+    bodies -- so the proof shows which guard did the saving instead of
+    reverting the lot.
+    """
+    if req is None:
+        return False
+    if chunked_before is not None and req is chunked_before:
+        return True
+    return getattr(req, "rid", None) in (resident_rids or ())
+
+
 def pp_pass_should_void(
     amended: Optional[PPAdmissionDecision],
     rank: Optional[int],
@@ -1128,6 +1318,15 @@ class SchedulerPPMixin:
                         self._pp_note_output_expectation(
                             mb_id, self._pp_output_expected_incoming, amended
                         )
+                # #797b: the chunked request as it stands BEFORE this round's
+                # admission can touch it. `get_next_batch_to_run` below is
+                # where `add_chunked_req` advances it (a finished chunk clears
+                # it, `adder.new_chunked_req` starts a new one), and a voided
+                # pass has to put it back -- a rank downstream of the
+                # retraction never ran this round at all, so ITS chunked state
+                # is the pre-admission one and that is what every rank must
+                # agree on. See `_pp_absorb_void_output`.
+                self._pp_note_chunked_req_before_admission(mb_id)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -3179,6 +3378,14 @@ class SchedulerPPMixin:
         self._pp_admission_amended_by_slot: List[Optional[PPAdmissionDecision]] = [
             None
         ] * self.pp_loop_size
+        # #797b: `self.chunked_req` as it stood before each slot's admission,
+        # written every pass by `_pp_note_chunked_req_before_admission` and
+        # read only when a void has to put it back. All-None at re-entry is
+        # correct: a cutover rebuilds the ring, so no slot has a pre-admission
+        # value until this epoch publishes one.
+        self._pp_chunked_req_before_by_slot: List[Optional[Req]] = [
+            None
+        ] * self.pp_loop_size
         # #753: NOT assigned here any more. The inbox moved onto the pp_group
         # so the crossing wire -- a second consumer of the same channel --
         # shares it; ``_pp_tensor_dict_inbox`` below is now a read-only view of
@@ -3891,6 +4098,27 @@ class SchedulerPPMixin:
             self._pp_admission_amended_by_slot = carried
         carried[mb_id] = amended
 
+    def _pp_note_chunked_req_before_admission(self: Scheduler, mb_id: int) -> None:
+        """#797b: remember this slot's chunked request as it stands NOW.
+
+        Written on EVERY pass by every rank, immediately before
+        `get_next_batch_to_run`, which is the only place `self.chunked_req`
+        moves. PER SLOT and not one scalar, for the same reason
+        `_pp_output_expected_by_slot` is: the void for a slot is absorbed
+        `pp_size - 1` passes after that slot was admitted, and by then the
+        scalar would name a different round.
+
+        Tolerant of a stand-in that never ran `init_pp_loop_state`, as this
+        file's convention requires (#787): a holder without the array grows
+        one here rather than raising.
+        """
+        size = max(int(getattr(self, "pp_loop_size", 0) or 0), int(mb_id) + 1)
+        carried = getattr(self, "_pp_chunked_req_before_by_slot", None)
+        if carried is None or len(carried) < size:
+            carried = list(carried or []) + [None] * (size - len(carried or []))
+            self._pp_chunked_req_before_by_slot = carried
+        carried[int(mb_id)] = getattr(self, "chunked_req", None)
+
     def _pp_output_expected_for_slot(self: Scheduler, mb_id: int) -> bool:
         """#791b: did the FIRST rank say it will receive an output for this
         slot? False whenever nothing was ever published for it."""
@@ -4186,17 +4414,37 @@ class SchedulerPPMixin:
         physically indistinguishable from "this rank's cache has nothing
         for it", which is exactly what "local < told" already means; it
         needs no special case.
+
+        #797c EXCEPTION, AND IT IS THE ONE REQUEST THAT SENTENCE IS WRONG
+        ABOUT. The CHUNKED request is dropped from `waiting_queue` the moment
+        it is first admitted (scheduler.py's `self.waiting_queue = [x for x in
+        self.waiting_queue if x not in can_run_set]`) and lives in
+        `self.chunked_req` from then on -- so the lookup above misses it by
+        construction on every round but its first, and the miss defaults to a
+        local match of 0 for a request this rank is DEMONSTRABLY mid-prefill
+        on. That false negative retracted the same rid three times in one
+        second on boot instr19 while `told` grew by one chunk each time. It is
+        answered from the request's own progress instead; see
+        `pp_chunked_local_match` for why `extend_range.end` is the right
+        quantity and a radix re-match is not.
         """
         pp_size = self.ps.pp_size
         if pp_size <= 1:
             return {}, decision
         by_rid = {req.rid: req for req in self.waiting_queue}
+        chunked = getattr(self, "chunked_req", None)
+        chunked_rid = getattr(chunked, "rid", None)
         local_match_lens: Dict[str, int] = {}
         for entry in decision.entries:
             if not entry.admitted or entry.retracted:
                 continue
             req = by_rid.get(entry.rid)
             if req is None:
+                if chunked_rid is not None and entry.rid == chunked_rid:
+                    computed = pp_chunked_local_match(chunked)
+                    if computed is not None:
+                        local_match_lens[entry.rid] = computed
+                        continue
                 local_match_lens[entry.rid] = 0
                 continue
             req.init_next_round_input(self.tree_cache)
@@ -4986,6 +5234,36 @@ class SchedulerPPMixin:
 
         pp_absorb_admission_return(self, message)
 
+        # #797b: PUT THE CHUNKED REQUEST BACK WHERE THE ROUND FOUND IT, and do
+        # it BEFORE the disposal loop, because that loop is what killed boot
+        # instr19 (53 s, all three ranks, `'NoneType' object has no attribute
+        # 'end'` at `get_next_batch_to_run`'s `self.chunked_req.extend_range.
+        # end`). `self.chunked_req` is SCHEDULER state that outlives the
+        # round, and `get_next_batch_to_run` is the only thing that moves it:
+        # `add_chunked_req` clears it when a chunk finishes, `adder.
+        # new_chunked_req` starts a new one. A rank downstream of the
+        # retraction never ran that code this pass at all, so ITS chunked
+        # state is the pre-admission one -- which makes the pre-admission
+        # value the only one every rank can agree on, and restoring it here
+        # the only disposal that leaves the ranks congruent.
+        #
+        # Both directions matter. A chunk STARTED this round is un-started, so
+        # its request goes back to being an ordinary waiting-queue member and
+        # is retracted by the loop below like any other. A chunk CARRIED into
+        # this round stays carried, is excluded from that loop, and has this
+        # round's prepared-but-never-run chunk parked -- see
+        # `_park_chunked_prefill_chunk` for why a park and not a retraction,
+        # and why only `[len(prefix_indices):extend_range.end]` may be freed.
+        carried_slots = getattr(self, "_pp_chunked_req_before_by_slot", None)
+        chunked_before = (
+            carried_slots[mb_id]
+            if carried_slots and 0 <= mb_id < len(carried_slots)
+            else None
+        )
+        if getattr(self, "chunked_req", None) is not chunked_before:
+            self.chunked_req = chunked_before
+        parked = _park_chunked_prefill_chunk(self, chunked_before)
+
         # #797: A RESIDENT REQUEST MUST NOT BE RELEASED HERE, and this is not
         # a hardening detail -- it is a double-free. `_release_dynamic_chunk_
         # probe` hands back the request's KV pages, mamba slot and req-pool
@@ -5004,7 +5282,7 @@ class SchedulerPPMixin:
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
         released = 0
         for req in reqs:
-            if req.rid in resident:
+            if pp_void_keeps_request(req, resident, chunked_before):
                 continue
             _release_dynamic_chunk_probe(self, req)
             try:
@@ -5018,13 +5296,15 @@ class SchedulerPPMixin:
             "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
             "this microbatch downstream, so the last rank produced nothing for "
             "it, and %d of rank 0's %d request(s) have been released and "
-            "re-queued (the rest are resident in the running batch and keep "
-            "their pages -- #797). The message itself is what keeps the output "
-            "ring matched -- without it rank 0 blocks for ever in a receive no "
-            "rank is required to satisfy (boot instr11, 2026-08-21).",
+            "re-queued (the rest are resident in the running batch, or are the "
+            "chunked request, and keep their pages -- #797/#797b; chunk "
+            "parked=%s). The message itself is what keeps the output ring "
+            "matched -- without it rank 0 blocks for ever in a receive no rank "
+            "is required to satisfy (boot instr11, 2026-08-21).",
             mb_id,
             released,
             len(reqs),
+            parked,
         )
         return True
 

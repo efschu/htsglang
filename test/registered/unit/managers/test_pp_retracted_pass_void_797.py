@@ -734,5 +734,592 @@ class PPVoidForwardRule797(unittest.TestCase):
         )
 
 
+CHUNK_SIZE = 512
+PREFIX_DONE = 4096
+RID_CHUNKED = "c0ffee00000000000000000000000000"
+
+
+class _StubChunkedReq:
+    """The scheduler's `self.chunked_req`, in the state boot instr19 had it.
+
+    ~17000-token prompt, `--chunked-prefill-size 512`: 4096 tokens already
+    computed and stashed, chunk 9 prepared this round. Only the fields the
+    two shipped functions under test read are present.
+    """
+
+    def __init__(self, pool_idx=0):
+        from sglang.srt.utils.common import Range
+
+        self.rid = RID_CHUNKED
+        self.req_pool_idx = pool_idx
+        self.prefix_indices = torch.arange(PREFIX_DONE, dtype=torch.int64)
+        self.extend_range = Range(PREFIX_DONE, PREFIX_DONE + CHUNK_SIZE)
+        self.inflight_middle_chunks = 1
+        self.retracted = False
+
+    def reset_for_retract(self):
+        # The two lines of the shipped `Req.reset_for_retract` that matter
+        # here (schedule_batch.py): `extend_range` becomes None -- which is
+        # what the next round dereferences -- and the tree handles for every
+        # chunk already stashed are thrown away.
+        self.extend_range = None
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.retracted = True
+
+
+class _StubPool:
+    def __init__(self, rows=1, cols=PREFIX_DONE + CHUNK_SIZE):
+        self.req_to_token = torch.arange(rows * cols, dtype=torch.int64).view(
+            rows, cols
+        )
+        self.freed_req = []
+
+    def free(self, req):
+        self.freed_req.append(req)
+
+
+class _StubAllocator:
+    def __init__(self):
+        self.freed = []
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
+
+
+class PPVoidChunkedRequest797b(unittest.TestCase):
+    """#797b: what a voided pass owes `self.chunked_req`.
+
+    THE SPECIMEN, boot instr19 (the first metal run carrying #797): health
+    08:46:48, DEAD 08:47:41 -- 53 seconds. Retractions 3, passes voided 3,
+    `PROXY BATCH DIVERGED` 0, proxy/batch mismatch 0, so the prevention did
+    exactly what it claimed and then the bookkeeping killed the boot:
+
+        AttributeError: 'NoneType' object has no attribute 'end'
+          scheduler.py  get_next_batch_to_run
+            if self.chunked_req.extend_range.end > len(...prefix_indices):
+
+    `self.chunked_req` is SCHEDULER state that outlives the round, and it is
+    ALSO a member of the batch the round builds -- so #797's void handed it to
+    the disposal loop like any other admitted request, and
+    `reset_for_retract` set `extend_range = None`. With
+    `--chunked-prefill-size 512` against ~17000-token prompts a chunked
+    request is in flight essentially always, so the first void hit it.
+
+    THE ARMS DRIVE THE SHIPPED `get_next_batch_to_run`, not a copy of its
+    dereference, so the red arm reproduces the traceback's own line and a
+    later edit to that line cannot leave this test passing against nothing.
+    The method is bounded by #797's own withheld-round gate, which is the
+    first `return` after the block that crashed.
+    """
+
+    def _scheduler(self, chunked_req, batch_reqs):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        pool = _StubPool()
+        h = types.SimpleNamespace(
+            # -- what `_pp_absorb_void_output` reads
+            ps=types.SimpleNamespace(pp_rank=0, pp_size=WORLD),
+            pp_group=types.SimpleNamespace(is_last_rank=False, is_first_rank=True),
+            chunked_req=chunked_req,
+            waiting_queue=[],
+            running_mbs=[None] * 3,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=_StubAllocator(),
+            _pp_admission_guard=None,
+            _pp_chunked_req_before_by_slot=[None] * 3,
+            # -- what `get_next_batch_to_run`'s prologue reads, all inert
+            enable_hierarchical_cache=False,
+            enable_fpm=False,
+            enable_hisparse=False,
+            enable_lora=False,
+            dllm_config=None,
+            kv_session_offload=None,
+            _regime_observer_mode="off",
+            regime_observer=None,
+            kv_capacity_runtime=None,
+            _pp_admission_pass_voided=True,
+            _round_built_nothing=True,
+            stashed=[],
+            server_args=types.SimpleNamespace(
+                kv_reshard_vectors=None,
+                enable_phase_flip=False,
+                enable_vram_dial=False,
+                kv_pressure_ladder=None,
+                gdn_resident_state_slots=None,
+            ),
+        )
+        h.process_pending_chunked_abort = lambda: None
+        h._abort_on_waiting_timeout = lambda: None
+        h._abort_on_running_timeout = lambda rb: None
+        h._update_uniform_pool_budget = lambda: None
+        h._census_tick = lambda: None
+        h._corridor_trace_tick = lambda: None
+        h._flight_serving_tick = lambda: None
+        h.stash_chunked_request = lambda req: h.stashed.append(req)
+        h._pp_absorb_void_output = types.MethodType(
+            SchedulerPPMixin._pp_absorb_void_output, h
+        )
+        h._pp_note_chunked_req_before_admission = types.MethodType(
+            SchedulerPPMixin._pp_note_chunked_req_before_admission, h
+        )
+        h.get_next_batch_to_run = types.MethodType(Scheduler.get_next_batch_to_run, h)
+        h._batch = types.SimpleNamespace(reqs=list(batch_reqs))
+        return h
+
+    def _void_pass(self, h, mb_id=0):
+        """One voided pass over the SHIPPED code: note the pre-admission
+        chunked request (what `_event_loop_pp_body` does immediately before
+        `get_next_batch_to_run`), let the round admit it, then absorb the
+        void."""
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            _PP_VOID_OUTPUT_KEY,
+            pp_admission_decision_to_wire,
+        )
+
+        h._pp_note_chunked_req_before_admission(mb_id)
+        mbs = [None] * 3
+        mbs[mb_id] = h._batch
+        mb_metadata = [None] * 3
+        payload = {_PP_VOID_OUTPUT_KEY: True}
+        payload.update(pp_admission_decision_to_wire(_pp0_decision()))
+        return h._pp_absorb_void_output(mb_id, payload, mbs, mb_metadata)
+
+    def _next_round(self, h):
+        """The pass AFTER the void, on the shipped method. Returns nothing --
+        the point is whether it raises."""
+        running = types.SimpleNamespace(
+            is_prefill_only=False, reqs=[], batch_is_full=False
+        )
+        return h.get_next_batch_to_run(running_batch=running, last_batch=None)
+
+    def test_instr19s_raise_returns_when_the_pre_admission_value_is_blinded(self):
+        """RED, and the can-fail proof for every green below.
+
+        ONE RETURN VALUE IS NEUTERED, through `scheduler_pp_mixin`'s own
+        module globals: `pp_void_keeps_request` returning False is exactly the
+        disposal that shipped before it existed -- "every batch member is the
+        round's to hand back". Everything else still runs its own body: the
+        pre-admission value is still recorded, `self.chunked_req` is still put
+        back, `_park_chunked_prefill_chunk` still parks the chunk. The loop
+        then retracts the chunked request anyway, `reset_for_retract` sets
+        `extend_range = None`, and the SHIPPED `get_next_batch_to_run` raises
+        instr19's own AttributeError on instr19's own line. A wholesale revert
+        would yield an AttributeError from the harness and prove nothing.
+        """
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        chunked = _StubChunkedReq()
+        h = self._scheduler(chunked, [chunked])
+        keeps = m.pp_void_keeps_request
+        m.pp_void_keeps_request = lambda req, resident, chunked_before: False
+        try:
+            self._void_pass(h)
+        finally:
+            m.pp_void_keeps_request = keeps
+        # The retraction really happened in the blinded run -- that is what
+        # makes the raise below the specimen rather than a broken harness.
+        self.assertTrue(chunked.retracted)
+        self.assertIsNone(chunked.extend_range)
+        with self.assertRaises(AttributeError) as caught:
+            self._next_round(h)
+        self.assertIn("'NoneType' object has no attribute 'end'", str(caught.exception))
+
+    def test_a_carried_chunk_survives_the_void_and_the_next_round_runs(self):
+        """GREEN, and the arm that reproduces instr19 when the fix is absent.
+
+        The chunked request is put back, parked, and NOT retracted, so the
+        next round's `self.chunked_req.extend_range.end` is a number rather
+        than an attribute of None.
+        """
+        chunked = _StubChunkedReq()
+        h = self._scheduler(chunked, [chunked])
+        self.assertTrue(self._void_pass(h))
+        self.assertIs(h.chunked_req, chunked, "the chunked request was dropped")
+        self.assertIsNotNone(
+            chunked.extend_range,
+            "reset_for_retract ran on the chunked request -- this is instr19",
+        )
+        self.assertFalse(chunked.retracted)
+        self.assertNotIn(chunked, h.waiting_queue, "re-queued AND still chunked")
+        try:
+            self._next_round(h)
+        except AttributeError as exc:  # pragma: no cover - this IS the defect
+            self.fail(f"instr19's raise is back: {exc}")
+
+    def test_the_parked_chunk_is_not_stashed_next_round(self):
+        """THE HALF A DEFINED extend_range ALONE WOULD NOT FIX.
+
+        `get_next_batch_to_run` stashes the chunk whenever `extend_range.end >
+        len(prefix_indices)`. The chunk a voided pass prepared was computed by
+        no rank downstream of the retraction, so stashing it would put a node
+        in THIS rank's radix tree that they lack -- and the next offer for
+        that prefix is then unhonourable, which is a void per chunk, i.e.
+        #630's livelock. The park makes the stash a no-op, which is the state
+        `add_chunked_req`'s own zero-budget park already produces.
+        """
+        chunked = _StubChunkedReq()
+        h = self._scheduler(chunked, [chunked])
+        self._void_pass(h)
+        self.assertEqual(
+            chunked.extend_range.end,
+            len(chunked.prefix_indices),
+            "a parked chunk must leave end == len(prefix_indices)",
+        )
+        self._next_round(h)
+        self.assertEqual(h.stashed, [], "an uncomputed chunk was stashed")
+
+    def test_only_this_rounds_allocation_is_freed_never_the_tree_s_prefix(self):
+        """THE DOUBLE FREE THE OBVIOUS FIX WOULD HAVE MADE.
+
+        `_release_dynamic_chunk_probe` frees `[:extend_range.end]`, which is
+        right for the synthetic dynamic-chunk probe it was written for and
+        wrong here: `[:len(prefix_indices)]` belongs to the RADIX TREE, held
+        under a lock ref by every chunk already stashed. Only
+        `[len(prefix_indices):end]` was allocated by the round being undone.
+        """
+        chunked = _StubChunkedReq()
+        h = self._scheduler(chunked, [chunked])
+        self._void_pass(h)
+        self.assertEqual(len(h.token_to_kv_pool_allocator.freed), 1)
+        freed = h.token_to_kv_pool_allocator.freed[0]
+        self.assertEqual(len(freed), CHUNK_SIZE, "wrong number of pages returned")
+        expected = h.req_to_token_pool.req_to_token[
+            0, PREFIX_DONE : PREFIX_DONE + CHUNK_SIZE
+        ]
+        self.assertTrue(torch.equal(freed, expected))
+        self.assertEqual(
+            h.req_to_token_pool.freed_req, [], "the req-pool row was handed back"
+        )
+
+    def test_the_admissions_inflight_increment_is_given_back(self):
+        """`inflight_middle_chunks` is incremented at admission and
+        decremented in `process_batch_result_prefill`, which never runs for a
+        voided pass. It gates `req.finished()`, so a leaked increment is a
+        request that can never report finished."""
+        chunked = _StubChunkedReq()
+        h = self._scheduler(chunked, [chunked])
+        self._void_pass(h)
+        self.assertEqual(chunked.inflight_middle_chunks, 0)
+
+    def test_a_chunk_started_this_round_is_un_started_not_kept(self):
+        """THE OTHER DIRECTION, and it is why the pre-admission value is
+        recorded rather than `self.chunked_req` simply being spared.
+
+        A rank downstream of the retraction never ran this round, so it has NO
+        chunked request. A rank that started one this round and kept it would
+        be the only rank mid-chunk -- a membership divergence, which is the
+        defect #797 exists to prevent. Restoring the pre-admission value (here
+        None) un-starts it, and the request is then an ordinary batch member
+        that the disposal loop retracts and re-queues.
+        """
+        started = _StubChunkedReq()
+        h = self._scheduler(None, [started])
+        h._pp_note_chunked_req_before_admission(0)
+        h.chunked_req = started  # what `adder.new_chunked_req` did this round
+        mbs, mb_metadata = [None] * 3, [None] * 3
+        mbs[0] = h._batch
+        from sglang.srt.managers.scheduler_pp_mixin import _PP_VOID_OUTPUT_KEY
+
+        h._pp_absorb_void_output(0, {_PP_VOID_OUTPUT_KEY: True}, mbs, mb_metadata)
+        self.assertIsNone(h.chunked_req, "a chunk started this round was kept")
+        self.assertTrue(started.retracted, "it must be retracted like any member")
+        self.assertIn(started, h.waiting_queue)
+
+    def test_the_crash_line_is_still_the_line_this_pins(self):
+        """DRIFT GUARD. The arms above bound the shipped method with #797's
+        own gate; if the dereference this file exists for ever moves out of
+        `get_next_batch_to_run`, they would pass against nothing."""
+        import inspect
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        src = inspect.getsource(Scheduler.get_next_batch_to_run)
+        self.assertIn("self.chunked_req.extend_range.end", src)
+        self.assertLess(
+            src.index("self.chunked_req.extend_range.end"),
+            src.index("_pp_admission_pass_voided"),
+            "the crash line must stay AHEAD of the gate that bounds these arms",
+        )
+
+
+PROMPT_TOKENS = 4096
+
+
+class _ChunkingReq:
+    """One request being chunk-prefilled, advanced the way the scheduler
+    advances it: `prepare_for_extend` sets `extend_range` to the chunk about
+    to run, and a COMPLETED round leaves `extend_range.end` at the absolute
+    index computed so far (`Req.get_fill_ids` is
+    `full_untruncated_fill_ids[:extend_range.end]`)."""
+
+    def __init__(self, rid, total=PROMPT_TOKENS, chunk=CHUNK_SIZE):
+        from sglang.srt.utils.common import Range
+
+        self.rid = rid
+        self.total = total
+        self.chunk = chunk
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.extend_range = Range(0, 0)
+        self.inflight_middle_chunks = 0
+        self.req_pool_idx = None
+
+    @property
+    def computed(self):
+        return self.extend_range.end
+
+    def stash_and_rematch(self):
+        """The top of a round: the completed chunk goes into the radix tree
+        and `init_next_round_input` matches it straight back, so
+        `prefix_indices` catches up with what was computed."""
+        self.prefix_indices = torch.arange(self.computed, dtype=torch.int64)
+
+    def prepare_chunk(self):
+        """`add_chunked_req` + `prepare_for_extend`."""
+        from sglang.srt.utils.common import Range
+
+        start = len(self.prefix_indices)
+        self.extend_range = Range(start, min(self.total, start + self.chunk))
+        self.inflight_middle_chunks += 1
+
+    def done(self):
+        return self.computed >= self.total
+
+
+class PPChunkedOfferLivelock797c(unittest.TestCase):
+    """#797c: `local` was never measured for the chunked request.
+
+    THE SPECIMEN, boot instr19, one rid, three retractions in one second,
+    `told` GROWING by exactly one chunk while `local` stayed 0:
+
+        08:47:26 PP1 unhonourable prefix: rid=d4f59edf... told=512  local=0
+        08:47:27 PP1 unhonourable prefix: rid=d4f59edf... told=1024 local=0
+        08:47:27 PP1 unhonourable prefix: rid=d4f59edf... told=1536 local=0
+        -> 3 voided passes, 1 distinct rid
+
+    and one second earlier, in the same log, all three ranks had admitted that
+    request's FIRST chunk congruently (`prefix_lens=0`). PP1 had the KV. What
+    it did not have was a way to say so: `_pp_reconcile_incoming_admission`
+    looks a rid up in `self.waiting_queue`, and scheduler.py drops every
+    admitted request out of that queue, so a chunked request -- which then
+    lives in `self.chunked_req` -- misses the lookup on every round but its
+    first and the miss DEFAULTS to 0.
+
+    So the retraction was spurious, on essentially every large request
+    (`--chunked-prefill-size 512`, ~17000-token prompts), on every round but
+    the first. Before #797 that was a narrowed pass and a silent same-width
+    mispair; after #797 it is a voided pass, and the boot's own amended gate
+    (voided passes <= distinct retracted rids) fails it 3 to 1.
+
+    THE TERMINATION ARGUMENT THESE ARMS PROVE, rather than assert:
+      * `told` is PP0's count of the tokens it has computed for the request;
+        `local` is the same count on the downstream (`extend_range.end`).
+      * Every rank advances the request through the same chunk sequence, so
+        after every COMPLETED round the two counts are EQUAL and `local >=
+        told` holds -- no retraction, hence no void.
+      * A round that does NOT complete is parked on the ranks that prepared it
+        (#797b), which restores the same count -- so `told` is NON-INCREASING
+        across a void and strictly increasing only across a completed round.
+      * A strictly increasing count bounded by the prompt length terminates.
+    """
+
+    def _reconciler(self, chunked_req):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        h = types.SimpleNamespace(
+            ps=types.SimpleNamespace(pp_rank=VICTIM, pp_size=WORLD),
+            waiting_queue=[],
+            chunked_req=chunked_req,
+            tree_cache=None,
+        )
+        h._pp_reconcile_incoming_admission = types.MethodType(
+            SchedulerPPMixin._pp_reconcile_incoming_admission, h
+        )
+        return h
+
+    def _offer(self, pp0_req):
+        """PP0's decision for this round, through the SHIPPED builder."""
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        return build_pp_admission_decision(
+            LIVE_MB, [_PP0View(pp0_req)], pp_size=WORLD, guard=None
+        )
+
+    def _drive(self, rounds=12, blind=False, park=True):
+        """Run ONE rid through repeated offers across chunk boundaries, on the
+        shipped reconcile. Returns (told sequence, retraction count, done)."""
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        pp0 = _ChunkingReq("d4f59edff89e46758eedf3d56227fe72")
+        pp1 = _ChunkingReq("d4f59edff89e46758eedf3d56227fe72")
+        h = self._reconciler(pp1)
+        told_seq, retractions = [], 0
+        real = m.pp_chunked_local_match
+        if blind:
+            # The pre-#797c reader: "not in the waiting queue, so nothing
+            # known". Every body still runs -- the reconcile, the builder, the
+            # retraction test -- only this one lookup answers as it did.
+            m.pp_chunked_local_match = lambda req: None
+        try:
+            for _ in range(rounds):
+                if pp0.done():
+                    break
+                # Top of PP0's round: stash the completed chunk, re-match it,
+                # prepare the next one, then publish the offer.
+                pp0.stash_and_rematch()
+                pp0.prepare_chunk()
+                decision = self._offer(pp0)
+                told_seq.append(decision.entries[0].prefix_len)
+                _, amended = h._pp_reconcile_incoming_admission(decision)
+                if any(e.retracted for e in amended.entries):
+                    retractions += 1
+                    if park:
+                        # #797b: the pass is voided, so PP0 parks the chunk it
+                        # prepared -- its count does NOT advance.
+                        from sglang.srt.utils.common import Range
+
+                        pp0.extend_range = Range(
+                            len(pp0.prefix_indices), len(pp0.prefix_indices)
+                        )
+                    # park=False is instr19's tree: the prepared chunk is left
+                    # in place, so the next round stashes a chunk no rank
+                    # downstream computed and the offer climbs.
+                    continue
+                # The round completed on every rank.
+                pp1.stash_and_rematch()
+                pp1.prepare_chunk()
+        finally:
+            m.pp_chunked_local_match = real
+        # DONE IS THE DOWNSTREAM'S, not PP0's. PP0 racing ahead of a stage
+        # that never computes the request is the livelock, not the cure --
+        # under park=False PP0 reaches the end of the prompt alone.
+        return told_seq, retractions, pp1.done()
+
+    def test_repeated_offers_of_one_rid_never_retract_and_the_request_finishes(self):
+        """GREEN, and the termination proof.
+
+        `told` is non-decreasing, advances by exactly one chunk per COMPLETED
+        round, never repeats a value (which is what a livelock looks like),
+        and the request reaches the end of its prompt.
+        """
+        told, retractions, done = self._drive()
+        self.assertEqual(retractions, 0, f"spurious retractions: told={told}")
+        self.assertTrue(done, f"the request never finished: told={told}")
+        self.assertEqual(told, sorted(told), "told must never go backwards")
+        self.assertEqual(len(told), len(set(told)), f"told repeated: {told}")
+        self.assertEqual(
+            told[: len(told)],
+            [i * CHUNK_SIZE for i in range(len(told))],
+            "told must advance by exactly one chunk per completed round",
+        )
+
+    def test_the_blinded_lookup_reproduces_instr19s_growing_offer(self):
+        """RED #1: instr19's tree exactly -- #797c blinded AND no park.
+
+        The first round is congruent at told=0 and RUNS (log line 1737, all
+        three ranks `prefix_lens=0`). From the second round on the lookup
+        misses, `local` reads 0 for a request this rank has computed, every
+        offer retracts, and because the prepared chunk is never parked PP0
+        stashes it anyway and re-offers one chunk more:
+
+            told=512 local=0 / told=1024 local=0 / told=1536 local=0
+
+        3 voided passes, 1 distinct rid -- the amended gate's failing ratio.
+        The offer grows without bound, so this cannot converge: it is a
+        livelock, not a slow clamp.
+        """
+        told, retractions, done = self._drive(rounds=12, blind=True, park=False)
+        self.assertFalse(done, "the downstream never computed the request")
+        self.assertEqual(
+            retractions,
+            len(told) - 1,
+            f"every round after the first must retract: {told}",
+        )
+        self.assertEqual(
+            told[:4],
+            [0, CHUNK_SIZE, 2 * CHUNK_SIZE, 3 * CHUNK_SIZE],
+            "instr19's measured sequence (0 then 512/1024/1536) must come back",
+        )
+        # THE SHAPE OF THE LIVELOCK, stated as a number: PP0 walks the whole
+        # prompt on its own -- one chunk per voided round -- while the
+        # downstream computes nothing at all. The offer is bounded here only
+        # by the prompt length, and every one of those rounds is a void.
+        self.assertEqual(told[-1] + CHUNK_SIZE, PROMPT_TOKENS)
+
+    def test_the_park_alone_leaves_a_flat_livelock(self):
+        """RED #2, and the reason #797b is NOT sufficient on its own.
+
+        With the park in place and only #797c blinded, the offer stops
+        growing -- and the request still never finishes, because the retraction
+        that voids the round is spurious in the first place. Fixing the
+        runaway offer without fixing the false negative converts an
+        accelerating livelock into a stationary one, which the amended gate
+        fails just as hard.
+        """
+        told, retractions, done = self._drive(rounds=12, blind=True, park=True)
+        self.assertFalse(done, "the blinded run was supposed to livelock")
+        self.assertGreaterEqual(retractions, 11)
+        self.assertEqual(
+            set(told[1:]), {CHUNK_SIZE}, f"the park must hold the offer flat: {told}"
+        )
+
+    def test_told_does_not_advance_across_a_voided_round(self):
+        """#797b's half of the termination argument, isolated.
+
+        The park is what makes `told` non-increasing across a void. Without
+        it, PP0 stashes a chunk no downstream rank computed and re-offers
+        told + one chunk -- which is the growth instr19 measured, and it is
+        unbounded.
+        """
+        pp0 = _ChunkingReq("rid-park")
+        pp0.stash_and_rematch()
+        pp0.prepare_chunk()
+        before = self._offer(pp0).entries[0].prefix_len
+        from sglang.srt.utils.common import Range
+
+        pp0.extend_range = Range(len(pp0.prefix_indices), len(pp0.prefix_indices))
+        pp0.stash_and_rematch()
+        pp0.prepare_chunk()
+        self.assertEqual(
+            self._offer(pp0).entries[0].prefix_len,
+            before,
+            "a voided round must not advance the offer",
+        )
+
+    def test_a_rid_that_is_genuinely_unknown_still_reads_as_zero(self):
+        """REGRESSION. The waiting-queue miss must keep meaning "nothing
+        known" for every request that is NOT this rank's chunked one --
+        that default is what #791's cold-cache retraction rests on."""
+        from sglang.srt.managers.pp_admission_congruence import (
+            PPAdmissionDecision,
+            PPAdmissionEntry,
+        )
+
+        h = self._reconciler(_ChunkingReq("some-other-rid"))
+        decision = PPAdmissionDecision(
+            mb_id=LIVE_MB,
+            entries=(
+                PPAdmissionEntry(
+                    rid=RID_UNHONOURABLE, prefix_len=TOLD_PREFIX, extend_len=64
+                ),
+            ),
+        )
+        effective, amended = h._pp_reconcile_incoming_admission(decision)
+        self.assertEqual(effective, {})
+        self.assertTrue(amended.entries[0].retracted)
+        self.assertEqual(amended.entries[0].observed_local, 0)
+
+
+class _PP0View:
+    """What `build_pp_admission_decision` reads off a request."""
+
+    def __init__(self, req):
+        self.rid = req.rid
+        self.prefix_indices = req.prefix_indices
+        self.extend_input_len = req.extend_range.length
+
+
 if __name__ == "__main__":
     unittest.main()
