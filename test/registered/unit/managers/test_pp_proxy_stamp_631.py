@@ -107,6 +107,14 @@ class _Rank:
     def _pp_flip_bump_sent(self, chan):
         pass
 
+    # #789 HARNESS REPAIR (interface drift, no assertion touched):
+    # _pp_send_dict_to_next_stage now publishes an "entered the send" count
+    # BEFORE the post, so a downstream can tell a RENDEZVOUS sender from an
+    # idle one. This rank counts nothing, so a no-op restores this file's
+    # previous behaviour rather than changing it.
+    def _pp_flip_bump_attempted(self, chan):
+        pass
+
 
 def _msg(mb_id, seq, rows, tag=None):
     d = {

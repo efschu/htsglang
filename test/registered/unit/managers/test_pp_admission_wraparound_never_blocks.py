@@ -206,6 +206,12 @@ def _make_holder(rank: int, wire: _RingWire):
     )
     h._pp_boundary_stats = lambda: None
     h._pp_flip_bump_sent = lambda chan: None
+    # #789 HARNESS REPAIR (interface drift, no assertion touched):
+    # _pp_send_dict_to_next_stage now publishes an 'entered the send'
+    # count before the post, so a downstream can tell a RENDEZVOUS
+    # sender from an idle one. This holder counts nothing, so a no-op
+    # restores its previous behaviour rather than changing it.
+    h._pp_flip_bump_attempted = lambda chan: None
     h._pp_flip_bump_consumed = lambda chan: None
     for name in (
         "_pp_send_admission_decision",

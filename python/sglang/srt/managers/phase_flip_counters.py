@@ -55,6 +55,21 @@ feature exists to remove. There is no third option and no "mostly fine"
 here: the ordering is the design.
 Pinned by ``test_can_fail_publishing_before_the_post_wedges_the_receiver``.
 
+THE QUESTION THAT RULE CANNOT ANSWER, AND THE SECOND COUNTER (#789)
+------------------------------------------------------------------
+Because ``sent`` means "on the wire", it says nothing during the window in
+which the sender is INSIDE the send call. That window is empty for an
+isend -- until the send is a RENDEZVOUS, which the lazy creation of a
+torch NCCL 2-rank p2p communicator is: it does not return until the peer
+enters the matching receive. A receiver gating on ``sent`` alone then
+becomes one arc of a cycle it is itself waiting to break. Two boots died
+there (2026-08-21). ``bump_attempted`` / ``attempted`` answer the other
+question -- "has the upstream irrevocably entered a send for me?" -- and
+are published BEFORE the post for exactly that reason. The rule above is
+unchanged and still governs ``sent``; see ``bump_attempted`` for why the
+second counter is not the phantom-message hazard wearing a new name, and
+why only the gate that would otherwise RAISE may read it.
+
 WHY A REWRITTEN FILE AND NOT A WRITE-ONCE MARKER PER MESSAGE
 ------------------------------------------------------------
 Presence markers are write-once because they answer a yes/no question that
@@ -133,6 +148,11 @@ CHAN_SLOT = "slot"
 
 _SENT = "s"
 _CONSUMED = "c"
+#: "This rank has ENTERED the send call for one more message on this
+#: channel", published BEFORE the post. See ``bump_attempted``: this is a
+#: second, differently-timed counter, NOT a relaxation of the ordering rule
+#: above, which governs ``_SENT`` and is unchanged.
+_ATTEMPTED = "a"
 
 
 class PhaseFlipCounters:
@@ -197,6 +217,74 @@ class PhaseFlipCounters:
         self._publish(chan, _SENT, n)
         return n
 
+    def bump_attempted(self, chan: str) -> int:
+        """Record that this rank has ENTERED the send call for one message.
+
+        PUBLISHED BEFORE THE POST -- the opposite timing to ``bump_sent``,
+        and the reason a second counter exists at all instead of moving
+        the first one.
+
+        WHY THE ORDERING RULE IN THE MODULE DOCSTRING IS NOT WEAKENED.
+        That rule governs ``_SENT`` and still does, unchanged: ``sent``
+        means "on the wire", and nothing may publish it early. This
+        counter answers a DIFFERENT question -- "has the upstream
+        irrevocably committed to sending me a message?" -- which the
+        ``sent`` counter structurally cannot answer, because the very
+        window in which the answer matters is the window BEFORE the post
+        completes.
+
+        THE FAILURE THAT MADE THIS NECESSARY (#789, boots instr7 + instr8,
+        2026-08-21, both identical). ``_pp_wait_for_proxy_readiness`` refuses
+        to enter the blocking proxy receive until ``sent`` exceeds this
+        rank's ``consumed``. Its docstring argued a stuck SENDER is
+        "covered identically" to a sender that never intended to send.
+        That is true only if the sender's progress is INDEPENDENT of the
+        receiver. It is not: the first point-to-point op on a torch NCCL
+        process group creates the 2-rank communicator lazily, and that
+        creation is a RENDEZVOUS -- ``isend`` does not return until the
+        peer enters the matching receive. So on the first real prefill of
+        every boot:
+
+            PP0  isend (distributed_c10d.py:2552)
+                 send_tensor_dict (parallel_state.py:2384)
+                 _pp_send_dict_to_next_stage (scheduler_pp_mixin.py:3196)
+            PP1  _pp_wait_for_proxy_readiness, polling counters
+            PP2  the same, one hop behind
+
+        PP0 cannot bump ``sent`` until the isend returns; the isend cannot
+        return until PP1 enters the receive; PP1 will not enter the
+        receive until ``sent`` bumps. A three-arc cycle in which the
+        readiness gate is itself one of the arcs. 30 s later the gate
+        raised "#789 PROXY READINESS TIMEOUT ... posted 1681, consumed
+        1681" and killed the boot -- a message that was NOT absent, it was
+        being posted, waiting for the very rank that refused to collect
+        it.
+
+        WHY THIS IS NOT THE PHANTOM-MESSAGE HAZARD IN REVERSE. The hazard
+        the ordering rule prevents is a receiver blocking for a message
+        NOBODY DECIDED TO SEND -- unbounded, because it waits on peer
+        scheduling. Here the decision is already made and unconditional:
+        this counter is bumped on the line immediately before the send
+        call, past every branch that could still skip it, so a receiver
+        acting on it waits only for a post that a peer is already inside.
+        That is bounded by transfer and rendezvous time, which is exactly
+        the bound the module docstring asks for. The one way the post can
+        still never happen is the sender RAISING inside it -- in which
+        case that rank dies and distributed teardown ends the receiver's
+        wait, the same disposal every dead-upstream case already relies
+        on.
+
+        Consequently only the gate that would otherwise RAISE reads this
+        counter. The drain loops keep reading ``sent``: they must take off
+        the wire only what is provably already on it, and are correct to
+        stop when nothing is.
+        """
+        key = (chan, _ATTEMPTED)
+        n = self._local.get(key, 0) + 1
+        self._local[key] = n
+        self._publish(chan, _ATTEMPTED, n)
+        return n
+
     def bump_consumed(self, chan: str) -> int:
         """Record one more message fully TAKEN OFF ``chan`` by this rank.
 
@@ -245,6 +333,17 @@ class PhaseFlipCounters:
     def consumed(self, chan: str, rank: int) -> int:
         return self._read(chan, _CONSUMED, rank)
 
+    def attempted(self, chan: str, rank: int) -> int:
+        """How many sends ``rank`` has ENTERED on ``chan``. See bump_attempted.
+
+        Always >= ``sent(chan, rank)`` for the same rank, since every post
+        is entered before it completes. A reader that gates on this one is
+        therefore strictly more permissive than one gating on ``sent``,
+        which is the entire point: the difference between the two IS the
+        set of messages currently being posted.
+        """
+        return self._read(chan, _ATTEMPTED, rank)
+
     def local_sent(self, chan: str) -> int:
         return self._local.get((chan, _SENT), 0)
 
@@ -268,7 +367,11 @@ class PhaseFlipCounters:
         """
         removed = 0
         prefix = f"{self.instance}.ctr."
-        suffixes = (f".{_SENT}{self.rank}", f".{_CONSUMED}{self.rank}")
+        suffixes = (
+            f".{_SENT}{self.rank}",
+            f".{_CONSUMED}{self.rank}",
+            f".{_ATTEMPTED}{self.rank}",
+        )
         try:
             names = os.listdir(self.directory)
         except OSError:

@@ -1806,6 +1806,11 @@ class SchedulerPPMixin:
         if counters is not None:
             counters.bump_sent(chan)
 
+    def _pp_flip_bump_attempted(self: Scheduler, chan: str) -> None:
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is not None:
+            counters.bump_attempted(chan)
+
     def _pp_flip_bump_consumed(self: Scheduler, chan: str) -> None:
         counters = getattr(self, "pp_flip_counters", None)
         if counters is not None:
@@ -3192,6 +3197,22 @@ class SchedulerPPMixin:
         p2p_work = []
         stats = self._pp_boundary_stats()
         started = time.perf_counter() if stats else 0.0
+        # #789: publish "a send for you is now under way" BEFORE the call,
+        # because the call itself can be a RENDEZVOUS. The first p2p op on
+        # a torch NCCL group creates its 2-rank communicator lazily, and
+        # `isend` then does not return until the downstream enters the
+        # matching receive -- so a counter published only AFTER the post
+        # cannot exist in the window where the downstream is deciding
+        # whether entering that receive is safe. Boots instr7/instr8
+        # (2026-08-21) both died there: PP0 inside this isend, PP1 and PP2
+        # in `_pp_wait_for_proxy_readiness` refusing to collect it, the gate
+        # raising after 30 s over "posted 1681, consumed 1681".
+        #
+        # This does NOT relax the counter module's ordering rule. `sent`
+        # below still means "on the wire" and is still published strictly
+        # after the post; this is a second counter with a second meaning.
+        # See PhaseFlipCounters.bump_attempted for the full argument.
+        self._pp_flip_bump_attempted(CHAN_DICT)
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
@@ -3629,9 +3650,26 @@ class SchedulerPPMixin:
         upstream's ``send_tensor_dict`` call returns, a sender that is
         itself stuck mid-send (metadata not yet posted, or a device-level
         payload send not yet posted) also never advances its counter --
-        this rank's poll sees the same "nothing new" either way, so a
-        stuck SENDER is covered identically to a sender that never
-        intended to send at all. What this gate does NOT cover: a send
+        this rank's poll sees the same "nothing new" either way.
+
+        THAT LAST SENTENCE USED TO END "so a stuck SENDER is covered
+        identically to a sender that never intended to send at all", AND
+        THAT WAS THE #789 DEFECT, not a description of it. Treating the
+        two identically is safe only when the sender's progress does not
+        depend on this rank. When the send is a RENDEZVOUS -- the lazy
+        creation of a torch NCCL 2-rank p2p communicator, which every boot
+        performs on its first real prefill -- the sender is stuck
+        PRECISELY BECAUSE this rank has not entered the receive, and this
+        gate refusing to enter it closes the cycle rather than avoiding
+        one. Boots instr7 and instr8 (2026-08-21) both died there, with
+        PP0 in `isend` inside `_pp_send_dict_to_next_stage` while PP1 and
+        PP2 polled here and then raised over "posted 1681, consumed 1681".
+        The two cases are now distinguished by a second counter,
+        `attempted`, published before the send rather than after it: a
+        sender inside a send has entered it, a sender that scheduled
+        nothing has not. See PhaseFlipCounters.bump_attempted.
+
+        What this gate does NOT cover: a send
         whose ``isend`` call has already returned (so ``bump_sent`` already
         fired and this gate already let the receive proceed) but whose
         underlying transfer then stalls mid-flight on the wire -- e.g. a
@@ -3669,6 +3707,24 @@ class SchedulerPPMixin:
                 # from here it is bounded by transfer time, not by whether
                 # the upstream ever schedules anything.
                 return
+            attempted = counters.attempted(CHAN_DICT, upstream)
+            if consumed < attempted:
+                # #789: the upstream is INSIDE a send for this rank right
+                # now. That is just as positive a signal as "posted", and
+                # it is the ONLY one available while the send in question
+                # is a rendezvous -- the first p2p op on a torch NCCL group
+                # creates its communicator lazily, and that isend cannot
+                # return, so `posted` above cannot bump, until THIS rank
+                # enters the receive. Gating on `posted` alone therefore
+                # made this gate one arc of a three-arc cycle and killed
+                # boots instr7 and instr8 on their first real prefill.
+                #
+                # Waiting here is bounded for the same reason the `posted`
+                # branch is: the decision to send is already taken and
+                # unconditional (the counter is bumped on the line before
+                # the send call), so the only remaining wait is transfer
+                # and rendezvous time. See PhaseFlipCounters.bump_attempted.
+                return
             now = time.monotonic()
             if deadline is None:
                 deadline = now + _pp_proxy_readiness_budget_s()
@@ -3679,20 +3735,23 @@ class SchedulerPPMixin:
             logger.error(
                 "%s #789 PROXY READINESS TIMEOUT: mb_id=%s -- this rank's "
                 "upstream (rank %s) has posted %d dict message(s) on CHAN_DICT "
-                "and this rank has consumed %d; no new message appeared within "
-                "%.1fs. No upstream scheduled work for this slot -- refusing "
-                "to enter the blocking proxy receive rather than wedge.",
+                "(entered %d) and this rank has consumed %d; no new message "
+                "appeared within %.1fs. No upstream scheduled work for this "
+                "slot -- refusing to enter the blocking proxy receive rather "
+                "than wedge.",
                 "PHASE-FLIP",
                 mb_id,
                 upstream,
                 posted,
+                attempted,
                 consumed,
                 budget,
             )
             raise RuntimeError(
                 f"#789 PROXY READINESS TIMEOUT: mb_id={mb_id}: this rank's "
                 f"upstream (rank {upstream}) posted {posted} dict message(s) "
-                f"on CHAN_DICT, this rank has consumed {consumed}, and no new "
+                f"on CHAN_DICT (entered {attempted}), this rank has consumed "
+                f"{consumed}, and no new "
                 f"message appeared within {budget:.1f}s. No upstream scheduled "
                 f"work for this slot; refusing to enter an unbounded blocking "
                 f"receive. See #789."

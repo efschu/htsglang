@@ -307,6 +307,13 @@ def _drain_n(h, live_mb_id, n):
     state = {"consumed": 0}
     h.pp_flip_counters = types.SimpleNamespace(
         sent=lambda chan, rank: n,
+        # #789 HARNESS REPAIR (interface drift, no assertion touched):
+        # the readiness gate now also reads an 'entered the send'
+        # count, which distinguishes a RENDEZVOUS sender from an idle
+        # one. Reading the same source as `sent` keeps this stub's
+        # meaning exactly as it was: whatever it says was posted, it
+        # had necessarily been entered first.
+        attempted=lambda chan, rank: n,
         local_consumed=lambda chan: state["consumed"],
     )
     h._pp_flip_bump_consumed = lambda chan: state.__setitem__(
@@ -339,6 +346,13 @@ def _drain_dynamic(h, live_mb_id, counter_path):
 
     h.pp_flip_counters = types.SimpleNamespace(
         sent=_read_sent,
+        # #789 HARNESS REPAIR (interface drift, no assertion touched):
+        # the readiness gate now also reads an 'entered the send'
+        # count, which distinguishes a RENDEZVOUS sender from an idle
+        # one. Reading the same source as `sent` keeps this stub's
+        # meaning exactly as it was: whatever it says was posted, it
+        # had necessarily been entered first.
+        attempted=_read_sent,
         local_consumed=lambda chan: state["consumed"],
     )
     h._pp_flip_bump_consumed = lambda chan: state.__setitem__(

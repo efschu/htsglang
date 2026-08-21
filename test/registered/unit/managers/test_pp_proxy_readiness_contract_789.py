@@ -254,6 +254,15 @@ def _victim(rank, wire, out_dir, case):
 
     counters = types.SimpleNamespace(
         sent=_sent,
+        # #789 second counter: "the upstream has ENTERED a send for me",
+        # published before the post so a RENDEZVOUS send (the lazy creation
+        # of a torch NCCL 2-rank p2p communicator) is distinguishable from
+        # an upstream that scheduled nothing. It reads the same source as
+        # `sent` here, which keeps BOTH constellations this file tests
+        # intact: an idle upstream has neither entered nor posted (0, so
+        # the gate still raises), and a healthy upstream that posted had
+        # necessarily entered first.
+        attempted=_sent,
         local_consumed=lambda chan: state["consumed"],
     )
     h = types.SimpleNamespace(
