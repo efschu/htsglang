@@ -6596,7 +6596,7 @@ class Scheduler(
 
             logger.info(
                 "#788 PP-ADMISSION verdict=%s n_reqs=%d rids=%s prefix_lens=%s "
-                "avail=%d evictable=%d queue=%d running=%d chunked=%d",
+                "avail=%d evictable=%d queue=%d running=%d chunked=%d reason=%s",
                 verdict,
                 n_reqs,
                 rids,
@@ -6606,6 +6606,11 @@ class Scheduler(
                 queue,
                 running,
                 chunked,
+                # #791b-instr22: WHICH gate declined, set by
+                # _get_new_batch_prefill_raw. "-" on ADMIT lines and on
+                # paths that never reached the prefill raw body (e.g. a
+                # decode-only pass), so the field never lies by omission.
+                getattr(self, "_admission_decline_note", None) or "-",
             )
         except Exception as e:  # noqa: BLE001
             # An instrument must never be able to kill the scheduler it is
@@ -6751,6 +6756,15 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        # #791b-instr22: WHY a pass admitted nothing, named. instr22 died on
+        # two TP replicas declining the same queued request a third one
+        # admitted (verdict=DECLINE vs verdict=ADMIT, 11:16:26), and the
+        # trace could show THAT they diverged but not WHICH of the half-dozen
+        # rank-local gates split. Every decline path below therefore names
+        # itself here, and _trace_pp_admission_verdict prints it on DECLINE
+        # lines. Host-side strings only (#790).
+        self._admission_decline_note = None
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -6786,6 +6800,10 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            self._admission_decline_note = (
+                f"gate=batch_full_or_empty_queue(batch_is_full="
+                f"{int(running_batch.batch_is_full)},queue={len(self.waiting_queue)})"
+            )
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -6798,6 +6816,10 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
+            self._admission_decline_note = (
+                f"gate=min_free_slots_delay(running_bs={running_bs},"
+                f"allocatable={self.get_num_allocatable_reqs(running_bs)})"
+            )
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -6811,6 +6833,9 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._admission_decline_note = (
+                f"gate=no_allocatable_reqs(running_bs={running_bs})"
+            )
             return None, running_batch
 
         # Get priority queue
@@ -6820,6 +6845,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            self._admission_decline_note = "gate=test_retract"
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
@@ -7023,9 +7049,20 @@ class Scheduler(
         # so `alloc_group_end` below still runs on its own line. Leaking an
         # open mamba alloc group would replace one corruption with another.
         schedule_refusal: Optional[PPScheduleRefused] = None
+        # #791b-instr22: per-category skip census for this pass's loop, and
+        # the FIRST skipped rid per category -- the divergence instrument's
+        # payload. Ints and short strings only (#790).
+        _skips: Dict[str, int] = {}
+        _skip_first_rid: Dict[str, str] = {}
+
+        def _note_skip(kind: str, rid) -> None:
+            _skips[kind] = _skips.get(kind, 0) + 1
+            _skip_first_rid.setdefault(kind, str(rid))
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                _note_skip("lora", req.rid)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -7041,6 +7078,7 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req, self.server_args
                 ):
+                    _note_skip("batch_full_break", req.rid)
                     break
 
             if self.enable_hicache_storage:
@@ -7051,6 +7089,7 @@ class Scheduler(
                 prefetch_done = self._prefetch_done_for(req, prefetch_verdicts)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    _note_skip("prefetch_pending", req.rid)
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -7102,6 +7141,7 @@ class Scheduler(
                         # reconsidered on a later pass -- the same
                         # requeue-for-free mechanism this loop already
                         # relies on for a capacity-driven rejection.
+                        _note_skip("pp_not_named", req.rid)
                         continue
                     # reconcile_pp_admission_decision's own contract
                     # guarantees told <= this rank's local match, i.e.
@@ -7161,6 +7201,7 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                _note_skip(f"add_result_{res.name}", req.rid)
                 break
 
         if mamba_allocator is not None:
@@ -7221,6 +7262,18 @@ class Scheduler(
             adder.can_run_list = can_run_list
 
         if len(can_run_list) == 0:
+            # #791b-instr22: an empty loop names its skips -- the silent
+            # local narrowing, made loud. "loop=clean" means the loop saw
+            # every queued request and admitted none WITHOUT any skip
+            # firing, which (queue > 0) should be impossible and is itself
+            # a finding.
+            if _skips:
+                self._admission_decline_note = "loop_skips(" + ",".join(
+                    f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                    for k, v in sorted(_skips.items())
+                ) + ")"
+            else:
+                self._admission_decline_note = "loop=clean"
             return None, running_batch
 
         can_run_set = set(can_run_list)
