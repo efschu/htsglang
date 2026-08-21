@@ -623,7 +623,20 @@ class PrefillAdder:
         fundable_extend_floor: Optional[int] = None,
         commitment_ledger: Optional[ChunkedCommitmentLedger] = None,
         chunked_admission_enabled: bool = True,
+        scheduled_extents: Optional[Dict[str, Tuple[int, int]]] = None,
     ):
+        # #791 CORE: `rid -> (prefix_len, extend_len)` decided ONCE by the
+        # first PP rank and forwarded on the admission decision, or None.
+        #
+        # None on every rank that owns its own admission truth -- PP0, and
+        # every non-PP boot -- so the default path below is not merely
+        # equivalent to the pre-#791 arithmetic, it is that arithmetic
+        # unentered. A downstream PP rank gets a mapping, and for the rids in
+        # it this adder stops DECIDING a chunk length and starts EXECUTING
+        # one. See `pp_admission_congruence.forwarded_schedule` for the boot
+        # instr20 specimen (one 845-token prompt, split 0+512 on PP0 and
+        # 512+333 on PP1, in the same second, off the same decision).
+        self.scheduled_extents = scheduled_extents
         # #701 defect (b). The ledger is owned by the SCHEDULER, not by this
         # adder: a PrefillAdder is rebuilt every pass, so anything held here
         # would forget a resident chunked request's outstanding prefill exactly
@@ -1208,7 +1221,129 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def scheduled_extent_for(self, req: Req) -> Optional[Tuple[int, int]]:
+        """The forwarded `(prefix_len, extend_len)` for `req`, or None.
+
+        None is the whole default path: no mapping (PP0, every non-PP boot),
+        or a rid the schedule does not name. A rid a forwarded schedule does
+        not name must never reach the local chunking arithmetic either -- the
+        admission loop refuses to admit it at all (scheduler.py), which is a
+        membership decision and not this method's subject.
+        """
+        if not self.scheduled_extents:
+            return None
+        return self.scheduled_extents.get(req.rid)
+
+    def _add_scheduled_req(
+        self,
+        req: Req,
+        extent: Tuple[int, int],
+        *,
+        carried_chunk: bool = False,
+    ):
+        """EXECUTE a forwarded pass geometry. Derive nothing.
+
+        This is the whole of #791's core on the adder side: the two numbers
+        that decide the cross-stage tensor's row count -- where the reused
+        prefix ends and how many tokens are freshly computed -- are READ off
+        the upstream's decision rather than recomputed from this rank's
+        `rem_chunk_tokens`, `rem_total_tokens`, radix match or host-hit
+        length. Every one of those is rank-local and every one of them moved
+        under this rank's feet on boot instr20 between the pass being decided
+        and the pass being built.
+
+        NO LOCAL BUDGET GATE, DELIBERATELY. `add_one_req`'s `NO_TOKEN` /
+        `OTHER` returns all mean "leave this request for a later pass", which
+        a rank executing a forwarded schedule is not entitled to decide: the
+        upstream has already built and launched a batch containing this
+        request. The budget is still CHARGED below, so the rest of the pass
+        accounts for what this request costs -- what is gone is the local
+        veto, not the bookkeeping. If the geometry is genuinely impossible the
+        refusal is loud and the whole pass is voided (`PPScheduleRefused`),
+        which is the one direction in which uniform membership can still be
+        restored.
+
+        NO HOST LOAD-BACK EITHER, and this is the instr20 line specifically.
+        `add_one_req` grows `req.prefix_indices` by `init_load_back`'s freshly
+        revived indices, which on instr20 put 512 host-resident prefix tokens
+        back onto a `prefix_indices` the admission loop had just clamped to
+        the schedule's 0 -- turning a 512-token chunk into a 333-token
+        remainder on PP1 and PP2 while PP0, whose `needs_host_load_back()` was
+        false, kept the 512. A load-back is a rank-local improvement to a
+        quantity this rank no longer owns, so on this path it does not run.
+        """
+        # Imported here rather than at module scope: this file's import block
+        # is already an E402 region, and a local import keeps the new
+        # dependency out of it without adding a finding -- the same call this
+        # repo's `prefix_lens_check` import makes in schedule_batch.py.
+        from sglang.srt.managers.pp_admission_congruence import (
+            PPScheduleRefused,
+            schedule_refusal_reason,
+        )
+
+        prefix_len, extend_len = int(extent[0]), int(extent[1])
+        local_prefix_len = len(req.prefix_indices)
+        local_fill_len = len(req.full_untruncated_fill_ids)
+        reason = schedule_refusal_reason(
+            rid=req.rid,
+            scheduled_prefix_len=prefix_len,
+            scheduled_extend_len=extend_len,
+            local_prefix_len=local_prefix_len,
+            local_fill_len=local_fill_len,
+        )
+        if reason is not None:
+            raise PPScheduleRefused(reason)
+
+        req.set_extend_range(prefix_len, prefix_len + extend_len)
+        self.can_run_list.append(req)
+        # LAST CHUNK OR NOT IS ALSO THE SCHEDULE'S TO SAY. `prefix + extend`
+        # reaching the request's fill length is the upstream's own
+        # last-chunk verdict, carried here as arithmetic on forwarded
+        # integers rather than re-taken against a local budget.
+        last_chunk = prefix_len + extend_len >= local_fill_len
+        # `carried_chunk`: this request is ALREADY `scheduler.chunked_req`, so
+        # announcing it as a NEW one would trip the `assert self.chunked_req
+        # is None` the scheduler takes before adopting `new_chunked_req`, and
+        # its prefix is carried allocation rather than a fresh cache hit --
+        # the same two distinctions the local `add_chunked_req` makes.
+        if not last_chunk and not carried_chunk:
+            self.new_chunked_req = req
+        if not carried_chunk:
+            self._req_inc_lock_ref(req)
+        self._update_prefill_budget(
+            0 if carried_chunk else prefix_len,
+            extend_len,
+            (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if last_chunk
+                else 0
+            ),
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slot_charge=self._mamba_slots_for_req(req),
+        )
+        return AddReqResult.CONTINUE
+
     def add_chunked_req(self, req: Req):
+        # #791 CORE: the carried chunked request is the consumer that had NO
+        # forwarded-decision gate at all. `add_one_req` at least read the
+        # schedule's prefix through the admission loop's clamp; this path is
+        # entered from scheduler.py before that loop runs and decided its
+        # chunk length purely from `rem_chunk_tokens`/`rem_total_tokens` and
+        # the #679 park, all rank-local. PP0 carried this rid as `chunked=1`
+        # on instr20 while PP1 and PP2 carried it as `chunked=0`.
+        scheduled = self.scheduled_extent_for(req)
+        if scheduled is not None:
+            self._add_scheduled_req(req, scheduled, carried_chunk=True)
+            # `add_chunked_req` answers "is this still the chunked request",
+            # and under a forwarded schedule that is the same last-chunk fact
+            # `_add_scheduled_req` just applied -- read back off the request
+            # so the two can never disagree.
+            return (
+                req
+                if req.extend_range.end < len(req.full_untruncated_fill_ids)
+                else None
+            )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1461,6 +1596,36 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        # #791 CORE: EXECUTE, DO NOT DERIVE.
+        #
+        # Placed above every rank-local gate in this method on purpose. The
+        # gates below (`rem_total_tokens`, `rem_input_tokens`,
+        # `rem_chunk_tokens`, the host load-back, the page/alignment
+        # truncation) each answer a question the first rank has already
+        # answered for this pass and forwarded. Re-answering them is not a
+        # second opinion, it is a SECOND SCHEDULE -- and the upstream's hidden
+        # states are already on the wire for the first one.
+        #
+        # NOT a new communication and not a new branch on peer state: the
+        # mapping was received earlier in this same pass by the wire #791
+        # already built, and it is None on every rank that owns its own
+        # admission truth. See `scheduled_extent_for`.
+        scheduled = self.scheduled_extent_for(req)
+        if scheduled is not None:
+            if self.dllm_config is not None:
+                from sglang.srt.managers.pp_admission_congruence import (
+                    PPScheduleRefused,
+                )
+
+                raise PPScheduleRefused(
+                    f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={req.rid}: "
+                    f"DLLM prefill re-derives its own block geometry "
+                    f"(`_add_dllm_req`) and cannot execute a forwarded one. "
+                    f"Refusing rather than running two schedules at once."
+                )
+            with self._lock_node(req.last_node):
+                return self._add_scheduled_req(req, scheduled)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which

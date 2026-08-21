@@ -43,6 +43,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
     entries_retracted_by_rank,
+    forwarded_schedule,
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
@@ -1276,6 +1277,10 @@ class SchedulerPPMixin:
                 # requirement). PP0 has nothing to consume here -- it is the
                 # one BUILDING the decision, inside the call below.
                 self._pp_admission_incoming_effective = None
+                # #791 CORE: reset on the same argument and in the same
+                # breath as `effective` -- the two are one fact split in two,
+                # and a pass that receives nothing must inherit neither half.
+                self._pp_admission_incoming_schedule = None
                 self._pp_admission_amended_to_forward = None
                 # #791b: reset before the receive, so a pass that receives
                 # nothing (pp_size <= 1, or the first rank) cannot inherit the
@@ -1309,6 +1314,14 @@ class SchedulerPPMixin:
                             effective, amended
                         )
                         self._pp_admission_incoming_effective = effective
+                        # #791 CORE: the SECOND number off the same decision.
+                        # Taken from `amended` and not from the raw incoming
+                        # decision, so a void empties it exactly when it
+                        # empties `effective` -- the two can never name
+                        # different rid sets.
+                        self._pp_admission_incoming_schedule = (
+                            self._pp_forwarded_schedule_from(amended)
+                        )
                         self._pp_admission_amended_to_forward = amended
                         # #791b: record what PP0 said it will expect back for
                         # this slot, and what this rank is forwarding, BEFORE
@@ -3343,6 +3356,13 @@ class SchedulerPPMixin:
         # wraparounds stay unavailable for a long stretch -- a memory bound
         # only, never a correctness one.
         self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
+        # #791 CORE: the forwarded pass geometry this rank EXECUTES --
+        # `rid -> (prefix_len, extend_len)`, filled from the same amended
+        # decision as `_pp_admission_incoming_effective` above and None on
+        # every rank that owns its own admission truth.
+        self._pp_admission_incoming_schedule: Optional[Dict[str, Tuple[int, int]]] = (
+            None
+        )
         self._pp_admission_amended_to_forward: Optional[PPAdmissionDecision] = None
         self._pp_admission_pending_sends: deque = deque()
         # #796: the admission decision's outstanding async send, held here
@@ -4456,6 +4476,21 @@ class SchedulerPPMixin:
             pp_size=pp_size,
             log=logger,
         )
+
+    def _pp_forwarded_schedule_from(
+        self: Scheduler, amended: Optional[PPAdmissionDecision]
+    ) -> Dict[str, Tuple[int, int]]:
+        """#791 CORE: the pass geometry this rank will EXECUTE, off `amended`.
+
+        A one-line method and not a one-line expression inline in
+        `_event_loop_pp_body`, for the same reason `_pp_pass_retraction_reason`
+        and `pp_pass_should_void` are methods: it is the single point at which
+        the forwarded chunk lengths enter this rank, so it is the single point
+        a test can neuter to prove the rest of the machinery actually depends
+        on them. Resolves `forwarded_schedule` through this module's globals,
+        which is what makes that neuter a real one.
+        """
+        return forwarded_schedule(amended)
 
     def _pp_void_retracted_pass(
         self: Scheduler,

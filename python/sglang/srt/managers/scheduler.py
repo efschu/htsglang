@@ -203,8 +203,10 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
+    PPScheduleRefused,
     build_pp_admission_decision,
     pp_admission_verdict_is_vacuous,
+    void_pp_admission_decision,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -6323,10 +6325,22 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
-        )
+        try:
+            ret, running_batch = self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                running_batch=running_batch,
+            )
+        except PPScheduleRefused as refusal:
+            # #791 CORE: THE LOUD REFUSAL, and the ONLY thing it may do.
+            # It may not narrow the batch, retry with different numbers, or
+            # fall through to a decode batch -- every one of those pairs this
+            # rank's metadata with the upstream's hidden states for a
+            # different pass. It voids the pass, through #797's existing
+            # machinery and with no new mechanism: `_pp_admission_pass_voided`
+            # is what `_event_loop_pp_body` reads to forward `pass_voided`
+            # and, with no batch built, to drain the upstream's orphaned
+            # proxy.
+            ret = self._pp_refuse_forwarded_schedule(refusal)
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
@@ -6335,6 +6349,66 @@ class Scheduler(
             self._trace_pp_admission_verdict(ret)
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _pp_scheduled_extents(self) -> Optional[Dict[str, Tuple[int, int]]]:
+        """#791 CORE: the forwarded pass geometry this rank must EXECUTE.
+
+        `None` -- and therefore the pre-#791 local arithmetic, unentered --
+        on every rank that owns its own admission truth: the first PP rank,
+        which BUILDS the decision, and every boot with `pp_size <= 1`, which
+        has no upstream to be told by. Downstream, it is the mapping received
+        earlier in this same pass; `None` there too on a pass that received
+        nothing, which the admission loop's own membership gate already
+        refuses to admit anything on.
+        """
+        ps = getattr(self, "ps", None)
+        if ps is None or ps.pp_size <= 1 or ps.pp_rank == 0:
+            return None
+        return getattr(self, "_pp_admission_incoming_schedule", None)
+
+    def _pp_refuse_forwarded_schedule(self, refusal: Exception) -> None:
+        """#791 CORE: turn an unexecutable forwarded geometry into a void.
+
+        QUOTING THE DECISION IS THE POINT. `PPScheduleRefused` carries the
+        forwarded numbers and this rank's own, formatted by
+        `pp_admission_congruence.schedule_refusal_reason`, so the log line
+        names what the upstream committed rather than only what this rank
+        found -- the failure mode this replaces was a rank quietly building a
+        different batch and saying nothing at all.
+
+        NO NEW MECHANISM. The pass is voided exactly as a #797 retraction
+        voids it: `_pp_admission_pass_voided` is set so `_event_loop_pp_body`
+        forwards `pass_voided=True` and drains the upstream's orphaned proxy,
+        and the decision this rank forwards is emptied by
+        `void_pp_admission_decision` so every rank after it makes the same
+        membership decision. Re-noted against the slot, because the
+        expectation was recorded before this refusal could be known.
+        """
+        self._pp_pass_schedule_refusals = (
+            getattr(self, "_pp_pass_schedule_refusals", 0) + 1
+        )
+        logger.error(
+            "#791 PP-ADMISSION forwarded schedule REFUSED on rank %s: %s "
+            "Voiding the whole pass rather than building a batch of a shape "
+            "the upstream did not decide.",
+            getattr(getattr(self, "ps", None), "pp_rank", None),
+            refusal,
+        )
+        self._pp_admission_pass_voided = True
+        self._pp_admission_incoming_effective = {}
+        self._pp_admission_incoming_schedule = {}
+        amended = getattr(self, "_pp_admission_amended_to_forward", None)
+        if amended is not None:
+            amended = void_pp_admission_decision(amended)
+            self._pp_admission_amended_to_forward = amended
+            note = getattr(self, "_pp_note_output_expectation", None)
+            if note is not None:
+                note(
+                    amended.mb_id,
+                    bool(getattr(self, "_pp_output_expected_incoming", False)),
+                    amended,
+                )
+        return None
 
     def _trace_pp_admission_verdict(self, ret: Optional[ScheduleBatch]) -> None:
         """#788: record THIS rank's admission verdict and the inputs behind it.
@@ -6905,6 +6979,11 @@ class Scheduler(
             # outstanding commitments every pass, which is the hole the
             # chokepoint subtraction cannot close on its own.
             commitment_ledger=self.chunked_commitment_ledger,
+            # #791 CORE: the pass geometry the first rank already decided, or
+            # None on the rank that decides it and on every non-PP boot. This
+            # is what turns the adder from a second scheduler into an
+            # executor -- see `PrefillAdder._add_scheduled_req`.
+            scheduled_extents=self._pp_scheduled_extents(),
         )
 
         if self.chunked_req is not None:
@@ -6940,6 +7019,10 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # #791 CORE: a refusal raised inside the loop is CARRIED, not thrown,
+        # so `alloc_group_end` below still runs on its own line. Leaking an
+        # open mamba alloc group would replace one corruption with another.
+        schedule_refusal: Optional[PPScheduleRefused] = None
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -7026,11 +7109,28 @@ class Scheduler(
                     if len(req.prefix_indices) > told:
                         req.prefix_indices = req.prefix_indices[:told]
 
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
+            try:
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
+            except PPScheduleRefused as exc:
+                # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
+                # different root): requests admitted EARLIER in this same loop
+                # have already taken a persistent `inc_lock_ref` via
+                # `_req_inc_lock_ref`, released when the batch completes -- and
+                # a refused batch never completes, so those refs leak for the
+                # rest of the pass's life. Undoing them needs the exact
+                # `IncLockRefResult` each `inc_lock_ref` returned (SWA/Mamba
+                # tombstone params; see `_lock_node`), which the adder does not
+                # keep, so a release written here would be a guess at the one
+                # thing a mismatched release makes worse. Bounded: it takes a
+                # genuinely unexecutable geometry to reach this line at all,
+                # and reaching it kills the pass rather than continuing on the
+                # leaked state. Filed at the site.
+                schedule_refusal = exc
+                break
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -7066,8 +7166,42 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        if schedule_refusal is not None:
+            raise schedule_refusal
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+
+        # #791 CORE: EVERY NAMED REQUEST, OR NONE OF THEM.
+        #
+        # The loop above still holds several rank-local vetoes that run before
+        # `add_one_req` is ever reached and therefore before the executor can
+        # refuse: `batch_is_full` (:6957, off this rank's own
+        # `get_num_allocatable_reqs`), the HiCache `prefetch_done` skip
+        # (:6969 -- the very race that produced boot instr20), and the LoRA
+        # gate (:6945). Each of them is a `continue`/`break`, i.e. a SILENT
+        # LOCAL NARROWING of a pass the upstream has already launched. They
+        # are correct as rank-local admission control and wrong as an answer
+        # to a forwarded schedule, so on that path they become a refusal
+        # instead of a smaller batch. Checked here, once, where the pass's
+        # final membership is first knowable -- and before the
+        # `len(can_run_list) == 0` early return below, which would otherwise
+        # swallow the total-narrowing case.
+        scheduled_extents = self._pp_scheduled_extents()
+        if scheduled_extents:
+            admitted_rids = {req.rid for req in can_run_list}
+            missing = [rid for rid in scheduled_extents if rid not in admitted_rids]
+            if missing:
+                raise PPScheduleRefused(
+                    f"#791 FORWARDED SCHEDULE UNEXECUTABLE: the decision names "
+                    f"{len(scheduled_extents)} request(s) and this rank's "
+                    f"admission loop reached only {len(admitted_rids)}; "
+                    f"missing rid(s)={','.join(sorted(missing))}. A rank "
+                    f"executing a forwarded schedule may not drop a named "
+                    f"request -- the upstream's hidden states for it are "
+                    f"already on the wire."
+                )
+
         if len(can_run_list) == 0:
             return None, running_batch
 

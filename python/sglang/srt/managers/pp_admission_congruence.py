@@ -160,6 +160,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
+class PPScheduleRefused(Exception):
+    """#791 CORE: this rank cannot EXECUTE the forwarded pass geometry.
+
+    Raised out of the admission adder and caught by the scheduler, which
+    voids the pass through #797's existing machinery. It is deliberately an
+    exception and not a return code: every `AddReqResult` a caller can return
+    means "build a batch without this request", and building a batch without a
+    request the upstream already launched hidden states for is precisely the
+    corruption this refusal exists to prevent. There is no narrower batch to
+    fall back to.
+    """
+
+
 @dataclass(frozen=True)
 class PPAdmissionEntry:
     """One request's admission decision, as it crosses the wire.
@@ -482,6 +495,108 @@ def reconcile_pp_admission_decision(
         # why "missing" must mean "do not admit", not "assume 0 is safe".
 
     return effective, PPAdmissionDecision(mb_id=decision.mb_id, entries=tuple(amended))
+
+
+def forwarded_schedule(
+    decision: Optional[PPAdmissionDecision],
+) -> Dict[str, Tuple[int, int]]:
+    """#791 CORE: the pass geometry a downstream rank must EXECUTE.
+
+    `rid -> (prefix_len, extend_len)` for exactly the entries that are still
+    admitted and not retracted -- i.e. exactly the rids
+    `reconcile_pp_admission_decision` put in `effective`, with the SECOND
+    number that function drops on the floor.
+
+    WHY THIS EXISTS AT ALL, AND IT IS NOT A NEW DATUM. `extend_len` has
+    crossed the wire since #791's first commit (see `PPAdmissionEntry` above
+    and the module docstring's "WHAT CROSSES THE WIRE"), and until this
+    function nothing read it. `reconcile_pp_admission_decision` returns
+    `Dict[rid, prefix_len]`, so a downstream rank received the chunk length
+    the first rank committed and then RE-DERIVED its own from
+    `PrefillAdder.add_one_req`'s rank-local `rem_chunk_tokens` /
+    `rem_total_tokens` / host-load-back. That re-derivation is the boot
+    instr20 crash, in full:
+
+        PP0  verdict=ADMIT rid=6cbe2733 prefix_lens=0  chunked=1  ->  512 rows
+        PP1  verdict=ADMIT rid=6cbe2733 prefix_lens=512 chunked=0  ->  333 tokens
+
+    -- one 845-token prompt, two different splits of it, taken in the same
+    second on the same forwarded decision. PP0 was told nothing new; PP1
+    simply asked its own state a question the schedule had already answered.
+    A HiCache prefetch had landed on PP1 (and PP2) between the retraction and
+    the re-admit, `needs_host_load_back()` went true there and stayed false on
+    PP0, and `add_one_req`'s load-back put the 512 prefix tokens back on a
+    `prefix_indices` the admission loop had just clamped to the schedule's 0.
+
+    So the fix is not to make the local derivation agree -- it is to stop
+    deriving. A rank holding a forwarded schedule reads BOTH numbers off it.
+
+    `None`, or a decision with nothing admitted (a #797 void), yields an empty
+    mapping, which every consumer reads as "no schedule is being executed this
+    pass" -- byte-identically to the behaviour that shipped before this
+    function existed. Pure; no rank-local input of any kind.
+    """
+    if decision is None:
+        return {}
+    return {
+        e.rid: (int(e.prefix_len), int(e.extend_len))
+        for e in decision.entries
+        if e.admitted and not e.retracted
+    }
+
+
+def schedule_refusal_reason(
+    *,
+    rid: str,
+    scheduled_prefix_len: int,
+    scheduled_extend_len: int,
+    local_prefix_len: int,
+    local_fill_len: int,
+) -> Optional[str]:
+    """`None` when this rank can execute the forwarded geometry verbatim;
+    otherwise the LOUD REFUSAL text, quoting the forwarded decision.
+
+    THE THREE WAYS A FORWARDED GEOMETRY CAN BE LOCALLY IMPOSSIBLE, and none
+    of them may be answered by adjusting the geometry:
+
+      * the rank's own prefix is not the scheduled one. The admission loop
+        clamps `prefix_indices` to the schedule before the adder ever sees the
+        request, and `reconcile_pp_admission_decision` retracts anything it
+        cannot reach, so this is unreachable on a healthy pass -- which is
+        exactly why it is checked. A silent re-clamp here would be the same
+        local narrowing this module exists to abolish.
+      * the request does not have the tokens. `prefix + extend` past
+        `full_untruncated_fill_ids` cannot be filled from anything this rank
+        holds.
+      * an empty extend. A pass that computes nothing for a named request is
+        not a smaller pass, it is a different one.
+
+    The caller turns this into a voided pass (the #797 path), never into a
+    narrower batch. Pure: five integers in, a string or None out.
+    """
+    if scheduled_extend_len <= 0:
+        return (
+            f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
+            f"names extend_len={scheduled_extend_len}, which computes nothing. "
+            f"A downstream rank may not substitute a length of its own."
+        )
+    if local_prefix_len != scheduled_prefix_len:
+        return (
+            f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
+            f"names prefix_len={scheduled_prefix_len}, this rank holds "
+            f"{local_prefix_len}. The batch geometry is the upstream's to "
+            f"decide; narrowing or widening it here is what pairs one "
+            f"microbatch's hidden states with another's metadata."
+        )
+    if scheduled_prefix_len + scheduled_extend_len > local_fill_len:
+        return (
+            f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
+            f"names prefix_len={scheduled_prefix_len} + "
+            f"extend_len={scheduled_extend_len}, past this rank's "
+            f"{local_fill_len} fill token(s). The two ranks disagree about the "
+            f"request itself, not merely about its cache."
+        )
+    return None
 
 
 def entries_retracted_by_rank(
