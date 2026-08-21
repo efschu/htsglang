@@ -1533,16 +1533,50 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 len(q) for q in getattr(scheduler, "_pp_tensor_dict_inbox", {}).values()
             ),
         )
-        if any(_inflight):
+        # #795: AND WHAT IT CANNOT SEE. Every probe above reads a structure
+        # inside this process. The tensor-dict WIRE is not one of them, and an
+        # undelivered proxy sitting on it survives this line, survives
+        # init_pp_loop_state below, and is then handed to the rebuilt ring by
+        # slot number -- the 2026-08-21 06:10:48 mispair. Boot instr15 logged
+        # "output path empty at cutover" 72 times while exactly that was
+        # happening. The CHAN_DICT sent/consumed counters are the one reading
+        # of the wire this rank can take without touching the transport (the
+        # corpse-F rule), so take it and report it: this is EVIDENCE, not a
+        # gate. The correctness fix is that the proxy stamp now names the flip
+        # epoch, so a message that does cross the cutover can no longer be
+        # mistaken for one of the new ring's (scheduler_pp_mixin.py,
+        # pp_proxy_stamp_names_pass).
+        _wire_gap = 0
+        _counters = getattr(scheduler, "pp_flip_counters", None)
+        _upstream_fn = getattr(scheduler, "_pp_flip_upstream", None)
+        if _counters is not None and _upstream_fn is not None:
+            try:
+                from sglang.srt.managers.phase_flip_counters import CHAN_DICT
+
+                _wire_gap = max(
+                    0,
+                    int(_counters.sent(CHAN_DICT, _upstream_fn()))
+                    - int(_counters.local_consumed(CHAN_DICT)),
+                )
+            except Exception:  # noqa: BLE001 - an instrument may never break a flip
+                _wire_gap = 0
+        if any(_inflight) or _wire_gap:
             logger.warning(
                 "%s CUTOVER DISCARDS IN-FLIGHT OUTPUT: pp_outputs=%s "
-                "last_rank_comm_queue=%d send_output_work=%d inbox=%d -- "
-                "each is a sampled token that reaches no output_ids",
+                "last_rank_comm_queue=%d send_output_work=%d inbox=%d "
+                "unconsumed_on_wire=%d -- each is a sampled token that reaches "
+                "no output_ids, and an unconsumed tensor dict outlives the "
+                "slot ring this cutover is about to rebuild (#795)",
                 LOG_PREFIX,
                 *_inflight,
+                _wire_gap,
             )
         else:
-            logger.info("%s output path empty at cutover", LOG_PREFIX)
+            logger.info(
+                "%s output path empty at cutover, and no unconsumed tensor "
+                "dict on the wire",
+                LOG_PREFIX,
+            )
         scheduler.init_pp_loop_state()
         # 6b. The TP loops read ``running_batch``, not the slot array, so
         # the TP leg moves the re-seeded set over (and empties the slots,

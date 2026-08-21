@@ -6,7 +6,7 @@ RANK-LOCAL: each rank times out on its own clock. The first rank to disarm
 resumes launching and sends its proxy hidden states; its downstream is
 still armed, still withholding, so that rank has no ``cur_batch`` and the
 proxy recv -- guarded by THIS rank's batch, never by whether the upstream
-sent -- is not made. The message strands in ``_pp_tensor_dict_inbox``.
+sent -- is not made. The message strands in the group's typed inbox.
 
 ``PPProxyTensors`` carried NO identity, so the pairing was purely
 positional: "whatever came off the wire this slot iteration" met "whatever
@@ -24,8 +24,8 @@ and only here, because an armed rank launches nothing and the message
 names a pass it never ran.
 
 DETECTION -- the stamp. Every proxy send carries ``(mb_id, monotone seqno,
-rows)`` and the receive matches on it. A leftover names a slot that is not
-this one and is REFUSED, loudly and by identity.
+rows, flip epoch)`` and the receive matches on it. A leftover names a slot
+that is not this one and is REFUSED, loudly and by identity.
 
 REFUSED, NOT DROPPED-AND-RETRIED. The first cut dropped the message and
 looped to take the next one; that wedged the instance on metal (corpse R,
@@ -34,17 +34,29 @@ one message per pass and the surplus recv closes a cycle with the peers.
 ``test_a_planted_leftover_is_REFUSED_and_the_wire_is_not_touched_again``
 pins both halves of that: not computed on, and not replaced.
 
-WHAT THESE TESTS DELIBERATELY ALSO RECORD: the match is on ``mb_id``
-ALONE, and ``mb_id`` is cyclic modulo ``pp_loop_size`` (3 on this rig). A
-leftover whose slot happens to coincide is NOT caught. The seqno is
-stamped and currently unused. ``test_a_coinciding_slot_is_the_residual_hole``
-pins that limit as MEASURED rather than leaving it as a surprise; do not
+WHAT THESE TESTS DELIBERATELY ALSO RECORD: ``mb_id`` is cyclic modulo
+``pp_loop_size`` (3 on this rig), so a leftover whose slot happens to
+coincide is NOT caught by the slot number. The limit was pinned here as
+MEASURED rather than left as a surprise -- and on 2026-08-21 metal answered
+the question the pin left open (boot instr15, 06:10:48, specimen
+/spinning/evidence-665-f1/SPECIMEN_795_proxy_batch_mismatch.txt): it occurs,
+across a phase-flip cutover, because the cutover REBUILDS the slot ring and
+restarts its numbering, so coincidence stops being a one-in-``pp_loop_size``
+accident and becomes routine.
+
+#795 therefore closed the CROSS-EPOCH half by appending the flip epoch to
+the stamp -- the generation number of the ring itself -- leaving the
+same-epoch half open and honestly named. The epoch dimension has its own
+file, over three real processes:
+test_pp_proxy_cross_epoch_mispair_795.py. What remains here is
+``test_a_coinciding_slot_within_one_epoch_is_the_residual_hole``; do not
 delete it to make the suite look greener.
 
 CPU-only.
 """
 
 import logging
+import types
 from collections import deque
 
 import pytest
@@ -55,6 +67,15 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 class _FakeGroup:
+    # #757 HARNESS REPAIR (interface drift, no assertion touched):
+    # `pp_typed_channel.resolve_src` -- reached from `stash_typed` on the
+    # demultiplex path the armed drain now takes -- derives the peer identity
+    # from `group.rank_in_group` / `group.world_size`. Neither existed on this
+    # fake when it was written. The same repair is documented verbatim in
+    # test_pp_flip_leftover_proxy_757.py's `_GlooWire`.
+    rank_in_group = 1
+    world_size = 3
+
     def __init__(self, is_first_rank=False):
         self.is_first_rank = is_first_rank
         self.sent = []
@@ -115,12 +136,35 @@ class _Rank:
     def _pp_flip_bump_attempted(self, chan):
         pass
 
+    # #789 HARNESS REPAIR (interface drift, no assertion touched), same
+    # category as the one above: _pp_recv_proxy_tensors now calls
+    # self._pp_wait_for_proxy_readiness(mb_id) before its receive. In
+    # production that gate reads PhaseFlipCounters; this rank has none, and
+    # the shipped method's own "if counters is None: return" fast path makes
+    # it a true no-op -- so binding the SHIPPED method here restores this
+    # file's previous behaviour rather than changing it. Bound, not stubbed,
+    # so a future change to the gate is felt here instead of hidden.
+    _pp_wait_for_proxy_readiness = SchedulerPPMixin._pp_wait_for_proxy_readiness
+    pp_flip_counters = None
 
-def _msg(mb_id, seq, rows, tag=None):
+    # #795 HARNESS REPAIR, same category: the stamp now names the phase-flip
+    # epoch as well as the slot, read through `pp_flip_epoch_of`, which
+    # answers None for a holder with no `_pp_flip_epoch`. This rank
+    # deliberately does NOT define one -- it has no flip runtime, so "no
+    # epoch" is the truthful answer and the slot-only comparison this file
+    # was written against is what the shipped code then performs. The epoch
+    # dimension has its own file,
+    # test_pp_proxy_cross_epoch_mispair_795.py, over three real processes.
+
+
+def _msg(mb_id, seq, rows, tag=None, epoch=-1):
     d = {
         "hidden_states": torch.zeros(rows, 4),
         "__msg_type__": "proxy",
-        "__stamp__": (mb_id, seq, rows),
+        # #795: the stamp is (slot, seqno, rows, flip epoch). -1 means "this
+        # sender named no epoch", which every consumer reads as the pre-#795
+        # slot-only comparison -- the case this file covers.
+        "__stamp__": (mb_id, seq, rows, epoch),
     }
     if tag is not None:
         d["tag"] = tag
@@ -130,11 +174,26 @@ def _msg(mb_id, seq, rows, tag=None):
 # -- the stamp itself ----------------------------------------------------------
 
 
-def test_stamp_carries_slot_monotone_seqno_and_rows():
+def test_stamp_carries_slot_monotone_seqno_rows_and_epoch():
+    """#795 appended the flip epoch; -1 is "this rank has no flip runtime"."""
     r = _Rank()
-    assert r._pp_proxy_stamp(1, _FakeResult(24)) == (1, 1, 24)
-    assert r._pp_proxy_stamp(2, _FakeResult(1)) == (2, 2, 1)
-    assert r._pp_proxy_stamp(0, _FakeResult(7)) == (0, 3, 7)
+    assert r._pp_proxy_stamp(1, _FakeResult(24)) == (1, 1, 24, -1)
+    assert r._pp_proxy_stamp(2, _FakeResult(1)) == (2, 2, 1, -1)
+    assert r._pp_proxy_stamp(0, _FakeResult(7)) == (0, 3, 7, -1)
+
+
+def test_the_stamp_names_the_flip_epoch_when_there_is_one():
+    """#795: the element the cross-cutover comparison actually reads.
+
+    `_pp_flip_epoch` reads `phase_flip_runtime.epoch` -- the generation number
+    of the microbatch slot ring, incremented once per completed cutover.
+    """
+
+    class _FlippingRank(_Rank):
+        _pp_flip_epoch = SchedulerPPMixin._pp_flip_epoch
+        phase_flip_runtime = types.SimpleNamespace(epoch=12)
+
+    assert _FlippingRank()._pp_proxy_stamp(1, _FakeResult(24)) == (1, 1, 24, 12)
 
 
 def test_the_seqno_never_resets_when_the_slot_repeats():
@@ -154,7 +213,7 @@ def test_a_stamp_never_breaks_a_send_even_if_the_result_is_malformed():
         pp_hidden_states_proxy_tensors = None
 
     r = _Rank()
-    assert r._pp_proxy_stamp(1, _Broken()) == (1, 1, -1)
+    assert r._pp_proxy_stamp(1, _Broken()) == (1, 1, -1, -1)
 
 
 # -- round trip through the wire -----------------------------------------------
@@ -164,10 +223,10 @@ def test_the_stamp_rides_in_the_dict_that_crosses_the_wire():
     sender = _Rank()
     payload = {"hidden_states": torch.zeros(24, 4)}
     sender._pp_send_dict_to_next_stage(
-        payload, async_send=True, msg_type="proxy", stamp=(1, 9, 24)
+        payload, async_send=True, msg_type="proxy", stamp=(1, 9, 24, -1)
     )
     on_wire = sender.pp_group.sent[0]
-    assert on_wire["__stamp__"] == (1, 9, 24)
+    assert on_wire["__stamp__"] == (1, 9, 24, -1)
     assert on_wire["__msg_type__"] == "proxy"
     assert on_wire["hidden_states"].shape[0] == 24
 
@@ -342,7 +401,13 @@ def test_the_armed_drain_TAKES_an_output_off_the_wire_but_KEEPS_it():
     assert r.pp_flip_drain_tensor_dicts() == 1
     assert r.recv_calls == 1
     # ...and it is still reachable by the consumer that is owed it.
-    assert list(r._pp_tensor_dict_inbox["output"]) == [out]
+    # #753 HARNESS REPAIR (interface drift, no assertion touched): the typed
+    # inbox lives on the GROUP now, not on the scheduler -- "two private
+    # stashes on one wire is not a demultiplexer". Same message, same queue,
+    # read where the shipped `take_typed` reads it.
+    from sglang.srt.distributed.pp_typed_channel import typed_inbox
+
+    assert list(typed_inbox(r.pp_group)[(0, "output")]) == [out]
 
 
 def test_the_armed_drain_still_DROPS_a_void_proxy():
@@ -353,11 +418,13 @@ def test_the_armed_drain_still_DROPS_a_void_proxy():
     mb_id=1.
     """
     proxy = {"hidden_states": torch.zeros(2), "__msg_type__": "proxy",
-             "__stamp__": (2, 151, 512)}
+             "__stamp__": (2, 151, 512, -1)}
     r = _ArmedRank(wire=[proxy], posted=1)
     assert r.pp_flip_drain_tensor_dicts() == 1
     assert r.recv_calls == 1
-    assert not list(getattr(r, "_pp_tensor_dict_inbox", {}).get("proxy", []))
+    from sglang.srt.distributed.pp_typed_channel import typed_inbox
+
+    assert not list(typed_inbox(r.pp_group).get((0, "proxy"), []))
 
 
 # -- THE STAMP MUST NOT REACH MODEL COMPUTE ------------------------------------
@@ -397,22 +464,55 @@ def test_a_delivered_proxy_survives_the_slice_path():
 # -- the honest limit ----------------------------------------------------------
 
 
-def test_a_coinciding_slot_is_the_residual_hole():
-    """MEASURED LIMIT, not an aspiration.
+def test_a_coinciding_slot_within_one_epoch_is_the_residual_hole():
+    """MEASURED LIMIT, not an aspiration, and NARROWED by #795.
 
     ``mb_id`` is cyclic modulo ``pp_loop_size`` (3 on this rig), so a
     leftover that is a whole cycle stale names THIS slot and is accepted.
-    The seqno that would settle it is stamped and not consulted. Metal has
-    to say whether this case occurs before more machinery is justified --
-    the ``model_runner.forward`` shape check is the standing tripwire for
-    it.
+
+    METAL ANSWERED THE OPEN QUESTION THIS PIN ASKED. The original text said
+    "metal has to say whether this case occurs before more machinery is
+    justified". It said yes, on 2026-08-21 (boot instr15, 06:10:48) -- but
+    what it exhibited was the CROSS-CUTOVER variant, where the coincidence is
+    not a modular accident: ``init_pp_loop_state`` rebuilds the ring at every
+    cutover and restarts the numbering, so old slot numbers are handed out
+    again wholesale. #795 closed that half by naming the flip epoch in the
+    stamp; see test_pp_proxy_cross_epoch_mispair_795.py.
+
+    WHAT IS STILL OPEN, AND WHY IT IS NOT THE SAME QUESTION. Within ONE epoch
+    the ring is intact, so a coinciding leftover requires this rank to have
+    fallen a whole cycle behind its upstream on a FIFO wire that owes exactly
+    one message per pass -- and the seqno that would settle it is monotone by
+    delivery order alone, so it discriminates nothing a receiver can predict.
+    Closing it needs a per-pass sequence the RECEIVER derives, which is a
+    different change and has no specimen. The ``model_runner.forward`` shape
+    check remains the standing tripwire.
     """
-    stale_but_coinciding = _msg(mb_id=1, seq=41, rows=1, tag="STALE")
-    mine = _msg(mb_id=1, seq=44, rows=24, tag="MINE")
+    stale_but_coinciding = _msg(mb_id=1, seq=41, rows=1, tag="STALE", epoch=7)
+    mine = _msg(mb_id=1, seq=44, rows=24, tag="MINE", epoch=7)
     receiver = _Rank(wire=[stale_but_coinciding, mine])
     got = receiver._pp_recv_proxy_tensors(mb_id=1)
     assert got["tag"] == "STALE"
     assert getattr(receiver, "_pp_proxy_drops", 0) == 0
+
+
+def test_the_same_coincidence_ACROSS_a_cutover_is_now_refused():
+    """#795, the half metal forced: same slot, different flip epoch.
+
+    Byte for byte the pair above, except that the leftover was stamped in the
+    epoch before a cutover. The ring it named no longer exists, so the slot
+    number names nothing here and the shipped guard says so.
+    """
+
+    class _FlippingRank(_Rank):
+        _pp_flip_epoch = SchedulerPPMixin._pp_flip_epoch
+        phase_flip_runtime = types.SimpleNamespace(epoch=8)
+
+    stale_across_cutover = _msg(mb_id=1, seq=41, rows=119, tag="STALE", epoch=7)
+    receiver = _FlippingRank(wire=[stale_across_cutover])
+    with pytest.raises(RuntimeError, match="PROXY LEFTOVER REFUSED"):
+        receiver._pp_recv_proxy_tensors(mb_id=1)
+    assert receiver.recv_calls == 1, "the wire was touched again after refusal"
 
 
 if __name__ == "__main__":

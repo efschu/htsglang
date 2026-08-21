@@ -523,7 +523,108 @@ def _pp_proxy_readiness_budget_s() -> float:
     return value if value > 0 else DEFAULT_PROXY_READINESS_BUDGET_S
 
 
-def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
+#: Position of the phase-flip epoch inside a proxy ``__stamp__``, appended by
+#: ``_pp_proxy_stamp``. A value below zero, or a stamp too short to have the
+#: element at all, means "this sender could not name its epoch" -- see
+#: ``pp_proxy_stamp_epoch``.
+PP_PROXY_STAMP_EPOCH_INDEX = 3
+
+
+def pp_proxy_stamp_epoch(stamp) -> Optional[int]:
+    """The phase-flip epoch a proxy stamp names, or None if it names none.
+
+    None for a stamp written before this field existed, for a stand-in that
+    carries a shorter tuple, and for a boot with no phase-flip runtime (where
+    ``_pp_flip_epoch`` has nothing to read and the sender writes -1). Every
+    consumer below treats None as "fall back to the slot-only comparison",
+    which is exactly the behaviour that shipped before this field.
+    """
+    try:
+        epoch = int(stamp[PP_PROXY_STAMP_EPOCH_INDEX])
+    except Exception:  # noqa: BLE001 - an unreadable epoch names no epoch
+        return None
+    return epoch if epoch >= 0 else None
+
+
+def pp_flip_epoch_of(holder) -> Optional[int]:
+    """``holder._pp_flip_epoch()``, or None if the holder has no such method.
+
+    MODULE-LEVEL AND getattr-BASED BY THIS FILE'S OWN CONVENTION (#787), not
+    as a defensive habit. Several methods here are bound UNBOUND onto stand-in
+    holders that carry only what the method under test touched when the holder
+    was written -- `pp_flip_drain_tensor_dicts` reaches `_pp_ran_mb_ids` the
+    same way, and `_pp_note_output_expectation`'s docstring states the rule.
+    A holder written before #795 must keep working, and "no accessor" reads as
+    "no epoch", which is exactly the slot-only comparison that shipped then.
+
+    A free function rather than a mixin method because a holder that binds
+    methods by NAME would not have the mixin method either -- which is the
+    whole failure this avoids.
+    """
+    fn = getattr(holder, "_pp_flip_epoch", None)
+    return fn() if fn is not None else None
+
+
+def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
+    """Does ``stamp`` name the pass ``(epoch, mb_id)`` this rank is running?
+
+    THE STAMP'S NAMESPACE IS (FLIP EPOCH, SLOT), NOT SLOT ALONE, and that is
+    the whole content of this predicate.
+
+    WHY SLOT ALONE IS NOT AN IDENTITY. ``mb_id`` is an index into the
+    microbatch slot ring, so it lives in ``range(pp_loop_size)`` -- three or
+    six values on this rig. Worse, the ring is not merely cyclic: a phase
+    flip's cutover calls ``init_pp_loop_state`` (phase_flip_runtime.py:1580),
+    which rebuilds ``mbs``/``running_mbs``/``last_mbs`` for the new topology
+    and restarts the slot numbering from zero. So after a cutover the SAME
+    slot numbers are handed out again to passes that have nothing to do with
+    the ones before it, and a proxy stranded on the wire across that cutover
+    matches a slot-only comparison with probability ``1/pp_loop_size`` rather
+    than never. That is the specimen of 2026-08-21 06:10:48 (boot instr15,
+    /spinning/evidence-665-f1/SPECIMEN_795_proxy_batch_mismatch.txt): the
+    ``PROXY LEFTOVER REFUSED`` guard read a matching ``mb_id``, passed the
+    message into model compute, and the only thing that caught it was the
+    WIDTH check 30 layers down -- "119 row(s) for a batch of 27 token(s)".
+
+    WHY THE EPOCH IS THE RIGHT SECOND COMPONENT, and not a longer timeout or
+    a wider drain. ``PhaseFlipRuntime._epoch`` (phase_flip_runtime.py:7398)
+    increments exactly once per COMPLETED cutover, immediately after
+    ``_cutover_fn`` -- i.e. once per rebuild of the very ring ``mb_id``
+    indexes. It is therefore not a heuristic clock but the generation number
+    of the namespace itself, and the runtime already refuses to flip at all
+    when ranks disagree on it (the equality family at
+    phase_flip_runtime.py:3438-3440, corpse H). An ABANDONED flip does not
+    advance it and does not rebuild the ring, so pre-arm proxies stay
+    legitimately owed and this predicate keeps saying so -- which is exactly
+    the distinction ``pp_flip_drain_leftover_dicts`` needs and could not make.
+
+    ABSENT EPOCH MEANS TODAY'S BEHAVIOUR, on both sides. A stamp with no
+    epoch, or a caller with no epoch to compare against, degrades to the
+    slot-only test that shipped before. Same convention as
+    ``_PP_OUTPUT_EXPECTED_KEY`` (#791b).
+
+    HONEST RESIDUAL. Within ONE epoch a leftover a whole ring-cycle stale
+    still names this slot and is still accepted; ``seq`` remains stamped and
+    unconsulted because FIFO delivery already makes it monotone, so it
+    discriminates nothing a receiver can predict. Closing that case needs a
+    per-pass sequence the RECEIVER can derive, which is a different change.
+    See ``test_a_coinciding_slot_within_one_epoch_is_the_residual_hole``.
+    """
+    try:
+        stamp_mb = int(stamp[0])
+    except Exception:  # noqa: BLE001 - an unreadable stamp names no pass
+        return False
+    if stamp_mb != int(mb_id):
+        return False
+    if epoch is None:
+        return True
+    stamp_epoch = pp_proxy_stamp_epoch(stamp)
+    if stamp_epoch is None:
+        return True
+    return stamp_epoch == int(epoch)
+
+
+def classify_armed_drain_message(msg, ran_mb_ids, epoch: Optional[int] = None) -> tuple:
     """``(action, kind, why)`` for one message taken while ARMED.
 
     #757. The armed drain used to be kind-BLIND and discard everything, which
@@ -548,6 +649,13 @@ def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
     * ``proxy`` for a microbatch this rank DID run -- stashed. It was launched
       before the arm and is still owed. The design note flagged exactly this
       case as "the same question a second time"; the stamp answers it.
+    * ``proxy`` from ANOTHER FLIP EPOCH -- discarded, and checked BEFORE the
+      slot test above, because the slot test is what it defeats. The cutover
+      rebuilds the slot ring (``init_pp_loop_state``), so a slot number from
+      the previous epoch names nothing in this one however well it matches;
+      believing it is the 2026-08-21 mispair. See
+      ``pp_proxy_stamp_names_pass``. ``epoch=None`` (a caller with no runtime
+      to ask) skips this test entirely, leaving the pre-#795 behaviour.
     * anything unstamped or of unknown kind -- stashed. An unidentifiable
       message is not evidence of a void pass, and discarding on absence of
       evidence is how the corpse-S class is re-entered.
@@ -567,6 +675,18 @@ def classify_armed_drain_message(msg, ran_mb_ids) -> tuple:
         mb_id = int(stamp[0])
     except Exception:  # noqa: BLE001 - a malformed stamp proves nothing
         return (DRAIN_STASH, kind, "proxy stamp unreadable; cannot prove it void")
+    stamp_epoch = pp_proxy_stamp_epoch(stamp)
+    if epoch is not None and stamp_epoch is not None and stamp_epoch != int(epoch):
+        # BEFORE the slot test below, because a cross-epoch slot number is
+        # exactly what defeats it: the cutover rebuilt the ring this rank
+        # indexes, so "this rank DID run slot N" is true of a DIFFERENT slot N.
+        return (
+            DRAIN_DISCARD,
+            kind,
+            f"proxy mb_id={mb_id} is from flip epoch {stamp_epoch} while this "
+            f"rank is on epoch {epoch}; the cutover rebuilt the slot ring, so "
+            f"no batch of this rank's can ever pair with it",
+        )
     if mb_id in set(ran_mb_ids or ()):
         return (
             DRAIN_STASH,
@@ -2094,8 +2214,13 @@ class SchedulerPPMixin:
             # touched. A missing accessor means "no slots known", which is the
             # conservative reading anyway.
             ran_fn = getattr(self, "_pp_ran_mb_ids", None)
+            # #795: same getattr convention for the epoch -- a stand-in with
+            # no accessor yields None, which turns the epoch test off and
+            # leaves the slot-only classification that shipped before.
             action, kind, why = classify_armed_drain_message(
-                raw, ran_fn() if ran_fn is not None else set()
+                raw,
+                ran_fn() if ran_fn is not None else set(),
+                pp_flip_epoch_of(self),
             )
             if action == DRAIN_STASH:
                 # Never discard for want of somewhere to put it -- that is
@@ -2246,20 +2371,37 @@ class SchedulerPPMixin:
                 )
                 continue
             stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
-            if stamp is None or live_mb_id < 0 or int(stamp[0]) == int(live_mb_id):
+            # #795: (epoch, slot), not slot alone. THIS LINE IS THE 2026-08-21
+            # MISPAIR. When the disarm follows a COMMITTED cutover, the ring
+            # this rank resumes on was rebuilt from zero by
+            # `init_pp_loop_state` (phase_flip_runtime.py:1580), so a
+            # pre-cutover proxy whose slot number coincides with `live_mb_id`
+            # was stashed here as "owed" and delivered straight into model
+            # compute -- with the #631 receive guard, the intended backstop,
+            # agreeing for the same reason. An ABANDONED flip does not advance
+            # the epoch and does not rebuild the ring, so the pre-arm proxies
+            # this drain was written for still read as owed. See
+            # `pp_proxy_stamp_names_pass`.
+            epoch = pp_flip_epoch_of(self)
+            if (
+                stamp is None
+                or live_mb_id < 0
+                or pp_proxy_stamp_names_pass(stamp, live_mb_id, epoch)
+            ):
                 # Owed, not leftover: this is the pass the rank is about to
                 # run. Stash so the ordinary receive returns it.
                 stash_typed(self.pp_group, None, "proxy", raw)
                 continue
             discarded += 1
             logger.info(
-                "%s #757 drained a LEFTOVER proxy at disarm: stamp=%s while this "
-                "rank resumes on mb_id=%s. It names a pass launched before the arm "
-                "that this rank never ran, so no batch can ever pair with it. "
-                "(%d this window)",
+                "%s #757/#795 drained a LEFTOVER proxy at disarm: stamp=%s while "
+                "this rank resumes on mb_id=%s in flip epoch %s. It names a pass "
+                "from another slot or another flip epoch, so no batch of this "
+                "rank's can ever pair with it. (%d this window)",
                 "PHASE-FLIP",
                 stamp,
                 live_mb_id,
+                epoch,
                 discarded,
             )
         if discarded:
@@ -3674,12 +3816,56 @@ class SchedulerPPMixin:
             log=logger,
         )
 
-    def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
-        """#631 VARIANT B: the identity a proxy message carries.
+    def _pp_flip_epoch(self: Scheduler) -> Optional[int]:
+        """#795: the generation number of the microbatch slot ring.
 
-        (mb_id, monotone seqno, row count). The seqno is per rank and never
-        resets, so it distinguishes two messages for the SAME slot -- which
-        is exactly the pair a stranded leftover creates.
+        ``PhaseFlipRuntime._epoch`` (phase_flip_runtime.py:7398) increments
+        exactly once per COMPLETED cutover, and the cutover is precisely what
+        rebuilds the ring ``mb_id`` indexes (``init_pp_loop_state``, called at
+        phase_flip_runtime.py:1580). So this is not a clock bolted onto the
+        wire -- it is the version of the namespace the proxy stamp names, read
+        from the one authority for it rather than mirrored into a second copy
+        (the same reason ``phase_flip_is_armed`` reads ``_pending`` directly).
+
+        Every rank increments it independently at its own cutover completion,
+        and the runtime's own consensus reduction raises DESYNC if two ranks
+        ever disagree (phase_flip_runtime.py:3438-3454), so a sender's epoch
+        and a receiver's epoch are comparable quantities by construction.
+
+        None -- not 0 -- when there is no runtime: a boot without the phase
+        flip has no epochs to tell apart, and None is what every consumer
+        below reads as "fall back to the slot-only comparison", i.e. exactly
+        the behaviour that shipped before this field existed.
+        """
+        runtime = getattr(self, "phase_flip_runtime", None)
+        if runtime is None:
+            return None
+        try:
+            return int(runtime.epoch)
+        except Exception:  # noqa: BLE001 - an unreadable epoch names no epoch
+            return None
+
+    def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
+        """#631 VARIANT B / #795: the identity a proxy message carries.
+
+        (mb_id, monotone seqno, row count, flip epoch).
+
+        The seqno is per rank and never resets, so it distinguishes two
+        messages for the SAME slot -- which is exactly the pair a stranded
+        leftover creates.
+
+        #795 APPENDED THE EPOCH, and that is the element the consumers
+        actually compare. ``mb_id`` alone is not an identity: it indexes a
+        ring of ``pp_loop_size`` slots that a cutover rebuilds from zero, so
+        a leftover stranded across a flip matches a slot-only test one time in
+        ``pp_loop_size``. Measured, 2026-08-21 06:10:48, boot instr15 -- the
+        guard passed a 119-row prefill proxy into a 27-token decode batch and
+        only the width check downstream caught it. See
+        ``pp_proxy_stamp_names_pass`` for the full argument.
+
+        -1 when this rank has no phase-flip runtime to ask. Readers map that
+        to "no epoch named" and fall back to the slot-only comparison, so a
+        boot without the flip keeps its exact previous behaviour.
         """
         self._pp_proxy_seq = getattr(self, "_pp_proxy_seq", 0) + 1
         rows = -1
@@ -3689,7 +3875,13 @@ class SchedulerPPMixin:
                 rows = int(hs.shape[0])
         except Exception:  # noqa: BLE001 - a stamp may never break a send
             pass
-        return (int(mb_id), int(self._pp_proxy_seq), rows)
+        epoch = pp_flip_epoch_of(self)
+        return (
+            int(mb_id),
+            int(self._pp_proxy_seq),
+            rows,
+            -1 if epoch is None else int(epoch),
+        )
 
     def _pp_wait_for_proxy_readiness(self: Scheduler, mb_id: int) -> None:
         """#789: refuse to enter the blocking proxy receive until there is
@@ -3979,23 +4171,33 @@ class SchedulerPPMixin:
         # entry SURVIVES THE WIRE; it does not show one is safe to compute
         # on.
         stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
-        if stamp is None or mb_id < 0 or int(stamp[0]) == int(mb_id):
+        # #795: the comparison is (epoch, slot). A slot-only test is what let
+        # the 2026-08-21 mispair through this exact line -- see
+        # `pp_proxy_stamp_names_pass` for why the slot number alone is not an
+        # identity across a cutover.
+        epoch = pp_flip_epoch_of(self)
+        if stamp is None or mb_id < 0 or pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
             return PPProxyTensors(raw)
 
         self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
         raise RuntimeError(
             f"#631 PROXY LEFTOVER REFUSED: a proxy stamped mb_id={stamp[0]} "
-            f"seq={stamp[1]} rows={stamp[2]} arrived while this rank is on "
-            f"mb_id={mb_id}. It belongs to a pass this rank did not run -- "
-            f"in practice one sent by an upstream that resumed while this "
-            f"rank was still armed. Computing on it would pair one "
-            f"microbatch's hidden states with another's metadata and "
-            f"corrupt memory rather than merely fail; taking another "
-            f"message instead wedges the pipeline (corpse R), because the "
-            f"wire owes exactly one message per pass. The armed drain "
-            f"(pp_flip_drain_tensor_dicts) is what is supposed to prevent "
-            f"this from ever being reached -- if you are reading this, it "
-            f"did not, and THAT is the defect to chase."
+            f"seq={stamp[1]} rows={stamp[2]} epoch={pp_proxy_stamp_epoch(stamp)} "
+            f"arrived while this rank is on mb_id={mb_id} in flip epoch "
+            f"{epoch}. It belongs to a pass this rank did not run -- either "
+            f"another slot of this epoch (in practice one sent by an upstream "
+            f"that resumed while this rank was still armed), or, when the "
+            f"epochs differ, a pass from before a cutover that rebuilt this "
+            f"rank's whole slot ring, whose slot number therefore names "
+            f"nothing here however well it matches (#795). Computing on it "
+            f"would pair one microbatch's hidden states with another's "
+            f"metadata and corrupt memory rather than merely fail; taking "
+            f"another message instead wedges the pipeline (corpse R), because "
+            f"the wire owes exactly one message per pass. The drains "
+            f"(pp_flip_drain_tensor_dicts while armed, "
+            f"pp_flip_drain_leftover_dicts at disarm) are what is supposed to "
+            f"prevent this from ever being reached -- if you are reading this, "
+            f"they did not, and THAT is the defect to chase."
         )
 
     def _pp_recv_dict_from_prev_stage(
