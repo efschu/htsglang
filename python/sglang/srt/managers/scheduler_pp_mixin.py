@@ -1349,6 +1349,25 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
 
+                # #797d: THIS RANK'S OWN VOID MUST REACH THE BATCH, NOT ONLY
+                # THE ADMISSION DICT. `_pp_void_retracted_pass` above already
+                # set `self._pp_admission_pass_voided`; `get_next_batch_to_
+                # run` is expected to honour it on its own (scheduler.py's
+                # `_pp_admission_pass_voided` guard), but its local
+                # continuation logic (chunked_req, the resident running
+                # batch) runs BEFORE that guard and can still leave
+                # `self.mbs[mb_id]` non-empty -- see `_pp_void_own_batch`'s
+                # docstring for the exact deadlock this closes
+                # (SPECIMEN_wedge_19-02.txt). Placed strictly before the
+                # admission-decision send below, so a voided slot's
+                # `launched=self.mbs[mb_id] is not None` is never sent True,
+                # and strictly before the `cur_batch = self.mbs[mb_id]`
+                # branch further down, so a voided rank takes the drain
+                # branch there instead of blocking in a proxy receive nobody
+                # will satisfy.
+                if self._pp_admission_pass_voided:
+                    self._pp_void_own_batch(mb_id)
+
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
                 # `get_next_batch_to_run`, and strictly BEFORE `_pp_launch_
@@ -4634,6 +4653,147 @@ class SchedulerPPMixin:
             "and discarded -- an unmatched message here blocks the UPSTREAM "
             "in its next pass's proxy commit, not this rank.",
             mb_id,
+        )
+        return True
+
+    def _pp_void_own_batch(self: Scheduler, mb_id: int) -> bool:
+        """#797d: THIS rank's own voided pass must build nothing for `mb_id`,
+        even when `get_next_batch_to_run` still handed back a batch.
+
+        `_pp_void_retracted_pass` (above) empties the ADMISSION DICT
+        (`effective`) and the forwarded DECISION (`amended`), but neither of
+        those is what `get_next_batch_to_run` schedules from: it also runs
+        its own local continuation logic -- `self.chunked_req` (the #797b
+        stash at scheduler.py's `if self.chunked_req.extend_range.end >
+        len(prefix_indices): self.stash_chunked_request(...)`, unconditional
+        and reached BEFORE that function's own `_pp_admission_pass_voided`
+        early return) and the resident `running_batch` -- so it can still
+        return a non-empty `plan.batch_to_run` for a pass this rank has
+        already decided to run nowhere.
+
+        Downstream of that, uncleared: `_event_loop_pp_body`'s `if
+        cur_batch:` branch is taken and blocks in `_pp_recv_proxy_tensors` on
+        a proxy the voided UPSTREAM rank never sends (it took the
+        `_pp_drain_voided_proxy` branch instead, having voided the same
+        pass) -- the exact deadlock in SPECIMEN_wedge_19-02.txt: PP2 wedged
+        in `_pp_recv_proxy_tensors` <- `_event_loop_pp_body:1503` with
+        `effective={}` (the void executed) but `cur_batch` non-None (the
+        batch did not). Clearing the slot here, before that branch is
+        reached, also fixes the LAST rank's own output-send decision for
+        free: `_pp_commit_send_output_work_and_preprocess_output_tensors`
+        reads this same `self.mbs[...]` entry to choose between sending real
+        output and the `#791b` void-output fallback, so no separate flag is
+        needed for that side of the ring.
+
+        Called immediately after `get_next_batch_to_run`, strictly before
+        this pass's admission decision is sent (so a voided slot's
+        `launched=self.mbs[mb_id] is not None` is never sent True) and
+        strictly before `cur_batch = self.mbs[mb_id]` is read.
+
+        Mirrors `_pp_absorb_void_output`'s restore idiom -- chunked_req
+        restored to its pre-admission value and parked, never retracted;
+        resident decode requests kept, not released -- but for THIS rank's
+        own decision rather than an incoming wire message, so it does not
+        touch `pp_absorb_admission_return` / `_pp_void_forward_payload`:
+        those are PP0-only return-trip bookkeeping that has no counterpart
+        here.
+
+        `self.running_batch` / `self.running_mbs[mb_id]` are deliberately
+        NOT touched. Both were already reassigned this pass from `plan.
+        running_batch`, but that value is the carry-over of the PRIOR pass's
+        already-finished `last_batch` (scheduler.py's `last_batch.forward_
+        mode.is_extend()` merge, reached and completed before that
+        function's void check), not a product of THIS pass's now-voided
+        admission -- undoing it would discard already-validated resident
+        state on the same reasoning `_pp_absorb_void_output` itself gives for
+        never releasing a resident request: "the pass simply did not run,
+        and it decodes again next pass from the state it still holds".
+
+        True iff there was a batch to void. False (a no-op) when
+        `get_next_batch_to_run` already honoured the void on its own --
+        scheduler.py's own `_pp_admission_pass_voided` guard is meant to
+        guarantee exactly that, so idempotence here is what makes this call
+        safe defense-in-depth rather than a second, competing source of
+        truth.
+        """
+        batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
+        if batch is None:
+            return False
+        self.mbs[mb_id] = None
+        if mb_id < len(self.mb_metadata):
+            self.mb_metadata[mb_id] = None
+
+        carried_slots = getattr(self, "_pp_chunked_req_before_by_slot", None)
+        chunked_before = (
+            carried_slots[mb_id]
+            if carried_slots and 0 <= mb_id < len(carried_slots)
+            else None
+        )
+        if getattr(self, "chunked_req", None) is not chunked_before:
+            self.chunked_req = chunked_before
+        parked = _park_chunked_prefill_chunk(self, chunked_before)
+
+        # THE INSTR19 STATE, DEFENDED AGAINST RATHER THAN PROPAGATED.
+        # `_park_chunked_prefill_chunk` treats `extend_range is None` on
+        # its way in as "already parked, already reset, or never
+        # prepared -- nothing to give back" and leaves it untouched (see
+        # its own docstring) -- which is the right call for the KV-release
+        # question it answers, but wrong for this call site's OWN
+        # obligation: whatever it leaves in `self.chunked_req` is what the
+        # NEXT pass's `get_next_batch_to_run` dereferences unconditionally
+        # (`self.chunked_req.extend_range.end`, scheduler.py) the instant
+        # `self.chunked_req is not None`, with no guard of its own. Under
+        # this rank's own restore above, that state should be unreachable:
+        # `chunked_before` is a snapshot taken at the top of THIS pass, and
+        # if its `extend_range` had already been None going into THIS
+        # pass, `get_next_batch_to_run`'s identical top-of-function read
+        # would already have raised earlier in this very pass, before this
+        # gate ever ran -- so nothing upstream of here is known to produce
+        # it. The check costs one attribute read and turns "should not
+        # happen" into an explicit, coherent "no carried chunk" rather than
+        # a silent bet that the argument keeps holding across every future
+        # edit to the functions on this path.
+        if (
+            self.chunked_req is not None
+            and getattr(self.chunked_req, "extend_range", None) is None
+        ):
+            logger.warning(
+                "#797d own-void: the chunked request for slot %d already had "
+                "extend_range=None (the reset_for_retract shape "
+                "_park_chunked_prefill_chunk cannot repair) -- clearing "
+                "self.chunked_req instead of carrying a request the next "
+                "pass's get_next_batch_to_run cannot read.",
+                mb_id,
+            )
+            self.chunked_req = None
+
+        running_mbs = getattr(self, "running_mbs", None) or ()
+        running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
+        resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
+        reqs = list(getattr(batch, "reqs", None) or ())
+        released = 0
+        for req in reqs:
+            if pp_void_keeps_request(req, resident, chunked_before):
+                continue
+            _release_dynamic_chunk_probe(self, req)
+            try:
+                req.reset_for_retract()
+            except Exception as exc:  # noqa: BLE001 - a retract may not raise
+                logger.warning("#797d own-void retract failed: %s", exc)
+            self.waiting_queue.append(req)
+            released += 1
+
+        logger.warning(
+            "#797d PP-ADMISSION own pass voided on slot %d: get_next_batch_to_run "
+            "still returned a batch for a pass this rank had already voided, so "
+            "it is being cleared here instead of launched. %d of %d request(s) "
+            "released and re-queued (the rest are resident in the running batch, "
+            "or are the chunked request, and keep their pages -- #797/#797b; "
+            "chunk parked=%s).",
+            mb_id,
+            released,
+            len(reqs),
+            parked,
         )
         return True
 

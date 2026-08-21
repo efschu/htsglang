@@ -1321,5 +1321,408 @@ class _PP0View:
         self.extend_input_len = req.extend_range.length
 
 
+class _StubBatch:
+    """A minimal `self.mbs[mb_id]`-shaped object: only `.reqs` is read by
+    `_pp_void_own_batch`."""
+
+    def __init__(self, reqs):
+        self.reqs = list(reqs)
+
+
+class _StubRoundReq:
+    """A plain, round-owned batch member: not resident, not the chunked
+    request. `req_pool_idx=None` makes `_release_dynamic_chunk_probe` a
+    no-op on it (its own `getattr(req, "req_pool_idx", None) is not None`
+    guard), which is correct here -- this stub never held real KV rows."""
+
+    def __init__(self, rid):
+        self.rid = rid
+        self.req_pool_idx = None
+        self.extend_range = None
+        self.retracted = False
+
+    def reset_for_retract(self):
+        self.retracted = True
+
+
+class PPVoidOwnBatch797d(unittest.TestCase):
+    """#797d: the void a rank decides against ITS OWN pass must reach the
+    BATCH `get_next_batch_to_run` handed back, not only the admission dict.
+
+    THE SPECIMEN, SPECIMEN_wedge_19-02.txt (PP0/PP1/PP2, pp_size=3, tp_size=1,
+    chunked prefill in flight, rid=429872ab). PP1 retracts and voids
+    (`#791 unhonourable prefix`, `#797 pass voided on rank 1`); PP0 absorbs
+    correctly (`#791b void output`). PP2's OWN frame, at the exact pass in
+    question, shows both halves of the contradiction at once:
+    `effective: {}` (`_pp_void_retracted_pass` ran and voided) AND
+    `cur_batch: <ScheduleBatch ...>` (NOT None) in `_event_loop_pp_body`'s
+    own locals, py-spy stack `_pp_recv_proxy_tensors <- _event_loop_pp_body:
+    1503`. PP2 then blocks forever in a proxy receive for a message the
+    voided PP1 (correctly, via `_pp_drain_voided_proxy`) never sends.
+
+    `_pp_void_own_batch` is the gate closing this: called right after
+    `get_next_batch_to_run`, before the admission-decision send and before
+    `cur_batch = self.mbs[mb_id]` is read, so a rank that decided
+    `_pp_admission_pass_voided = True` cannot carry a non-empty
+    `self.mbs[mb_id]` into either of those two reads regardless of what
+    `get_next_batch_to_run` produced.
+
+    THE ARMS DRIVE THE SHIPPED METHOD DIRECTLY (`types.MethodType`, the same
+    pattern `PPVoidChunkedRequest797b` uses for `_pp_absorb_void_output`),
+    not a copy of it, so a later edit to the gate cannot leave these tests
+    passing against nothing.
+    """
+
+    def _holder(self, chunked_req=None, chunked_before=None, mb_id=1, size=3):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        h = types.SimpleNamespace(
+            mbs=[None] * size,
+            mb_metadata=[None] * size,
+            chunked_req=chunked_req,
+            waiting_queue=[],
+            running_mbs=[None] * size,
+            req_to_token_pool=_StubPool(),
+            token_to_kv_pool_allocator=_StubAllocator(),
+            _pp_chunked_req_before_by_slot=[None] * size,
+        )
+        h._pp_chunked_req_before_by_slot[mb_id] = chunked_before
+        h._pp_void_own_batch = types.MethodType(SchedulerPPMixin._pp_void_own_batch, h)
+        return h
+
+    def test_the_voided_ranks_batch_is_cleared_even_when_get_next_batch_to_run_disagreed(
+        self,
+    ):
+        """RED, and the can-fail proof for every other test below.
+
+        Reproduces the specimen's own contradiction directly rather than
+        depending on `get_next_batch_to_run`'s internal void guard to
+        (dis)agree: `self.mbs[mb_id]` is set to a non-None batch, exactly as
+        PP2's own frame shows it, on a rank that has already decided
+        `_pp_admission_pass_voided = True`. Before this change
+        `_pp_void_own_batch` does not exist at all, so this is
+        `AttributeError`; after it, `self.mbs[mb_id]` must be None -- the
+        gate `_event_loop_pp_body` applies is `if self.
+        _pp_admission_pass_voided: self._pp_void_own_batch(mb_id)`.
+        """
+        h = self._holder()
+        h.mbs[1] = _StubBatch([_StubRoundReq("round-owned")])
+        h._pp_admission_pass_voided = True
+
+        if h._pp_admission_pass_voided:
+            h._pp_void_own_batch(1)
+
+        self.assertIsNone(
+            h.mbs[1],
+            "the specimen's own contradiction: a voided pass still carrying a batch",
+        )
+
+    def test_a_carried_chunk_is_restored_not_consumed_by_the_own_void(self):
+        """The chunked request must survive as `_pp_absorb_void_output`
+        leaves it: parked (`extend_range.end == len(prefix_indices)`), not
+        retracted, still `self.chunked_req`, and never appended to
+        `waiting_queue` (it re-admits from `self.chunked_req` directly, so
+        appending it would duplicate it)."""
+        chunked = _StubChunkedReq()
+        h = self._holder(chunked_req=chunked, chunked_before=chunked, mb_id=1)
+        h.mbs[1] = _StubBatch([chunked, _StubRoundReq("round-owned")])
+        h._pp_admission_pass_voided = True
+
+        h._pp_void_own_batch(1)
+
+        self.assertIs(h.chunked_req, chunked, "the chunked request was dropped")
+        self.assertIsNotNone(
+            chunked.extend_range,
+            "reset_for_retract ran on the chunked request -- this is instr19",
+        )
+        self.assertEqual(chunked.extend_range.end, len(chunked.prefix_indices))
+        self.assertFalse(chunked.retracted)
+        self.assertNotIn(chunked, h.waiting_queue, "re-queued AND still chunked")
+        # The round-owned member is not the chunked request and is not
+        # resident: it must still be released and re-queued like any other
+        # ordinary batch member of a voided pass.
+        self.assertEqual(len(h.waiting_queue), 1)
+        self.assertEqual(h.waiting_queue[0].rid, "round-owned")
+
+    def test_launched_is_false_for_the_voided_rank_after_the_gate(self):
+        """`_event_loop_pp_body` forwards `launched=self.mbs[mb_id] is not
+        None` at both send sites (PP0's own decision and the non-first-rank
+        forward). After the gate runs, that expression must read False for
+        a voided slot -- this is what stops the upstream ever believing a
+        voided downstream rank launched something."""
+        h = self._holder()
+        h.mbs[1] = _StubBatch([_StubRoundReq("r1")])
+        h._pp_admission_pass_voided = True
+
+        h._pp_void_own_batch(1)
+        launched = h.mbs[1] is not None
+
+        self.assertFalse(launched)
+
+    def test_a_non_voided_pass_is_untouched_by_the_gate(self):
+        """REGRESSION. The gate in `_event_loop_pp_body` is `if self.
+        _pp_admission_pass_voided: self._pp_void_own_batch(mb_id)` -- a pass
+        that never voided must not even reach `_pp_void_own_batch`, so its
+        batch, chunked_req and waiting_queue are byte-identical to before."""
+        chunked = _StubChunkedReq()
+        h = self._holder(chunked_req=chunked, chunked_before=chunked, mb_id=1)
+        batch = _StubBatch([chunked, _StubRoundReq("r1")])
+        h.mbs[1] = batch
+        h._pp_admission_pass_voided = False
+
+        if h._pp_admission_pass_voided:
+            h._pp_void_own_batch(1)
+
+        self.assertIs(h.mbs[1], batch)
+        self.assertIs(h.chunked_req, chunked)
+        self.assertEqual(h.waiting_queue, [])
+        self.assertFalse(chunked.retracted)
+
+    def test_an_already_none_slot_is_a_safe_no_op(self):
+        """DEFENSE-IN-DEPTH IDEMPOTENCE. When `get_next_batch_to_run`
+        already honoured the void on its own (scheduler.py's own
+        `_pp_admission_pass_voided` guard), `self.mbs[mb_id]` is already
+        None and `_pp_void_own_batch` must do nothing and report it did
+        nothing -- this is what makes stacking the gate on top of that guard
+        safe rather than a second, competing source of truth."""
+        h = self._holder()
+        h._pp_admission_pass_voided = True
+
+        result = h._pp_void_own_batch(1)
+
+        self.assertFalse(result)
+        self.assertIsNone(h.mbs[1])
+        self.assertEqual(h.waiting_queue, [])
+
+    def test_an_already_reset_chunked_req_does_not_crash_the_next_pass(self):
+        """THE INSTR19 STATE, ARRIVING PRE-BROKEN. `chunked_before` is
+        constructed already in the post-`reset_for_retract` shape
+        (`extend_range=None`) -- the state `_park_chunked_prefill_chunk`
+        cannot repair (its own docstring: "already parked, already reset,
+        or never prepared -- nothing to give back", and it leaves
+        `extend_range` untouched in that branch). Before the defensive
+        check this added, `_pp_void_own_batch` would still assign
+        `self.chunked_req = chunked_before` and leave it there, and the
+        NEXT pass's `get_next_batch_to_run` dereferences
+        `self.chunked_req.extend_range.end` unconditionally the instant
+        `self.chunked_req is not None` (scheduler.py) --
+        `AttributeError: 'NoneType' object has no attribute 'end'`, boot
+        instr19's own crash shape. This asserts the gate clears
+        `self.chunked_req` to None instead, and then runs the next pass's
+        own guard directly (not a copy of it) to prove it does not raise.
+        """
+        broken = _StubChunkedReq()
+        broken.reset_for_retract()  # extend_range -> None, exactly instr19
+        h = self._holder(chunked_req=broken, chunked_before=broken, mb_id=1)
+        h.mbs[1] = _StubBatch([broken])
+        h._pp_admission_pass_voided = True
+
+        h._pp_void_own_batch(1)
+
+        self.assertIsNone(
+            h.chunked_req,
+            "extend_range was already None and unrepairable -- carrying "
+            "the request forward as self.chunked_req is the instr19 crash",
+        )
+        self.assertNotIn(
+            broken,
+            h.waiting_queue,
+            "the chunked request must not be released/re-queued either -- "
+            "it is dropped, not retracted",
+        )
+        # THE NEXT PASS'S OWN GUARD (scheduler.py get_next_batch_to_run),
+        # run directly against this holder's post-gate state rather than
+        # re-implemented: must not raise.
+        if h.chunked_req is not None:
+            _ = h.chunked_req.extend_range.end
+
+
+class _StopAtDrain(Exception):
+    """Raised by the rigged `_pp_drain_voided_proxy` stub the instant it is
+    reached, to stop `_event_loop_pp_body`'s infinite loop exactly where this
+    test's assertions are complete -- everything past the drain call (proxy
+    send, `_pp_launch_batch`, output processing, the chain flush, phase-flip)
+    is untouched by #797d and would need its own stubs for no additional
+    coverage."""
+
+
+class _StoppedAtRecvProxy(Exception):
+    """Raised by the rigged `_pp_recv_proxy_tensors` stub. Reaching it means
+    `cur_batch` was still truthy when `_event_loop_pp_body` read it -- i.e.
+    the #797d gate did not run, did not run in time, or was bypassed. This is
+    the exact deadlock site in SPECIMEN_wedge_19-02.txt
+    (`_pp_recv_proxy_tensors <- _event_loop_pp_body:1503`), turned from an
+    infinite block into an immediate, loud failure."""
+
+
+class _LoopStubBatch:
+    """The non-empty batch `get_next_batch_to_run` hands back despite the
+    pass already being voided -- the specimen's own contradiction
+    (`effective: {}` but `cur_batch: <ScheduleBatch ...>`), constructed
+    directly rather than relying on scheduler.py's own void guard to
+    (dis)agree."""
+
+    def __init__(self, reqs=()):
+        self.reqs = list(reqs)
+
+
+class PPVoidOwnBatchWiring797d(unittest.TestCase):
+    """WIRING, not the gate's own logic (`PPVoidOwnBatch797d` above already
+    covers that in isolation). This class drives the SHIPPED
+    `_event_loop_pp_body` itself -- the real bound method, not a
+    hand-replicated copy of its sequence -- so it goes RED if the two-line
+    call site
+
+        if self._pp_admission_pass_voided:
+            self._pp_void_own_batch(mb_id)
+
+    is removed from `_event_loop_pp_body`, or moved to after the
+    admission-decision send, or moved to after `cur_batch = self.mbs[mb_id]`
+    is read. `PPVoidOwnBatch797d` alone cannot detect any of those three
+    regressions: it calls `_pp_void_own_batch` directly and would stay green
+    even if `_event_loop_pp_body` never called it at all.
+
+    THE STOPPING TRICK. Fully driving one pass of `_event_loop_pp_body` to
+    completion would require stubbing `_pp_launch_batch`, real forward
+    compute, output post-processing, the request-chain flush and phase-flip
+    -- none of which #797d touches. Instead, `_pp_recv_proxy_tensors` and
+    `_pp_drain_voided_proxy` are rigged to raise the instant either is
+    reached, which is also exactly the branch point the gate decides between
+    (`if cur_batch: ... recv ... else: ... drain ...`) -- so the raised
+    exception's TYPE is itself the assertion: `_StopAtDrain` means the gate
+    ran and cleared the slot before `cur_batch` was read; `_StoppedAtRecvProxy`
+    means it did not, and the loop took the branch that would have blocked
+    forever on a proxy nobody sends (the specimen's own deadlock, made loud
+    instead of silent).
+
+    VERIFIED TO GO RED: with the call site in `_event_loop_pp_body` changed
+    to ``if False and self._pp_admission_pass_voided:`` (disabling it while
+    leaving `_pp_void_own_batch` itself intact), `test_the_real_event_loop_
+    clears_the_slot_and_never_touches_the_proxy_receive` fails with
+    `_StoppedAtRecvProxy` instead of the expected `_StopAtDrain`; see the
+    task report for the captured output. Restoring the call site returns it
+    to green.
+    """
+
+    def _holder(self):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        calls = {"recv_proxy": 0, "drain": 0, "sent_decisions": []}
+        stub_batch = _LoopStubBatch(reqs=())
+
+        h = types.SimpleNamespace(
+            ps=types.SimpleNamespace(pp_rank=1, pp_size=WORLD),
+            pp_group=types.SimpleNamespace(is_first_rank=False, is_last_rank=False),
+            pp_loop_size=WORLD,
+            running_mbs=[None] * WORLD,
+            last_mbs=[None] * WORLD,
+            mbs=[None] * WORLD,
+            mb_metadata=[None] * WORLD,
+            chunked_req=None,
+            request_receiver=types.SimpleNamespace(recv_requests=lambda: []),
+            server_args=types.SimpleNamespace(
+                pp_async_batch_depth=0, enable_phase_flip=False
+            ),
+            _pp_output_expected_incoming=False,
+            _pp_admission_pass_voided=False,
+        )
+
+        h._pp_flip_pass_tick = lambda mb_id: None
+        h._pp_forward_and_process_input_requests = lambda recv_reqs: None
+        h._pp_recv_admission_decision = lambda: object()
+        h._pp_reconcile_incoming_admission = lambda incoming: ({}, object())
+        # `_pp_forwarded_schedule_from` is a real mixin method that expects a
+        # real `PPAdmissionDecision`'s `.entries`; the `amended` this rig
+        # forwards is a bare `object()` (its content is irrelevant to
+        # #797d), so this is stubbed rather than bound.
+        h._pp_forwarded_schedule_from = lambda amended: None
+
+        def _void_retracted_pass(effective, amended):
+            # THE PRECONDITION #797d ACTS ON: the pass is already decided
+            # voided before `get_next_batch_to_run` runs, exactly as
+            # `_pp_void_retracted_pass` (the real one) leaves it.
+            h._pp_admission_pass_voided = True
+            return {}, amended
+
+        h._pp_void_retracted_pass = _void_retracted_pass
+
+        class _Plan:
+            def __init__(self, batch_to_run, running_batch):
+                self.batch_to_run = batch_to_run
+                self.running_batch = running_batch
+
+        def _get_next_batch_to_run(running_batch=None, last_batch=None):
+            # THE CONTRADICTION ITSELF: void already decided (True, set by
+            # the stub above), yet a non-empty batch comes back anyway.
+            return _Plan(batch_to_run=stub_batch, running_batch=running_batch)
+
+        h.get_next_batch_to_run = _get_next_batch_to_run
+
+        def _recv_proxy_tensors(mb_id):
+            calls["recv_proxy"] += 1
+            raise _StoppedAtRecvProxy(
+                f"cur_batch was truthy for mb_id={mb_id} on a voided pass -- "
+                "the #797d gate did not clear self.mbs[mb_id] in time"
+            )
+
+        h._pp_recv_proxy_tensors = _recv_proxy_tensors
+
+        def _drain_voided_proxy(mb_id):
+            calls["drain"] += 1
+            raise _StopAtDrain()
+
+        h._pp_drain_voided_proxy = _drain_voided_proxy
+
+        def _send_admission_decision(
+            amended, expects_output=None, pass_voided=None, launched=None
+        ):
+            calls["sent_decisions"].append(
+                {"pass_voided": pass_voided, "launched": launched}
+            )
+
+        h._pp_send_admission_decision = _send_admission_decision
+
+        # THE METHODS UNDER TEST, bound for real -- not stubbed, not
+        # reimplemented. If `_event_loop_pp_body` stops calling
+        # `_pp_void_own_batch` at the #797d call site, nothing in this rig
+        # papers over that; the real bound methods are the only things that
+        # can clear `h.mbs[0]` or record a call.
+        for name in (
+            "_event_loop_pp_body",
+            "_pp_void_own_batch",
+            "_pp_note_output_expectation",
+            "_pp_note_chunked_req_before_admission",
+        ):
+            setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
+
+        return h, calls
+
+    def test_the_real_event_loop_clears_the_slot_and_never_touches_the_proxy_receive(
+        self,
+    ):
+        h, calls = self._holder()
+
+        with self.assertRaises(_StopAtDrain):
+            h._event_loop_pp_body()
+
+        # The drain branch ran, not the receive branch -- the receive is
+        # rigged to raise a DIFFERENT exception type, so reaching it instead
+        # would have failed this `assertRaises` with `_StoppedAtRecvProxy`
+        # rather than silently passing.
+        self.assertEqual(calls["drain"], 1)
+        self.assertEqual(calls["recv_proxy"], 0)
+        # The gate reached `self.mbs[0]` (mb_id starts at 0) before the
+        # pass's own admission-decision send and before the drain/receive
+        # branch read it.
+        self.assertIsNone(h.mbs[0])
+        self.assertEqual(len(calls["sent_decisions"]), 1)
+        self.assertFalse(
+            calls["sent_decisions"][0]["launched"],
+            "the forwarded decision must carry launched=False for a voided "
+            "slot the gate cleared",
+        )
+        self.assertTrue(calls["sent_decisions"][0]["pass_voided"])
+
+
 if __name__ == "__main__":
     unittest.main()
