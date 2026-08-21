@@ -6254,24 +6254,49 @@ class ModelRunnerKVCacheMixin:
         rank = int(self._seam_world_rank())
         layout_pp, layout_tp = derivation
         draft = self._flip_draft_residency_bytes()
-        charged = probe.post_sizing_stack_bytes(rank, layout_pp, layout_tp, draft)
+        # THE CREDIT AND THE DEFERRAL ARE ONE DECISION, asked once, here.
+        # ``cold_stack_deferred`` is the SAME predicate the boot consults
+        # before it decides whether to build the flip draft's attention
+        # workspaces and decode graphs (build_phase_flip_tp_stack step 5).
+        # Reading it from anywhere else -- a second flag, a copy of the depth
+        # comparison -- admits the one failure this cannot survive: a pool
+        # sized as if the cold posts are absent, in a boot that allocates
+        # them anyway.
+        from sglang.srt.managers.phase_flip_spill import cold_stack_deferred
+
+        deferred = cold_stack_deferred(getattr(self, "server_args", None))
+        charged = probe.post_sizing_stack_bytes(
+            rank, layout_pp, layout_tp, draft, cold_stack_deferred=deferred
+        )
         self._post_sizing_stack_cached = int(charged)
+        residual_mib = float(
+            probe.STACK_RESIDUAL_MIB[rank]
+            if rank < len(probe.STACK_RESIDUAL_MIB)
+            else 0
+        )
+        # The residual line has to follow the decision, not the constant. A
+        # boot that took the credit and still printed "+ measured stack
+        # residual 2294" would be reporting a charge it did not make, at the
+        # one line anybody debugging a pool size reads first.
         logger.info(
             "%s (rank %d): POST-SIZING STACK POST %.1f MiB charged against the "
             "KV budget = arena above the PP weights %.1f + flip-draft weights "
-            "%.1f + measured stack residual %.1f (backends, graphs). Every "
-            "member is created by build_phase_flip_tp_stack AFTER this solve; "
-            "they are charged as ONE term because charging them separately "
-            "cost two boots and two different OOMs.",
+            "%.1f + %s. Every member is created by "
+            "build_phase_flip_tp_stack AFTER this solve; they are charged as "
+            "ONE term because charging them separately cost two boots and two "
+            "different OOMs.",
             probe.LOG_PREFIX,
             rank,
             charged / 1048576.0,
             max(0, layout_tp - layout_pp) / 1048576.0,
             draft / 1048576.0,
-            float(
-                probe.STACK_RESIDUAL_MIB[rank]
-                if rank < len(probe.STACK_RESIDUAL_MIB)
-                else 0
+            (
+                f"stack residual 0.0 CREDITED, not charged: the flip draft's "
+                f"attention workspaces and decode graphs ({residual_mib:.1f} "
+                f"MiB measured) are DEFERRED to the first pp->tp cutover, "
+                f"which is the phase that first uses them (spill rung 4)"
+                if deferred
+                else f"measured stack residual {residual_mib:.1f} (backends, graphs)"
             ),
         )
         return self._post_sizing_stack_cached

@@ -1701,6 +1701,31 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             # afford them.
             if _ladder is not None:
                 _ladder.on_enter_tp(stacks.draft_worker)
+
+            # 7b-ii. SPILL RUNG 4: the posts the BOOT deferred.
+            #
+            # BETWEEN the weight restore above and the bootstrap below, and
+            # neither neighbour is arbitrary. The capture bakes draft
+            # parameter addresses, so rung 2 must have put pages under them
+            # first; the bootstrap arms graphs, so the graphs must exist.
+            #
+            # This is a ONE-TIME move, not a per-flip spill. The boot skipped
+            # these posts because the PP phase it entered cannot execute a TP
+            # or draft forward -- and that PP phase is what sizes the KV pool.
+            # From the second pp->tp leg on this is a no-op.
+            from sglang.srt.managers.phase_flip_boot import (
+                restore_deferred_cold_stack,
+            )
+
+            if restore_deferred_cold_stack(scheduler, stacks):
+                logger.info(
+                    "%s rung 4: built the flip TP stack's deferred cold posts "
+                    "(attention workspaces + decode graphs) at the first "
+                    "pp->tp cutover; the KV budget was solved with this "
+                    "credit already taken and the seam priced the restore",
+                    LOG_PREFIX,
+                )
+
             arm_draft_bootstrap_all_reachable(scheduler, want_draft)
 
             # #662-F4: AND THE MIRROR OF THE RECOVERY BELOW. Since the rung
@@ -5023,9 +5048,24 @@ class PhaseFlipRuntime:
         # this form at 0.80x (OVER). For a gate whose only action is to
         # refuse, over-reserving costs a delayed flip and under-reserving cost
         # the corridor breach above.
+        # RUNG 4 JOINS THE DRAFT RESTORE INSIDE THE max(), SUMMED WITH IT.
+        # Both are cutover-instant commits, and the cutover's own ordering
+        # makes them coexist -- rung 2 restores the weight pages first so the
+        # deferred capture has addresses to bake. See _cold_stack_restore_bytes.
+        #
+        # THE SHAPE OF THIS RETURN IS PINNED, deliberately, by
+        # test_phase_flip_arena_tail_631.ThePendingCommitIsPricedTest: the tail
+        # is ADDED to the max() and must never become a third argument of it.
+        # Keep the tail and the max() on their own lines -- the pin reads the
+        # source text, because the difference it guards is one measured
+        # corridor breach wide (MERGE-R9 12.4) and is invisible in a value.
         return int(
             self._arena_tail_bytes(direction)
-            + max(wave_peak, self._draft_restore_bytes(direction))
+            + max(
+                wave_peak,
+                self._draft_restore_bytes(direction)
+                + self._cold_stack_restore_bytes(direction),
+            )
         )
 
     def _arena_tail_bytes(self, direction: str) -> int:
@@ -5113,6 +5153,68 @@ class PhaseFlipRuntime:
             logger.warning(
                 "%s could not price the draft restore, gating on the wave "
                 "peak alone: %s",
+                LOG_PREFIX,
+                e,
+            )
+            return 0
+
+    def _cold_stack_restore_bytes(self, direction: str) -> int:
+        """Device bytes the pp->tp leg must commit for the DEFERRED cold posts.
+
+        RUNG 4's mirror of ``_draft_restore_bytes``, and it is here for exactly
+        the same reason: when the boot deferred the flip TP stack's attention
+        workspaces and decode graphs, the pp->tp ``_cutover`` is what builds
+        them -- past the point of no return. An allocation failure there cannot
+        be unwound, and it is the same failure shape that took all three ranks
+        down on 2026-08-09 when rung 2's re-commit was unpriced. Pricing it
+        turns that death into a unanimous, free abandon before a byte moves.
+
+        THE NUMBER IS THE MEASURED RESIDUAL, the same constant the KV sizer
+        took as a credit (``arena_tail_probe.STACK_RESIDUAL_MIB``). Using one
+        constant for both sides is deliberate: the credit and the charge are
+        the same bytes seen at the two ends of the deferral, and if they could
+        drift apart the pool would be sized against one number and funded
+        against another.
+
+        SUMMED WITH THE DRAFT RESTORE, not max()'d with it. Both commits run
+        inside the same ``_cutover``, and the ordering makes them coexist: rung
+        2 puts the weight pages back FIRST precisely so the capture has
+        something to bake addresses into, so at the instant the graphs are
+        captured the restored weights are still held. max() would model a peak
+        that the code's own ordering rules out.
+
+        Zero on the tp->pp leg, zero at every rung that does not defer, and
+        zero once the posts exist -- which is every flip after the first. A
+        charge that outlived the build would shrink the staging budget forever
+        and abandon flips that fit, against a record of 0 abandons in 402.
+        """
+        if direction != PP_TO_TP:
+            return 0
+        # getattr throughout: _staging_bytes is exercised by unit stubs built
+        # with object.__new__, which carry none of the runtime's fields.
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:  # unit stubs
+            return 0
+        try:
+            from sglang.srt.managers.arena_tail_probe import STACK_RESIDUAL_MIB
+            from sglang.srt.managers.phase_flip_boot import COLD_STACK_BUILT_ATTR
+            from sglang.srt.managers.phase_flip_spill import cold_stack_deferred
+
+            if not cold_stack_deferred(getattr(scheduler, "server_args", None)):
+                return 0
+            stacks = getattr(scheduler, "phase_flip_stacks", None)
+            tp_worker = getattr(stacks, "tp_worker", None)
+            if tp_worker is None or getattr(tp_worker, COLD_STACK_BUILT_ATTR, False):
+                return 0
+            rank = int(self._rank)
+            if not 0 <= rank < len(STACK_RESIDUAL_MIB):
+                return 0
+            return int(STACK_RESIDUAL_MIB[rank]) * 1048576
+        except Exception as e:  # pragma: no cover - never block a flip on this
+            # A gate that cannot price the build must not also refuse it.
+            logger.warning(
+                "%s could not price the deferred cold-stack build, gating on "
+                "the wave peak alone: %s",
                 LOG_PREFIX,
                 e,
             )

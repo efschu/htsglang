@@ -233,6 +233,21 @@ DEPTH_NAMES_BY_VALUE = {v: k for k, v in DEPTH_NAMES.items()}
 DEPTH_ENV = "SGLANG_PHASE_FLIP_SPILL_DEPTH"
 VERIFY_ENV = "SGLANG_PHASE_FLIP_SPILL_VERIFY"
 
+#: THE EXERCISE HATCH, and the reason a hatch exists at all.
+#:
+#: ``IMPLEMENTED_DEPTH`` is raised only after a rung has RUN on metal (the
+#: desk-written-never-executed rule). That rule and the refusal below form a
+#: deadlock for the rung being wired: the rung cannot be promoted until it has
+#: been exercised, and it cannot be exercised while the refusal that guards
+#: promotion is what stops the boot from reaching it.
+#:
+#: This env is the only way through, and it is deliberately not a server arg:
+#: an operator sweeping ``--phase-flip-spill-depth`` must keep hitting the
+#: refusal, because for them the rung genuinely is unexercised. It is loud
+#: (WARNING on every resolution) and it is expected to become dead weight the
+#: moment the rung it was opened for is promoted.
+DEPTH_UNIMPLEMENTED_ENV = "SGLANG_PHASE_FLIP_SPILL_DEPTH_EXPERIMENTAL"
+
 _MIB = 1048576.0
 
 
@@ -243,6 +258,16 @@ class PhaseFlipSpillError(RuntimeError):
     whose parameters are 0-sized placeholders, and a forward through those
     is a far worse diagnostic than this exception.
     """
+
+
+def _unimplemented_hatch_open() -> bool:
+    """Whether this process may request a wired-but-unexercised rung."""
+    return os.environ.get(DEPTH_UNIMPLEMENTED_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def resolve_spill_depth(server_args: Any = None) -> int:
@@ -276,6 +301,24 @@ def resolve_spill_depth(server_args: Any = None) -> int:
             f"{LOG_PREFIX} spill depth {value} out of range; valid depths "
             f"are 0..{MAX_DEPTH} (cumulative: 2 implies 1)"
         )
+    if value > IMPLEMENTED_DEPTH and _unimplemented_hatch_open():
+        # The hatch is checked BEFORE the refusal is built, not caught after
+        # it: the refusal text asserts the rung is unreachable, and a path
+        # that raises it and then swallows it would leave that assertion
+        # standing while being false.
+        logger.warning(
+            "%s spill depth %d (%r) exceeds the implemented rung %d and is "
+            "being allowed by %s=1. This is the EXPERIMENTAL hatch: the rung "
+            "is wired but has not yet been exercised on metal, which is the "
+            "only reason it is not promoted. Do not use it for a measurement "
+            "you intend to keep without saying that the hatch was open.",
+            LOG_PREFIX,
+            value,
+            DEPTH_NAMES_BY_VALUE.get(value, value),
+            IMPLEMENTED_DEPTH,
+            DEPTH_UNIMPLEMENTED_ENV,
+        )
+        return value
     if value > IMPLEMENTED_DEPTH:
         # Refuse rather than clamp. Clamping would make a depth sweep report
         # that the refused rung is worth exactly what a lower one is worth,
@@ -1001,6 +1044,33 @@ class VmmWeightsArenaCarrier:
             self._released_mib = released / _MIB
             return released / _MIB
         return 0.0
+
+
+def cold_stack_deferred(server_args: Any = None) -> bool:
+    """ONE predicate for the rung-4 deferral: sizer credit AND boot behaviour.
+
+    WHY ONE PREDICATE AND NOT TWO FLAGS. The credit
+    (``arena_tail_probe.post_sizing_stack_bytes(cold_stack_deferred=True)``)
+    and the deferral (``build_phase_flip_tp_stack`` skipping the cold posts)
+    are the same claim seen from two sides: the pool may be sized as if the
+    flip draft's attention workspaces and decode graphs are absent EXACTLY
+    WHEN the boot actually leaves them unbuilt. Two independently-set flags
+    can disagree, and the direction that disagrees silently -- credit taken,
+    deferral not performed -- sizes a pool into memory the same boot then
+    allocates. That is the #678 OOM class, and no test of either side alone
+    can catch it. So both sides ask this function and nothing else.
+
+    IT ANSWERS FALSE RATHER THAN RAISING on a depth this build refuses. The
+    sizer calls this on every boot, including one configured for a rung that
+    is not promoted yet; taking the boot down HERE would report the ladder's
+    policy as a memory-sizing failure, at a line that has nothing to do with
+    it. The refusal still happens -- loudly, with its own text -- when the
+    scheduler resolves the ladder in ``get_spill_ladder``.
+    """
+    try:
+        return resolve_spill_depth(server_args) >= DEPTH_DRAFT_GRAPHS
+    except PhaseFlipSpillError:
+        return False
 
 
 class PhaseFlipSpillLadder:

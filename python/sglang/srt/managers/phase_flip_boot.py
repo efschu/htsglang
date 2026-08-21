@@ -631,6 +631,127 @@ def build_flip_draft_worker(scheduler, tp_worker, tp_args, world_rank):
     return draft
 
 
+#: Marks a worker whose cold posts are already built. On the TARGET worker
+#: rather than on the stacks object because the cutover reaches the worker
+#: through ``stacks`` but the boot reaches it as a local, and a flag that
+#: lives on the thing being built cannot go stale relative to it.
+COLD_STACK_BUILT_ATTR = "_phase_flip_cold_stack_built"
+
+
+def build_cold_stack_posts(
+    tp_worker, draft_worker, draft_carrier, *, where: str
+) -> bool:
+    """The flip TP stack's PHASE-COLD posts: attention workspaces + graphs.
+
+    Returns True if this call built them, False if they already existed.
+
+    WHY THESE FOUR CALLS ARE ONE FUNCTION. They are the posts that the PP
+    phase pays for and cannot use. The PP phase runs on the boot stack, so
+    between boot and the first pp->tp cutover no TP forward and no draft
+    forward happens -- the workspaces are untouched memory and the captured
+    graphs are unreplayed. Measured on this rig they are 2294 / 1188 / 625 MiB
+    (``arena_tail_probe.STACK_RESIDUAL_MIB``), and on the binding rank that is
+    the whole distance between the pool this cut solves and the 669k plain-TP
+    reference.
+
+    THE ORDER IS THE BOOT'S ORDER AND IS LOAD-BEARING. Backends on both
+    workers before graphs on either: the target's capture drives the drafter,
+    so the drafter's backend must exist before the target captures.
+
+    IDEMPOTENT BY CONSTRUCTION, and that is the point of routing both sites
+    through here. The deferral's failure mode is not "never built" -- that
+    fails loudly on the first decode -- but "built twice", which allocates a
+    second set of workspaces and a second capture, silently, and only shows up
+    as a pool that can no longer back itself.
+    """
+    if getattr(tp_worker, COLD_STACK_BUILT_ATTR, False):
+        logger.info(
+            "%s cold stack posts already built; %s is a no-op", LOG_PREFIX, where
+        )
+        return False
+
+    tp_worker.init_attention_backends()
+    if draft_worker is not None:
+        draft_worker.init_attention_backends()
+    tp_worker.init_cuda_graphs()
+    if draft_worker is not None:
+        draft_worker.init_cuda_graphs()
+
+    # THE CARRIER PIN (#656 rung 2), checked AFTER capture -- and it travels
+    # with the capture rather than staying at the boot site.
+    #
+    # Capture is the instant the drafter's parameter addresses stop being
+    # movable. Asserting here is what catches the failure this ordering exists
+    # to prevent: something between the carrier pack (4c) and the capture
+    # reallocating a draft parameter, so the graphs bake an address the
+    # carrier does not own and the spill later releases pages the graphs still
+    # read. There is no runtime symptom to catch that later; the drafter
+    # simply produces wrong tokens and the accept rate decays.
+    #
+    # Left BEFORE the built-flag is set: a refusal must not latch, or a retry
+    # would skip the capture and run a drafter with no graphs at all.
+    if draft_carrier is not None:
+        if not draft_carrier.contains_all_params():
+            raise PhaseFlipBootError(
+                "PHASE-FLIP-SPILL the draft CUDA graphs were captured "
+                "against parameter addresses that do NOT all lie "
+                "inside the spill carrier's reservation. Something "
+                "between the carrier pack (4c) and the capture "
+                f"(at {where}) reallocated a draft parameter. Spilling "
+                "would then release pages the graphs still address, which "
+                "is silent corruption -- refusing the boot instead."
+            )
+        logger.info(
+            "%s carrier pin OK at %s: all %d draft parameters lie inside the "
+            "VA-stable reservation after graph capture; rung 2 may "
+            "release their pages without moving an address",
+            LOG_PREFIX,
+            where,
+            len(draft_carrier.param_ptrs()),
+        )
+
+    setattr(tp_worker, COLD_STACK_BUILT_ATTR, True)
+    logger.info("%s cold stack posts built at %s", LOG_PREFIX, where)
+    return True
+
+
+def restore_deferred_cold_stack(scheduler, stacks) -> bool:
+    """pp->tp leg: build the cold posts this instance's boot left out.
+
+    Returns True if this call built them.
+
+    WHERE THIS SITS AND WHY. Called from the cutover's tp_phase branch, AFTER
+    rung 2 has restored the draft weights and BEFORE the draft bootstrap. Both
+    neighbours are load-bearing:
+
+    * after the weights, because the capture bakes parameter addresses and
+      there must be pages under them to bake;
+    * before the bootstrap, because ``arm_draft_bootstrap_all_reachable``
+      scrubs the drafter's pool and the graphs must exist to be armed.
+
+    THE BYTES ARE ALREADY PAID FOR when control reaches here. The pp->tp
+    affordability verdict prices this build (see ``_staging_bytes``), so a
+    rank that got this far has agreed it can afford them; the KV pool is the
+    relief provider that funds it (``kv_backing_relief`` /
+    ``recover_kv_backing``). That is the whole reason the boot was allowed to
+    size a pool as if these bytes were absent.
+
+    ONCE PER PROCESS, not once per flip. ``build_cold_stack_posts`` latches,
+    so the second and every later pp->tp leg costs nothing. A per-flip
+    re-capture is the trade #656 spec item 8 measured at 41% of decode
+    throughput and rejected, and this must not reintroduce it by accident.
+    """
+    from sglang.srt.managers import phase_flip_spill as spill
+
+    if not spill.cold_stack_deferred(getattr(scheduler, "server_args", None)):
+        return False
+    draft_worker = getattr(stacks, "draft_worker", None)
+    carrier = spill.carrier_of(draft_worker) if draft_worker is not None else None
+    return build_cold_stack_posts(
+        stacks.tp_worker, draft_worker, carrier, where="pp->tp cutover"
+    )
+
+
 def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     """Build the TP decode stack beside the fully-constructed PP stack.
 
@@ -987,48 +1108,47 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                     token_to_kv_pool_allocator=allocator,
                 )
 
-            tp_worker.init_attention_backends()
-            if draft_worker is not None:
-                draft_worker.init_attention_backends()
-            tp_worker.init_cuda_graphs()
-            if draft_worker is not None:
-                draft_worker.init_cuda_graphs()
-
-            # 5b. THE CARRIER PIN (#656 rung 2), checked AFTER capture.
+            # 5b. THE COLD POSTS (spill rung 4), built HERE or deferred to the
+            # first pp->tp cutover -- see build_cold_stack_posts, and note that
+            # the carrier pin moved INTO it because the pin belongs to the
+            # capture, wherever the capture happens.
             #
-            # Capture is the instant the drafter's parameter addresses stop
-            # being movable. Asserting here -- not at pack time -- is what
-            # catches the failure this ordering exists to prevent: something
-            # between the pack and the capture reallocating a draft
-            # parameter, so the graphs bake an address the carrier does not
-            # own and the spill later releases pages the graphs still read.
-            # There is no runtime symptom to catch that later; the drafter
-            # simply produces wrong tokens and the accept rate decays.
-            if draft_carrier is not None:
-                if not draft_carrier.contains_all_params():
-                    raise PhaseFlipBootError(
-                        "PHASE-FLIP-SPILL the draft CUDA graphs were captured "
-                        "against parameter addresses that do NOT all lie "
-                        "inside the spill carrier's reservation. Something "
-                        "between the carrier pack (4c) and the capture (5) "
-                        "reallocated a draft parameter. Spilling would then "
-                        "release pages the graphs still address, which is "
-                        "silent corruption -- refusing the boot instead."
-                    )
+            # The predicate is the ladder's, not a local one: the KV sizer
+            # asked the SAME function before it solved the pool. If these two
+            # sites could disagree, the disagreement that matters is a pool
+            # sized for a deferral this boot then declines to perform.
+            from sglang.srt.managers.phase_flip_spill import cold_stack_deferred
+
+            if cold_stack_deferred(getattr(scheduler, "server_args", None)):
                 logger.info(
-                    "%s carrier pin OK: all %d draft parameters lie inside the "
-                    "VA-stable reservation after graph capture; rung 2 may "
-                    "release their pages without moving an address",
+                    "%s rung 4: DEFERRING the flip TP stack's cold posts (the "
+                    "attention-backend workspaces and the decode CUDA graphs) "
+                    "to the first pp->tp cutover. The PP phase this boot is "
+                    "about to enter cannot execute a TP or draft forward, so "
+                    "these bytes would be resident and unusable for the whole "
+                    "phase that sizes the KV pool. The KV budget was solved "
+                    "with the matching credit already taken.",
                     LOG_PREFIX,
-                    len(draft_carrier.param_ptrs()),
+                )
+            else:
+                build_cold_stack_posts(
+                    tp_worker, draft_worker, draft_carrier, where="boot"
                 )
 
             # 5c. EXCLUSIVE-BACKING PIN, measured rather than intended.
             # Between the release above and the restore below exactly one
             # layout may hold pages. Asserting it here -- with the TP pool
-            # allocated and its graphs captured, the worst moment -- is what
-            # makes "exclusive" a checked property instead of a claim about
-            # the code's shape.
+            # allocated -- is what makes "exclusive" a checked property
+            # instead of a claim about the code's shape.
+            #
+            # THIS IS THE WORST MOMENT ONLY AT RUNGS BELOW 4. It used to be,
+            # unconditionally, because the graphs were captured just above.
+            # Under the rung-4 deferral they are not, so the true residency
+            # peak moves to the first pp->tp cutover -- which is exactly why
+            # that build is priced into the seam's affordability verdict
+            # (_cold_stack_restore_bytes) instead of being checked here.
+            # What this pin still asserts is unchanged and still exact: the
+            # two KV layouts never hold pages at the same time.
             tp_kv_pool = tp_worker.model_runner.token_to_kv_pool
             if _swappable:
                 pp_backed = int(getattr(pp_kv_pool, "backed_bytes", 0))
