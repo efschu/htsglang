@@ -120,7 +120,9 @@ arithmetic over ids, testable on CPU with no CUDA present.
 from __future__ import annotations
 
 import logging
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
+
+from sglang.srt.managers.log_cycle_collapse import CycleCollapse
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +163,11 @@ class ParkedDecodeSet:
         #: Counters a summary can read without re-deriving them.
         self.parked_total = 0
         self.readmitted_total = 0
+        #: The reconcile receipt is per-round and level-triggered, so a
+        #: steady cadence restates it forever -- 140184 lines and 25 MB of
+        #: boot instr14. See :meth:`_emit_reconcile_receipt`.
+        self._receipt_collapse = CycleCollapse()
+        self._suppressed_summary: Tuple[int, int] = (0, 0)
 
     # -- shape ------------------------------------------------------------
 
@@ -290,6 +297,64 @@ class ParkedDecodeSet:
                 f"{max(0, int(running_bs) - len(self._ids))}, and the binding "
                 f"bound on new prefill is the GDN slot pool {self.slot_pool}"
             )
+            self._emit_reconcile_receipt(len(self._ids), int(running_bs))
+
+    def _emit_reconcile_receipt(self, parked: int, running_bs: int) -> None:
+        """Log :attr:`last_receipt`, unless the reconcile is repeating itself.
+
+        WHY THIS EXISTS. Boot instr14 wrote 140184 of these lines in ten
+        minutes -- 25373304 bytes, 49% of a 51 MB log, at 13.03 MB/min peak.
+        ``sync_carriers`` is LEVEL-TRIGGERED and runs once per scheduler
+        round, so a steady phase-flip cadence restates the same handful of
+        reconciles forever.
+
+        AND WHY IT IS A CYCLE DETECTOR. On instr14 no two consecutive
+        receipts are equal; they cycle with period 3::
+
+            carriers 4 parked (+4 -2) of 4 resident; ...
+            carriers 2 parked (+2 -4) of 2 resident; ...
+            carriers 2 parked (+2 -2) of 2 resident; ...
+
+        A "same as the last line" test removes 3 lines out of 13545 on the
+        measured tail. Recognising the cycle removes all but 5.
+
+        THIS RECEIPT IS RANK-LOCAL and must not be read as congruence
+        evidence: ``slot_pool`` is this rank's mamba allocator size and
+        ``running_bs`` this rank's resident count, so two ranks may
+        legitimately differ. It is collapsed on its own terms -- the
+        decision is a pure function of the receipt text, hence deterministic
+        for a given receipt sequence, which is all this line needs. The
+        cross-rank law that governs the #788 admission trace is stated in
+        ``log_cycle_collapse`` and applies there, not here.
+
+        Only the reconcile receipt is throttled. ``park``, ``readmit`` and
+        ``evacuate`` are EDGE receipts naming a specific request, so they
+        never repeat and must stay unconditional.
+        """
+        collapse = self._receipt_collapse.observe(self.last_receipt)
+        if not collapse.emit:
+            # Recorded before the roll-up reads it, so a PERIODIC roll-up
+            # names the pass it was just handed and a FLUSHED one names the
+            # last pass it actually swallowed -- never the line that broke
+            # the cycle.
+            self._suppressed_summary = (parked, running_bs)
+        if collapse.rollup:
+            # Silence must not be ambiguous. Deliberately NOT spelled
+            # "PARKED-DECODE carriers": prove_park_677.sh counts receipts
+            # with that grep, and a roll-up matching it would inflate the
+            # very count it reports a reduction in.
+            last_parked, last_running = self._suppressed_summary
+            logger.info(
+                "%s suppressed=%d reconcile receipts repeating a %d-pass "
+                "cycle (last: %d parked of %d resident) since the last "
+                "emitted line",
+                LOG_PREFIX,
+                collapse.rollup,
+                collapse.period,
+                last_parked,
+                last_running,
+            )
+        if collapse.emit:
             logger.info("%s", self.last_receipt)
 
     def park(self, req_id: str, running_bs: int) -> bool:

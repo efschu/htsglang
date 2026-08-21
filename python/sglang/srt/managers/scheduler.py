@@ -182,6 +182,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.log_cycle_collapse import CycleCollapse
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -6419,6 +6420,70 @@ class Scheduler(
                     )
                     for r in ret.reqs[:4]
                 )
+
+            # #788 (boot instr14): drop passes that REPEAT A CYCLE already
+            # printed in full. The vacuous predicate above only fires on an
+            # empty scheduler, so under burst load every pass counted as
+            # informative and printed: instr14 wrote 141513 admission lines
+            # in ten minutes, 20367381 bytes, at 13.03 MB/min peak.
+            #
+            # A plain "same as last line" test recovers NOTHING here -- the
+            # measured stream alternates (queue=1 running=2 / queue=1
+            # running=4 / ...), so consecutive lines are almost never equal
+            # and the run lengths are 1. See log_cycle_collapse for the
+            # replay that establishes this.
+            #
+            # THE KEY IS THE CONGRUENT PAYLOAD AND NOTHING ELSE. `avail` and
+            # `evictable` are deliberately absent: they are this rank's own
+            # pool accounting and legitimately differ between ranks, so
+            # keying on them would let rank 0 suppress a line rank 1 emits
+            # and make verdict_790.sh's cross-rank payload diff report a
+            # divergence that never happened. Same law as
+            # pp_admission_verdict_is_vacuous, whose docstring carries the
+            # long form: no wall-clock time, no per-rank counter, no log
+            # volume, no sampling.
+            # Created on first use, like `_pp_admission_vacuous_run` above,
+            # so the instrument owns all of its own state and adds nothing
+            # to __init__ that the scheduler would carry when the trace is
+            # off.
+            collapser = getattr(self, "_pp_admission_repeat_collapse", None)
+            if collapser is None:
+                collapser = CycleCollapse()
+                self._pp_admission_repeat_collapse = collapser
+            collapse = collapser.observe(
+                (verdict, n_reqs, rids, prefix_lens, queue, running, chunked)
+            )
+            if collapse.rollup:
+                (
+                    last_verdict,
+                    last_n_reqs,
+                    _last_rids,
+                    _last_prefix_lens,
+                    last_queue,
+                    last_running,
+                    last_chunked,
+                ) = collapse.last
+                # Silence must never be ambiguous: without this line a reader
+                # cannot tell "the scheduler kept doing the same thing" from
+                # "the instrument died". The count and the period are
+                # congruent too, so they diff across ranks exactly like the
+                # verdict lines. Deliberately NOT spelled "verdict=": the
+                # gate greps that token to collect payloads.
+                logger.info(
+                    "#788 PP-ADMISSION suppressed=%d passes repeating a "
+                    "%d-pass cycle (last: decision=%s n_reqs=%d queue=%d "
+                    "running=%d chunked=%d) since the last emitted line",
+                    collapse.rollup,
+                    collapse.period,
+                    last_verdict,
+                    last_n_reqs,
+                    last_queue,
+                    last_running,
+                    last_chunked,
+                )
+            if not collapse.emit:
+                return
+
             logger.info(
                 "#788 PP-ADMISSION verdict=%s n_reqs=%d rids=%s prefix_lens=%s "
                 "avail=%d evictable=%d queue=%d running=%d chunked=%d",
