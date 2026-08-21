@@ -409,7 +409,14 @@ class TheEvictionReceiptIsReadTest(unittest.TestCase):
         # is a REGRESSION, because the frontier can pay what the counter
         # promises.
         self.assertIn("REGRESSION SIGNAL", note)
-        self.assertIn("UNREACHABLE", note)
+        # #790 retired the "THIS LINE SHOULD BE UNREACHABLE" clause, and the
+        # reason is the same one that retired "LEAF FRONTIER" above: it pinned
+        # a claim that turned out to be false. A residency cap
+        # (managers/kv_backing_relief.py, ``KvRowCap``) confiscates freed ids
+        # above its cap at the allocator's free listener, so a shortfall here
+        # has a LAWFUL cause and the note now names it when one is engaged.
+        # "REGRESSION SIGNAL" survives as the verdict for the case where no
+        # confiscator is named, which is what this assertion covers.
         self.assertNotIn(
             "behind a locked chain",
             note,

@@ -397,6 +397,62 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     return extra
 
 
+def payable_size(allocator) -> int:
+    """Tokens the pool can hand out once its open free group is applied.
+
+    #790. THE DELIVERY MEASURE, and it is deliberately not
+    ``available_size()``. Two different mechanisms in this tree hold freed
+    tokens outside the pool's published availability, and they need opposite
+    verdicts:
+
+    * an open free group (#681 third root) holds tokens the caller CAN still
+      reach, through ``flush_free_group``. Counting them here keeps a batching
+      window from reading as an under-delivery it is not.
+    * a residency cap (``KvBackingRelief``'s ``KvRowCap``) holds tokens the
+      caller CANNOT reach at all: it subscribes to the allocator's free
+      listener and pulls every freed id above its cap straight back out of the
+      free list. Those are in neither term, which is exactly right -- they were
+      never delivered.
+
+    Never raises: this feeds a diagnostic and a cold-path relief rung, and a
+    measurement that dies takes the real allocation error with it.
+    """
+    try:
+        payable = int(allocator.available_size())
+    except Exception:  # noqa: BLE001 - a measurement must not raise here
+        return 0
+    for chunk in getattr(allocator, "free_group", None) or ():
+        try:
+            payable += int(chunk.numel())
+        except Exception:  # noqa: BLE001 - an exotic staging entry counts as 0
+            continue
+    return payable
+
+
+def _residency_withheld_note(allocator) -> str:
+    """One clause naming the confiscator, or ''. #790.
+
+    ``KvRowCap`` publishes what it holds out of circulation as
+    ``residency_withheld_slots`` (kv_backing_relief.py, ``_publish``) so the
+    scheduler's idle invariant does not read it as a leak. The same number is
+    the answer to "where did the tokens the tree just freed go", so the error
+    that reports the under-delivery names it.
+    """
+    withheld = getattr(allocator, "residency_withheld_slots", 0)
+    try:
+        withheld = int(withheld)
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        return ""
+    if withheld <= 0:
+        return ""
+    return (
+        f" A RESIDENCY CAP IS ENGAGED and is holding {withheld} slot ids out "
+        f"of the allocator's free list: every freed id above the cap is taken "
+        f"straight back by the cap's free listener, so peeling nodes whose "
+        f"slots live above it frees the TREE and pays the POOL nothing."
+    )
+
+
 def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
     """One clause naming the promise-versus-delivery gap, or ''.
 
@@ -405,6 +461,13 @@ def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
     to allocate 512" and had no way to see that the eviction in between had
     under-delivered. Naming it here is the difference between a confusing
     message and a diagnosis.
+
+    #790: ``evicted`` is what the POOL RECEIVED, not what the tree counted.
+    The caller measures it with :func:`payable_size` across the eviction,
+    because the two numbers came apart on the 2026-08-21 01:54:55 specimen: the
+    tree freed its full 512 tokens, a residency cap confiscated every one of
+    them at the allocator's free listener, and this note -- fed the tree's own
+    receipt -- returned '' on the one failure it exists to explain.
     """
     if evicted >= asked:
         return ""
@@ -423,15 +486,17 @@ def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
             break
         except Exception:  # noqa: BLE001 - a diagnostic must not raise
             continue
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
     return (
-        f"\nEVICTION UNDER-DELIVERED: asked for {asked} tokens, freed "
-        f"{evicted}. The tree still reports {evictable} evictable tokens. "
-        f"THIS LINE SHOULD BE UNREACHABLE: since #681 the frontier can pay "
-        f"every unlocked leaf it selects (mamba tombstone leaves included), so "
-        f"the count and the actuator's capability agree. If you are reading "
-        f"it, treat it as a REGRESSION SIGNAL -- a new class of node is being "
-        f"counted that the peel cannot consume -- not as the expected shape of "
-        f"an out-of-memory."
+        f"\nEVICTION UNDER-DELIVERED: asked for {asked} tokens, the pool "
+        f"received {evicted}. The tree still reports {evictable} evictable "
+        f"tokens.{_residency_withheld_note(allocator)} Since #681 the frontier "
+        f"can pay every unlocked leaf it selects (mamba tombstone leaves "
+        f"included), so a shortfall here is NOT the tree failing to find "
+        f"victims -- it is something taking the freed slots between the tree "
+        f"and the pool. With no confiscator named above, treat it as a "
+        f"REGRESSION SIGNAL: a new class of node is being counted that the "
+        f"peel cannot consume."
     )
 
 
@@ -464,13 +529,73 @@ def _flush_deferred_frees(allocator) -> int:
         return 0
 
 
+#: #790: how many further peels the confiscation rung may take. Each round
+#: that pays NOTHING doubles its ask, so the ladder 512 -> 1024 -> ... -> 65536
+#: walks a fully confiscated region in a handful of rounds instead of one
+#: chunk at a time; a round that pays goes back to asking for the exact
+#: remainder, so the rung never evicts more cache than the shortfall needs.
+_CONFISCATION_PEEL_ROUNDS = 8
+
+
+def _evict_past_confiscation(tree_cache, allocator, shortfall: int) -> int:
+    """Peel until the POOL has received ``shortfall`` tokens (#790).
+
+    Returns tokens DELIVERED -- the growth of :func:`payable_size` -- which is
+    the only number this rung may believe. The tree's own receipt is what
+    failed: ``KvRowCap`` (managers/kv_backing_relief.py) registers a free
+    listener and pulls every freed id above its cap back out of the free list,
+    so ``FullComponent.evict_component`` frees a leaf, counts its 512 tokens,
+    and the pool's availability does not move.
+
+    WHY PEELING AGAIN IS THE RIGHT ANSWER, not a wider admission gate. The
+    confiscated ids are a REGION of the id space, not the whole of it: on the
+    2026-08-21 specimen the cap sat at row 137135 of 161792, so ~114k evictable
+    tokens below the cap were payable the whole time and the peel stopped
+    before reaching one of them -- because it was told it had already been
+    paid. An admission bound computed from the same wrong receipt would have
+    admitted the batch too.
+
+    GROUP-UNIFORM BY REFUSAL, the precedent being ``uniform_host_floor_active``.
+    ``shortfall`` is rank-local, so the number of rounds this takes is
+    rank-local, and under an active ``uniform_avail_floor`` -- the #616g state
+    where the radix trees are replicas that must peel identically -- a
+    rank-local peel is exactly the divergence that floor exists to prevent. So
+    with a floor in force this rung declines and the original error raises:
+    fail-loud beats a wedge.
+    """
+    if getattr(tree_cache, "uniform_avail_floor", None) is not None:
+        return 0
+    delivered = 0
+    ask = max(1, int(shortfall))
+    for _ in range(_CONFISCATION_PEEL_ROUNDS):
+        before = payable_size(allocator)
+        try:
+            counted = int(evict_from_tree_cache(tree_cache, ask) or 0)
+        except Exception as exc:  # noqa: BLE001 - a relief rung must not mask the OOM
+            logger.warning("#790: the confiscation peel raised (%s); stopping", exc)
+            break
+        delivered += max(0, payable_size(allocator) - before)
+        if delivered >= shortfall or counted <= 0:
+            # ``counted <= 0`` is the frontier saying it has nothing left to
+            # give: peeling again would be the same no-op forever.
+            break
+        ask = (shortfall - delivered) if delivered else ask * 2
+    return delivered
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evicted = evict_from_tree_cache(tree_cache, num_tokens)
+    # #790: MEASURE THE DELIVERY, DO NOT ASK THE TREE. ``evict_from_tree_cache``
+    # returns the tree's own count of what it freed, and that count is true
+    # about the TREE and false about the POOL whenever something intercepts the
+    # free -- which is what a residency cap does, on every free, by design.
+    payable_before = payable_size(allocator)
+    evict_from_tree_cache(tree_cache, num_tokens)
+    delivered = max(0, payable_size(allocator) - payable_before)
 
     state = None
     if backup_state:
@@ -530,6 +655,42 @@ def alloc_token_slots(
                 "SUCCEEDED" if out_cache_loc is not None else "did not help",
             )
 
+    if out_cache_loc is None and delivered < num_tokens:
+        # #790 SECOND ROOT, AND IT IS TRIED BEFORE THE RELIEF LADDER BECAUSE IT
+        # IS STILL ONLY CACHE. The rungs below give up a victim's decode
+        # progress; this gives up more recomputable prefix, which is what the
+        # eviction three lines up was already spending.
+        #
+        # Measured 2026-08-21 01:54:55 on PP0, 4m55s after a tp_to_pp flip:
+        # eviction reported its full 512 tokens, ``full_available_size`` stayed
+        # at 189, no under-delivery note printed -- because by the tree's books
+        # the eviction HAD delivered -- and the scheduler died on a pool
+        # reporting 138089 available tokens. The flip had carried 160822 live
+        # slots back across the whole 161792-id space while the #631 backing
+        # rung's row cap was still engaged at row 137135, so the leaves the
+        # peel selected were exactly the ones the cap confiscates.
+        gained = _evict_past_confiscation(tree_cache, allocator, num_tokens - delivered)
+        if gained > 0:
+            delivered += gained
+            # The peel may have landed inside an open batching window; the
+            # flush above already ran, so apply anything it staged now.
+            _flush_deferred_frees(allocator)
+            if backup_state:
+                # Same reason as the flush rung: the snapshot predates these
+                # frees and rolling back to it would drop them.
+                state = allocator.backup_state()
+            out_cache_loc = allocator.alloc(num_tokens)
+            logger.warning(
+                "extend allocation of %d tokens failed after an eviction the "
+                "pool did not receive; peeling further delivered %d tokens and "
+                "the retry %s. This is #790: the tree's eviction receipt counts "
+                "slots a residency cap takes straight back out of the free "
+                "list, so the peel stopped believing it had been paid.",
+                num_tokens,
+                gained,
+                "SUCCEEDED" if out_cache_loc is not None else "did not help",
+            )
+
     if out_cache_loc is None:
         freed = _attempt_extend_relief(num_tokens)
         if freed > 0:
@@ -549,7 +710,7 @@ def alloc_token_slots(
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
-            f"{_eviction_shortfall_note(tree_cache, num_tokens, evicted)}"
+            f"{_eviction_shortfall_note(tree_cache, num_tokens, delivered)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
@@ -1588,9 +1749,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert tree_cache.supports_mamba(), (
-            "Only MambaRadixCache allow freeing before alloc"
-        )
+        assert (
+            tree_cache.supports_mamba()
+        ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -1639,9 +1800,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert start_p == end_p, (
-            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
-        )
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
@@ -1655,9 +1816,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert req.mamba_pool_idx is not None, (
-            "mamba state is freed while the tree cache does not manage mamba states"
-        )
+        assert (
+            req.mamba_pool_idx is not None
+        ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
