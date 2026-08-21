@@ -7000,12 +7000,28 @@ class ModelRunnerKVCacheMixin:
             # measurement runs it instead.
             self._maybe_suggest_mlp_rebalance(available_bytes)
             self._maybe_suggest_dcp_token_vector(available_bytes, allow_install=True)
-        elif self.server_args.uneven_kv_derived_mode():
-            # --rank-kv-ratio capacity/speed with post-capture sizing planned: the
-            # token vector must be FINAL before pools/backends/graphs
-            # snapshot it, so the measured install runs on the pre-capture
-            # profiling here; the post-capture pass stays hint-only (any
-            # residual delta shows up as the usual restart hint).
+        elif (
+            self.server_args.uneven_kv_derived_mode()
+            # #797: a SEEDED explicit vector is a request for the measured
+            # install just as much as a derived --rank-kv-ratio is, and it must
+            # be admitted HERE too. Without this clause the seed reaches the
+            # install gate inside _maybe_suggest_dcp_token_vector and finds
+            # allow_install=False, because the only call that ran was the
+            # advisory one -- the boot then prints the better vector and keeps
+            # the smaller pool, which is exactly the behaviour #797 exists to
+            # end. Measured on the falsifier boot (boot_seed796.log): role
+            # 'seed' arrived in server_args, the pin warning correctly stayed
+            # silent, and the vector still did not install, because a
+            # post-capture-sizing boot in 'coupled' mode takes this branch and
+            # this branch alone.
+            or self.server_args.uneven_token_vector_is_seed()
+        ):
+            # --rank-kv-ratio capacity/speed, or a seeded vector, with
+            # post-capture sizing planned: the token vector must be FINAL
+            # before pools/backends/graphs snapshot it, so the measured install
+            # runs on the pre-capture profiling here; the post-capture pass
+            # stays hint-only (any residual delta shows up as the usual
+            # restart hint).
             self._maybe_suggest_dcp_token_vector(available_bytes, allow_install=True)
         config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(

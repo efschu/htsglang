@@ -331,6 +331,45 @@ class TheFlagItself797(CustomTestCase):
             )
 
 
+class TheCallSiteAdmitsTheSeed797(CustomTestCase):
+    """THE GATE INSIDE THE HELPER IS NOT ENOUGH, and a real boot proved it.
+
+    `_maybe_suggest_dcp_token_vector` is called twice: once advisory
+    (allow_install defaults to False) and once from `_resolve_memory_pool_
+    config` with allow_install=True. That second call is itself gated -- on
+    `uneven_kv_derived_mode()` when post-capture sizing is planned. A seeded
+    vector in 'coupled' mode fails that outer gate, so the install branch is
+    never reached and the helper's own seed handling never runs.
+
+    Observed exactly so on boot_seed796.log: role 'seed' present in
+    server_args, the pin warning correctly silent, and the vector still not
+    installed. Structural rather than behavioural because the call site sits
+    mid-way through a method that needs a fully profiled ModelRunner; the
+    point is to fail if a future edit drops the seed clause from the branch."""
+
+    def _source(self):
+        import inspect
+
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        return inspect.getsource(ModelRunnerKVCacheMixin._resolve_memory_pool_config)
+
+    def test_the_install_call_site_consults_the_seed_predicate(self):
+        self.assertIn(
+            "uneven_token_vector_is_seed",
+            self._source(),
+            "_resolve_memory_pool_config no longer admits a seeded vector to "
+            "the allow_install=True call: a seed in 'coupled' mode with "
+            "post-capture sizing will print the better vector and keep the "
+            "smaller pool, which is the #797 defect returning",
+        )
+
+    def test_the_derived_mode_route_is_still_admitted(self):
+        self.assertIn("uneven_kv_derived_mode", self._source())
+
+
 class CanFail797(CustomTestCase):
     """Guards that must FAIL if the gate stops distinguishing the two roles --
     the failure mode being defended against is a future edit collapsing the
