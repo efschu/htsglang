@@ -5733,28 +5733,38 @@ class ServerArgs:
     ] = None
     barlink_bar1_cap_cycles: A[
         Optional[int],
-        Arg(help="BAR1 direct-path cycle cap. Promoted from "
-            "SGLANG_BARLINK_BAR1_CAP_CYCLES (#781)."),
+        Arg(
+            help="BAR1 direct-path cycle cap. Promoted from "
+            "SGLANG_BARLINK_BAR1_CAP_CYCLES (#781)."
+        ),
     ] = None
     mamba_slot_reorder: A[
         Optional[bool],
-        Arg(help="Reorder mamba pool slots. Promoted from "
-            "SGLANG_MAMBA_SLOT_REORDER (#781)."),
+        Arg(
+            help="Reorder mamba pool slots. Promoted from "
+            "SGLANG_MAMBA_SLOT_REORDER (#781)."
+        ),
     ] = None
     uneven_dcp: A[
         Optional[bool],
-        Arg(help="Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). "
-            "Superseded in most cases by --rank-kv-ratio."),
+        Arg(
+            help="Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). "
+            "Superseded in most cases by --rank-kv-ratio."
+        ),
     ] = None
     uneven_dcp_weighted: A[
         Optional[bool],
-        Arg(help="Enable weighted uneven DCP. Promoted from "
-            "SGLANG_UNEVEN_DCP_WEIGHTED (#781)."),
+        Arg(
+            help="Enable weighted uneven DCP. Promoted from "
+            "SGLANG_UNEVEN_DCP_WEIGHTED (#781)."
+        ),
     ] = None
     kv_backing_relief: A[
         Optional[bool],
-        Arg(help="Enable KV backing relief. Promoted from "
-            "SGLANG_KV_BACKING_RELIEF (#781). Default is ON."),
+        Arg(
+            help="Enable KV backing relief. Promoted from "
+            "SGLANG_KV_BACKING_RELIEF (#781). Default is ON."
+        ),
     ] = None
     phase_flip_image_file_backed: A[
         Optional[bool],
@@ -5768,8 +5778,10 @@ class ServerArgs:
     ] = None
     corridor_rebalance: A[
         Optional[bool],
-        Arg(help="Enable the corridor rebalance lender. Promoted from "
-            "SGLANG_CORRIDOR_REBALANCE (#781)."),
+        Arg(
+            help="Enable the corridor rebalance lender. Promoted from "
+            "SGLANG_CORRIDOR_REBALANCE (#781)."
+        ),
     ] = None
     enable_tp_memory_imbalance_check: A[
         Optional[bool],
@@ -12206,11 +12218,26 @@ class ServerArgs:
         final ``o`` write -- so with ``T`` chunk tokens,
         ``NT = ceil(T / FLA_CHUNK_SIZE)`` chunks and activation itemsize ``s``:
 
-            peak = s*T*(3*q_dim + 3*k_dim + 5*v_dim + Hv*Dk + FLA_CHUNK_SIZE*Hv)
+            peak = s*T*(2*k_dim + 2*v_dim + 2*Hv)
+                 + s*T*(3*q_dim + 3*k_dim + 5*v_dim + Hv*Dk + FLA_CHUNK_SIZE*Hv)
                  + s*NT*Hv*Dv*Dk
                  + 12*T*Hv
 
-        In allocation order the terms are: the conv output ``mixed_qkv``
+        THE FIRST LINE IS THE PROJECTION OUTPUT, AND IT WAS MISSING UNTIL AN
+        OOM NAMED IT. This estimate used to start at the conv output, i.e. one
+        allocation too late: ``in_proj_qkvz`` produces a packed
+        ``[T, 2*key_dim + 2*value_dim]`` tensor (models/qwen3_5.py:543 --
+        note the ``z`` half, which appears in no other term) and
+        ``in_proj_ba`` adds ``2*Hv`` columns beside it. On 2026-08-21 an
+        instance died at exactly that line -- ``F.linear`` in
+        ``in_proj_qkvz`` asking for 256.00 MiB with 131.69 MiB free -- and
+        256 MiB is precisely ``8192 * 16384 * 2``, the tensor this formula did
+        not count. The prefill-admission guard derives its threshold from
+        here, so the omission did not merely under-report: it set the gate
+        that was supposed to prevent the allocation, at 1024 MiB where the
+        honest figure is ~1280.
+
+        In allocation order the remaining terms are: the conv output ``mixed_qkv``
         (q+k+v), the fused ``q``/``k``/``v`` split
         (``jit_kernel/triton/gdn_fused_proj.py``), the l2-normed ``q``/``k``,
         the ``A`` matrix (``FLA_CHUNK_SIZE`` per v-head per token), ``u`` and
@@ -12244,7 +12271,12 @@ class ServerArgs:
             tokens = max(int(self.max_prefill_tokens or 0), 2048)
         num_chunks = math.ceil(tokens / FLA_CHUNK_SIZE)
         peak_bytes = (
-            itemsize
+            # in_proj_qkvz's packed output plus in_proj_ba's two columns per
+            # v-head. First because it is allocated first, and because leaving
+            # it out is what let an OOM happen at a line this function exists
+            # to predict.
+            itemsize * tokens * (2 * k_dim + 2 * v_dim + 2 * hv)
+            + itemsize
             * tokens
             * (
                 3 * q_dim
@@ -16429,7 +16461,11 @@ class ServerArgs:
         # The remedy is NAMED, not hinted: the full-attention counts of the
         # requested ranges are exactly the --pp-attn-stage-ratio that realizes
         # them, so it is computed and printed rather than left as an exercise.
-        if attn_scores is None and sum(scores) == depth and list(counts) != list(scores):
+        if (
+            attn_scores is None
+            and sum(scores) == depth
+            and list(counts) != list(scores)
+        ):
             want_full, start = [], 0
             for count in scores:
                 want_full.append(sum(1 for k in kinds[start : start + count] if k))

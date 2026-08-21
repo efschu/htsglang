@@ -1007,7 +1007,11 @@ class TestPinnedReserveShortfall(CustomTestCase):
             # v_dim=1536; T=2048, NT=32, s=2.
             scratch = args.gdn_prefill_scratch_mib(17976 / 64928)
         expected = (
-            2 * 2048 * (3 * 512 + 3 * 512 + 5 * 1536 + 12 * 128 + 64 * 12)
+            # in_proj_qkvz's packed output (+ in_proj_ba), added 2026-08-21
+            # after an OOM landed on exactly that allocation; see
+            # gdn_prefill_scratch_mib's docstring.
+            2 * 2048 * (2 * 512 + 2 * 1536 + 2 * 12)
+            + 2 * 2048 * (3 * 512 + 3 * 512 + 5 * 1536 + 12 * 128 + 64 * 12)
             + 2 * 32 * 12 * 128 * 128
             + 12 * 2048 * 12
         ) / (1 << 20)
@@ -1039,7 +1043,9 @@ class TestPinnedReserveShortfall(CustomTestCase):
         self.assertIn("3968 MiB", note)  # runtime/activation reserve
         self.assertIn("192 MiB", note)  # graph capture
         self.assertIn("GDN prefill scratch", note)
-        self.assertIn("63 MiB per layer", note)
+        # 63 -> 79 MiB per layer on 2026-08-21: the estimator now counts
+        # in_proj_qkvz's packed output, the allocation an OOM landed on.
+        self.assertIn("79 MiB per layer", note)
         self.assertIn("--rank-auto-reserve-mib auto", note)
 
     def test_note_fires_for_the_value_that_boots_today_too(self):
