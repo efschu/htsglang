@@ -200,8 +200,10 @@ from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
 from sglang.srt.managers.pp_admission_congruence import (
+    PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
     build_pp_admission_decision,
+    pp_admission_verdict_is_vacuous,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -6321,9 +6323,72 @@ class Scheduler(
         value below is an int already resident on the host. len() on a tensor
         reads its shape and does NOT synchronize, which is why prefix length
         is taken that way rather than by reading the tensor.
+
+        VACUOUS VERDICTS ARE SUPPRESSED (#788, after boot instr11's 5.9 GB
+        idle log). A pass with nothing admitted, queued, running or chunked
+        is dropped and counted; a roll-up line naming the count is emitted
+        every ``PP_ADMISSION_VACUOUS_ROLLUP_EVERY`` such passes and in front
+        of the next informative verdict. Both the predicate and the cadence
+        read only rank-congruent payload fields, which is what keeps the
+        cross-rank payload diff usable -- see
+        ``pp_admission_verdict_is_vacuous``.
         """
         try:
             alloc = self.token_to_kv_pool_allocator
+            n_reqs = 0 if ret is None else len(ret.reqs)
+            queue = len(self.waiting_queue)
+            running = len(self.running_batch.reqs) if self.running_batch else 0
+            chunked = 1 if self.chunked_req is not None else 0
+
+            # #788: drop the VACUOUS verdicts, keep every informative one.
+            # Boot instr11 ran this instrument for three hours against an
+            # idle server and wrote 5.9 GB; instr10's census shows the
+            # payload -- 146023 lines per rank, overwhelmingly
+            # "DECLINE n_reqs=0 ... queue=0 running=0 chunked=0". A verdict
+            # taken over an empty scheduler cannot show two ranks
+            # disagreeing, because there is nothing for them to disagree
+            # about, so the flood buried exactly the lines the instrument
+            # exists to produce.
+            #
+            # `ret is None` is the DECLINE half of the `verdict` payload
+            # field, so this whole condition -- like the predicate it calls,
+            # whose docstring explains why this is load-bearing rather than
+            # tidy -- is a pure function of RANK-CONGRUENT payload data. Every
+            # rank therefore decides to speak or stay silent identically, and
+            # the acceptance gate's cross-rank payload diff keeps meaning what
+            # it says.
+            vacuous = ret is None and pp_admission_verdict_is_vacuous(
+                n_reqs, queue, running, chunked
+            )
+            run = getattr(self, "_pp_admission_vacuous_run", 0)
+            if vacuous:
+                run += 1
+                # The roll-up cadence is a COUNT of passes, not a duration:
+                # an iteration counter advances identically on every rank,
+                # a clock does not.
+                if run >= PP_ADMISSION_VACUOUS_ROLLUP_EVERY:
+                    rollup, run = run, 0
+                else:
+                    rollup = 0
+            else:
+                rollup, run = run, 0
+            self._pp_admission_vacuous_run = run
+            if rollup:
+                # Silence must never be ambiguous. Without this line a reader
+                # cannot tell "nothing was happening" from "the instrument
+                # died", which is the one thing an instrument may not leave
+                # open. The count is congruent too, so it diffs across ranks
+                # exactly like the verdict lines. Deliberately NOT spelled
+                # "verdict=": the gate greps that token to collect payloads.
+                logger.info(
+                    "#788 PP-ADMISSION suppressed=%d vacuous verdicts "
+                    "(n_reqs=0 queue=0 running=0 chunked=0) "
+                    "since the last emitted line",
+                    rollup,
+                )
+            if vacuous:
+                return
+
             if ret is None:
                 verdict = "DECLINE"
                 rids = ""
@@ -6358,14 +6423,14 @@ class Scheduler(
                 "#788 PP-ADMISSION verdict=%s n_reqs=%d rids=%s prefix_lens=%s "
                 "avail=%d evictable=%d queue=%d running=%d chunked=%d",
                 verdict,
-                0 if ret is None else len(ret.reqs),
+                n_reqs,
                 rids,
                 prefix_lens,
                 int(alloc.available_size()),
                 int(self.tree_cache.evictable_size()),
-                len(self.waiting_queue),
-                len(self.running_batch.reqs) if self.running_batch else 0,
-                1 if self.chunked_req is not None else 0,
+                queue,
+                running,
+                chunked,
             )
         except Exception as e:  # noqa: BLE001
             # An instrument must never be able to kill the scheduler it is

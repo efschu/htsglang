@@ -505,3 +505,44 @@ def congruent_rids(decisions: Iterable[PPAdmissionDecision]) -> bool:
         if seen != reference:
             return False
     return True
+
+
+# How many consecutive VACUOUS admission verdicts the #788 trace swallows
+# before it emits a roll-up line. Chosen against the measured idle rate of
+# boot instr10 (146023 trace lines per rank), which puts a roll-up roughly
+# every minute or two of idling: frequent enough that a reader never has to
+# wonder whether the instrument is still alive, rare enough that three hours
+# of idling costs kilobytes instead of the 5.9 GB boot instr11 wrote.
+#
+# It is a COUNT, never a duration. A wall-clock cadence would make the
+# emission points rank-local and destroy the congruence property below.
+PP_ADMISSION_VACUOUS_ROLLUP_EVERY = 1024
+
+
+def pp_admission_verdict_is_vacuous(
+    n_reqs: int, queue: int, running: int, chunked: int
+) -> bool:
+    """True iff this admission verdict carries no congruence evidence.
+
+    A pass with nothing admitted, nothing queued, nothing running and nothing
+    chunked was taken over an empty scheduler. Two ranks cannot disagree
+    about an empty scheduler, so the line cannot show the divergence the #788
+    trace exists to catch -- and at idle it is essentially every line: boot
+    instr11 wrote 5.9 GB in three hours, of which the informative fraction
+    was a rounding error.
+
+    THE PROPERTY THIS FUNCTION MUST KEEP, and the reason it takes four plain
+    ints and nothing else. The acceptance gate for rank congruence
+    (evidence-665-f1/verdict_790.sh, step 3) diffs the emitted trace payloads
+    across PP0/PP1/PP2 and requires ONE group per event. That diff is only
+    meaningful if every rank decides to speak or stay silent from data every
+    rank has identically. So the predicate is a pure function of the
+    CONGRUENT payload fields -- `n_reqs`, `queue`, `running`, `chunked` --
+    and must never consult anything rank-local: not wall-clock time, not a
+    per-rank log volume, not a random sample, and not `avail`/`evictable`
+    (which are this rank's own pool accounting and legitimately differ). If
+    rank 0 suppressed a line rank 1 emitted, the gate would report a
+    divergence that never happened, and an instrument that manufactures
+    false positives is worse than no instrument.
+    """
+    return n_reqs == 0 and queue == 0 and running == 0 and chunked == 0
