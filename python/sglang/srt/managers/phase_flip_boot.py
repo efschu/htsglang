@@ -42,7 +42,7 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -214,9 +214,26 @@ def phase_flip_tp_scope(world_rank: int, n: int):
     Contextvar override for construction-time caching + module routing for
     forward-time collectives (see module docstring). ``world_rank`` is this
     process's flat world rank, which under the primary (tp=1, pp=N)
-    topology equals pp_rank and IS the flip-TP rank."""
+    topology equals pp_rank and IS the flip-TP rank.
+
+    #785/#791 PART B: RE-ENTRANT w.r.t. an already-armed TP routing. The
+    boot-time caller (``build_phase_flip_tp_stack``) always enters this with
+    routing OFF, so hard-coding ``set_phase_flip_tp_active(False)`` on exit
+    used to be a no-op there. It stopped being a no-op once
+    ``restore_deferred_cold_stack`` started opening this scope AT THE PP->TP
+    CUTOVER: by that point ``phase_flip_runtime`` has ALREADY called
+    ``set_phase_flip_tp_active(True)`` for the whole TP phase, and that phase
+    keeps running after this scope returns. Forcing it back to False on exit
+    would silently route every later TP-phase collective back onto the
+    primary tp=1 groups -- a silent no-op all-reduce, exactly the corruption
+    class ``set_phase_flip_tp_active``'s own docstring says the routing
+    exists to prevent. Save the value ``phase_flip_tp_routing_active()``
+    reports on entry and restore THAT in the finally, instead of hard-coding
+    False -- at the boot call site the saved value is always False, so that
+    caller's behaviour is unchanged."""
     from sglang.srt.distributed.parallel_state import (
         get_phase_flip_group,
+        phase_flip_tp_routing_active,
         set_phase_flip_tp_active,
     )
     from sglang.srt.runtime_context import get_parallel
@@ -224,6 +241,7 @@ def phase_flip_tp_scope(world_rank: int, n: int):
     flip_tp = get_phase_flip_group("tp")
     flip_dcp = get_phase_flip_group("dcp")
     flip_pp = get_phase_flip_group("pp")
+    prior_tp_routing_active = phase_flip_tp_routing_active()
     set_phase_flip_tp_active(True)
     # --pp-layer-ratio exports SGLANG_PP_LAYER_PARTITION process-wide; the
     # TP stack builds with pp_size=1 and get_pp_indices would refuse a
@@ -255,7 +273,7 @@ def phase_flip_tp_scope(world_rank: int, n: int):
         ):
             yield
     finally:
-        set_phase_flip_tp_active(False)
+        set_phase_flip_tp_active(prior_tp_routing_active)
         if pp_partition_env is not None:
             os.environ["SGLANG_PP_LAYER_PARTITION"] = pp_partition_env
 
@@ -341,20 +359,143 @@ def _full_attn_row_schema(pool) -> Tuple[int, int, int, str]:
 def assert_row_schema_compatible(pp_pool, tp_pool) -> None:
     """Operator pin 3 (DESIGN_631 3.6a): the flip's KV move is a pure row
     redistribution ONLY IF both layouts' full-attention rows are the same
-    bytes. That holds because the fork's weighted DCP REPLICATES KV heads
-    (uneven_dcp_kv_replicated -> get_total_num_kv_heads); it breaks the
-    moment the TP pool is head-sharded. Checked on the real pools at boot,
-    and hermetically from the real config in the pin-3 test."""
+    bytes -- this checks that byte equality directly (head_num * head_dim *
+    elem_bytes per pool), not a claim about WHY it holds.
+
+    #785/#791 PART D: it is NOT true, as a blanket property of the fork,
+    that "weighted DCP replicates KV heads". Row-byte equality here is a
+    consequence of ``uneven_dcp_kv_replicated(dcp_size)`` being True for the
+    flip TP layout -- true on this rig's flip configuration because
+    ``build_phase_flip_tp_stack`` refuses to build unless
+    ``server_args.uneven_weighted_dcp_enabled()``, and the flip TP scope
+    always sets ``attn_dcp_size`` to the full TP width -- NOT a consequence
+    of head-count arithmetic. The LOCAL attention head split is a SEPARATE
+    predicate, ``attn_kv_replicated(tp_size, total_num_kv_heads)``, which is
+    OFF whenever kv_heads >= tp_size: e.g. 4 total KV heads over tp=3 gives
+    per-rank heads [2, 1, 1], head-SHARDED, not replicated, at the attention
+    layer. That predicate does not gate what this function checks -- the
+    pool's STORED row width is ``uneven_dcp_kv_replicated``'s call, not
+    ``attn_kv_replicated``'s, and the two happening to agree on a config with
+    a uniform head_num is what let this function pass at boot; it is not
+    what the passing check proves. Outside a flip TP scope (DCP disabled, or
+    no --rank-tp-ratio plan installed) ``uneven_dcp_kv_replicated`` is False
+    and the TP pool would store head-sharded rows -- this check must, and
+    does, still fail loudly in that case rather than silently accepting a
+    byte-width mismatch. Checked on the real pools at boot, and hermetically
+    from the real config in the pin-3 test."""
     pp_schema = _full_attn_row_schema(pp_pool)
     tp_schema = _full_attn_row_schema(tp_pool)
     if pp_schema != tp_schema:
+        from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+        from sglang.srt.runtime_context import get_parallel
+
+        observed_dcp_size = get_parallel().attn_dcp_size
         raise PhaseFlipBootError(
             f"full-attention KV row schemas DIVERGE between the phase "
             f"layouts: PP (head_num, head_dim, elem_bytes, dtype) = "
-            f"{pp_schema}, TP = {tp_schema}. The flip's KV move is only a "
-            f"row redistribution when both layouts store identical row "
-            f"bytes (weighted-DCP head replication); refusing to boot a "
+            f"{pp_schema}, TP = {tp_schema}, observed at attn_dcp_size="
+            f"{observed_dcp_size} (uneven_dcp_kv_replicated="
+            f"{uneven_dcp_kv_replicated(observed_dcp_size)}). The flip's KV "
+            f"move is only a row redistribution when both layouts store "
+            f"identical row bytes; the TP layout's row width is set by "
+            f"DCP-wide pool replication (uneven_dcp_kv_replicated), not by "
+            f"the local attn_kv_replicated head split; refusing to boot a "
             f"flip that would scatter mis-shaped rows."
+        )
+
+
+def _pool_full_attn_row_schema_defensive(pool) -> Optional[Tuple[int, int]]:
+    """(head_num, head_dim) of ``pool``'s full-attention KV rows, read
+    DEFENSIVELY for the Part-C geometry guard, which must skip rather than
+    crash on a pool shape it does not recognize -- it is a belt-and-braces
+    check, not the source of truth for row compatibility (that is
+    ``assert_row_schema_compatible``, checked on the real pools at boot).
+
+    Tries the hybrid-pool path first (``_full_attn_row_schema``, which reads
+    ``pool.full_kv_pool.k_buffer``), then falls back to a plain non-hybrid
+    pool's own ``k_buffer`` directly. Returns None if neither shape matches."""
+    try:
+        head_num, head_dim, _, _ = _full_attn_row_schema(pool)
+        return head_num, head_dim
+    except AttributeError:
+        pass
+    try:
+        k0 = pool.k_buffer[0]
+        return int(k0.shape[-2]), int(k0.shape[-1])
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _guard_geometry_before_backend_build(tp_worker, where: str) -> None:
+    """#785/#791 PART C: refuse to build attention backends under an ambient
+    geometry that disagrees with what the KV pool was already baked for.
+
+    THE FAILURE THIS GUARDS. The attention backends read the TP geometry
+    FRESH at construction time from ``get_parallel()`` (contextvars), while
+    the KV pool's row width is a BAKED ``ModelRunner`` attribute fixed once
+    at pool-construction time. If ``build_cold_stack_posts`` is ever reached
+    with no ``phase_flip_tp_scope`` open around it -- as
+    ``restore_deferred_cold_stack`` used to, before part A -- the backends
+    build under the wrong geometry: ``uneven_dcp_kv_replicated`` reads the
+    ambient (not the flip TP) dcp_size, disagrees with the replicated/sharded
+    row width the pool was actually built with, ``TritonAttnBackend.uneven_dcp``
+    ends up wrong, ``_set_kv_buffer`` skips ``_dcp_write_gather``, and the
+    store kernel silently refolds per-rank KV rows into a pool sized for
+    gathered replicated rows -- the #785 "store_cache rejected ...
+    row_dim=1024 -> k_rows=12" crash, with no error until the first decode.
+
+    CHEAP AND MUST NOT FIRE ON THE HEALTHY PATH: one buffer-shape read, no
+    collective, no allocation. On both the boot call site and the (post part
+    A) cutover call site, this runs inside an already-open
+    ``phase_flip_tp_scope`` where the ambient geometry matches the pool by
+    construction, so the predicates below always agree and this is a no-op.
+    """
+    from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+    from sglang.srt.runtime_context import get_parallel
+
+    model_runner = getattr(tp_worker, "model_runner", None)
+    pool = getattr(model_runner, "token_to_kv_pool", None) if model_runner else None
+    model_config = getattr(model_runner, "model_config", None) if model_runner else None
+    if pool is None or model_config is None:
+        return
+    schema = _pool_full_attn_row_schema_defensive(pool)
+    if schema is None:
+        return
+    head_num, head_dim = schema
+    try:
+        total_num_kv_heads = int(model_config.get_total_num_kv_heads())
+    except (AttributeError, TypeError, ValueError):
+        return
+
+    attn_dcp_size = int(get_parallel().attn_dcp_size)
+    pool_baked_replicated = head_num == total_num_kv_heads
+    ambient_uneven_dcp = uneven_dcp_kv_replicated(attn_dcp_size)
+    if pool_baked_replicated != ambient_uneven_dcp:
+        # attn_tp_size is DIAGNOSTIC ONLY (the raise decision above depends
+        # solely on attn_dcp_size); reading it can itself raise when no
+        # attn-tp group is initialized at all (e.g. this guard firing from a
+        # bare hermetic caller), and a diagnostic read must never suppress
+        # the refusal it is trying to explain.
+        try:
+            attn_tp_size = str(int(get_parallel().attn_tp_size))
+        except Exception:
+            attn_tp_size = "<unavailable: attn-tp group not initialized>"
+        raise PhaseFlipBootError(
+            f"geometry mismatch building attention backends at {where!r}: "
+            f"the KV pool was baked with head_num={head_num} "
+            f"(row_dim={head_num * head_dim}) against "
+            f"total_num_kv_heads={total_num_kv_heads} "
+            f"({'replicated' if pool_baked_replicated else 'sharded'} row "
+            f"schema), but the ambient geometry the backends are about to "
+            f"build under is attn_dcp_size={attn_dcp_size}, "
+            f"attn_tp_size={attn_tp_size}, giving "
+            f"uneven_dcp_kv_replicated={ambient_uneven_dcp}. Building the "
+            f"attention backends under this ambient geometry would make "
+            f"TritonAttnBackend.uneven_dcp disagree with the pool's baked "
+            f"row schema, skip _dcp_write_gather in _set_kv_buffer, and "
+            f"silently refold per-rank KV rows into a pool sized for "
+            f"gathered replicated rows -- refusing to build rather than "
+            f"corrupt the KV cache."
         )
 
 
@@ -663,6 +804,12 @@ def build_cold_stack_posts(
     fails loudly on the first decode -- but "built twice", which allocates a
     second set of workspaces and a second capture, silently, and only shows up
     as a pool that can no longer back itself.
+
+    #785/#791 PART C: a NAMED REFUSAL GUARD runs first
+    (``_guard_geometry_before_backend_build``), so a caller that reaches this
+    function with no ``phase_flip_tp_scope`` open around it -- the exact bug
+    part A fixed at the ``restore_deferred_cold_stack`` call site -- fails
+    loudly here instead of silently refolding KV rows on the first decode.
     """
     if getattr(tp_worker, COLD_STACK_BUILT_ATTR, False):
         logger.info(
@@ -670,6 +817,7 @@ def build_cold_stack_posts(
         )
         return False
 
+    _guard_geometry_before_backend_build(tp_worker, where)
     tp_worker.init_attention_backends()
     if draft_worker is not None:
         draft_worker.init_attention_backends()
@@ -740,16 +888,43 @@ def restore_deferred_cold_stack(scheduler, stacks) -> bool:
     so the second and every later pp->tp leg costs nothing. A per-flip
     re-capture is the trade #656 spec item 8 measured at 41% of decode
     throughput and rejected, and this must not reintroduce it by accident.
+
+    #785/#791 PART A: THE BUILD MUST HAPPEN INSIDE ``phase_flip_tp_scope``,
+    exactly like the (non-deferred) boot-time call at rung < 4. The two
+    calls are NOT symmetric by default: the boot-time call sits inside the
+    scope opened by ``build_phase_flip_tp_stack`` for its entire construction,
+    but this cutover-time call runs from ``phase_flip_runtime`` with no scope
+    of its own. The attention backends read the TP geometry FRESH at
+    construction time from ``get_parallel()`` (contextvars --
+    ``TritonAttnBackend.__init__`` reads ``attn_dcp_size`` / ``attn_tp_size``
+    there, and derives ``uneven_dcp`` from
+    ``uneven_dcp_kv_replicated(dcp_size)``), while the KV pool's row width is
+    a BAKED ``ModelRunner`` attribute fixed once at boot and therefore
+    scope-independent. Left unscoped here, ``get_parallel().attn_dcp_size``
+    would read the ambient PRIMARY topology (pp=N, tp=1, dcp disabled) instead
+    of the flip TP size the pool was actually sized under: ``uneven_dcp``
+    comes up False, ``_set_kv_buffer`` skips ``_dcp_write_gather``, and the
+    store kernel is handed the raw per-rank k/v (e.g. 2/1/1 KV heads across
+    ranks) instead of the gathered full-head replicated row the pool's
+    ``row_dim`` was baked for -- silently refolded rows, observed as
+    "store_cache rejected: k(24, 2, 256) v(24, 2, 256) row_dim=1024 ->
+    k_rows=12, k_cache(201377, 4, 256) ... size_limit=201377" on rank 0
+    (and the 1-head variant on ranks 1/2). ``n`` and ``world_rank`` are
+    recovered the same way ``build_phase_flip_tp_stack`` derives them.
     """
+    from sglang.srt.distributed.parallel_state import get_world_group
     from sglang.srt.managers import phase_flip_spill as spill
 
     if not spill.cold_stack_deferred(getattr(scheduler, "server_args", None)):
         return False
     draft_worker = getattr(stacks, "draft_worker", None)
     carrier = spill.carrier_of(draft_worker) if draft_worker is not None else None
-    return build_cold_stack_posts(
-        stacks.tp_worker, draft_worker, carrier, where="pp->tp cutover"
-    )
+    n = len(stacks.vector)
+    world_rank = get_world_group().rank_in_group
+    with phase_flip_tp_scope(world_rank, n):
+        return build_cold_stack_posts(
+            stacks.tp_worker, draft_worker, carrier, where="pp->tp cutover"
+        )
 
 
 def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:

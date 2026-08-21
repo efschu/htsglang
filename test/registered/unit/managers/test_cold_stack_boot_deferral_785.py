@@ -153,9 +153,13 @@ def test_the_boot_reaches_the_cold_posts_only_through_the_builder():
 
 
 class _Stacks:
-    def __init__(self, tp, draft):
+    def __init__(self, tp, draft, vector=(1, 1, 1)):
         self.tp_worker = tp
         self.draft_worker = draft
+        #: The weight-shard vector; restore_deferred_cold_stack derives
+        #: ``n = len(stacks.vector)`` from it (part A), mirroring how
+        #: build_phase_flip_tp_stack derives n at boot.
+        self.vector = vector
 
 
 class _Sched:
@@ -166,13 +170,42 @@ class _Sched:
         self.server_args = _A()
 
 
-def _restore(depth, tp, draft, monkeypatch, carrier=None):
+class _WorldGroup:
+    def __init__(self, rank):
+        self.rank_in_group = rank
+
+
+def _patch_flip_scope_deps(monkeypatch, active=False, world_rank=0):
+    """Stub the distributed-state getters ``phase_flip_tp_scope`` (and, after
+    part A, ``restore_deferred_cold_stack``) call, so the scope's OWN control
+    flow -- arm/restore-on-exit, geometry override -- runs hermetically with
+    fakes: no real process groups, no NCCL, no CUDA.
+
+    ``active`` seeds the routing-active state the scope must SAVE on entry
+    and RESTORE on exit (part B). Returns the mutable dict backing the fake
+    so a test can read/flip it directly if needed."""
+    from sglang.srt.distributed import parallel_state as ps
+
+    routing = {"active": active}
+    monkeypatch.setattr(ps, "get_phase_flip_group", lambda kind: f"fake-flip-{kind}")
+    monkeypatch.setattr(
+        ps,
+        "set_phase_flip_tp_active",
+        lambda v: routing.__setitem__("active", bool(v)),
+    )
+    monkeypatch.setattr(ps, "phase_flip_tp_routing_active", lambda: routing["active"])
+    monkeypatch.setattr(ps, "get_world_group", lambda: _WorldGroup(world_rank))
+    return routing
+
+
+def _restore(depth, tp, draft, monkeypatch, carrier=None, vector=(1, 1, 1)):
     from sglang.srt.managers import phase_flip_spill as sp
 
     monkeypatch.delenv(sp.DEPTH_ENV, raising=False)
     monkeypatch.setenv(sp.DEPTH_UNIMPLEMENTED_ENV, "1")
     monkeypatch.setattr(sp, "carrier_of", lambda w: carrier)
-    return boot.restore_deferred_cold_stack(_Sched(depth), _Stacks(tp, draft))
+    _patch_flip_scope_deps(monkeypatch)
+    return boot.restore_deferred_cold_stack(_Sched(depth), _Stacks(tp, draft, vector))
 
 
 def test_the_cutover_builds_the_posts_the_boot_left_out(monkeypatch):
@@ -299,6 +332,147 @@ def test_the_staging_formula_actually_consults_the_new_term():
 
     src = inspect.getsource(PhaseFlipRuntime._staging_bytes)
     assert "_cold_stack_restore_bytes" in src
+
+
+# --------------------------------------------------------------------------
+# #785/#791 part A: the deferred build runs under the FLIP TP geometry, not
+# the ambient primary one -- the actual defect (row refolding -> "store_cache
+# rejected ... row_dim=1024 -> k_rows=12" on the real rig).
+# --------------------------------------------------------------------------
+
+
+def test_the_restore_builds_under_the_flip_tp_geometry_not_the_ambient_one(
+    monkeypatch,
+):
+    """CAN-FAIL PROOF for part A. Before the fix, restore_deferred_cold_stack
+    called build_cold_stack_posts with no phase_flip_tp_scope open, so
+    get_parallel().attn_dcp_size read the ambient PRIMARY topology (1)
+    instead of the flip TP size (n) the KV pool was actually sized under.
+    Assert on the geometry the code under test ACTUALLY OBSERVES during the
+    build, not on the fix's intent."""
+    from sglang.srt.runtime_context import get_parallel
+
+    # Ambient, outside any scope: no distributed groups are initialized in
+    # this hermetic process, so this is the real fallback the ambient read
+    # takes, not a stub value chosen to make the test pass.
+    assert get_parallel().attn_dcp_size == 1
+
+    seen = {}
+
+    class _GeometryProbeWorker(_Worker):
+        def init_attention_backends(self):
+            seen["attn_dcp_size"] = get_parallel().attn_dcp_size
+            seen["attn_tp_size"] = get_parallel().attn_tp_size
+            super().init_attention_backends()
+
+    tp, draft = _GeometryProbeWorker(), _Worker()
+    assert _restore("draft+graphs", tp, draft, monkeypatch, vector=(30, 17, 17)) is True
+    assert seen["attn_dcp_size"] == 3
+    assert seen["attn_tp_size"] == 3
+    # The scope closed cleanly: the ambient read outside it is back to 1.
+    assert get_parallel().attn_dcp_size == 1
+
+
+# --------------------------------------------------------------------------
+# #785/#791 part B: the scope is re-entrant w.r.t. an already-armed TP
+# routing -- it must SAVE and RESTORE, not hard-code False on exit.
+# --------------------------------------------------------------------------
+
+
+def test_the_scope_restores_a_previously_armed_tp_routing(monkeypatch):
+    """CAN-FAIL PROOF for part B. At the pp->tp cutover, phase_flip_runtime
+    has already armed TP routing (set_phase_flip_tp_active(True)) before
+    restore_deferred_cold_stack opens this scope, and the TP phase keeps
+    running after the scope returns. Hard-coding False on exit would
+    silently route every later TP-phase collective back onto the primary
+    tp=1 groups -- a silent no-op all-reduce."""
+    _patch_flip_scope_deps(monkeypatch, active=True)
+    # Imported AFTER patching: the fake replaces the module attribute, and
+    # this name must bind to the CURRENT (patched) function object, not the
+    # real one bound at module-import time.
+    from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+
+    assert phase_flip_tp_routing_active() is True
+    with boot.phase_flip_tp_scope(0, 3):
+        assert phase_flip_tp_routing_active() is True
+    assert phase_flip_tp_routing_active() is True
+
+
+def test_the_scope_leaves_routing_off_when_it_started_off(monkeypatch):
+    """Mirror case: the boot-time call site's actual shape. Prior value is
+    always False there, so the scope must still exit False -- this is what
+    keeps the boot path's behaviour unchanged by the part B fix."""
+    _patch_flip_scope_deps(monkeypatch, active=False)
+    from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+
+    assert phase_flip_tp_routing_active() is False
+    with boot.phase_flip_tp_scope(0, 3):
+        assert phase_flip_tp_routing_active() is True
+    assert phase_flip_tp_routing_active() is False
+
+
+# --------------------------------------------------------------------------
+# #785/#791 part C: a named refusal guard fires when the ambient geometry
+# disagrees with what the KV pool was baked for.
+# --------------------------------------------------------------------------
+
+
+def _guard_worker(pool_head_num, total_kv_heads, pool_head_dim=256):
+    """A worker fake with just enough shape for
+    _pool_full_attn_row_schema_defensive's non-hybrid fallback branch
+    (``pool.k_buffer[0].shape[-2:]`` == (head_num, head_dim)) -- no CUDA, no
+    real KV pool class."""
+    import torch
+
+    class _Pool:
+        def __init__(self):
+            self.k_buffer = [torch.zeros(1, pool_head_num, pool_head_dim)]
+
+    class _ModelConfig:
+        def get_total_num_kv_heads(self):
+            return total_kv_heads
+
+    class _ModelRunner:
+        def __init__(self):
+            self.token_to_kv_pool = _Pool()
+            self.model_config = _ModelConfig()
+
+    worker = _Worker()
+    worker.model_runner = _ModelRunner()
+    return worker
+
+
+def test_the_geometry_guard_does_not_fire_on_the_healthy_scoped_path(monkeypatch):
+    """NEGATIVE-DIRECTION proof the guard genuinely can pass, not just raise:
+    the ambient geometry inside an open phase_flip_tp_scope (attn_dcp_size ==
+    n == 3, an uneven-TP plan installed) agrees with a pool baked replicated
+    (head_num == total_num_kv_heads == 4) -- the healthy boot AND (post part
+    A) cutover shape. Executed explicitly, not merely asserted about,
+    because a guard that always fires would make the positive-direction test
+    below meaningless."""
+    from sglang.srt.distributed import utils as dist_utils
+
+    monkeypatch.setattr(
+        dist_utils, "get_tp_partition_ratios", lambda *a, **k: [30, 17, 17]
+    )
+    _patch_flip_scope_deps(monkeypatch)
+    tp = _guard_worker(pool_head_num=4, total_kv_heads=4)
+    with boot.phase_flip_tp_scope(0, 3):
+        boot.build_cold_stack_posts(tp, None, None, where="test-healthy")
+    assert tp.calls == ["backends", "graphs"]
+
+
+def test_the_geometry_guard_fires_when_backends_would_build_unscoped(monkeypatch):
+    """CAN-FAIL PROOF for part C, positive direction: reproduces the exact
+    bug part A fixed (build_cold_stack_posts reached with no
+    phase_flip_tp_scope open) directly against the guard. Ambient
+    attn_dcp_size falls back to 1 (no scope open), uneven_dcp_kv_replicated
+    comes back False, but the pool was baked replicated (head_num ==
+    total_num_kv_heads == 4): mismatch, must raise BEFORE any worker call."""
+    tp = _guard_worker(pool_head_num=4, total_kv_heads=4)
+    with pytest.raises(boot.PhaseFlipBootError, match="geometry mismatch"):
+        boot.build_cold_stack_posts(tp, None, None, where="test-unscoped")
+    assert tp.calls == []
 
 
 if __name__ == "__main__":
