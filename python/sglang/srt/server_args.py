@@ -5701,9 +5701,38 @@ class ServerArgs:
             "installed -- a precondition a PP-prefill boot does not meet. "
             "Prefer the value the runtime's own calibration prints as its "
             "restart hint: it is the measured per-rank profiled capacity, "
-            "not a guess.",
+            "not a guess. See --uneven-token-vector-role to let the runtime "
+            "act on that hint itself instead of asking for a restart.",
         ),
     ] = None
+    uneven_token_vector_role: A[
+        str,
+        Arg(
+            choices=["pin", "seed"],
+            help="What --uneven-token-vector (or SGLANG_UNEVEN_TOKEN_VECTOR) "
+            "MEANS (#797). "
+            "'pin' (default, unchanged behaviour): the vector is an "
+            "ASSERTION. It is installed as given and suppresses the measured "
+            "capacity solve entirely -- the runtime may only print a restart "
+            "hint naming a better vector, and a human has to act on it. "
+            "'seed': the vector is an ESTIMATE, used to size the boot up to "
+            "the point where real per-rank capacity is known, after which the "
+            "MEASURED optimum supersedes it in-process. No restart, no "
+            "hand-copied numbers. "
+            "WHY THIS EXISTS: the calibration already computes the optimal "
+            "vector from measured per-rank capacity and then throws it away as "
+            "a log line, so the feedback loop is closed by a human or not at "
+            "all. On this fork's own reference rig the shipped pinned vector "
+            "left ~10 %% of the KV pool unreachable while every boot printed "
+            "the better vector. "
+            "PROVENANCE: a pinned vector is only as good as the investigation "
+            "it came from, and nothing in a vector records which one that was. "
+            "If the number was inherited, copied from an old note, or came out "
+            "of a study that was later retracted, it is an estimate and 'seed' "
+            "is the honest role for it. Reserve 'pin' for a vector you are "
+            "actively asserting against the runtime's own measurement.",
+        ),
+    ] = "pin"
     barlink: A[
         Optional[bool],
         Arg(help="Enable barlink. Promoted from SGLANG_BARLINK (#781)."),
@@ -10201,6 +10230,26 @@ class ServerArgs:
             or self.uneven_kv_speed_mode()
             or self.uneven_kv_corridor_mode()
         )
+
+    def uneven_token_vector_is_seed(self) -> bool:
+        """True when an explicit token vector is an ESTIMATE the measured
+        optimum may supersede in-process, rather than a pinned assertion (#797).
+
+        Read INSTEAD OF the raw ``SGLANG_UNEVEN_TOKEN_VECTOR`` presence test at
+        the capacity-install gate. The distinction the boolean env cannot make
+        is the whole point: 'a vector is present' and 'the operator asserts
+        THIS vector' are different statements, and conflating them is what
+        makes the calibration advisory-only forever -- it computes the better
+        vector from measured capacity, finds an env value set, and downgrades
+        itself to a log line a human must act on.
+
+        Deliberately NOT tied to --rank-kv-ratio. Requiring a derived mode as
+        well would put this behind server_args.py's _handle_uneven_tp, which
+        SILENTLY downgrades a mode string to 'coupled' when no --rank-tp-ratio
+        plan is installed -- a precondition a PP-prefill boot cannot meet, so
+        the one configuration that most needs the measured vector is exactly
+        the one that would never get it. One flag, one meaning."""
+        return self.uneven_token_vector_role == "seed"
 
     def uneven_weighted_dcp_enabled(self) -> bool:
         """True when the weighted-DCP token vector should be installed:
@@ -17416,6 +17465,16 @@ class ServerArgs:
             # and not the boot-time PP -- exactly the scope split the #754 fix
             # is about. Publishing keeps one value visible to both stacks.
             os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = str(self.uneven_token_vector)
+        # #797: the ROLE travels with the vector, for the same reason the
+        # vector itself is published rather than read off a ServerArgs field --
+        # the resolver runs inside the flip's SECOND stack build, where this
+        # object is not the one being consulted. Published unconditionally
+        # (unlike the vector) because 'no vector set' and 'vector set, role
+        # pin' must stay distinguishable from a stale env left by an earlier
+        # process in the same shell.
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"] = str(
+            self.uneven_token_vector_role
+        )
         # One definition, called from here and from the early hoist in
         # __post_init__ that the VRAM ledger depends on (#786).
         self._publish_barlink_ownership_env()

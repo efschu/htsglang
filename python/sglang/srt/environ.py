@@ -693,6 +693,10 @@ class Envs:
     # pools to the profiled optimum. Model-type-agnostic (keys off measured
     # capacity, which is dtype-independent).
     SGLANG_UNEVEN_TOKEN_VECTOR = EnvStr(None)
+    # #797: "pin" (the vector is an assertion) or "seed" (an estimate the
+    # measured optimum may supersede in-process). Unset reads as "pin", so a
+    # process that never sets it behaves exactly as before.
+    SGLANG_UNEVEN_TOKEN_VECTOR_ROLE = EnvStr(None)
     # Log one per-rank residency census line once everything permanent is
     # resident (planner/residency_census.py). Read-only instrument for
     # calibrating the #485 cut gate against exclusively-owned, measured bytes

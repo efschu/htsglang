@@ -5699,10 +5699,26 @@ class ModelRunnerKVCacheMixin:
         # (rank-uniform decision: server args + gathered P_r only). An explicit
         # pin (env vector or flag list) and the draft worker keep hint-only
         # semantics.
+        # #797: an explicit vector suppresses the install only when it is a
+        # PIN. Under role=seed it was a sizing estimate and the measured
+        # optimum supersedes it here, in-process -- the calibration stops being
+        # a log line a human has to act on. `seed_role` is read from the env
+        # (not from server_args) so the flip's second stack build, which does
+        # not consult this ServerArgs object, reaches the same verdict.
+        seed_role = (
+            str(envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get() or "pin").strip().lower()
+            == "seed"
+        )
+        pinned_vector = bool(envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()) and not seed_role
         install = (
             allow_install
-            and self.server_args.uneven_kv_derived_mode()
-            and not envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+            # A seeded vector is itself the request for a measured install, so
+            # it does not additionally require a derived --rank-kv-ratio mode.
+            # Demanding both would route this through _handle_uneven_tp's
+            # silent downgrade to 'coupled' (no --rank-tp-ratio plan on a
+            # PP-prefill boot) and the mode would never arrive.
+            and (self.server_args.uneven_kv_derived_mode() or seed_role)
+            and not pinned_vector
             and not self.is_draft_worker
         )
 
@@ -5780,6 +5796,23 @@ class ModelRunnerKVCacheMixin:
             if optimal != active and improves:
                 mode = self.server_args.rank_kv_ratio
                 set_cp_token_ratios(optimal)
+                # #797: MAKE THE INSTALL SURVIVE THE CUTOVER. Under
+                # --enable-phase-flip the decode stack does not inherit this
+                # process-local install: parse_flip_token_vector rebuilds the
+                # vector from SGLANG_UNEVEN_TOKEN_VECTOR (falling back to
+                # --phase-flip-tp-vector) and phase_flip_runtime re-installs
+                # THAT at every cutover, so an install left only in
+                # set_cp_token_ratios is silently reverted at the first flip
+                # and the boot reverts to the seed it was meant to supersede.
+                # Writing the measured vector back into the env the flip reads
+                # keeps ONE value visible to both stacks -- the same reason the
+                # seed itself is published rather than read off ServerArgs.
+                # Only for a seeded vector: a derived mode without a seed had
+                # no env entry to begin with and must not gain one here.
+                if seed_role:
+                    os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = ",".join(
+                        str(v) for v in optimal
+                    )
                 if self.tp_rank == 0:
                     logger.info(
                         "Uneven DCP %s mode (--rank-kv-ratio %s): installed "
@@ -5830,6 +5863,31 @@ class ModelRunnerKVCacheMixin:
                     p_by_rank,
                     active,
                 )
+                # #797 PROVENANCE. The hint above has been printed on every
+                # boot of this configuration and nothing consumes it, because
+                # a PINNED vector suppresses the install. Say so at the point
+                # of loss, with the size of the loss, and name the one flag
+                # that closes the loop -- an advisory that does not say how to
+                # stop needing it is how a 10 % pool gap survives for months.
+                # Only when a vector is actually pinned: with no explicit
+                # vector at all the remedy is --rank-kv-ratio capacity, which
+                # the hint's own restart line already covers.
+                if pinned_vector and c_active > 0:
+                    logger.warning(
+                        "#797 PINNED VECTOR IS COSTING %.1f %% OF THE KV POOL: "
+                        "%s was supplied as an assertion (--uneven-token-vector"
+                        "-role pin, the default), so the measured optimum %s "
+                        "above is only advisory and this boot will keep the "
+                        "smaller pool. If that vector is an inherited estimate "
+                        "rather than a claim you are actively making -- copied "
+                        "from an older note, or from a study since superseded "
+                        "-- pass --uneven-token-vector-role seed and the "
+                        "runtime installs the measured vector itself, with no "
+                        "restart and no hand-copied numbers.",
+                        100.0 * (c_optimal - c_active) / c_active,
+                        active,
+                        optimal,
+                    )
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
