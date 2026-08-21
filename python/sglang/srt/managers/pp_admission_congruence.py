@@ -484,6 +484,49 @@ def reconcile_pp_admission_decision(
     return effective, PPAdmissionDecision(mb_id=decision.mb_id, entries=tuple(amended))
 
 
+def entries_retracted_by_rank(
+    decision: Optional[PPAdmissionDecision], rank: int
+) -> Tuple[PPAdmissionEntry, ...]:
+    """The entries THIS rank newly retracted from a decision it received.
+
+    #791c. `reconcile_pp_admission_decision` above is the only writer of
+    `retracted_by_rank`, and it writes it ONLY on the hop that first finds
+    the prefix unhonourable -- an entry another rank already retracted takes
+    the pass-through branch and keeps that rank's number. So a non-empty
+    result here means exactly one thing, with no inference: THIS RANK'S BATCH
+    FOR THIS PASS IS NARROWER THAN ITS UPSTREAM'S, because the upstream built
+    and forwarded its own batch from the decision as it stood BEFORE this
+    retraction, and nothing can amend a batch that is already in flight.
+
+    That is the whole content of the 2026-08-21 07:12:49 mispair (boot
+    instr17): PP0 admitted two requests (126 extend tokens), PP1 found
+    rid=5e744c29's told=16896 prefix unhonourable against its own local=0,
+    excluded it from `effective`, and built a one-request batch of 22 tokens
+    -- then paired PP0's 126 rows of hidden states with it. Every identity
+    the proxy carries (slot, sequence, flip epoch) was CORRECT: the message
+    was the current pass's, from the current ring, in the current epoch. Only
+    the WIDTH disagreed, and the width disagreed because of this function's
+    subject.
+
+    PURE, AND KEPT IN THIS MODULE ON PURPOSE. The consumer is the PP proxy
+    receive guard in scheduler_pp_mixin.py, but the fact is a property of a
+    decision, and this module already owns every other such property
+    (`congruent_rids` below is the same shape). `None` -- a caller with no
+    decision recorded for the slot -- yields an empty tuple, which every
+    consumer reads as "nothing known against this pass", i.e. exactly the
+    behaviour that shipped before this function existed.
+    """
+    if decision is None:
+        return ()
+    return tuple(
+        e
+        for e in decision.entries
+        if e.retracted
+        and e.retracted_by_rank is not None
+        and int(e.retracted_by_rank) == int(rank)
+    )
+
+
 def congruent_rids(decisions: Iterable[PPAdmissionDecision]) -> bool:
     """True iff every decision in `decisions` agrees on membership AND on
     every admitted rid's `(prefix_len, extend_len)`. Test/diagnostic helper:

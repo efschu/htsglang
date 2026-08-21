@@ -487,6 +487,23 @@ def test_a_coinciding_slot_within_one_epoch_is_the_residual_hole():
     Closing it needs a per-pass sequence the RECEIVER derives, which is a
     different change and has no specimen. The ``model_runner.forward`` shape
     check remains the standing tripwire.
+
+    #791c CORRECTION, AND IT IS THE REASON THIS PARAGRAPH NOW CARRIES ONE.
+    Boot instr17 (2026-08-21 07:12:49 PP1) died on the same ValueError -- "126
+    row(s) for a 1 batch of 22 token(s)" -- and it was read, twice, as THIS
+    hole finally showing up. IT IS NOT. instr17's message was not stale at
+    all: its slot, its seqno and its flip epoch were every one of them
+    correct, the #795 wire probe reported nothing unconsumed on the wire at
+    the cutover, and ``PROXY LEFTOVER REFUSED`` stayed 0 because there was
+    genuinely no leftover to refuse. What diverged was the BATCH, not the
+    message: PP0 admitted two requests (126 extend tokens), PP1 found one of
+    their prefixes unhonourable, retracted it, and built a 22-token batch --
+    126 = 22 + 104. See test_pp_proxy_retracted_pass_mispair_791c.py.
+
+    So this pin still has NO specimen, and a reader who arrives here holding
+    a proxy/batch mismatch should check ``_pp_pass_retraction_reason`` FIRST:
+    an identity defect and a membership defect present identically at
+    ``model_runner.forward``, and only one of them has ever been measured.
     """
     stale_but_coinciding = _msg(mb_id=1, seq=41, rows=1, tag="STALE", epoch=7)
     mine = _msg(mb_id=1, seq=44, rows=24, tag="MINE", epoch=7)

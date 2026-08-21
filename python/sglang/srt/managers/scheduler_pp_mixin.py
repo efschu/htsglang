@@ -42,6 +42,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
+    entries_retracted_by_rank,
     reconcile_pp_admission_decision,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -622,6 +623,98 @@ def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
     if stamp_epoch is None:
         return True
     return stamp_epoch == int(epoch)
+
+
+def pp_proxy_pass_retraction_reason(
+    amended: Optional[PPAdmissionDecision], rank: Optional[int]
+) -> Optional[str]:
+    """#791c: why the proxy about to be paired belongs to a WIDER batch.
+
+    THE IDENTITY IS NOT THE PROBLEM ANY MORE; THE MEMBERSHIP IS. `mb_id`,
+    `seq` and the flip `epoch` all answer "WHICH PASS is this message from",
+    and by 2026-08-21 all three answered correctly and the instance still
+    died. Boot instr17, 07:12:49 PP1:
+
+        PP0  #788 PP-ADMISSION verdict=ADMIT n_reqs=2
+             rids=51a294650b...,5e744c29f8... prefix_lens=0,16896
+        PP1  #791 PP-ADMISSION unhonourable prefix on rank 1:
+             rid=5e744c29f8... told=16896 local=0
+        PP1  #788 PP-ADMISSION verdict=ADMIT n_reqs=1
+             rids=51a294650b... prefix_lens=0
+        PP1  ValueError: #631 PP proxy/batch mismatch: received hidden_states
+             with 126 row(s) for a 1 batch of 22 token(s)
+
+    126 = 22 + 104: PP0's batch is PP1's batch PLUS the request PP1 retracted.
+    Same pass, same slot, same flip epoch, `PROXY LEFTOVER REFUSED` correctly
+    0 on the whole boot. Nothing was stale, nothing was stranded, no cutover
+    was involved -- and no sharper pass identity, per-slot generation or
+    receiver-derived sequence could ever have discriminated it, because the
+    message WAS this pass's.
+
+    WHAT ACTUALLY DIVERGED. `reconcile_pp_admission_decision`
+    (pp_admission_congruence.py) drops a rid whose `told` prefix this rank
+    cannot honour from `effective`, and scheduler.py's admission loop then
+    omits it from this rank's batch. The UPSTREAM rank built and forwarded
+    its own batch from the decision as it stood before that retraction and
+    has already launched: a batch in flight cannot be amended. So the
+    retraction, which is rank-local and correct in itself, makes this rank's
+    batch a strict subset of the one whose hidden states are on the wire.
+
+    WHY THIS PREDICATE AND NOT A WIDTH COMPARISON. The width is already
+    checked, at model_runner.py's `_hs.shape[0] != _want` -- 30 layers into
+    compute, naming no cause, and BLIND WHENEVER THE TWO BATCHES HAPPEN TO
+    HAVE THE SAME TOKEN COUNT. Chunked prefill caps a chunk at
+    `chunked_prefill_size`, so two ranks running DIFFERENT requests routinely
+    present the SAME width; that pair is not a shape error, it is silent
+    wrong output, and it is the same hazard the #631 stamp exists for ("a
+    leftover of the SAME width, which is silent wrong output rather than a
+    shape error"). This predicate reads the retraction itself, so it fires on
+    membership, not on arithmetic.
+
+    RECEIVER-PREDICTABLE BY CONSTRUCTION, which is the property `seq` never
+    had. The receiver does not infer this from anything the sender wrote: it
+    IS the rank that performed the retraction, it did so at the top of this
+    same pass (`_event_loop_pp_body`'s #791 block, strictly before the proxy
+    receive), and #791b already records the amended decision per slot in
+    `_pp_admission_amended_by_slot`. Nothing new crosses the wire.
+
+    NONE MEANS "NOTHING KNOWN AGAINST THIS PASS", on both arguments -- a rank
+    with no decision recorded for the slot, a stand-in that never ran the
+    #791 block, `pp_size <= 1`, the first rank. Every such case reproduces
+    exactly the behaviour that shipped before this function, per this file's
+    `_pp_note_output_expectation` / `pp_flip_epoch_of` convention (#787).
+    """
+    if amended is None or rank is None:
+        return None
+    retracted = entries_retracted_by_rank(amended, rank)
+    if not retracted:
+        return None
+    first = retracted[0]
+    return (
+        f"this rank retracted {len(retracted)} request(s) from the admission "
+        f"decision for this pass (first: rid={first.rid} told="
+        f"{first.prefix_len} local={first.observed_local} extend="
+        f"{first.extend_len}), so its batch is a strict SUBSET of the one the "
+        f"upstream had already launched when it forwarded these hidden states"
+    )
+
+
+def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
+    """``holder._pp_pass_retraction_reason(mb_id)``, or None if it has none.
+
+    MODULE-LEVEL AND getattr-BASED BY THIS FILE'S OWN CONVENTION (#787), for
+    the identical reason ``pp_flip_epoch_of`` above is: several methods here
+    are bound UNBOUND onto stand-in holders that carry only what the method
+    under test touched when the holder was written, and a holder written
+    before #791c must keep working. "No accessor" reads as "nothing known
+    against this pass", which is exactly the behaviour that shipped then.
+
+    A free function rather than a mixin method because a holder that binds
+    methods by NAME would not have the mixin method either -- which is the
+    whole failure this avoids.
+    """
+    fn = getattr(holder, "_pp_pass_retraction_reason", None)
+    return fn(mb_id) if fn is not None else None
 
 
 def classify_armed_drain_message(msg, ran_mb_ids, epoch: Optional[int] = None) -> tuple:
@@ -3541,6 +3634,28 @@ class SchedulerPPMixin:
             return False
         return bool(flags[mb_id])
 
+    def _pp_pass_retraction_reason(self: Scheduler, mb_id: int) -> Optional[str]:
+        """#791c: did THIS rank narrow its own batch for slot ``mb_id``?
+
+        Reads the amended decision `_pp_note_output_expectation` already
+        records per slot (#791b) -- written on EVERY pass by every non-first
+        rank, at the top of the pass, strictly before the proxy receive -- so
+        this asks a question that is fully answered before the message it
+        judges has even arrived. That is what makes it a discriminator the
+        RECEIVER CAN PREDICT rather than another label on the wire.
+
+        getattr-based and None-tolerant throughout, by this file's stand-in
+        convention (#787): a holder with no slot array, a rank with no
+        `ps.pp_rank`, `pp_size <= 1` and the first rank all yield None, which
+        `_pp_recv_proxy_tensors` reads as "nothing known against this pass" --
+        exactly the behaviour that shipped before #791c.
+        """
+        carried = getattr(self, "_pp_admission_amended_by_slot", None)
+        if not carried or int(mb_id) < 0 or int(mb_id) >= len(carried):
+            return None
+        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
+        return pp_proxy_pass_retraction_reason(carried[int(mb_id)], rank)
+
     def _pp_send_admission_decision(
         self: Scheduler,
         decision: PPAdmissionDecision,
@@ -4177,7 +4292,39 @@ class SchedulerPPMixin:
         # identity across a cutover.
         epoch = pp_flip_epoch_of(self)
         if stamp is None or mb_id < 0 or pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
-            return PPProxyTensors(raw)
+            # #791c: THE STAMP IS RIGHT AND THE MESSAGE IS STILL WRONG. Every
+            # identity above answers "which PASS is this from"; none answers
+            # "which BATCH is it of". A retraction this rank performed at the
+            # top of THIS pass makes its batch a strict subset of the one the
+            # upstream had already launched, so the current pass's own proxy
+            # is the wrong width -- or, worse, the right width and the wrong
+            # requests. See `pp_proxy_pass_retraction_reason`.
+            diverged = pp_pass_retraction_reason_of(self, mb_id)
+            if diverged is None:
+                return PPProxyTensors(raw)
+            self._pp_proxy_batch_divergences = (
+                getattr(self, "_pp_proxy_batch_divergences", 0) + 1
+            )
+            raise RuntimeError(
+                f"#791c PROXY BATCH DIVERGED: a proxy stamped {stamp} arrived "
+                f"for mb_id={mb_id} in flip epoch {epoch} and its identity is "
+                f"CORRECT -- it is this pass, this slot, this ring. It is "
+                f"still unpairable, because {diverged}. Computing on it pairs "
+                f"one request set's hidden states with another's metadata; "
+                f"when the two sets happen to have the same token count "
+                f"(chunked prefill caps every chunk at the same size, so this "
+                f"is common) that is silent wrong output, which the width "
+                f"check in model_runner.forward cannot see at all. The "
+                f"upstream cannot be told: it built and launched its batch "
+                f"from the decision as it stood BEFORE this rank's "
+                f"retraction, and a batch in flight cannot be amended. The "
+                f"defect to chase is therefore upstream of this line -- "
+                f"either PP0 must not offer a prefix a downstream rank cannot "
+                f"honour (PPAdmissionCongruenceGuard.prefix_len_for is the "
+                f"floor built for that, and #796 removed the return trip that "
+                f"fed it), or a retraction must void the whole pass on every "
+                f"rank rather than only narrow this one's batch."
+            )
 
         self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
         raise RuntimeError(
