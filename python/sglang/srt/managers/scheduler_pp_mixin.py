@@ -824,6 +824,15 @@ class SchedulerPPMixin:
                 # top-of-pass position closed a cycle. Guarded the same way
                 # the send site is: the last rank never posts a chain send,
                 # so it has nothing to flush here either.
+                # #796: reap this pass's admission-decision send BEFORE the
+                # chain flush. Retaining the handle is what makes the
+                # decision actually reach the peer at all (see
+                # _pp_send_admission_decision); reaping it here, rather than
+                # never, is what keeps the channel from growing an
+                # ever-longer list of un-waited isends. Ordered before the
+                # chain flush because it is the strictly weaker wait -- see
+                # _pp_commit_admission_send_work's docstring.
+                self._pp_commit_admission_send_work()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_pending_req_work()
 
@@ -2570,6 +2579,13 @@ class SchedulerPPMixin:
         self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
         self._pp_admission_amended_to_forward: Optional[PPAdmissionDecision] = None
         self._pp_admission_pending_sends: deque = deque()
+        # #796: the admission decision's outstanding async send, held here
+        # for the same reason `send_req_work` / `send_proxy_work` /
+        # `send_output_work` are held on the scheduler -- a gloo isend whose
+        # handle and buffers are local temporaries is dropped when they go
+        # out of scope, and the message never reaches the peer. Drained
+        # every iteration by `_pp_commit_admission_send_work`.
+        self._pp_admission_send_work: List[P2PWork] = []
         # #753: NOT assigned here any more. The inbox moved onto the pp_group
         # so the crossing wire -- a second consumer of the same channel --
         # shares it; ``_pp_tensor_dict_inbox`` below is now a read-only view of
@@ -3258,16 +3274,100 @@ class SchedulerPPMixin:
         decided (`_event_loop_pp_body`'s `if cur_batch: ... _pp_recv_proxy_
         tensors(mb_id)`, the root defect this whole feature targets).
 
-        Fire-and-forget async: nothing on the admission path may block on a
-        peer (scheduler.py's `_get_new_batch_prefill_raw` NO COLLECTIVE
-        note -- the 2026-08-17 deadlock family this must not repeat).
+        NOT SENT BY THE LAST RANK -- #796, and this is a CORRECTION to the
+        ring described above. The wraparound edge (last rank -> PP0) has no
+        matching receive on PP0 by construction: PP0 never issues a blocking
+        receive for it (that closed a ring, the fourth specimen -- see
+        `_pp_try_recv_admission_decision`), it only PEEKS an inbox that is
+        filled solely as a side effect of the per-iteration OUTPUT receive
+        -- and that receive early-returns whenever the slot is empty
+        (`_pp_send_recv_and_preprocess_output_tensors`'s `_do_recv`: `if
+        target is None ... return`), which is every idle pass. So the
+        wraparound was one unmatched message per pass on the channel: the
+        exact corpse `_pp_send_dict_to_next_stage` already refuses for the
+        proxy under a gapped wire ("Sending anyway would leave one unmatched
+        message per pass on the channel -- the bounded-recv corpse, from the
+        sender's side"). The same law is now applied here: A RANK MUST NOT
+        POST A SEND NO PEER IS REQUIRED TO TAKE.
+
+        WHAT THAT COSTS, STATED PLAINLY: `PPAdmissionCongruenceGuard.
+        record_return_trip` no longer runs, because no lap can arrive. It
+        was never load-bearing for TERMINATION -- #630's retry livelock
+        terminates on the floor the guard learns from the RETRACTION
+        (`prefix_len_for`, strictly decreasing and non-negative), and
+        `record_return_trip` only CLEARED that floor early. The floors are
+        keyed by rid and a rid dies with its request, so the residual cost
+        is that one request's reuse stays suppressed for the rest of ITS
+        life instead of recovering mid-flight. A bounded, per-request
+        performance effect -- traded for a channel with no unmatched sends
+        on it.
+
+        THE WORK HANDLE IS RETAINED, NOT DISCARDED -- #796, the defect that
+        wedged six boots. This used to call `_pp_send_dict_to_next_stage`
+        and throw the returned `P2PWork` list away, which made it the ONLY
+        async channel in `_event_loop_pp_body` that did not keep its handle
+        alive on the scheduler (`send_req_work`, `send_proxy_work` and
+        `send_output_work` all do, and all are committed later). A gloo
+        isend whose handle and backing buffers are local temporaries is
+        dropped when they go out of scope: the message never reaches the
+        peer, and every downstream rank then blocks for ever at
+        `_event_loop_pp_body`'s decision receive waiting for something that
+        was never actually on the wire. That is why three successive
+        re-orderings of this send (#791, #795, and the wraparound fix) each
+        corrected a real defect and none of them saved a boot -- the
+        ordering of a message that does not exist cannot matter.
+        Reproduced hermetically in
+        test_pp_admission_send_handle_dropped_796.py, whose dropped-handle
+        arm reproduces the six-boot py-spy signature exactly (PP0 in the
+        chain flush one iteration ahead, PP1 and PP2 both in this channel's
+        receive). Committed at the end of the iteration by
+        `_pp_commit_admission_send_work`.
+
+        Still fire-and-forget WITHIN the pass: nothing on the admission path
+        may block on a peer here (scheduler.py's `_get_new_batch_prefill_raw`
+        NO COLLECTIVE note -- the 2026-08-17 deadlock family this must not
+        repeat). Retaining a handle is not blocking on one.
         """
         if self.ps.pp_size <= 1:
             return
+        if self.pp_group.is_last_rank:
+            return
         tensor_dict = pp_admission_decision_to_wire(decision)
-        self._pp_send_dict_to_next_stage(
+        works = self._pp_send_dict_to_next_stage(
             tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
         )
+        # Tolerant of a stand-in that never ran `init_pp_loop_state`, as this
+        # file's own convention requires (#787): a holder without the field
+        # simply grows one here.
+        pending = getattr(self, "_pp_admission_send_work", None)
+        if pending is None:
+            pending = []
+            self._pp_admission_send_work = pending
+        pending.extend(works or [])
+
+    def _pp_commit_admission_send_work(self: Scheduler) -> None:
+        """#796: reap this pass's admission-decision send.
+
+        Called once per iteration from `_event_loop_pp_body`, immediately
+        BEFORE `_pp_commit_pending_req_work`. That order is deliberate and
+        the weaker of the two waits comes first: this one is satisfied as
+        soon as the next rank reaches its decision receive at the TOP of the
+        same pass, whereas the chain flush is not satisfied until that rank
+        reaches the top of the NEXT pass. A wait that is already implied by
+        one placed after it can never be the wait that closes a cycle.
+
+        Safe to wait on unconditionally. Every remaining send on this
+        channel is matched by construction: rank r sends to rank r+1 exactly
+        once per pass, rank r+1 issues exactly one blocking receive for it
+        at the top of that same pass, and the last rank now posts nothing
+        (see `_pp_send_admission_decision`). So this is a wait on a message
+        the peer is REQUIRED to take -- the same property
+        `_pp_commit_pending_req_work` relies on -- or, on a pass that sent
+        nothing, a wait on an empty list.
+        """
+        pending = getattr(self, "_pp_admission_send_work", None)
+        if pending:
+            self._pp_commit_comm_work(pending)
 
     def _pp_recv_admission_decision(self: Scheduler) -> Optional[PPAdmissionDecision]:
         """#791: this pass's inbound admission decision (blocking receive).
@@ -3345,6 +3445,20 @@ class SchedulerPPMixin:
         going to issue anyway, at no extra wire cost. If it is not there
         yet, this iteration simply carries on without it -- see the call
         site in `_event_loop_pp_body` for what that costs.
+
+        #796 UPDATE, AND IT MAKES THIS METHOD DORMANT RATHER THAN WRONG:
+        the last rank no longer EMITS the wraparound at all, because PP0 was
+        never required to take it and one unmatched message per pass is the
+        bounded-recv corpse (see `_pp_send_admission_decision` for the full
+        argument and for what the lost `record_return_trip` learning costs).
+        No lap can therefore arrive any more, and this returns None every
+        time. It is kept, not deleted, for the same reason
+        `pp_pump_send_req_work` is kept: it is exactly where a working
+        wraparound would be consumed if PP0 ever gains a receive it is
+        genuinely required to issue, and deleting it would erase the record
+        of what the ring was for. It is NOT a mechanism anything may rely
+        on, and nothing does -- the call site treats a None as an ordinary
+        "not this pass".
 
         Returns None immediately, touching nothing, when `pp_size <= 1`
         (matching `_pp_recv_admission_decision`'s own no-op contract) or
