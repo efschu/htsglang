@@ -6334,8 +6334,24 @@ class Scheduler(
                 # batch dump. A flood here has cost this feature a self-kill
                 # before (see the origin guard in request_receiver).
                 rids = ",".join(r.rid for r in ret.reqs[:4])
+                # #796: NO `or []` HERE. `prefix_indices` is a tensor, and
+                # `x or []` asks `bool(x)`, which torch refuses for an empty
+                # tensor ("Boolean value of Tensor with no values is
+                # ambiguous") and for a multi-element one. This branch runs
+                # only on an ADMIT, so the effect was that EVERY admitting
+                # pass lost its trace line to the except below while the idle
+                # DECLINE passes logged fine -- boot instr6 showed all three
+                # ranks reporting a bare "RuntimeError" at the exact pass the
+                # first real request arrived, and the verdict lines that
+                # mattered were the ones that never got printed.
+                # The docstring above already said len() is the right
+                # spelling; the `or []` slipped in anyway.
                 prefix_lens = ",".join(
-                    str(len(getattr(r, "prefix_indices", []) or []))
+                    str(
+                        0
+                        if getattr(r, "prefix_indices", None) is None
+                        else len(r.prefix_indices)
+                    )
                     for r in ret.reqs[:4]
                 )
             logger.info(
@@ -6354,7 +6370,18 @@ class Scheduler(
         except Exception as e:  # noqa: BLE001
             # An instrument must never be able to kill the scheduler it is
             # measuring -- that is the #790 lesson generalised.
-            logger.warning("#788 PP-ADMISSION trace unavailable: %s", type(e).__name__)
+            # #796: the MESSAGE, not just the type. Boot instr6 logged three
+            # ranks reporting a bare "RuntimeError" at the exact pass a real
+            # request first appeared, and a bare type name is a diagnostic
+            # dead end -- it cost a whole boot to learn nothing. Still
+            # swallowed rather than raised: an instrument must never be able
+            # to kill the scheduler it is measuring (the #790 lesson
+            # generalised); it just has to say what went wrong.
+            logger.warning(
+                "#788 PP-ADMISSION trace unavailable: %s: %s",
+                type(e).__name__,
+                e,
+            )
 
     def _drain_prefetch_progress(self) -> Dict[str, bool]:
         """Advance EVERY queued request's HiCache storage prefetch, and return

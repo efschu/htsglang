@@ -349,7 +349,24 @@ def build_pp_admission_decision(
     """
     entries = []
     for req in reqs:
-        raw_prefix_len = len(getattr(req, "prefix_indices", None) or [])
+        # #796: `prefix_indices` is a TENSOR of KV-pool slot pointers, so it
+        # must never reach a boolean context. `x or []` evaluates `bool(x)`,
+        # and torch raises on both ends of the range that matters here: an
+        # EMPTY tensor gives "Boolean value of Tensor with no values is
+        # ambiguous" and a multi-element one gives the "more than one
+        # element" variant. Only the single-element case would have gone
+        # through silently -- so the original spelling was broken for very
+        # nearly every request, and it took the boot that first got this far
+        # to find out (PP0 aborted here on its first real prefill, boot
+        # instr5, once the #796 send-handle fix stopped the ring wedging at
+        # idle before any request was ever admitted).
+        #
+        # `len()` reads the shape only and does not synchronise, which is
+        # what #790 requires of anything on this path; it is also the
+        # spelling the rest of this feature already uses
+        # (scheduler_pp_mixin.py:2652, :3508).
+        prefix_indices = getattr(req, "prefix_indices", None)
+        raw_prefix_len = 0 if prefix_indices is None else len(prefix_indices)
         raw_extend_len = getattr(req, "extend_input_len", None)
         if raw_extend_len is None:
             fill_ids = getattr(req, "full_untruncated_fill_ids", None)
