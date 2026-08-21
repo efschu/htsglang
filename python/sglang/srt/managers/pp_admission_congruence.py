@@ -527,6 +527,53 @@ def entries_retracted_by_rank(
     )
 
 
+def void_pp_admission_decision(
+    decision: PPAdmissionDecision,
+) -> PPAdmissionDecision:
+    """#797: drop every STILL-ADMITTED entry, leaving the retractions alone.
+
+    THE PASS, NOT THE REQUEST, IS WHAT A RETRACTION COSTS. `reconcile_pp_
+    admission_decision` above narrows a decision by ONE rid and leaves the
+    rest admitted, which is correct as a statement about that rid and wrong
+    as a plan for the pass: the upstream has already built and launched a
+    batch containing BOTH rids, so a batch of "the rest" is a strict subset
+    of the one whose hidden states are already on the wire. Boot instr17
+    computed exactly that subset -- 22 tokens against 126 rows -- and boots
+    instr15/16/17 between them logged 661, 1651 and 1718 of these narrowings
+    while the width check caught ONE. The other ~4000 were same-width
+    pairings, which are silent wrong output. See `entries_retracted_by_rank`.
+
+    So the retracting rank drops the whole pass instead, and this is the
+    membership half of that: every entry that is still admitted becomes
+    `admitted=False`, which `reconcile_pp_admission_decision`'s own
+    pass-through branch then carries to every rank after this one, and which
+    scheduler.py's admission loop reads as "not named this pass" -- the
+    existing requeue-for-free path, not a new one.
+
+    admitted=False AND retracted=False, WHICH IS THE THIRD STATE AND NOT AN
+    OVERSIGHT. `PPAdmissionCongruenceGuard.record_return_trip` reads exactly
+    these two flags: `retracted` teaches a floor, `admitted` clears one, and
+    neither ("excluded before this module ever saw it") leaves the rid
+    untouched. A collaterally-dropped rid must land in that third state: it
+    suffered no shortfall, so it must teach no floor, and it was never
+    served, so it must clear none either. Marking it `retracted` would clamp
+    a prefix that was perfectly honourable; leaving it `admitted` would clear
+    a floor another rank had just paid to learn.
+
+    Pure and idempotent: a decision with nothing left to drop is returned
+    with equal content, and a `retracted` entry is never touched.
+    """
+    if not any(e.admitted and not e.retracted for e in decision.entries):
+        return decision
+    return PPAdmissionDecision(
+        mb_id=decision.mb_id,
+        entries=tuple(
+            replace(e, admitted=False) if e.admitted and not e.retracted else e
+            for e in decision.entries
+        ),
+    )
+
+
 def congruent_rids(decisions: Iterable[PPAdmissionDecision]) -> bool:
     """True iff every decision in `decisions` agrees on membership AND on
     every admitted rid's `(prefix_len, extend_len)`. Test/diagnostic helper:

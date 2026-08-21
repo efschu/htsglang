@@ -6005,6 +6005,42 @@ class Scheduler(
             self._round_built_nothing = False
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
+        # #797: A ROUND WITHHELD FOR A VOIDED PP PASS, on the same argument
+        # and in the same shape as the pending-flip branch above -- and it has
+        # to be the WHOLE round, not just the prefill admission.
+        #
+        # `_pp_void_retracted_pass` (scheduler_pp_mixin.py) empties this pass's
+        # `effective`, which stops every prefill rid being admitted; the
+        # admission loop below reads a rid it does not name as "not this
+        # pass". That alone is not enough. With nothing to prefill this method
+        # falls through to its decode branch and returns the RUNNING batch --
+        # so the rank would run a decode batch for a slot whose upstream is
+        # running a prefill batch, which is the same mispairing one forward
+        # further on. The retraction voids the pass, so the pass must build
+        # nothing at all.
+        #
+        # Uniform across the ranks that matter by construction, which is the
+        # property every other branch here has to argue: the flag is not
+        # re-derived per rank, it is set by the one rank that retracted and
+        # carried to every rank after it on the admission decision
+        # (`_PP_PASS_VOIDED_KEY`). Ranks BEFORE it never see it, and they are
+        # exactly the ranks that already launched -- the void is what their
+        # output ring absorbs (#791b), not something they can join.
+        #
+        # Nothing is lost and nothing leaks: no batch was built, so no KV,
+        # mamba slot or req-pool row was allocated to drop, and the requests
+        # stay in `self.waiting_queue` for the next pass.
+        #
+        # Scoped by `ps.pp_size > 1` exactly as `_pp_admission_incoming_
+        # effective` is at this method's other consumer
+        # (`_get_new_batch_prefill_raw`): the flag is written only by the PP
+        # event loop, and a phase flip into the TP layout must not be able to
+        # inherit a void decided in the PP window. `init_pp_loop_state` clears
+        # it at every cutover for the same reason.
+        if self.ps.pp_size > 1 and getattr(self, "_pp_admission_pass_voided", False):
+            self._round_built_nothing = False
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif phase_prefill_blocked_here(
@@ -7515,6 +7551,53 @@ class Scheduler(
             num_tokens_next = batch.new_tokens_required_next_decode()
             evict_from_tree_cache(self.tree_cache, num_tokens_next)
             kv_full_retract_flag = self.uniform_min_avail() < num_tokens_next
+        # #797, EXAMINED AND DELIBERATELY NOT CHANGED. This decision and the
+        # loop bound below are RANK-LOCAL on a TP=1/PP=3 boot -- not by
+        # oversight, but because `_update_uniform_pool_budget` reduces on
+        # `tp_cpu_group`, which has one member per rank there, and says so in
+        # its own boot log line: "#788 UNIFORM-FLOOR SCOPE ... With pp_size>1
+        # the ranks that must agree are NOT in this reduce group". The stages
+        # own different layer counts and therefore different pools, so two
+        # stages CAN pop different numbers of decode victims and end a pass
+        # with different membership. The same holds for the offload branch
+        # above and for `_admission_relief_ladder`'s rung 3, which reaches
+        # this same actuator through the same `_retract_decode_and_requeue`.
+        #
+        # WHAT THEY CANNOT DO is produce #791c's SILENT divergence, and that
+        # is why they are not folded into #797:
+        #   * `ScheduleBatch._get_decode_retraction_order` sorts on
+        #     `len(req.output_ids)`, `-len(req.origin_input_ids)` and
+        #     optionally `req.priority` -- all replicated per-request state --
+        #     under replicated server args (`retraction_policy`,
+        #     `schedule_low_priority_values_first`, `spec_algorithm`), so
+        #     every stage computes the SAME preference order over the SAME
+        #     request list;
+        #   * `retract_decode` pops only from the END of that order, so the
+        #     stages' victim sets are NESTED, never disjoint: for a given
+        #     victim COUNT the victims are identical;
+        #   * a decode batch's row count is a strict function of its request
+        #     count (one token per request, or `1 + num_speculative_tokens`),
+        #     so different membership always means a different
+        #     `forward_batch.input_ids.shape[0]`;
+        #   * and `retract_decode` entered with more than one request always
+        #     retracts at least one (its `first_iter` do-while), so "entered
+        #     on one stage only" is never a zero-victim reorder.
+        # A divergence here is therefore ALWAYS a width divergence, which
+        # `model_runner.forward`'s `_hs.shape[0] != _want` raises on every
+        # time. Loud, attributable, and not the same-width class that made
+        # instr15/16/17's ~4000 narrowings compute in silence.
+        #
+        # It is still a real defect -- a crash, and a running batch that stays
+        # divergent afterwards -- and #797's remedy does not fit it: voiding a
+        # pass repairs per-pass membership, while a retracted decode victim is
+        # a change to LONG-LIVED state that one voided pass cannot undo. The
+        # root is the reduce group at `_update_uniform_pool_budget`, and
+        # closing it means either widening that group (a new cross-stage
+        # synchronisation point every iteration, against the law this whole
+        # feature is built on) or giving the decode retraction the same
+        # learn-and-carry shape `PPAdmissionCongruenceGuard` has. Either is
+        # its own change.
+        #
         # #583 (desync site 2): hand the SAME reduced value to the batch, so
         # `retract_decode`'s loop bound and its last-survivor test decide from
         # it too. #603 made the decision to ENTER retraction rank-uniform;

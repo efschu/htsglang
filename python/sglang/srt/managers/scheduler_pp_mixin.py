@@ -44,6 +44,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionEntry,
     entries_retracted_by_rank,
     reconcile_pp_admission_decision,
+    void_pp_admission_decision,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -142,6 +143,42 @@ _PP_OUTPUT_EXPECTED_KEY = "__pp_output_expected__"
 # for what PP0 does with it and why it may not be turned into a placeholder
 # result.
 _PP_VOID_OUTPUT_KEY = "__pp_void_output__"
+
+# #797: THIS PASS IS OFF, ON EVERY RANK FROM HERE DOWN. Set by the rank that
+# performs a #791 retraction and then FORWARDED (OR-ed, never cleared) by
+# every rank after it, on the decision message that already travels
+# 0 -> 1 -> ... -> last within the pass.
+#
+# The membership half of a void travels on the entries themselves
+# (`void_pp_admission_decision` marks them `admitted=False`, which
+# scheduler.py's admission loop already reads as "not named this pass"). This
+# key carries the half the entries cannot express: a rank whose prefill
+# admission is emptied does not therefore run NOTHING -- `get_next_batch_to_
+# run` falls through to its running decode batch, and a downstream decode
+# batch paired with the upstream's prefill batch is the same mispairing one
+# forward further on. So the fact that the ROUND is withheld has to be a fact
+# about the pass, not an inference each rank makes from its own emptiness.
+#
+# Absent key means False: a stand-in, a sender that predates this key, or
+# `pp_size <= 1` all behave exactly as they did before it existed.
+_PP_PASS_VOIDED_KEY = "__pp_pass_voided__"
+
+# #797: "I have a runnable batch for this slot, so a proxy from me is coming."
+# PER-HOP, not forwarded: every sender OVERWRITES it with its own slot's
+# state, because the only rank a receiver needs this about is its IMMEDIATE
+# upstream. (`_PP_OUTPUT_EXPECTED_KEY` above is the opposite -- PP0's verdict,
+# carried verbatim to the last rank -- and the two must not be confused.)
+#
+# WHY A RECEIVER NEEDS IT. A rank that voids its pass has no `cur_batch`, so
+# `_event_loop_pp_body` never calls `_pp_recv_proxy_tensors` -- while its
+# upstream, which voided nothing, has already launched and posted its proxy
+# isend. That is the bounded-recv corpse: one unmatched message per voided
+# pass, and the upstream blocks for ever in the NEXT pass's
+# `_pp_commit_comm_work(self.send_proxy_work)`. The voiding rank therefore
+# drains exactly one proxy and discards it -- but only when a proxy really is
+# coming, which is a fact only the sender has (its batch can be empty for
+# capacity reasons that never reach the decision). So the sender states it.
+_PP_UPSTREAM_LAUNCHED_KEY = "__pp_upstream_launched__"
 
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
 # not required for this iteration's forward progress" family. PP0's ring
@@ -699,6 +736,185 @@ def pp_proxy_pass_retraction_reason(
     )
 
 
+def pp_first_retracting_rank(decision: Optional[PPAdmissionDecision]) -> Optional[int]:
+    """#797: the lowest rank that retracted anything from this decision.
+
+    THE RANKS ABOVE IT RAN THE PASS AND THE RANKS FROM IT DOWN DID NOT, and
+    that split is the whole content of this number. A rank voids when it
+    retracts (`pp_pass_should_void`) and every rank after it inherits the
+    void on the wire, while every rank BEFORE it built and launched its batch
+    from the decision as it stood earlier -- they cannot join a void decided
+    after they had already gone.
+
+    `None` when nothing in the decision names a retracting rank: an ordinary
+    pass, or a void produced by something other than a #791 retraction. Every
+    consumer reads that as "do not forward", which is the behaviour that
+    shipped before this function existed.
+    """
+    if decision is None:
+        return None
+    ranks = [
+        int(e.retracted_by_rank)
+        for e in decision.entries
+        if e.retracted and e.retracted_by_rank is not None
+    ]
+    return min(ranks) if ranks else None
+
+
+def pp_void_forward_payload(
+    holder, message: Dict[str, object]
+) -> Optional[Dict[str, object]]:
+    """#797: the void this rank must pass on, or None if it is the last one.
+
+    THE WEDGE THIS CLOSES, and it is one #797 would otherwise CREATE. #791b's
+    void keeps the output ring matched for the FIRST rank, because that is
+    where boot instr11 died. It stops there. When the retraction happens on
+    rank r, every rank in 1..r-1 also holds a launched batch for that slot and
+    also has an output receive posted for it -- and PP0, having absorbed the
+    void, forwards nothing, so they block on a message no rank will send.
+
+    Before #797 that shape produced a MISPAIR rather than a wedge (the
+    retracting rank narrowed its batch and the last rank still sent a real
+    output), so trading one for the other would not be a fix. The void
+    therefore travels the whole way the real output would have: last -> 0 ->
+    1 -> ... -> r-1, each rank absorbing it, releasing its own copies of the
+    requests and passing it on.
+
+    IT MUST STOP AT r-1. Rank r and everything after it voided, so their slots
+    are empty and their receives early-return (`_do_recv`'s `target is None`);
+    one more hop would be an unmatched message, the bounded-recv corpse. The
+    stopping point is not guessed -- it is `pp_first_retracting_rank` of the
+    decision the void already carries.
+
+    Returns the payload VERBATIM (a copy), decision included, so the next hop
+    can apply the identical rule. None whenever the rule does not fire, which
+    is every ordinary pass and every rank at or past the retraction.
+    """
+    if not isinstance(message, dict):
+        return None
+    group = getattr(holder, "pp_group", None)
+    if group is None or getattr(group, "is_last_rank", False):
+        return None
+    rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    if rank is None:
+        return None
+    raw = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
+    if raw is None:
+        return None
+    first = pp_first_retracting_rank(
+        pp_admission_decision_from_wire({_ADMISSION_DECISION_PAYLOAD_KEY: raw})
+    )
+    if first is None or int(rank) + 1 >= int(first):
+        return None
+    return dict(message)
+
+
+def pp_output_payload_with_return_trip(
+    holder, payload: Dict[str, object], mb_id: int
+) -> Dict[str, object]:
+    """#797: put this slot's chain-reconciled decision on the output.
+
+    THE ONE CHANNEL THAT SURVIVES #796'S LAW. `record_return_trip` is what
+    `PPAdmissionCongruenceGuard` learns from, and #796 removed its only
+    feeder when it deleted the ring wraparound -- correctly, because a
+    rank must not post a send no peer is required to take. #791b restored
+    HALF of it: the void output carries the decision back, so a floor is
+    learned on a pass that produced no output at all. The other half was
+    still missing, and it is the half that CLEARS a floor.
+
+    WHY THE MISSING HALF MATTERS. `record_return_trip` learns on
+    `retracted` and clears on `admitted and not retracted`; with only the
+    void feeding it, no successful pass ever reaches it, so a rid that was
+    once one token short keeps its clamp for the rest of its life (#796
+    named that residual cost precisely, and this is what pays it back).
+    The floor is what makes the retraction TERMINATE; the clearing is what
+    keeps a single cold-cache moment from suppressing that request's
+    prefix reuse for ever.
+
+    NOT A NEW MESSAGE. This rides the output message the last rank already
+    sends and PP0 is already required to receive, exactly as
+    `_PP_OUTPUT_EXPECTED_KEY` rides the decision message. PER HOP, and
+    that is not decoration: PP0 POPS the payload (`pp_absorb_admission_
+    return`) before the dict becomes a `PPProxyTensors` and is forwarded
+    on, because that class maps `v[key]` over EVERY entry and a tuple left
+    in it would slice to nonsense rather than raise -- the same hazard
+    `_pp_recv_proxy_tensors` pops `__stamp__` for.
+
+    COPIES rather than mutates: the caller's dict belongs to a live
+    `PPProxyTensors` on the sending rank, and adding a non-tensor entry to
+    it would put that same hazard on the SENDER's copy.
+    """
+    carried = getattr(holder, "_pp_admission_amended_by_slot", None)
+    decision = carried[mb_id] if carried and 0 <= mb_id < len(carried) else None
+    if decision is None:
+        return payload
+    out = dict(payload)
+    out.update(pp_admission_decision_to_wire(decision))
+    return out
+
+
+def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
+    """#797: take the decision riding home on an output and learn from it.
+
+    True iff one was there. POPS it, for the reason
+    `pp_output_payload_with_return_trip` gives: what is left of this dict
+    becomes a `PPProxyTensors` and is forwarded round the ring.
+
+    Every guard is a getattr: a rank with no `_pp_admission_guard` (a
+    stand-in, `pp_size <= 1`, a boot predating #630) simply drops the
+    payload, which is the behaviour that shipped before this existed.
+    """
+    if not isinstance(message, dict):
+        return False
+    raw = message.pop(_ADMISSION_DECISION_PAYLOAD_KEY, None)
+    if raw is None:
+        return False
+    guard = getattr(holder, "_pp_admission_guard", None)
+    if guard is None:
+        return False
+    guard.record_return_trip(
+        pp_admission_decision_from_wire({_ADMISSION_DECISION_PAYLOAD_KEY: raw})
+    )
+    return True
+
+
+def pp_pass_should_void(
+    amended: Optional[PPAdmissionDecision],
+    rank: Optional[int],
+    incoming_voided: bool,
+) -> bool:
+    """#797: must this rank run NOTHING for this pass?
+
+    TWO WAYS IN, AND THEY ARE DIFFERENT FACTS. Either this rank performed a
+    #791 retraction against the decision it received -- in which case its own
+    batch would be a strict subset of the one its upstream already launched,
+    which is the mispair -- or a rank BEFORE it did, and said so on the wire
+    (`_PP_PASS_VOIDED_KEY`), in which case the pass is already off and this
+    rank must not restart it with a decode batch of its own.
+
+    ORed, NEVER CLEARED. A rank downstream of a retraction retracts nothing
+    itself (`reconcile_pp_admission_decision` passes an already-retracted
+    entry through verbatim, which is what `entries_retracted_by_rank` is
+    `retracted_by_rank ==`-keyed for), so a rank that consulted only its own
+    verdict would un-void the pass and be the only rank running it.
+
+    A SEPARATE, NAMED PREDICATE because it is the one thing a can-fail proof
+    has to be able to neuter WITHOUT taking `entries_retracted_by_rank` down
+    with it -- that lookup also feeds #791c's receive guard, and a proof that
+    blinds both cannot show which of the two did the preventing. Looked up
+    through this module's globals at call time, like every other function
+    here.
+
+    `None` on either argument means "nothing known", the same convention
+    `pp_proxy_pass_retraction_reason` and `pp_flip_epoch_of` use.
+    """
+    if bool(incoming_voided):
+        return True
+    if amended is None or rank is None:
+        return False
+    return bool(entries_retracted_by_rank(amended, rank))
+
+
 def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
     """``holder._pp_pass_retraction_reason(mb_id)``, or None if it has none.
 
@@ -875,11 +1091,32 @@ class SchedulerPPMixin:
                 # nothing (pp_size <= 1, or the first rank) cannot inherit the
                 # previous pass's expectation.
                 self._pp_output_expected_incoming = False
+                # #797: reset on the same argument, and on EVERY rank -- PP0
+                # and `pp_size <= 1` never receive, so without this they would
+                # carry a void decided passes ago into a pass that has no
+                # retraction in it at all.
+                self._pp_pass_voided_incoming = False
+                self._pp_upstream_launched_incoming = False
+                self._pp_admission_pass_voided = False
                 if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
                     with torch.profiler.record_function("pp_admission_decision_recv"):
                         incoming_decision = self._pp_recv_admission_decision()
                         effective, amended = self._pp_reconcile_incoming_admission(
                             incoming_decision
+                        )
+                        # #797 PREVENTION, and this is the line the whole
+                        # change turns on. `effective` above is the pass
+                        # NARROWED by this rank's own retraction, and a
+                        # narrowed pass is precisely what may not be run: the
+                        # upstream built and launched its batch from the
+                        # decision as it stood BEFORE the retraction, so this
+                        # rank's batch would be a strict subset of the one
+                        # whose hidden states are already on the wire. #791c
+                        # detects that pairing at the proxy boundary; this
+                        # stops it being created. See
+                        # `_pp_void_retracted_pass`.
+                        effective, amended = self._pp_void_retracted_pass(
+                            effective, amended
                         )
                         self._pp_admission_incoming_effective = effective
                         self._pp_admission_amended_to_forward = amended
@@ -967,7 +1204,13 @@ class SchedulerPPMixin:
                         expects_output = _pp_output_exchange_due(self.mbs[mb_id])
                         self._pp_note_output_expectation(mb_id, expects_output, None)
                         self._pp_send_admission_decision(
-                            fresh_decision, expects_output=expects_output
+                            fresh_decision,
+                            expects_output=expects_output,
+                            # #797: PP0 builds the decision, so it can never
+                            # be the rank that retracts against it -- the void
+                            # can only ever start downstream of here.
+                            pass_voided=False,
+                            launched=self.mbs[mb_id] is not None,
                         )
                         self._pp_admission_pending_sends.append(mb_id)
                         # Capped, not unbounded -- see
@@ -1031,6 +1274,13 @@ class SchedulerPPMixin:
                         self._pp_send_admission_decision(
                             amended,
                             expects_output=self._pp_output_expected_incoming,
+                            # #797: the void is OR-ed, never cleared -- a rank
+                            # downstream of a retraction must not be able to
+                            # un-void a pass by having retracted nothing of its
+                            # own. `launched` is the opposite: it is THIS
+                            # rank's own slot, overwritten for the next hop.
+                            pass_voided=self._pp_admission_pass_voided,
+                            launched=self.mbs[mb_id] is not None,
                         )
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
@@ -1038,6 +1288,13 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                else:
+                    # #797: a voided pass has no batch, so the branch above
+                    # never runs -- and the upstream, which voided nothing,
+                    # has already posted its proxy isend. Take it and drop it,
+                    # or the upstream blocks for ever on next pass's
+                    # `_pp_commit_comm_work(self.send_proxy_work)`.
+                    self._pp_drain_voided_proxy(mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -2896,6 +3153,14 @@ class SchedulerPPMixin:
         # out of scope, and the message never reaches the peer. Drained
         # every iteration by `_pp_commit_admission_send_work`.
         self._pp_admission_send_work: List[P2PWork] = []
+        # #797: PASS-SCOPED, rewritten at the top of every pass by
+        # `_event_loop_pp_body` before `get_next_batch_to_run` reads them.
+        # Cleared here too, because a cutover re-enters the loop and a void
+        # decided in the epoch that just ended names nothing in the new one --
+        # the same argument `_pp_output_expected_by_slot` makes above.
+        self._pp_admission_pass_voided: bool = False
+        self._pp_pass_voided_incoming: bool = False
+        self._pp_upstream_launched_incoming: bool = False
         # #791b: PER SLOT, refreshed every pass by
         # `_pp_note_output_expectation`, read on the last rank by
         # `_pp_send_output_to_next_stage`. Per slot rather than one scalar
@@ -3661,6 +3926,8 @@ class SchedulerPPMixin:
         decision: PPAdmissionDecision,
         *,
         expects_output: bool = False,
+        pass_voided: bool = False,
+        launched: bool = False,
     ) -> None:
         """#791: forward this pass's admission decision to the next stage.
 
@@ -3744,6 +4011,11 @@ class SchedulerPPMixin:
         # being re-derived per rank, and `_pp_send_output_to_next_stage` for
         # what the last rank does with it.
         tensor_dict[_PP_OUTPUT_EXPECTED_KEY] = bool(expects_output)
+        # #797: the two facts a #791 retraction makes the next rank need. See
+        # each key's own comment; `pass_voided` is OR-ed along the chain and
+        # `launched` is overwritten by every hop.
+        tensor_dict[_PP_PASS_VOIDED_KEY] = bool(pass_voided)
+        tensor_dict[_PP_UPSTREAM_LAUNCHED_KEY] = bool(launched)
         works = self._pp_send_dict_to_next_stage(
             tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
         )
@@ -3802,6 +4074,12 @@ class SchedulerPPMixin:
         # then behaves exactly as it did before this key existed.
         self._pp_output_expected_incoming = bool(
             message.get(_PP_OUTPUT_EXPECTED_KEY, False)
+        )
+        # #797: the two facts a retraction upstream of this rank makes it
+        # need. Absent means False on both, for the same reason.
+        self._pp_pass_voided_incoming = bool(message.get(_PP_PASS_VOIDED_KEY, False))
+        self._pp_upstream_launched_incoming = bool(
+            message.get(_PP_UPSTREAM_LAUNCHED_KEY, False)
         )
         return pp_admission_decision_from_wire(message)
 
@@ -3930,6 +4208,135 @@ class SchedulerPPMixin:
             pp_size=pp_size,
             log=logger,
         )
+
+    def _pp_void_retracted_pass(
+        self: Scheduler,
+        effective: Dict[str, int],
+        amended: PPAdmissionDecision,
+    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
+        """#797: a retraction drops the PASS, not just the rid.
+
+        THE NUMBERS THAT DECIDED THIS. Boots instr15/16/17 logged 661, 1651
+        and 1718 `#791 unhonourable prefix` retractions and died on ONE width
+        mismatch each. Every other narrowing computed: `reconcile_pp_
+        admission_decision` dropped the unhonourable rid, this rank built a
+        batch from what was left, and the upstream's hidden states -- for a
+        batch containing that rid -- were paired with it. Chunked prefill caps
+        every chunk at the same size, so two ranks running DIFFERENT request
+        sets routinely present EQUAL widths; `model_runner.forward`'s
+        `_hs.shape[0] != _want` sees nothing at all in that case. So the
+        ~4000 survivals in that series are not survivals, they are silent
+        wrong output, and every uptime number measured on them is void.
+
+        WHY THE PASS AND NOT THE RID. There are only three membership
+        outcomes and two of them are unavailable. The rank cannot ADMIT the
+        rid -- it has no KV for the prefix its upstream reused, and the
+        upstream sent hidden states only for the extend tokens, so there is
+        nothing to reconstruct the missing prefix from. The upstream cannot be
+        AMENDED -- it sent its decision and launched its batch earlier in this
+        same pass, and a batch in flight cannot be recalled. What is left is
+        to run the pass NOWHERE, which restores uniform membership in the one
+        direction that is physically available.
+
+        THE COST, NAMED: the upstream's forward for this pass is wasted, once
+        per prefix first offered that a downstream cannot honour. It is not
+        once per pass: the void rides back to PP0 inside #791b's void output,
+        `PPAdmissionCongruenceGuard.record_return_trip` learns the observed
+        local match as a floor, and `prefix_len_for` clamps the next offer for
+        that rid to it -- a strictly decreasing, non-negative sequence, so the
+        rid stops being re-offered an unhonourable prefix. The requests are
+        not lost either: `_pp_absorb_void_output` releases and re-queues them
+        on PP0, which is the same requeue-for-free path a capacity rejection
+        already uses.
+
+        WHAT IT REPLACES, STATED PLAINLY: #791c's boundary raise. That
+        converted the mispair into a named refusal thirty layers earlier and
+        killed the boot anyway; it stays in place as a tripwire, and a boot
+        carrying this change should count zero of it.
+
+        Returns `(effective, amended)` UNCHANGED when this rank retracted
+        nothing of its own and nothing upstream voided -- the default path is
+        not merely equivalent, it is the same objects.
+        """
+        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
+        voided = pp_pass_should_void(
+            amended, rank, getattr(self, "_pp_pass_voided_incoming", False)
+        )
+        self._pp_admission_pass_voided = voided
+        if not voided:
+            return effective, amended
+        mine = entries_retracted_by_rank(amended, rank) if rank is not None else ()
+        if mine:
+            self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
+            first = mine[0]
+            logger.warning(
+                "#797 PP-ADMISSION pass voided on rank %s: this rank retracted "
+                "%d request(s) (first: rid=%s told=%d local=%s), so its batch "
+                "would have been a strict SUBSET of the one the upstream "
+                "already launched. Running the whole pass nowhere instead: "
+                "rank 0's requests are released and re-queued by the void "
+                "output, and the observed local match is fed back as a prefix "
+                "floor so the next offer for this rid is honourable.",
+                rank,
+                len(mine),
+                first.rid,
+                first.prefix_len,
+                first.observed_local,
+            )
+        # Both halves of the void. The dict is what scheduler.py's admission
+        # loop reads (a rid it does not name is simply not admitted, the
+        # existing requeue-for-free path); the decision is what the next rank
+        # and the return trip read.
+        return {}, void_pp_admission_decision(amended)
+
+    def _pp_drain_voided_proxy(self: Scheduler, mb_id: int) -> bool:
+        """#797: take the proxy a voided pass will never pair, and drop it.
+
+        True iff a message was taken. THE WIRE OWES EXACTLY ONE MESSAGE PER
+        PASS and that debt does not disappear because this rank decided not to
+        run: the upstream posted its proxy isend before anything downstream
+        could tell it otherwise, and `_pp_commit_comm_work(self.send_proxy_
+        work)` on its NEXT pass is a blocking wait on that message being
+        taken. Leaving it is the bounded-recv corpse (see `_pp_send_dict_to_
+        next_stage`), and it wedges the upstream, not this rank.
+
+        GATED ON THE SENDER'S OWN STATEMENT, never on an inference from this
+        rank's state. `_PP_UPSTREAM_LAUNCHED_KEY` is written per hop by the
+        rank that will or will not send, because "did my upstream launch" is
+        not derivable here: its batch can be empty for capacity reasons that
+        never appear in the decision, and a blocking receive for a message
+        nobody sent is the deadlock family this whole feature is a list of.
+
+        Not the #631 guard's business: this is a deliberate discard of a
+        message whose pairing has already been refused, so it reads no stamp
+        and raises nothing. Under a gapped set there is no proxy on this
+        channel at all (`_pp_recv_proxy_tensors`' own early return), so this
+        is a no-op there for the same reason.
+        """
+        if not getattr(self, "_pp_admission_pass_voided", False):
+            return False
+        if not getattr(self, "_pp_upstream_launched_incoming", False):
+            return False
+        if self.ps.pp_size <= 1 or self.pp_group.is_first_rank:
+            return False
+        if getattr(self, "_pp_gapped_wire", False):
+            return False
+        self._pp_recv_typed_dict(
+            expected_kind="proxy",
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
+        )
+        self._pp_voided_proxy_drains = getattr(self, "_pp_voided_proxy_drains", 0) + 1
+        logger.warning(
+            "#797 PP-ADMISSION voided proxy drained on slot %d: the upstream "
+            "had already launched when this pass was voided, so its hidden "
+            "states are on the wire with no batch to pair them with. Taken "
+            "and discarded -- an unmatched message here blocks the UPSTREAM "
+            "in its next pass's proxy commit, not this rank.",
+            mb_id,
+        )
+        return True
 
     def _pp_flip_epoch(self: Scheduler) -> Optional[int]:
         """#795: the generation number of the microbatch slot ring.
@@ -4456,7 +4863,11 @@ class SchedulerPPMixin:
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            pp_output_payload_with_return_trip(
+                                self,
+                                pp_outputs_to_send.tensors,
+                                next_first_rank_mb_id,
+                            ),
                             async_send=async_output,
                             msg_type="output",
                         )
@@ -4510,12 +4921,9 @@ class SchedulerPPMixin:
         wraparound this one is not an unmatched message: it exists only on a
         pass where PP0's own published verdict obliges it to receive.
         """
-        payload: Dict[str, object] = {_PP_VOID_OUTPUT_KEY: True}
-        carried = getattr(self, "_pp_admission_amended_by_slot", None)
-        decision = carried[mb_id] if carried and mb_id < len(carried) else None
-        if decision is not None:
-            payload.update(pp_admission_decision_to_wire(decision))
-        return payload
+        return pp_output_payload_with_return_trip(
+            self, {_PP_VOID_OUTPUT_KEY: True}, mb_id
+        )
 
     def _pp_absorb_void_output(
         self: Scheduler,
@@ -4560,6 +4968,15 @@ class SchedulerPPMixin:
         if not isinstance(message, dict) or not message.pop(_PP_VOID_OUTPUT_KEY, False):
             return False
 
+        # #797: decided BEFORE the pops below strip the decision out, and
+        # published for `_do_recv` to forward. See `pp_void_forward_payload`
+        # for why a void that stops at the first rank turns #797 into a wedge
+        # whenever the retraction happens on a rank other than the first
+        # downstream one.
+        self._pp_void_forward_payload = pp_void_forward_payload(
+            self, {_PP_VOID_OUTPUT_KEY: True, **message}
+        )
+
         batch = mbs[mb_id] if mb_id < len(mbs) else None
         reqs = list(getattr(batch, "reqs", None) or ())
         if mb_id < len(mbs):
@@ -4567,26 +4984,46 @@ class SchedulerPPMixin:
         if mb_id < len(mb_metadata):
             mb_metadata[mb_id] = None
 
-        guard = getattr(self, "_pp_admission_guard", None)
-        if guard is not None and _ADMISSION_DECISION_PAYLOAD_KEY in message:
-            guard.record_return_trip(pp_admission_decision_from_wire(message))
+        pp_absorb_admission_return(self, message)
 
+        # #797: A RESIDENT REQUEST MUST NOT BE RELEASED HERE, and this is not
+        # a hardening detail -- it is a double-free. `_release_dynamic_chunk_
+        # probe` hands back the request's KV pages, mamba slot and req-pool
+        # row; a request that is also in `running_mbs[mb_id]` keeps decoding
+        # from those same pages on the next pass, so freeing them corrupts
+        # another request's cache and re-queueing it duplicates it. It was
+        # unreachable while only a FULL decline could void a slot (the void
+        # then carried a freshly built prefill batch, whose requests are not
+        # merged into the running batch until the next visit) and #797 makes
+        # it reachable, because a mixed chunked-prefill batch voids the same
+        # way and carries resident decode requests in it. A resident request
+        # needs nothing done to it: the pass simply did not run, and it
+        # decodes again next pass from the state it still holds.
+        running_mbs = getattr(self, "running_mbs", None) or ()
+        running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
+        resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
+        released = 0
         for req in reqs:
+            if req.rid in resident:
+                continue
             _release_dynamic_chunk_probe(self, req)
             try:
                 req.reset_for_retract()
             except Exception as exc:  # noqa: BLE001 - a retract may not raise
                 logger.warning("#791b void-output retract failed: %s", exc)
             self.waiting_queue.append(req)
+            released += 1
 
         logger.warning(
             "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
             "this microbatch downstream, so the last rank produced nothing for "
-            "it, and rank 0's %d request(s) have been released and re-queued. "
-            "The message itself is what keeps the output ring matched -- "
-            "without it rank 0 blocks for ever in a receive no rank is "
-            "required to satisfy (boot instr11, 2026-08-21).",
+            "it, and %d of rank 0's %d request(s) have been released and "
+            "re-queued (the rest are resident in the running batch and keep "
+            "their pages -- #797). The message itself is what keeps the output "
+            "ring matched -- without it rank 0 blocks for ever in a receive no "
+            "rank is required to satisfy (boot instr11, 2026-08-21).",
             mb_id,
+            released,
             len(reqs),
         )
         return True
@@ -4669,7 +5106,26 @@ class SchedulerPPMixin:
             # holds with all three of `next_pp_outputs`, `batch_result` and
             # `d2h_event` left as None.
             if self._pp_absorb_void_output(next_mb_id, raw_output, mbs, mb_metadata):
+                # #797: PASS THE VOID ON when a rank between this one and the
+                # retraction still holds a launched batch for this slot. It
+                # rides the ordinary one-iteration output lag -- this is the
+                # same `pp_outputs` a real output would have been forwarded
+                # by, and `_do_send`'s `if pp_outputs:` is the same gate.
+                # `pp_void_forward_payload` returns None on every ordinary
+                # pass and at the last rank that needs it, so nothing is put
+                # on the wire that no peer must take.
+                forward = getattr(self, "_pp_void_forward_payload", None)
+                if forward is not None:
+                    next_pp_outputs = PPProxyTensors(forward)
+                    self._pp_void_forward_payload = None
                 return
+            # #797: a SUCCESSFUL pass carries its chain-reconciled decision
+            # home too, not only a voided one, and it is popped here for the
+            # same reason `__stamp__` is popped in `_pp_recv_proxy_tensors` --
+            # what is left becomes a PPProxyTensors and is forwarded on.
+            # Learning only from voids leaves `record_return_trip` with no way
+            # to CLEAR a floor, which is #796's named residual cost.
+            pp_absorb_admission_return(self, raw_output)
             next_pp_outputs = PPProxyTensors(raw_output)
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
