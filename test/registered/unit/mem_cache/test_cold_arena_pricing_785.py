@@ -102,3 +102,51 @@ def test_the_charge_is_the_subtraction_and_not_the_pp_layout():
     """
     priced = _Runner((RANK2_PP, RANK2_TP)).price(_cold())
     assert priced.arena_fixed_bytes < RANK2_PP // 4
+
+
+# ---------------------------------------------------------------------------
+# The flip-draft residency charge, and the ranks that must NOT pay it.
+# ---------------------------------------------------------------------------
+
+
+class _DraftRunner:
+    """Only the attributes the guard reads before it would derive anything."""
+
+    def __init__(self, **kw):
+        self.is_draft_worker = kw.get("is_draft_worker", False)
+        self.is_phase_flip_tp_stack = kw.get("is_phase_flip_tp_stack", False)
+        self.server_args = kw.get("server_args", _Args())
+
+    def _seam_world_rank(self):
+        return 0
+
+    charge = ModelRunnerKVCacheMixin._flip_draft_residency_bytes
+
+
+class _Args:
+    def __init__(self, algorithm="NEXTN"):
+        self.speculative_algorithm = algorithm
+
+
+def test_the_draft_worker_does_not_charge_itself():
+    """It IS the draft; charging here would book the model twice."""
+    assert _DraftRunner(is_draft_worker=True).charge() == 0
+
+
+def test_the_flip_tp_stack_does_not_charge_the_draft_again():
+    """The TP stack reaches this path too, and the primary already paid."""
+    assert _DraftRunner(is_phase_flip_tp_stack=True).charge() == 0
+
+
+def test_no_speculation_means_no_flip_draft_and_no_charge():
+    """There is no second model to fund, so funding one would shrink the pool
+    for nothing -- the mirror of the defect this term fixes."""
+    assert _DraftRunner(server_args=_Args(algorithm=None)).charge() == 0
+
+
+def test_the_charge_is_cached_rather_than_rederived_per_call():
+    """The solve consults the budget more than once; a meta build per call
+    would put a model construction inside a sizing loop."""
+    runner = _DraftRunner(is_draft_worker=True)
+    runner.charge()
+    assert runner._flip_draft_bytes_cached == 0
