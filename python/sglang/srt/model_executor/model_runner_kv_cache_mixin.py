@@ -3238,7 +3238,9 @@ class ModelRunnerKVCacheMixin:
             _ratio_r,
             _S,
             get_parallel().attn_dcp_rank,
-            sum(1 for i in all_attn_layer_ids if self.start_layer <= i < self.end_layer),
+            sum(
+                1 for i in all_attn_layer_ids if self.start_layer <= i < self.end_layer
+            ),
             default_size,
         )
         return list(layer_ids), size
@@ -6085,6 +6087,81 @@ class ModelRunnerKVCacheMixin:
         )
         return dataclasses.replace(reserve, per_row_bytes=float(slope))
 
+    def _instrument_arena_tail_derivation(self: ModelRunner) -> None:
+        """#785 BOOT INSTRUMENT: derive this rank's arena tail from THIS boot.
+
+        The tail is ``max(0, layout_pp - layout_tp)`` and it is a post in the
+        solve running a few frames above this call -- but ``layout_tp`` belongs
+        to a TP stack the scheduler does not build until after the pool is
+        sized, so the term has been read from a record a PREVIOUS boot wrote,
+        and read as 0 when there is none. ``arena_tail_probe`` answers it from
+        a meta-device TP model instead, at a cost of about 0.1 s and no
+        allocated weights.
+
+        INSTRUMENT ONLY, DELIBERATELY. Nothing here feeds the solve yet: the
+        number is derived, announced, and parked on the runner so that
+        ``phase_flip_boot`` can grade it against the totals it measures later
+        in this same boot. Wiring it into the budget before that grade exists
+        would be sizing a pool against an unchecked derivation, which is the
+        failure mode the census estimate already demonstrated (628 MiB out on
+        the binding rank, about 63k tokens of pool).
+
+        A derivation that fails must not cost a boot that would otherwise
+        have started, so every failure degrades to a warning and leaves the
+        existing record-based path exactly as it was.
+        """
+        if getattr(self, "_arena_tail_derivation", None) is not None:
+            return
+        # The draft worker and the flip's own TP stack both reach the sizing
+        # path. Neither owns the PP arena, and the TP stack running this would
+        # derive a TP layout from inside a TP layout.
+        if getattr(self, "is_draft_worker", False) or getattr(
+            self, "is_phase_flip_tp_stack", False
+        ):
+            return
+
+        import time as _time
+
+        from sglang.srt.managers import arena_tail_probe as probe
+        from sglang.srt.managers.phase_flip_boot import (
+            checkpoint_param_dict,
+            parse_flip_vector,
+        )
+        from sglang.srt.model_executor.weights_arena import plan_arena_layout
+
+        rank = int(self._seam_world_rank())
+        started = _time.perf_counter()
+        try:
+            vector = parse_flip_vector(self.server_args)
+            # layout_pp is MEASURED, not derived: the PP model is loaded by
+            # now, so a second derivation of it would only add a way to be
+            # wrong about something this boot already knows.
+            layout_pp_bytes = int(
+                plan_arena_layout(checkpoint_param_dict(self.model)).total_bytes
+            )
+            layout_tp_bytes = probe.derive_layout_tp_bytes(
+                self.model_config,
+                self.load_config,
+                self.server_args,
+                vector,
+                rank,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s (rank %d): derivation UNAVAILABLE (%s: %s). The pool is "
+                "sized exactly as it was before this instrument existed, from "
+                "the seam record. No verdict will be taken on this boot.",
+                probe.LOG_PREFIX,
+                rank,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        self._arena_tail_derivation = (layout_pp_bytes, layout_tp_bytes)
+        probe.log_derivation(
+            rank, layout_pp_bytes, layout_tp_bytes, _time.perf_counter() - started
+        )
+
     def _seam_staging_ask_bytes(self: ModelRunner):
         """#771: this rank's MANDATORY staging ask, or 0 with its reason.
 
@@ -6148,6 +6225,10 @@ class ModelRunnerKVCacheMixin:
         # the operator already stated, and is knowable on every rig at boot.
         # So the two are charged separately from here on.
         flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
+        # #785: derive the arena tail here, where the record that stands in for
+        # it is about to be spent. Announced only -- see the method docstring.
+        if flips_on:
+            self._instrument_arena_tail_derivation()
         # The floor is resolved from the SAME two inputs the guard resolves it
         # from -- the operator's override and this rank's measured seam draw --
         # so the pool reserves for the number the gate will actually enforce.

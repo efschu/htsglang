@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.managers.arena_tail_probe import (
     arena_tail_bytes,
+    grade_derivation,
     plan_meta_layout,
     storage_alias_relation,
 )
@@ -117,3 +118,49 @@ def test_a_smaller_pp_layout_has_no_tail_rather_than_a_negative_one():
     the pool memory the arena still owns.
     """
     assert arena_tail_bytes(8008, 8573) == 0
+
+
+# ---------------------------------------------------------------------------
+# The gate that authorizes wiring the derivation into the pool solve.
+# ---------------------------------------------------------------------------
+
+MIB = 1048576
+
+#: boot_735_default791b.log:975 -- rank 0's own two totals.
+RANK0_PP = int(16007.47 * MIB)
+RANK0_TP = int(15925.80 * MIB)
+
+
+def test_an_exact_derivation_passes():
+    assert grade_derivation(0, RANK0_PP, RANK0_TP, RANK0_PP, RANK0_TP) is True
+
+
+def test_the_bar_is_one_mib_and_it_is_a_bar_not_a_gesture():
+    """CAN-FAIL PROOF. The census route missed by 628 MiB and looked fine."""
+    census_error = int(628 * MIB)
+    assert (
+        grade_derivation(2, RANK0_PP, RANK0_TP - census_error, RANK0_PP, RANK0_TP)
+        is False
+    )
+
+
+def test_a_miss_on_either_layout_fails_not_only_on_the_tail():
+    """Two errors that cancel in the difference must still fail.
+
+    The tail is a subtraction, so a derivation wrong by the same amount on
+    both totals produces the RIGHT tail from the WRONG layouts. That is a
+    derivation that does not understand the model, and it would stop being
+    right the moment the cut or the vector moved.
+    """
+    off = int(200 * MIB)
+    assert (
+        grade_derivation(1, RANK0_PP + off, RANK0_TP + off, RANK0_PP, RANK0_TP) is False
+    )
+
+
+def test_the_bar_admits_rounding_but_not_a_megabyte_of_drift():
+    half = int(0.5 * MIB)
+    assert grade_derivation(0, RANK0_PP + half, RANK0_TP, RANK0_PP, RANK0_TP) is True
+    assert (
+        grade_derivation(0, RANK0_PP + 2 * MIB, RANK0_TP, RANK0_PP, RANK0_TP) is False
+    )

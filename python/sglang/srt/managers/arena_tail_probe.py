@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "ARENA-TAIL-PROBE"
 
+#: The bar the derivation is graded at, in MiB, against a ~16 GiB layout.
+#: A layout total is subtracted from a memory budget, so the tolerance is set
+#: by what a difference COSTS, not by what is easy to hit: 1 MiB of rank 2's
+#: bracket is ~100 tokens of pool at this rig's cell size.
+VERDICT_BAR_MIB = 1.0
+
 
 class ArenaTailProbeError(RuntimeError):
     """The tail could not be derived. Never downgraded to a guess."""
@@ -244,3 +250,54 @@ def log_derivation(
         arena_tail_bytes(layout_pp_bytes, layout_tp_bytes) / mib,
         elapsed_s,
     )
+
+
+def grade_derivation(
+    rank: int,
+    derived_pp_bytes: int,
+    derived_tp_bytes: int,
+    measured_pp_bytes: int,
+    measured_tp_bytes: int,
+) -> bool:
+    """THE DECIDING GATE: the derivation against the SAME boot's own totals.
+
+    A desk run has to pin one GPU capability, and the compressed-tensors
+    linear scheme is chosen from ``torch.cuda.get_device_capability()`` at
+    construction time -- so on a mixed rig a desk agreement is evidence and
+    not proof. This grades the derivation where the question actually lives:
+    inside the boot, on the numbers that boot measured minutes later, on the
+    card the rank is really running.
+
+    Returns the verdict rather than raising it. An instrument that can abort a
+    boot stops being an instrument -- and this one is not yet load-bearing:
+    nothing consumes the derived number until the sizing path is wired to it,
+    which is the change this gate exists to authorize.
+    """
+    mib = 1048576.0
+    d_pp = derived_pp_bytes / mib
+    d_tp = derived_tp_bytes / mib
+    m_pp = measured_pp_bytes / mib
+    m_tp = measured_tp_bytes / mib
+    err_pp = abs(d_pp - m_pp)
+    err_tp = abs(d_tp - m_tp)
+    passed = err_pp <= VERDICT_BAR_MIB and err_tp <= VERDICT_BAR_MIB
+    (logger.info if passed else logger.error)(
+        "%s (rank %d): VERDICT %s at a %.1f MiB bar. layout_pp derived %.2f "
+        "vs measured %.2f MiB (error %.2f); layout_tp derived %.2f vs measured "
+        "%.2f MiB (error %.2f). Arena tail derived %.2f vs measured %.2f MiB. "
+        "Both measurements are from THIS boot, so this is an identity check "
+        "rather than a comparison against a remembered rig.",
+        LOG_PREFIX,
+        rank,
+        "PASS" if passed else "FAIL",
+        VERDICT_BAR_MIB,
+        d_pp,
+        m_pp,
+        err_pp,
+        d_tp,
+        m_tp,
+        err_tp,
+        arena_tail_bytes(derived_pp_bytes, derived_tp_bytes) / mib,
+        arena_tail_bytes(measured_pp_bytes, measured_tp_bytes) / mib,
+    )
+    return passed

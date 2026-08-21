@@ -270,6 +270,36 @@ def checkpoint_param_dict(model) -> Dict[str, torch.nn.Parameter]:
     }
 
 
+def _grade_arena_tail_derivation(primary_runner, world_rank, layout_pp, layout_tp):
+    """#785: grade the sizing-time derivation against what this boot measured.
+
+    The derivation is parked on the runner by
+    ``ModelRunner._instrument_arena_tail_derivation`` while the pool is being
+    sized. Absent means it was not attempted (flips off) or it declined and
+    said why -- in both cases the boot sized from the seam record exactly as
+    before, and there is nothing to grade.
+
+    ``world_rank`` here and ``_seam_world_rank`` there are the same number by
+    construction: the flip's primary topology is (tp=1, pp=N), so the flat
+    world rank IS pp_rank. Grading rank 0's derivation against rank 2's
+    measurement would be the one way to make this check meaningless, so the
+    two are stated rather than assumed.
+    """
+    derivation = getattr(primary_runner, "_arena_tail_derivation", None)
+    if derivation is None:
+        return None
+    from sglang.srt.managers.arena_tail_probe import grade_derivation
+
+    derived_pp, derived_tp = derivation
+    return grade_derivation(
+        int(world_rank),
+        derived_pp,
+        derived_tp,
+        int(layout_pp.total_bytes),
+        int(layout_tp.total_bytes),
+    )
+
+
 def snapshot_and_free(
     named: Dict[str, torch.nn.Parameter], layout: ArenaLayout, pin: bool
 ) -> torch.Tensor:
@@ -458,9 +488,7 @@ class PhaseFlipStacks:
         layouts on either leg, not the layout being written -- which is what
         makes this a property of the arena rather than of the direction.
         """
-        return max(
-            int(self.layout_pp.total_bytes), int(self.layout_tp.total_bytes)
-        )
+        return max(int(self.layout_pp.total_bytes), int(self.layout_tp.total_bytes))
 
     def _timed_arena_refill(self, direction: str, layout, image, restore) -> None:
         """#758 emitter (3 of 3): PER-RANK FLIP REFILL TIME.
@@ -738,6 +766,14 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # exists precisely for this and says so in its docstring.
             tp_named = checkpoint_param_dict(tp_worker.model_runner.model)
             layout_tp = plan_arena_layout(tp_named)
+            # #785 GATE: this is the first moment in the boot where the
+            # MEASURED layout_tp exists, and the pool was sized minutes ago
+            # against a derivation of it. Grade the two here, against each
+            # other, on one boot's own numbers -- a derivation checked against
+            # a remembered rig proves nothing about the rig it ran on.
+            _grade_arena_tail_derivation(
+                primary_runner, world_rank, layout_pp, layout_tp
+            )
             image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -762,15 +798,11 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                 )
                 arena = arena_carrier.tensor
             else:
-                arena = allocate_arena(
-                    arena_total, tp_worker.model_runner.device
-                )
+                arena = allocate_arena(arena_total, tp_worker.model_runner.device)
             # Pure rebind, then one contiguous refill from the host image;
             # arena_refill verifies the checksum on the arena's device
             # after the copy.
-            bind_arena_views(
-                layout_tp, arena, rebind=list(tp_named.items())
-            )
+            bind_arena_views(layout_tp, arena, rebind=list(tp_named.items()))
             arena_refill(arena, layout_tp, image_tp)
 
             # 4b. The TP-phase draft worker (#631 speculation slice).
