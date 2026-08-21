@@ -325,6 +325,79 @@ def arming_floor_mib(
     return corridor_band_floor_mib() + max(0, int(seam_entry_reserve_mib))
 
 
+#: The one machine-readable line a boot emits so its acceptance verdict can
+#: credit what the flip has committed. THE FORMAT LIVES HERE AND NOWHERE ELSE:
+#: ``corridor_verdict_774.sh`` imports :func:`parse_corridor_posts` rather than
+#: re-deriving the field names in awk, which is how the verdict and the runtime
+#: came to disagree about the band ceiling by 1 MiB in the first place.
+CORRIDOR_POST_PREFIX = "CORRIDOR-POST"
+
+
+def format_corridor_post(
+    rank: int, gpu_id: int, arming_mib: int, uuid: Optional[str] = None
+) -> str:
+    """One rank's committed arming reserve, as the verdict reads it.
+
+    ``gpu_id`` is the PHYSICAL device index, not the process-local one: with
+    per-rank ``CUDA_VISIBLE_DEVICES`` isolation every rank sees itself as
+    ``cuda:0``, while the verdict enumerates NVML in physical order. The UUID
+    rides along because NVML's enumeration order can shift between boots and
+    driver states, so a reader that doubts the index has the identity.
+    """
+    line = (
+        f"{CORRIDOR_POST_PREFIX} rank={int(rank)} gpu={int(gpu_id)} "
+        f"arming_floor_mib={int(arming_mib)} "
+        f"band_floor_mib={corridor_band_floor_mib()} "
+        f"committed_mib={committed_arming_mib(arming_mib)}"
+    )
+    if uuid:
+        line += f" uuid={uuid}"
+    return line
+
+
+def parse_corridor_posts(text: str) -> dict:
+    """``{physical_gpu_id: committed MiB}`` from a boot log.
+
+    TWO RULES, BOTH OF THEM LOAD-BEARING.
+
+    *Co-resident ranks ADD.* Two ranks sharing a physical GPU each hold their
+    own arming floor, so the card's committed column is the sum.
+
+    *A rank is counted ONCE, at its latest reading.* A phase-flip boot
+    resolves its arming floor in the PP phase and again when the TP stack is
+    built, so the same rank emits more than once in a single log. Summing the
+    LINES would charge the card twice and hand the verdict a pass it did not
+    earn, which is the one failure mode a credit must not have. So the last
+    line per rank wins -- including its card, so a rank that moved is not
+    counted on both.
+
+    A malformed line is skipped rather than raising: this runs inside an
+    acceptance verdict, where dying on a truncated log would turn a gradeable
+    boot into no verdict at all.
+    """
+    latest = {}
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if CORRIDOR_POST_PREFIX not in line:
+            continue
+        fields = {}
+        for token in line[line.index(CORRIDOR_POST_PREFIX) :].split():
+            if "=" in token:
+                key, _, value = token.partition("=")
+                fields[key] = value
+        try:
+            rank = int(fields["rank"])
+            gpu = int(fields["gpu"])
+            committed = int(fields["committed_mib"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        latest[rank] = (gpu, max(0, committed))
+    posts: dict = {}
+    for gpu, committed in latest.values():
+        posts[gpu] = posts.get(gpu, 0) + committed
+    return posts
+
+
 def check_threshold_pair(
     arming_mib: int,
     law_mib: int = CORRIDOR_LAW_MIB,

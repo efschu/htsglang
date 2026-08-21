@@ -6223,6 +6223,38 @@ class ModelRunnerKVCacheMixin:
                 max(already_reserved, seam._corridor_law_bytes()) >> 20,
                 floor_charge >> 20,
             )
+        # #784: REGISTER THE COMMITTED PART AS A POST THE VERDICT CAN READ.
+        #
+        # The prose line above is what an operator reads; this one is what the
+        # acceptance verdict parses. It exists because the verdict has
+        # documented net = free_min - sum(registered posts) since 2026-07-22
+        # and had no post to read: corridor_verdict_774.sh hard-coded them to
+        # zero, so every boot was graded on RAW free. Grading raw free is
+        # unsatisfiable for an armed flip -- the smallest arming floor any rig
+        # can ask for is 819 + 512 + 192 = 1523 MiB against a band ceiling of
+        # 1229 -- so the boot was measured against a threshold its own arming
+        # rule forbids it to reach.
+        #
+        # The PHYSICAL device index, not this process's: under per-rank
+        # CUDA_VISIBLE_DEVICES isolation every rank is cuda:0 to itself, while
+        # the verdict enumerates NVML in physical order.
+        if flips_on and arming_floor:
+            from sglang.srt.managers import corridor_guard as _cg
+            from sglang.srt.utils.common import get_physical_device_id
+
+            try:
+                physical_gpu = get_physical_device_id(self.gpu_id)
+            except (IndexError, TypeError, ValueError):
+                # An unreadable mapping must not kill a boot over a log line.
+                physical_gpu = int(getattr(self, "gpu_id", 0) or 0)
+            logger.info(
+                "%s",
+                _cg.format_corridor_post(
+                    rank=self._seam_world_rank(),
+                    gpu_id=physical_gpu,
+                    arming_mib=arming_floor >> 20,
+                ),
+            )
         # #685: HOW MANY ATTENTION LAYERS DOES THIS RANK ACTUALLY RECEIVE at
         # the flip? A rank that receives none pays no per-token seam -- its
         # measured per_row_bytes is BASELINE (checksums, the one-layer

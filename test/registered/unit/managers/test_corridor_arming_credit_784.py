@@ -164,6 +164,80 @@ class TheThresholdPairGateNowHasACeilingSide(unittest.TestCase):
             cg.check_threshold_pair(cg.corridor_band_floor_mib() - 1)
 
 
+class TheRegisteredPostSurvivesTheRoundTrip(unittest.TestCase):
+    """The credit is worthless unless the acceptance verdict can read it.
+
+    ``corridor_verdict_774.sh`` documents ``net = free_min - sum(registered
+    posts)`` and hard-codes the posts to zero, so it has always graded raw
+    free. These pin the ONE line the boot emits and the ONE parser that reads
+    it back, so the verdict never reimplements the format in awk.
+    """
+
+    def test_a_post_round_trips_to_the_committed_credit(self):
+        arming = 1523
+        line = cg.format_corridor_post(rank=0, gpu_id=2, arming_mib=arming)
+        self.assertEqual(
+            cg.parse_corridor_posts(line), {2: cg.committed_arming_mib(arming)}
+        )
+
+    def test_the_line_carries_its_own_prefix(self):
+        line = cg.format_corridor_post(rank=1, gpu_id=0, arming_mib=1523)
+        self.assertTrue(line.startswith(cg.CORRIDOR_POST_PREFIX))
+
+    def test_unrelated_log_text_contributes_nothing(self):
+        self.assertEqual(cg.parse_corridor_posts("no posts here\nnor here\n"), {})
+
+    def test_co_resident_ranks_on_one_card_ADD(self):
+        # Two ranks sharing a physical GPU each hold their own arming floor,
+        # so the card's committed column is the sum. Not this rig's layout,
+        # but the rule has to be general.
+        text = "\n".join(
+            (
+                cg.format_corridor_post(rank=0, gpu_id=1, arming_mib=1523),
+                cg.format_corridor_post(rank=1, gpu_id=1, arming_mib=1523),
+            )
+        )
+        self.assertEqual(
+            cg.parse_corridor_posts(text), {1: 2 * cg.committed_arming_mib(1523)}
+        )
+
+    def test_a_rank_that_re_emits_is_counted_ONCE_at_its_latest_value(self):
+        # THE DOUBLE-COUNT TRAP. A phase-flip boot resolves its arming floor
+        # in the PP phase and again when the TP stack is built, so the same
+        # rank emits twice in one log. Summing the lines would charge the card
+        # twice and hand the verdict a pass it did not earn.
+        text = "\n".join(
+            (
+                cg.format_corridor_post(rank=0, gpu_id=2, arming_mib=1523),
+                cg.format_corridor_post(rank=0, gpu_id=2, arming_mib=3226),
+            )
+        )
+        self.assertEqual(
+            cg.parse_corridor_posts(text), {2: cg.committed_arming_mib(3226)}
+        )
+
+    def test_a_rank_that_moved_card_is_not_counted_on_both(self):
+        text = "\n".join(
+            (
+                cg.format_corridor_post(rank=0, gpu_id=0, arming_mib=1523),
+                cg.format_corridor_post(rank=0, gpu_id=1, arming_mib=1523),
+            )
+        )
+        self.assertEqual(
+            cg.parse_corridor_posts(text), {1: cg.committed_arming_mib(1523)}
+        )
+
+    def test_a_floor_at_the_band_floor_registers_no_post(self):
+        line = cg.format_corridor_post(
+            rank=0, gpu_id=0, arming_mib=cg.corridor_band_floor_mib()
+        )
+        self.assertEqual(cg.parse_corridor_posts(line), {0: 0})
+
+    def test_a_malformed_line_is_ignored_rather_than_killing_the_verdict(self):
+        text = cg.CORRIDOR_POST_PREFIX + " rank=x gpu=y arming_floor_mib=z\n"
+        self.assertEqual(cg.parse_corridor_posts(text), {})
+
+
 class TheCodeAndItsAcceptanceGateAgreeOnTheCeiling(unittest.TestCase):
     def test_the_ceiling_is_the_rounded_value_the_verdict_script_uses(self):
         # corridor_verdict_774.sh computes int(round(law + law * fraction)) =
