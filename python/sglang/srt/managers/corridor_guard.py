@@ -398,6 +398,92 @@ def parse_corridor_posts(text: str) -> dict:
     return posts
 
 
+#: The layout that BINDS the KV pool, and therefore the only one whose free
+#: column grades a boot's sizing. Under Route A the PP prefill layout is where
+#: the id space is min-reduced across ranks and where the binding rank's
+#: bracket runs down to its arming floor; the TP decode layout inherits that id
+#: space through the canonical KV page and sizes nothing of its own.
+SIZING_PHASE = "pp"
+
+#: Below this a card is one allocation from death, in any phase.
+NEAR_OOM_MIB = 400
+
+
+def phase_corridor_verdict(net_by_phase: dict, sizing_phase: str = SIZING_PHASE):
+    """``(verdict, findings)`` from per-phase, per-card NET free minima.
+
+    THE DEFECT (#784). The acceptance verdict had no phase detection: it
+    sampled one window and called that the verdict. On 2026-08-20 the window
+    fell entirely inside the TP phase, where the arena tail has been released
+    and the free column reads gibibytes higher than the phase that actually
+    sizes the pool. Rank 2 was graded at 5475 MiB while at rest in PP it sat at
+    3232 MiB against a 3226 MiB arming floor -- six MiB of slack. The boot was
+    graded on a layout that sizes nothing, 2243 MiB away from the number that
+    binds.
+
+    So the sizing phase decides, and a window that never observed it is not a
+    pass but an absent measurement. Other phases are still reported: a card
+    resting high in TP is the layout doing what it should, not a sizing defect,
+    and demoting that to a finding is what stops the instrument from failing a
+    boot for releasing its own arena tail.
+
+    The band is asymmetric by the operator's ruling. Over-band in the sizing
+    phase is a failed acceptance -- VRAM that buys no tokens. Under-band is a
+    finding and a planner task, never a stopper. A near-OOM reading fails in
+    ANY phase, because that one is about survival rather than efficiency.
+    """
+    findings: List[str] = []
+    floor, ceiling = corridor_band_floor_mib(), corridor_band_ceiling_mib()
+    fail = False
+    warn = False
+
+    for phase in sorted(net_by_phase):
+        for gpu in sorted(net_by_phase[phase]):
+            net = int(net_by_phase[phase][gpu])
+            if net < NEAR_OOM_MIB:
+                fail = True
+                findings.append(
+                    f"GPU{gpu} phase={phase}: net {net} MiB is below the "
+                    f"{NEAR_OOM_MIB} MiB near-OOM floor -- one allocation from "
+                    f"death, and that is a stopper in any phase"
+                )
+            elif net > ceiling:
+                if phase == sizing_phase:
+                    fail = True
+                    findings.append(
+                        f"GPU{gpu} phase={phase}: net {net} MiB > {ceiling} MiB "
+                        f"-- {net - ceiling} MiB of KV pool given away in the "
+                        f"phase that sizes it"
+                    )
+                else:
+                    findings.append(
+                        f"note: GPU{gpu} phase={phase}: net {net} MiB > "
+                        f"{ceiling} MiB, reported only -- this layout inherits "
+                        f"its id space and sizes nothing, and it has released "
+                        f"its arena tail, so a high reading here is the layout "
+                        f"working, not a sizing defect"
+                    )
+            elif net < floor and phase == sizing_phase:
+                warn = True
+                findings.append(
+                    f"GPU{gpu} phase={phase}: net {net} MiB < {floor} MiB -- "
+                    f"file as a planner task, NOT a stopper"
+                )
+
+    if sizing_phase not in net_by_phase:
+        findings.append(
+            f"the sizing phase {sizing_phase!r} was never sampled (saw: "
+            f"{sorted(net_by_phase) or 'nothing'}). The pool is bound in "
+            f"{sizing_phase!r}, so this window grades a layout that sizes "
+            f"nothing. An absent measurement is not a pass."
+        )
+        return "NO-VERDICT", findings
+
+    if fail:
+        return "FAIL", findings
+    return ("WARN" if warn else "PASS"), findings
+
+
 def check_threshold_pair(
     arming_mib: int,
     law_mib: int = CORRIDOR_LAW_MIB,

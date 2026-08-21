@@ -238,6 +238,79 @@ class TheRegisteredPostSurvivesTheRoundTrip(unittest.TestCase):
         self.assertEqual(cg.parse_corridor_posts(text), {})
 
 
+class TheVerdictIsCutPerPhase(unittest.TestCase):
+    """#784: the pool is solved in one phase and was graded in another.
+
+    A phase-flip boot binds its KV pool in the PP prefill layout -- that is
+    where the id space is min-reduced across ranks and where the binding rank's
+    bracket runs down to its arming floor. The TP decode layout sizes nothing:
+    it inherits the id space through the canonical KV page, and it has released
+    its arena tail, so its free column reads gibibytes higher.
+
+    The acceptance verdict had no phase detection at all. It sampled one window
+    and called it the verdict. On 2026-08-20 that window fell entirely inside
+    the TP phase -- rank 2 read 5475 MiB there while at rest in PP it sat at
+    3232 MiB against a 3226 MiB floor, six MiB of slack. The boot was graded on
+    a phase that sizes nothing, and the number it was graded on was 2243 MiB
+    away from the number that binds.
+
+    So a window that never observed the sizing phase is NOT a pass. It is an
+    absent measurement, and saying so is the point.
+    """
+
+    def _nets(self, **by_phase):
+        return by_phase
+
+    def test_the_sizing_phase_is_the_prefill_layout(self):
+        self.assertEqual(cg.SIZING_PHASE, "pp")
+
+    def test_a_window_that_never_sampled_the_sizing_phase_is_not_a_pass(self):
+        verdict, findings = cg.phase_corridor_verdict({"tp": {0: 900, 1: 900, 2: 900}})
+        self.assertNotEqual(verdict, "PASS")
+        self.assertTrue(any("pp" in f for f in findings))
+
+    def test_in_band_in_the_sizing_phase_is_a_pass(self):
+        verdict, _ = cg.phase_corridor_verdict({"pp": {0: 900, 1: 1000, 2: 825}})
+        self.assertEqual(verdict, "PASS")
+
+    def test_over_band_in_the_sizing_phase_fails(self):
+        verdict, findings = cg.phase_corridor_verdict(
+            {"pp": {0: 6323, 1: 5062, 2: 825}}
+        )
+        self.assertEqual(verdict, "FAIL")
+        # The binder is correctly filled; the other two are the stranding.
+        self.assertTrue(any("GPU0" in f for f in findings))
+        self.assertTrue(any("GPU1" in f for f in findings))
+        self.assertFalse(any("GPU2" in f for f in findings))
+
+    def test_over_band_in_the_decode_phase_alone_does_not_fail_the_boot(self):
+        # The TP window reads high because the arena tail is released there.
+        # That is the layout doing what it should, not a sizing defect, so it
+        # is reported and does not decide the verdict.
+        verdict, findings = cg.phase_corridor_verdict(
+            {"pp": {0: 900, 1: 900, 2: 825}, "tp": {0: 4525, 1: 5908, 2: 3068}}
+        )
+        self.assertEqual(verdict, "PASS")
+        self.assertTrue(any("tp" in f for f in findings))
+
+    def test_a_near_oom_reading_fails_in_any_phase(self):
+        verdict, _ = cg.phase_corridor_verdict(
+            {"pp": {0: 900, 1: 900, 2: 825}, "tp": {0: 120, 1: 900, 2: 900}}
+        )
+        self.assertEqual(verdict, "FAIL")
+
+    def test_under_band_in_the_sizing_phase_warns_and_does_not_stop(self):
+        # The corridor law is asymmetric by the user's own ruling: over-band
+        # is a failed acceptance, under-band is a finding and a planner task.
+        verdict, findings = cg.phase_corridor_verdict({"pp": {0: 400, 1: 900, 2: 900}})
+        self.assertEqual(verdict, "WARN")
+        self.assertTrue(any("GPU0" in f for f in findings))
+
+    def test_no_samples_at_all_is_not_a_pass(self):
+        verdict, _ = cg.phase_corridor_verdict({})
+        self.assertNotEqual(verdict, "PASS")
+
+
 class TheCodeAndItsAcceptanceGateAgreeOnTheCeiling(unittest.TestCase):
     def test_the_ceiling_is_the_rounded_value_the_verdict_script_uses(self):
         # corridor_verdict_774.sh computes int(round(law + law * fraction)) =
