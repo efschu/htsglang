@@ -63,11 +63,6 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
-from sglang.srt.model_executor.weights_arena import (
-    checksum_is_representable,
-    uint8_checksum,
-)
-from sglang.srt.utils.common import ceil_align
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -75,6 +70,11 @@ from sglang.srt.managers.kv_reshard import (
     _encode,
     _gather_block_rows,
 )
+from sglang.srt.model_executor.weights_arena import (
+    checksum_is_representable,
+    uint8_checksum,
+)
+from sglang.srt.utils.common import ceil_align
 
 logger = logging.getLogger(__name__)
 
@@ -1076,28 +1076,40 @@ def flip_host_headroom_verdict(
         return True, False, "host RAM unreadable -- guard stood down (no honest number)"
     avail = int(available_bytes)
     if avail >= need:
-        return True, False, (
-            f"host headroom OK: {avail / 1e9:.2f} GB available >= "
-            f"{need / 1e9:.2f} GB needed "
-            f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
-            f"{int(floor_bytes) / 1e9:.2f})"
+        return (
+            True,
+            False,
+            (
+                f"host headroom OK: {avail / 1e9:.2f} GB available >= "
+                f"{need / 1e9:.2f} GB needed "
+                f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
+                f"{int(floor_bytes) / 1e9:.2f})"
+            ),
         )
     if int(defers_so_far) >= int(max_defers):
-        return True, True, (
-            f"{DEFERRED_HOST_RAM} ESCALATED after {defers_so_far} defers: "
-            f"{avail / 1e9:.2f} GB available < {need / 1e9:.2f} GB needed "
-            f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
-            f"{int(floor_bytes) / 1e9:.2f}). PROCEEDING WITH EYES OPEN -- a "
-            f"permanent hold would stop the instance alternating prefill and "
-            f"decode, which is a certain half-service outage, while the kill "
-            f"this defends against is recoverable by a restore."
+        return (
+            True,
+            True,
+            (
+                f"{DEFERRED_HOST_RAM} ESCALATED after {defers_so_far} defers: "
+                f"{avail / 1e9:.2f} GB available < {need / 1e9:.2f} GB needed "
+                f"(transient {int(projected_transient_bytes) / 1e9:.2f} + floor "
+                f"{int(floor_bytes) / 1e9:.2f}). PROCEEDING WITH EYES OPEN -- a "
+                f"permanent hold would stop the instance alternating prefill and "
+                f"decode, which is a certain half-service outage, while the kill "
+                f"this defends against is recoverable by a restore."
+            ),
         )
-    return False, False, (
-        f"{DEFERRED_HOST_RAM}: {avail / 1e9:.2f} GB available < "
-        f"{need / 1e9:.2f} GB needed (transient "
-        f"{int(projected_transient_bytes) / 1e9:.2f} + floor "
-        f"{int(floor_bytes) / 1e9:.2f}); defer {int(defers_so_far) + 1} of "
-        f"{max_defers}, the flip is retried next round"
+    return (
+        False,
+        False,
+        (
+            f"{DEFERRED_HOST_RAM}: {avail / 1e9:.2f} GB available < "
+            f"{need / 1e9:.2f} GB needed (transient "
+            f"{int(projected_transient_bytes) / 1e9:.2f} + floor "
+            f"{int(floor_bytes) / 1e9:.2f}); defer {int(defers_so_far) + 1} of "
+            f"{max_defers}, the flip is retried next round"
+        ),
     )
 
 
@@ -1987,8 +1999,8 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         get_world_group,
     )
     from sglang.srt.managers.kv_pressure_runtime import default_collective_min
-    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
     from sglang.srt.managers.kv_reshard import _dist_exchange
+    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
 
     stacks = scheduler.phase_flip_stacks
     if stacks is None:
@@ -6799,9 +6811,7 @@ class PhaseFlipRuntime:
             too_small.append(slot_detail)
         if corridor_detail:
             too_small.append(corridor_detail)
-        affordable, staging_detail = self._staging_affordable(
-            staging_bytes, direction
-        )
+        affordable, staging_detail = self._staging_affordable(staging_bytes, direction)
         if not affordable:
             too_small.append(staging_detail)
 

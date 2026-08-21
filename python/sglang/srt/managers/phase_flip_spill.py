@@ -1997,8 +1997,7 @@ def get_corridor_guard(scheduler: Any):
             # it. The env is still honoured as a deprecated bridge, but telling
             # an operator to go looking for an env var they should not be using
             # is how the 1536-vs-1024 split stayed alive.
-            " (set by --phase-flip-corridor-floor-mib"
-            f"/{CORRIDOR_FLOOR_ENV})"
+            " (set by --phase-flip-corridor-floor-mib" f"/{CORRIDOR_FLOOR_ENV})"
             if configured and int(configured) >= derived_mib
             else (
                 f" (derived from this rank's MEASURED seam draw of "
