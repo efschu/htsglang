@@ -392,13 +392,24 @@ class PrefillAdmissionGate:
         therefore used and the config formula supplies only the SHAPE (the
         curvature a narrower width has, including the ``ceil(T/64)`` state
         term the probe cannot interpolate across buckets). Where it has not,
-        the scale is 1.0 and the bound prices the cut unmodified -- earlier
-        cuts, never later ones, which is the safe direction for a mechanism
-        whose failure mode is a dead worker.
+        the scale is 1.0 and the config figure prices the cut unmodified.
 
-        Clamped to 1.0: a measurement ABOVE the bound means the bound is not
-        one, and trusting it to raise the price would let a probe artefact
-        widen the chunk past what the config says is possible.
+        THE SCALE IS NOT CLAMPED TO 1.0, AND THE FIRST VERSION OF THIS
+        FUNCTION CLAMPED IT -- corrected by the rig's own first measurement.
+        The clamp assumed the config figure is an upper bound on what the
+        forward takes. It is not: it prices the intermediates of ONE GDN
+        layer, while the OOM is decided by the peak of the WHOLE forward,
+        which is what the probe reports. The first row the probe wrote on this
+        rig (forward_peak_794.tp0.json, 2026-08-21) measured 38436864 bytes of
+        transient over 122 extend tokens -- ~315 KiB/token, about twice the
+        config figure's per-token share at that width. Clamping would have
+        priced the chunk BELOW what it costs, which is the one direction this
+        mechanism must never err in: an underpriced chunk is a chunk that is
+        not cut, and a chunk that is not cut is the 2026-08-21 crash.
+
+        So a measurement raises the price as readily as it lowers it. What it
+        may never do is price NOTHING -- see ``transient_price``, where an
+        unmeasured bucket falls back to the config shape rather than to zero.
         """
         measured = _measured_bytes_per_token(self._scheduler, tokens)
         if measured is None:
@@ -409,7 +420,7 @@ class PrefillAdmissionGate:
         scale = (float(measured) * float(tokens)) / config
         if not (scale > 0):
             return 1.0
-        return min(1.0, scale)
+        return scale
 
     def transient_price(self, requested_tokens: int):
         """A price callable for widths <= ``requested_tokens``, or None.

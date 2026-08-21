@@ -380,18 +380,51 @@ def test_a_config_without_gdn_layers_is_never_narrowed():
     assert gate.cuts == 0
 
 
-def test_a_measured_probe_only_ever_lowers_the_price():
-    """Calibration may correct the bound downward, never upward.
+def test_a_measured_probe_moves_the_price_in_both_directions():
+    """Calibration corrects the config figure up as readily as down.
 
-    A measurement above the config bound means the bound is not one; letting
-    it widen the chunk would be a probe artefact deciding the width.
+    The config figure prices ONE GDN layer; the OOM is decided by the peak of
+    the WHOLE forward, which is what the probe measures. The rig's first probe
+    row read ~315 KiB/token against a config share about half that, so a
+    calibration clamped at 1.0 would price the chunk BELOW its cost -- and an
+    underpriced chunk is a chunk that is not cut, which is the crash.
     """
     gate = build_actuator(free_mib=1000.0)
     gate._measured_calibration = lambda tokens: 1.0  # noqa: SLF001
     uncalibrated = gate.granted_width(4096)
+
     cheap = build_actuator(free_mib=1000.0)
     cheap._measured_calibration = lambda tokens: 0.25  # noqa: SLF001
     assert cheap.granted_width(4096) >= uncalibrated
+
+    dear = build_actuator(free_mib=1000.0)
+    dear._measured_calibration = lambda tokens: 4.0  # noqa: SLF001
+    assert dear.granted_width(4096) < uncalibrated, (
+        "a forward measured as more expensive than the config share must "
+        "narrow the chunk further, not be clamped away"
+    )
+
+
+def test_the_calibration_is_the_measured_share_over_the_config_share():
+    """The scale is a ratio, not a capped correction -- pinned on the rig's
+    own first probe row: 38436864 bytes over 122 extend tokens."""
+    gate = build_actuator(free_mib=1000.0)
+    measured_bytes_per_token = 38436864 / 122
+    gate._scheduler.metrics_reporter = None  # noqa: SLF001
+    import sglang.srt.managers.corridor_admission as ca
+
+    original = ca._measured_bytes_per_token
+    ca._measured_bytes_per_token = lambda _s, _t: measured_bytes_per_token
+    try:
+        scale = gate._measured_calibration(122)  # noqa: SLF001
+    finally:
+        ca._measured_bytes_per_token = original
+    config = gate._config_transient_bytes(122)  # noqa: SLF001
+    assert abs(scale - (measured_bytes_per_token * 122) / config) < 1e-9
+    assert scale > 1.0, (
+        "on this rig the measured whole-forward transient exceeds the "
+        "single-layer config share; the code must be able to say so"
+    )
 
 
 # --------------------------------------------------------------------------
