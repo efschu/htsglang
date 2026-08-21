@@ -6162,6 +6162,66 @@ class ModelRunnerKVCacheMixin:
             rank, layout_pp_bytes, layout_tp_bytes, _time.perf_counter() - started
         )
 
+    def _maybe_price_cold_arena_tail(self: ModelRunner, reserve):
+        """On a COLD record only, charge the arena tail this boot DERIVED.
+
+        THE CLIFF THIS CLOSES. A cold ``SeamReserve`` has ``arena_fixed_bytes``
+        at 0, not because the tail is zero but because the only way to learn it
+        used to be a previous boot. On this rig rank 2's tail is 2215 MiB, so a
+        cold boot prices that rank's arming floor at 1523 instead of 3226,
+        sizes the pool against the missing 1703 MiB, and dies when the NEXTN
+        draft weights land -- 755649 tokens solved, then OOM. The workaround
+        was to boot twice and let the second boot inherit the first one's
+        measurement, which also means any configuration change silently sizes
+        against the previous configuration.
+
+        A MEASUREMENT STILL OUTRANKS A DERIVATION. Any non-cold record is
+        returned untouched, and a cold record that already carries an arena
+        term is left alone. This adds a number where there was none; it never
+        replaces one.
+
+        THE DERIVATION IS THE SAME ONE THE BOOT GRADES. It is produced by
+        ``_instrument_arena_tail_derivation`` and checked against this boot's
+        own measured layout totals when the TP stack is built, at a 1 MiB bar.
+        Measured on this rig at commit fa7d387a4e: error 0.00 MiB on both
+        layouts on all three ranks.
+        """
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+        from sglang.srt.managers.arena_tail_probe import LOG_PREFIX, arena_tail_bytes
+
+        if reserve.provenance != seam.PROVENANCE_COLD:
+            return reserve
+        if int(getattr(reserve, "arena_fixed_bytes", 0) or 0) > 0:
+            return reserve
+        derivation = getattr(self, "_arena_tail_derivation", None)
+        if derivation is None:
+            return reserve
+        tail = arena_tail_bytes(*derivation)
+        if tail <= 0:
+            # A rank whose PP layout is the smaller one genuinely has no tail.
+            # Saying so is worth a line: zero-because-derived and
+            # zero-because-unknown were indistinguishable before this.
+            logger.info(
+                "%s (rank %d): COLD record and this rank's DERIVED arena tail "
+                "is exactly 0 -- its PP layout does not exceed its TP layout. "
+                "That is a structural property of the cut and the vector, not "
+                "a missing measurement.",
+                LOG_PREFIX,
+                int(self._seam_world_rank()),
+            )
+            return reserve
+        logger.info(
+            "%s (rank %d): COLD record -- arena tail DERIVED, not measured: "
+            "%.1f MiB charged into the pool solve and into the arming floor. "
+            "Without this the cold pool is sized as though the tail were zero "
+            "and the boot dies when the draft weights land (#678). A measured "
+            "record from any later boot supersedes this.",
+            LOG_PREFIX,
+            int(self._seam_world_rank()),
+            tail / 1048576.0,
+        )
+        return dataclasses.replace(reserve, arena_fixed_bytes=int(tail))
+
     def _seam_staging_ask_bytes(self: ModelRunner):
         """#771: this rank's MANDATORY staging ask, or 0 with its reason.
 
@@ -6208,8 +6268,16 @@ class ModelRunnerKVCacheMixin:
     ) -> int:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
-        reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
+        # #785: DERIVE BEFORE PRICING. The cold record's missing arena term is
+        # exactly what the derivation supplies, so it has to exist before the
+        # reserve is priced rather than after.
+        if flips_on:
+            self._instrument_arena_tail_derivation()
+        reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
+        reserve = self._maybe_price_cold_arena_tail(reserve)
 
         # #662-F4 / A0: THE ARMING FLOOR IS CHARGED EVEN ON A COLD RECORD.
         #
@@ -6224,11 +6292,6 @@ class ModelRunnerKVCacheMixin:
         # arming LEVEL is unknown: that one is derived from the corridor law
         # the operator already stated, and is knowable on every rig at boot.
         # So the two are charged separately from here on.
-        flips_on = bool(getattr(self.server_args, "enable_phase_flip", False))
-        # #785: derive the arena tail here, where the record that stands in for
-        # it is about to be spent. Announced only -- see the method docstring.
-        if flips_on:
-            self._instrument_arena_tail_derivation()
         # The floor is resolved from the SAME two inputs the guard resolves it
         # from -- the operator's override and this rank's measured seam draw --
         # so the pool reserves for the number the gate will actually enforce.
@@ -6238,8 +6301,17 @@ class ModelRunnerKVCacheMixin:
         arming_floor = (
             seam.arming_floor_target_bytes(
                 configured_mib=seam.configured_arming_floor_mib(self.server_args),
+                # #785: ``active`` requires an id-space ANCHOR, which a cold
+                # record has no way to have -- so a cold rank read a draw of 0
+                # and armed at the bare corridor law, 1523 MiB, while its real
+                # floor was 3226. The anchor is genuinely absent; the arena
+                # tail is not, once it is derived. So the draw is read whenever
+                # there IS one, and ``arming_draw_bytes`` already returns
+                # exactly the arena term when no per-leg measurement exists.
                 measured_draw_mib=(
-                    int(reserve.arming_draw_bytes()) >> 20 if reserve.active else 0
+                    int(reserve.arming_draw_bytes()) >> 20
+                    if (reserve.active or int(reserve.arena_fixed_bytes) > 0)
+                    else 0
                 ),
             )
             if flips_on
@@ -6505,17 +6577,28 @@ class ModelRunnerKVCacheMixin:
                     cell,
                 )
                 return net
+            # #785: THE ARENA TERM IS NO LONGER ZERO HERE. This argument was a
+            # literal 0 because a cold record could not know the tail; it can
+            # now, and the tail is the term that decides whether this rank's
+            # pool leaves room for the flip to re-commit the arena.
+            cold_arena = max(0, int(reserve.arena_fixed_bytes))
             allowed_cold = seam.solve_pool_tokens(
-                net, int(cell), 0, cold_slope, 0, received_layers=received_layers
+                net,
+                int(cell),
+                0,
+                cold_slope,
+                cold_arena,
+                received_layers=received_layers,
             )
             priced = max(0, min(net, allowed_cold * int(cell)))
             logger.info(
                 "%s (rank %s): COLD seam priced from the layout -- receives %d "
                 "layer(s), %.1f B/token/attn-layer, slope %.1f B/token; R' = "
                 "%d MiB net of the %d MiB floor charge -> %d tokens, budget "
-                "%d -> %d MiB. No measured record, so the fixed and arena "
-                "terms are NOT charged; this undercharges versus warm, which "
-                "is the safe direction on a first boot.",
+                "%d -> %d MiB. The arena term IS charged, at %d MiB, derived "
+                "from this boot's own layouts (#785); the measured FIXED term "
+                "is still absent, so this remains a slight undercharge versus "
+                "warm, which is the safe direction on a first boot.",
                 seam.LOG_PREFIX,
                 self._seam_world_rank(),
                 int(received_layers or 0),
@@ -6526,6 +6609,7 @@ class ModelRunnerKVCacheMixin:
                 allowed_cold,
                 net >> 20,
                 priced >> 20,
+                cold_arena >> 20,
             )
             return priced
 
