@@ -30,8 +30,22 @@ def _recipes():
         if not os.path.isdir(directory):
             continue
         for pattern in RECIPE_GLOBS:
-            found.extend(sorted(glob.glob(os.path.join(directory, pattern))))
+            for path in sorted(glob.glob(os.path.join(directory, pattern))):
+                if _is_recipe(path):
+                    found.append(path)
     return found
+
+
+def _is_recipe(path):
+    """An argv recipe CONTAINS flag lines. Notes files sitting under the same
+    glob are prose about a boot, not a boot -- and one of them
+    (argv_hc_interval8192.HOSTRAM-NOTES.txt) was touched after the order and
+    would otherwise fail this guard for quoting the flag it documents."""
+    try:
+        with open(path) as handle:
+            return any(line.startswith("--") for line in handle)
+    except OSError:
+        return False
 
 
 #: The order's effective moment, as a unix timestamp (2026-08-21 16:00 UTC).

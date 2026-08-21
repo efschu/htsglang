@@ -294,7 +294,11 @@ STACK_RESIDUAL_MIB = (2294, 1188, 625)
 
 
 def post_sizing_stack_bytes(
-    rank: int, layout_pp_bytes: int, layout_tp_bytes: int, draft_bytes: int
+    rank: int,
+    layout_pp_bytes: int,
+    layout_tp_bytes: int,
+    draft_bytes: int,
+    cold_stack_deferred: bool = False,
 ) -> int:
     """ONE post for everything ``build_phase_flip_tp_stack`` creates.
 
@@ -316,9 +320,41 @@ def post_sizing_stack_bytes(
     come from the same meta probe. Only the remainder is a measured constant,
     and it is measured on a boot that lived through the build rather than
     inferred from one that died in it.
+
+    ``cold_stack_deferred`` DROPS THE RESIDUAL, and it is not free money. The
+    residual is the flip draft's attention-backend workspaces and its decode
+    CUDA graphs -- the two posts that are PHASE-COLD, since the PP phase that
+    sizes this pool never executes a draft forward. Deferring them until the
+    first pp->tp cutover is the literal reading of spill-before-alloc: the
+    memory is not allocated during the phase that cannot use it.
+
+    THE PRICE IS REAL AND IT MOVES, IT DOES NOT VANISH. The bytes must exist
+    again at the cutover, and by then the pool has grown into them. That is
+    payable only because the KV pool is a relief provider at the seam
+    (``kv_backing_relief`` / ``recover_kv_backing``, #656 spec item 12): the
+    rung returns backing on the pp->tp leg, which is the same leg that has to
+    fund the restore. So the credit here is valid ONLY when the restore is
+    charged to the flip budget, never as a standalone discount.
+
+    AND IT OVERTURNS A RECORDED DECISION, DELIBERATELY. ``phase_flip_spill``
+    refused rung 4 with the reasoning that it "buys a phase-local spill of
+    something the next TP phase must re-capture, which is a different and much
+    worse trade than rung 2". That reasoning was about a RUNTIME, per-flip
+    spill, where every flip pays a recapture. This is a BOOT-time deferral
+    paid once, and the arithmetic that changed the trade is measured: rank 0
+    binds the pool at 525462 tokens and needs 2242 MiB more to fund the 669k
+    reference, against a residual on that same rank of 2294 MiB. The refusal
+    is left standing in ``phase_flip_spill`` until the park/restore path is
+    wired and exercised in a real flip cycle; this function only makes the
+    sizer able to express the credit.
     """
     arena_over_weights = max(0, int(layout_tp_bytes) - int(layout_pp_bytes))
-    residual = STACK_RESIDUAL_MIB[rank] if 0 <= rank < len(STACK_RESIDUAL_MIB) else 0
+    if cold_stack_deferred:
+        residual = 0
+    else:
+        residual = (
+            STACK_RESIDUAL_MIB[rank] if 0 <= rank < len(STACK_RESIDUAL_MIB) else 0
+        )
     return arena_over_weights + int(draft_bytes) + int(residual) * 1048576
 
 
