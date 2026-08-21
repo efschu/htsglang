@@ -101,7 +101,10 @@ from sglang.srt.managers.admission_limiter import (
     set_admission_limiter,
     throttle_before_retract,
 )
-from sglang.srt.managers.corridor_admission import guard_prefill_admission
+from sglang.srt.managers.corridor_admission import (
+    get_prefill_admission_gate,
+    guard_prefill_admission,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -200,6 +203,7 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
+
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
 # `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
 # which is what lets a test neuter exactly that one function in a child
@@ -3186,9 +3190,7 @@ class Scheduler(
                 uniform_avail_for_evict,
             )
 
-            want = int(
-                getattr(self.server_args, "chunked_prefill_size", 0) or 0
-            ) or 512
+            want = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
 
             # ZERO IS AMBIGUOUS, AND THE FIRST VERSION OF THIS LOG READ IT
             # WRONG. `evict_from_tree_cache` returns 0 in TWO different states:
@@ -3499,7 +3501,9 @@ class Scheduler(
             return False
         chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
         need = min(chunk, int(pending_tokens))
-        mamba = getattr(getattr(self, "req_to_token_pool", None), "mamba_allocator", None)
+        mamba = getattr(
+            getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+        )
         try:
             slots = int(mamba.available_size()) if mamba is not None else 1
         except Exception:  # noqa: BLE001 - a probe must not break the round
@@ -4868,9 +4872,8 @@ class Scheduler(
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
             t[_ballot_at:].tolist(), _ballot_rids
         )
-        if (
-            self._uniform_prefetch_ballot is None
-            and not getattr(self, "_prefetch_ballot_mismatch_logged", False)
+        if self._uniform_prefetch_ballot is None and not getattr(
+            self, "_prefetch_ballot_mismatch_logged", False
         ):
             # A divergent queue HEAD is a deeper breakage than a divergent
             # prefetch verdict; say so once and fall back to the local
@@ -6372,6 +6375,84 @@ class Scheduler(
             int(history_len),
         )
 
+    def _corridor_granted_prefill_width(self, chunked_prefill_size: int) -> int:
+        """#794: narrow this pass's chunk to what this card's corridor funds.
+
+        WHO IS ENTITLED TO NARROW, and why the answer is not "every rank".
+
+        The width must end up rank-uniform or the group splits, and this fork
+        already has exactly one place per topology where a uniform width is
+        decided. This function does not add a second one, and above all it
+        does not add a collective to the admission path -- the #791 corpus
+        exists because collectives here deadlocked this instance twice
+        (instr22 5m19s, instr23 5m12s, identical signature).
+
+        * pp_size > 1: PP0 DECIDES AND THE RING CARRIES IT. The decision is
+          built on rank 0 only (`build_pp_admission_decision`, called at
+          `_get_new_batch_prefill_raw` under `pp_rank == 0`) and every other
+          rank must reproduce the forwarded `(rid, prefix_len, extend_len)`
+          set exactly or raise `PPScheduleRefused` and void the pass. So a cut
+          taken on PP0 is uniform by construction and costs nothing, while a
+          cut taken DOWNSTREAM would produce a narrower local batch than the
+          one it was handed -- a refusal, then a void, then the same request
+          again: a livelock, not a safety measure. Downstream ranks therefore
+          never narrow, and that is not a gap in their protection: the guard's
+          relief ladder still runs on every rank, and the binding card on this
+          rig is PP0 (the 5090, both OOM specimens).
+
+        * pp_size == 1 and tp_cpu_group world > 1: NAMED GAP, deliberately.
+          Under pure TP every rank builds its own batch, so a uniform width
+          needs the MIN reduce -- and the right close is to widen
+          `_update_uniform_pool_budget`'s existing packed reduce by one term,
+          where the reduce already lives, rather than to open a second one
+          here ("two reduces would be two chances for the counts to diverge").
+          Until then the width is not narrowed on that topology and this says
+          so once, at WARNING, rather than being silently inert.
+
+        * otherwise (world size 1): the local decision IS the group decision.
+        """
+        requested = int(chunked_prefill_size or 0)
+        if requested <= 0:
+            return chunked_prefill_size
+        pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
+        if pp_size > 1:
+            if int(getattr(self.ps, "pp_rank", 0) or 0) != 0:
+                return chunked_prefill_size
+        else:
+            grp = getattr(self, "tp_cpu_group", None)
+            try:
+                world = 0 if grp is None else int(torch.distributed.get_world_size(grp))
+            except Exception:  # noqa: BLE001
+                world = 0
+            if world > 1:
+                if not getattr(self, "_corridor_width_gap_logged", False):
+                    self._corridor_width_gap_logged = True
+                    logger.warning(
+                        "#794 CORRIDOR WIDTH ACTUATOR OFF on this topology: "
+                        "tp_cpu_group world=%d with pp_size=1, so every rank "
+                        "builds its own prefill batch and a rank-local cut "
+                        "would split the group. The width stays at the "
+                        "configured %d tokens; the close is one more term in "
+                        "_update_uniform_pool_budget's packed MIN reduce.",
+                        world,
+                        requested,
+                    )
+                return chunked_prefill_size
+        gate = get_prefill_admission_gate(self)
+        if gate is None:
+            return chunked_prefill_size
+        try:
+            granted = int(gate.granted_width(requested))
+        except Exception as e:  # noqa: BLE001
+            # An actuator that cannot compute a width must leave the width
+            # alone. It is a safety net; a net that tears must not take down
+            # the thing it was protecting.
+            logger.error("#794 corridor width actuator failed: %s", e)
+            return chunked_prefill_size
+        if granted <= 0 or granted > requested:
+            return chunked_prefill_size
+        return granted
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -6941,6 +7022,27 @@ class Scheduler(
         # admission decision. See managers/corridor_admission.py.
         guard_prefill_admission(self, chunked_prefill_size)
 
+        # #794 THE VERDICT NOW ACTUATES -- AS A WIDTH, NEVER AS A REFUSAL.
+        #
+        # The comment above is still true and is the reason this is a separate
+        # line: a rank-local REFUSAL splits the group's admission decision and
+        # hangs it. A rank-local NARROWING does not, provided it is taken where
+        # the pass geometry is decided, and it is the only remedy that matches
+        # the physics -- the GDN prefill transient is first-order in the chunk
+        # width, so a chunk the card cannot fund always has a prefix it can.
+        #
+        # TWICE MEASURED, TWICE FATAL, before this line existed. 2026-08-21
+        # 17:33 the gate reported "corridor shortfall of 981 MiB for rank 0 /
+        # the corridor cannot be restored ahead of this chunk" and the chunk
+        # ran, dying in in_proj_qkvz (256 MiB asked, 131.69 MiB free). 18:01,
+        # after the width was halved to 4096 by hand, the same rank died one
+        # allocation further down the same layer -- causal_conv1d, 80 MiB
+        # asked, 5.69 MiB free. A static width cannot answer a free column
+        # that moves; only a width derived FROM it can.
+        chunked_prefill_size = self._corridor_granted_prefill_width(
+            chunked_prefill_size
+        )
+
         # RANK-UNIFORM prefill admission budget (uneven DCP): the deficit was
         # min-reduced once this iteration in update_dcp_admission_state (single
         # collective, pre-branch). Read the stored value -- NO collective here,
@@ -7146,8 +7248,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     _note_skip("batch_full_break", req.rid)
                     break
@@ -7157,9 +7260,7 @@ class Scheduler(
                 # predicates above; do NOT call into the tree cache here. The
                 # call carries collectives and this point is only reachable on
                 # the ranks whose own pool let them get this far.
-                _local_prefetch_done = self._prefetch_done_for(
-                    req, prefetch_verdicts
-                )
+                _local_prefetch_done = self._prefetch_done_for(req, prefetch_verdicts)
                 # #791b: THE GROUP VERDICT, not the local one. instr22/23:
                 # the storage backend finishes each rank's load at that
                 # rank's own speed, so the local verdict split the TP
@@ -7174,10 +7275,7 @@ class Scheduler(
                 )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    if (
-                        _prefetch_ballot is not None
-                        and req.rid not in _prefetch_ballot
-                    ):
+                    if _prefetch_ballot is not None and req.rid not in _prefetch_ballot:
                         _note_skip("prefetch_ballot_uncovered", req.rid)
                     elif _local_prefetch_done:
                         _note_skip("prefetch_pending_group", req.rid)
@@ -7361,10 +7459,14 @@ class Scheduler(
             # firing, which (queue > 0) should be impossible and is itself
             # a finding.
             if _skips:
-                self._admission_decline_note = "loop_skips(" + ",".join(
-                    f"{k}={v}(first={_skip_first_rid[k][:16]})"
-                    for k, v in sorted(_skips.items())
-                ) + ")"
+                self._admission_decline_note = (
+                    "loop_skips("
+                    + ",".join(
+                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        for k, v in sorted(_skips.items())
+                    )
+                    + ")"
+                )
             else:
                 self._admission_decline_note = "loop=clean"
             return None, running_batch
@@ -9833,9 +9935,7 @@ class Scheduler(
             # relief earlier in this series. A stand-in without the probe has
             # measured nothing, and 'not measured' is a state the policy
             # already reports honestly.
-            kv_available_tokens=getattr(
-                self, "_uniform_kv_available", lambda: None
-            )(),
+            kv_available_tokens=getattr(self, "_uniform_kv_available", lambda: None)(),
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),
@@ -9924,9 +10024,7 @@ class Scheduler(
             # STAND-INS carrying only the fields the policy reads. A stand-in
             # without the relief hook must decline exactly as before, not raise
             # AttributeError inside the arming path.
-            getattr(self, "_apply_both_blocked_relief", lambda *_: None)(
-                decision, inp
-            )
+            getattr(self, "_apply_both_blocked_relief", lambda *_: None)(decision, inp)
             return None
         # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
         # its seam has moved the zero-GPU window one stage right instead of
@@ -10413,9 +10511,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
-        "phase flip x PD disaggregation is refused at argument time"
-    )
+    assert (
+        scheduler.disaggregation_mode == DisaggregationMode.NULL
+    ), "phase flip x PD disaggregation is refused at argument time"
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
@@ -10861,9 +10959,7 @@ def run_scheduler_process(
                 release_lockstep_sentinel,
             )
 
-            release_kv_session_offload_io(
-                scheduler, graceful=scheduler.gracefully_exit
-            )
+            release_kv_session_offload_io(scheduler, graceful=scheduler.gracefully_exit)
             release_dual_group_lanes(scheduler, graceful=scheduler.gracefully_exit)
             release_barlink_watchdog(scheduler, graceful=scheduler.gracefully_exit)
             release_lockstep_sentinel(scheduler, graceful=scheduler.gracefully_exit)

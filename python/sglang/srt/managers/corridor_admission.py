@@ -90,6 +90,12 @@ import logging
 import time
 from typing import Any, Optional
 
+from sglang.srt.managers.corridor_width import (
+    MIN_CHUNK_TOKENS,
+    fundable_chunk_tokens,
+    width_was_cut,
+)
+
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "[#656 CORRIDOR-ADMISSION]"
@@ -254,6 +260,14 @@ class PrefillAdmissionGate:
         self.short = 0
         self.cooldown_skips = 0
         self.reclaimed_bytes = 0
+        # #794: the ACTUATOR's own evidence. `short` counts a corridor the
+        # ladder could not restore; `cuts` counts the times something was done
+        # about it. The 2026-08-21 crash is precisely the state where the first
+        # counter moves and the second cannot.
+        self.cuts = 0
+        self.tokens_withheld = 0
+        self._last_cut_logged = None
+        self._unpriced_logged = False
 
     # -- the gate ---------------------------------------------------------
 
@@ -270,7 +284,9 @@ class PrefillAdmissionGate:
         """
         tokens = max(0, int(tokens or 0))
         cap = WANT_CAP_MIB * (1024 * 1024)
-        measured = _measured_bytes_per_token(self._scheduler, tokens) if tokens else None
+        measured = (
+            _measured_bytes_per_token(self._scheduler, tokens) if tokens else None
+        )
         if measured is not None:
             raw = int(tokens * measured)
             # NET OF THE ALLOCATOR CACHE, and only on this branch.
@@ -314,6 +330,190 @@ class PrefillAdmissionGate:
                 slope,
             )
         return min(tokens * slope, cap)
+
+    # -- #794: the actuator ------------------------------------------------
+
+    def _config_transient_bytes(self, tokens: int) -> Optional[float]:
+        """The GDN prefill transient for ``tokens``, from the model config.
+
+        THE ONLY PRICE THAT EXISTS ON A DEFAULT BOOT. The measured probe needs
+        ``SGLANG_FORWARD_PEAK_PATH`` and the geometry proxy needs
+        ``--enable-mfu-metrics``; the rig's own boot log answers "pricing
+        source NONE -- want is 0" on all three ranks, which is why the gate
+        that measured the 2026-08-21 OOM to the MiB was pricing the chunk it
+        died on at zero. ``ServerArgs.gdn_prefill_scratch_mib`` is derived from
+        the allocation sites of the chunked gated-delta-rule prefill and needs
+        nothing but the checkpoint config, so it is always available.
+
+        It is an UPPER BOUND on residency (every intermediate of the layer
+        counted alive at once), which is the right direction for a width
+        decision and the wrong magnitude for the relief ladder -- hence it
+        prices the cut here and never ``want``.
+        """
+        server_args = getattr(self._scheduler, "server_args", None)
+        estimator = getattr(server_args, "gdn_prefill_scratch_mib", None)
+        if estimator is None:
+            return None
+        try:
+            mib = estimator(self._head_share(), int(tokens))
+        except Exception:  # noqa: BLE001 -- an estimator must never break admission
+            return None
+        if mib is None or mib <= 0:
+            return None
+        return float(mib) * (1024 * 1024)
+
+    def _head_share(self) -> float:
+        """This rank's share of the sharded head dimension, 1.0 when unsharded.
+
+        Under pure PP (this rig: ``--tp-size 1 --pp-size 3``) no head is split,
+        so every rank carries the full width and the share is 1. Read from the
+        parallel state rather than assumed, because the flip's TP phase does
+        shard it.
+        """
+        try:
+            tp_size = int(getattr(self._scheduler.server_args, "tp_size", 1) or 1)
+        except Exception:  # noqa: BLE001
+            return 1.0
+        return 1.0 / max(1, tp_size)
+
+    def _measured_calibration(self, tokens: int) -> float:
+        """Scale the config upper bound onto what the forward MEASURABLY took.
+
+        The two prices answer different questions. ``_config_transient_bytes``
+        counts every intermediate of a GDN layer as simultaneously resident;
+        the probe reports ``max_memory_allocated`` minus the pre-forward
+        baseline, i.e. what the allocator actually grew by. The first is an
+        upper bound on the second, and on this rig the gap is large enough to
+        matter: a 4096-token chunk prices at ~635 MiB of config transient on a
+        card whose free column sits near 350 MiB, and the instance serves that
+        chunk all day -- so the bound is not what the driver is asked for.
+
+        Where the probe has measured THIS width's bucket, its magnitude is
+        therefore used and the config formula supplies only the SHAPE (the
+        curvature a narrower width has, including the ``ceil(T/64)`` state
+        term the probe cannot interpolate across buckets). Where it has not,
+        the scale is 1.0 and the bound prices the cut unmodified -- earlier
+        cuts, never later ones, which is the safe direction for a mechanism
+        whose failure mode is a dead worker.
+
+        Clamped to 1.0: a measurement ABOVE the bound means the bound is not
+        one, and trusting it to raise the price would let a probe artefact
+        widen the chunk past what the config says is possible.
+        """
+        measured = _measured_bytes_per_token(self._scheduler, tokens)
+        if measured is None:
+            return 1.0
+        config = self._config_transient_bytes(tokens)
+        if config is None or config <= 0:
+            return 1.0
+        scale = (float(measured) * float(tokens)) / config
+        if not (scale > 0):
+            return 1.0
+        return min(1.0, scale)
+
+    def transient_price(self, requested_tokens: int):
+        """A price callable for widths <= ``requested_tokens``, or None.
+
+        None means NOT PRICED, and an unpriced chunk is never cut.
+        """
+        if self._config_transient_bytes(int(requested_tokens)) is None:
+            return None
+        scale = self._measured_calibration(int(requested_tokens))
+
+        def price(width: int) -> Optional[float]:
+            raw = self._config_transient_bytes(int(width))
+            return None if raw is None else raw * scale
+
+        return price
+
+    def spendable_bytes(self, guard) -> Optional[float]:
+        """What the forward may grow by without crossing into an OOM.
+
+        THE LINE IS THE OOM LINE, NOT THE CORRIDOR LAW, and that distinction is
+        a user decision this actuator may not quietly reverse. The 1024 MiB
+        corridor law is a FILL-QUALITY target: "it may not block, delay or
+        refuse anything on its own" (corridor_guard.py:949-953, 2026-08-16,
+        after a law-gated seam refused 76 times in a row while 727004 tokens
+        waited on an idle GPU). Sizing the cut against the law would make the
+        law block prefill, which is exactly what that decision forbids -- and
+        on this rig, where the free column sits far below 1024 MiB at
+        admission time as a matter of course, it would narrow every chunk to
+        the floor and stall the instance.
+
+        What stays hard is the thing that was ever unsurvivable: an allocation
+        larger than what can be served. So the budget is the driver's free
+        column plus the allocator's own cache (bytes already reserved from the
+        driver, which a forward can take without the free column moving),
+        minus the guard's existing ``delta`` watermark as the margin for what
+        this estimate does not model -- fragmentation, and the concurrent
+        allocations of the rest of the round.
+        """
+        try:
+            free = float(guard.free_bytes())
+        except Exception:  # noqa: BLE001
+            return None
+        delta = float(getattr(guard, "delta_mib", 0) or 0) * (1024 * 1024)
+        return free + float(self._allocator_cache_bytes()) - delta
+
+    def granted_width(self, requested_tokens: int) -> int:
+        """The width this rank's corridor can fund, <= ``requested_tokens``.
+
+        Called AFTER ``before_admission``, deliberately: the relief ladder runs
+        first, so the actuator narrows only what relief could not fund, and the
+        free column it reads is the post-relief one.
+        """
+        requested = int(requested_tokens or 0)
+        if requested <= 0:
+            return requested
+        guard = self._guard()
+        if guard is None:
+            return requested
+        budget = self.spendable_bytes(guard)
+        if budget is None:
+            return requested
+        price = self.transient_price(requested)
+        if price is None:
+            if not self._unpriced_logged:
+                self._unpriced_logged = True
+                logger.warning(
+                    "%s the prefill width is NOT PRICED on this rank (no GDN "
+                    "layers in the config, or the config is unreadable), so "
+                    "the corridor cannot narrow a chunk it cannot cost. The "
+                    "gate keeps measuring and the ladder keeps spending; the "
+                    "width is whatever was configured.",
+                    LOG_PREFIX,
+                )
+            return requested
+        granted = fundable_chunk_tokens(
+            requested_tokens=requested,
+            budget_bytes=budget,
+            price_bytes=price,
+            # FLA_CHUNK_SIZE. The GDN prefill walks the chunk in 64-token
+            # blocks, so a width off that grid buys a partial block at the
+            # price of a whole one.
+            granularity_tokens=64,
+            min_tokens=MIN_CHUNK_TOKENS,
+        )
+        if not width_was_cut(requested, granted):
+            return requested
+        self.cuts += 1
+        self.tokens_withheld += requested - granted
+        if granted != self._last_cut_logged:
+            self._last_cut_logged = granted
+            logger.warning(
+                "%s NARROWED this prefill chunk from %d to %d tokens: the "
+                "card can fund %.0f MiB of forward transient after relief and "
+                "the full width prices at %.0f MiB. The tokens are not "
+                "refused -- they are admitted over more passes. This is the "
+                "actuator the 2026-08-21 OOM proved missing, when the same "
+                "shortfall was measured, logged and then run into.",
+                LOG_PREFIX,
+                requested,
+                granted,
+                budget / (1024 * 1024),
+                (price(requested) or 0) / (1024 * 1024),
+            )
+        return granted
 
     def _price_source(self) -> str:
         """Which estimator is pricing this gate, for the announcement.

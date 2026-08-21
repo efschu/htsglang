@@ -12208,9 +12208,21 @@ class ServerArgs:
             # No GDN/linear-attention layers, or an unexpected config shape.
             return None
 
-    def gdn_prefill_scratch_mib(self, head_share: float) -> Optional[float]:
+    def gdn_prefill_scratch_mib(
+        self, head_share: float, tokens: Optional[int] = None
+    ) -> Optional[float]:
         """Peak transient VRAM (MiB) of ONE GDN/linear-attention prefill chunk
         on ONE rank, or None when the checkpoint has no GDN layers.
+
+        ``tokens`` overrides the chunk width the estimate is taken at. It
+        defaults to the CONFIGURED width (``--chunked-prefill-size``), which is
+        what every diagnostic and ledger consumer wants: the cost of the chunk
+        this boot is set up to take. #794's admission actuator asks a different
+        question -- "what would a NARROWER chunk cost?" -- and it must be
+        answered by this same formula rather than by a per-token slope derived
+        from it, because the ``NT = ceil(T / FLA_CHUNK_SIZE)`` state term does
+        not scale with ``T`` at all. A slope taken at 8192 tokens misprices a
+        512-token chunk by exactly that term.
 
         Derived from the allocation sites, not measured. The chunked
         gated-delta-rule prefill keeps every intermediate of a layer alive
@@ -12266,9 +12278,14 @@ class ServerArgs:
         hv = max(1, units * num_v_heads // num_k_heads)
         q_dim = k_dim = hk * head_k_dim
         v_dim = hv * head_v_dim
-        tokens = int(self.chunked_prefill_size or 0)
+        if tokens is None:
+            tokens = int(self.chunked_prefill_size or 0)
+            if tokens <= 0:
+                tokens = max(int(self.max_prefill_tokens or 0), 2048)
+        else:
+            tokens = int(tokens)
         if tokens <= 0:
-            tokens = max(int(self.max_prefill_tokens or 0), 2048)
+            return None
         num_chunks = math.ceil(tokens / FLA_CHUNK_SIZE)
         peak_bytes = (
             # in_proj_qkvz's packed output plus in_proj_ba's two columns per
