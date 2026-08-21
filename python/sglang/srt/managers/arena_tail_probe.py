@@ -111,8 +111,24 @@ def arena_tail_bytes(layout_pp_bytes: int, layout_tp_bytes: int) -> int:
     return max(0, int(layout_pp_bytes) - int(layout_tp_bytes))
 
 
+def flip_draft_model_config(tp_args):
+    """The ModelConfig the flip's draft worker is built from.
+
+    Mirrors ``TpModelWorker._init_model_config`` for the draft case: the draft
+    path, or the target path when the speculative method keeps its extra
+    layers in the target checkpoint (NEXTN/MTP does).
+    """
+    from sglang.srt.configs.model_config import ModelConfig
+
+    path = getattr(tp_args, "speculative_draft_model_path", None) or tp_args.model_path
+    return ModelConfig.from_server_args(tp_args, model_path=path, is_draft_model=True)
+
+
 def build_meta_tp_model(model_config, load_config, server_args, vector, world_rank):
     """A TP-shaped model on the meta device, for layout only.
+
+    ``model_config=None`` means the flip's DRAFT model, whose config can only
+    be built once the TP server args are published (see inside).
 
     Built under the SAME two scopes the real TP stack is built under, because
     a layout derived under a different geometry is a different layout:
@@ -174,6 +190,11 @@ def build_meta_tp_model(model_config, load_config, server_args, vector, world_ra
                         f"an EVEN split of the wrong geometry, and it would "
                         f"look entirely plausible"
                     )
+                if model_config is None:
+                    # The DRAFT config has to be built with tp_args PUBLISHED,
+                    # because that is the geometry the real draft worker is
+                    # constructed under (build_flip_draft_worker).
+                    model_config = flip_draft_model_config(tp_args)
                 quant_config = _get_quantization_config(model_config, load_config)
                 with set_default_torch_dtype(model_config.dtype):
                     with torch.device("meta"):
@@ -199,6 +220,49 @@ def derive_layout_tp_bytes(
             raise ArenaTailProbeError(
                 "the meta TP model exposed no checkpoint parameters; an empty "
                 "layout would price the tail at the full PP layout"
+            )
+        return int(plan_meta_layout(named).total_bytes)
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def derive_flip_draft_bytes(load_config, server_args, vector, world_rank) -> int:
+    """This rank's FLIP DRAFT weight footprint, derived rather than met.
+
+    THE SECOND HALF OF THE SAME ORDERING DEFECT, and the one that actually
+    kills boots. ``build_flip_draft_worker`` (phase_flip_boot.py:614) loads a
+    whole second model -- the NEXTN/MTP draft -- and it runs at
+    scheduler.py:1442, long after the KV pool was sized at :1425. So the pool
+    is solved against a budget that does not know a 1.4 GiB model is still
+    coming.
+
+    That is survivable only while the pool is small enough to leave accidental
+    slack, which is exactly why it went unnoticed: on the shipped cut the
+    binding rank held 7027 MiB free and the draft fit by luck. Raise the pool
+    and the luck runs out -- measured on boot 735-full785 at commit
+    6c18085383, which solved 764512 tokens and then died in
+    ``ct_embedding.create_weights`` trying to allocate 406 MiB with 227.75 MiB
+    free on rank 0. Same shape as the #678 OOM, same cause: a post that the
+    solve cannot see because it is created later.
+
+    Derived here at 0.01 s and no allocated weights. On this rig:
+    1441.14 / 1352.35 / 1352.35 MiB.
+
+    THIS IS ALSO THE PLANNER'S MISSING INPUT. ``planner/pp_cut.py:412-432``
+    makes ``RankResources.draft_residency_mib`` MANDATORY and refuses to solve
+    a cut without it; until now nothing could supply it before a boot.
+    """
+    from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
+
+    model = build_meta_tp_model(None, load_config, server_args, vector, world_rank)
+    try:
+        named = checkpoint_param_dict(model)
+        if not named:
+            raise ArenaTailProbeError(
+                "the meta flip-draft model exposed no checkpoint parameters; "
+                "charging 0 would reproduce the OOM this term exists to stop"
             )
         return int(plan_meta_layout(named).total_bytes)
     finally:

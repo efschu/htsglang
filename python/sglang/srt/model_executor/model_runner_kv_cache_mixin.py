@@ -6162,6 +6162,66 @@ class ModelRunnerKVCacheMixin:
             rank, layout_pp_bytes, layout_tp_bytes, _time.perf_counter() - started
         )
 
+    def _flip_draft_residency_bytes(self: ModelRunner) -> int:
+        """#785: the flip draft model's weights, charged BEFORE it is built.
+
+        ``build_flip_draft_worker`` loads a whole second model at
+        scheduler.py:1442; the pool was solved at :1425. The budget therefore
+        never knew a 1.4 GiB model was still coming, and the only thing that
+        made that survivable was a pool small enough to leave accidental
+        slack. Boot 735-full785 removed the slack -- 764512 tokens solved,
+        then dead in ct_embedding.create_weights asking for 406 MiB with
+        227.75 MiB free on rank 0.
+
+        Charged once, cached, and only where a flip draft will actually be
+        built. A failure leaves the charge at zero and says so, which is the
+        behaviour every boot had before this term existed.
+        """
+        cached = getattr(self, "_flip_draft_bytes_cached", None)
+        if cached is not None:
+            return cached
+        self._flip_draft_bytes_cached = 0
+        if getattr(self, "is_draft_worker", False) or getattr(
+            self, "is_phase_flip_tp_stack", False
+        ):
+            return 0
+        algorithm = getattr(self.server_args, "speculative_algorithm", None)
+        if not algorithm:
+            return 0
+        from sglang.srt.managers import arena_tail_probe as probe
+        from sglang.srt.managers.phase_flip_boot import parse_flip_vector
+
+        rank = int(self._seam_world_rank())
+        try:
+            vector = parse_flip_vector(self.server_args)
+            charged = probe.derive_flip_draft_bytes(
+                self.load_config, self.server_args, vector, rank
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s (rank %d): flip-draft residency UNAVAILABLE (%s: %s). The "
+                "pool is sized as it was before this term existed, which is "
+                "the sizing that OOMs once the pool is large enough to remove "
+                "the accidental slack.",
+                probe.LOG_PREFIX,
+                rank,
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+        self._flip_draft_bytes_cached = int(charged)
+        logger.info(
+            "%s (rank %d): flip-draft residency %.1f MiB charged against the "
+            "KV budget. This model is built AFTER the pool is sized "
+            "(phase_flip_boot.build_flip_draft_worker), so the solve could "
+            "not previously see it; derived here from a meta-device model "
+            "with no weights allocated.",
+            probe.LOG_PREFIX,
+            rank,
+            charged / 1048576.0,
+        )
+        return self._flip_draft_bytes_cached
+
     def _maybe_price_cold_arena_tail(self: ModelRunner, reserve):
         """On a COLD record only, charge the arena tail this boot DERIVED.
 
@@ -6276,6 +6336,13 @@ class ModelRunnerKVCacheMixin:
         # reserve is priced rather than after.
         if flips_on:
             self._instrument_arena_tail_derivation()
+            # #785: and the model that is built AFTER this solve. Subtracted
+            # from the budget rather than folded into the seam reserve: it is
+            # resident weight, not a seam cost, and a term that is charged
+            # under the wrong name is a term the next reader misprices.
+            budget_bytes = max(
+                0, int(budget_bytes) - self._flip_draft_residency_bytes()
+            )
         reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
         reserve = self._maybe_price_cold_arena_tail(reserve)
 
