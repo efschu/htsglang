@@ -103,6 +103,45 @@ ADMISSION_DECISION_KIND = "admission_decision"
 # exactly this already.
 _ADMISSION_DECISION_PAYLOAD_KEY = "__admission_decision__"
 
+# #791b: the FIRST rank's own output-ring verdict for the slot this decision
+# belongs to, carried on the decision message that already travels 0 -> 1 ->
+# ... -> last in the same pass.
+#
+# WHY IT HAS TO TRAVEL. The output ring has two gates and they read two
+# DIFFERENT ranks' `mbs`: the last rank sends when ITS slot holds a runnable
+# batch (`_pp_send_output_to_next_stage`), and PP0 receives when ITS slot does
+# (`_pp_send_recv_and_preprocess_output_tensors`'s `_do_recv`). #753 made them
+# the same EXPRESSION (`_pp_output_exchange_due`) but could not make them the
+# same FACT, because each rank still asks it of its own batch. That is sound
+# only while every rank's membership for a slot is identical -- which is
+# exactly what a #791 retraction breaks: a downstream rank that cannot honour
+# a told prefix drops the rid, the amended decision carries the drop to every
+# rank AFTER it, and the last rank ends up with an empty slot while PP0, which
+# is upstream of every retracting rank and therefore never sees the amendment,
+# still holds the batch it launched. PP0 then blocks for ever in a receive no
+# rank is required to satisfy (specimen: boot instr11, 2026-08-21 05:00:33,
+# rid 2f5e25a1... told=512 local=0 retracted on rank 1; PP0 wedged two passes
+# later in `_pp_recv_dict_from_prev_stage` while PP1 and PP2 sat at the top of
+# their next pass in `pp_chain_receiver.recv`, waiting for the chain send PP0
+# could no longer reach -- a three-way ring).
+#
+# So the verdict is decided ONCE, by the rank that will apply it to the
+# receive, and carried to the rank that must honour it on the send. Same law
+# as #791 itself ("decide admission on rank 0 and carry the decision") and as
+# #753 ("send and receive must be the SAME QUESTION asked of the SAME batch"),
+# applied to the one gate pair those two left rank-local.
+#
+# Absent key means False, so a message from a stand-in or from a path that
+# never sets it produces exactly today's behaviour.
+_PP_OUTPUT_EXPECTED_KEY = "__pp_output_expected__"
+
+# #791b: marks an output message the last rank sent ONLY to keep the ring
+# matched -- the slot PP0 expects an output for produced none, because the
+# pipeline retracted it. Never carries tokens; see `_pp_absorb_void_output`
+# for what PP0 does with it and why it may not be turned into a placeholder
+# result.
+_PP_VOID_OUTPUT_KEY = "__pp_void_output__"
+
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
 # not required for this iteration's forward progress" family. PP0's ring
 # wraparound receive for the admission decision (feeding
@@ -619,6 +658,10 @@ class SchedulerPPMixin:
                 # one BUILDING the decision, inside the call below.
                 self._pp_admission_incoming_effective = None
                 self._pp_admission_amended_to_forward = None
+                # #791b: reset before the receive, so a pass that receives
+                # nothing (pp_size <= 1, or the first rank) cannot inherit the
+                # previous pass's expectation.
+                self._pp_output_expected_incoming = False
                 if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
                     with torch.profiler.record_function("pp_admission_decision_recv"):
                         incoming_decision = self._pp_recv_admission_decision()
@@ -627,6 +670,14 @@ class SchedulerPPMixin:
                         )
                         self._pp_admission_incoming_effective = effective
                         self._pp_admission_amended_to_forward = amended
+                        # #791b: record what PP0 said it will expect back for
+                        # this slot, and what this rank is forwarding, BEFORE
+                        # anything below can raise or return early. The last
+                        # rank reads both again in
+                        # `_pp_send_output_to_next_stage`.
+                        self._pp_note_output_expectation(
+                            mb_id, self._pp_output_expected_incoming, amended
+                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -691,7 +742,20 @@ class SchedulerPPMixin:
                             if raw is not None
                             else PPAdmissionDecision(mb_id=mb_id, entries=())
                         )
-                        self._pp_send_admission_decision(fresh_decision)
+                        # #791b: PP0's own output-ring verdict for this slot,
+                        # taken from the batch `get_next_batch_to_run` just
+                        # installed and published on the decision so the last
+                        # rank applies the SAME fact rather than re-deriving
+                        # it from a slot a retraction may have emptied. It is
+                        # the identical expression, on the identical object,
+                        # that PP0's own `_do_recv` will apply to this slot
+                        # `pp_size - 1` passes from now -- `self.mbs[mb_id]`
+                        # is not rewritten again until this slot comes round.
+                        expects_output = _pp_output_exchange_due(self.mbs[mb_id])
+                        self._pp_note_output_expectation(mb_id, expects_output, None)
+                        self._pp_send_admission_decision(
+                            fresh_decision, expects_output=expects_output
+                        )
                         self._pp_admission_pending_sends.append(mb_id)
                         # Capped, not unbounded -- see
                         # _PP_ADMISSION_PENDING_SENDS_CAP's docstring. What
@@ -748,7 +812,13 @@ class SchedulerPPMixin:
                         amended = self._pp_admission_amended_to_forward
                         if amended is None:
                             amended = PPAdmissionDecision(mb_id=mb_id, entries=())
-                        self._pp_send_admission_decision(amended)
+                        # #791b: forwarded VERBATIM. This rank is not entitled
+                        # to an opinion about the ring -- PP0 owns the verdict,
+                        # every rank in between only carries it.
+                        self._pp_send_admission_decision(
+                            amended,
+                            expects_output=self._pp_output_expected_incoming,
+                        )
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -2591,6 +2661,24 @@ class SchedulerPPMixin:
         # out of scope, and the message never reaches the peer. Drained
         # every iteration by `_pp_commit_admission_send_work`.
         self._pp_admission_send_work: List[P2PWork] = []
+        # #791b: PER SLOT, refreshed every pass by
+        # `_pp_note_output_expectation`, read on the last rank by
+        # `_pp_send_output_to_next_stage`. Per slot rather than one scalar
+        # because with `pp_async_batch_depth > 0` the last rank's send gate
+        # reads `next_first_rank_mb_id`, which is the slot whose decision
+        # arrived `pp_async_batch_depth` passes ago, not this pass's.
+        # All-False at re-entry is the correct start: no slot has an
+        # expectation until PP0 publishes one, so nothing can be voided on
+        # the strength of a pre-flip pass.
+        self._pp_output_expected_by_slot: List[bool] = [False] * self.pp_loop_size
+        # #791b: the fully chain-reconciled decision this rank forwarded for
+        # each slot. The last rank rides it back to PP0 inside a void output
+        # so `PPAdmissionCongruenceGuard.record_return_trip` -- which #796
+        # left with no feeder at all when it removed the wraparound -- learns
+        # the observed shortfall and #630's termination argument holds again.
+        self._pp_admission_amended_by_slot: List[Optional[PPAdmissionDecision]] = [
+            None
+        ] * self.pp_loop_size
         # #753: NOT assigned here any more. The inbox moved onto the pp_group
         # so the crossing wire -- a second consumer of the same channel --
         # shares it; ``_pp_tensor_dict_inbox`` below is now a read-only view of
@@ -3274,8 +3362,48 @@ class SchedulerPPMixin:
             )
         return tensor_dict
 
+    def _pp_note_output_expectation(
+        self: Scheduler,
+        mb_id: int,
+        expects_output: bool,
+        amended: Optional[PPAdmissionDecision],
+    ) -> None:
+        """#791b: record this pass's output-ring verdict for slot ``mb_id``.
+
+        Written on EVERY pass by every rank, so a slot can never be voided on
+        a stale expectation: the value the last rank reads was published for
+        that same slot, in the same generation, by the rank that will apply
+        it on the receiving side.
+
+        Tolerant of a stand-in that never ran ``init_pp_loop_state``, as this
+        file's own convention requires (#787): a holder without the arrays
+        grows them here rather than raising.
+        """
+        size = max(int(getattr(self, "pp_loop_size", 0) or 0), int(mb_id) + 1)
+        flags = getattr(self, "_pp_output_expected_by_slot", None)
+        if flags is None or len(flags) < size:
+            flags = list(flags or []) + [False] * (size - len(flags or []))
+            self._pp_output_expected_by_slot = flags
+        flags[mb_id] = bool(expects_output)
+        carried = getattr(self, "_pp_admission_amended_by_slot", None)
+        if carried is None or len(carried) < size:
+            carried = list(carried or []) + [None] * (size - len(carried or []))
+            self._pp_admission_amended_by_slot = carried
+        carried[mb_id] = amended
+
+    def _pp_output_expected_for_slot(self: Scheduler, mb_id: int) -> bool:
+        """#791b: did the FIRST rank say it will receive an output for this
+        slot? False whenever nothing was ever published for it."""
+        flags = getattr(self, "_pp_output_expected_by_slot", None)
+        if not flags or mb_id >= len(flags):
+            return False
+        return bool(flags[mb_id])
+
     def _pp_send_admission_decision(
-        self: Scheduler, decision: PPAdmissionDecision
+        self: Scheduler,
+        decision: PPAdmissionDecision,
+        *,
+        expects_output: bool = False,
     ) -> None:
         """#791: forward this pass's admission decision to the next stage.
 
@@ -3354,6 +3482,11 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             return
         tensor_dict = pp_admission_decision_to_wire(decision)
+        # #791b: PP0's output-ring verdict for this slot rides along. See
+        # `_PP_OUTPUT_EXPECTED_KEY` for why the fact has to travel instead of
+        # being re-derived per rank, and `_pp_send_output_to_next_stage` for
+        # what the last rank does with it.
+        tensor_dict[_PP_OUTPUT_EXPECTED_KEY] = bool(expects_output)
         works = self._pp_send_dict_to_next_stage(
             tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
         )
@@ -3407,6 +3540,12 @@ class SchedulerPPMixin:
         if self.ps.pp_size <= 1:
             return None
         message = self._pp_recv_typed_dict(expected_kind=ADMISSION_DECISION_KIND)
+        # #791b: PP0's output-ring verdict for this slot, published on the
+        # same message. Absent means False -- an older sender, or a stand-in,
+        # then behaves exactly as it did before this key existed.
+        self._pp_output_expected_incoming = bool(
+            message.get(_PP_OUTPUT_EXPECTED_KEY, False)
+        )
         return pp_admission_decision_from_wire(message)
 
     def _pp_try_recv_admission_decision(
@@ -3958,6 +4097,7 @@ class SchedulerPPMixin:
         async_output = not getattr(self, "_pp_gapped_wire", False)
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
+            sent_real_output = False
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
@@ -3971,6 +4111,29 @@ class SchedulerPPMixin:
                             async_send=async_output,
                             msg_type="output",
                         )
+                    sent_real_output = True
+            # #791b: THE PREDICATE ABOVE IS THIS RANK'S, AND THAT IS THE HOLE.
+            # It reads this rank's own slot, while the receiving side reads
+            # PP0's -- and a #791 retraction empties this one without touching
+            # that one, because the amendment only ever travels DOWNSTREAM and
+            # PP0 is upstream of every rank that can make it. When that
+            # happens PP0 is already blocked, or about to block, in a receive
+            # nothing will satisfy; boot instr11 died there with all three
+            # ranks in a ring. So the ring is kept matched by construction:
+            # if PP0 said it expects an output for this slot and this rank has
+            # none to give, it still puts exactly one message on the wire.
+            # This is NOT the bounded-recv corpse in reverse -- the message is
+            # one PP0 is REQUIRED to take, by the same verdict that put it on
+            # the wire.
+            if not sent_real_output and self._pp_output_expected_for_slot(
+                next_first_rank_mb_id
+            ):
+                with torch.profiler.record_function("send_void_res_dict"):
+                    send_output_work = self._pp_send_dict_to_next_stage(
+                        self._pp_void_output_payload(next_first_rank_mb_id),
+                        async_send=async_output,
+                        msg_type="output",
+                    )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
@@ -3981,6 +4144,103 @@ class SchedulerPPMixin:
                         msg_type="output",
                     )
         return send_output_work
+
+    def _pp_void_output_payload(self: Scheduler, mb_id: int) -> Dict[str, object]:
+        """#791b: the message the last rank sends when PP0 expects an output
+        for a slot the pipeline retracted out from under it.
+
+        Carries no tensors -- a dict of pure metadata is established practice
+        on this channel (`__msg_type__`, `__stamp__`, the whole admission
+        decision), and fabricating a zero token tensor here is precisely what
+        must not happen: `_pp_make_skip_output_result`'s placeholder is
+        legitimate only because a mid-prefill chunk really produced no token,
+        whereas THESE requests were never run past this rank's stage at all.
+
+        The fully chain-reconciled decision rides back with it, which is the
+        return trip #796 removed when it deleted the wraparound. Unlike that
+        wraparound this one is not an unmatched message: it exists only on a
+        pass where PP0's own published verdict obliges it to receive.
+        """
+        payload: Dict[str, object] = {_PP_VOID_OUTPUT_KEY: True}
+        carried = getattr(self, "_pp_admission_amended_by_slot", None)
+        decision = carried[mb_id] if carried and mb_id < len(carried) else None
+        if decision is not None:
+            payload.update(pp_admission_decision_to_wire(decision))
+        return payload
+
+    def _pp_absorb_void_output(
+        self: Scheduler,
+        mb_id: int,
+        message: Dict[str, object],
+        mbs: List[ScheduleBatch],
+        mb_metadata: List[Optional[PPBatchMetadata]],
+    ) -> bool:
+        """#791b: consume a void output on the first rank. True iff it was one.
+
+        THREE THINGS HAPPEN, AND THE ORDER IS NOT ARBITRARY.
+
+        1. The slot is EMPTIED. `_event_loop_pp_body` guards result processing
+           on `self.mbs[next_mb_id] is not None`, not on whether a result
+           arrived, so leaving the batch in place would run
+           `d2h_event.synchronize()` on None. Emptying it also makes
+           `_pp_record_slot_last_batch` record None, which keeps the
+           un-processed prefill out of `get_next_batch_to_run`'s
+           `last_batch.filter_batch(...)` / `running_batch.merge_batch(...)`
+           path -- where it would have become a resident decode request whose
+           sampled token never existed.
+
+        2. Every request in it is RELEASED and RE-QUEUED. This is the wiring
+           `pp_admission_congruence`'s docstring names and explicitly leaves
+           out of its own scope ("expected to be re-queued and re-admitted on
+           a LATER pass ... that is scheduler-loop wiring"). Without it the
+           batch's KV pages, mamba slot and req-pool slot have no owner at
+           all: `process_batch_result_prefill` is what normally hands them to
+           the tree cache, and it never runs for a voided pass.
+           `_release_dynamic_chunk_probe` is reused verbatim because it
+           already frees the three in the one order that works (mamba before
+           the req slot) and is documented idempotent and non-raising.
+
+        3. The carried decision teaches `PPAdmissionCongruenceGuard` the
+           shortfall. Without it PP0 re-offers the identical `told` next pass,
+           the same rank retracts again, and the void repeats for ever -- a
+           degrade that makes no forward progress, which is #630's livelock
+           rather than a fix. With it, `told` is clamped to the observed local
+           match, and a strictly decreasing sequence of non-negative integers
+           terminates.
+        """
+        if not isinstance(message, dict) or not message.pop(_PP_VOID_OUTPUT_KEY, False):
+            return False
+
+        batch = mbs[mb_id] if mb_id < len(mbs) else None
+        reqs = list(getattr(batch, "reqs", None) or ())
+        if mb_id < len(mbs):
+            mbs[mb_id] = None
+        if mb_id < len(mb_metadata):
+            mb_metadata[mb_id] = None
+
+        guard = getattr(self, "_pp_admission_guard", None)
+        if guard is not None and _ADMISSION_DECISION_PAYLOAD_KEY in message:
+            guard.record_return_trip(pp_admission_decision_from_wire(message))
+
+        for req in reqs:
+            _release_dynamic_chunk_probe(self, req)
+            try:
+                req.reset_for_retract()
+            except Exception as exc:  # noqa: BLE001 - a retract may not raise
+                logger.warning("#791b void-output retract failed: %s", exc)
+            self.waiting_queue.append(req)
+
+        logger.warning(
+            "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
+            "this microbatch downstream, so the last rank produced nothing for "
+            "it, and rank 0's %d request(s) have been released and re-queued. "
+            "The message itself is what keeps the output ring matched -- "
+            "without it rank 0 blocks for ever in a receive no rank is "
+            "required to satisfy (boot instr11, 2026-08-21).",
+            mb_id,
+            len(reqs),
+        )
+        return True
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,
@@ -4052,7 +4312,16 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                raw_output = self._pp_recv_dict_from_prev_stage()
+            # #791b: a void carries no tokens and must not be turned into one.
+            # `_pp_absorb_void_output` empties the slot, so the loop's "slot
+            # non-empty => a result was received for it" invariant (the guard
+            # at `_event_loop_pp_body`'s `if self.mbs[next_mb_id] is not None`)
+            # holds with all three of `next_pp_outputs`, `batch_result` and
+            # `d2h_event` left as None.
+            if self._pp_absorb_void_output(next_mb_id, raw_output, mbs, mb_metadata):
+                return
+            next_pp_outputs = PPProxyTensors(raw_output)
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
