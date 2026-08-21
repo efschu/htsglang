@@ -44,6 +44,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionEntry,
     entries_retracted_by_rank,
     forwarded_schedule,
+    order_batch_by_schedule,
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
@@ -4491,6 +4492,21 @@ class SchedulerPPMixin:
         which is what makes that neuter a real one.
         """
         return forwarded_schedule(amended)
+
+    def _pp_order_batch_by_schedule(
+        self: Scheduler, reqs, schedule: Dict[str, Tuple[int, int]]
+    ):
+        """#791 CORE: put this rank's batch into the forwarded ORDER.
+
+        A method for the same reason `_pp_forwarded_schedule_from` above is
+        one: it is the single point at which the forwarded order is applied,
+        so it is the single point a test can neuter -- and it resolves
+        `order_batch_by_schedule` through this module's globals, which is what
+        makes that neuter real. scheduler.py calls it through here rather than
+        importing the function directly, so the test and production share one
+        resolution path.
+        """
+        return order_batch_by_schedule(reqs, schedule)
 
     def _pp_void_retracted_pass(
         self: Scheduler,

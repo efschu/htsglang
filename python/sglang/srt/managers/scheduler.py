@@ -7201,6 +7201,24 @@ class Scheduler(
                     f"request -- the upstream's hidden states for it are "
                     f"already on the wire."
                 )
+            extra = [rid for rid in admitted_rids if rid not in scheduled_extents]
+            if extra:
+                raise PPScheduleRefused(
+                    f"#791 FORWARDED SCHEDULE UNEXECUTABLE: this rank admitted "
+                    f"rid(s)={','.join(sorted(extra))}, which the decision does "
+                    f"not name. A rank executing a forwarded schedule may not "
+                    f"add a request either -- the upstream computed no hidden "
+                    f"states for it."
+                )
+
+            # #791 CORE: ORDER IS GEOMETRY TOO -- the one divergence every
+            # width check on this branch is blind to. Membership is proven
+            # identical by the two refusals above, so the permutation this
+            # applies is total. See `order_batch_by_schedule`.
+            can_run_list = self._pp_order_batch_by_schedule(
+                can_run_list, scheduled_extents
+            )
+            adder.can_run_list = can_run_list
 
         if len(can_run_list) == 0:
             return None, running_batch
@@ -7225,6 +7243,11 @@ class Scheduler(
                 can_run_list,
                 pp_size=self.ps.pp_size,
                 guard=self._pp_admission_guard,
+                # #791 CORE: the ONE production call site, and the only one
+                # that must never fall back. A `can_run_list` member with no
+                # `extend_range` is a torn-down request, not a missing
+                # optimisation -- refuse and name it.
+                require_executed_geometry=True,
             )
         if adder.preempt_list:
             for req in adder.preempt_list:

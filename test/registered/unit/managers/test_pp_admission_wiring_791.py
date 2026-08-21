@@ -128,10 +128,22 @@ class _RingWire:
         self.rank = rank
         self.rank_in_group = rank
         self.world_size = WORLD
+        # `GroupCoordinator` exposes these as plain attributes and the mixin
+        # reads them directly (e.g. scheduler_pp_mixin.py:1548); a stub
+        # without them dies as an AttributeError inside the worker, which is
+        # a harness gap, not a wiring finding.
+        self.is_first_rank = rank == 0
+        self.is_last_rank = rank == WORLD - 1
+        # Direct measurement for the #796 law ("a rank must not post a send
+        # no peer is required to take"): the last rank's send must be a
+        # no-op, and a counter sees that where a hang-detector would only
+        # time out.
+        self.sends = 0
 
     def send_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None, async_send=False):
         import pickle
 
+        self.sends += 1
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         buf = pickle.dumps(tensor_dict)
@@ -190,9 +202,11 @@ def _make_holder(rank: int, wire: _RingWire, waiting_queue):
     h._pp_boundary_stats = lambda: None
     h._pp_flip_bump_sent = lambda chan: None
     h._pp_flip_bump_consumed = lambda chan: None
+    h._pp_flip_bump_attempted = lambda chan: None
     for name in (
         "_pp_send_admission_decision",
         "_pp_recv_admission_decision",
+        "_pp_try_recv_admission_decision",
         "_pp_reconcile_incoming_admission",
         # The two SHIPPED wire primitives the three methods above are built
         # on top of (_pp_send_dict_to_next_stage / _pp_recv_typed_dict) --
@@ -216,7 +230,6 @@ class _WarningCatcher(logging.Handler):
 
 def _worker(rank, init_file, out_dir):
     from sglang.srt.managers.pp_admission_congruence import (
-        PPAdmissionCongruenceGuard,
         PPAdmissionDecision,
         PPAdmissionEntry,
     )
@@ -243,22 +256,14 @@ def _worker(rank, init_file, out_dir):
                 ),
             )
             h._pp_send_admission_decision(decision)
-            returned = h._pp_recv_admission_decision()
-            guard = PPAdmissionCongruenceGuard()
-            guard.record_return_trip(returned)
-
-            res["returned_entries"] = [
-                {
-                    "rid": e.rid,
-                    "admitted": e.admitted,
-                    "retracted": e.retracted,
-                    "retracted_by_rank": e.retracted_by_rank,
-                    "observed_local": e.observed_local,
-                }
-                for e in returned.entries
-            ]
-            res["guard_outstanding"] = list(guard.outstanding_rids())
-            res["guard_floor_after"] = guard.prefix_len_for(RID, 999)
+            # #796: the wraparound lap no longer exists -- the last rank
+            # does not emit it, so PP0's only legal read of this channel is
+            # the opportunistic peek, and the peek is DORMANT: it must
+            # return None without touching the wire. A blocking receive
+            # here is exactly the fourth-specimen deadlock the peek
+            # replaced.
+            res["lap"] = h._pp_try_recv_admission_decision()
+            res["sends"] = wire.sends
             res["warning_count"] = len(catcher.records)
             res["warnings"] = catcher.records
             res["ok"] = True
@@ -272,6 +277,7 @@ def _worker(rank, init_file, out_dir):
             h._pp_send_admission_decision(amended)
 
             res["effective"] = dict(effective)
+            res["sends"] = wire.sends
             res["warning_count"] = len(catcher.records)
             res["warnings"] = catcher.records
             res["ok"] = True
@@ -285,9 +291,16 @@ def _worker(rank, init_file, out_dir):
             h = _make_holder(rank, wire, waiting_queue=[_FakeReq(RID, 10)])
             incoming = h._pp_recv_admission_decision()
             effective, amended = h._pp_reconcile_incoming_admission(incoming)
+            # #796: THE LAST RANK'S SEND IS A NO-OP. If this posted a real
+            # gloo send, no peer would ever take it: PP0 issues no blocking
+            # receive for the wraparound (see `_pp_try_recv_admission_
+            # decision`), so this process would hang in the synchronous
+            # send and surface as a stuck rank -- and `wire.sends` measures
+            # the refusal directly rather than by absence of a hang.
             h._pp_send_admission_decision(amended)
 
             res["effective"] = dict(effective)
+            res["sends"] = wire.sends
             res["incoming_retracted"] = [
                 {"rid": e.rid, "retracted": e.retracted, "observed_local": e.observed_local}
                 for e in incoming.entries
@@ -341,7 +354,20 @@ def _run():
 
 
 class PPAdmissionWiring791(unittest.TestCase):
-    def test_ring_roundtrip_degrades_and_reports_back(self):
+    def test_the_decision_degrades_down_the_chain_and_stops_at_the_last_rank(self):
+        """Three live gloo ranks over the SHIPPED send/recv path.
+
+        Until #796 this test asserted a ring ROUNDTRIP: PP2 wrapped the
+        amended decision back to PP0 and the guard learned from it
+        (`record_return_trip`). #796 deleted that edge -- PP0 was never
+        required to take it, so the wraparound was one unmatched message
+        per pass on the channel (the bounded-recv corpse), and the learning
+        now travels on the OUTPUT channel instead
+        (`pp_output_payload_with_return_trip`, pinned by the #791b/#797
+        suites). What this test pins since then is the CURRENT contract:
+        the decision degrades PP0 -> PP1 -> PP2 and STOPS -- the last
+        rank's send is a no-op and PP0's opportunistic peek is dormant.
+        """
         res = _run()
         self.assertEqual(
             res["stuck_ranks"], [], f"a rank never finished: {res}"
@@ -372,24 +398,24 @@ class PPAdmissionWiring791(unittest.TestCase):
         self.assertTrue(r2["incoming_retracted"][0]["retracted"])
         self.assertNotIn(RID, r2["effective"])
 
-        # PP0 receives the ring's wraparound (PP2 -> PP0, dst=None), naming
-        # the retraction with the rank that made it and the local length
-        # that was actually observed.
-        entries = r0["returned_entries"]
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["rid"], RID)
-        self.assertTrue(entries[0]["retracted"])
-        self.assertFalse(entries[0]["admitted"])
-        self.assertEqual(entries[0]["retracted_by_rank"], PP1)
-        self.assertEqual(entries[0]["observed_local"], PP1_LOCAL_MATCH)
+        # #796: the chain STOPS at the last rank. PP2's send is a no-op
+        # (zero wire activity, measured, not inferred from the absence of a
+        # hang), and PP0's only read of the channel -- the opportunistic
+        # peek -- is dormant and returns None without touching the wire.
+        self.assertEqual(r0["sends"], 1, "PP0 sends exactly its own decision")
+        self.assertEqual(r1["sends"], 1, "PP1 forwards exactly once")
+        self.assertEqual(
+            r2["sends"],
+            0,
+            "the last rank must not post a send no peer is required to take",
+        )
+        self.assertIsNone(r0["lap"], "the wraparound lap no longer exists")
 
-        # record_return_trip (the already-tested #630 pure effect) against
-        # a decision that actually crossed the wire.
-        self.assertEqual(r0["guard_outstanding"], [RID])
-        self.assertEqual(r0["guard_floor_after"], PP1_LOCAL_MATCH)
         # PP0 itself never independently discovers a mismatch in this
-        # scenario -- it only relays what came back -- so it must not have
-        # logged anything of its own.
+        # scenario -- with the lap gone (#796) it learns nothing back at
+        # all on this channel -- so it must not have logged anything of its
+        # own. (`record_return_trip` now feeds off the OUTPUT channel; the
+        # #791b/#797 suites pin that path.)
         self.assertEqual(r0["warning_count"], 0)
 
 

@@ -327,12 +327,54 @@ class PPAdmissionCongruenceGuard:
         return tuple(self._learned_floor)
 
 
+def _executed_extent(req) -> Optional[Tuple[int, int]]:
+    """`(start, length)` of the extend range this rank ACTUALLY BUILT, or None.
+
+    THE BATCH IS THE SCHEDULE -- this reads the very field
+    `ScheduleBatch.prepare_for_extend` sizes the cross-stage tensor from
+    (`extend_range.start` == `len(prefix_indices)`, `extend_range.length`;
+    schedule_batch.py:2261-2281), rather than recomputing a value that ought
+    to agree with it. Two expressions that must agree is the defect one level
+    up, so there is exactly one expression.
+
+    `None` ONLY for a request the adder never touched. Every one of the eight
+    `can_run_list.append(req)` sites in schedule_policy.py is immediately
+    preceded by a `set_extend_range` (:1168/:1170, :1199/:1200, :1297/:1298,
+    :1420/:1421, :1535/:1538, :1555/:1558, :1742/:1745, :1785/:1789), so a
+    member of a real `can_run_list` always has one and the fallback in
+    `build_pp_admission_decision` is reachable only from a bare test stand-in.
+    That was worth establishing rather than assuming: a `getattr` default
+    that silently produced 0, or silently produced the full length, would be
+    the instr21 defect in new clothing.
+
+    A ZERO-LENGTH RANGE IS REPORTED, NOT SUPPRESSED. `add_chunked_req`'s #679
+    park (schedule_policy.py:1399) sets `extend_range(prefix, prefix)` and
+    returns WITHOUT appending, so a parked chunk is not in `can_run_list` at
+    all; but a chunk that lands exactly on its last token can be appended with
+    `new_len == 0` (:1420-1421). If the first rank ran zero rows for a
+    request, every rank must run zero rows for it -- reporting that faithfully
+    is the contract, and inventing a length for it would be the same defect
+    again. Downstream, `schedule_refusal_reason` therefore refuses a NEGATIVE
+    extend and executes a zero verbatim.
+    """
+    extend_range = getattr(req, "extend_range", None)
+    if extend_range is None:
+        return None
+    start = getattr(extend_range, "start", None)
+    end = getattr(extend_range, "end", None)
+    if start is None or end is None:
+        return None
+    start, end = int(start), int(end)
+    return start, max(0, end - start)
+
+
 def build_pp_admission_decision(
     mb_id: int,
     reqs: Sequence,
     *,
     pp_size: int,
     guard: Optional[PPAdmissionCongruenceGuard] = None,
+    require_executed_geometry: bool = False,
 ) -> PPAdmissionDecision:
     """PP0's (or, under `pp_size<=1`, the only rank's) committed decision.
 
@@ -359,9 +401,100 @@ def build_pp_admission_decision(
     to before this parameter existed -- see DEFAULT PATH above, still true
     with a guard object in play as long as it is never passed a `pp_size<=1`
     caller's decisions to learn from.
+
+    #791 CORE: THE DECISION REPORTS WHAT THIS RANK RAN, NOT WHAT IT WAS
+    OFFERED -- and until boot instr21 it reported neither.
+
+    `req.extend_input_len` DOES NOT EXIST. There is no assignment to it
+    anywhere in the tree; it survives only as a doc comment
+    (schedule_batch.py:1847) and two stale references (:2379-2380). So the
+    `getattr` below has ALWAYS returned `None` and the fallback has ALWAYS
+    run -- and the fallback computes `len(full_untruncated_fill_ids) -
+    prefix`, i.e. the WHOLE remaining prompt. Under chunked prefill that is
+    never the batch: `PrefillAdder.add_one_req` caps the chunk at
+    `rem_chunk_tokens` AFTER this value would have been read
+    (schedule_policy.py:1738-1766), and `add_chunked_req` does the same
+    (:1415-1419).
+
+    Nothing noticed for as long as nothing read `extend_len`. The first boot
+    that executed it died in 37 seconds (instr21, PP1 10:42:12): a ~17000-
+    token drive prompt, one 512-row chunk on the wire, and
+
+        ValueError: #631 PP proxy/batch mismatch: received hidden_states with
+                    512 row(s) for a 1 batch of 16983 token(s)
+
+    16983 is exactly `len(fill_ids) - prefix`. The disagreement had moved
+    INSIDE the schedule: it named a pass no rank had run.
+
+    `req.extend_range` is the executed geometry. `PrefillAdder` writes it via
+    `set_extend_range` on every path that appends to `can_run_list`
+    (schedule_policy.py:1719, :1743, :1762, :1202, :1428, and this feature's
+    own :1287), and this function is called from scheduler.py AFTER that loop,
+    over `can_run_list` itself -- so the value is always already there, and
+    the producer needs no move. `prepare_for_extend` derives the tensor's row
+    count from the same pair (`extend_range.start` == `len(prefix_indices)`,
+    `extend_range.length`; schedule_batch.py:2261-2281), which is what makes
+    reporting it -- rather than recomputing an equivalent -- the point.
+
+    THE GUARD IS NOT RE-APPLIED ON THAT PATH, and the old comment claiming it
+    was idempotent is now false. The admission loop clamps `prefix_indices` to
+    the learned floor BEFORE `add_one_req` (scheduler.py), and
+    `add_one_req`'s host load-back then GROWS it again
+    (schedule_policy.py:1707-1717) -- so re-running `prefix_len_for` here
+    would clamp a second time and move the difference into `extend_len`,
+    manufacturing a third geometry nobody ran. The guard's job is upstream, on
+    the request, where it belongs; this function's job is to report.
+
+    `require_executed_geometry` (True from scheduler.py, the one production
+    call site): a request with NO `extend_range` is a LOUD REFUSAL naming the
+    rid, never a default. A silent 0 or a silent full length would be the
+    instr21 defect in new clothing, and `None` is REACHABLE here --
+    `Req.reset_for_retract` sets `extend_range = None`
+    (schedule_batch.py:1588), which is how boot instr19 died at
+    scheduler.py:5572 with `AttributeError: 'NoneType' object has no
+    attribute 'end'`. Refusing here reaches that same state three frames
+    earlier and names the request; the alternative is not "no refusal", it is
+    the AttributeError we have already lost a boot to.
+
+    WHEN THE None CASE AND THE RETRACTION CASE CO-OCCUR -- and they can, since
+    `reset_for_retract` is ON the retraction path, which this rebuild makes
+    rare but cannot eliminate (physical impossibility is real): the refusal
+    fires FIRST, on the first rank, before any decision is sent. That is
+    strictly the better order. The pass is voided everywhere by the ordinary
+    mechanism (the first rank builds no batch, so `launched` is False and the
+    empty decision admits nothing downstream), and no rank ever sees a
+    geometry for a request whose geometry had been torn down.
+
+    `require_executed_geometry=False` (the default) keeps the pre-#791-core
+    arithmetic for a stand-in that carries no adder output -- the reqs in
+    test_pp_admission_retry_livelock_630.py and
+    test_pp_admission_prefix_indices_tensor_796.py, which exist to pin the
+    guard and the #796 tensor read and never reach a real batch.
     """
     entries = []
     for req in reqs:
+        executed = _executed_extent(req)
+        if executed is not None:
+            entries.append(
+                PPAdmissionEntry(
+                    rid=req.rid,
+                    prefix_len=executed[0],
+                    extend_len=executed[1],
+                    admitted=True,
+                )
+            )
+            continue
+        if require_executed_geometry:
+            raise PPScheduleRefused(
+                f"#791 SCHEDULE UNBUILDABLE for rid={getattr(req, 'rid', '?')}: "
+                f"this rank admitted the request but its extend_range is "
+                f"{getattr(req, 'extend_range', None)!r}, so there is no "
+                f"executed geometry to forward. Reporting a length derived "
+                f"from anything else would name a pass no rank ran. "
+                f"`reset_for_retract` is the known producer of this state "
+                f"(schedule_batch.py:1588); boot instr19 met it one frame "
+                f"later as an AttributeError at scheduler.py:5572."
+            )
         # #796: `prefix_indices` is a TENSOR of KV-pool slot pointers, so it
         # must never reach a boolean context. `x or []` evaluates `bool(x)`,
         # and torch raises on both ends of the range that matters here: an
@@ -545,6 +678,39 @@ def forwarded_schedule(
     }
 
 
+def order_batch_by_schedule(reqs: Sequence, schedule: Dict[str, Tuple[int, int]]):
+    """#791 CORE: put this rank's batch into the FORWARDED order.
+
+    ORDER IS GEOMETRY, and it is the one divergence every width check on this
+    branch is blind to. `ScheduleBatch.prepare_for_extend` concatenates each
+    request's tokens in `can_run_list` order (schedule_batch.py:2261-2262), so
+    the same rid set in a different order gives the SAME row count and a
+    different meaning for every row. `model_runner.py`'s `_hs.shape[0] !=
+    _want` counts rows; the #757 stamp counts rows; neither can see a
+    permutation. Only an identity can.
+
+    The two orders are independently derived and there is no reason for them
+    to agree: `can_run_list` follows THIS rank's `waiting_queue`, the schedule
+    follows the first rank's, and the queues are fed by separate
+    chain-forward arrivals.
+
+    SORTED, NOT MERELY CHECKED. The decision is an ORDERED list --
+    `build_pp_admission_decision` iterates the first rank's own
+    `can_run_list`, so `decision.entries` IS that rank's batch order, and
+    `forwarded_schedule` preserves it (dicts keep insertion order). A caller
+    reaching this function has already proven membership identical, so the
+    permutation is total and loses nothing; refusing would void a pass that
+    is perfectly runnable once the rows line up.
+
+    Returns a NEW list. An empty schedule returns the input order unchanged,
+    which is the default path (no forwarded geometry) byte for byte.
+    """
+    if not schedule:
+        return list(reqs)
+    order = {rid: i for i, rid in enumerate(schedule)}
+    return sorted(reqs, key=lambda req: order[req.rid])
+
+
 def schedule_refusal_reason(
     *,
     rid: str,
@@ -568,17 +734,25 @@ def schedule_refusal_reason(
       * the request does not have the tokens. `prefix + extend` past
         `full_untruncated_fill_ids` cannot be filled from anything this rank
         holds.
-      * an empty extend. A pass that computes nothing for a named request is
-        not a smaller pass, it is a different one.
+      * a NEGATIVE extend. Not merely unrunnable -- unrepresentable, so it can
+        only mean a malformed decision.
+
+    A ZERO EXTEND IS EXECUTABLE, and the change of mind is #791-core's own
+    doing. Before the producer reported the EXECUTED geometry, a zero could
+    only have been a fabrication; now it is a faithful report of a first rank
+    that ran zero rows for that request (a chunk landing exactly on its last
+    token, schedule_policy.py:1420-1421). Refusing it would void a pass the
+    upstream ran perfectly well -- and substituting a length of this rank's
+    own is precisely what this module abolishes. See `_executed_extent`.
 
     The caller turns this into a voided pass (the #797 path), never into a
     narrower batch. Pure: five integers in, a string or None out.
     """
-    if scheduled_extend_len <= 0:
+    if scheduled_extend_len < 0:
         return (
             f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
-            f"names extend_len={scheduled_extend_len}, which computes nothing. "
-            f"A downstream rank may not substitute a length of its own."
+            f"names extend_len={scheduled_extend_len}, which is not a length. "
+            f"A downstream rank may not substitute one of its own."
         )
     if local_prefix_len != scheduled_prefix_len:
         return (

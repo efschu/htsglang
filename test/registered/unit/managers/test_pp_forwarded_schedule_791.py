@@ -143,6 +143,14 @@ class _GlooWire:
         return pickle.loads(bytes(buf.numpy()))
 
 
+#: instr21's drive prompt. 16983 = len(fill_ids) - prefix, i.e. what the
+#: producer forwarded before it learned to report the EXECUTED geometry.
+LONG_PROMPT_TOKENS = 17000
+LONG_PROMPT_EXTEND = 16983
+LONG_PROMPT_PREFIX = LONG_PROMPT_TOKENS - LONG_PROMPT_EXTEND
+RID_B = "b0b0b0b0b0b04574978be55f5a600b96"
+
+
 def _pp0_decision() -> PPAdmissionDecision:
     """PP0's committed pass, in instr20's shape: prefix 0, one 512-chunk."""
     return PPAdmissionDecision(
@@ -150,6 +158,34 @@ def _pp0_decision() -> PPAdmissionDecision:
         entries=(
             PPAdmissionEntry(rid=RID, prefix_len=TOLD_PREFIX, extend_len=TOLD_EXTEND),
         ),
+    )
+
+
+def _pp0_builds_its_own_decision(reqs):
+    """THE REAL PRODUCER PATH: run the shipped `PrefillAdder` exactly as PP0's
+    admission loop does, then build the decision from the assembled
+    `can_run_list` exactly as scheduler.py:7223 does.
+
+    This is the arm that was missing. Every other arm in this file CONSTRUCTS
+    a decision, so the whole file was green while the producer forwarded a
+    geometry no rank had run.
+    """
+    from sglang.srt.managers.pp_admission_congruence import (
+        PPAdmissionCongruenceGuard,
+        build_pp_admission_decision,
+    )
+
+    adder = _adder(None)  # PP0 owns its own admission truth: no schedule.
+    for req in reqs:
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+    return (
+        build_pp_admission_decision(
+            LIVE_MB,
+            adder.can_run_list,
+            pp_size=WORLD,
+            guard=PPAdmissionCongruenceGuard(),
+        ),
+        adder,
     )
 
 
@@ -203,6 +239,7 @@ def _holder(wire, pp_rank):
         "_pp_send_admission_decision",
         "_pp_recv_admission_decision",
         "_pp_forwarded_schedule_from",
+        "_pp_order_batch_by_schedule",
         "_pp_void_retracted_pass",
         "_pp_drain_voided_proxy",
         "_pp_flip_epoch",
@@ -220,18 +257,25 @@ class _Req:
     the quantities under test, and a mock would record the call instead of
     answering the question."""
 
-    def __init__(self, prefix_len: int, host_resident: int):
-        from sglang.srt.utils.common import Range
-
-        self.rid = RID
+    def __init__(
+        self,
+        prefix_len: int,
+        host_resident: int,
+        rid: str = RID,
+        total: int = PROMPT_TOKENS,
+    ):
+        self.rid = rid
         # A TENSOR of KV-pool slot pointers, as the real `Req` carries -- the
         # load-back path `torch.cat`s onto it, and #796 is the standing
         # reminder that this object's type is load-bearing.
         self.prefix_indices = torch.arange(prefix_len)
-        self.full_untruncated_fill_ids = list(range(PROMPT_TOKENS))
+        self.full_untruncated_fill_ids = list(range(total))
         self.output_ids = []
         self.origin_input_ids = self.full_untruncated_fill_ids
-        self.extend_range = Range(0, 0)
+        # None, as a fresh `Req` carries it (schedule_batch.py:739) and as
+        # `reset_for_retract` restores it (:1588) -- the state the producer
+        # must refuse rather than default.
+        self.extend_range = None
         self.retracted_stain = False
         self.last_node = "node"
         self.best_match_node = "node"
@@ -381,6 +425,131 @@ def _victim_pass(h, decision, res):
     res["sentinel"] = int(tail["next_token_ids"][0].item())
 
 
+#: THE ORDER ARM's pass: two requests, EQUAL extend lengths, so every width
+#: check on this branch is blind to a permutation between them.
+ORDER_EXTEND = 256
+#: One float per request, written into that request's own rows. The hidden
+#: state of a row belongs to exactly one request; a row count cannot say so.
+ORDER_TAG = {RID: 1.0, RID_B: 2.0}
+
+
+def _order_decision() -> PPAdmissionDecision:
+    """PP0's ORDERED batch: RID first, RID_B second."""
+    return PPAdmissionDecision(
+        mb_id=LIVE_MB,
+        entries=(
+            PPAdmissionEntry(rid=RID, prefix_len=0, extend_len=ORDER_EXTEND),
+            PPAdmissionEntry(rid=RID_B, prefix_len=0, extend_len=ORDER_EXTEND),
+        ),
+    )
+
+
+def _order_proxy():
+    """PP0's hidden states for that batch, ROW-TAGGED BY REQUEST and laid out
+    in PP0's order: rows 0..255 are RID's, rows 256..511 are RID_B's.
+    `prepare_for_extend` concatenates in `can_run_list` order, so a victim
+    holding the reverse order reads RID_B's rows as RID's -- at exactly the
+    same width."""
+    hs = torch.zeros(2 * ORDER_EXTEND, 4)
+    hs[:ORDER_EXTEND] = ORDER_TAG[RID]
+    hs[ORDER_EXTEND:] = ORDER_TAG[RID_B]
+    return {
+        "__msg_type__": "proxy",
+        "__stamp__": (LIVE_MB, PROXY_SEQ, int(hs.shape[0]), FLIP_EPOCH),
+        "hidden_states": hs,
+    }
+
+
+def _order_pass(h, decision, res):
+    """The victim's pass for the ORDER arm, on shipped functions.
+
+    Its own `waiting_queue` holds the two requests in the REVERSE order --
+    which needs no contrivance: `can_run_list` follows THIS rank's queue and
+    the decision follows the first rank's, and the two are fed by independent
+    chain-forward arrivals.
+    """
+    from sglang.srt.managers.pp_admission_congruence import (
+        reconcile_pp_admission_decision,
+    )
+
+    effective, amended = reconcile_pp_admission_decision(
+        decision, {RID: 0, RID_B: 0}, rank=VICTIM, pp_size=WORLD
+    )
+    effective, amended = h._pp_void_retracted_pass(effective, amended)
+    schedule = h._pp_forwarded_schedule_from(amended)
+    res["schedule_order"] = list(schedule)
+
+    local_queue_order = [RID_B, RID]
+    adder = _adder(schedule or None)
+    for rid in local_queue_order:
+        adder.add_one_req(
+            _Req(prefix_len=0, host_resident=0, rid=rid, total=ORDER_EXTEND),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+    res["local_order"] = [r.rid for r in adder.can_run_list]
+
+    # THE SHIPPED REORDER, taken through this module's globals so the
+    # child-side neuter reaches it.
+    batch = h._pp_order_batch_by_schedule(adder.can_run_list, schedule)
+    res["batch_order"] = [r.rid for r in batch]
+
+    got = h._pp_recv_proxy_tensors(LIVE_MB)
+    hs = got["hidden_states"]
+    res["rows"] = int(hs.shape[0])
+    res["batch_tokens"] = sum(int(r.extend_range.length) for r in batch)
+    # model_runner.forward's own expression. EQUAL on both arms -- that is the
+    # point of this test.
+    res["mismatch"] = res["rows"] != res["batch_tokens"]
+
+    # THE IDENTITY CHECK, which is the only thing that can see a permutation.
+    # Walk the delivered rows in batch order and ask, per request, whether the
+    # rows it is about to compute on are its OWN.
+    foreign = 0
+    pos = 0
+    for req in batch:
+        n = int(req.extend_range.length)
+        want = ORDER_TAG[req.rid]
+        foreign += sum(1 for v in hs[pos : pos + n, 0].tolist() if float(v) != want)
+        pos += n
+    res["foreign_rows"] = foreign
+
+    tail = h._pp_recv_typed_dict(expected_kind="output")
+    res["sentinel"] = int(tail["next_token_ids"][0].item())
+
+
+def _producer_pass(h, decision, res):
+    """The victim EXECUTING a decision that came off the REAL producer.
+
+    Nothing in this arm constructs a geometry: the numbers were produced by
+    PP0's own `PrefillAdder` run and carried over gloo. That is the whole
+    difference between this arm and the seventeen that were green while
+    instr21 died.
+    """
+    from sglang.srt.managers.pp_admission_congruence import (
+        reconcile_pp_admission_decision,
+    )
+
+    effective, amended = reconcile_pp_admission_decision(
+        decision, {RID: LONG_PROMPT_PREFIX}, rank=VICTIM, pp_size=WORLD
+    )
+    effective, amended = h._pp_void_retracted_pass(effective, amended)
+    schedule = h._pp_forwarded_schedule_from(amended)
+    res["schedule"] = {k: list(v) for k, v in schedule.items()}
+
+    req = _Req(prefix_len=LONG_PROMPT_PREFIX, host_resident=0, total=LONG_PROMPT_TOKENS)
+    adder = _adder(schedule or None)
+    adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+    res["batch_tokens"] = int(req.extend_range.length)
+
+    got = h._pp_recv_proxy_tensors(LIVE_MB)
+    res["rows"] = int(got["hidden_states"].shape[0])
+    res["mismatch"] = res["rows"] != res["batch_tokens"]
+
+    tail = h._pp_recv_typed_dict(expected_kind="output")
+    res["sentinel"] = int(tail["next_token_ids"][0].item())
+
+
 def _worker(rank, init_file, out_dir, case):
     res = {"rank": rank, "ok": False, "error": None}
     try:
@@ -393,19 +562,53 @@ def _worker(rank, init_file, out_dir, case):
             )
 
             wire = _GlooWire(rank, src=DOWNSTREAM, dst=VICTIM)
-            msg = pp_admission_decision_to_wire(_pp0_decision())
+            if case == "order":
+                decision = _order_decision()
+                proxy = _order_proxy()
+            elif case == "producer":
+                # THE REAL PRODUCER PATH: PP0 runs the shipped adder on a
+                # ~17000-token prompt with a 512 chunk, and the decision is
+                # built from the batch it actually assembled.
+                decision, pp0_adder = _pp0_builds_its_own_decision(
+                    [
+                        _Req(
+                            prefix_len=LONG_PROMPT_PREFIX,
+                            host_resident=0,
+                            total=LONG_PROMPT_TOKENS,
+                        )
+                    ]
+                )
+                ran = int(pp0_adder.can_run_list[0].extend_range.length)
+                res["pp0_ran"] = ran
+                res["pp0_forwarded"] = [
+                    [e.prefix_len, e.extend_len] for e in decision.entries
+                ]
+                proxy = {
+                    "__msg_type__": "proxy",
+                    "__stamp__": (LIVE_MB, PROXY_SEQ, ran, FLIP_EPOCH),
+                    "hidden_states": torch.zeros(ran, 4),
+                }
+            else:
+                decision = _pp0_decision()
+                proxy = _proxy()
+            msg = pp_admission_decision_to_wire(decision)
             msg["__msg_type__"] = "admission_decision"
             msg["__pp_output_expected__"] = True
             msg["__pp_pass_voided__"] = False
             msg["__pp_upstream_launched__"] = True
             wire.send_tensor_dict(tensor_dict=msg)
-            wire.send_tensor_dict(tensor_dict=_proxy())
+            wire.send_tensor_dict(tensor_dict=proxy)
             wire.send_tensor_dict(tensor_dict=_sentinel())
         elif rank == VICTIM:
             h = _holder(_GlooWire(rank, src=UPSTREAM, dst=DOWNSTREAM), VICTIM)
             decision = h._pp_recv_admission_decision()
             assert decision.mb_id == LIVE_MB, f"wrong slot on the wire: {decision}"
-            _victim_pass(h, decision, res)
+            if case == "order":
+                _order_pass(h, decision, res)
+            elif case == "producer":
+                _producer_pass(h, decision, res)
+            else:
+                _victim_pass(h, decision, res)
             h._pp_send_admission_decision(
                 decision,
                 expects_output=False,
@@ -448,6 +651,40 @@ def _blind_forwarded_schedule(rank, init_file, out_dir, case):
     from sglang.srt.managers import scheduler_pp_mixin as m
 
     m.forwarded_schedule = lambda decision: {}
+    return _worker(rank, init_file, out_dir, case)
+
+
+def _blind_executed_extent(rank, init_file, out_dir, case):
+    """THE PRODUCER CAN-FAIL: the first rank reports what it was OFFERED
+    instead of what it RAN, and nothing else, IN THE CHILD.
+
+    `_executed_extent` returning None is exactly the pre-instr22 producer:
+    `build_pp_admission_decision` then falls through to its legacy arithmetic
+    (`len(full_untruncated_fill_ids) - prefix`), which under chunked prefill
+    is the whole remaining prompt and never the chunk. Every function still
+    exists and still runs its own body -- the producer, the executor, the
+    refusal, the reconcile -- so an AttributeError is impossible.
+
+    Rebound in `pp_admission_congruence`'s own globals because that is where
+    `build_pp_admission_decision` resolves it.
+    """
+    from sglang.srt.managers import pp_admission_congruence as c
+
+    c._executed_extent = lambda req: None
+    return _worker(rank, init_file, out_dir, case)
+
+
+def _blind_order(rank, init_file, out_dir, case):
+    """THE ORDER CAN-FAIL: the batch keeps this rank's own order.
+
+    `order_batch_by_schedule` returning the input unchanged is the behaviour
+    that shipped before this function existed. It still exists, still has its
+    signature, and `_pp_order_batch_by_schedule` still runs its own body and
+    still calls it.
+    """
+    from sglang.srt.managers import scheduler_pp_mixin as m
+
+    m.order_batch_by_schedule = lambda reqs, schedule: list(reqs)
     return _worker(rank, init_file, out_dir, case)
 
 
@@ -518,6 +755,94 @@ class PPForwardedSchedule791(unittest.TestCase):
         self.assertEqual(out[DOWNSTREAM]["schedule"], out[VICTIM]["schedule"])
 
 
+class PPProducerReportsWhatItRan791(unittest.TestCase):
+    """THE ARM THAT WOULD HAVE CAUGHT instr21, and did not exist.
+
+    Every other live arm in this file CONSTRUCTS the decision. A suite can be
+    exhaustive about the executor and blind to the producer feeding it, which
+    is exactly what 17/17 green meant while the first rank forwarded a
+    geometry no rank had run.
+    """
+
+    def test_red_the_producer_forwards_the_whole_prompt(self):
+        """RED, and it is instr21 to the token: PP0 RUNS a 512-token chunk and
+        FORWARDS 16983, so the victim builds 16983 against 512 rows."""
+        out = _run(_blind_executed_extent, case="producer")
+        up, v = out[UPSTREAM], out[VICTIM]
+        self.assertIsNone(up["error"], up["error"])
+        self.assertIsNone(v["error"], v["error"])
+        self.assertEqual(up["pp0_ran"], TOLD_EXTEND, "PP0 really chunked to 512")
+        self.assertEqual(
+            up["pp0_forwarded"],
+            [[LONG_PROMPT_PREFIX, LONG_PROMPT_EXTEND]],
+            "the producer reported the whole prompt, not the chunk",
+        )
+        self.assertEqual(v["batch_tokens"], LONG_PROMPT_EXTEND)
+        self.assertEqual(v["rows"], TOLD_EXTEND)
+        self.assertTrue(
+            v["mismatch"],
+            f"instr21: {v['rows']} row(s) for a 1 batch of "
+            f"{v['batch_tokens']} token(s)",
+        )
+
+    def test_green_the_producer_forwards_the_chunk_it_ran(self):
+        """GREEN. The decision is built from PP0's assembled `can_run_list`,
+        reading `extend_range` -- the SAME field `prepare_for_extend` sizes
+        the tensor from and the SAME field `model_runner`'s shape check
+        compares against. One expression, not two that ought to agree."""
+        out = _run(_worker, case="producer")
+        up, v = out[UPSTREAM], out[VICTIM]
+        self.assertIsNone(up["error"], up["error"])
+        self.assertIsNone(v["error"], v["error"])
+        self.assertEqual(up["pp0_ran"], TOLD_EXTEND)
+        self.assertEqual(
+            up["pp0_forwarded"],
+            [[LONG_PROMPT_PREFIX, TOLD_EXTEND]],
+            "the producer must report the chunk it ran",
+        )
+        self.assertEqual(v["schedule"], {RID: [LONG_PROMPT_PREFIX, TOLD_EXTEND]})
+        self.assertEqual(v["batch_tokens"], TOLD_EXTEND)
+        self.assertEqual(v["rows"], TOLD_EXTEND)
+        self.assertFalse(v["mismatch"])
+        self.assertEqual(v["sentinel"], SENTINEL_TOKEN)
+
+
+class PPScheduleOrder791(unittest.TestCase):
+    """rid ORDER: the one divergence that yields EQUAL WIDTHS, so every width
+    check on this branch is blind to it and only an identity can see it."""
+
+    def test_red_the_local_order_survives_and_every_row_is_foreign(self):
+        """RED. Same rid set, same total width, reversed order: 512 rows for a
+        512-token batch, `mismatch` FALSE -- and all 512 rows belong to the
+        other request. This is what a width check cannot see."""
+        out = _run(_blind_order, case="order")
+        v = out[VICTIM]
+        self.assertIsNone(v["error"], v["error"])
+        self.assertEqual(v["schedule_order"], [RID, RID_B])
+        self.assertEqual(v["local_order"], [RID_B, RID])
+        self.assertEqual(v["batch_order"], [RID_B, RID], "the neuter kept local order")
+        self.assertEqual(v["rows"], 2 * ORDER_EXTEND)
+        self.assertEqual(v["batch_tokens"], 2 * ORDER_EXTEND)
+        self.assertFalse(v["mismatch"], "THE WIDTHS MATCH -- that is the hazard")
+        self.assertEqual(
+            v["foreign_rows"],
+            2 * ORDER_EXTEND,
+            "every row computed on the wrong request's metadata",
+        )
+
+    def test_green_the_batch_is_reordered_into_the_forwarded_order(self):
+        out = _run(_worker, case="order")
+        v = out[VICTIM]
+        self.assertIsNone(v["error"], v["error"])
+        self.assertEqual(v["local_order"], [RID_B, RID])
+        self.assertEqual(v["batch_order"], [RID, RID_B], "the forwarded order wins")
+        self.assertEqual(v["rows"], 2 * ORDER_EXTEND)
+        self.assertEqual(v["batch_tokens"], 2 * ORDER_EXTEND)
+        self.assertFalse(v["mismatch"])
+        self.assertEqual(v["foreign_rows"], 0, "every row on its own request")
+        self.assertEqual(v["sentinel"], SENTINEL_TOKEN)
+
+
 class PPForwardedSchedulePure791(unittest.TestCase):
     """The pure half: no processes, no wire."""
 
@@ -580,10 +905,12 @@ class PPForwardedSchedulePure791(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn(str(PROMPT_TOKENS), reason)
 
-    def test_an_empty_extend_is_refused_not_run(self):
-        """A pass that computes nothing for a named request is not a smaller
-        pass, it is a different one."""
-        self.assertIsNotNone(
+    def test_a_zero_extend_the_upstream_ran_is_executed_verbatim(self):
+        """Once the producer reports the EXECUTED geometry, a zero is a
+        faithful report of a first rank that ran zero rows -- a chunk landing
+        exactly on its last token. Refusing it would void a pass the upstream
+        ran perfectly well."""
+        self.assertIsNone(
             schedule_refusal_reason(
                 rid=RID,
                 scheduled_prefix_len=TOLD_PREFIX,
@@ -592,6 +919,134 @@ class PPForwardedSchedulePure791(unittest.TestCase):
                 local_fill_len=PROMPT_TOKENS,
             )
         )
+
+    def test_a_negative_extend_is_not_a_length(self):
+        self.assertIsNotNone(
+            schedule_refusal_reason(
+                rid=RID,
+                scheduled_prefix_len=TOLD_PREFIX,
+                scheduled_extend_len=-1,
+                local_prefix_len=TOLD_PREFIX,
+                local_fill_len=PROMPT_TOKENS,
+            )
+        )
+
+
+class PPProducerNoGeometry791(unittest.TestCase):
+    """`extend_range is None` is REACHABLE -- `reset_for_retract` sets it
+    (schedule_batch.py:1588), which is how boot instr19 died at
+    scheduler.py:5572 -- so the producer owes it a defined answer."""
+
+    def test_the_production_call_site_refuses_a_torn_down_request(self):
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        req = _Req(prefix_len=0, host_resident=0)
+        self.assertIsNone(req.extend_range, "a fresh Req carries None")
+        with self.assertRaises(PPScheduleRefused) as ctx:
+            build_pp_admission_decision(
+                LIVE_MB, [req], pp_size=WORLD, require_executed_geometry=True
+            )
+        self.assertIn(RID, str(ctx.exception))
+        self.assertIn("extend_range", str(ctx.exception))
+
+    def test_the_refusal_fires_before_any_geometry_is_emitted(self):
+        """A torn-down request among healthy ones must not let a partial
+        decision out: the whole build refuses."""
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        healthy = _Req(prefix_len=0, host_resident=0, rid=RID_B)
+        healthy.set_extend_range(0, TOLD_EXTEND)
+        with self.assertRaises(PPScheduleRefused):
+            build_pp_admission_decision(
+                LIVE_MB,
+                [healthy, _Req(prefix_len=0, host_resident=0)],
+                pp_size=WORLD,
+                require_executed_geometry=True,
+            )
+
+    def test_a_stand_in_without_the_flag_keeps_the_legacy_arithmetic(self):
+        """The default keeps the #630 / #796 stand-ins working; they carry no
+        adder output and never reach a real batch."""
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        decision = build_pp_admission_decision(
+            LIVE_MB, [_Req(prefix_len=0, host_resident=0)], pp_size=WORLD
+        )
+        self.assertEqual(decision.entries[0].extend_len, PROMPT_TOKENS)
+
+    def test_a_zero_length_executed_range_is_reported_not_suppressed(self):
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        req = _Req(prefix_len=0, host_resident=0)
+        req.set_extend_range(PROMPT_TOKENS, PROMPT_TOKENS)
+        decision = build_pp_admission_decision(
+            LIVE_MB, [req], pp_size=WORLD, require_executed_geometry=True
+        )
+        self.assertEqual(decision.entries[0].prefix_len, PROMPT_TOKENS)
+        self.assertEqual(decision.entries[0].extend_len, 0)
+
+    def test_the_guard_is_not_re_applied_to_an_executed_geometry(self):
+        """The old comment called the second `prefix_len_for` idempotent. It
+        is not: the loop clamps `prefix_indices` BEFORE `add_one_req`, and the
+        host load-back grows it again AFTER -- so re-clamping here would move
+        the difference into `extend_len` and name a third geometry."""
+        from sglang.srt.managers.pp_admission_congruence import (
+            PPAdmissionCongruenceGuard,
+            build_pp_admission_decision,
+        )
+
+        guard = PPAdmissionCongruenceGuard()
+        guard._learned_floor[RID] = 0  # a floor outstanding from a retraction
+        req = _Req(prefix_len=PREFETCHED_PREFIX, host_resident=0)
+        req.set_extend_range(PREFETCHED_PREFIX, PREFETCHED_PREFIX + TOLD_EXTEND)
+        decision = build_pp_admission_decision(
+            LIVE_MB,
+            [req],
+            pp_size=WORLD,
+            guard=guard,
+            require_executed_geometry=True,
+        )
+        self.assertEqual(decision.entries[0].prefix_len, PREFETCHED_PREFIX)
+        self.assertEqual(decision.entries[0].extend_len, TOLD_EXTEND)
+
+
+class PPOrderBatchBySchedule791(unittest.TestCase):
+    def test_an_empty_schedule_is_the_untouched_default_path(self):
+        from sglang.srt.managers.pp_admission_congruence import (
+            order_batch_by_schedule,
+        )
+
+        reqs = [_Req(0, 0, rid=RID_B), _Req(0, 0, rid=RID)]
+        self.assertEqual(
+            [r.rid for r in order_batch_by_schedule(reqs, {})],
+            [RID_B, RID],
+        )
+
+    def test_the_forwarded_order_is_applied(self):
+        from sglang.srt.managers.pp_admission_congruence import (
+            order_batch_by_schedule,
+        )
+
+        reqs = [_Req(0, 0, rid=RID_B), _Req(0, 0, rid=RID)]
+        ordered = order_batch_by_schedule(reqs, {RID: (0, 1), RID_B: (0, 1)})
+        self.assertEqual([r.rid for r in ordered], [RID, RID_B])
+
+    def test_an_already_congruent_order_is_unchanged(self):
+        from sglang.srt.managers.pp_admission_congruence import (
+            order_batch_by_schedule,
+        )
+
+        reqs = [_Req(0, 0, rid=RID), _Req(0, 0, rid=RID_B)]
+        ordered = order_batch_by_schedule(reqs, {RID: (0, 1), RID_B: (0, 1)})
+        self.assertEqual([r.rid for r in ordered], [RID, RID_B])
 
     def test_no_mapping_is_the_untouched_default_path(self):
         """`scheduled_extent_for` must answer None for every rank that owns
