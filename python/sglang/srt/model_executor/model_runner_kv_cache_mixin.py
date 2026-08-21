@@ -6181,6 +6181,10 @@ class ModelRunnerKVCacheMixin:
         if cached is not None:
             return cached
         self._flip_draft_bytes_cached = 0
+        # NOTE: this returns the DRAFT WEIGHTS only. It is a component of
+        # _post_sizing_stack_bytes, which is the term actually charged; it is
+        # not charged on its own, because charging the members of that set one
+        # at a time is what produced two boots and two different OOMs.
         if getattr(self, "is_draft_worker", False) or getattr(
             self, "is_phase_flip_tp_stack", False
         ):
@@ -6221,6 +6225,54 @@ class ModelRunnerKVCacheMixin:
             charged / 1048576.0,
         )
         return self._flip_draft_bytes_cached
+
+    def _post_sizing_stack_bytes(self: ModelRunner) -> int:
+        """ONE post for everything the flip's TP stack build creates later.
+
+        The members -- the arena above the PP weights, the flip draft's
+        weights, its attention-backend workspaces, its CUDA graphs -- are all
+        allocated at scheduler.py:1442, after this solve. Charging them one at
+        a time produced two boots and two different OOMs at two different
+        lines, which is why this is a single term. See
+        ``arena_tail_probe.post_sizing_stack_bytes``.
+
+        Requires the layout derivation, which the caller runs first. Without
+        it the charge is 0 and the boot sizes exactly as it did before the
+        term existed -- the sizing that OOMs once the pool is large enough.
+        """
+        cached = getattr(self, "_post_sizing_stack_cached", None)
+        if cached is not None:
+            return cached
+        self._post_sizing_stack_cached = 0
+        derivation = getattr(self, "_arena_tail_derivation", None)
+        if derivation is None:
+            return 0
+        from sglang.srt.managers import arena_tail_probe as probe
+
+        rank = int(self._seam_world_rank())
+        layout_pp, layout_tp = derivation
+        draft = self._flip_draft_residency_bytes()
+        charged = probe.post_sizing_stack_bytes(rank, layout_pp, layout_tp, draft)
+        self._post_sizing_stack_cached = int(charged)
+        logger.info(
+            "%s (rank %d): POST-SIZING STACK POST %.1f MiB charged against the "
+            "KV budget = arena above the PP weights %.1f + flip-draft weights "
+            "%.1f + measured stack residual %.1f (backends, graphs). Every "
+            "member is created by build_phase_flip_tp_stack AFTER this solve; "
+            "they are charged as ONE term because charging them separately "
+            "cost two boots and two different OOMs.",
+            probe.LOG_PREFIX,
+            rank,
+            charged / 1048576.0,
+            max(0, layout_tp - layout_pp) / 1048576.0,
+            draft / 1048576.0,
+            float(
+                probe.STACK_RESIDUAL_MIB[rank]
+                if rank < len(probe.STACK_RESIDUAL_MIB)
+                else 0
+            ),
+        )
+        return self._post_sizing_stack_cached
 
     def _maybe_price_cold_arena_tail(self: ModelRunner, reserve):
         """On a COLD record only, charge the arena tail this boot DERIVED.
@@ -6340,9 +6392,7 @@ class ModelRunnerKVCacheMixin:
             # from the budget rather than folded into the seam reserve: it is
             # resident weight, not a seam cost, and a term that is charged
             # under the wrong name is a term the next reader misprices.
-            budget_bytes = max(
-                0, int(budget_bytes) - self._flip_draft_residency_bytes()
-            )
+            budget_bytes = max(0, int(budget_bytes) - self._post_sizing_stack_bytes())
         reserve = self._maybe_price_cold_seam(self._seam_reserve(), configurator)
         reserve = self._maybe_price_cold_arena_tail(reserve)
 

@@ -271,6 +271,57 @@ def derive_flip_draft_bytes(load_config, server_args, vector, world_rank) -> int
             torch.cuda.empty_cache()
 
 
+#: MiB of post-sizing stack demand that is NOT the arena delta and NOT the
+#: draft weights: the draft's flashinfer workspaces, the decode CUDA graphs and
+#: the stack's own bookkeeping. Measured, per rank, on the one boot that
+#: SURVIVED the whole build -- 735-tail785 -- as the net VRAM consumed between
+#: "Memory pool end" and the end of build_phase_flip_tp_stack, minus the two
+#: terms above:
+#:
+#:     rank 0   10.60 -> 6.95 GB = 3.65 net, minus 0 arena delta, minus 1.407
+#:              draft                                   -> 2294 MiB
+#:     rank 1    8.94 -> 5.91 GB = 3.03 net, minus 0.551 arena delta, minus
+#:              1.320 draft                             -> 1188 MiB
+#:     rank 2    5.92 -> 3.99 GB = 1.93 net, minus 0 arena delta, minus 1.320
+#:              draft                                   ->  625 MiB
+#:
+#: The TP stack's own KV pools cost nothing here and that is checked rather
+#: than assumed: the boot logs "Memory pool end" nine times, and the second and
+#: third readings on each rank are identical to the first (PP0 7.69 / 7.69), so
+#: those pools REBIND the existing allocation instead of allocating a second
+#: one. Charging them would have been charging the pool against itself.
+STACK_RESIDUAL_MIB = (2294, 1188, 625)
+
+
+def post_sizing_stack_bytes(
+    rank: int, layout_pp_bytes: int, layout_tp_bytes: int, draft_bytes: int
+) -> int:
+    """ONE post for everything ``build_phase_flip_tp_stack`` creates.
+
+    WHY THIS IS ONE TERM AND NOT THREE. Everything that build creates is
+    allocated at scheduler.py:1442, after the pool is solved at :1425 -- the
+    arena, the flip draft's weights, its attention-backend workspaces, its
+    CUDA graphs. Each was invisible to the solve for the same reason, and each
+    only became fatal once the pool grew enough to remove the accidental slack
+    that had been paying for it. Charging them one at a time produced two
+    boots and two different OOMs at two different lines (735-full785 in
+    ct_embedding.create_weights, 735-draft785 in the flashinfer prefill
+    backend), which is the evidence that the shape was wrong rather than the
+    numbers.
+
+    The first two components are DERIVED exactly for this boot, so they track
+    the cut and the vector: the arena exceeds the PP weights by
+    ``max(0, layout_tp - layout_pp)`` (the PP originals are snapshotted to
+    host during the build, so what stays is the arena), and the draft weights
+    come from the same meta probe. Only the remainder is a measured constant,
+    and it is measured on a boot that lived through the build rather than
+    inferred from one that died in it.
+    """
+    arena_over_weights = max(0, int(layout_tp_bytes) - int(layout_pp_bytes))
+    residual = STACK_RESIDUAL_MIB[rank] if 0 <= rank < len(STACK_RESIDUAL_MIB) else 0
+    return arena_over_weights + int(draft_bytes) + int(residual) * 1048576
+
+
 def derive_arena_tail_bytes(
     model_config,
     load_config,
