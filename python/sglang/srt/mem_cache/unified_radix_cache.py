@@ -448,6 +448,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
+        # #581/#773: give the request pool a handle back, so a REQUIRED mamba
+        # allocation can evict cached checkpoints before failing. `MambaRadixCache`
+        # has always done this at construction; this lineage never did, which
+        # left `_alloc_mamba_slots_or_evict`'s evict-then-retry (and #639b's
+        # rank-parity tombstone branch) unreachable on every hybrid-SSM boot
+        # routed here -- i.e. the pool reported exhaustion while cached,
+        # evictable checkpoints were sitting in the tree.
+        if hasattr(self.req_to_token_pool, "bind_tree_cache"):
+            self.req_to_token_pool.bind_tree_cache(self)
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def _wait_bounded(self, work, label: str) -> None:
@@ -683,6 +692,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        # #773: resolved lazily -- the pool and the server args are both in
+        # place by the first backup, but not necessarily at construction.
+        self._mamba_pin_budget_cached: Optional[int] = None
+        self._mamba_pin_skipped = 0
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1072,12 +1085,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1770,6 +1783,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
+            return 0
+
+        # #581 pin budget, #773: a write-through pin on a node that carries a
+        # mamba checkpoint makes its STATE SLOT unevictable until the ack
+        # drains. Beyond the budget, skip the backup entirely rather than pin
+        # another slot -- the state stays cached on the device and stays
+        # EVICTABLE, so the pool can always serve the running set's required
+        # allocations. Backing off here costs at most a host-tier miss; not
+        # backing off costs the scheduler.
+        #
+        # Checked BEFORE the parent recursion and before any transfer is
+        # built, so a refusal neither forces a parent backup this node will
+        # not use nor strands a host allocation.
+        if not self._mamba_write_through_pin_admissible(node, write_back=write_back):
+            self._note_mamba_pin_skipped()
             return 0
 
         # Backup invariant (write-through): parent must be backuped first
@@ -2835,8 +2863,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             current = getattr(self.cache_controller, "storage_backend_type", None)
             if current == storage_backend:
                 return True, (
-                    f"HiCache storage backend {storage_backend!r} is already "
-                    f"attached."
+                    f"HiCache storage backend {storage_backend!r} is already attached."
                 )
             return False, (
                 f"A different HiCache storage backend is already attached "
@@ -3249,6 +3276,97 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             count += 1
         return count
+
+    def _mamba_pins_held(self) -> int:
+        """Mamba state slots currently pinned by in-flight write-throughs."""
+        return self._mamba_pins_in(self.ongoing_write_through)
+
+    @property
+    def _mamba_pin_budget(self) -> int:
+        """How many state slots retention may hold pinned at once.
+
+        The pool above the hard floor -- see
+        :func:`mamba_pool_floor.mamba_retention_pin_budget` for why that is
+        the right number and what happens without it (#581).
+        """
+        if self._mamba_pin_budget_cached is None:
+            from sglang.srt.mem_cache.mamba_pool_floor import (
+                mamba_retention_pin_budget,
+            )
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            if mamba_pool is None:
+                # No mamba pool on this tree: nothing to protect, and the
+                # guard must never refuse a backup it cannot be about. -1
+                # reads as "unbounded" at the single comparison below.
+                self._mamba_pin_budget_cached = -1
+            else:
+                self._mamba_pin_budget_cached = mamba_retention_pin_budget(
+                    server_args,
+                    server_args.max_running_requests or 1,
+                    mamba_pool.size,
+                )
+        return self._mamba_pin_budget_cached
+
+    def _mamba_write_through_pin_admissible(
+        self, node: UnifiedTreeNode, write_back: bool = False
+    ) -> bool:
+        """May this backup take a write-through pin on a mamba checkpoint?
+
+        Three ways to be admissible without consulting the budget at all, and
+        each is a case where the backup costs no state slot:
+
+        * ``write_back=True`` -- the demotion path never calls
+          ``inc_lock_ref`` (see ``write_backup``), so it pins nothing;
+        * the node carries no mamba value -- ``acquire_component_lock`` takes
+          a MAMBA ref only on a node that has one, so a KV-only node's pin
+          costs no state slot and refusing it would lose a host copy for
+          nothing;
+        * there is no mamba pool on this tree.
+
+        Otherwise the pin is charged against the budget. Refusing here costs
+        at most a host-tier miss: the state stays cached on the device and
+        stays EVICTABLE, so the pool can always serve the running set. Not
+        refusing costs the scheduler.
+        """
+        if write_back:
+            return True
+        budget = self._mamba_pin_budget
+        if budget < 0:
+            return True
+        if ComponentType.MAMBA not in self.tree_components:
+            return True
+        if node is self.root_node:
+            return True
+        if len(node.component_data) <= int(ComponentType.MAMBA):
+            return True
+        if node.component_data[ComponentType.MAMBA].value is None:
+            return True
+        return self._mamba_pins_held() < budget
+
+    def _note_mamba_pin_skipped(self) -> None:
+        """Count and (rate-limited) announce a backup declined by the budget.
+
+        A persistent count is a real signal, not noise: it means the
+        write-through ack drain is not keeping up with insert pressure, so
+        the host tier is being fed slower than the tree is producing
+        checkpoints. The pool is safe either way -- that is the point of the
+        budget -- but the host-tier hit rate is paying for it.
+        """
+        self._mamba_pin_skipped += 1
+        if self._mamba_pin_skipped <= 3 or self._mamba_pin_skipped % 1000 == 0:
+            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            logger.warning(
+                "mamba write-through pin budget reached (%d in flight, "
+                "budget=%d, pool=%s): skipping the host backup of this "
+                "checkpoint to keep its state slot evictable. occurrence=%d",
+                self._mamba_pins_held(),
+                self._mamba_pin_budget,
+                "?" if mamba_pool is None else mamba_pool.size,
+                self._mamba_pin_skipped,
+            )
 
     def _emit_pin_trace(self) -> None:
         """One line per rank per N ticks; counters are since the previous line."""

@@ -166,6 +166,37 @@ def mamba_hard_floor(server_args: "ServerArgs", max_running_requests: int) -> in
     return max(1, int(max_running_requests)) * per_req
 
 
+def mamba_retention_pin_budget(
+    server_args: "ServerArgs",
+    max_running_requests: int,
+    mamba_pool_size: int,
+) -> int:
+    """Slots cache RETENTION may pin at once: the pool above the hard floor.
+
+    The floor says what the running set structurally requires. Everything
+    above it is cache, and cache may pin every slot the running set does not
+    require -- and not one more. That is what turns the floor from an
+    arithmetic exercise into a guarantee: a REQUIRED allocation (the active
+    state slot, the ping-pong buffer) always has somewhere to go no matter how
+    far behind the write-through ack drain is, independently of any drain
+    rate.
+
+    Without this cap a `--hicache-write-policy write_through` boot pins EVERY
+    inserted checkpoint the moment it is created (the write-through threshold
+    is 1), the eviction walk skips pinned nodes, and the pinned set ratchets
+    until it owns the pool: #581, where raising `--max-mamba-cache-size` only
+    buys time because the ratchet scales with the pool.
+
+    Single source of truth for BOTH cache lineages on purpose. The bound used
+    to exist only inside `HiMambaRadixCache`, which `registry.py` documents as
+    having no construction site anywhere -- so every hybrid-SSM boot under
+    hierarchical cache was charged the floor while running unbounded. Deriving
+    it here means a lineage cannot silently ship without it again.
+    """
+    floor = mamba_hard_floor(server_args, max_running_requests)
+    return max(0, int(mamba_pool_size) - floor)
+
+
 def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -> str:
     """Human-readable derivation, for error messages and boot logs."""
     per_req = mamba_slots_per_running_req(server_args)
