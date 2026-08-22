@@ -7032,6 +7032,32 @@ class ModelRunnerKVCacheMixin:
                     used_b >> 20,
                 )
                 available_bytes = kv_allow
+        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+        # #797: name which install-capable branch this boot took, and with what
+        # inputs. Both branches below can decline silently, and a declined
+        # install is indistinguishable in the log from an install that ran and
+        # agreed with the active vector. The ordering this exposes is the point:
+        # this method runs from Scheduler.init_model_worker's init_memory_pools
+        # (scheduler.py:1429), which is BEFORE build_phase_flip_tp_stack
+        # (scheduler.py:1446) performs the first set_cp_token_ratios
+        # (phase_flip_boot.py:971-990). So on a phase-flip boot the token vector
+        # is typically NOT YET INSTALLED here -- get_cp_token_ratios() is None
+        # and uneven_dcp_active() is False -- and the install-capable site
+        # declines for lack of a vector to improve on, while the site that DOES
+        # have the measured capacities (post_capture_resize_kv_pool) is
+        # hint-only. One line per rank per boot.
+        logger.info(
+            "#797 install-capable sizing reached: post_capture_kv_active=%s "
+            "derived_mode=%s token_vector_is_seed=%s role=%r dcp_size=%d "
+            "active_vector=%r. Install is attempted only on a taken branch.",
+            self.post_capture_kv_active,
+            self.server_args.uneven_kv_derived_mode(),
+            self.server_args.uneven_token_vector_is_seed(),
+            envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get(),
+            self.dcp_size,
+            get_cp_token_ratios(),
+        )
         if not self.post_capture_kv_active:
             # Uneven-TP self-calibration on the final profiled budget;
             # with post-capture sizing the (more accurate) post-capture
