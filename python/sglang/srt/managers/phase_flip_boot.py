@@ -537,8 +537,7 @@ def refill_report(
     mib = nbytes / 1048576.0
     rate = (mib / elapsed) if elapsed > 0 else 0.0
     head = (
-        f"REFILL {direction} took {elapsed:.3f} s for {mib:.1f} MiB "
-        f"({rate:.0f} MiB/s)"
+        f"REFILL {direction} took {elapsed:.3f} s for {mib:.1f} MiB ({rate:.0f} MiB/s)"
     )
     if not file_backed:
         # The pinned arm IS the reference path, so it is measured against the
@@ -719,11 +718,16 @@ class PhaseFlipStacks:
         elapsed = _time.perf_counter() - started
         # #677: FEED THE ECONOMICS THE MEASURED LEG, NOT A REMEMBERED ONE.
         # The flip policy priced a leg at a 3.2 s pinned-era constant while the
-        # file-backed arm measures 22-24 s -- 7.03x too cheap, which moved
+        # file-backed arm measured 22-24 s -- 7.03x too cheap, which moved
         # break-even from 49,248 tokens to 7,004 and is why flips churn. The
         # estimator is inert until it is fed, and this is the only place in the
         # process that knows what a leg actually cost, because it is the timer
         # that brackets the copy.
+        # #802 then repriced the leg downward (slowest rank 11.070 -> 4.246 s,
+        # whole flip 12.121 -> 4.998 s) by reading the image instead of
+        # faulting it. That is exactly why this feeds a MEASUREMENT and not a
+        # constant: the regime changed underneath the number, and the estimator
+        # followed it without anyone editing a threshold.
         try:
             from sglang.srt.managers.phase_policy import observe_flip_cost
 

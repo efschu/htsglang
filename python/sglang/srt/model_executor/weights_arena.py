@@ -561,6 +561,14 @@ def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) 
     buffered reads from kernel threads that the caller is never charged for,
     which is why ``read_bytes`` is not a usable instrument on the other arms
     and the fault count is.
+
+    ON METAL, A/B on one binary under the same load, with the same bytes
+    moved: the slowest rank's leg went 11.070 s -> 4.246 s and the whole flip
+    12.121 s -> 4.998 s. The per-rank RATES carry the mechanism. On the fault
+    path they CONVERGE -- 821 and 775 MiB/s on ranks whose PCIe links differ
+    by 1.80x -- which is what says no DMA took part. With the read path they
+    DIVERGE again (2651 / 2602 / 3751 MiB/s, PP0 ahead on its better link),
+    because the transfer is real and the link is allowed to matter.
     """
     pool = _refill_staging_pool(_refill_chunk_bytes(), _refill_depth())
     chunk = pool.page_bytes
@@ -663,6 +671,16 @@ def _file_backed_image(total: int) -> torch.Tensor:
     (8-14 s for a full weight set on this same pool) is the same-medium
     cold anchor. That price is why this arm is OPT-IN and the default stays
     pinned and byte-identical.
+
+    #802 -- THAT COST MODEL WAS WRONG ABOUT THE RECLAIMED CASE, and the
+    correction is why ``_staged_file_refill`` exists. The reclaimed read was
+    never "bounded by the pool's sequential rate": ``arena_refill`` copied
+    straight off the MAPPING, so it took one synchronous major fault per
+    4 KiB page (4 077 015 of them for the 16.7 GB image) and reached
+    1 108 MiB/s on a pool that writes at ~3 500 MiB/s. Nothing about that is
+    sequential-rate-bound -- it is fault-latency-bound, and no DMA takes part
+    on either side. Reading the file instead restores the model the docstring
+    claimed: on metal the slowest rank's leg is 4.246 s, not 11.070 s.
 
     REFUSES rather than falls back: an enabled arm that quietly pinned
     would claim reclaimability the host ledger then plans on (the #742

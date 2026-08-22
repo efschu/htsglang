@@ -573,11 +573,27 @@ class FlipCostEstimator:
     """#677: the flip cost, MEASURED, not believed.
 
     ``DEFAULT_FLIP_COST_S = 3.2`` was derived from 997/1246/1720 ms in the
-    PINNED-image era. The file-backed arm measures 22-24 s per leg (5 flips x 3
+    PINNED-image era. The file-backed arm measured 22-24 s per leg (5 flips x 3
     ranks, ``NOTE_690_refill_commit_split.md``), and the live boot's own policy
     line still reads ``break-even 3.2s ... N=7004`` against a true break-even of
     ~49,250 tokens. Flips were priced **7.03x too cheaply**, which also makes
     #759's IDLE-LOCK floor -- itself ``flip_tokens`` -- 7x too permissive.
+
+    #802 REPRICED THE LEG, so do not plan against 22-24 s any more. Most of
+    that number was not transfer at all: the refill copied straight off the
+    file-backed mapping and took one synchronous major fault per 4 KiB page.
+    Reading the file instead (A/B on one binary, same load, same bytes moved)
+    took the slowest rank's leg from 11.070 s to 4.246 s and the whole flip
+    from 12.121 s to 4.998 s. The signature is in the RATES: on the fault path
+    the ranks converge (821 and 775 MiB/s) despite PCIe links differing by
+    1.80x, which is what says no DMA took part; with the read path they
+    diverge again (2651 / 2602 / 3751 MiB/s) because the link matters once the
+    transfer is real.
+
+    None of this is a constant here, and deliberately so -- the estimator is
+    fed the measured leg by ``observe_flip_cost`` at every refill, so a regime
+    change like #802's reprices itself. The numbers above are provenance for
+    the reader, not inputs.
 
     A constant cannot survive a regime change it does not know about, so the
     cost is estimated from the seam's own marks instead. Four properties, each
@@ -2528,9 +2544,7 @@ def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
         try:
             from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
 
-            _warn_deprecated_env_to_cli_flag(
-                env_name, "--" + field.replace("_", "-")
-            )
+            _warn_deprecated_env_to_cli_flag(env_name, "--" + field.replace("_", "-"))
         except Exception:
             # A missing/renamed helper must never cost a boot: the warning is
             # advisory, the value below is what matters.
@@ -2555,7 +2569,10 @@ def config_from_env(
     """
     rest_state = os.environ.get(ENV_REST_STATE) or REST_DECODE
     min_dwell = _flag_or_env(
-        server_args, "phase_policy_min_dwell_s", ENV_MIN_DWELL, _env_float,
+        server_args,
+        "phase_policy_min_dwell_s",
+        ENV_MIN_DWELL,
+        _env_float,
         DEFAULT_MIN_DWELL_S,
     )
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
@@ -2611,12 +2628,18 @@ def config_from_env(
         idle_dwell_s=idle_dwell,
         rest_state=rest_state,
         pp_window_s=_flag_or_env(
-            server_args, "phase_policy_pp_window_s", ENV_PP_WINDOW, _env_float,
+            server_args,
+            "phase_policy_pp_window_s",
+            ENV_PP_WINDOW,
+            _env_float,
             DEFAULT_PP_WINDOW_S,
         ),
         tp_decode_floor_s=_flag_or_env(
-            server_args, "phase_policy_tp_decode_floor_s", ENV_TP_FLOOR,
-            _env_float, DEFAULT_TP_DECODE_FLOOR_S,
+            server_args,
+            "phase_policy_tp_decode_floor_s",
+            ENV_TP_FLOOR,
+            _env_float,
+            DEFAULT_TP_DECODE_FLOOR_S,
         ),
         # #689: the caller passes max_running_requests; the env can override
         # it, and 0/1 disables the gate and restores the previous behaviour.
@@ -2633,12 +2656,18 @@ def config_from_env(
         # against what NOT flipping costs the same decodes; without it the
         # old one-sided form is kept, unchanged.
         decode_contention=_flag_or_env(
-            server_args, "phase_policy_decode_contention", ENV_DECODE_CONTENTION,
-            _env_float, DEFAULT_DECODE_CONTENTION,
+            server_args,
+            "phase_policy_decode_contention",
+            ENV_DECODE_CONTENTION,
+            _env_float,
+            DEFAULT_DECODE_CONTENTION,
         ),
         decode_stall_slo_s=_flag_or_env(
-            server_args, "phase_policy_decode_stall_slo_s", ENV_DECODE_STALL_SLO,
-            _env_float, DEFAULT_DECODE_STALL_SLO_S,
+            server_args,
+            "phase_policy_decode_stall_slo_s",
+            ENV_DECODE_STALL_SLO,
+            _env_float,
+            DEFAULT_DECODE_STALL_SLO_S,
         ),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
         # Passed in rather than read from env: it is a runtime fact of THIS
