@@ -255,9 +255,7 @@ class KvPoolView:
                     return True
         return False
 
-    def read_rows_into(
-        self, layer: int, rows: torch.Tensor, out: torch.Tensor
-    ) -> None:
+    def read_rows_into(self, layer: int, rows: torch.Tensor, out: torch.Tensor) -> None:
         """``read_rows`` without materialising the concatenation.
 
         Writes exactly what ``read_rows`` returns into a caller-owned
@@ -392,16 +390,13 @@ class KvReshardRuntime:
         cutover_fn: Optional[Callable[[Tuple[int, ...]], None]] = None,
         guards: Sequence[str] = (),
         clock: Callable[[], float] = time.perf_counter,
-        fit_check: Optional[
-            Callable[[Tuple[int, ...]], Tuple[bool, str]]
-        ] = None,
+        fit_check: Optional[Callable[[Tuple[int, ...]], Tuple[bool, str]]] = None,
         free_bytes_fn: Optional[Callable[[], int]] = None,
         corridor_floor_bytes: int = CORRIDOR_FLOOR_MIB * 1024 * 1024,
     ):
         if dcp_size < 2:
             raise KvReshardError(
-                f"KV resharding needs a multi-rank DCP group, got dcp_size="
-                f"{dcp_size}"
+                f"KV resharding needs a multi-rank DCP group, got dcp_size={dcp_size}"
             )
         if consensus_interval < 1:
             raise ValueError(
@@ -549,7 +544,7 @@ class KvReshardRuntime:
             return False, msg
         if len(vec) != self._size or any(v < 1 for v in vec):
             return False, (
-                f"invalid target vector {vec}: needs {self._size} entries " f">= 1"
+                f"invalid target vector {vec}: needs {self._size} entries >= 1"
             )
         if vec == self._current:
             return False, f"target {vec} is already the current vector"
@@ -561,7 +556,7 @@ class KvReshardRuntime:
             )
         if self._pending is not None and self._pending != vec:
             logger.warning(
-                "%s re-arming %s -> %s (source %s) replaces the pending " "target",
+                "%s re-arming %s -> %s (source %s) replaces the pending target",
                 LOG_PREFIX,
                 self._pending,
                 vec,
@@ -653,8 +648,7 @@ class KvReshardRuntime:
         if lo["ready"] == 0:
             if not fit_ok:
                 self._hold(
-                    f"armed, but the target does not fit the backed pool: "
-                    f"{fit_msg}"
+                    f"armed, but the target does not fit the backed pool: {fit_msg}"
                 )
             else:
                 self._hold(
@@ -1034,6 +1028,78 @@ def _dist_exchange(device_group, device):
     def _exchange(
         outgoing: Dict[int, torch.Tensor], incoming_nbytes: Dict[int, int]
     ) -> Dict[int, torch.Tensor]:
+        # #802: AGREE THE SIZES BEFORE MOVING A SINGLE BYTE.
+        #
+        # THE HOLE THIS CLOSES, measured 2026-08-22 17:22:44. `incoming_nbytes`
+        # is a PREDICTION: the caller derives it locally (gdn_flip_mover.move's
+        # `_pair_nbytes(..., len(slots), ...)`) from its OWN rank-local slot
+        # enumeration, while the sender packs its payload from ITS OWN. For the
+        # GDN leg that enumeration is `flip_mamba_slots` -- "resident requests'
+        # mamba slots UNION the radix tree's checkpoints" -- which has no
+        # cross-rank agreement step at all, unlike the KV leg's
+        # `build_flip_live_slots_fn`. The three ranks demonstrably disagreed
+        # that day (150695 / 159848 / 151656 enumerated rows).
+        #
+        # Nothing downstream could catch it. `torch.empty` below is never
+        # zeroed; NCCL p2p with mismatched counts does not raise; the buffer
+        # keeps its ALLOCATED numel, so the receiver's length check passes; and
+        # `bounded_collective` polls `is_completed()`, never a byte count. The
+        # short receive therefore leaves the original allocator garbage exactly
+        # where the payload's checksum trailer is read from, and the flip died
+        # reporting a data corruption that had not happened.
+        #
+        # A zero-filled matrix summed across the group is a full all-to-all of
+        # the advertised sizes in one symmetric collective: every rank writes
+        # only its own row, so the sum is the truth and no rank can shadow
+        # another's entry. It runs UNCONDITIONALLY and BEFORE the `not ops`
+        # early return -- a rank that skipped it while its peers did not would
+        # be the very desynchronisation this is here to prevent.
+        # THE REFUSAL MUST BE COLLECTIVE, and the first cut of this guard was
+        # not -- a mistake its own three-process test caught within a minute.
+        # Checking only "what MY peers advertised versus what I expected" makes
+        # the verdict rank-local: in a three-rank group where rank 1 packs a
+        # short payload, ranks 0 and 2 see the disagreement and raise while
+        # rank 1 sees nothing wrong, walks into `batch_isend_irecv` and blocks
+        # for ever on peers that have already left. A guard that strands the
+        # group is worse than the corruption it prevents.
+        #
+        # So BOTH halves are gathered -- what each rank will SEND to each peer,
+        # and what each rank has SIZED ITS RECEIVE for -- and every rank then
+        # checks every ordered pair against the identical matrix and reaches
+        # the identical verdict. Zero-filled and summed: each rank writes only
+        # its own row, so the sum is the truth and no rank can shadow another.
+        n_ranks = dist.get_world_size(device_group)
+        me = dist.get_rank(device_group)
+        agreed = torch.zeros((2, n_ranks, n_ranks), dtype=torch.int64, device=device)
+        for peer, buf in outgoing.items():
+            agreed[0][me][int(peer)] = int(buf.numel())
+        for peer, want in incoming_nbytes.items():
+            agreed[1][me][int(peer)] = int(want)
+        dist.all_reduce(agreed, group=device_group)
+        for sender in range(n_ranks):
+            for receiver in range(n_ranks):
+                if sender == receiver:
+                    continue
+                sent = int(agreed[0][sender][receiver].item())
+                want = int(agreed[1][receiver][sender].item())
+                if sent == want:
+                    continue
+                raise KvReshardError(
+                    f"kv_reshard p2p SIZE DISAGREEMENT on the {sender}->"
+                    f"{receiver} pair: rank {sender} is sending {sent} bytes, "
+                    f"rank {receiver} sized its receive for {want}. The two "
+                    "ends derived the byte count independently from their own "
+                    "state and never agreed it, so one of the enumerations "
+                    "they are built on has diverged (for the GDN leg that is "
+                    "flip_mamba_slots, which is rank-local and has no union "
+                    "step, unlike the KV leg's build_flip_live_slots_fn). "
+                    "REFUSED BEFORE ANY TRANSFER: nothing was received, so no "
+                    "buffer holds a partly-written payload and no checksum "
+                    "trailer is read out of allocator garbage. Raised on EVERY "
+                    "rank off one shared matrix, so no peer is left in the "
+                    "exchange. This is a state divergence, NOT a data "
+                    "corruption (#802)."
+                )
         received: Dict[int, torch.Tensor] = {}
         ops = []
         for peer in sorted(incoming_nbytes):
@@ -1166,7 +1232,7 @@ def _cutover_fn_for(scheduler) -> Callable[[Tuple[int, ...]], None]:
         if controller is not None and hasattr(controller, "_dcp_owner_ctx_cache"):
             delattr(controller, "_dcp_owner_ctx_cache")
         logger.info(
-            "%s cutover: vector %s installed, %d owner-bounds consumers " "refreshed",
+            "%s cutover: vector %s installed, %d owner-bounds consumers refreshed",
             LOG_PREFIX,
             list(new_vector),
             refreshed,
