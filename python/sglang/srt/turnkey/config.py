@@ -198,6 +198,14 @@ class WatchdogSpec:
     #: See Policy.generation_probe_enabled. Retired by user order
     #: 2026-08-14; False unless a config explicitly says otherwise.
     generation_probe_enabled: bool = False
+    #: #799: consume the scheduler's published admission-wedge verdict. ON by
+    #: default -- it is the passive replacement for the retired probe, and a
+    #: detector nobody consumes is the defect being fixed, not the safe choice.
+    wedge_signal_enabled: bool = True
+    #: Directory the schedulers publish their verdicts into. Empty means
+    #: ``wedge_status.DEFAULT_STATUS_DIR``; both sides must agree, so a config
+    #: that overrides it must also set SGLANG_WEDGE_STATUS_DIR in [env].
+    wedge_status_dir: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -409,6 +417,8 @@ def _build(raw: dict, source: str) -> StackConfig:
         restart_window_s=int(wd.get("restart_window_s", 3600)),
         generation_probe_enabled=bool(
             wd.get("generation_probe_enabled", False)),
+        wedge_signal_enabled=bool(wd.get("wedge_signal_enabled", True)),
+        wedge_status_dir=str(wd.get("wedge_status_dir", "") or ""),
         enabled=bool(wd.get("enabled", True)))
     if not watchdog.backoff_s:
         raise_refusal(REFUSE_CONFIG_INCOMPLETE, "watchdog.backoff_s", "<empty>",

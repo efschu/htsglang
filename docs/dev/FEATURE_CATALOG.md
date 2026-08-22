@@ -3771,10 +3771,48 @@ taxonomy and the global importance ladder.
   `:188` (`orphan_pids`), `:226` (`reap_orphans`);
   probes `turnkey/probe.py:99` (`generation_ok`), `:75` (`LIVENESS_PATH`).
   Units in `deploy/turnkey/`, installer `scripts/turnkey_539_install.sh`.
+  SIGNAL SOURCE (#799): the watchdog's liveness verdict no longer comes from
+  an HTTP status. `LIVENESS_PATH` is `/get_model_info`, which answers from the
+  HTTP process WITHOUT touching the scheduler and is therefore structurally
+  blind to the wedge class (alive, port open, serving nobody); the generation
+  probe that could see it is retired by user order (`watchdog.py:88`). The
+  replacement is the #699/#739 admission-wedge verdict, published passively by
+  the scheduler that already computes it and read as a file:
+  publish `managers/wedge_status.py:126` (`publish_verdict`), read `:172`
+  (`read_wedge_signal`), tri-state `:98` (`WedgeSignal`); the detector's own
+  publish edge `invariant_checker.py` (`make_admission_wedge_poller`, the
+  callable the live thread runs); consumed at `turnkey/runner.py`
+  (`WatchdogRunner.tick`) into `watchdog.py` (`Observation.wedged`).
+  RESTART VETO (#799): `turnkey/runner.py` (`restart_target_drift`) refuses a
+  restart whose configured `--model-path` disagrees with the one the lane last
+  booted. Measured 2026-08-22: stack.toml, `start-serving-30030.sh` and the
+  running instance named THREE different models. A sighted watchdog that
+  "recovers" into a stale configuration replaces the service instead of
+  restoring it.
+  OPERATOR STOP (#799): `turnkey/runner.py` (`operator_stop_reason`) honours
+  `/spinning/PRODUCTION_STOPPED`. The legacy shell watchdog inherits that guard
+  through its start script (`start-serving-30030.sh:16`, exit 3); the turnkey
+  path restarts via `systemctl` and did NOT, so arming it without this check
+  would boot into GPU windows an operator had closed.
+  NAMED BLIND SPOT (#799, inherited from #536): the transported verdict is
+  `admission_wedge_verdict`'s unchanged, and that returns "not wedged" whenever
+  `running > 0` (`invariant_checker.py:585-588`). The fast-lane starvation
+  class -- a request starved behind a co-tenant that IS running -- produces no
+  alarm, no published wedge and no watchdog action. Transporting a verdict does
+  not widen it; closing that class is #536's own work.
   GATE: `/etc/htsglang/stack.toml` must exist and name cards by UUID; the
   units ship DISABLED (enabling them reverses the standing "do not restore
   production" order, `/spinning/GPU_WINDOWS.md:71`). `plan.mode="pinned"`
   additionally requires a plan file written by `turnkey plan-pin`.
+  ARMING IS STILL BLOCKED after #799, and by three separate things, none of
+  which #799 can decide on its own. (a) The standing order above: the units
+  are disabled deliberately, not by oversight. (b) The installed units name
+  `PYTHONPATH=/spinning/htsglang-gpu/python`, a worktree that does NOT contain
+  `sglang.srt.turnkey` at all -- `ExecStart` would die on ModuleNotFoundError.
+  (c) `/etc/htsglang/stack.toml` is stale against what actually boots (see the
+  restart veto above), so a restart would boot the wrong lane. #799 makes the
+  watchdog SEE; it does not arm it, and arming it before (b) and (c) are fixed
+  would trade blindness for a supervisor that actively replaces the service.
   REACH NOTE, and it is why this is a separate entry from the one below:
   `liveness/watchdog.py` (`ConsumerWatchdog`) is IN-PROCESS liveness of an
   attached consumer holding resource claims. This is process-level
@@ -3850,6 +3888,43 @@ taxonomy and the global importance ladder.
   (`collect`), pid discovery `:55`.
   GATE: none. Triage matches the collective-census output line
   (`debug_utils/wedge_triage.py:29`) — see §18.5.
+- **admission-wedge recovery channel (#800)** — the watchdog POSTS a
+  corridor-relief request and the SCHEDULER THREAD runs it, then the watchdog
+  consumes the named outcome: `ACTUATED`, `INERT` (carrying which of the
+  gate's exits was taken), or `UNCONSUMED` (the scheduler thread never
+  reached `process_input_requests` within the grace window — a statement
+  about the wedge, not about the gate). Two consecutive non-actuating
+  outcomes emit `ADMISSION-WEDGE-UNRECOVERED`, once, as a token distinct
+  from the repeating `ADMISSION-WEDGE` alarm so an external supervisor can
+  grip it.
+  ENTRY `managers/wedge_recovery.py:*` (channel, states, grace/retry
+  constants); drain edge `managers/scheduler.py` in
+  `process_input_requests` (the one function every loop family reaches once
+  per iteration); driver `scheduler_components/invariant_checker.py`
+  (`AdmissionWedgeRecovery`, `make_admission_wedge_poller`); named gate
+  exits `managers/corridor_admission.py` (`REASON_*`, `ACTUATING_REASONS`,
+  `guard_prefill_admission_explained`).
+  GATE: none — the channel is allocated by the first post, so a boot that
+  never wedges never builds one.
+  PUBLISHED (#800 x #799): the outcome leaves the process. `wedge_status`'s
+  per-rank JSON record carries a `recovery` object (state, reason, seq,
+  waited_s, consecutive_non_actuating, escalated) and `WedgeSignal.recovery`
+  surfaces it — the WEDGED rank's own record, never a reduction across ranks,
+  because the ranks disagreeing is the finding. The field is omitted, not
+  null, when nothing has settled, so an old reader and a new file agree; the
+  reader then says "no recovery attempt has been settled on this rank" in
+  words rather than leaving absence to read as health.
+  ORDERING IS LOAD-BEARING: `_poll_once` steps the recovery driver BEFORE it
+  publishes. #799 published first, so the file it wrote could never contain
+  the attempt's outcome — structurally, not by one poll.
+  SUPERSEDES the #788 rung, which called `guard_prefill_admission` FROM THE
+  WATCHDOG THREAD and read its `None` as "the gate is off or inert". Both
+  halves were wrong on the 2026-08-22 11:22Z specimen: the gate was ARMED on
+  all three ranks and the `None` came from the healthy-corridor exit, and on
+  PP0 the cross-thread CUDA call was the last thing that rank ever logged.
+  NOTE: the relief ladder still cannot admit anything — `corridor_admission`
+  says so itself ("IT SPILLS. IT NEVER REFUSES") and no forced-admission
+  actuator exists. What the request buys is the diagnosis, not a cure.
 - **DeviceTimer / SplitDeviceTimer / GapTimer** — CUDA-event timers for a
   region, a split region, and the GAP between regions (the last is what
   turns "the kernel is fast" into "the kernel is fast and we wait 8 ms

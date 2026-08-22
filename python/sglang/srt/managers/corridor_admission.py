@@ -88,7 +88,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from sglang.srt.managers.corridor_width import (
     MIN_CHUNK_TOKENS,
@@ -102,6 +102,107 @@ LOG_PREFIX = "[#656 CORRIDOR-ADMISSION]"
 
 #: Attribute the per-scheduler gate is memoised under.
 ADMISSION_GATE_ATTR = "phase_flip_corridor_admission"
+
+# -- #800: WHY THE GATE DID NOTHING -----------------------------------------
+#
+# ``before_admission`` has SEVEN exits and six of them return ``None``. For its
+# own caller that is fine: the scheduler admits the batch either way, so the
+# return value is decoration. It stopped being fine the moment a SECOND caller
+# appeared that reads the return value as a verdict on the gate itself.
+#
+# The 2026-08-22 11:22Z wedge is that failure, in the log, in one line:
+#
+#     ADMISSION-WEDGE RECOVERY: forced-admission attempt returned None (None
+#     means the gate is off or inert on this boot -- ...)
+#
+# The gate was NEITHER off NOR inert. The same boot logged, at 10:44:01Z on all
+# three ranks, ``[#656 CORRIDOR-ADMISSION] ARMED on device 0``, and at 11:19:47Z
+# it cleared four prefill admissions reclaiming 232 / 1112 / 1126 / 1216 MiB. It
+# returned ``None`` from the ``free - want >= floor`` exit -- there was no
+# memory pressure, so there was nothing to relieve. "Working perfectly" and
+# "never built" are opposite in value and were identical in the return value.
+#
+# That is the exact defect ``_announce_once`` below already names for the
+# ANNOUNCEMENT ("opposite in value and identical in the log"). These constants
+# close it one level up: every exit says which one it was, so a caller can tell
+# a no-op-because-nothing-to-do from a no-op-because-nothing-is-there.
+#: The ladder ran and restored the corridor ahead of the chunk.
+REASON_CLEARED = "cleared"
+#: The ladder ran and could not restore it. Still an actuation.
+REASON_SHORT = "short"
+#: ``--enable-phase-flip`` is off, so this module is deliberately not built.
+REASON_PHASE_FLIP_OFF = "phase-flip-off"
+#: Phase flip is on but no ``CorridorGuard`` is reachable from this scheduler.
+REASON_NO_GUARD = "no-guard"
+#: The card's free column could not be read; the gate declined to act blind.
+REASON_FREE_PROBE_FAILED = "free-probe-failed"
+#: There was nothing to do: free minus want already clears the arming floor.
+REASON_HEADROOM_SUFFICIENT = "headroom-sufficient"
+#: A relief attempt is still inside its cooldown window.
+REASON_COOLDOWN = "cooldown"
+#: ``ensure_headroom`` itself raised; the net tore and was caught.
+REASON_LADDER_RAISED = "ladder-raised"
+#: The gate was never entered at all (no scheduler).
+REASON_NO_SCHEDULER = "no-scheduler"
+#: A gate object exists but ``before_admission`` has not run on it yet.
+REASON_NEVER_CALLED = "never-called"
+
+#: The exits that mean the relief ladder ACTUALLY RAN. Everything else is a
+#: no-op, whatever its cause -- and a caller that wants an action performed
+#: must treat the whole complement as "nothing happened".
+ACTUATING_REASONS = frozenset({REASON_CLEARED, REASON_SHORT})
+
+#: The no-op exits where the gate was PRESENT, WORKING, and CORRECTLY had
+#: nothing to do.
+#:
+#: THE COMPLEMENT OF ``ACTUATING_REASONS`` IS NOT ONE THING, and collapsing it
+#: into one is how the 2026-08-22 line came to say "the gate is off or inert"
+#: about a gate that was armed and healthy. Two no-ops with opposite meanings
+#: sit in it:
+#:
+#:   * these -- nothing to relieve, or a relief just ran. The gate answered
+#:     correctly and the answer is not a defect. It must not be loud.
+#:   * everything else -- no guard reachable, the card unreadable, the ladder
+#:     raised. The mechanism is absent or broke. THAT is a defect and it is
+#:     the one that has to be loud, because it is the state that looks
+#:     identical to health from the outside.
+#:
+#: Callers that only need "did it act" still read ``ACTUATING_REASONS`` and
+#: are unaffected; this split is for callers that must also say WHY not.
+NOT_APPLICABLE_REASONS = frozenset(
+    {REASON_HEADROOM_SUFFICIENT, REASON_COOLDOWN, REASON_PHASE_FLIP_OFF}
+)
+
+
+def reason_is_defect(reason: str) -> bool:
+    """True when a no-op exit means the MECHANISM is broken or missing.
+
+    Written as the single predicate rather than a third frozenset so that a
+    reason added above lands in the loud class by default. A new exit nobody
+    classified should shout, not hide -- the opposite default is what this
+    whole change exists to undo.
+    """
+    return reason not in ACTUATING_REASONS and reason not in NOT_APPLICABLE_REASONS
+
+
+class AdmissionActuation(NamedTuple):
+    """What one call to the gate did, and why it did no more than that.
+
+    ``verdict`` keeps the historic return value untouched for the scheduler's
+    own call site. ``reason`` is the new information: it names WHICH exit
+    produced that value. ``actuated`` is the single bit a recovery caller
+    needs -- ``verdict is not None`` is NOT that bit, because the ladder can
+    run and still be summarised by a falsy-looking verdict, and a ``None`` can
+    mean anything from "off" to "healthy".
+    """
+
+    verdict: Optional[Any]
+    reason: str
+
+    @property
+    def actuated(self) -> bool:
+        return self.reason in ACTUATING_REASONS
+
 
 #: Minimum seconds between two RELIEF attempts on this path.
 #:
@@ -268,6 +369,12 @@ class PrefillAdmissionGate:
         self.tokens_withheld = 0
         self._last_cut_logged = None
         self._unpriced_logged = False
+        # #800: which exit the LAST call took. Written at every return of
+        # ``before_admission`` without exception -- an unwritten exit would
+        # report the previous call's reason, which is worse than reporting
+        # none. The initial value says "never called" rather than pretending
+        # a healthy exit.
+        self.last_reason = REASON_NEVER_CALLED
 
     # -- the gate ---------------------------------------------------------
 
@@ -570,10 +677,15 @@ class PrefillAdmissionGate:
         Returns the guard's verdict, or None when there is nothing to guard.
         THE RETURN VALUE IS EVIDENCE, NOT A DECISION: see the module
         docstring. Callers must admit the batch either way.
+
+        #800: every exit also writes ``self.last_reason``. A caller that needs
+        to know whether the ladder RAN must read that, not the return value --
+        six of the seven exits return ``None`` for six different causes.
         """
         guard = self._guard()
         self._announce_once(guard)
         if guard is None:
+            self.last_reason = REASON_NO_GUARD
             return None
         # SPEC ITEM 16, FIRST RELIEF STAGE, BEFORE THE GATE IS EVEN PRICED.
         #
@@ -592,12 +704,15 @@ class PrefillAdmissionGate:
         except Exception as e:  # noqa: BLE001
             # A probe that cannot read the card must not take prefill down.
             logger.warning("%s free probe failed: %s", LOG_PREFIX, e)
+            self.last_reason = REASON_FREE_PROBE_FAILED
             return None
         if free - want >= guard.floor_bytes:
+            self.last_reason = REASON_HEADROOM_SUFFICIENT
             return None
         now = self._clock()
         if now - self._last_arm < self._cooldown_s:
             self.cooldown_skips += 1
+            self.last_reason = REASON_COOLDOWN
             return None
         self._last_arm = now
         self.armed += 1
@@ -617,6 +732,7 @@ class PrefillAdmissionGate:
             # The gate is a safety net. A net that tears must not take down
             # the thing it was protecting.
             logger.error("%s gate failed to evaluate: %s", LOG_PREFIX, e)
+            self.last_reason = REASON_LADDER_RAISED
             return None
         self.reclaimed_bytes += int(getattr(verdict, "reclaimed", 0) or 0)
         # THE DIP IS THE EVENT HERE, not the verdict. This gate never refused
@@ -627,9 +743,11 @@ class PrefillAdmissionGate:
         # would have quietly reported a perfect corridor forever.
         if verdict.ok and not getattr(verdict, "law_breached", False):
             self.cleared += 1
+            self.last_reason = REASON_CLEARED
             logger.info("%s cleared before prefill: %s", LOG_PREFIX, verdict.detail)
         else:
             self.short += 1
+            self.last_reason = REASON_SHORT
             logger.error(
                 "%s SHORT before prefill: %s. Every provider is exhausted, so "
                 "the corridor cannot be restored ahead of this chunk. The "
@@ -781,10 +899,30 @@ def guard_prefill_admission(scheduler: Any, tokens: int) -> Optional[Any]:
     of this feature's regime; it does not get to change everyone else's
     allocator behaviour as a side effect.
     """
+    return guard_prefill_admission_explained(scheduler, tokens).verdict
+
+
+def guard_prefill_admission_explained(
+    scheduler: Any, tokens: int
+) -> AdmissionActuation:
+    """``guard_prefill_admission``, plus WHICH exit produced the result.
+
+    #800. Same call, same side effects, same order -- the only difference is
+    that the caller is told which of the seven exits it hit. Written as the
+    implementation rather than as a wrapper so there is exactly one traversal
+    of the gate and no second place for the two to drift apart.
+
+    Read the constants above for what each reason means. The bit that matters
+    to a caller wanting an ACTION performed is ``.actuated``, never
+    ``.verdict is not None``.
+    """
+    if scheduler is None:
+        return AdmissionActuation(None, REASON_NO_SCHEDULER)
     server_args = getattr(scheduler, "server_args", None)
     if not getattr(server_args, "enable_phase_flip", False):
-        return None
+        return AdmissionActuation(None, REASON_PHASE_FLIP_OFF)
     gate = get_prefill_admission_gate(scheduler)
     if gate is None:
-        return None
-    return gate.before_admission(tokens)
+        return AdmissionActuation(None, REASON_NO_SCHEDULER)
+    verdict = gate.before_admission(tokens)
+    return AdmissionActuation(verdict, gate.last_reason)
