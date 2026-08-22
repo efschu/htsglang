@@ -480,6 +480,47 @@ def _cutover_bytecode():
     return list(dis.get_instructions(inner[0]))
 
 
+def test_the_cutover_also_retires_an_undeclared_stash(caplog):
+    """The disposition one over, which the first cut of #800 left behind.
+
+    An undeclared entry BLOCKS presence, so reaching a cutover with one held
+    means the gate was bypassed -- but leaving it is exactly the outliving this
+    sweep exists to prevent, and nothing is registered to consume it. It goes,
+    and it goes loudly.
+    """
+    box = _inbox("a_kind_from_the_future")
+    h = _holder(box)
+    with caplog.at_level("ERROR"):
+        assert h.pp_flip_retire_pp_loop_stash() == 1, (
+            "an undeclared entry survived the cutover; it is then handed to the "
+            "next epoch's receive, which is the defect this sweep is for"
+        )
+    assert not box[(UPSTREAM, "a_kind_from_the_future")]
+    assert any(
+        "CUTOVER FOUND AN UNDECLARED STASH" in r.message for r in caplog.records
+    ), "an undeclared entry was swept at a cutover without saying so"
+
+
+def test_the_cutover_instrument_splits_owed_from_pp_loop_only():
+    """The instrument said one number for three different fates.
+
+    Its heading calls the inbox figure "a sampled token that reaches no
+    output_ids". That is true of an owed entry and false of a PP-loop-only one,
+    which carries no token and is retired on purpose. Pinned in the compiled
+    body, where a comment cannot stand in for a format string.
+    """
+    consts = [c for c in _cutover_bytecode() if isinstance(c.argval, str)]
+    blob = "\n".join(c.argval for c in consts)
+    assert "inbox_owed=" in blob, (
+        "the cutover instrument still reports one undifferentiated inbox count "
+        "under a heading that calls all of it lost tokens"
+    )
+    assert "inbox_pp_loop=" in blob, (
+        "the routine PP-loop-only retirement is not reported, so a designed "
+        "discard is indistinguishable from silence"
+    )
+
+
 def test_the_cutover_call_site_runs_before_the_ring_is_rebuilt():
     """CALL-EDGE PIN for the one edge this suite cannot execute.
 

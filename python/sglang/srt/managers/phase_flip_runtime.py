@@ -1548,13 +1548,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # message parked there outlived the whole TP phase and was handed to
         # the next PP epoch's receive. pp_flip_retire_pp_loop_stash below makes
         # the discard real, and names what it discarded.
+        #
+        # AND THE COUNT IS SPLIT BY DISPOSITION, because one number here meant
+        # three different fates. The heading says these are sampled tokens that
+        # reach no output_ids; that is true of an OWED entry and false of a
+        # PP-loop-only one, which is not a token at all and is retired below on
+        # purpose. Reporting them as one figure made a routine retirement look
+        # like data loss and real data loss look routine.
+        from sglang.srt.managers.pp_stash_disposition import census_stash
+
+        try:
+            _stash = census_stash(getattr(scheduler, "_pp_tensor_dict_inbox", {}))
+            _inbox_owed = _stash.blocking_total + _stash.undeclared_total
+            _inbox_pp_loop = _stash.gate_blind_total
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            _inbox_owed = 0
+            _inbox_pp_loop = 0
         _inflight = (
             getattr(scheduler, "pp_outputs", None) is not None,
             len(getattr(scheduler, "last_rank_comm_queue", None) or ()),
             len(getattr(scheduler, "send_output_work", None) or ()),
-            sum(
-                len(q) for q in getattr(scheduler, "_pp_tensor_dict_inbox", {}).values()
-            ),
+            _inbox_owed,
         )
         # #795: AND WHAT IT CANNOT SEE. Every probe above reads a structure
         # inside this process. The tensor-dict WIRE is not one of them, and an
@@ -1586,18 +1600,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         if any(_inflight) or _wire_gap:
             logger.warning(
                 "%s CUTOVER DISCARDS IN-FLIGHT OUTPUT: pp_outputs=%s "
-                "last_rank_comm_queue=%d send_output_work=%d inbox=%d "
+                "last_rank_comm_queue=%d send_output_work=%d inbox_owed=%d "
                 "unconsumed_on_wire=%d -- each is a sampled token that reaches "
                 "no output_ids, and an unconsumed tensor dict outlives the "
-                "slot ring this cutover is about to rebuild (#795)",
+                "slot ring this cutover is about to rebuild (#795). Separately, "
+                "inbox_pp_loop=%d message(s) are retired by design below: their "
+                "only consumer is the PP loop body, they carry no token, and "
+                "the ring they name is about to be rebuilt (#800)",
                 LOG_PREFIX,
                 *_inflight,
                 _wire_gap,
+                _inbox_pp_loop,
             )
         else:
             logger.info(
                 "%s output path empty at cutover, and no unconsumed tensor "
-                "dict on the wire",
+                "dict on the wire"
+                + (
+                    f" (inbox_pp_loop={_inbox_pp_loop} retired by design below)"
+                    if _inbox_pp_loop
+                    else ""
+                ),
                 LOG_PREFIX,
             )
         # #800: retire the PP-loop-only stash BEFORE the ring is rebuilt. Its

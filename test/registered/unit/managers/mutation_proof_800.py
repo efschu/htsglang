@@ -94,6 +94,20 @@ MUTATIONS = [
         ["test_the_cutover_call_site_runs_before_the_ring_is_rebuilt"],
     ),
     (
+        "M10 the cutover sweep goes back to leaving undeclared entries behind",
+        MIXIN,
+        "        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY, UNDECLARED)):",
+        "        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY,)):",
+        ["test_the_cutover_also_retires_an_undeclared_stash"],
+    ),
+    (
+        "M11 the cutover instrument goes back to one undifferentiated count",
+        RUNTIME,
+        '"last_rank_comm_queue=%d send_output_work=%d inbox_owed=%d "',
+        '"last_rank_comm_queue=%d send_output_work=%d inbox=%d "',
+        ["test_the_cutover_instrument_splits_owed_from_pp_loop_only"],
+    ),
+    (
         "M9 the abandonment goes back to naming one of two causes",
         RUNTIME,
         '                f"THIS rank withheld its own presence for "',

@@ -3234,10 +3234,25 @@ class SchedulerPPMixin:
         stamp exists to catch. This makes the discard real and names what it
         discarded.
 
-        Only ``PP_LOOP_ONLY`` is retired. A ``BLOCKS_FLIP`` entry at a cutover
-        is a quiescence-predicate failure, not a message to sweep: it is
-        reported as an error and left in place, so the defect is visible rather
-        than tidied away.
+        THE THREE DISPOSITIONS ARE TREATED DIFFERENTLY HERE, and the split is
+        the point:
+
+        ``PP_LOOP_ONLY``  retired, at INFO. Expected, routine, and the reason
+                          this method exists.
+        ``UNDECLARED``    retired, at ERROR. An undeclared entry BLOCKS
+                          presence, so a rank cannot announce while holding
+                          one and finding it here means the gate was bypassed
+                          -- but leaving it is the very outliving this method
+                          prevents, and nothing is known to be owed it. So it
+                          goes, loudly. (This branch was missing from the
+                          first cut of #800: the sweep took only PP_LOOP_ONLY
+                          and an undeclared entry would have survived into the
+                          next phase, which is the defect being fixed, one
+                          disposition over.)
+        ``BLOCKS_FLIP``   NOT retired. A real consumer may still be owed the
+                          payload, so sweeping it would destroy a token to
+                          tidy up a predicate bug. Reported and left, so the
+                          defect stays visible.
         """
         inbox = getattr(self, "_pp_tensor_dict_inbox", None)
         census = census_stash(inbox)
@@ -3246,12 +3261,24 @@ class SchedulerPPMixin:
                 "%s CUTOVER FOUND A BLOCKING STASH: %s. The presence gate is "
                 "supposed to make this impossible -- a rank does not announce "
                 "while it holds one -- so this is a quiescence-predicate bug. "
-                "Left in place deliberately; sweeping it here would hide it.",
+                "Left in place deliberately; sweeping it here would hide it, "
+                "and its payload may still be owed to a real consumer.",
                 "#800",
                 ", ".join(f"{n} x {kind}" for kind, n in census.blocking),
             )
+        if census.undeclared:
+            logger.error(
+                "%s CUTOVER FOUND AN UNDECLARED STASH: %s. This also blocks "
+                "presence, so reaching a cutover with one held means the gate "
+                "was bypassed. Retired anyway -- nothing is registered to "
+                "consume it and leaving it would hand it to the next epoch's "
+                "receive -- but declare its disposition in "
+                "pp_stash_disposition rather than relying on this sweep.",
+                "#800",
+                ", ".join(f"{n} x {kind}" for kind, n in census.undeclared),
+            )
         retired = 0
-        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY,)):
+        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY, UNDECLARED)):
             queue = inbox.get(key)
             depth = len(queue or ())
             if not depth:
