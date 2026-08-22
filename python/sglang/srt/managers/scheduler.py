@@ -2723,6 +2723,21 @@ class Scheduler(
         # read and one int compare on a boot that has never wedged; see
         # managers/wedge_recovery.py for why the actuator must not run on the
         # watchdog thread (it silenced PP0's detector on 2026-08-22).
+        #
+        # THIS DRAIN IS UNREACHABLE FOR ONE WEDGE CLASS, AND MOVING IT EARLIER
+        # DOES NOT HELP. On the live wedge of 2026-08-22 17:10Z py-spy put
+        # PP2's scheduler thread inside a blocking chain receive:
+        #     scheduler_pp_mixin.py  recv_reqs = recv_requests()   <- parked
+        #     scheduler_pp_mixin.py  _pp_forward_and_process_input_requests(..)
+        #     scheduler_pp_mixin.py      self.process_input_requests(..)  <- here
+        # i.e. one statement ahead of this function. A drain at the TOP of the
+        # loop body would not have caught it either: the thread had already
+        # passed the head of the body when it blocked, so the earlier drain
+        # would have run before the watchdog posted. There is no point in the
+        # body that thread still reaches. The correct response is the
+        # UNCONSUMED verdict and an escalation OUTSIDE the process, which is
+        # what wedge_recovery.py's ESCALATION_UNREACHABLE class is for -- not
+        # a different drain site.
         drain_recovery_request(self)
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:

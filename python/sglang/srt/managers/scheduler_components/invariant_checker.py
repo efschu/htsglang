@@ -28,10 +28,12 @@ from sglang.srt.managers.wedge_recovery import (
     DEFAULT_ESCALATE_AFTER,
     DEFAULT_RETRY_SECONDS,
     ESCALATION_TOKEN,
+    ESCALATION_UNREACHABLE,
     RECOVERY_CHANNEL_ATTR,
     STATE_NOT_APPLICABLE,
     STATE_PENDING,
     STATE_UNCONSUMED,
+    UNREACHABLE_RETRY_FACTOR,
     RecoveryOutcome,
     get_recovery_channel,
 )
@@ -811,7 +813,15 @@ class AdmissionWedgeRecovery:
         if age < threshold:
             return None
         now = self._clock()
-        if now - self._last_post_at < self._retry_s:
+        # Once the actuator is proven undeliverable, probe far less often. The
+        # specimen posted five times into a thread parked in a blocking
+        # receive; four of those were noise. Backing off rather than stopping
+        # keeps the ability to notice a thread that unblocks.
+        existing = getattr(self._scheduler, RECOVERY_CHANNEL_ATTR, None)
+        interval = self._retry_s
+        if existing is not None and existing.unreachable:
+            interval = self._retry_s * UNREACHABLE_RETRY_FACTOR
+        if now - self._last_post_at < interval:
             return None
         channel = get_recovery_channel(self._scheduler)
         if channel is None:
@@ -855,6 +865,11 @@ class AdmissionWedgeRecovery:
             "waited_s": round(float(outcome.waited_s), 3),
             "consecutive_non_actuating": channel.consecutive_non_actuating,
             "escalated": channel.escalated,
+            # #800: WHICH escalation, so a supervisor outside the process can
+            # tell "the in-process actuator is reachable and useless" from
+            # "nothing in-process can be delivered at all". Only the second
+            # justifies a restart, and only the second is provable from here.
+            "escalation_class": channel.escalation_class,
         }
 
     def _settle(self, channel) -> RecoveryOutcome:
@@ -917,19 +932,41 @@ class AdmissionWedgeRecovery:
                 outcome.reason,
             )
         if channel.record(outcome, self._escalate_after):
-            logger.error(
-                "%s: %d consecutive recovery attempts changed nothing on this "
-                "rank (latest: %s / '%s'). The recovery path is not working "
-                "and the wedge is not clearing; this line is the distinct, "
-                "greppable state an external supervisor should act on, and it "
-                "is emitted ONCE per run so it cannot be mistaken for the "
-                "repeating %s alarm it sits among.",
-                ESCALATION_TOKEN,
-                channel.consecutive_non_actuating,
-                outcome.state,
-                outcome.reason,
-                ADMISSION_WEDGE,
-            )
+            if channel.escalation_class == ESCALATION_UNREACHABLE:
+                # THE FINDING IS ABOUT DELIVERY, NOT ABOUT THE ACTUATOR.
+                # Established on the live wedge of 2026-08-22 17:10Z: py-spy
+                # put the scheduler thread inside a blocking chain receive one
+                # statement ahead of the drain. Nothing in this process can be
+                # handed to that thread, so promising a better in-process
+                # actuator would be a lie -- and saying "recovery is not
+                # working" would point at the wrong subsystem.
+                logger.error(
+                    "%s [%s]: %d consecutive recovery attempts were never "
+                    "CONSUMED on this rank. The scheduler thread is not "
+                    "running its loop, so NO in-process actuator can be "
+                    "delivered to it -- not this one and not a better one. "
+                    "This is not a fault of the relief ladder and cannot be "
+                    "fixed by changing it. Only something OUTSIDE this "
+                    "process can act now. Emitted ONCE per run.",
+                    ESCALATION_TOKEN,
+                    ESCALATION_UNREACHABLE,
+                    channel.consecutive_non_actuating,
+                )
+            else:
+                logger.error(
+                    "%s [%s]: %d consecutive recovery attempts were consumed "
+                    "by the scheduler thread and changed nothing (latest: %s "
+                    "/ '%s'). The thread IS looping, so the wedge is not a "
+                    "delivery problem -- the actuator simply does not address "
+                    "this wedge class. Emitted ONCE per run so it cannot be "
+                    "mistaken for the repeating %s alarm it sits among.",
+                    ESCALATION_TOKEN,
+                    channel.escalation_class,
+                    channel.consecutive_non_actuating,
+                    outcome.state,
+                    outcome.reason,
+                    ADMISSION_WEDGE,
+                )
         return outcome
 
 

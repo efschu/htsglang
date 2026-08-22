@@ -72,6 +72,8 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     make_admission_wedge_poller,
 )
 from sglang.srt.managers.wedge_recovery import (
+    ESCALATION_INEFFECTIVE,
+    ESCALATION_UNREACHABLE,
     RECOVERY_CHANNEL_ATTR,
     STATE_ACTUATED,
     STATE_INERT,
@@ -508,9 +510,15 @@ class TestOutcomesAreConsumed(CustomTestCase):
         self.assertEqual(first.state, STATE_UNCONSUMED)
         self.assertFalse(channel.escalated, "one is not a run")
 
-        # Second attempt, same silence -> escalation.
+        # Second attempt, same silence -> escalation. The retry interval is
+        # now 4x, because the first UNCONSUMED proved the actuator cannot be
+        # delivered (see UNREACHABLE_RETRY_FACTOR).
         clock.advance(30.0)
+        self.assertIsNone(driver.step(alarm=True))  # too soon: backed off
+        self.assertEqual(channel.requested_seq, 1)
+        clock.advance(95.0)
         self.assertIsNone(driver.step(alarm=True))  # posts #2
+        self.assertEqual(channel.requested_seq, 2)
         clock.advance(50.0)
         second = driver.step(alarm=True)
         self.assertEqual(second.state, STATE_UNCONSUMED)
@@ -615,8 +623,9 @@ class TestOutcomesAreConsumed(CustomTestCase):
         clock.advance(50.0)
         self.assertEqual(driver.step(alarm=True).state, STATE_UNCONSUMED)
         self.assertEqual(channel.consecutive_non_actuating, 1)
+        self.assertTrue(channel.unreachable)
 
-        clock.advance(30.0)
+        clock.advance(125.0)  # past the 4x backoff the UNCONSUMED installed
         driver.step(alarm=True)
         Scheduler.process_input_requests(sched, [])
         clock.advance(1.0)
@@ -625,6 +634,77 @@ class TestOutcomesAreConsumed(CustomTestCase):
         self.assertEqual(outcome.state, STATE_ACTUATED)
         self.assertEqual(outcome.reason, REASON_CLEARED)
         self.assertEqual(channel.consecutive_non_actuating, 0)
+
+    def test_undeliverable_and_ineffective_are_different_escalations(self):
+        """The live wedge of 2026-08-22 17:10Z, as a test.
+
+        py-spy put PP2's scheduler thread inside a blocking chain receive one
+        statement ahead of the drain, and five posts went unconsumed. That is
+        NOT "the relief ladder does not help" -- it is "nothing in this
+        process can be handed to that thread". Reporting both as one finding
+        points a supervisor at the wrong subsystem: one says fix the actuator,
+        the other says only something outside the process can act.
+
+        MUTANT KILLED: collapse escalation_class to a constant, or let an
+        UNCONSUMED and a consumed-but-useless outcome share a class.
+        """
+        clock = _Clock()
+        sched = _FakeScheduler(queued=2, running=0, age=200.0)
+        driver = self._driver(sched, clock, grace_s=45.0, retry_s=30.0)
+        channel = get_recovery_channel(sched)
+
+        driver.step(alarm=True)
+        clock.advance(50.0)
+        self.assertEqual(driver.step(alarm=True).state, STATE_UNCONSUMED)
+        self.assertTrue(channel.unreachable)
+        self.assertEqual(channel.escalation_class, ESCALATION_UNREACHABLE)
+
+        # A CONSUMED outcome is positive proof the thread is looping, and that
+        # proof is newer than the silence before it.
+        setattr(
+            sched,
+            "phase_flip_corridor_admission",
+            _gate(_FakeGuard(free_mib=4096, floor_mib=1331)),
+        )
+        clock.advance(125.0)
+        driver.step(alarm=True)
+        Scheduler.process_input_requests(sched, [])
+        clock.advance(1.0)
+        outcome = driver.step(alarm=True)
+
+        self.assertEqual(outcome.state, STATE_NOT_APPLICABLE)
+        self.assertFalse(
+            channel.unreachable,
+            "a consumed attempt proves reachability and must clear the flag",
+        )
+        self.assertEqual(channel.escalation_class, ESCALATION_INEFFECTIVE)
+
+    def test_reachability_and_effectiveness_are_separate_axes(self):
+        """Non-actuating counts BOTH ways; only UNCONSUMED sets unreachable.
+
+        MUTANT KILLED: set ``unreachable`` for any non-actuating outcome. The
+        escalation then tells a supervisor to restart the process because a
+        healthy corridor had nothing to relieve.
+        """
+        clock = _Clock()
+        sched = _FakeScheduler(queued=2, running=0, age=200.0)
+        setattr(
+            sched,
+            "phase_flip_corridor_admission",
+            _gate(_FakeGuard(free_mib=4096, floor_mib=1331)),
+        )
+        driver = self._driver(sched, clock, grace_s=45.0, retry_s=30.0)
+        channel = get_recovery_channel(sched)
+
+        driver.step(alarm=True)
+        Scheduler.process_input_requests(sched, [])
+        clock.advance(1.0)
+        outcome = driver.step(alarm=True)
+
+        self.assertEqual(outcome.state, STATE_NOT_APPLICABLE)
+        self.assertEqual(channel.consecutive_non_actuating, 1, "still counts")
+        self.assertFalse(channel.unreachable, "but it WAS delivered")
+        self.assertEqual(channel.escalation_class, ESCALATION_INEFFECTIVE)
 
     def test_a_cleared_wedge_resets_the_episode(self):
         clock = _Clock()
@@ -656,10 +736,15 @@ class TestOutcomesAreConsumed(CustomTestCase):
         channel = get_recovery_channel(sched)
         clock.advance(50.0)
         self.assertEqual(driver.step(alarm=True).state, STATE_UNCONSUMED)
-        clock.advance(1.0)  # t0+51, inside the 60 s retry window
+        # UNCONSUMED -> the actuator is undeliverable -> 4x backoff, so the
+        # window is 240 s from the post, not 60 s.
+        clock.advance(1.0)
         driver.step(alarm=True)
         self.assertEqual(channel.requested_seq, 1, "must not retry inside the window")
-        clock.advance(10.0)  # t0+61
+        clock.advance(10.0)  # t0+61: past the PLAIN window, inside the backed-off one
+        driver.step(alarm=True)
+        self.assertEqual(channel.requested_seq, 1, "the backoff must still hold")
+        clock.advance(180.0)  # t0+241
         driver.step(alarm=True)
         self.assertEqual(channel.requested_seq, 2)
 

@@ -64,8 +64,10 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     make_admission_wedge_poller,
 )
 from sglang.srt.managers.wedge_recovery import (
+    ESCALATION_UNREACHABLE,
     STATE_INERT,
     STATE_NOT_APPLICABLE,
+    STATE_UNCONSUMED,
     get_recovery_channel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -405,6 +407,38 @@ class TestTheOrderingIsTheFix(CustomTestCase):
         self.assertNotIn("recovery", record)
         self.assertIs(signal.verdict, False)
         self.assertIsNone(signal.recovery)
+
+    def test_the_published_record_names_WHICH_escalation(self):
+        """An external supervisor must be able to tell the two apart.
+
+        Only ``UNREACHABLE`` justifies acting from outside the process: it
+        means nothing in-process can be delivered to that scheduler thread.
+        ``INEFFECTIVE`` means the thread is looping and the actuator simply
+        does not address this wedge -- a different subsystem's problem, and
+        NOT a restart.
+
+        This is the seam half of the 2026-08-22 17:10Z finding: the verdict
+        already left the process, but without the class it left as "wedged and
+        recovery did nothing", which reads as "fix the recovery".
+
+        MUTANT KILLED: drop escalation_class from the published record.
+        """
+        with _StatusDir() as d:
+            sched = _FakeScheduler(queued=2, running=0, age=400.0)
+            # No gate at all -> the drain never acks -> UNCONSUMED, which is
+            # the undeliverable class.
+            driver = AdmissionWedgeRecovery(sched, grace_s=0.0, retry_s=0.0)
+            driver.step(alarm=True)
+            driver.step(alarm=True)  # settles as UNCONSUMED (grace 0)
+            status = driver.recovery_status()
+            wedge_status.publish_verdict(
+                _rank_label(sched), True, "wedged", directory=d, recovery=status
+            )
+            signal = wedge_status.read_wedge_signal(directory=d)
+
+        self.assertEqual(status["state"], STATE_UNCONSUMED)
+        self.assertEqual(status["escalation_class"], ESCALATION_UNREACHABLE)
+        self.assertEqual(signal.recovery["escalation_class"], ESCALATION_UNREACHABLE)
 
     def test_recovery_status_is_none_until_something_settles(self):
         """``None`` means no measurement, and must not be faked into a value."""

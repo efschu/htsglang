@@ -92,7 +92,7 @@ UNCONSUMED (its loop is spinning inside the flip entry and never reaches
 ``process_input_requests``) while PP0 reports NOT_APPLICABLE. Two ranks, two
 different states, which is the discrimination that did not exist before.
 THE HALF IT DOES NOT OWN is the threshold: no per-rank classification helps a
-rank that never reaches the attempt. Deliberately NOT retuned here -- 60 s is
+rank that never reaches the attempt. Deliberately NOT re-tuned here -- 60 s is
 a documented policy number with its own rationale in
 ``ADMISSION_WEDGE_RECOVERY_SECONDS`` -- and recorded instead so the next
 reader has the measurement rather than the guess.
@@ -210,6 +210,53 @@ DEFAULT_RETRY_SECONDS: float = 30.0
 #: like the 46 identical alarm lines it is buried in.
 ESCALATION_TOKEN = "ADMISSION-WEDGE-UNRECOVERED"
 
+# -- #800: WHICH KIND OF UNRECOVERED ---------------------------------------
+#
+# ESTABLISHED ON A LIVE WEDGE, 2026-08-22 17:10-17:16Z, boot 689161de77 -- the
+# first boot to carry this module. Log
+# evidence-665-f1/boot_802f_staged1_0822_1703.log: five posts, five NOT
+# CONSUMED, one escalation. py-spy on all three ranks during the wedge
+# (evidence-800/wedge_1703_pp2/) shows PP2's scheduler thread here:
+#
+#     _advance        (pp_chain_receiver.py:218)
+#     recv            (pp_chain_receiver.py:329)
+#     recv_requests   (scheduler_components/request_receiver.py:103)
+#     _event_loop_pp_body (scheduler_pp_mixin.py:~1296)
+#
+# and the PP body is:
+#
+#     1292:  recv_reqs = self.request_receiver.recv_requests()   <- BLOCKED HERE
+#     1293:  self._pp_forward_and_process_input_requests(recv_reqs)
+#     2225:      self.process_input_requests(recv_reqs)          <- the drain
+#
+# THE DRAIN IS ONE STATEMENT BEHIND THE BLOCK. That is not a flaw in the
+# instrument -- UNCONSUMED is the instrument correctly reporting that the
+# thread never got past 1292 -- but it settles what the actuator can do:
+# posting work to a thread that is parked in a blocking receive cannot be
+# delivered, no matter how often it is posted.
+#
+# AND MOVING THE DRAIN EARLIER DOES NOT HELP, so nobody should try. The thread
+# had already passed the head of the body when it blocked; a drain at the top
+# would have run BEFORE the watchdog posted. There is no point in the body
+# this thread still reaches.
+#
+# So the two escalations are different findings and must not share a sentence:
+#: Attempts were CONSUMED and changed nothing. The scheduler thread is looping;
+#: the in-process actuator is reachable and simply does not help this wedge.
+ESCALATION_INEFFECTIVE = "INEFFECTIVE"
+#: Attempts were NEVER consumed. The scheduler thread is not running its loop,
+#: so NO in-process actuator can be delivered to it -- not this one, not a
+#: better one. Only something outside the process can act.
+ESCALATION_UNREACHABLE = "UNREACHABLE"
+
+#: Once the actuator is proven undeliverable, probe far less often.
+#:
+#: NOT "stop entirely". The five identical NOT-CONSUMED lines on the specimen
+#: are noise, but a thread that unblocks must still be noticed, and the only
+#: way to notice is to post again. Backing off keeps the discovery and drops
+#: the repetition. The episode ends on its own when the alarm clears.
+UNREACHABLE_RETRY_FACTOR: float = 4.0
+
 
 def _classify(reason: str) -> str:
     """One gate exit -> one of the three outcome states.
@@ -262,6 +309,11 @@ class WedgeRecoveryChannel:
         self._posted_at: float = 0.0
         self._consecutive_non_actuating: int = 0
         self._escalated: bool = False
+        #: True once an attempt in this run went unconsumed. Cleared by ANY
+        #: consumed outcome -- a consumed attempt is positive proof the thread
+        #: is looping, and that proof is newer than the failure that preceded
+        #: it.
+        self._unreachable: bool = False
         #: The last SETTLED outcome, kept so the recovery's own result is a
         #: readable fact and not only a log line. #788 had no such field, and
         #: that is the whole reason its ineffectiveness could be reported
@@ -311,10 +363,16 @@ class WedgeRecoveryChannel:
             self.last_outcome = outcome
             self._consecutive_non_actuating = 0
             self._escalated = False
+            self._unreachable = False
             return False
         if outcome.state not in NON_ACTUATING_STATES:
             return False
         self.last_outcome = outcome
+        # REACHABILITY IS A SEPARATE AXIS FROM EFFECTIVENESS. An INERT or
+        # NOT_APPLICABLE outcome did not help, but it was CONSUMED -- which
+        # proves the scheduler thread ran its loop, and that proof overrides
+        # any earlier UNCONSUMED.
+        self._unreachable = outcome.state == STATE_UNCONSUMED
         self._consecutive_non_actuating += 1
         if self._escalated or self._consecutive_non_actuating < escalate_after:
             return False
@@ -325,6 +383,7 @@ class WedgeRecoveryChannel:
         """The wedge cleared. Forget the run, keep the sequence monotone."""
         self._consecutive_non_actuating = 0
         self._escalated = False
+        self._unreachable = False
 
     @property
     def consecutive_non_actuating(self) -> int:
@@ -333,6 +392,15 @@ class WedgeRecoveryChannel:
     @property
     def escalated(self) -> bool:
         return self._escalated
+
+    @property
+    def unreachable(self) -> bool:
+        return self._unreachable
+
+    @property
+    def escalation_class(self) -> str:
+        """Which of the two findings this run is. See the constants above."""
+        return ESCALATION_UNREACHABLE if self._unreachable else ESCALATION_INEFFECTIVE
 
     # -- scheduler thread ------------------------------------------------
 
@@ -398,7 +466,9 @@ __all__ = [
     "DEFAULT_ACK_GRACE_SECONDS",
     "DEFAULT_ESCALATE_AFTER",
     "DEFAULT_RETRY_SECONDS",
+    "ESCALATION_INEFFECTIVE",
     "ESCALATION_TOKEN",
+    "ESCALATION_UNREACHABLE",
     "NON_ACTUATING_STATES",
     "RECOVERY_CHANNEL_ATTR",
     "REASON_NO_SCHEDULER",
@@ -409,6 +479,7 @@ __all__ = [
     "STATE_NOT_APPLICABLE",
     "STATE_PENDING",
     "STATE_UNCONSUMED",
+    "UNREACHABLE_RETRY_FACTOR",
     "WedgeRecoveryChannel",
     "drain_recovery_request",
     "get_recovery_channel",
