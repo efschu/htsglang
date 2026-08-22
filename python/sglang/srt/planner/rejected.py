@@ -364,7 +364,7 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         ),
         level=BLOCKED,
         evidence=(
-            "server_args.py:17583 (if pp_size > 1) and server_args.py:17598 "
+            "server_args.py:18958 (if pp_size > 1) and server_args.py:18973 "
             "(spec assert, "
             "'or self.enable_phase_flip'); the overlap half is auto-disabled "
             "first at arg_groups/overrides.py:2163 "
