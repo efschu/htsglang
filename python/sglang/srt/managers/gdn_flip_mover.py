@@ -671,6 +671,7 @@ def agree_mamba_slots(
     group,
     local_capacity: int,
     all_reduce=None,
+    device=None,
 ) -> Tuple[torch.Tensor, str]:
     """Make every rank move the SAME mamba slot set. Returns (slots, refusal).
 
@@ -734,12 +735,28 @@ def agree_mamba_slots(
     reduce_fn = all_reduce if all_reduce is not None else _default_all_reduce
     local = slots.detach().to("cpu", torch.int64).reshape(-1)
     local_max = int(local.max().item()) if local.numel() else -1
+    # #802: THE COLLECTIVES RUN ON THE GROUP'S OWN DEVICE. The caller passes
+    # `flip_tp.device_group`, an NCCL group with NO CPU backend, so reducing
+    # a CPU tensor on it raises "No backend type associated with device type
+    # cpu" -- which is exactly how the first real flip of the 18:49 boot died
+    # (specimen: /spinning/evidence-665-f1/boot_802ab_arm1_0822_1849.log).
+    # The KV leg on the very next line of the caller already pairs the two:
+    # `_dist_exchange(flip_tp.device_group, device)`. This one was simply
+    # never told which device its group speaks.
+    #
+    # `local` deliberately STAYS on CPU: it is only ever indexed and returned,
+    # never reduced, and the caller has always received a CPU tensor back.
+    # Only the two reduced buffers move. `device=None` keeps the pre-existing
+    # CPU behaviour, so every in-process caller that injects `all_reduce` is
+    # unchanged.
 
     # COLLECTIVE 1, and it carries both agreed scalars at once. MAX over
     # [max_slot_id, -capacity] yields the group's highest slot id and the
     # NEGATED group minimum capacity -- the same [x, -x] inversion the KV
     # leg's fit verdict uses to get two directions out of one reduction.
-    header = torch.tensor([local_max, -int(local_capacity)], dtype=torch.int64)
+    header = torch.tensor(
+        [local_max, -int(local_capacity)], dtype=torch.int64, device=device
+    )
     reduce_fn(header, group)
     group_max = int(header[0].item())
     min_capacity = -int(header[1].item())
@@ -755,12 +772,16 @@ def agree_mamba_slots(
     # leg spells the same OR as -1/0 under MIN because that is the channel
     # its rung already had; here the channel is free, so the direct form is
     # used and the inversion is not repeated.)
-    presence = torch.zeros(span, dtype=torch.int64)
+    presence = torch.zeros(span, dtype=torch.int64, device=device)
     in_span = local[local < span]
     if in_span.numel():
-        presence[in_span] = 1
+        # `local` is CPU by construction above; the index must follow the
+        # buffer onto whatever device the group speaks.
+        presence[in_span.to(presence.device)] = 1
     reduce_fn(presence, group)
-    union = presence.nonzero().flatten().to(torch.int64)
+    # Back to CPU for the caller: the mover's slot list has always been a CPU
+    # tensor, and `union` is compared and indexed below as one.
+    union = presence.nonzero().flatten().to(torch.int64).cpu()
 
     highest = int(union[-1].item()) if union.numel() else -1
     if highest >= min_capacity:
@@ -882,8 +903,15 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
         # rank on every leg, unconditionally -- see agree_mamba_slots for why
         # there is no early return in it.
         local = flip_mamba_slots(scheduler)
+        # #802: the same (group, device) pairing the KV leg uses below at
+        # `_dist_exchange(flip_tp.device_group, device)`. Without the device
+        # the union reduces CPU tensors on an NCCL group and the first real
+        # flip dies with "No backend type associated with device type cpu".
         agreed, refusal = agree_mamba_slots(
-            local, flip_tp.device_group, _local_slot_capacity()
+            local,
+            flip_tp.device_group,
+            _local_slot_capacity(),
+            device=pp_req_pool.mamba_pool.mamba_cache.temporal.device,
         )
         if refusal:
             logger.error("%s %s", LOG_PREFIX, refusal)
