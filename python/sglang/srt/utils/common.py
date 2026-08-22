@@ -4217,10 +4217,23 @@ def log_info_on_rank0(logger, msg):
         if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
     except Exception as e:
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"{msg} (rank-check failed: {e})")
-        else:
+        # #815: this is the FALLBACK, so it is the one branch that may not
+        # raise. `get_rank()` throws outright when there is no default
+        # process group, and `is_initialized()` does not reliably rule that
+        # out -- it is a plain module attribute that test doubles and
+        # embedding hosts do replace. When it threw here it took
+        # `SessionController.rewind_to` down with it: a log line aborting a
+        # session rewind. A rank we cannot determine degrades to "log it",
+        # exactly as the never-initialized case below already did.
+        try:
+            on_rank0 = (
+                torch.distributed.get_rank() == 0
+                if torch.distributed.is_initialized()
+                else True
+            )
+        except Exception:
+            on_rank0 = True
+        if on_rank0:
             logger.info(f"{msg} (rank-check failed: {e})")
 
 
