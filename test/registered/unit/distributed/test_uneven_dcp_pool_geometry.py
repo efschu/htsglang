@@ -90,6 +90,25 @@ class _StubRunner(ModelRunnerKVCacheMixin):
         self.dcp_size = dcp_size
         self.model_config = model_config
         self.is_draft_worker = is_draft_worker
+        # #797 made the pool-geometry decision sites read a SEPARATE flag:
+        #
+        #   model_runner.py:512
+        #   self.is_draft_pool_worker = (
+        #       is_draft_worker and not is_phase_flip_tp_stack)
+        #
+        # and the comment above it states the rule these two methods now obey
+        # -- they "consult THIS flag, never is_draft_worker directly", because
+        # the flip's TP stack rides the draft construction gates while its
+        # POOLS take the target-model treatment. So this runner, which exists
+        # to be the smallest object those methods read, has to carry both.
+        #
+        # Derived rather than pinned: no case here constructs a phase-flip TP
+        # stack, so the second term is False and the pool flag follows the
+        # draft flag -- including for the two draft cases below, which are
+        # ordinary draft runners and whose geometry expectations are therefore
+        # unchanged. A test that did build a flip stack would have to pass the
+        # two apart, and writing the rule out is what makes that visible.
+        self.is_draft_pool_worker = is_draft_worker
         self.server_args = SimpleNamespace(draft_kv_layout=draft_kv_layout)
 
 

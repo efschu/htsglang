@@ -122,6 +122,14 @@ def _run_ranks(server_args, *, allow_install=True, dcp_size=3):
             tp_rank=rank,
             server_args=server_args,
             is_draft_worker=False,
+            # #797 (model_runner.py:512) split the POOL-geometry flag off the
+            # construction flag -- `is_draft_pool_worker = is_draft_worker and
+            # not is_phase_flip_tp_stack` -- and the sizing sites this stub
+            # drives read the pool flag, never `is_draft_worker` directly. A
+            # SimpleNamespace mirroring a ModelRunner has to carry both.
+            # Every stub in this file is a plain target-model rank, so both
+            # flags are False and nothing under test moves.
+            is_draft_pool_worker=False,
         )
         gpu = server_args.rank_gpu_id[rank]
         stub._corridor_card_free_bytes = server_args._free_mib[gpu] * MIB
@@ -242,7 +250,13 @@ class TestCorridorRefusals(CustomTestCase):
             post_sizing_mib={0: post_sizing_mib, 1: 2000, 2: 2000},
         )
         stub = SimpleNamespace(
-            dcp_size=3, page_size=1, tp_rank=0, server_args=sa, is_draft_worker=False
+            dcp_size=3,
+            page_size=1,
+            tp_rank=0,
+            server_args=sa,
+            is_draft_worker=False,
+            # #797, as in `_stub_for` above: the pool flag is read separately.
+            is_draft_pool_worker=False,
         )
         stub._corridor_card_free_bytes = stub_free_mib * MIB
         stub._rank_vector_index = lambda: 0
@@ -281,7 +295,13 @@ class TestCorridorRefusals(CustomTestCase):
             post_sizing_mib={0: 2000, 1: 2000},
         )
         stub = SimpleNamespace(
-            dcp_size=3, page_size=1, tp_rank=0, server_args=sa, is_draft_worker=False
+            dcp_size=3,
+            page_size=1,
+            tp_rank=0,
+            server_args=sa,
+            is_draft_worker=False,
+            # #797, as in `_stub_for` above: the pool flag is read separately.
+            is_draft_pool_worker=False,
         )
         stub._corridor_card_free_bytes = 30000 * MIB
         stub._rank_vector_index = lambda: 0

@@ -164,7 +164,13 @@ class _FakeScheduler:
         self.tree_cache = _RecordingTreeCache(done_rids=done_rids)
         self.enable_hicache_storage = enable_hicache_storage
         self.enable_hierarchical_cache = True
-        self.ps = types.SimpleNamespace(tp_size=tp_size)
+        # #791 made the admission loop ask `self.ps.pp_size` / `.pp_rank`
+        # (scheduler.py:6607) to decide whether this rank EXECUTES a forwarded
+        # pass geometry or owns its own. This fixture is a pure-TP one, so
+        # `pp_size=1` is not a neutral placeholder but the true value -- and it
+        # is the value on which `_pp_scheduled_extents` returns None, i.e. "the
+        # pre-#791 local arithmetic", which is what these cases assert about.
+        self.ps = types.SimpleNamespace(tp_size=tp_size, pp_size=1, pp_rank=0)
         self.running_batch = _FakeBatch(batch_is_full=batch_is_full)
 
         self.grammar_manager = types.SimpleNamespace(has_waiting_grammars=lambda: False)
@@ -219,6 +225,36 @@ class _FakeScheduler:
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
     _prefetch_done_for = Scheduler._prefetch_done_for
     _get_new_batch_prefill_raw = Scheduler._get_new_batch_prefill_raw
+    # #794 (86d1cb1384) made `_get_new_batch_prefill_raw` narrow the pass's
+    # chunk through the corridor at scheduler.py:7146, so the bound method
+    # above now calls a sibling this stub did not have.
+    #
+    # Bound rather than stubbed, and it costs nothing to bind: the shipped
+    # function returns the requested width unchanged unless it is entitled to
+    # narrow, and neither entitlement exists here. `self.ps` carries no
+    # `pp_size` (so the PP0-decides branch is not taken) and there is no
+    # `tp_cpu_group` (so the pure-TP branch sees world size 1, where "the local
+    # decision IS the group decision"). The prefetch symmetry under test
+    # therefore sees the same widths it saw before #794, while still running
+    # the real function rather than a paraphrase of it.
+    _corridor_granted_prefill_width = Scheduler._corridor_granted_prefill_width
+    # #701 (90e792bd46) moved the cross-pass reservation onto the SCHEDULER,
+    # because a ledger owned by the per-pass `PrefillAdder` forgets a resident
+    # chunked request's outstanding prefill exactly when the next pass needs
+    # it. `_get_new_batch_prefill_raw` hands it to the adder at
+    # scheduler.py:7284, so a stub driving that method needs the property.
+    #
+    # Bound rather than replaced by a fake ledger: the property is written to
+    # be usable exactly like this -- "LAZY on purpose ... constructing it on
+    # first read is what lets the ownership be tested without standing up a
+    # scheduler". It holds only integers keyed by request id, so it starts
+    # empty here and reserves nothing, and this file's symmetry assertions are
+    # unmoved.
+    chunked_commitment_ledger = Scheduler.chunked_commitment_ledger
+    # #791 (6cea3ae016): the admission loop now asks what geometry it was
+    # HANDED before deriving one (scheduler.py:7289). Bound, and it answers
+    # None on this fixture's pure-TP `ps` -- see the note at its construction.
+    _pp_scheduled_extents = Scheduler._pp_scheduled_extents
 
 
 def _run_rank(sched: _FakeScheduler) -> List[str]:
