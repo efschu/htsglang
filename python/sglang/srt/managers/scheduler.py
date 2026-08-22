@@ -106,6 +106,7 @@ from sglang.srt.managers.corridor_admission import (
     guard_prefill_admission,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.wedge_recovery import drain_recovery_request
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -2712,6 +2713,17 @@ class Scheduler(
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
+        # #800: run any wedge-recovery request the watchdog thread posted, on
+        # THIS thread. This function is the one place every loop family reaches
+        # once per iteration -- event_loop_normal, event_loop_overlap and the
+        # three PP loops via _pp_forward_and_process_input_requests -- which is
+        # what a phase-flip boot needs, since it re-dispatches between
+        # event_loop_pp and event_loop_normal per phase and a drain point in
+        # only one of them would be inert in the other. Costs one attribute
+        # read and one int compare on a boot that has never wedged; see
+        # managers/wedge_recovery.py for why the actuator must not run on the
+        # watchdog thread (it silenced PP0's detector on 2026-08-22).
+        drain_recovery_request(self)
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.

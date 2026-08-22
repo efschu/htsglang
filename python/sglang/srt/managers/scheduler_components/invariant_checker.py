@@ -22,6 +22,18 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.wedge_recovery import (
+    DEFAULT_ACK_GRACE_SECONDS,
+    DEFAULT_ESCALATE_AFTER,
+    DEFAULT_RETRY_SECONDS,
+    ESCALATION_TOKEN,
+    RECOVERY_CHANNEL_ATTR,
+    STATE_NOT_APPLICABLE,
+    STATE_PENDING,
+    STATE_UNCONSUMED,
+    RecoveryOutcome,
+    get_recovery_channel,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -715,6 +727,212 @@ def check_admission_wedge_once(
     return alarm, detail
 
 
+class AdmissionWedgeRecovery:
+    """#800: drive the recovery attempt and CONSUME its outcome.
+
+    #788 shipped the attempt. What it did not ship was a consumer: the result
+    went to ``logger.error`` and nowhere else, so on 2026-08-22 the code
+    reported its own ineffectiveness three times, correctly, and
+    nothing in the system was any the wiser. A log line is not a consumer.
+
+    This class is that consumer. It owns three things the old closure did not:
+
+    1. **A reason, not a guess.** It reads
+       ``guard_prefill_admission_explained``'s named exit instead of inferring
+       a cause from a ``None`` that six different exits produce.
+    2. **A thread split.** It POSTS the request and lets the scheduler thread
+       run the actuator. The old path called into the CUDA allocator from the
+       watchdog thread, and the specimen shows PP0's watchdog going silent
+       from the moment it made that call: four recovery announcements were
+       logged and only three results, the missing one PP0's, and PP0 emitted
+       ZERO log lines of any kind over the remaining 88 s while PP1 and PP2
+       emitted 18.
+    3. **An escalation.** After ``escalate_after`` consecutive non-actuating
+       outcomes it emits ``ESCALATION_TOKEN``, once, on its own line. That
+       token is deliberately NOT ``ADMISSION_WEDGE``: the state it marks was
+       previously invisible precisely because it was buried in 46 identically
+       worded alarm lines, and an external watchdog needs something it can
+       grep for that the ordinary alarm does not also match.
+
+    The state that only exists here is ``UNCONSUMED``: the request was posted
+    and the scheduler thread never reached ``process_input_requests`` to take
+    it. That is a statement about the WEDGE -- the scheduler thread is not
+    looping -- and it is the finding the specimen needed and could not make.
+    """
+
+    def __init__(
+        self,
+        scheduler: Scheduler,
+        *,
+        grace_s: float = DEFAULT_ACK_GRACE_SECONDS,
+        retry_s: float = DEFAULT_RETRY_SECONDS,
+        escalate_after: int = DEFAULT_ESCALATE_AFTER,
+        clock=time.monotonic,
+    ) -> None:
+        self._scheduler = scheduler
+        self._grace_s = float(grace_s)
+        self._retry_s = float(retry_s)
+        self._escalate_after = int(escalate_after)
+        self._clock = clock
+        self._last_post_at = float("-inf")
+        self._outstanding = False
+
+    def step(self, alarm: bool) -> Optional[RecoveryOutcome]:
+        """One watchdog poll's worth of recovery work. Returns what it learnt.
+
+        Called on the watchdog thread. Touches no CUDA, imports nothing at
+        call time, and allocates nothing on the common (no-alarm) path.
+        """
+        if self._outstanding:
+            # An outstanding request must be settled whatever the alarm says:
+            # a recovery that DID actuate has to be credited before the wedge
+            # clearing resets the counters, or the one outcome worth knowing
+            # about is the one thrown away.
+            channel = get_recovery_channel(self._scheduler)
+            outcome = self._settle(channel)
+            if outcome.state != STATE_PENDING:
+                self._outstanding = False
+            if not alarm:
+                self._outstanding = False
+                channel.reset_episode()
+            return outcome
+        if not alarm:
+            # NOTHING IS BUILT ON A HEALTHY BOX. The channel is created by the
+            # first post and by nothing else, so a boot that never wedges
+            # never allocates one -- and the test asserting its absence is how
+            # that stays true.
+            channel = getattr(self._scheduler, RECOVERY_CHANNEL_ATTR, None)
+            if channel is not None:
+                channel.reset_episode()
+            return None
+        threshold = _admission_wedge_recovery_threshold()
+        age = time.perf_counter() - self._scheduler.last_first_token_progress_time
+        if age < threshold:
+            return None
+        now = self._clock()
+        if now - self._last_post_at < self._retry_s:
+            return None
+        channel = get_recovery_channel(self._scheduler)
+        if channel is None:
+            return None
+        self._last_post_at = now
+        seq = channel.post(now, tokens=0)
+        self._outstanding = True
+        logger.error(
+            "%s RECOVERY: wedge has been continuously alarming for %.1fs "
+            "(>= %.1fs recovery threshold). Posted corridor-relief request "
+            "#%d to the SCHEDULER thread (not run here: the actuator touches "
+            "CUDA allocator state and running it on this thread silenced "
+            "PP0's own detector on 2026-08-22). The next poll reports whether "
+            "the scheduler thread consumed it, and what the relief ladder did.",
+            ADMISSION_WEDGE,
+            age,
+            threshold,
+            seq,
+        )
+        return None
+
+    def _settle(self, channel) -> RecoveryOutcome:
+        outcome = channel.settle(self._clock(), self._grace_s)
+        if outcome.state == STATE_PENDING:
+            return outcome
+        if outcome.state == STATE_UNCONSUMED:
+            logger.error(
+                "%s RECOVERY: request #%d was NOT CONSUMED after %.1fs "
+                "(grace %.1fs). The scheduler thread has not reached "
+                "process_input_requests in that window, so it is not running "
+                "its loop -- this is a finding about the wedge, not about the "
+                "corridor gate. A phase-flip leg cannot explain it: the grace "
+                "window is set above one.",
+                ADMISSION_WEDGE,
+                outcome.seq,
+                outcome.waited_s,
+                self._grace_s,
+            )
+        elif outcome.actuated:
+            logger.error(
+                "%s RECOVERY: request #%d ACTUATED on the scheduler thread "
+                "(relief ladder exit '%s' after %.1fs). The scheduler thread "
+                "IS looping, and the ladder did run.",
+                ADMISSION_WEDGE,
+                outcome.seq,
+                outcome.reason,
+                outcome.waited_s,
+            )
+        elif outcome.state == STATE_NOT_APPLICABLE:
+            # DELIBERATELY NOT logger.error, and that is the point of the
+            # three-state split. The gate was there, it worked, and it
+            # correctly had nothing to do -- reporting that at the same volume
+            # as a broken mechanism is what produced "the gate is off or
+            # inert" about a gate that had cleared four admissions an hour
+            # earlier. The escalation below is what gets loud if this keeps
+            # being the answer.
+            logger.info(
+                "%s RECOVERY: request #%d was NOT APPLICABLE -- the scheduler "
+                "thread consumed it after %.1fs and the gate correctly had "
+                "nothing to do (exit '%s'). The gate is present and working; "
+                "this wedge is not a corridor problem.",
+                ADMISSION_WEDGE,
+                outcome.seq,
+                outcome.waited_s,
+                outcome.reason,
+            )
+        else:
+            logger.error(
+                "%s RECOVERY: request #%d was INERT -- the scheduler thread "
+                "consumed it after %.1fs and the MECHANISM was missing or "
+                "broke, exit '%s'. This is a defect in the recovery path "
+                "itself, not a report about the wedge, and it is distinct "
+                "from NOT_APPLICABLE by construction. It is not the old "
+                "'returned None', which six exits produced and which was read "
+                "as 'the gate is off' on a boot where the gate was armed.",
+                ADMISSION_WEDGE,
+                outcome.seq,
+                outcome.waited_s,
+                outcome.reason,
+            )
+        if channel.record(outcome, self._escalate_after):
+            logger.error(
+                "%s: %d consecutive recovery attempts changed nothing on this "
+                "rank (latest: %s / '%s'). The recovery path is not working "
+                "and the wedge is not clearing; this line is the distinct, "
+                "greppable state an external supervisor should act on, and it "
+                "is emitted ONCE per run so it cannot be mistaken for the "
+                "repeating %s alarm it sits among.",
+                ESCALATION_TOKEN,
+                channel.consecutive_non_actuating,
+                outcome.state,
+                outcome.reason,
+                ADMISSION_WEDGE,
+            )
+        return outcome
+
+
+def make_admission_wedge_poller(scheduler: Scheduler):
+    """One watchdog poll, as a callable. The thread calls this; so do tests.
+
+    Extracted so a test exercises the SAME callable the production thread
+    runs, rather than a helper the thread happens to resemble. A test that
+    calls the driver directly proves the driver works and says nothing about
+    whether anything calls it -- which is the exact gap that let #788's
+    recovery ship inert.
+    """
+    driver = AdmissionWedgeRecovery(scheduler)
+
+    def _poll_once() -> None:
+        try:
+            alarm, _detail = check_admission_wedge_once(scheduler, log_on_alarm=True)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.error(f"admission-wedge watchdog check failed: {e}")
+            return
+        try:
+            driver.step(alarm)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.error("%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e)
+
+    return _poll_once
+
+
 def create_admission_wedge_watchdog(
     scheduler: Scheduler,
     poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
@@ -729,99 +947,49 @@ def create_admission_wedge_watchdog(
     and the first-token-progress clock.
 
     Log-only for the REPORT, still, by design: there is no SIGQUIT path here
-    and this thread does not decide to restart anything. #788 adds exactly
-    one bounded action on top of the report: once a wedge has stayed
-    continuously alarming past ``_admission_wedge_recovery_threshold()`` (see
-    that function; env-overridable, default conservative, always well above
-    the report threshold itself), this loop makes ONE forced-admission
-    recovery attempt for that episode and logs the attempt loudly whichever
-    way it goes. "Episode" means a maximal run of consecutive alarming
-    polls; the attempt flag resets the moment a poll reports no alarm, so a
-    wedge that recurs later gets its own attempt.
+    and this thread does not decide to restart anything. On top of the report
+    it drives ``AdmissionWedgeRecovery`` (see that class), which posts a
+    corridor-relief request to the scheduler thread once a wedge has stayed
+    continuously alarming past ``_admission_wedge_recovery_threshold()``, and
+    then CONSUMES the outcome: actuated, inert-with-a-named-exit, or never
+    consumed at all.
 
-    The action reuses ``corridor_admission.guard_prefill_admission`` --
-    the SAME spill-before-alloc actuator normal prefill admission already
-    calls before building a chunk -- rather than inventing a new subsystem,
-    per #699/#788's own instruction to reuse what exists. It is best-effort
-    and admittedly narrow: ``guard_prefill_admission`` no-ops when phase-flip
-    is off (see its own docstring), and even when it runs, it only relieves
-    VRAM pressure at the admission site. A wedge whose cause is elsewhere --
-    the #788 PP comms deadlock this file's own ADMISSION_WEDGE docstring
-    calls "broader than that path" is exactly such a case -- will not be
-    moved by it, and the report keeps firing on every subsequent poll
-    regardless of whether the attempt ran.
+    #800 CHANGED TWO THINGS #788 GOT WRONG, both measured on the 2026-08-22
+    11:22Z specimen and both recorded here so the reasoning is not lost:
 
-    CROSS-THREAD CAVEAT, named rather than assumed away: this watchdog
-    thread already reads scheduler.waiting_queue and scheduler.running_batch
-    unsynchronized (see check_admission_wedge_once), which this codebase
-    already treats as an accepted read-only risk. Calling
-    guard_prefill_admission from here goes further -- it can touch CUDA
-    allocator state (torch.cuda.memory_reserved/allocated, an empty_cache
-    provider on the relief ladder) concurrently with the scheduler's own
-    forward thread. That is a real, new concurrency shape, not a hazard this
-    change removes; it is accepted here because the alternative -- wiring a
-    new cross-thread signal/flag into the scheduler's own loop so the
-    scheduler thread runs the actuator itself -- is the "new subsystem"
-    #788 was explicit about not building for this slice.
+    * The actuator no longer runs on THIS thread. #788's own docstring named
+      the hazard -- ``guard_prefill_admission``'s relief ladder touches CUDA
+      allocator state, including an ``empty_cache`` provider, concurrently
+      with the scheduler's forward thread -- and accepted it rather than
+      build the cross-thread signal. The specimen shows the hazard firing:
+      four recovery announcements were logged and only three results, and the
+      missing one is PP0's. PP0 announced at 11:23:09 and then emitted ZERO
+      log lines of any kind over the remaining 88 s, while PP1 and PP2 emitted
+      18 in that window. The recovery attempt silenced the only mechanism
+      still reporting. Both the attempt and its caller catch ``Exception``, so
+      a clean raise is excluded. The cross-thread signal is now built; it is
+      ``managers/wedge_recovery.py`` and it is 3 ints wide.
+    * The outcome is no longer a ``None`` with a guessed meaning. It carries
+      the gate's own named exit, and after ``DEFAULT_ESCALATE_AFTER``
+      consecutive non-actuating outcomes it emits ``ESCALATION_TOKEN`` on its
+      own line, once, so an external supervisor has something to grep that the
+      46 identically worded alarm lines do not also match.
+
+    What has NOT changed, and must not be misread: the relief ladder still
+    cannot un-wedge anything. It is a spill-before-alloc VRAM gate whose own
+    docstring says *"IT SPILLS. IT NEVER REFUSES"*, and there is no
+    forced-admission actuator in this codebase for it to be. What the request
+    now buys is a DIAGNOSIS the old path could not make -- whether the
+    scheduler thread is still running its loop at all -- and an honest report
+    of what the ladder did when it is.
     """
 
-    recovery_attempted_this_episode = False
-
-    def _attempt_recovery(age: float, threshold: float) -> None:
-        logger.error(
-            "%s RECOVERY: wedge has been continuously alarming for %.1fs "
-            "(>= %.1fs recovery threshold). Making ONE forced-admission "
-            "attempt for this episode via corridor_admission."
-            "guard_prefill_admission before reporting again.",
-            ADMISSION_WEDGE,
-            age,
-            threshold,
-        )
-        try:
-            from sglang.srt.managers.corridor_admission import (
-                guard_prefill_admission,
-            )
-
-            verdict = guard_prefill_admission(scheduler, tokens=0)
-        except Exception as e:  # noqa: BLE001 - recovery must not kill the watchdog
-            logger.error("%s RECOVERY: forced attempt raised: %s", ADMISSION_WEDGE, e)
-            return
-        logger.error(
-            "%s RECOVERY: forced-admission attempt returned %s (None means "
-            "the gate is off or inert on this boot -- see guard_prefill_"
-            "admission's own docstring; this does not mean the wedge is "
-            "resolved either way, only that the attempt ran)",
-            ADMISSION_WEDGE,
-            verdict,
-        )
+    poll = make_admission_wedge_poller(scheduler)
 
     def _loop() -> None:
-        nonlocal recovery_attempted_this_episode
         while True:
             time.sleep(poll_interval)
-            try:
-                alarm, _detail = check_admission_wedge_once(
-                    scheduler, log_on_alarm=True
-                )
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.error(f"admission-wedge watchdog check failed: {e}")
-                continue
-            if not alarm:
-                recovery_attempted_this_episode = False
-                continue
-            if recovery_attempted_this_episode:
-                continue
-            threshold = _admission_wedge_recovery_threshold()
-            age = time.perf_counter() - scheduler.last_first_token_progress_time
-            if age < threshold:
-                continue
-            recovery_attempted_this_episode = True
-            try:
-                _attempt_recovery(age, threshold)
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.error(
-                    "%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e
-                )
+            poll()
 
     t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
     t.start()
