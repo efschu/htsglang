@@ -48,6 +48,12 @@ from sglang.srt.managers.pp_admission_congruence import (
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
+from sglang.srt.managers.pp_stash_disposition import (
+    PP_LOOP_ONLY,
+    UNDECLARED,
+    census_stash,
+    stash_keys_with_disposition,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -234,9 +240,7 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
     }
 
 
-def pp_admission_decision_from_wire(
-    message: Dict[str, object]
-) -> PPAdmissionDecision:
+def pp_admission_decision_from_wire(message: Dict[str, object]) -> PPAdmissionDecision:
     """#791: inverse of pp_admission_decision_to_wire."""
     mb_id, raw_entries = message[_ADMISSION_DECISION_PAYLOAD_KEY]
     entries = tuple(
@@ -3117,6 +3121,156 @@ class SchedulerPPMixin:
             self.pp_flip_flush_drained_sends()
         except Exception as exc:  # noqa: BLE001
             logger.error("%s armed flush failed: %s", "#631", exc)
+        # #800: THE ESCAPE HATCH, and it belongs HERE rather than in the
+        # presence probe. `pp_flip_channels_empty` is consulted twice per round
+        # and is documented as reporting rather than acting; retiring from
+        # inside it would make a probe mutate the thing it measures. This is
+        # the armed loop's one service turn, it already acts, and it runs
+        # immediately BEFORE the probe in the same round.
+        try:
+            self.pp_flip_retire_undeclared_stash()
+        except Exception as exc:  # noqa: BLE001 - an escape may never kill a flip
+            logger.error("%s undeclared-stash escape failed: %s", "#800", exc)
+
+    def pp_flip_retire_undeclared_stash(self: Scheduler) -> int:
+        """#800: bound how long an UNDECLARED kind may hold the flip gate.
+
+        THE STATE THIS CREATES, and it is the one the specimen did not have.
+        A stashed message with no declared disposition used to have no timeout,
+        no discard rule and no way to say "I cannot place this". It simply sat
+        there and the rank went quiet -- 57922 withheld rounds over five
+        minutes, six abandon/re-arm cycles, an instance that answered nothing
+        while its port stayed open. A message this rank cannot place is now a
+        NAMED, BOUNDED state: held conservatively at first (it might be an owed
+        payload), reported by kind from the first round by
+        ``pp_flip_channels_empty``, and retired loudly here once the escape
+        deadline expires.
+
+        DECLARED KINDS ARE NEVER TOUCHED. ``output``, ``proxy`` and
+        ``crossing`` are owed to a consumer that looks for them after the
+        cutover and must keep blocking; ``admission_decision`` does not block
+        at all and must survive an abandon intact, because the resumed PP body
+        pops exactly one per pass and dropping one puts every later receive off
+        by one. Retiring either group here would be corpse S with a clock on
+        it.
+
+        The clock is per ``(src, kind)`` and is reset when the key empties, so
+        a kind that is consumed and stashed again starts fresh rather than
+        inheriting a stranger's age.
+
+        ``SGLANG_PP_STASH_ESCAPE_S <= 0`` disables the retirement while leaving
+        the census and its log line intact -- the off-switch a guard needs in
+        order to be provable in both directions.
+        """
+        inbox = getattr(self, "_pp_tensor_dict_inbox", None)
+        seen: Dict[tuple, float] = getattr(self, "_pp_stash_first_seen", None)
+        if seen is None:
+            seen = {}
+            self._pp_stash_first_seen = seen
+        keys = stash_keys_with_disposition(inbox, (UNDECLARED,))
+        # Forget keys that have emptied, so the next occupant is timed from its
+        # own arrival rather than from a predecessor's.
+        for stale in [k for k in seen if k not in keys]:
+            del seen[stale]
+        if not keys:
+            return 0
+        # One named seam for the clock, so the escape's DEADLINE can be tested
+        # without a five-minute test. Absent on the shipped scheduler, which is
+        # the point: production reads the real monotonic clock and nothing has
+        # to be injected for it to do so.
+        now = getattr(self, "_pp_stash_clock", time.monotonic)()
+        deadline = envs.SGLANG_PP_STASH_ESCAPE_S.get()
+        retired = 0
+        for key in keys:
+            first = seen.setdefault(key, now)
+            age = now - first
+            if deadline <= 0 or age < deadline:
+                continue
+            queue = inbox.get(key)
+            depth = len(queue or ())
+            if not depth:
+                continue
+            queue.clear()
+            del seen[key]
+            retired += depth
+            logger.error(
+                "%s RETIRED %d stashed message(s) of UNDECLARED kind=%s from "
+                "rank %s after %.1fs (escape deadline %.1fs). No consumer is "
+                "registered for this kind at the flip gate, so holding it was "
+                "blocking this rank's presence and no amount of waiting could "
+                "clear it. Declare its disposition in pp_stash_disposition "
+                "instead of relying on this escape: a retired message is a "
+                "LOST payload if any consumer did in fact owe it.",
+                "#800",
+                depth,
+                key[1] if isinstance(key, tuple) and len(key) >= 2 else key,
+                key[0] if isinstance(key, tuple) and len(key) >= 2 else "?",
+                age,
+                deadline,
+            )
+        if retired:
+            self._pp_stash_retired_total = (
+                getattr(self, "_pp_stash_retired_total", 0) + retired
+            )
+        return retired
+
+    def pp_flip_retire_pp_loop_stash(self: Scheduler) -> int:
+        """#800: retire the PP-loop-only stash at a CUTOVER, by name.
+
+        Called from the cutover, which is the one moment these messages stop
+        being owed: they name a pass in a slot ring that the cutover destroys
+        (``init_pp_loop_state`` rebuilds it), and the phase they are consumed
+        in no longer exists after this point.
+
+        WHY THIS IS NOT ALREADY IMPLICIT. The cutover's own instrument states
+        that ``init_pp_loop_state`` "clears ... the tensor-dict inbox with no
+        drain and no carry" and reports ``inbox=%d`` under the heading CUTOVER
+        DISCARDS IN-FLIGHT OUTPUT. That stopped being true at #753, which moved
+        the inbox off the scheduler and onto the ``pp_group`` so the crossing
+        wire could share it; ``init_pp_loop_state`` explicitly does not touch it
+        any more. Nothing has cleared it since, so a message parked here
+        outlives the cutover, outlives the whole TP phase, and is handed to the
+        NEXT PP epoch's receive -- a mispair of exactly the class #795's epoch
+        stamp exists to catch. This makes the discard real and names what it
+        discarded.
+
+        Only ``PP_LOOP_ONLY`` is retired. A ``BLOCKS_FLIP`` entry at a cutover
+        is a quiescence-predicate failure, not a message to sweep: it is
+        reported as an error and left in place, so the defect is visible rather
+        than tidied away.
+        """
+        inbox = getattr(self, "_pp_tensor_dict_inbox", None)
+        census = census_stash(inbox)
+        if census.blocking:
+            logger.error(
+                "%s CUTOVER FOUND A BLOCKING STASH: %s. The presence gate is "
+                "supposed to make this impossible -- a rank does not announce "
+                "while it holds one -- so this is a quiescence-predicate bug. "
+                "Left in place deliberately; sweeping it here would hide it.",
+                "#800",
+                ", ".join(f"{n} x {kind}" for kind, n in census.blocking),
+            )
+        retired = 0
+        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY,)):
+            queue = inbox.get(key)
+            depth = len(queue or ())
+            if not depth:
+                continue
+            queue.clear()
+            retired += depth
+            logger.info(
+                "%s cutover retired %d stashed message(s) of kind=%s from rank "
+                "%s: they name a pass in the slot ring this cutover rebuilds, "
+                "so no consumer can ever take them again",
+                "#800",
+                depth,
+                key[1] if isinstance(key, tuple) and len(key) >= 2 else key,
+                key[0] if isinstance(key, tuple) and len(key) >= 2 else "?",
+            )
+        seen = getattr(self, "_pp_stash_first_seen", None)
+        if seen:
+            seen.clear()
+        return retired
 
     def pp_flip_channels_empty(self: Scheduler) -> Optional[str]:
         """Are ALL of this rank's channels empty? None if yes, else why not.
@@ -3164,11 +3318,19 @@ class SchedulerPPMixin:
                 f"tensor-dict wire has {dict_posted - dict_taken} "
                 f"unconsumed message(s) from rank {self._pp_flip_upstream()}"
             )
-        stashed = sum(
-            len(q) for q in getattr(self, "_pp_tensor_dict_inbox", {}).values()
-        )
-        if stashed:
-            reasons.append(f"tensor-dict inbox holds {stashed} stashed message(s)")
+        # #800: BY DISPOSITION, not by a blanket sum. A blanket sum counts a
+        # message whose only consumer is the PP loop body -- which cannot run
+        # while the presence gate holds this rank -- and the gate then waits
+        # for a consumer the gate itself is preventing. That closed cycle
+        # killed serving twice on 2026-08-22, both times on PP1, with
+        # `kind=admission_decision` in the inbox and 57922 withheld rounds.
+        # See `pp_stash_disposition` for the full measurement and for why the
+        # message must be KEPT (an abandon resets nothing, so discarding it
+        # would put every later decision receive off by one).
+        census = census_stash(getattr(self, "_pp_tensor_dict_inbox", {}))
+        stash_reason = census.block_reason()
+        if stash_reason:
+            reasons.append(stash_reason)
 
         for attr in ("send_req_work", "send_output_work", "send_proxy_work"):
             if getattr(self, attr, None):
@@ -4963,9 +5125,7 @@ class SchedulerPPMixin:
         if batch is None:
             return False
 
-        self._pp_upstream_idle_voids = (
-            getattr(self, "_pp_upstream_idle_voids", 0) + 1
-        )
+        self._pp_upstream_idle_voids = getattr(self, "_pp_upstream_idle_voids", 0) + 1
         logger.warning(
             "#798 PP-ADMISSION pass voided on slot %d: the upstream reported "
             "launched=False for this pass, so no hidden states were posted for "
