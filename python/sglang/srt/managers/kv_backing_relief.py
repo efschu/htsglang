@@ -181,6 +181,91 @@ def collective_kv_target(reduced):
     return int(target)
 
 
+def explain_kv_target(reduced) -> str:
+    """WHY :func:`collective_kv_target` returned what it returned, in one line.
+
+    THE SILENCE THIS ENDS, measured on metal 2026-08-22
+    (boot_798_0822_0543.log). PP0 was short of seam staging with a fundable
+    plan in hand -- ``current=204800 rows, floor=115681, slack=89119,
+    deficit=+1740 MiB -> SHRINK to 149126`` -- and no shrink ever ran. Across
+    that whole boot there is not one occurrence of ``runtime_set_backing_rows``,
+    of "the eviction did not deliver the mark", or of "ABSTAIN on device":
+    this function's caller returned ``None`` and ``apply_target`` was never
+    reached. Eight flips abandoned, phase purity yielded, and the instance
+    prefilled in the TP layout.
+
+    The decisive term was a PEER's floor, and it is the one number no log
+    carries. ``target = max(desire, max_floor)`` must clear EVERY rank's live
+    set, so a rank under no memory pressure at all -- PP2, sitting on 2693 MiB
+    spendable and reporting ``fundable_bytes() == 0`` on all eight of its asks,
+    which by construction means its floor was at or above its own cap -- vetoes
+    the shrink that the pressed rank needs. Every rank computes its floor,
+    every rank retains it in ``_last_proposal_terms``, and a rank that FITS
+    prints nothing, because the only caller that prints these terms is the one
+    that refuses.
+
+    A bare ``Optional[int]`` cannot carry that. The caller was left to report
+    "returned NOTHING" and list three possible causes without saying which one
+    held -- and the three want opposite responses: an abstention is repaired on
+    the abstaining rank, a peer-floor veto is answered by lowering that peer's
+    floor, and a cheap-tier decline is the tier law working and wants nothing
+    at all. Naming the cause is the difference between a reading and an
+    inference, and this chain has now paid for that difference more than once.
+
+    PURE, and deliberately separate from the decision itself: it re-derives the
+    same three terms from the same reduced tuple rather than being threaded
+    through the decision as an out-parameter, so it cannot change what the
+    group decides. A diagnostic that can alter the verdict it reports is worse
+    than none.
+    """
+    if len(reduced) < 3:
+        return (
+            "the reduced proposal is MALFORMED (fewer than three fields), so no "
+            "target could be read at all -- this is a payload-length defect, not "
+            "a capacity verdict"
+        )
+    desire = int(reduced[0])
+    max_floor = -int(reduced[1])
+    min_current = int(reduced[2])
+    if min_current <= 0:
+        return (
+            f"DECLINED because a rank ABSTAINED (the group's smallest current row "
+            f"count is {min_current}). One abstention cancels the shrink for every "
+            f"rank, because the danger was never 'nobody capped' -- it is 'some "
+            f"capped and some did not'. Repair the abstaining rank; its own "
+            f"ABSTAIN line names the precondition it failed."
+        )
+    target = max(desire, max_floor)
+    if target >= min_current:
+        if max_floor >= min_current:
+            return (
+                f"DECLINED by a PEER FLOOR: the deepest target any rank asked for "
+                f"is {desire} rows, but the group's highest floor is {max_floor} "
+                f"rows -- at or above the group's smallest cap of {min_current} -- "
+                f"so NO uniform target below the cap clears every rank's live set. "
+                f"A rank under no pressure can veto the shrink a pressed rank "
+                f"needs, and the pressed rank's slack stays unreachable. The "
+                f"answer is on the FLOOR side (lower the highest floor by evicting "
+                f"its recomputable prefix), never on the ambition side."
+            )
+        return (
+            f"DECLINED because no rank asked to go below the group's smallest cap "
+            f"(deepest desire {desire} rows against cap {min_current}): the cheaper "
+            f"tiers covered every rank's gap, which is the tier law working."
+        )
+    if max_floor > desire:
+        return (
+            f"GRANTED {target} rows, RAISED from the deepest ask of {desire} by the "
+            f"group's highest floor {max_floor}: the pressed rank wins less than it "
+            f"priced, because a peer's live set sits above what it asked for."
+        )
+    return (
+        f"GRANTED {target} rows: the most-pressed rank set the ambition ({desire}), "
+        f"the group's highest floor ({max_floor}) permits it, and the group's "
+        f"smallest cap is {min_current} rows."
+    )
+
+
 #: The proposal of a rank that cannot take part in the CAP AGREEMENT below.
 #: Its first field (``capable``) is 0, and :func:`collective_cap_target`
 #: declines whenever the group's minimum is not positive, so one abstention

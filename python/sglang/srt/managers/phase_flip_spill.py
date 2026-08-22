@@ -1817,6 +1817,38 @@ def collective_kv_backing_relief(
                 e,
             )
     target = kbr.collective_kv_target(reduced[:4])
+    # #796: THE GROUP'S VERDICT, AND THIS RANK'S TERMS BEHIND IT, ON EVERY RANK.
+    #
+    # The shrink target is a MAX over per-rank floors, so the rank that decides
+    # the outcome is frequently NOT the rank that needed the shrink -- and until
+    # now only a rank that REFUSED ever printed its terms. On 2026-08-22 that
+    # cost the flip outright: PP0 held a fundable plan (89119 rows of slack,
+    # +1740 MiB deficit, SHRINK to 149126), PP2 was under no pressure at all and
+    # its floor sat at its own cap, the group declined, and the whole boot
+    # contains no evidence of the decline beyond a bare "returned NOTHING".
+    #
+    # Logged on EVERY rank, including the ones that fit, because the fitting
+    # rank is exactly the one whose floor may be the veto. Logged at the same
+    # cadence as the "returned NOTHING" line the gate already emits once per
+    # seam, so a seam's funding story stays one grep and this adds no new
+    # class of volume.
+    try:
+        logger.info(
+            "%s KV shrink verdict (%s): %s | this rank: %s",
+            LOG_PREFIX,
+            direction,
+            kbr.explain_kv_target(reduced[:4]),
+            (
+                relief.last_proposal_summary()
+                if relief is not None
+                else "abstained from the shrink on this leg, so it has no terms"
+            ),
+        )
+    except Exception as e:
+        # THE GATE IS A NO-RETURN PATH: a raise from here climbs into the event
+        # loop and takes the instance down (see _abandon_parked_flip). A
+        # diagnostic may never be the thing that does that.
+        logger.warning("%s could not report the KV shrink verdict: %s", LOG_PREFIX, e)
     if target is not None and relief is not None:
         # A SHRINK MAKES THE GROUP LEVEL BY CONSTRUCTION -- every rank caps to
         # the same absolute row target -- so the levelling has nothing to do
@@ -2067,7 +2099,7 @@ def get_corridor_guard(scheduler: Any):
             # it. The env is still honoured as a deprecated bridge, but telling
             # an operator to go looking for an env var they should not be using
             # is how the 1536-vs-1024 split stayed alive.
-            " (set by --phase-flip-corridor-floor-mib" f"/{CORRIDOR_FLOOR_ENV})"
+            f" (set by --phase-flip-corridor-floor-mib/{CORRIDOR_FLOOR_ENV})"
             if configured and int(configured) >= derived_mib
             else (
                 f" (derived from this rank's MEASURED seam draw of "
