@@ -751,6 +751,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        # #810: built in `init_hicache`, once the controller and the
+        # symmetrized prefetch reservation exist. None here and for the whole
+        # of `--hicache-host-role retention`, which is the default.
+        self.staging_write_ring = None
         self._init_pin_trace()
 
         if self.cache_controller is not None:
@@ -842,6 +846,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Uneven-DCP: make the storage-prefetch handshake rank-symmetric so
             # concurrent bursts don't desync the prefetch collectives (deadlock).
             self._symmetrize_prefetch_capacity()
+
+            # #810: bound the write-through consumer of a STAGING host tier,
+            # AFTER the symmetrization above so the capacity is the complement
+            # of the GROUP-agreed prefetch reservation. A later runtime attach
+            # re-derives that reservation; it is not the staging shape (the
+            # role requires a backend at boot) and the ring keeps its boot
+            # capacity there rather than dropping live admissions.
+            from sglang.srt.mem_cache.staging_write_ring import (
+                build_staging_write_ring,
+            )
+
+            self.staging_write_ring = build_staging_write_ring(
+                server_args, self.cache_controller
+            )
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
@@ -2011,12 +2029,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if evicted < needed:
                 return 0
 
+        # #810: the STAGING bound, taken BEFORE the allocation rather than
+        # after it fails. Under `--hicache-host-role staging` the tier is a
+        # drain buffer, so the undrained write-through set must leave room for
+        # the read consumer; a refusal costs one un-backed-up node -- what an
+        # exhausted tier costs today -- but it is COUNTED and it is reached
+        # without the rank-local `evict_host` above. `None` under the default
+        # role skips the gate entirely.
+        ring = self.staging_write_ring
+        if ring is not None and not ring.admit(node.id, kv_tokens):
+            return 0
+
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
+            # #810: the write failed after the ring admitted it, so the page
+            # never reaches the drain and its admission must not stay charged.
+            if ring is not None:
+                ring.abort(node.id)
             return 0
 
         # #645: charge the admission against the published floor, so the next
@@ -2094,6 +2127,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(node, medium=StorageMedium.CPU)
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
+        # #810: end of the ADMITTED phase. The device->host copy has landed, so
+        # the admission taken in `write_backup` is retired here -- before the
+        # storage hand-off below, which takes its own charge per operation.
+        # Releasing first keeps the two phases from double-counting one page,
+        # and retiring the node-keyed charge at exactly one site keeps a node
+        # SPLIT (one ack, several storage backups) from stranding it.
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.release(ack_id)
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
@@ -2379,6 +2420,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
         )
+        # #810: the DRAIN phase begins here. The host lock keeps these tokens
+        # resident until the backup acks, so they are the bytes a staging tier
+        # is sized from; the charge cannot be refused (the page is already on
+        # the host) but it must be counted, or the next admission decides
+        # against an occupancy that hides the whole drain queue. Keyed by the
+        # STORAGE OPERATION, so a split node's fragments -- several backups out
+        # of one write-through ack -- each carry and retire their own charge.
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.occupy(
+                operation_id,
+                len(node.component_data[BASE_COMPONENT_TYPE].host_value),
+            )
 
     def prefetch_from_storage(
         self,
@@ -2786,6 +2839,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if entry is not None:
                     node, lock_params = entry
                     self.dec_host_lock_ref(node, lock_params)
+                # #810: the storage write acked -- this is the drain the
+                # staging ring measures its residency against. Outside the
+                # `entry is not None` arm on purpose: the charge is keyed by
+                # the operation, so it retires whenever the operation does.
+                if self.staging_write_ring is not None:
+                    self.staging_write_ring.release(operation.id)
                 if (
                     log_metrics
                     and self.enable_storage_metrics
