@@ -136,6 +136,32 @@ def test_the_contract_names_every_kind_that_travels_on_this_wire():
     }
 
 
+def test_every_kind_the_wire_actually_carries_is_declared():
+    """THE TABLE KEYS ON RAW STRINGS THAT LIVE SOMEWHERE ELSE.
+
+    `stash_flip_disposition` matches literals, while the senders use constants
+    defined in two other modules. Renaming `ADMISSION_DECISION_KIND` would not
+    break a single import -- it would quietly move that kind into UNDECLARED,
+    where it blocks presence again for 20 s per flip and is then RETIRED. That
+    is the wedge coming back wearing the escape hatch as a hat, and no other
+    test in this file would notice.
+
+    So the constants are read from where the senders read them, and every kind
+    the wire actually carries has to be declared.
+    """
+    from sglang.srt.distributed.pp_typed_channel import CROSSING_KIND
+    from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+
+    for kind in (ADMISSION_DECISION_KIND, CROSSING_KIND, "output", "proxy"):
+        assert stash_flip_disposition(kind) != UNDECLARED, (
+            f"{kind!r} travels on this wire but has no declared flip "
+            "disposition; it would block the presence gate and then be retired "
+            "as unplaceable"
+        )
+    assert ADMISSION_DECISION_KIND in declared_stash_kinds()
+    assert CROSSING_KIND in declared_stash_kinds()
+
+
 def test_the_census_never_answers_none_for_two_different_states():
     """Empty and gate-blind are different facts and must read differently."""
     empty = census_stash({})

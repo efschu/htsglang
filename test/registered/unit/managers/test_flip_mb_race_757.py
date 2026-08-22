@@ -166,8 +166,8 @@ def _rank_body(rank, port, q):
         if rank == 0:
             # The upstream resumed while rank 1 is still armed: it sends an
             # OUTPUT owed to a real consumer, then a VOID proxy.
-            dist.send(torch.tensor([1.0]), 1)          # output-ish
-            dist.send(torch.tensor([2.0]), 1)          # void proxy
+            dist.send(torch.tensor([1.0]), 1)  # output-ish
+            dist.send(torch.tensor([2.0]), 1)  # void proxy
             q.put((rank, "ok", 0, 0))
         elif rank == 1:
             # Armed: take both off the wire and classify each.
@@ -205,7 +205,9 @@ class TestTheRaceOverRealGloo(CustomTestCase):
         ctx = mp.get_context("spawn")
         port = _free_port()
         q = ctx.Queue()
-        procs = [ctx.Process(target=_rank_body, args=(r, port, q)) for r in range(WORLD)]
+        procs = [
+            ctx.Process(target=_rank_body, args=(r, port, q)) for r in range(WORLD)
+        ]
         for p in procs:
             p.start()
         results = {}

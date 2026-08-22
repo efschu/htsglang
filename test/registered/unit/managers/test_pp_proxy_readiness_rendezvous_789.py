@@ -252,7 +252,9 @@ class TestProxyReadinessRendezvous789(unittest.TestCase):
         for rank in (1, 2):
             self.assertIn(rank, results, f"rank {rank} produced nothing: {results}")
             self.assertIn("RuntimeError", results[rank][0], results[rank])
-            self.assertIn("#789 PROXY READINESS TIMEOUT", results[rank][0], results[rank])
+            self.assertIn(
+                "#789 PROXY READINESS TIMEOUT", results[rank][0], results[rank]
+            )
 
 
 class TestAttemptedCounterOrdering789(unittest.TestCase):

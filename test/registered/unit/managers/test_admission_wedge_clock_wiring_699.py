@@ -121,9 +121,7 @@ class TestCheckAdmissionWedgeOnce(CustomTestCase):
         self.assertFalse(alarm)
         self.assertIn("initializing", detail)
 
-    @patch(
-        "sglang.srt.managers.scheduler_components.invariant_checker.logger"
-    )
+    @patch("sglang.srt.managers.scheduler_components.invariant_checker.logger")
     def test_a_firing_alarm_logs_a_single_loud_line_naming_age_and_clock(
         self, mock_logger
     ):
@@ -209,9 +207,7 @@ class TestFirstTokenCommitCallsTheProgressClock(CustomTestCase):
         "sglang.srt.managers.scheduler_components.batch_result_processor."
         "maybe_cache_unfinished_req"
     )
-    def test_a_finishing_prefill_chunk_records_progress_exactly_once(
-        self, _mock_cache
-    ):
+    def test_a_finishing_prefill_chunk_records_progress_exactly_once(self, _mock_cache):
         """req.inflight_middle_chunks <= 0: this round genuinely appends the
         FIRST output token (output_ids was empty going in). This is the
         first-token-commit instant the clock must stamp."""

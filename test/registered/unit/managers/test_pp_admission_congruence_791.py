@@ -182,7 +182,9 @@ class UnhonourableCaseDegradesSafelyTest(CustomTestCase):
 
     def test_local_below_told_is_excluded_not_corrupted(self):
         decision0 = _decision(req=(120, 80))
-        with self.assertLogs("sglang.srt.managers.pp_admission_congruence", level="WARNING") as cm:
+        with self.assertLogs(
+            "sglang.srt.managers.pp_admission_congruence", level="WARNING"
+        ) as cm:
             eff1, decision1 = reconcile_pp_admission_decision(
                 decision0, {"req": 64}, rank=PP1, pp_size=WORLD
             )
@@ -246,7 +248,9 @@ class UnhonourableCaseDegradesSafelyTest(CustomTestCase):
 
     def test_a_sibling_request_in_the_same_decision_is_unaffected(self):
         decision0 = _decision(bad=(120, 80), good=(30, 170))
-        with self.assertLogs("sglang.srt.managers.pp_admission_congruence", level="WARNING") as cm:
+        with self.assertLogs(
+            "sglang.srt.managers.pp_admission_congruence", level="WARNING"
+        ) as cm:
             eff1, decision1 = reconcile_pp_admission_decision(
                 decision0, {"bad": 64, "good": 30}, rank=PP1, pp_size=WORLD
             )

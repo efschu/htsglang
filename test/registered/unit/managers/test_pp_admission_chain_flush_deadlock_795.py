@@ -438,8 +438,10 @@ def _worker(rank, init_file, out_dir, variant, n_passes):
                         if returned is not None:
                             pending_sends.popleft()
                 else:
-                    fwd = amended if amended is not None else PPAdmissionDecision(
-                        mb_id=p, entries=()
+                    fwd = (
+                        amended
+                        if amended is not None
+                        else PPAdmissionDecision(mb_id=p, entries=())
                     )
                     h._pp_send_admission_decision(fwd)
 
@@ -462,9 +464,7 @@ def _worker(rank, init_file, out_dir, variant, n_passes):
                     recv_typed_tensor_dict(wire, CROSSING_KIND, src=PP2)
                 else:
                     _progress(out_dir, rank, f"pass{p}_crossing_send")
-                    send_typed_tensor_dict(
-                        wire, {"x": PAYLOAD[0]}, PP0, CROSSING_KIND
-                    )
+                    send_typed_tensor_dict(wire, {"x": PAYLOAD[0]}, PP0, CROSSING_KIND)
 
             if variant == "send_before_launch":
                 # THE PROPOSED FIX, measured before touching production:
@@ -516,9 +516,7 @@ def _run(variant, n_passes=N_PASSES, join_timeout=GREEN_JOIN_TIMEOUT_S):
     with tempfile.TemporaryDirectory() as tmp:
         init_file = os.path.join(tmp, "pg_init")
         procs = [
-            ctx.Process(
-                target=_worker, args=(r, init_file, tmp, variant, n_passes)
-            )
+            ctx.Process(target=_worker, args=(r, init_file, tmp, variant, n_passes))
             for r in range(WORLD)
         ]
         for p in procs:
@@ -527,9 +525,7 @@ def _run(variant, n_passes=N_PASSES, join_timeout=GREEN_JOIN_TIMEOUT_S):
         for p in procs:
             p.join(timeout=max(0.1, deadline - time.time()))
         stuck_ranks = [r for r, p in enumerate(procs) if p.is_alive()]
-        stall_report = {
-            r: _read_progress(tmp, r) for r in stuck_ranks
-        }
+        stall_report = {r: _read_progress(tmp, r) for r in stuck_ranks}
         for p in procs:
             if p.is_alive():
                 p.terminate()
@@ -573,9 +569,7 @@ class PPAdmissionChainFlushDeadlock795(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
 
     def test_ordering_pin_discriminates_broken_send_site(self):
         """NEGATIVE FINDING, measured, reported plainly rather than forced
@@ -609,9 +603,7 @@ class PPAdmissionChainFlushDeadlock795(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
 
     def test_fixed_ordering_with_crossing_channel(self):
         """THE POSITIVE RESULT. Adds the mid-`_pp_launch_batch` CROSSING
@@ -703,9 +695,7 @@ class PPAdmissionChainFlushDeadlock795(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
 
 
 if __name__ == "__main__":

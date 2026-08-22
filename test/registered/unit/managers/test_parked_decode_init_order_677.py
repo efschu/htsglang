@@ -66,7 +66,10 @@ def _class_node(tree, name):
 
 def _method(cls_node, name):
     for node in cls_node.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
             return node
     raise AssertionError(f"method {name} not found on {cls_node.name}")
 

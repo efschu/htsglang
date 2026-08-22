@@ -45,6 +45,7 @@ FAST_RANK = 2  # the rank whose storage load finished first (instr23's PP2)
 R_SLOW = "5e58e0b6fd3240e6bb1b09ba961b8754"  # instr23's fatal rid, verbatim
 R_READY = "25bd2696b3e74beeb1d0bd303b1e4206"
 
+
 # Local verdicts, instr23's shape: every rank agrees R_READY is done; only
 # the fast rank believes R_SLOW is done.
 def _local_done(rank: int):
@@ -103,8 +104,8 @@ def _blind_ballot(rank, init_file, out_dir, case):
     """THE CAN-FAIL: the decision ignores the ballot and trusts the local
     verdict -- byte-identical to the pre-#791b admission path. ONE function,
     rebound in the child, everything else shipped and live."""
-    prefetch_ballot.prefetch_done_under_ballot = (
-        lambda local_done, rid, ballot: local_done
+    prefetch_ballot.prefetch_done_under_ballot = lambda local_done, rid, ballot: (
+        local_done
     )
     return _worker(rank, init_file, out_dir, case)
 

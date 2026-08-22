@@ -105,7 +105,7 @@ class _Runtime(unittest.TestCase):
         import sglang.srt.managers.session_checkpoint as m
 
         self._orig_exists = m.backend_exists_fn
-        m.backend_exists_fn = lambda tree: (lambda key: key in self.store)
+        m.backend_exists_fn = lambda tree: lambda key: key in self.store
         self.addCleanup(setattr, m, "backend_exists_fn", self._orig_exists)
 
     def _bundle(self, manifest=None, blobs=None, name="b.tar"):

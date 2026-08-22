@@ -162,7 +162,9 @@ class _RingWire:
         self.rank_in_group = rank
         self.world_size = WORLD
 
-    def send_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None, async_send=False):
+    def send_tensor_dict(
+        self, tensor_dict, dst=None, all_gather_group=None, async_send=False
+    ):
         import pickle
 
         if dst is None:
@@ -461,9 +463,7 @@ class PPAdmissionWraparoundOpportunistic(unittest.TestCase):
         every iteration within a bounded deadline, and PP0's own
         pending-sends bookkeeping never exceeds the real shipped cap."""
         res = _run("opportunistic", GREEN_JOIN_TIMEOUT_S)
-        self.assertEqual(
-            res["stuck_ranks"], [], f"a rank never finished: {res}"
-        )
+        self.assertEqual(res["stuck_ranks"], [], f"a rank never finished: {res}")
         for name, r in (
             ("PP0", res["result_0"]),
             ("PP1", res["result_1"]),

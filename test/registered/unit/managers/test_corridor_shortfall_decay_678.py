@@ -165,8 +165,10 @@ class TheInheritedBreachExpires(_Recorded):
         )
         self.assertEqual(
             sr.DEFAULT_MARGIN_MIB << 20,
-            sr.seam_margin_bytes(reserve) if hasattr(sr, "seam_margin_bytes") else
-            (sr.DEFAULT_MARGIN_MIB << 20) + max(0, reserve.corridor_shortfall_bytes),
+            sr.seam_margin_bytes(reserve)
+            if hasattr(sr, "seam_margin_bytes")
+            else (sr.DEFAULT_MARGIN_MIB << 20)
+            + max(0, reserve.corridor_shortfall_bytes),
             "the load margin must return to its default once the breach expires",
         )
 

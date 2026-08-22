@@ -78,8 +78,9 @@ RED_JOIN_TIMEOUT_S = 25.0
 RED_PASSES = 20
 
 
-def _dropping_send_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None,
-                               async_send=False):
+def _dropping_send_tensor_dict(
+    self, tensor_dict, dst=None, all_gather_group=None, async_send=False
+):
     """#795's `_RingWire.send_tensor_dict`, minus the `_inflight` retention.
 
     Everything else is byte-for-byte that method. The handles and their
@@ -208,8 +209,11 @@ def _decision_holder(is_last_rank: bool, works):
         _pp_admission_send_work=[],
     )
     h._pp_send_dict_to_next_stage = _fake_send_dict
-    for name in ("_pp_send_admission_decision", "_pp_commit_admission_send_work",
-                 "_pp_commit_comm_work"):
+    for name in (
+        "_pp_send_admission_decision",
+        "_pp_commit_admission_send_work",
+        "_pp_commit_comm_work",
+    ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h, sent
 
@@ -249,8 +253,8 @@ class PPAdmissionSendHandleDropped796(unittest.TestCase):
         # while they still wait for an earlier pass's decision. That
         # asymmetry is exactly what made this look like an ordering problem
         # for three commits, and it is what a dropped message produces.
-        pp0_pass = int(stalls[PP0].split("_", 1)[0][len("pass"):])
-        pp1_pass = int(stalls[PP1].split("_", 1)[0][len("pass"):])
+        pp0_pass = int(stalls[PP0].split("_", 1)[0][len("pass") :])
+        pp1_pass = int(stalls[PP1].split("_", 1)[0][len("pass") :])
         self.assertGreater(
             pp0_pass,
             pp1_pass,

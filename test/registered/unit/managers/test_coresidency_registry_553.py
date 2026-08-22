@@ -258,9 +258,7 @@ class TestCut2TheProbesAreWired(unittest.TestCase):
         def _blind(participant):
             raise ProbeUnavailable("unbooted pool")
 
-        view = _view(
-            dial_participants=[_Participant()], dial_reclaimable_bytes=_blind
-        )
+        view = _view(dial_participants=[_Participant()], dial_reclaimable_bytes=_blind)
         self.assertEqual(view.available, ())
         self.assertEqual(len(view.unavailable), 1)
         self.assertIn("unbooted pool", view.unavailable[0].reason)
@@ -325,9 +323,7 @@ class TestCut2TheDialProbeReadsLive(unittest.TestCase):
     def _probe(self, pool, floor):
         from sglang.srt.managers.vram_dial import reclaimable_bytes_for
 
-        return reclaimable_bytes_for(
-            type("P", (), {"pool": pool})(), floor
-        )
+        return reclaimable_bytes_for(type("P", (), {"pool": pool})(), floor)
 
     def test_no_floor_authority_is_none_not_zero(self):
         self.assertIsNone(self._probe(self._Pool(backed=100), None))

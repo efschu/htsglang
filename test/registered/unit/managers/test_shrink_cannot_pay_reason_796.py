@@ -127,9 +127,13 @@ def _warn(r) -> str:
     with mock.patch.object(logger, "warning") as w:
         got = r._shrink_to(TARGET, CURRENT)
     assert got == 0, "a pool that released nothing must report zero"
-    calls = [c for c in w.call_args_list if "cannot pay" in str(c.args[0]).lower()
-             or "did not move" in str(c.args[0]).lower()
-             or "released nothing" in str(c.args[0]).lower()]
+    calls = [
+        c
+        for c in w.call_args_list
+        if "cannot pay" in str(c.args[0]).lower()
+        or "did not move" in str(c.args[0]).lower()
+        or "released nothing" in str(c.args[0]).lower()
+    ]
     assert calls, f"the refusal must warn; got {w.call_args_list!r}"
     fmt, *rest = calls[-1].args
     return fmt % tuple(rest)
@@ -176,8 +180,14 @@ class TestTheRefusalReportsMeasuredState(unittest.TestCase):
     def test_retention_is_reported_as_a_number_not_as_an_env_var(self):
         with mock.patch(
             "sglang.srt.mem_cache.kv_vmm_backing.arena_census",
-            return_value={0: {"reserved": 8 << 30, "backed": 6 << 30,
-                              "retained": 1536 * 1024 * 1024, "arenas": 2}},
+            return_value={
+                0: {
+                    "reserved": 8 << 30,
+                    "backed": 6 << 30,
+                    "retained": 1536 * 1024 * 1024,
+                    "arenas": 2,
+                }
+            },
         ):
             msg = _warn(_relief(claimed_bytes=0))
         self.assertIn(

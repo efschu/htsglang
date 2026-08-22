@@ -106,7 +106,10 @@ class TestAddressingATenant(CustomTestCase):
 class TestStrandingIsNotZero(CustomTestCase):
     def test_a_route_that_reports_nothing_is_stranded(self):
         mover = TenantMover()
-        mover.register("t", [_Route("good", 100), _Route("silent", 40, parked_bytes=REPORTS_NOTHING)])
+        mover.register(
+            "t",
+            [_Route("good", 100), _Route("silent", 40, parked_bytes=REPORTS_NOTHING)],
+        )
         # REPORTS_NOTHING makes park() return None: asked, reported nothing.
         result = mover.park_tenant("t")
         self.assertEqual(result.released_bytes, 100)
@@ -130,7 +133,7 @@ class TestTheVocabularyIsConfiguration(CustomTestCase):
         order = []
         routes = [_Route("codec", 10), _Route("asr", 10), _Route("talker", 10)]
         for r in routes:
-            r.restore = (lambda n=r.name: order.append(n))
+            r.restore = lambda n=r.name: order.append(n)
         mover.register("t", routes, ranks={"asr": 0, "talker": 1, "codec": 2})
         mover.park_tenant("t")
         mover.restore_tenant("t")
@@ -141,18 +144,20 @@ class TestTheVocabularyIsConfiguration(CustomTestCase):
         order = []
         routes = [_Route("x", 10), _Route("y", 10)]
         for r in routes:
-            r.restore = (lambda n=r.name: order.append(n))
+            r.restore = lambda n=r.name: order.append(n)
         mover.register("other", routes, ranks={"y": 0, "x": 1})
         mover.park_tenant("other")
         mover.restore_tenant("other")
-        self.assertEqual(order, ["y", "x"], "the ordering must not be translator-shaped")
+        self.assertEqual(
+            order, ["y", "x"], "the ordering must not be translator-shaped"
+        )
 
     def test_unranked_routes_restore_last_in_registration_order(self):
         mover = TenantMover()
         order = []
         routes = [_Route("a", 1), _Route("b", 1), _Route("c", 1)]
         for r in routes:
-            r.restore = (lambda n=r.name: order.append(n))
+            r.restore = lambda n=r.name: order.append(n)
         mover.register("t", routes, ranks={"c": 0})
         mover.park_tenant("t")
         mover.restore_tenant("t")

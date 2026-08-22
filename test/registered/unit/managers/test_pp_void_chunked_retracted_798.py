@@ -181,8 +181,7 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
             _reads_chunked_req_like_the_scheduler(holder)
         except AttributeError as exc:  # pragma: no cover - the red state
             self.fail(
-                "scheduler.py's chunked_req read raised the boot's exception: "
-                f"{exc}"
+                f"scheduler.py's chunked_req read raised the boot's exception: {exc}"
             )
 
     def test_a_healthy_carried_chunk_is_still_carried(self):

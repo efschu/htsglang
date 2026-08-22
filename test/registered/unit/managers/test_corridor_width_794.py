@@ -70,9 +70,9 @@ def test_the_crash_chunk_is_narrowed_until_it_fits_the_free_column():
     )
 
     assert width_was_cut(CRASH_TOKENS, granted), "the actuator must actuate"
-    assert (
-        linear_price(granted) <= budget
-    ), "the granted width must fit the budget that the full width did not"
+    assert linear_price(granted) <= budget, (
+        "the granted width must fit the budget that the full width did not"
+    )
     # It must also stay useful: cutting to the floor when 1900 tokens fit
     # would trade an OOM for a stall.
     assert granted >= 1536, f"cut far more than the budget required: {granted}"

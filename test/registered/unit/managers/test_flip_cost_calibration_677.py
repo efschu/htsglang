@@ -174,9 +174,7 @@ class TestTheHookFeedsThePolicy(CustomTestCase):
         )
         for _ in range(5):
             pp.observe_flip_cost(MEASURED_COST_S)
-        n_after = break_even_tokens(
-            pp._FLIP_COST_ESTIMATOR.value(), TP_TOK_S, PP_TOK_S
-        )
+        n_after = break_even_tokens(pp._FLIP_COST_ESTIMATOR.value(), TP_TOK_S, PP_TOK_S)
         self.assertEqual(n_before, LOGGED_N)
         self.assertGreater(n_after, 40_000)
         self.assertTrue(pp.flip_cost_estimator().calibrated)

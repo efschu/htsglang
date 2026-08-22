@@ -95,9 +95,7 @@ class TheBundleIsFinished(unittest.TestCase):
 
     def test_the_receipt_names_the_bundle_and_its_duration(self):
         cfg = _cfg()
-        decision, _ = _drive(
-            cfg, [(0.0, 400_000, 4), (60.0, 400_000, 0)]
-        )
+        decision, _ = _drive(cfg, [(0.0, 400_000, 4), (60.0, 400_000, 0)])
         self.assertIn("decode bundle complete", decision.reason)
         self.assertIn("4", decision.reason, "the bundle size must be named")
         self.assertIn("decode drained", decision.reason)
@@ -155,8 +153,10 @@ class TheFullCycle(unittest.TestCase):
         # PP: prefill until the pool is carrying its four and cannot admit.
         for now, pending, bs in ((0.0, 400_000, 4), (10.0, 400_000, 4)):
             inp = pp.PhasePolicyInputs(
-                phase=pp.PHASE_PP, pending_prefill_tokens=pending,
-                running_bs=bs, now=now,
+                phase=pp.PHASE_PP,
+                pending_prefill_tokens=pending,
+                running_bs=bs,
+                now=now,
             )
             pp.observe_idle(state, inp)
             d = pp.decide(cfg, state, inp)
@@ -189,8 +189,10 @@ class TheBackstopsAreUntouched(unittest.TestCase):
         last = None
         for now in (0.0, window + 1.0):
             inp = pp.PhasePolicyInputs(
-                phase=pp.PHASE_PP, pending_prefill_tokens=403_779,
-                running_bs=4, now=now,
+                phase=pp.PHASE_PP,
+                pending_prefill_tokens=403_779,
+                running_bs=4,
+                now=now,
             )
             pp.observe_idle(state, inp)
             last = pp.decide(cfg, state, inp)
@@ -258,12 +260,15 @@ class TheGateIsReachableFromABoot(unittest.TestCase):
         from sglang.srt.managers import phase_purity
 
         stub = types.SimpleNamespace(phase_policy_cfg=_cfg(drain_mode=False))
-        with unittest.mock.patch.object(
-            phase_purity, "_active_phase", lambda s: pp.PHASE_TP
-        ), unittest.mock.patch.object(
-            phase_purity, "purity_of", lambda s: types.SimpleNamespace(
-                prefill_allowed_in_tp=lambda: True
-            )
+        with (
+            unittest.mock.patch.object(
+                phase_purity, "_active_phase", lambda s: pp.PHASE_TP
+            ),
+            unittest.mock.patch.object(
+                phase_purity,
+                "purity_of",
+                lambda s: types.SimpleNamespace(prefill_allowed_in_tp=lambda: True),
+            ),
         ):
             self.assertFalse(phase_purity.prefill_blocked_here(stub))
 
@@ -410,9 +415,7 @@ class TheValveOutranksDrainModeSuppression(unittest.TestCase):
         rt = types.SimpleNamespace(_seam_abandons_in_a_row={}, blocking_guards=())
         sched = types.SimpleNamespace(
             phase_policy_cfg=_cfg(),
-            phase_policy_state=pp.PhasePolicyState(
-                arm_refusals={pp.TP_TO_PP: 76}
-            ),
+            phase_policy_state=pp.PhasePolicyState(arm_refusals={pp.TP_TO_PP: 76}),
             phase_flip_runtime=rt,
             server_args=None,
             _phase_purity=None,
@@ -469,26 +472,18 @@ class SuppressionNeedsABundleToProtect(unittest.TestCase):
     """
 
     def test_a_running_bundle_is_still_protected(self):
-        self.assertTrue(
-            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=4)
-        )
-        self.assertTrue(
-            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=1)
-        )
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=4))
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=1))
 
     def test_an_empty_bundle_suppresses_nothing(self):
         """THE WEDGE."""
-        self.assertFalse(
-            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=0)
-        )
+        self.assertFalse(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=0))
 
     def test_an_unmeasured_bundle_is_not_read_as_empty(self):
         """-1 means the caller did not measure it. An unmeasured input must
         never become a licence -- that is how the drain contract would quietly
         stop applying wherever a call site forgot to pass the count."""
-        self.assertTrue(
-            pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=-1)
-        )
+        self.assertTrue(pp.prefill_suppressed_in_tp(_cfg(), pp.PHASE_TP, running_bs=-1))
 
     def test_the_scheduler_passes_the_count(self):
         """THE CALL SITE, for the fourth time in this file. A condition the

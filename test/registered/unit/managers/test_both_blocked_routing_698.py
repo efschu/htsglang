@@ -34,11 +34,13 @@ class TheDeclineMustRouteToTheRemedy(unittest.TestCase):
         src = inspect.getsource(scheduler_mod)
         tree = ast.parse(src)
         cls = next(
-            n for n in ast.walk(tree)
+            n
+            for n in ast.walk(tree)
             if isinstance(n, ast.ClassDef) and n.name == "Scheduler"
         )
         fn = next(
-            n for n in cls.body
+            n
+            for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "maybe_arm_phase_policy"
         )
         # MATCH THE NAME, NOT THE CALL FORM. The routing is invoked through
@@ -57,9 +59,7 @@ class TheDeclineMustRouteToTheRemedy(unittest.TestCase):
         )
 
     def test_the_relief_actually_calls_eviction(self):
-        body = inspect.getsource(
-            scheduler_mod.Scheduler._apply_both_blocked_relief
-        )
+        body = inspect.getsource(scheduler_mod.Scheduler._apply_both_blocked_relief)
         self.assertIn(
             "evict_from_tree_cache",
             body,
@@ -69,23 +69,24 @@ class TheDeclineMustRouteToTheRemedy(unittest.TestCase):
     def test_it_reports_a_zero_delivery(self):
         """'Ran and freed 0' and 'never ran' are the two states the outage
         could not tell apart. The receipt must separate them."""
-        body = inspect.getsource(
-            scheduler_mod.Scheduler._apply_both_blocked_relief
-        )
+        body = inspect.getsource(scheduler_mod.Scheduler._apply_both_blocked_relief)
         self.assertIn("freed", body)
         self.assertIn("NOTHING", body)
 
     def test_it_is_rate_limited(self):
         self.assertGreater(
-            scheduler_mod.Scheduler.BOTH_BLOCKED_EVICT_INTERVAL_S, 0.0,
+            scheduler_mod.Scheduler.BOTH_BLOCKED_EVICT_INTERVAL_S,
+            0.0,
             "the decline is evaluated every round; an unbounded evict there "
             "walks the whole tree in a tight loop on an already-wedged box.",
         )
 
     def test_the_constant_is_shared_not_respelled(self):
         self.assertEqual("BOTH BLOCKED", BOTH_BLOCKED)
-        self.assertIn("BOTH_BLOCKED", inspect.getsource(
-            scheduler_mod.Scheduler._apply_both_blocked_relief))
+        self.assertIn(
+            "BOTH_BLOCKED",
+            inspect.getsource(scheduler_mod.Scheduler._apply_both_blocked_relief),
+        )
 
 
 if __name__ == "__main__":

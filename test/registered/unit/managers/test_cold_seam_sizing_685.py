@@ -52,10 +52,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5)
 
 MIB = 1024 * 1024
-CELL = 16287          # this rig's rank-0 bytes/token (7 attention layers)
-SLOPE = 2326.7        # one received layer, derived
+CELL = 16287  # this rig's rank-0 bytes/token (7 attention layers)
+SLOPE = 2326.7  # one received layer, derived
 BUDGET = 24000 * MIB
-FLOOR = 1728 * MIB    # the measured arming floor on rank 0
+FLOOR = 1728 * MIB  # the measured arming floor on rank 0
 
 
 class ColdSizingMustPriceTheSeam(unittest.TestCase):
@@ -78,9 +78,7 @@ class ColdSizingMustPriceTheSeam(unittest.TestCase):
     def test_the_zero_receive_rank_is_not_charged(self):
         """The other half of #685: no received layers, no per-token seam."""
         charged = solve_pool_tokens(BUDGET - FLOOR, CELL, 0, SLOPE)
-        exempt = solve_pool_tokens(
-            BUDGET - FLOOR, CELL, 0, SLOPE, received_layers=0
-        )
+        exempt = solve_pool_tokens(BUDGET - FLOOR, CELL, 0, SLOPE, received_layers=0)
         self.assertGreater(exempt, charged)
         self.assertEqual(exempt, solve_pool_tokens(BUDGET - FLOOR, CELL, 0, 0.0))
 

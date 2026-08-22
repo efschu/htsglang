@@ -410,9 +410,7 @@ def _run(case, join_timeout, readiness_budget_env=None):
 
         out = {"stuck_ranks": stuck_ranks}
         for r in range(WORLD):
-            out[f"progress_{r}"] = _load(
-                os.path.join(tmp, f"progress_r{r}.json"), None
-            )
+            out[f"progress_{r}"] = _load(os.path.join(tmp, f"progress_r{r}.json"), None)
             out[f"result_{r}"] = _load(os.path.join(tmp, f"r{r}.json"), None)
         return out
 

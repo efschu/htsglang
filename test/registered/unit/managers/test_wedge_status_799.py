@@ -121,9 +121,13 @@ class TestPublishAndRead(CustomTestCase):
 
     def test_a_stale_verdict_is_not_a_verdict(self):
         with tempfile.TemporaryDirectory() as d:
-            WS.publish_verdict("pp0-tp0", False, "was fine long ago",
-                               directory=d,
-                               now=lambda: time.time() - 10_000.0)
+            WS.publish_verdict(
+                "pp0-tp0",
+                False,
+                "was fine long ago",
+                directory=d,
+                now=lambda: time.time() - 10_000.0,
+            )
             sig = WS.read_wedge_signal(d)
             self.assertIsNone(sig.verdict)
             self.assertTrue(sig.stale)
@@ -132,9 +136,13 @@ class TestPublishAndRead(CustomTestCase):
         """Staleness cuts both ways, deliberately. A dead publisher's last
         word must not restart a lane forever."""
         with tempfile.TemporaryDirectory() as d:
-            WS.publish_verdict("pp0-tp0", True, "wedged, then died",
-                               directory=d,
-                               now=lambda: time.time() - 10_000.0)
+            WS.publish_verdict(
+                "pp0-tp0",
+                True,
+                "wedged, then died",
+                directory=d,
+                now=lambda: time.time() - 10_000.0,
+            )
             self.assertIsNone(WS.read_wedge_signal(d).verdict)
 
     def test_one_wedged_rank_wedges_the_lane(self):
@@ -169,7 +177,8 @@ class TestPublishAndRead(CustomTestCase):
             blocked = os.path.join(d, "file-not-a-dir")
             open(blocked, "w").close()
             self.assertIsNone(
-                WS.publish_verdict("pp0-tp0", True, "x", directory=blocked))
+                WS.publish_verdict("pp0-tp0", True, "x", directory=blocked)
+            )
 
     def test_the_payload_is_machine_readable(self):
         with tempfile.TemporaryDirectory() as d:
@@ -244,8 +253,7 @@ class TestTheDetectorPublishes(CustomTestCase):
     def test_rank_labels_come_from_the_parallel_state(self):
         with tempfile.TemporaryDirectory() as d:
             with _use_dir(d):
-                poll = make_admission_wedge_poller(
-                    _FakeScheduler(queued=1, pp=2, tp=1))
+                poll = make_admission_wedge_poller(_FakeScheduler(queued=1, pp=2, tp=1))
                 poll()
                 names = os.listdir(d)
         self.assertIn("wedge.pp2-tp1.json", names)
@@ -268,7 +276,9 @@ class TestTheThreadRunsThePoll(CustomTestCase):
                 try:
                     t = invariant_checker.create_admission_wedge_watchdog(
                         _FakeScheduler(queued=9, running=0, age=64.7),
-                        poll_interval=0.05, stop=stop)
+                        poll_interval=0.05,
+                        stop=stop,
+                    )
                     deadline = time.time() + 10.0
                     verdict = None
                     while time.time() < deadline:
@@ -284,8 +294,7 @@ class TestTheThreadRunsThePoll(CustomTestCase):
                     # into a temp path.
                     stop.set()
                     t.join(timeout=5.0)
-        self.assertIs(verdict, True,
-                      "the watchdog thread published nothing within 10s")
+        self.assertIs(verdict, True, "the watchdog thread published nothing within 10s")
         self.assertFalse(t.is_alive(), "the watchdog thread would not stop")
 
 

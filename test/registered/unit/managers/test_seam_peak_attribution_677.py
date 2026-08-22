@@ -149,9 +149,7 @@ class TestItCannotBreakAFlip(unittest.TestCase):
         import sys
 
         saved = sys.modules.get("sglang.srt.mem_ledger")
-        sys.modules["sglang.srt.mem_ledger"] = SimpleNamespace(
-            flight_recorder=_Angry()
-        )
+        sys.modules["sglang.srt.mem_ledger"] = SimpleNamespace(flight_recorder=_Angry())
         try:
             _Runtime()._record_seam_peak("pp_to_tp", 1, 2, 3)
         finally:

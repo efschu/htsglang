@@ -94,7 +94,8 @@ class TheCarryConsumesTheQueueEntry(unittest.TestCase):
     def test_no_queue_and_no_merge_are_both_safe(self):
         self.assertEqual(0, _consume(types.SimpleNamespace(waiting_queue=[]), None))
         self.assertEqual(
-            0, _consume(types.SimpleNamespace(waiting_queue=None), _Batch([_Req("x", 1)]))
+            0,
+            _consume(types.SimpleNamespace(waiting_queue=None), _Batch([_Req("x", 1)])),
         )
 
     def test_the_carry_ITSELF_consumes_the_queue(self):

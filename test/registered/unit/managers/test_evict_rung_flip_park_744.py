@@ -75,6 +75,7 @@ def _relief(
     r._device_index = 0
     r._bytes_per_row = 1024
     if live_max is not None:
+
         class _L:
             def numel(self):
                 return 1
@@ -138,9 +139,7 @@ class TestTheParkedExtentIsVisible(CustomTestCase):
         def _boom():
             raise RuntimeError("probe down")
 
-        r = _relief(
-            {"req_max": -1, "req_rows": 0}, pending=_boom, armed=lambda: True
-        )
+        r = _relief({"req_max": -1, "req_rows": 0}, pending=_boom, armed=lambda: True)
         self.assertFalse(r._nothing_resident())
 
     def test_the_net_folds_the_parked_top_into_max_live_row(self):
@@ -221,9 +220,7 @@ class TestTheArmedGate(CustomTestCase):
             pending=lambda: (PARKED_ROWS, PARKED_TOP),
         )
         floor, won = r._evict_floor_rows(MAX_LIVE)
-        self.assertGreater(
-            won, 0, "an armed flip must still be able to fund itself"
-        )
+        self.assertGreater(won, 0, "an armed flip must still be able to fund itself")
         freed = r._lower_watermark_to(PARKED_TOP + 1)
         self.assertGreater(freed, 0, "the funding eviction was not collected")
 
@@ -297,9 +294,7 @@ class TestTheArmedGate(CustomTestCase):
         freed = r._lower_watermark_to(EVICT_TARGET)
         self.assertGreater(freed, 0, "the priced eviction was not collected")
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(
-            self.calls[0][1], -1, "nothing resident pins anything here"
-        )
+        self.assertEqual(self.calls[0][1], -1, "nothing resident pins anything here")
 
     def test_default_construction_leaves_the_rung_unchanged(self):
         """No channels wired -> exactly the pre-#744 behaviour.

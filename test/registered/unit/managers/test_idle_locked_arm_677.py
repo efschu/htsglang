@@ -239,7 +239,7 @@ class TheRecordedPrematureArmMustNotArm(unittest.TestCase):
                 phase=PHASE_PP,
                 running_bs=1,
                 pending_prefill_tokens=25625,
-                nothing_can_run=False,   # the simulation says PP can admit
+                nothing_can_run=False,  # the simulation says PP can admit
                 target_can_admit=True,
             ),
         )
@@ -247,7 +247,7 @@ class TheRecordedPrematureArmMustNotArm(unittest.TestCase):
 
 
 class AnIdleServerIsNotADeadlock(unittest.TestCase):
-    """"No batch" alone is not the trigger, deliberately.
+    """ "No batch" alone is not the trigger, deliberately.
 
     An empty instance also builds nothing, and flipping it is thrash with no
     work to show for it. The scheduler-side observation requires resident

@@ -140,7 +140,9 @@ class _RingWire:
         # time out.
         self.sends = 0
 
-    def send_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None, async_send=False):
+    def send_tensor_dict(
+        self, tensor_dict, dst=None, all_gather_group=None, async_send=False
+    ):
         import pickle
 
         self.sends += 1
@@ -269,9 +271,7 @@ def _worker(rank, init_file, out_dir):
             res["ok"] = True
 
         elif rank == PP1:
-            h = _make_holder(
-                rank, wire, waiting_queue=[_FakeReq(RID, PP1_LOCAL_MATCH)]
-            )
+            h = _make_holder(rank, wire, waiting_queue=[_FakeReq(RID, PP1_LOCAL_MATCH)])
             incoming = h._pp_recv_admission_decision()
             effective, amended = h._pp_reconcile_incoming_admission(incoming)
             h._pp_send_admission_decision(amended)
@@ -302,7 +302,11 @@ def _worker(rank, init_file, out_dir):
             res["effective"] = dict(effective)
             res["sends"] = wire.sends
             res["incoming_retracted"] = [
-                {"rid": e.rid, "retracted": e.retracted, "observed_local": e.observed_local}
+                {
+                    "rid": e.rid,
+                    "retracted": e.retracted,
+                    "observed_local": e.observed_local,
+                }
                 for e in incoming.entries
             ]
             res["warning_count"] = len(catcher.records)
@@ -369,9 +373,7 @@ class PPAdmissionWiring791(unittest.TestCase):
         rank's send is a no-op and PP0's opportunistic peek is dormant.
         """
         res = _run()
-        self.assertEqual(
-            res["stuck_ranks"], [], f"a rank never finished: {res}"
-        )
+        self.assertEqual(res["stuck_ranks"], [], f"a rank never finished: {res}")
         r0, r1, r2 = res["result_0"], res["result_1"], res["result_2"]
         for name, r in (("PP0", r0), ("PP1", r1), ("PP2", r2)):
             self.assertIsNotNone(r, f"{name} produced no result: {res}")
@@ -473,8 +475,7 @@ class PPAdmissionOrdering791(unittest.TestCase):
         self.assertLess(
             i_admission,
             i_batch,
-            "the admission-decision receive must run before "
-            "get_next_batch_to_run",
+            "the admission-decision receive must run before get_next_batch_to_run",
         )
         self.assertLess(
             i_admission,

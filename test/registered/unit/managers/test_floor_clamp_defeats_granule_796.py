@@ -170,12 +170,8 @@ class TestGuardOnASubGranuleShape(unittest.TestCase):
         released = kbr.KvBackingRelief.release_rows_after_floor(
             r, rows_wanted=107_049, current=CURRENT, floor=near_floor, page=1
         )
-        self.assertEqual(
-            released, 0, "a shrink below one granule returns nothing"
-        )
-        self.assertEqual(
-            r.engaged, [], "and must not engage the cap to discover that"
-        )
+        self.assertEqual(released, 0, "a shrink below one granule returns nothing")
+        self.assertEqual(r.engaged, [], "and must not engage the cap to discover that")
 
     def test_a_shrink_that_does_cross_a_granule_still_proceeds(self):
         r = _Relief()

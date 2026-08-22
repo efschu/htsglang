@@ -57,7 +57,9 @@ _ABSENT = _Absent()
 
 class PPAdmissionPrefixIndicesTensor796(unittest.TestCase):
     def _prefix_len_for(self, prefix_indices):
-        decision = build_pp_admission_decision(0, [_req("r0", prefix_indices)], pp_size=3)
+        decision = build_pp_admission_decision(
+            0, [_req("r0", prefix_indices)], pp_size=3
+        )
         self.assertEqual(len(decision.entries), 1)
         return decision.entries[0].prefix_len
 
@@ -65,9 +67,7 @@ class PPAdmissionPrefixIndicesTensor796(unittest.TestCase):
         """The exact specimen: a request with no cached prefix. This raised
         'Boolean value of Tensor with no values is ambiguous' and killed the
         boot."""
-        self.assertEqual(
-            self._prefix_len_for(torch.empty(0, dtype=torch.int64)), 0
-        )
+        self.assertEqual(self._prefix_len_for(torch.empty(0, dtype=torch.int64)), 0)
 
     def test_multi_element_tensor_is_its_row_count(self):
         """The other raising shape: 'more than one element is ambiguous'.

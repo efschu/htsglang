@@ -199,7 +199,9 @@ def _worker(rank, init_file, out_dir, case):
                 res["note"] = "output survived and the owed proxy arrived"
             else:  # "drain"
                 dropped = _drain_n(h, LIVE_MB, 2)
-                assert dropped == 1, f"expected exactly 1 leftover dropped, got {dropped}"
+                assert dropped == 1, (
+                    f"expected exactly 1 leftover dropped, got {dropped}"
+                )
                 proxy = h._pp_recv_proxy_tensors(LIVE_MB)
                 assert proxy["h"] == 2, f"wrong proxy delivered: {proxy}"
                 res["note"] = f"dropped={dropped}, owed proxy delivered"

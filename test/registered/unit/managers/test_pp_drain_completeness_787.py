@@ -499,7 +499,9 @@ def _worker(rank, init_file, out_dir, case):
             elif case == "before_drain":
                 dropped = _drain_n(h, LIVE_MB, 1)
                 res["drained"] = dropped
-                assert dropped == 1, f"expected exactly 1 leftover dropped, got {dropped}"
+                assert dropped == 1, (
+                    f"expected exactly 1 leftover dropped, got {dropped}"
+                )
                 # The wire owes nothing further; the guard must never fire.
                 res["note"] = f"dropped={dropped}, guard never reached"
             else:  # "corpse"
@@ -610,7 +612,9 @@ class DrainCompleteness787(unittest.TestCase):
         v = res.get(VICTIM, {})
         self.assertIsNone(v.get("error"), f"victim failed: {v.get('error')}")
         self.assertTrue(v.get("ok"), f"victim did not finish: {v}")
-        self.assertEqual(v.get("drained"), 1, f"expected the leftover to be dropped: {v}")
+        self.assertEqual(
+            v.get("drained"), 1, f"expected the leftover to be dropped: {v}"
+        )
 
     def test_an_owed_output_and_proxy_survive_the_drain(self):
         """CORPSE S GUARD. Must stay green under any future #787 fix.

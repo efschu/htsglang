@@ -108,6 +108,16 @@ MUTATIONS = [
         ["test_the_cutover_instrument_splits_owed_from_pp_loop_only"],
     ),
     (
+        "M12 a kind is renamed at its sender and silently falls out of the table",
+        DISP,
+        '    "admission_decision": PP_LOOP_ONLY,',
+        '    "admission_decision_RENAMED": PP_LOOP_ONLY,',
+        [
+            "test_every_kind_the_wire_actually_carries_is_declared",
+            "test_an_admission_decision_no_longer_withholds_presence",
+        ],
+    ),
+    (
         "M9 the abandonment goes back to naming one of two causes",
         RUNTIME,
         '                f"THIS rank withheld its own presence for "',

@@ -121,9 +121,7 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
 
         sched = _scheduler(carried=self.req, queued=[self.req])
         before = _enumerate(sched)
-        removed = _consume_carried_from_waiting_queue(
-            sched, _Batch([self.req])
-        )
+        removed = _consume_carried_from_waiting_queue(sched, _Batch([self.req]))
         self.assertEqual(removed, 1, "#731's consume did not fire")
         self.assertEqual(sched.waiting_queue, [])
         after = _enumerate(sched)
@@ -155,9 +153,7 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
 
         src = inspect.getsource(m._live_reqs)
         names = {
-            n.attr
-            for n in ast.walk(ast.parse(src))
-            if isinstance(n, ast.Attribute)
+            n.attr for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Attribute)
         } | {
             c.value
             for c in ast.walk(ast.parse(src))

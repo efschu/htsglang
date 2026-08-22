@@ -48,9 +48,9 @@ class BuildInsideCutover(AssertionError):
 def _image(fill: int, nbytes: int = PAYLOAD):
     """A valid arena image: payload plus its 8-byte checksum trailer."""
     payload = torch.full((nbytes,), fill, dtype=torch.uint8)
-    checksum = torch.tensor(
-        [wa.uint8_checksum(payload)], dtype=torch.int64
-    ).view(torch.uint8)
+    checksum = torch.tensor([wa.uint8_checksum(payload)], dtype=torch.int64).view(
+        torch.uint8
+    )
     return torch.cat([payload, checksum])
 
 

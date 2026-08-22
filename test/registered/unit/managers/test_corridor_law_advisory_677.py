@@ -123,7 +123,9 @@ class TheSeamCommitChunkDefaultIsArmed(unittest.TestCase):
 
         from sglang.srt.mem_cache import memory_pool
 
-        src = _inspect.getsource(memory_pool.MHATokenToKVPool._alloc_post_capture_buffers)
+        src = _inspect.getsource(
+            memory_pool.MHATokenToKVPool._alloc_post_capture_buffers
+        )
         self.assertIn('"SGLANG_FLIP_SEAM_CHUNK_MIB", "8"', src)
         self.assertNotIn('"SGLANG_FLIP_SEAM_CHUNK_MIB", "0"', src)
 
@@ -134,6 +136,8 @@ class TheSeamCommitChunkDefaultIsArmed(unittest.TestCase):
 
         from sglang.srt.mem_cache import memory_pool
 
-        src = _inspect.getsource(memory_pool.MHATokenToKVPool._alloc_post_capture_buffers)
+        src = _inspect.getsource(
+            memory_pool.MHATokenToKVPool._alloc_post_capture_buffers
+        )
         self.assertIn("MEASURED UNDER LOAD", src)
         self.assertIn("1438.25", src)

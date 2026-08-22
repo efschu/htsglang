@@ -66,10 +66,10 @@ MIB = 1024 * 1024
 
 # PP1 exactly as recorded on the live rig.
 PP1 = dict(
-    fixed_bytes=145652736,          # 138.9 MiB, the drafter restore
-    arena_fixed_bytes=854522624,    # 814.9 MiB, the weights-arena tail
+    fixed_bytes=145652736,  # 138.9 MiB, the drafter restore
+    arena_fixed_bytes=854522624,  # 814.9 MiB, the weights-arena tail
     worst_leg_fixed_bytes=854522624,
-    rung_fund_bytes=1000175360,     # 953.8 MiB, measured at ONE fill
+    rung_fund_bytes=1000175360,  # 953.8 MiB, measured at ONE fill
     per_row_bytes=424.2,
     id_space=471470,
 )
@@ -111,7 +111,8 @@ class TheExcuseMustNotBeGrantedOnAPointMeasurement(unittest.TestCase):
         """Relieving the arena must not relieve the other leg by accident."""
         r = _reserve(rung_guaranteed_bytes=10_000 * MIB)
         self.assertGreaterEqual(
-            r.arming_draw_bytes(), PP1["fixed_bytes"],
+            r.arming_draw_bytes(),
+            PP1["fixed_bytes"],
             "the drafter's restore is not arena tail and is not paid by this "
             "provider; it floors the draw.",
         )
@@ -122,8 +123,10 @@ class RanksWithoutATailAreUnaffected(unittest.TestCase):
 
     def test_pp0_draw_is_its_leg(self):
         r = _reserve(
-            fixed_bytes=238763008, arena_fixed_bytes=0,
-            worst_leg_fixed_bytes=238763008, rung_fund_bytes=238763008,
+            fixed_bytes=238763008,
+            arena_fixed_bytes=0,
+            worst_leg_fixed_bytes=238763008,
+            rung_fund_bytes=238763008,
         )
         self.assertAlmostEqual(r.arming_draw_bytes() / MIB, 227.7, places=0)
 

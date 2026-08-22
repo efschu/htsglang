@@ -166,9 +166,7 @@ class TestTheFloorFollowsCompletion(unittest.TestCase):
         'proceed as asked' or 'do nothing'. The cap follows the mark the
         eviction actually reached."""
         delivered = 150_000
-        r = _relief(
-            CRASH_LIVE_ROW, {"req_max": -1, "req_rows": 0}, evicts_to=delivered
-        )
+        r = _relief(CRASH_LIVE_ROW, {"req_max": -1, "req_rows": 0}, evicts_to=delivered)
 
         r._shrink_to(CRASH_CAP, current=400_000)
 

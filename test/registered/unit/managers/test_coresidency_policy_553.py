@@ -155,9 +155,7 @@ class TestShrinkNeverStrandsBytes(unittest.TestCase):
         def _boom(source):
             raise RuntimeError("actuator exploded")
 
-        result = cold_event(
-            1000, view=_view(_src("dial0", 2000)), release_fn=_boom
-        )
+        result = cold_event(1000, view=_view(_src("dial0", 2000)), release_fn=_boom)
         self.assertFalse(result.ok)
         self.assertIn("actuator exploded", result.steps[0].detail)
 
@@ -181,8 +179,9 @@ class TestGrowRespectsTheDialsRefusal(unittest.TestCase):
             grow_fn=lambda n: calls.append(n) or (False, "below floor"),
         )
         self.assertEqual(
-            calls, [1000], "a floor refusal is a statement about the rig, not "
-            "a negotiation"
+            calls,
+            [1000],
+            "a floor refusal is a statement about the rig, not a negotiation",
         )
 
 
@@ -219,9 +218,7 @@ class TestHotMeasuresRatherThanAsserts(unittest.TestCase):
         self.assertIn("must not be reported warm", result.refused)
 
     def test_a_measured_zero_is_reported_as_zero(self):
-        result = hot_event(
-            10_000, grow_fn=lambda n: (True, "ok"), measure_fn=lambda: 0
-        )
+        result = hot_event(10_000, grow_fn=lambda n: (True, "ok"), measure_fn=lambda: 0)
         self.assertEqual(result.reached_bytes, 0)
         self.assertTrue(result.ok, "a measured zero is a fact, not a failure")
 

@@ -117,7 +117,9 @@ class TestArrivingWorkIsCounted(CustomTestCase):
         logged.
         """
         s = _sched()
-        self.assertEqual(s._idle_locked_inputs(0, s._pending_prefill_tokens()), (True, False))
+        self.assertEqual(
+            s._idle_locked_inputs(0, s._pending_prefill_tokens()), (True, False)
+        )
 
     def test_the_early_false_is_what_hides_the_holding_terms(self):
         """Why the diagnostic showed both PP terms holding and still refused."""

@@ -233,7 +233,9 @@ class TheRecoveryTargetIgnoresTheReservation(unittest.TestCase):
         """
         pool = _FakeVmmPool(backed_rows=110592, reserved_rows=190596)
         affordable_rows = 39408
-        free_mib = LAW_FLOOR // (1 << 20) + (affordable_rows * BYTES_PER_ROW) // (1 << 20)
+        free_mib = LAW_FLOOR // (1 << 20) + (affordable_rows * BYTES_PER_ROW) // (
+            1 << 20
+        )
         relief = _relief(pool, free_mib=free_mib, rows_at_boot=270646)
         relief.recover()
         self.assertTrue(pool.attempts, "recovery must have been attempted")

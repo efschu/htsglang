@@ -228,9 +228,7 @@ class TestTheBoundIsStructural(CustomTestCase):
                 # The threshold is always the same MULTIPLE of that ladder's
                 # own break-even, so nothing but N needs re-deriving.
                 self.assertEqual(len(shape), 1, f"ladder-dependent at bs={bs}")
-                self.assertAlmostEqual(
-                    shape.pop(), (1 + 2 * bs) / (1 + bs), places=2
-                )
+                self.assertAlmostEqual(shape.pop(), (1 + 2 * bs) / (1 + bs), places=2)
 
 
 class TestTheMeasurementIsValidated(CustomTestCase):
@@ -322,9 +320,7 @@ class TestTheShippedDefaultWindow(CustomTestCase):
         from sglang.srt.managers.phase_policy import UNREACHABLE_FLIP_THRESHOLD
 
         cfg = self._cfg0(0.1)
-        self.assertEqual(
-            effective_flip_threshold(cfg, 6), UNREACHABLE_FLIP_THRESHOLD
-        )
+        self.assertEqual(effective_flip_threshold(cfg, 6), UNREACHABLE_FLIP_THRESHOLD)
 
     def test_a_measured_full_stall_still_flips_with_no_window(self):
         """sigma = 1 is the measured case, and it must stay reachable even
@@ -450,8 +446,12 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
                 arms += 1
                 note_flip_armed(state, d, now)
                 note_flip_outcome(
-                    cfg, state, d.direction, False,
-                    "corridor guard refused the seam staging", now,
+                    cfg,
+                    state,
+                    d.direction,
+                    False,
+                    "corridor guard refused the seam staging",
+                    now,
                 )
             now += 1.0
 
@@ -508,7 +508,9 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
         note_flip_outcome(cfg, state, d.direction, False, "corridor", now)
         # Rate-limited one second later.
         nxt = PhasePolicyInputs(
-            phase=PHASE_TP, pending_prefill_tokens=60_000, running_bs=2,
+            phase=PHASE_TP,
+            pending_prefill_tokens=60_000,
+            running_bs=2,
             now=now + 1.0,
         )
         self.assertIsNone(decide(cfg, state, nxt).direction)
@@ -535,10 +537,16 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
         note_flip_armed(state, d, now)
         note_flip_outcome(cfg, state, d.direction, False, "corridor guard", now)
 
-        nxt = decide(cfg, state, PhasePolicyInputs(
-            phase=PHASE_TP, pending_prefill_tokens=60_000, running_bs=2,
-            now=now + 1.0,
-        ))
+        nxt = decide(
+            cfg,
+            state,
+            PhasePolicyInputs(
+                phase=PHASE_TP,
+                pending_prefill_tokens=60_000,
+                running_bs=2,
+                now=now + 1.0,
+            ),
+        )
         self.assertIsNone(nxt.direction)
         self.assertIn("refused", nxt.reason)
 
@@ -586,9 +594,7 @@ class TestTheRuntimeToggle(CustomTestCase):
         """It arrives over JSON, so "1.0" must work as well as 1.0."""
         from sglang.srt.managers.phase_policy import with_decode_contention
 
-        self.assertEqual(
-            with_decode_contention(_cfg(), "0.5").decode_contention, 0.5
-        )
+        self.assertEqual(with_decode_contention(_cfg(), "0.5").decode_contention, 0.5)
 
     def test_nonsense_is_refused_rather_than_half_applied(self):
         from sglang.srt.managers.phase_policy import with_decode_contention
@@ -695,8 +701,7 @@ class TestTheLadderIsSolvedNotConfigured(CustomTestCase):
         # and the bar is higher -- which is the right error while a wrongly
         # armed flip abandons and latches the direction.
         solved = [
-            int(round(self._p_star(1196.0) * (1 + 2 * b) / (1 + b)))
-            for b in range(5)
+            int(round(self._p_star(1196.0) * (1 + 2 * b) / (1 + b))) for b in range(5)
         ]
         self.assertEqual(solved, [10059, 15088, 16764, 17603, 18106])
         # The 2x bound is structural against the P* the ladder was SOLVED
@@ -799,16 +804,22 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         state = PhasePolicyState()
         state.phase_since = 1000.0
         inp = PhasePolicyInputs(
-            phase="pp", pending_prefill_tokens=pending, running_bs=bs,
+            phase="pp",
+            pending_prefill_tokens=pending,
+            running_bs=bs,
             now=1000.0 + in_pp,
         )
         return decide(cfg, state, inp)
 
     def _cfg_slo(self, slo):
         return _cfg(
-            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=0.0,
-            decode_stall_slo_s=slo, pp_prefill_tok_s=4036.0,
-            tp_prefill_tok_s=1196.0, min_dwell_s=0.0,
+            decode_contention=1.0,
+            flip_cost_s=5.918,
+            pp_window_s=0.0,
+            decode_stall_slo_s=slo,
+            pp_prefill_tok_s=4036.0,
+            tp_prefill_tok_s=1196.0,
+            min_dwell_s=0.0,
         )
 
     def test_the_solved_cap_is_the_slo_minus_both_seams(self):
@@ -852,8 +863,12 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
     def test_the_legacy_stopwatch_states_what_drain_would_have_done(self):
         """Requirement (3): the deferring line must be auditable in place."""
         cfg = _cfg(
-            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=15.0,
-            decode_stall_slo_s=0.0, pp_prefill_tok_s=4036.0, min_dwell_s=0.0,
+            decode_contention=1.0,
+            flip_cost_s=5.918,
+            pp_window_s=15.0,
+            decode_stall_slo_s=0.0,
+            pp_prefill_tok_s=4036.0,
+            min_dwell_s=0.0,
         )
         d = self._pp(cfg, 23_313, 3, 15.0)
         self.assertEqual(d.direction, PP_TO_TP)
@@ -864,14 +879,16 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
 
     def test_a_declared_slo_overrides_the_hand_set_window(self):
         cfg = _cfg(
-            decode_contention=1.0, flip_cost_s=5.918, pp_window_s=15.0,
-            decode_stall_slo_s=45.0, pp_prefill_tok_s=4036.0, min_dwell_s=0.0,
+            decode_contention=1.0,
+            flip_cost_s=5.918,
+            pp_window_s=15.0,
+            decode_stall_slo_s=45.0,
+            pp_prefill_tok_s=4036.0,
+            min_dwell_s=0.0,
         )
         self.assertIsNone(self._pp(cfg, 23_313, 3, 15.0).direction)
 
     def test_the_tp_floor_is_solved_from_the_seam(self):
         from sglang.srt.managers.phase_policy import solved_tp_decode_floor_s
 
-        self.assertAlmostEqual(
-            solved_tp_decode_floor_s(self._cfg_slo(45.0)), 11.836
-        )
+        self.assertAlmostEqual(solved_tp_decode_floor_s(self._cfg_slo(45.0)), 11.836)

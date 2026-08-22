@@ -85,7 +85,10 @@ class TestMixedResultRollsBack(unittest.TestCase):
         """THE PIN. Ranks 0 and 2 attached; the group must not stay that way."""
         mgr = _Mgr(
             [_ok(0), _fail(1), _ok(2)],
-            [DetachHiCacheStorageReqOutput(success=True, message="d", rank=r) for r in (0, 1, 2)],
+            [
+                DetachHiCacheStorageReqOutput(success=True, message="d", rank=r)
+                for r in (0, 1, 2)
+            ],
         )
         out = _run(mgr)
         self.assertEqual(mgr.detach_calls, 1, "the group was left half-attached")
@@ -94,7 +97,10 @@ class TestMixedResultRollsBack(unittest.TestCase):
     def test_the_message_says_the_group_is_now_detached(self):
         mgr = _Mgr(
             [_ok(0), _fail(1), _ok(2)],
-            [DetachHiCacheStorageReqOutput(success=True, message="d", rank=r) for r in (0, 1, 2)],
+            [
+                DetachHiCacheStorageReqOutput(success=True, message="d", rank=r)
+                for r in (0, 1, 2)
+            ],
         )
         out = _run(mgr)
         self.assertIn("fully detached", out.message)
@@ -103,7 +109,10 @@ class TestMixedResultRollsBack(unittest.TestCase):
     def test_the_original_failure_is_still_reported(self):
         mgr = _Mgr(
             [_ok(0), _fail(1, "disk missing"), _ok(2)],
-            [DetachHiCacheStorageReqOutput(success=True, message="d", rank=r) for r in (0, 1, 2)],
+            [
+                DetachHiCacheStorageReqOutput(success=True, message="d", rank=r)
+                for r in (0, 1, 2)
+            ],
         )
         out = _run(mgr)
         self.assertIn("disk missing", out.message, "rollback must not hide the cause")

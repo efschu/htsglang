@@ -445,9 +445,7 @@ def _run(variant, n_local_passes=None, join_timeout=JOIN_TIMEOUT_S):
 
         out = {"stuck_ranks": stuck_ranks}
         for r in range(WORLD):
-            out[f"progress_{r}"] = _load(
-                os.path.join(tmp, f"progress_r{r}.json"), None
-            )
+            out[f"progress_{r}"] = _load(os.path.join(tmp, f"progress_r{r}.json"), None)
             out[f"result_{r}"] = _load(os.path.join(tmp, f"result_r{r}.json"), None)
             out[f"ops_{r}"] = _load(os.path.join(tmp, f"ops_r{r}.json"), [])
         return out
@@ -472,9 +470,7 @@ class PPChainFlushDeadlock788(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
         self.assertEqual(res[f"result_{PP2}"]["received"], [1, 2, 3])
 
         for rank in (PP0, PP1):
@@ -511,9 +507,7 @@ class PPChainFlushDeadlock788(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
         for rank in (PP0, PP1):
             ops = res[f"ops_{rank}"]
             self.assertNotEqual(
@@ -565,9 +559,7 @@ class PPChainFlushDeadlock788(unittest.TestCase):
         for r in range(WORLD):
             result = res[f"result_{r}"]
             self.assertIsNotNone(result, f"rank {r} produced no result: {res}")
-            self.assertTrue(
-                result.get("ok"), f"rank {r} failed: {result.get('error')}"
-            )
+            self.assertTrue(result.get("ok"), f"rank {r} failed: {result.get('error')}")
 
 
 if __name__ == "__main__":

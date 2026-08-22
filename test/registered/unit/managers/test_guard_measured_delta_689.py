@@ -58,12 +58,15 @@ def _guard(free_mib, *, providers=()):
         law_floor_mib=0,
     )
     for name, cost, pays in providers:
+
         def _mk(pays=pays):
             def _spend(want):
                 give = min(int(want), int(pays) * MIB)
                 state["free"] += give
                 return give
+
             return _spend
+
         g.register(name, cost, _mk())
     return g, state
 

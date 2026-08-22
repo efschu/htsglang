@@ -178,8 +178,10 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         no shrink decision anywhere changes as a result of distinguishing them.
         """
         results = []
-        for split in ({"req_max": MAX_LIVE - 100, "req_rows": 3},
-                      {"req_max": 1_000, "req_rows": 3}):
+        for split in (
+            {"req_max": MAX_LIVE - 100, "req_rows": 3},
+            {"req_max": 1_000, "req_rows": 3},
+        ):
             r = _relief(split)
             with mock.patch(
                 "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",

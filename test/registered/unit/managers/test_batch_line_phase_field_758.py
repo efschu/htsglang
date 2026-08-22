@@ -61,6 +61,7 @@ class PhaseField(unittest.TestCase):
 
         prev = sa.get_server_args
         try:
+
             def _boom():
                 raise RuntimeError("authority unavailable")
 

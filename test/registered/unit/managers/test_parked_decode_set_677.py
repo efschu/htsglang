@@ -143,17 +143,18 @@ class TheDiscountIsTheWholeFix(unittest.TestCase):
         return min(res, s.admission_headroom(running_bs, res))
 
     def test_the_wedge_reproduces_without_the_discount(self):
-        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING,
-                                enabled=False)
+        s = pds.ParkedDecodeSet(
+            slot_pool=SLOT_POOL, max_running=MAX_RUNNING, enabled=False
+        )
         self.assertEqual(0, self._gate(s, MAX_RUNNING, running_bs=MAX_RUNNING))
 
     def test_the_discount_relieves_it(self):
         s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING)
-        s.sync_carriers([f"c{i}" for i in range(MAX_RUNNING)],
-                        running_bs=MAX_RUNNING)
+        s.sync_carriers([f"c{i}" for i in range(MAX_RUNNING)], running_bs=MAX_RUNNING)
         self.assertEqual(MAX_RUNNING, s.carrier_discount())
-        self.assertEqual(MAX_RUNNING,
-                         self._gate(s, MAX_RUNNING, running_bs=MAX_RUNNING))
+        self.assertEqual(
+            MAX_RUNNING, self._gate(s, MAX_RUNNING, running_bs=MAX_RUNNING)
+        )
 
     def test_relief_stops_at_the_state_pool_not_at_the_cap(self):
         """The cap stops binding; the GDN pool must start.
@@ -264,8 +265,9 @@ class TheSafetyNetIsUnderneath(unittest.TestCase):
     now breaks it -- is exactly what it was."""
 
     def test_disabled_parking_reproduces_the_old_gate_exactly(self):
-        s = pds.ParkedDecodeSet(slot_pool=SLOT_POOL, max_running=MAX_RUNNING,
-                                enabled=False)
+        s = pds.ParkedDecodeSet(
+            slot_pool=SLOT_POOL, max_running=MAX_RUNNING, enabled=False
+        )
         self.assertFalse(s.park("a", running_bs=MAX_RUNNING))
         self.assertEqual(0, len(s))
         # THE IDENTITY, not "the same bound by another route". The scheduler

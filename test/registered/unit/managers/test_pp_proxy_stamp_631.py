@@ -417,8 +417,11 @@ def test_the_armed_drain_still_DROPS_a_void_proxy():
     by one -- the specimen's mb_id=2 seq=151 rows=512 arriving on a rank at
     mb_id=1.
     """
-    proxy = {"hidden_states": torch.zeros(2), "__msg_type__": "proxy",
-             "__stamp__": (2, 151, 512, -1)}
+    proxy = {
+        "hidden_states": torch.zeros(2),
+        "__msg_type__": "proxy",
+        "__stamp__": (2, 151, 512, -1),
+    }
     r = _ArmedRank(wire=[proxy], posted=1)
     assert r.pp_flip_drain_tensor_dicts() == 1
     assert r.recv_calls == 1

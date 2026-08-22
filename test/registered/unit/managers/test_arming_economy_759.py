@@ -144,9 +144,7 @@ class TestGateBMustNotDie(CustomTestCase):
 
     def test_one_token_below_the_break_even_waits_for_the_dwell(self):
         """The boundary, both sides -- so the floor is a floor, not a fence."""
-        d = _decide(
-            phase="tp", pending=FLIP_TOKENS - 1, running_bs=0, idle_since=999.9
-        )
+        d = _decide(phase="tp", pending=FLIP_TOKENS - 1, running_bs=0, idle_since=999.9)
         self.assertFalse(_is_idle_lock_arm(d))
 
 
