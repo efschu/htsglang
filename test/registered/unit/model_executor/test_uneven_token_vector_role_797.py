@@ -85,6 +85,7 @@ def _run(
     derived=False,
     allow_install=True,
     draft_worker=False,
+    draft_pool_worker=None,
 ):
     """Drive the real method once per simulated DCP rank.
 
@@ -122,6 +123,17 @@ def _run(
                 tp_rank=rank,
                 server_args=_server_args(derived),
                 is_draft_worker=draft_worker,
+                # Mirrors ModelRunner's own definition (model_runner.py:512):
+                # is_draft_pool_worker = is_draft_worker and not
+                # is_phase_flip_tp_stack. These stubs model a NON-flip runner,
+                # where the two coincide, so every existing case keeps its
+                # meaning. The flip-TP case, where they diverge and where #797
+                # actually lives, is covered in
+                # test_draft_pool_worker_gate_797.py, which drives this helper
+                # with draft_pool_worker set explicitly.
+                is_draft_pool_worker=(
+                    draft_worker if draft_pool_worker is None else draft_pool_worker
+                ),
             )
             stub._is_solo_draft_kv_host = lambda s=stub: (
                 ModelRunnerKVCacheMixin._is_solo_draft_kv_host(s)
@@ -429,6 +441,7 @@ def _skip_infos(
             tp_rank=0,
             server_args=_server_args(False),
             is_draft_worker=False,
+            is_draft_pool_worker=False,
         )
         stub._is_solo_draft_kv_host = lambda s=stub: (
             ModelRunnerKVCacheMixin._is_solo_draft_kv_host(s)

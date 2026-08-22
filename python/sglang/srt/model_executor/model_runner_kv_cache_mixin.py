@@ -5777,7 +5777,31 @@ class ModelRunnerKVCacheMixin:
             # PP-prefill boot) and the mode would never arrive.
             and (self.server_args.uneven_kv_derived_mode() or seed_role)
             and not pinned_vector
-            and not self.is_draft_worker
+            # #797 THE LAST GATE. This used to read self.is_draft_worker, and
+            # on the flip's TP stack that is the runner which OWNS the real KV
+            # pool. model_runner.py:512 defines the distinction the codebase
+            # already relies on: is_draft_pool_worker = is_draft_worker and not
+            # is_phase_flip_tp_stack -- a flip-TP draft runner is a draft
+            # worker whose POOLS take the target-model treatment. The sizing
+            # branch twenty lines up (:7272) keys on is_draft_pool_worker for
+            # exactly that reason, then this gate keyed on the other member of
+            # the pair and refused the install to the very runner that had just
+            # resolved the pool config.
+            #
+            # The exclusion is still correct and still enforced -- a runner
+            # with its OWN draft pool must not install the target's token
+            # vector, because its capacity is not the target's capacity. It is
+            # now asked about the pool, which is what the vector is about,
+            # rather than about the worker's label.
+            #
+            # Measured, boot_798_0822_0629.log: at the TP-stack sizing site all
+            # three ranks logged allow_install=True, role='seed', dcp_size=3,
+            # active_vector=[29,19,16], no SKIP, and the calibration still
+            # printed "restart with SGLANG_UNEVEN_TOKEN_VECTOR=30,17,17". The
+            # PINNED-VECTOR warning did not fire, so pinned_vector was False
+            # and seed_role True, which leaves this conjunct as the only one
+            # that can have been False.
+            and not self.is_draft_pool_worker
         )
 
         # --rank-kv-ratio speed: the objective is the DECODE step, not the
