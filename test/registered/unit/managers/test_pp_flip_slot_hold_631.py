@@ -42,6 +42,7 @@ CPU-only, no CUDA, no distributed.
 
 import pytest
 
+from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
 
@@ -87,6 +88,13 @@ class _ServerArgs:
 
 class _PS:
     pp_size = 3
+    # #791 (f31fd5e43e): `_pp_reconcile_incoming_admission` reads
+    # `self.ps.pp_rank` directly (scheduler_pp_mixin.py:4510), no getattr
+    # default. `_Group.is_last_rank = True` above already fixes this fixture
+    # as the LAST of 3 stages -- ranks are 0..pp_size-1, so the last rank's
+    # number is `pp_size - 1 = 2`. Not an independent stub: it is the same
+    # rank identity `is_last_rank`/`is_first_rank` are derived from.
+    pp_rank = 2
 
 
 class _Receiver:
@@ -122,35 +130,113 @@ class _Rank:
     # (`_pp_recv_typed_dict`), which this fixture has no peer for; binding it
     # would not test the receive, it would hang the suite.
     #
-    # None is the shipped "received nothing" answer, which the admission
-    # loop's own membership gate already refuses to admit anything on, so the
-    # body proceeds exactly as it does on a pass with no inbound decision --
-    # leaving the slot-hold predicate under test the only thing deciding.
+    # NOT a bare `None`. This fixture models an upstream that ALWAYS
+    # launches (the #631 slot-hold scenario this file exists to pin, not the
+    # #798 "upstream ran nothing" one -- that is covered separately by the
+    # excluded test_pp_void_slot_advance_798.py). The shipped function sets
+    # three flags straight off the wire message with `message.get(KEY,
+    # False)` (scheduler_pp_mixin.py:4358-4366): `_pp_output_expected_
+    # incoming`, `_pp_pass_voided_incoming`, and `_pp_upstream_launched_
+    # incoming`. A real sender in this scenario always posts
+    # `_PP_UPSTREAM_LAUNCHED_KEY=True` (`launched=self.mbs[mb_id] is not
+    # None`, scheduler_pp_mixin.py:1530, true on every non-armed pass) and
+    # never retracts or asks for output on this path, so the three flags a
+    # real message would produce here are False/False/True -- set them
+    # explicitly rather than leave the loop's own unconditional per-pass
+    # reset (`False` at :1289/:1294/:1295) stand in for "received", because
+    # leaving `_pp_upstream_launched_incoming` False would make `_pp_void_
+    # pass_without_upstream_launch` below spuriously void every steady-state
+    # pass (`self.mbs[mb_id]` is non-None whenever this rank is not armed),
+    # corrupting the very slot state this suite pins. `PPAdmissionDecision
+    # (mb_id=0, entries=())` is the shape `pp_admission_decision_from_wire`
+    # produces for a message with no entries; `mb_id` on it is never read by
+    # anything this fixture reaches (checked: `_pp_reconcile_incoming_
+    # admission`, `_pp_void_retracted_pass`, `_pp_forwarded_schedule_from`,
+    # `_pp_note_output_expectation` all key off `.entries`, not `.mb_id`).
     def _pp_recv_admission_decision(self):
-        return None
+        self._pp_output_expected_incoming = False
+        self._pp_pass_voided_incoming = False
+        self._pp_upstream_launched_incoming = True
+        return PPAdmissionDecision(mb_id=0, entries=())
 
-    # The receive's consumer, one line later. Stubbed for the same reason and
-    # NOT bound: the shipped `_pp_reconcile_incoming_admission` reads
-    # `decision.entries` after its `pp_size <= 1` early return, so on this
-    # 3-stage fixture it would dereference the None just returned above.
-    #
-    # `({}, None)` is not invented -- it is the shape the shipped function
-    # itself returns when it declines to reconcile (`return {}, decision`,
-    # scheduler_pp_mixin.py:4488), with the same `decision` this fixture
-    # received. No rid is narrowed, so the #797 prevention below it is a
-    # no-op and the slot-hold predicate stays the only thing deciding.
-    def _pp_reconcile_incoming_admission(self, decision):
-        return {}, decision
+    # #791 (f31fd5e43e): the receive's consumer, one line later. BOUND, not
+    # stubbed -- now that the line above answers with a real
+    # `PPAdmissionDecision` instead of `None`, the shipped function no longer
+    # dereferences anything this fixture lacks. With `entries=()` its `for
+    # entry in decision.entries` loop body never runs, so it needs no
+    # `self.tree_cache`; it does build `{req.rid: req for req in self.
+    # waiting_queue}` unconditionally and read `self.ps.pp_rank` directly
+    # (scheduler_pp_mixin.py:4489/4510), both supplied above. Reduces to
+    # `reconcile_pp_admission_decision(decision, {}, rank=2, pp_size=3, ...)`,
+    # which on an empty `decision.entries` returns `({}, decision)` unchanged
+    # (pp_admission_congruence.py:584-628) -- the same answer this file used
+    # to hand-stub, now produced by the delivered function itself.
+    _pp_reconcile_incoming_admission = SchedulerPPMixin._pp_reconcile_incoming_admission
 
-    # #797's prevention step, the third and last link of the same chain.
-    # Identity is the shipped answer here, not a shortcut: the function
-    # "returns `(effective, amended)` UNCHANGED when this rank retracted
-    # nothing" and reaches that by `if not voided: return effective, amended`
-    # (scheduler_pp_mixin.py:4599). This fixture received no decision, so it
-    # narrowed no rid and retracted nothing -- `voided` is False by
-    # construction and the shipped path is the identity.
-    def _pp_void_retracted_pass(self, effective, amended):
-        return effective, amended
+    # #797 (6f42d7f923/d2c5be2dee)'s prevention step, the third link of the
+    # same chain. BOUND for the same reason as above: it reads `self.ps.
+    # pp_rank` directly and calls `pp_pass_should_void(amended, rank,
+    # _pp_pass_voided_incoming)` (scheduler_pp_mixin.py:4594-4598), which
+    # with `incoming_voided=False` and an `amended` whose `entries=()` (so
+    # `entries_retracted_by_rank` returns `()`) answers False -- "this rank
+    # retracted nothing of its own and nothing upstream voided" -- so the
+    # shipped path returns `(effective, amended)` UNCHANGED, exactly the
+    # identity this file used to hand-stub, and additionally sets
+    # `self._pp_admission_pass_voided = False` itself (this fixture no
+    # longer relies solely on the loop's own per-pass reset at :1296 for it).
+    _pp_void_retracted_pass = SchedulerPPMixin._pp_void_retracted_pass
+
+    # #797b (scheduler_pp_mixin.py:4156). BOUND: "Tolerant of a stand-in that
+    # never ran `init_pp_loop_state`... a holder without the array grows one
+    # here rather than raising" is this file's own #787 convention stated in
+    # the function's own docstring. Reads only `pp_loop_size` (set) and
+    # `chunked_req` (set to `None` in `__init__`, the real pre-admission
+    # value for a rank that has never started a chunk).
+    _pp_note_chunked_req_before_admission = (
+        SchedulerPPMixin._pp_note_chunked_req_before_admission
+    )
+
+    # #798 (07744abcb7). BOUND, not stubbed, and this is the safety-critical
+    # one: `if self.ps.pp_size <= 1 or self.pp_group.is_first_rank: return
+    # False` does not short-circuit here (pp_size=3, is_first_rank=False),
+    # but the very next guard does -- `if getattr(self, "_pp_upstream_
+    # launched_incoming", False): return False` (scheduler_pp_mixin.py:4904)
+    # -- because `_pp_recv_admission_decision` above now sets that flag True
+    # for every pass, matching the always-launching upstream this file
+    # models. Without that flag this method would treat every non-armed
+    # pass's `self.mbs[mb_id]` as "upstream voided, this rank must not run
+    # it" and call the real `_pp_void_own_batch`, wiping the slot state the
+    # #631 hold predicate depends on -- a #798 behaviour this file is not
+    # scoped to exercise (that is test_pp_void_slot_advance_798.py).
+    _pp_void_pass_without_upstream_launch = (
+        SchedulerPPMixin._pp_void_pass_without_upstream_launch
+    )
+
+    # #797 (6f42d7f923/d2c5be2dee). BOUND: its very first line is `if not
+    # getattr(self, "_pp_admission_pass_voided", False): return False`
+    # (scheduler_pp_mixin.py:4649), and `_pp_admission_pass_voided` is False
+    # throughout this fixture's runs (never voided, per the two bindings
+    # above), so it returns immediately and never reaches the real
+    # `_pp_recv_typed_dict` call that would need an actual wire.
+    _pp_drain_voided_proxy = SchedulerPPMixin._pp_drain_voided_proxy
+
+    # #796 (2323c9255d). BOUND: `pending = getattr(self, "_pp_admission_send_
+    # work", None); if pending: ...` (scheduler_pp_mixin.py:4331-4333) -- this
+    # fixture's `_pp_send_admission_decision` stub below never sets `_pp_
+    # admission_send_work`, so `pending` stays `None`, `if pending` is False,
+    # and the real `_pp_commit_comm_work` call it would otherwise make is
+    # never reached.
+    _pp_commit_admission_send_work = SchedulerPPMixin._pp_commit_admission_send_work
+
+    # #791 (f31fd5e43e). STUBBED, like `_pp_recv_admission_decision` above
+    # and for the same reason: the shipped function's job past its two early
+    # returns is `self._pp_send_dict_to_next_stage(..., async_send=True,
+    # msg_type=ADMISSION_DECISION_KIND)`, a real isend on a wire this fixture
+    # has no peer for. No-op, following this class's own convention for
+    # every other wire-touching call (`_pp_commit_comm_work`, `_pp_launch_
+    # batch`).
+    def _pp_send_admission_decision(self, decision, **kwargs):
+        pass
 
     # #791: the point where forwarded chunk lengths enter this rank. BOUND,
     # unlike the three above -- it takes `Optional[PPAdmissionDecision]` and
@@ -180,6 +266,23 @@ class _Rank:
         self.pp_group = _Group()
         self.server_args = _ServerArgs(enable_phase_flip)
         self.request_receiver = _Receiver()
+        # #791 (f31fd5e43e): `_pp_reconcile_incoming_admission` builds
+        # `{req.rid: req for req in self.waiting_queue}` unconditionally, no
+        # getattr default. Empty is the real shape: nothing in this fixture
+        # ever appends to it, so a real object at this point in its life
+        # (before any request admission) would have an empty queue too.
+        self.waiting_queue = []
+        # #753 (669f85eca9): `_event_loop_pp_body` reads `self._pp_gapped_wire`
+        # directly at scheduler_pp_mixin.py:1669 (no getattr default), set for
+        # real by `init_pp_loop_state` from `pp_gapped_ownership_active(pp_
+        # size)` -- which this fixture never calls. `pp_gapped_ownership_
+        # active` itself answers False whenever no `PP_LAYER_SET_ENV` is
+        # configured (distributed/utils.py:2029-2030), which is the case in
+        # this hermetic test process, so False is the value a REAL rank in
+        # this run's configuration would carry, not a simplification: this
+        # file's whole scope is the ungapped stage-boundary loop (#631), the
+        # gapped crossing-wire lockstep is #753's separate concern.
+        self._pp_gapped_wire = False
         self.mbs = [None] * pp_loop_size
         self.last_mbs = [None] * pp_loop_size
         self.running_mbs = [_Batch() for _ in range(pp_loop_size)]
