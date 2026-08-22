@@ -89,6 +89,21 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.enable_fpm = False
     s.last_batch = None
     s.require_mlp_sync = False
+    # #797 (6f42d7f923) made the prologue consult the PP topology before
+    # anything else: `if self.ps.pp_size > 1 and getattr(self,
+    # "_pp_admission_pass_voided", False)` at scheduler.py:6154. Read on `self`
+    # directly, not through getattr, so a `__new__`-built scheduler has to
+    # carry it.
+    #
+    # A real namespace and not a MagicMock, for the reason the block below
+    # already records about `server_args`: a bare MagicMock makes every flag
+    # truthy, and here it would make `pp_size > 1` a comparison against a Mock
+    # rather than the topology check it is. `pp_size=1` is this fixture's true
+    # value -- these cases drive `get_next_batch_to_run` on a single-rank
+    # scheduler -- and it is the value on which #797's void gate is scoped OUT,
+    # which is what the gate under test assumes. The voided-pass behaviour
+    # belongs to the PP event loop and is pinned in the #797 and #791 files.
+    s.ps = SimpleNamespace(pp_size=1, pp_rank=0)
     s.spec_algorithm = MagicMock()
     # A bare MagicMock makes EVERY flag truthy, which arms the phase-boundary
     # actuators this gate test has nothing to do with (kv-reshard raised on
