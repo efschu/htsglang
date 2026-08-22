@@ -342,6 +342,42 @@ class _FakeUnifiedCache:
         self.tracked = 0
 
     # -- the surface write_backup calls, and nothing else ------------------
+    #
+    # [#772] #773/#581 (703b05c723) added a gate to this surface:
+    # ``write_backup`` asks ``self._mamba_write_through_pin_admissible(node,
+    # write_back=write_back)`` at unified_radix_cache.py:1921, BEFORE the
+    # #639 host-pool admission this file pins, and this fixture -- which IS
+    # the ``self`` that ``write_backup`` receives below -- did not carry it.
+    # Baseline symptom: AttributeError on the missing method (surfacing as
+    # ``Exception: retry() exceed maximum number of retries.`` under
+    # CustomTestCase; the real cause only shows under --tb=long).
+    #
+    # The SHIPPED predicate is bound rather than stubbed True, so the real
+    # admission rule keeps running here -- same choice as
+    # test_uniform_host_evict_floor_645.py's identical fixture problem.
+    # ``_mamba_pin_budget`` is pinned to -1, which is not an invented number:
+    # it is the value the production property itself computes when there is
+    # no mamba pool to protect (unified_radix_cache.py:3423-3426, the
+    # ``mamba_pool is None`` branch), and the predicate's first budget check
+    # is ``budget < 0 -> admissible``. This fixture's tree has no mamba
+    # component at all (``component_data`` below carries only
+    # ``BASE_COMPONENT_TYPE``), so that is the branch a real cache of this
+    # shape would take, and the #639 host-backup admission under test sees
+    # exactly the verdicts it saw before #773. Pinning the class attribute
+    # directly also sidesteps the property's own ``get_server_args()`` call,
+    # which raises ``ValueError: Global server args is not set yet!`` in this
+    # hermetic fixture -- global config this WITHDRAWAL does not need, since
+    # the mamba-pin-budget arithmetic itself is covered elsewhere
+    # (test_mamba_pin_budget_live_773.py, test_mamba_pool_floor.py).
+    _mamba_pin_budget = -1
+
+    def _mamba_write_through_pin_admissible(self, node, write_back=False):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return UnifiedRadixCache._mamba_write_through_pin_admissible(
+            self, node, write_back=write_back
+        )
+
     def _build_sidecar_transfers(self, phase, kv_xfer, comp_xfers):
         return []
 
