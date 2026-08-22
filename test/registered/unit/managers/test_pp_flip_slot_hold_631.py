@@ -66,6 +66,17 @@ class _Event:
 
 class _Group:
     is_last_rank = True  # skips the proxy-send block; not what is under test
+    # [#791] f31fd5e43e added a read of `is_first_rank` in the admission
+    # block of `_event_loop_pp_body` (scheduler_pp_mixin.py:1297): PP0 never
+    # receives an admission decision, every other rank does. Real
+    # `is_first_rank`/`is_last_rank` are derived from the SAME rank number
+    # (parallel_state.py:1051/1056, `self.rank == self.first_rank` /
+    # `self.rank == self.last_rank`), so the two must not be set
+    # independently here either. `_PS.pp_size = 3` below and `is_last_rank =
+    # True` together fix this fixture as the LAST of 3 stages (rank 2 of
+    # 0..2) -- a rank that is last in a >1-stage group cannot also be first,
+    # so `is_first_rank` is False, not an independent stub.
+    is_first_rank = False
 
 
 class _ServerArgs:
@@ -97,6 +108,63 @@ class _Rank:
     # #631 defect R: the slot's last-batch bookkeeping is shipping code too,
     # so it is taken off the mixin like the rest rather than restubbed here.
     _pp_record_slot_last_batch = SchedulerPPMixin._pp_record_slot_last_batch
+
+    # #795 (a996a653a7) put the admission decision on the wire, and
+    # `_event_loop_pp_body` now issues a BLOCKING receive for it at
+    # scheduler_pp_mixin.py:1299 on every rank that is not PP0. `_Group`
+    # above fixes this fixture as the last of three stages, so it is such a
+    # rank and the receive is genuinely on its path.
+    #
+    # STUBBED, not taken off the mixin, and that is the exception this class
+    # states for itself: the loop CONTROL is shipping code, "everything the
+    # body calls into is stubbed to the cheapest thing that keeps the control
+    # flow real". The shipped receive blocks on a real PP wire
+    # (`_pp_recv_typed_dict`), which this fixture has no peer for; binding it
+    # would not test the receive, it would hang the suite.
+    #
+    # None is the shipped "received nothing" answer, which the admission
+    # loop's own membership gate already refuses to admit anything on, so the
+    # body proceeds exactly as it does on a pass with no inbound decision --
+    # leaving the slot-hold predicate under test the only thing deciding.
+    def _pp_recv_admission_decision(self):
+        return None
+
+    # The receive's consumer, one line later. Stubbed for the same reason and
+    # NOT bound: the shipped `_pp_reconcile_incoming_admission` reads
+    # `decision.entries` after its `pp_size <= 1` early return, so on this
+    # 3-stage fixture it would dereference the None just returned above.
+    #
+    # `({}, None)` is not invented -- it is the shape the shipped function
+    # itself returns when it declines to reconcile (`return {}, decision`,
+    # scheduler_pp_mixin.py:4488), with the same `decision` this fixture
+    # received. No rid is narrowed, so the #797 prevention below it is a
+    # no-op and the slot-hold predicate stays the only thing deciding.
+    def _pp_reconcile_incoming_admission(self, decision):
+        return {}, decision
+
+    # #797's prevention step, the third and last link of the same chain.
+    # Identity is the shipped answer here, not a shortcut: the function
+    # "returns `(effective, amended)` UNCHANGED when this rank retracted
+    # nothing" and reaches that by `if not voided: return effective, amended`
+    # (scheduler_pp_mixin.py:4599). This fixture received no decision, so it
+    # narrowed no rid and retracted nothing -- `voided` is False by
+    # construction and the shipped path is the identity.
+    def _pp_void_retracted_pass(self, effective, amended):
+        return effective, amended
+
+    # #791: the point where forwarded chunk lengths enter this rank. BOUND,
+    # unlike the three above -- it takes `Optional[PPAdmissionDecision]` and
+    # is a single delegation to `forwarded_schedule`, so it answers for the
+    # None this fixture carries without needing a peer. Its own docstring
+    # calls it "the single point at which the forwarded chunk lengths enter
+    # this rank, so it is the single point a test can neuter"; taking it off
+    # the mixin means this fixture is NOT neutering it.
+    _pp_forwarded_schedule_from = SchedulerPPMixin._pp_forwarded_schedule_from
+    # #791b: the per-slot output-ring verdict, written on EVERY pass by every
+    # rank. Bound: it reads only `pp_loop_size` (which this fixture sets) and
+    # self-initialises its two per-slot lists through `getattr` defaults, so
+    # it needs nothing a peer would have to supply.
+    _pp_note_output_expectation = SchedulerPPMixin._pp_note_output_expectation
 
     def __init__(
         self,
