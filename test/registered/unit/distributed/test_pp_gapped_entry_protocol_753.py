@@ -345,13 +345,69 @@ class TestGappedCorridorHoldback(unittest.TestCase):
         self.assertAlmostEqual(post[1], 1.0, places=6)
 
     def test_contiguous_boot_sizing_is_untouched(self):
-        """Every shipped configuration must price exactly as before."""
-        rest, post = self._call(11.923, layer_set=CONTIGUOUS_SET)
+        """Every shipped configuration must price exactly as before.
+
+        WITHDRAWAL (#774). These two cases used to leave `reserve` at the
+        helper's 1024 default while asserting "untouched", which held only
+        while the holdback was gated on the gapped path ALONE. `5ea4500466`
+        ("An explicitly set --rank-user-reserve-mib is never silently
+        dropped") widened the gate to
+
+            if configured is None and not pp_gapped_ownership_active(pp_size):
+                return rest_memory, None
+
+        so a reserve the operator actually asked for is honoured on a
+        contiguous boot too. Under that rule the old fixture was asserting
+        that an EXPLICIT request gets ignored -- which is the defect #774
+        exists to fix, not the property these cases are named for.
+
+        `reserve=None` is the correction, and it makes the test finally match
+        its own sentence: a shipped configuration is precisely one that does
+        not pass the flag, as the production comment says in as many words
+        ("they never set this flag, so they are unaffected either way").
+        The explicit-flag behaviour is pinned in its own case below rather
+        than dropped.
+        """
+        rest, post = self._call(11.923, layer_set=CONTIGUOUS_SET, reserve=None)
+        self.assertEqual(rest, 11.923)
+        self.assertIsNone(post)
+
+    def test_an_explicit_reserve_is_honoured_on_a_contiguous_boot(self):
+        """#774: asked for and ignored is worse than absent.
+
+        The other half of the widened gate, and the half the two "untouched"
+        cases above used to assert the opposite of. A contiguous boot that
+        DOES pass --rank-user-reserve-mib must have it priced in.
+        """
+        rest, post = self._call(11.923, layer_set=CONTIGUOUS_SET, reserve=1024)
+        self.assertAlmostEqual(rest, 10.923, places=6)
+        self.assertIsNotNone(post)
+        self.assertAlmostEqual(post[1], 1.0, places=6)
+
+    def test_an_explicit_zero_reserve_switches_the_holdback_off(self):
+        """0 means "no holdback", and must not be read as "unset".
+
+        The production code calls this out at its own gate: "None means
+        'unset, take the default'; 0 means 'the operator asked for no
+        holdback'. The ``or`` idiom conflates the two and would make the
+        reserve impossible to switch off." Pinned here on the gapped path,
+        where the default would otherwise apply.
+        """
+        rest, post = self._call(11.923, reserve=0)
         self.assertEqual(rest, 11.923)
         self.assertIsNone(post)
 
     def test_boot_without_a_layer_set_is_untouched(self):
-        rest, post = self._call(11.923, layer_set=None)
+        """No layer set and no explicit reserve: the shipped shape, unmoved.
+
+        `reserve=None` for the reason given on the contiguous case above
+        (#774 widened the gate; a shipped configuration is one that does not
+        pass the flag). This is also the boot shape #774's own measurement
+        note describes -- driven by --pp-stage-ratio, so no PP layer set in
+        the environment -- which is where an explicit reserve used to be
+        discarded without a word.
+        """
+        rest, post = self._call(11.923, layer_set=None, reserve=None)
         self.assertEqual(rest, 11.923)
         self.assertIsNone(post)
 
