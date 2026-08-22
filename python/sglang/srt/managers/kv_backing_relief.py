@@ -1111,6 +1111,38 @@ class KvBackingRelief:
 
         return int(torch.cuda.mem_get_info(self._device_index)[0])
 
+    def _retained_bytes_clause(self) -> str:
+        """Retained arena bytes for this device, or an honest 'unknown'.
+
+        #796: retention is the one candidate the old refusal message named
+        that could actually be true, and it was named as an env var rather
+        than as a number. ``arena_census`` already keeps it -- read-only,
+        allocation-free, and it never raises by contract -- so there is no
+        reason to make the reader go and check a variable.
+
+        A census that cannot be read must say so. Reporting an unreadable
+        census as ``0 MiB`` would be inventing the measurement that the whole
+        point of this change is to stop inventing.
+        """
+        try:
+            from sglang.srt.mem_cache.kv_vmm_backing import arena_census
+
+            census = arena_census() or {}
+            row = census.get(int(self._device_index))
+            if row is None and len(census) == 1:
+                # CUDA_VISIBLE_DEVICES isolation can make the arena's device id
+                # disagree with this rung's index. One arena set on the process
+                # is unambiguous regardless of which id it filed itself under.
+                row = next(iter(census.values()))
+            if row is None:
+                return "unknown (no arena for this device in the census)"
+            return "%.0f MiB across %d arena(s)" % (
+                int(row.get("retained", 0)) / (1024 * 1024),
+                int(row.get("arenas", 0)),
+            )
+        except Exception as e:  # pragma: no cover - a census must not fail a log
+            return "unknown (census unreadable: %s)" % (e,)
+
     def _supported(self) -> bool:
         return callable(getattr(self._pool, "runtime_set_backing_rows", None))
 
@@ -2298,19 +2330,72 @@ class KvBackingRelief:
             granularity = self._min_release_rows()
             if granularity <= 0 or asked >= granularity:
                 self._mark_exhausted(target)
-            logger.warning(
-                "%s shrink to %d rows reported %.0f MiB but the driver's free "
-                "column did not move, so this pool cannot pay: the arena has "
-                "no commit chunk, or its handles are retained "
-                "(SGLANG_FLIP_SEAM_RETAIN_HANDLES), and unmapping without "
-                "releasing yields address space rather than memory. The cap "
-                "STAYS ON -- undoing it here would re-commit pages inside a "
-                "gate that armed because memory was short. No further attempt "
-                "will be made until the next recovery.",
-                LOG_PREFIX,
-                target,
-                claimed / (1024 * 1024),
+            # #796: REPORT WHAT WAS MEASURED, NOT TWO CANDIDATE CAUSES.
+            #
+            # The previous wording offered "the arena has no commit chunk, or
+            # its handles are retained", separated the two in neither code nor
+            # fact, and on 2026-08-22 (boot_798_0822_0810.log) was wrong about
+            # both across all 24 refusals. A chunkless arena cannot reach this
+            # line at all -- registration refuses one outright at the
+            # ``supports_backing_spans`` gate -- and retention is a number
+            # ``arena_census()`` already keeps, so naming an env var the reader
+            # then has to go and check is strictly worse than printing it.
+            chunk_bytes = int(
+                getattr(self._pool, "backing_commit_chunk_bytes", 0) or 0
             )
+            retained = self._retained_bytes_clause()
+            if claimed <= 0:
+                # THE POOL AND THE DRIVER AGREE, so there is nothing to
+                # reconcile and no unmap to reason about. This is the branch
+                # that actually fired on metal, 24 times out of 24, while 15
+                # shrinks on the SAME boot released 256/512 MiB -- which is why
+                # no standing property of the arena can be the explanation.
+                # ``runtime_set_backing_rows`` returns BYTES RELEASED TO THE
+                # DRIVER, so claimed=0 is the pool declining upstream of any
+                # measurement this rung makes.
+                logger.warning(
+                    "%s shrink to %d rows released NOTHING and the pool agrees: "
+                    "it returned claimed=%d bytes, so the backing never moved "
+                    "and there is no pool-versus-driver divergence to explain. "
+                    "Measured state: asked %d rows against a release "
+                    "granularity of %d rows (commit chunk %.0f MiB across %d "
+                    "buffers, %.0f KiB per row), arena retained %s. The cap "
+                    "STAYS ON -- undoing it here would re-commit pages inside a "
+                    "gate that armed because memory was short. No further "
+                    "attempt will be made until the next recovery.",
+                    LOG_PREFIX,
+                    target,
+                    int(claimed),
+                    asked,
+                    granularity,
+                    chunk_bytes / (1024 * 1024),
+                    self._buffers,
+                    self._bytes_per_row / 1024,
+                    retained,
+                )
+            else:
+                # THE REAL DIVERGENCE, kept because it is a genuine failure
+                # mode -- it simply was not the one being hit.
+                logger.warning(
+                    "%s shrink to %d rows: the pool reported %.0f MiB released "
+                    "but the driver's free column did not move. That "
+                    "disagreement is the unmap-without-release signature -- "
+                    "extents unmapped while this process still owns their "
+                    "handles yield address space rather than memory. Measured "
+                    "state: arena retained %s, commit chunk %.0f MiB across %d "
+                    "buffers, asked %d rows against a granularity of %d. The "
+                    "cap STAYS ON -- undoing it here would re-commit pages "
+                    "inside a gate that armed because memory was short. No "
+                    "further attempt will be made until the next recovery.",
+                    LOG_PREFIX,
+                    target,
+                    claimed / (1024 * 1024),
+                    retained,
+                    chunk_bytes / (1024 * 1024),
+                    self._buffers,
+                    asked,
+                    granularity,
+                )
             return 0
         self.shrink_count += 1
         self.released_total += measured
