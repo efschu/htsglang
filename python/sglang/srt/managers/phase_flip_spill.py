@@ -1596,6 +1596,21 @@ def seam_unfundable_objection(direction: str) -> Optional[str]:
     )
 
 
+def _rank_verdict_terms(relief, target) -> str:
+    """This rank's clause on the verdict line: applied when granted, proposed
+    when declined.
+
+    Tolerates a rung that predates ``explain_shrink_ppm`` (a stub, or an older
+    rung surface) by falling back to the proposal summary, because a diagnostic
+    may never be the thing that takes the seam down.
+    """
+    if target is not None:
+        explain = getattr(relief, "explain_shrink_ppm", None)
+        if explain is not None:
+            return explain(target)
+    return relief.last_proposal_summary()
+
+
 def collective_kv_backing_relief(
     scheduler: Any,
     reduce_fn,
@@ -1839,7 +1854,14 @@ def collective_kv_backing_relief(
             direction,
             kbr.explain_kv_target(reduced[:4]),
             (
-                relief.last_proposal_summary()
+                # #796 FOLLOW-UP: on a GRANTED seam report what this rank will
+                # APPLY, not what it proposed. The two diverge by design under a
+                # proportional agreement -- a rank that asked for nothing still
+                # pays its share -- and reusing the refusal summary here printed
+                # "no change" on a rank that unmapped 702 MiB
+                # (boot_798_0822_0646.log, 06:50:59Z). The declined path keeps
+                # the proposal terms, which is what that reader needs.
+                _rank_verdict_terms(relief, target)
                 if relief is not None
                 else "abstained from the shrink on this leg, so it has no terms"
             ),

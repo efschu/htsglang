@@ -1868,6 +1868,63 @@ class KvBackingRelief:
             -int(current),
         )
 
+    def preview_shrink_ppm(self, ppm: int) -> tuple:
+        """What ``apply_shrink_ppm`` WILL do, without doing it.
+
+        #796: the verdict line is logged before the shrink is applied, so it
+        can only report the outcome by predicting it. This is that prediction,
+        and ``apply_shrink_ppm`` is implemented on top of it so the two cannot
+        disagree -- a diagnostic that drifts from the behaviour it describes is
+        the defect this method exists to prevent, not a style preference.
+
+        MEASURED, boot_798_0822_0646.log 06:50:59Z: the verdict reused the
+        rung's PROPOSAL summary, so PP1 -- whose deficit was already covered,
+        and which therefore proposed the neutral element -- printed "no change"
+        in the same round in which it unmapped 702 MiB. Under a proportional
+        agreement the proposal and the applied action diverge BY DESIGN: a rank
+        that asked for nothing still pays its share, because shrinking only the
+        pressed rank would change the capacity ratio the uneven DCP token
+        vector is calibrated against.
+
+        Returns ``(current_rows, target_rows)``. ``target_rows >= current_rows``
+        means this rank yields nothing this round.
+        """
+        current = self._current_rows()
+        if current <= 0:
+            return 0, 0
+        rows = _rows_for_ppm(int(ppm), current)
+        max_live = self._max_live_row()
+        floor_rows, _evictable = (
+            self._evict_floor_rows(max_live) if max_live >= 0 else (current, 0)
+        )
+        return int(current), max(int(floor_rows), int(rows))
+
+    def explain_shrink_ppm(self, ppm: int) -> str:
+        """One clause naming what THIS rank does with the group's proportion.
+
+        Replaces ``last_proposal_summary()`` on the GRANTED path. That method
+        stays correct for the caller it was written for -- the one that refuses
+        -- but on a granted seam it reports the one number guaranteed to be
+        wrong for any rank that was not the most-pressed.
+        """
+        current, target = self.preview_shrink_ppm(ppm)
+        if current <= 0:
+            return "this rank has no backed pool, so it yields nothing"
+        if target >= current:
+            return (
+                f"KV rung: current={current} rows -> no shrink applied; this "
+                f"rank's own floor ({target}) already sits at or above the "
+                "group's proportion, so it yields nothing this round"
+            )
+        freed_mib = ((current - target) * self._bytes_per_row) // (1024 * 1024)
+        return (
+            f"KV rung: current={current} rows -> APPLIED shrink to {target} "
+            f"rows ({freed_mib} MiB returned). Every rank pays the group's "
+            "proportion, including one under no pressure of its own: the "
+            "capacity ratio across ranks is what the uneven token vector is "
+            "calibrated against."
+        )
+
     def apply_shrink_ppm(self, ppm: int) -> int:
         """Apply the group's agreed PROPORTION to this rank's own pool.
 
@@ -1876,15 +1933,9 @@ class KvBackingRelief:
         is uniform, the ROW COUNT is rank-local, and the floor -- which protects
         this rank's live set from an unmap -- can only ever be applied here.
         """
-        current = self._current_rows()
+        current, target = self.preview_shrink_ppm(ppm)
         if current <= 0:
             return 0
-        rows = _rows_for_ppm(int(ppm), current)
-        max_live = self._max_live_row()
-        floor_rows, _evictable = (
-            self._evict_floor_rows(max_live) if max_live >= 0 else (current, 0)
-        )
-        target = max(int(floor_rows), int(rows))
         if target >= current:
             # This rank's own floor already sits at or above the group's
             # proportion, so it wins nothing this round. Not an error, and not
