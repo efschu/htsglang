@@ -277,6 +277,15 @@ class _FakeTreeCache:
         return freed
 
 
+#: The configured prefill width every fixture rank reports for #794's corridor
+#: slot. Shared by the fake scheduler and by the fake collective's payload
+#: mirror below, because the two must agree by construction: the scheduler
+#: CONTRIBUTES this number and the collective REDUCES it, and a fixture where
+#: those two drifted apart would reduce a vector whose slots no longer line up
+#: -- silently, since MIN accepts any numbers at all.
+_CORRIDOR_WIDTH = 4096
+
+
 class _FakeScheduler:
     """Built by hand: the real constructor wants a model, a device and a
     process group, none of which this decision depends on."""
@@ -307,6 +316,22 @@ class _FakeScheduler:
     uniform_budget_deficit = Scheduler.uniform_budget_deficit
     # #791b: and the PREFETCH BALLOT, same reason one release later again.
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
+    # #794: and the CORRIDOR WIDTH CEILING, one release later again -- the same
+    # shape as #791b directly above, and the same shape #610 records at its own
+    # fake. `_update_uniform_pool_budget` calls
+    # `self._local_corridor_width_ceiling()` unconditionally while assembling
+    # the vote vector (scheduler.py:4896), so a fake without it raises
+    # AttributeError inside the reduce.
+    #
+    # Bind the SHIPPED function rather than stub a number: it is written to be
+    # non-binding on a rank that cannot price (every failure path returns the
+    # configured width), so this harness -- which has no admission gate --
+    # contributes 4096 to a MIN and cannot move the mamba floors under test.
+    # A hand-written stub would have to re-state that policy and would drift
+    # away from it the next time the ceiling changes.
+    chunked_prefill_size = _CORRIDOR_WIDTH
+    _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    uniform_corridor_width = Scheduler.uniform_corridor_width
 
 
 class _FakeDist:
@@ -339,6 +364,14 @@ class _FakeDist:
             -absent,
             mamba_avail,
             -mamba_avail,
+            # #794: the corridor width ceiling rides BETWEEN the mamba pair and
+            # the ballot -- scheduler.py:4896, and the placement is deliberate
+            # there ("everything above is indexed from the head and the ballot
+            # is indexed from the TAIL, so inserting here leaves both readings
+            # intact"). This mirror has to insert it in the SAME place for that
+            # to hold: appending it after the ballot would keep the vector
+            # length right and every ballot reading wrong.
+            _CORRIDOR_WIDTH,
             # #791b: the prefetch ballot rides behind the mamba pair;
             # neutral on every fixture rank (empty queue).
             *build_prefetch_ballot_payload([], {}),
@@ -376,6 +409,20 @@ def _match_len(nodes):
     # #747: validators take (node, depth) and gate on the checkpoint grid;
     # this test is about lock floors, not the grid, so the grid is off.
     component.mamba_checkpoint_interval = None
+    # #783: `_raw_token_pos` (mamba_component.py:130) converts the walk's KEY
+    # units into RAW tokens and asks the owning cache whether this is an EAGLE
+    # (bigram) key space. An `object.__new__` component has no `cache`, so the
+    # real validator raised AttributeError before reaching its own predicate --
+    # the same shape as the `PrefillAdder.__new__` stub in #610/#701, one layer
+    # down.
+    #
+    # `is_eagle=False` is the identity case that #783 names explicitly ("Identity
+    # outside EAGLE, where key units already are raw tokens"), so the walk sees
+    # the depths it saw before that commit and the lock-floor verdicts under test
+    # are unmoved. The EAGLE off-by-one #783 fixed is a statement about the grid,
+    # which this fixture switches off one line above; it is pinned where it
+    # belongs, in the #783 tests.
+    component.cache = types.SimpleNamespace(is_eagle=False)
     mamba_validator = MambaComponent.create_match_validator(
         component, match_device_only=True
     )
@@ -575,7 +622,20 @@ class UniformMambaEvictFloorTest(CustomTestCase):
         # #791b: the prefetch ballot appended (digest pair + slot verdicts)
         # to the same reduce; still one collective, still a width that
         # depends on no per-rank quantity.
-        self.assertEqual(widths, {6 + 2 + PREFETCH_BALLOT_SLOTS})
+        #
+        # #794 then inserted the CORRIDOR WIDTH CEILING as a single slot between
+        # the mamba pair and the ballot, so the width is 41 rather than 40. The
+        # claim this test makes is unchanged and is the reason to update the
+        # number rather than delete the case: still ONE collective per iteration
+        # (asserted above), and still a width that no per-rank quantity can move
+        # -- every rank contributes its CONFIGURED width to that slot, which is
+        # exactly why #794 computes it from configuration and not from the
+        # pass's dynamic width.
+        #
+        # Kept as a sum of named parts, not folded into 41: written that way, the
+        # next slot added to this reduce fails here with a one-line diff that
+        # says which part grew.
+        self.assertEqual(widths, {6 + 2 + 1 + PREFETCH_BALLOT_SLOTS})
 
     def test_the_616g_and_639_quantities_are_unchanged(self):
         """The mamba pair was APPENDED. The device and host floors must still
