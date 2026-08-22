@@ -1368,6 +1368,21 @@ class SchedulerPPMixin:
                 if self._pp_admission_pass_voided:
                     self._pp_void_own_batch(mb_id)
 
+                # #798: AND THE MIRROR OF IT -- a pass this rank's UPSTREAM
+                # did not launch cannot run here either. `_pp_drain_voided_
+                # proxy` was gated on the sender's own `launched` statement;
+                # the `if cur_batch:` RECEIVE branch below never was, so a
+                # rank holding resident work while its upstream ran nothing
+                # entered a blocking receive for a message nobody posted and
+                # consumed the next pass's proxy instead -- the 2026-08-21
+                # specimens, which are a surplus receive and not a slot-ring
+                # divergence. Placed HERE, strictly before the admission
+                # decision is forwarded below, so the `launched=` this rank
+                # sends is already the voided value and the ranks below take
+                # the same decision off the same per-hop fact. See
+                # `_pp_void_pass_without_upstream_launch`.
+                self._pp_void_pass_without_upstream_launch(mb_id)
+
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
                 # `get_next_batch_to_run`, and strictly BEFORE `_pp_launch_
@@ -4795,6 +4810,137 @@ class SchedulerPPMixin:
             len(reqs),
             parked,
         )
+        return True
+
+    def _pp_void_pass_without_upstream_launch(self: Scheduler, mb_id: int) -> bool:
+        """#798: this rank may not run a pass its UPSTREAM did not launch.
+
+        True iff this pass was voided here. THE DEFECT THIS CLOSES, stated as
+        the wire contract it breaks: whether a proxy message exists for a
+        given pass is decided independently on the two ends of the wire.
+
+            sender    (:1567-1580)   sends iff ``self.mbs[mb_id]``
+            receiver  (:1518-1529)   receives iff ``self.mbs[mb_id]``, else
+                                     drains iff voided AND
+                                     ``_pp_upstream_launched_incoming``
+
+        Three of those four combinations are reconciled. ``_pp_drain_voided_
+        proxy`` was given an explicit gate on the sender's own statement, and
+        its docstring states the rule: "GATED ON THE SENDER'S OWN STATEMENT,
+        never on an inference from this rank's state ... a blocking receive
+        for a message nobody sent is the deadlock family this whole feature is
+        a list of." The RECEIVE branch never got that gate --
+        ``_PP_UPSTREAM_LAUNCHED_KEY`` was read in exactly one place in this
+        module, inside the drain -- so the fourth combination, THIS RANK HAS A
+        BATCH AND ITS UPSTREAM DID NOT LAUNCH, entered a blocking receive for
+        a message that was never posted, took the NEXT pass's proxy instead,
+        and left every later receive one message ahead for ever. The first
+        stamp compared after that reads exactly one slot ahead in the same
+        flip epoch.
+
+        BOTH #798 SPECIMENS ARE THAT READING, and neither is a slot-ring
+        divergence: specimen 1 (boot_seed796, 22:44:52Z) refused a proxy
+        stamped mb_id=2 while on mb_id=1; specimen 2 (boot_seed797b,
+        22:52:20Z) one stamped mb_id=1 while on mb_id=0. In both the receiver
+        is BEHIND in slot index and AHEAD in messages consumed, which is the
+        signature of a surplus receive, not of a rank that spun ahead. A
+        voided pass keeps every per-hop rendezvous that paces the loop -- the
+        chain receive (:1263), the decision receive (:1299), the decision-send
+        reap (:1607) and the chain flush (:1609) all run on a voided pass --
+        so a void cannot desynchronise the ring on its own, and
+        test_pp_void_slot_advance_798.py's genuine-void case proves it does
+        not.
+
+        WHY THE COMBINATION ARISES AFTER A RETRACTION, which is what puts this
+        defect one to two passes downstream of every #797 void rather than
+        anywhere else. The void is deliberately asymmetric in what it
+        preserves: ``_pp_void_own_batch`` does NOT touch ``running_mbs``,
+        because "the pass simply did not run, and it decodes again next pass
+        from the state it still holds", while PP0's #791b void output RELEASES
+        and re-queues its own requests (both specimens log "1 of rank 0's 2
+        request(s) have been released and re-queued"). So right after a void
+        the upstream can have nothing to launch for a slot on which this rank
+        still holds resident work.
+
+        VOIDING, NOT WAITING, AND NOT COMPUTING. A non-first rank under a
+        non-gapped set has no entry activations of its own -- the hidden
+        states it needs are exactly the ones the upstream did not produce -- so
+        the pass is unrunnable here in the same physical sense #797 describes.
+        Running it nowhere is the one direction available, and it restores
+        uniform membership rather than repairing a consequence.
+
+        RANK-AGREED BY CONSTRUCTION, which is the property that makes this
+        safe where a rank-local hold would not be. The decision is taken from
+        ``_pp_upstream_launched_incoming`` -- a per-hop fact written by the
+        rank that will or will not send -- and it is taken HERE, immediately
+        after ``_pp_void_own_batch`` and strictly BEFORE this pass's admission
+        decision is forwarded (:1371-1516). So the ``launched=self.mbs[mb_id]
+        is not None`` this rank forwards is already the voided value, and the
+        next rank down learns the pass is off by the same mechanism a #797
+        void travels on, one hop at a time, with no collective and no new
+        synchronisation point. Ordering this after the send instead would
+        forward ``launched=True`` while sending no proxy, which is the same
+        defect one hop further down.
+
+        THE SLOT CURSOR IS DELIBERATELY NOT TOUCHED. An earlier reading of
+        #798 proposed holding ``mb_id`` for a voided pass, mirroring #631
+        defect Q's arming hold at :1625. That would have been wrong twice
+        over: the ring does not diverge here (measured above), and the hold's
+        ``continue`` skips the #753 gapped-lockstep barrier at :1656, so a
+        hold taken on a condition that is not rank-uniform converts a
+        harmless state into a barrier hang. This fix adds no ``continue`` and
+        changes no index.
+
+        NO-OP ON EVERY PATH THAT CANNOT HAVE THE PROBLEM: the first rank (no
+        upstream), ``pp_size <= 1``, a gapped set (there is no stage-boundary
+        proxy at all -- ``_pp_recv_proxy_tensors`` returns None immediately
+        there, so the receive this prevents is not made in the first place),
+        an upstream that did launch, and a slot that is already empty.
+        """
+        if self.ps.pp_size <= 1 or self.pp_group.is_first_rank:
+            return False
+        if getattr(self, "_pp_gapped_wire", False):
+            return False
+        if getattr(self, "_pp_upstream_launched_incoming", False):
+            return False
+        batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
+        if batch is None:
+            return False
+
+        self._pp_upstream_idle_voids = (
+            getattr(self, "_pp_upstream_idle_voids", 0) + 1
+        )
+        logger.warning(
+            "#798 PP-ADMISSION pass voided on slot %d: the upstream reported "
+            "launched=False for this pass, so no hidden states were posted for "
+            "it, but this rank still derived a batch from its own resident "
+            "state. Receiving here would take the NEXT pass's proxy and leave "
+            "every later receive one message ahead (the 2026-08-21 specimens). "
+            "Running the pass nowhere instead, and forwarding the void so the "
+            "ranks below take the same decision.",
+            mb_id,
+        )
+
+        # Both halves of the void, exactly as `_pp_void_retracted_pass`
+        # arranges them, so that what this rank FORWARDS names the same empty
+        # pass its own batch now is. Set before `_pp_void_own_batch` below so
+        # the clearing runs under the same flag the #797 path sets.
+        self._pp_admission_pass_voided = True
+        self._pp_admission_incoming_effective = {}
+        amended = getattr(self, "_pp_admission_amended_to_forward", None)
+        if amended is not None:
+            amended = void_pp_admission_decision(amended)
+            self._pp_admission_amended_to_forward = amended
+            self._pp_admission_incoming_schedule = self._pp_forwarded_schedule_from(
+                amended
+            )
+
+        # The clearing itself is `_pp_void_own_batch`'s, unchanged: chunked
+        # request restored to its pre-admission value and parked, resident
+        # decode requests kept, everything else released and re-queued. This
+        # void has exactly the same obligation, so it uses exactly the same
+        # code rather than a second implementation of it.
+        self._pp_void_own_batch(mb_id)
         return True
 
     def _pp_flip_epoch(self: Scheduler) -> Optional[int]:

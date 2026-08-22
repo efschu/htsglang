@@ -1687,9 +1687,19 @@ class PPVoidOwnBatchWiring797d(unittest.TestCase):
         # `_pp_void_own_batch` at the #797d call site, nothing in this rig
         # papers over that; the real bound methods are the only things that
         # can clear `h.mbs[0]` or record a call.
+        # #798 added a second void gate at this same call site, immediately
+        # after `_pp_void_own_batch`. It is bound FOR REAL here rather than
+        # stubbed away, on this rig's own stated principle: a stub would let a
+        # future change to that gate silently alter what this test observes.
+        # It must be inert in this rig, and that is itself worth pinning --
+        # the #797d void has already cleared `h.mbs[mb_id]` by the time it
+        # runs, and its first act is to return False on an empty slot. If it
+        # ever stops being inert here, the `_StopAtDrain` expectation below
+        # changes and this test says so.
         for name in (
             "_event_loop_pp_body",
             "_pp_void_own_batch",
+            "_pp_void_pass_without_upstream_launch",
             "_pp_note_output_expectation",
             "_pp_note_chunked_req_before_admission",
         ):
