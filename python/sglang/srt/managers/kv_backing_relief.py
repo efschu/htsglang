@@ -949,10 +949,28 @@ class KvBackingRelief:
                 "it can legitimately exceed the number of rows backed. State "
                 "the fact, do not infer the cause."
             )
+        # #796: A RUNG WITH NO SLACK IS A GROUP-WIDE VETO, so it owes the
+        # reader the branch that put its floor where it is. The agreed shrink
+        # target must clear the HIGHEST floor in the group, so this rank --
+        # which may be under no memory pressure at all -- can cancel a peer's
+        # fully fundable plan. Measured 2026-08-22: it did, eight arms running,
+        # and the eight branches of _evict_floor_rows were indistinguishable
+        # from the outside. Printed only when slack is 0, which is exactly when
+        # the floor is capable of being the binding term.
+        vetoing = ""
+        if int(t["floor_rows"]) >= int(t["current"]):
+            reason = getattr(self, "_last_evict_floor_reason", None)
+            if reason:
+                vetoing = (
+                    f" -- NO SLACK, so this rank's floor can VETO the group's "
+                    f"shrink even if a peer has a fundable plan; the floor is "
+                    f"where it is because {reason}"
+                )
         return (
             f"KV rung: current={t['current']} rows, floor={t['floor_rows']}, "
             f"slack={max(0, t['current'] - t['floor_rows'])}, deficit="
-            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why}){unreachable}"
+            f"{t['deficit'] / _MIB:+.0f} MiB -> {verdict} ({why})"
+            f"{unreachable}{vetoing}"
         )
 
     def _mark_exhausted(self, target: Optional[int] = None) -> None:
@@ -1403,18 +1421,42 @@ class KvBackingRelief:
         already pinned by resident requests, this degrades EXACTLY to
         ``_floor_rows(max_live)`` with zero cost -- so a rank that cannot
         evict proposes precisely what it proposed before this existed.
+
+        #796: EVERY RETURN RECORDS WHY. Over a sparse live set the plain floor
+        is routinely ABOVE the cap (#714: ``max_live`` is a high-water ID, not
+        a count of backed rows), so all eight of the branches below produce one
+        observable -- ``floor >= current``, slack 0 -- and that observable
+        cancels the group's shrink for EVERY rank, because the agreed target
+        must clear the highest floor in the group. On 2026-08-22 a rank under
+        no memory pressure vetoed a peer's fully fundable +1740 MiB plan that
+        way, eight arms in a row, and nothing in the log said which branch had
+        done it. The eight want different answers -- three are healthy, one is
+        a setting, the rest are defects -- so the reason is recorded here and
+        printed by ``last_proposal_summary`` whenever the rung has no slack.
         """
         plain = self._floor_rows(max_live)
         if not self._evict_enabled():
+            self._last_evict_floor_reason = (
+                "the evict rung is DISABLED by configuration, so this rank can "
+                "only offer the slack above its plain floor"
+            )
             return plain, 0
         # #748: the parked extent EXCLUDES rows, it does not close the rung.
         # An UNKNOWN extent under an armed flip is the one case with no
         # boundary to name, so it still refuses.
         parked = self._parked_ceiling()
         if parked == -2:
+            self._last_evict_floor_reason = (
+                "the PARKED flip extent is unreadable, and an unknown extent "
+                "has no boundary to evict up to -- a DEFECT if it persists"
+            )
             return plain, 0
         tree = self._tree_cache()
         if tree is None:
+            self._last_evict_floor_reason = (
+                "there is no radix TREE cache on this rank, so no recomputable "
+                "prefix can be priced -- a DEFECT if the pool is meant to cache"
+            )
             return plain, 0
         req_max = self._resident_ceiling()
         if parked >= 0:
@@ -1425,6 +1467,11 @@ class KvBackingRelief:
         if req_max < 0:
             if not self._nothing_resident():
                 # Unknown resident half: refuse to price an eviction at all.
+                self._last_evict_floor_reason = (
+                    "the RESIDENT half of the live set could not be read while "
+                    "rows are resident, and an unknown split is not an empty "
+                    "one -- a DEFECT if it persists"
+                )
                 return plain, 0
             # #717: NOTHING RESIDENT is not "unknown". No request pins any
             # row, so nothing is above the reserve that an eviction may not
@@ -1440,9 +1487,19 @@ class KvBackingRelief:
             req_max = -1  # _floor_rows(-1) == the reserve, nothing above it
         if req_max >= int(max_live):
             # The mark is pinned by work in flight; nothing to win here.
+            self._last_evict_floor_reason = (
+                f"the mark is PINNED by work in flight: the resident/parked "
+                f"ceiling {req_max} is at or above the high-water row "
+                f"{int(max_live)}, so there is no recomputable prefix above it "
+                f"-- healthy, the pool is genuinely live"
+            )
             return plain, 0
         floor = self._floor_rows(req_max)
         if floor >= plain:
+            self._last_evict_floor_reason = (
+                f"evicting would not lower this rank's floor: the priced floor "
+                f"{floor} is no better than the plain floor {plain} -- healthy"
+            )
             return plain, 0
         try:
             from sglang.srt.managers.kv_radix_watermark import evictable_rows_above
@@ -1450,9 +1507,22 @@ class KvBackingRelief:
             rows, _nodes = evictable_rows_above(tree, max(0, floor - 1))
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("%s could not price the watermark rung: %s", LOG_PREFIX, e)
+            self._last_evict_floor_reason = (
+                f"pricing the watermark rung RAISED ({e}) -- a DEFECT; the "
+                f"floor fell back to the plain {plain}"
+            )
             return plain, 0
         if rows <= 0:
+            self._last_evict_floor_reason = (
+                f"NO EVICTABLE rows above the priced floor {floor} (plain floor "
+                f"{plain}, high-water row {int(max_live)}) -- healthy, the pool "
+                f"is genuinely live, but it still vetoes the group's shrink"
+            )
             return plain, 0
+        self._last_evict_floor_reason = (
+            f"PRICED an eviction: floor {floor} instead of the plain {plain}, "
+            f"funded by {int(rows)} evictable rows above it"
+        )
         return floor, int(rows)
 
     def _lower_watermark_to(self, target: int) -> int:
