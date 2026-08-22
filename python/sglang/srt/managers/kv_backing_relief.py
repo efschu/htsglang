@@ -1517,8 +1517,9 @@ class KvBackingRelief:
         rows, top = self._flip_pending()
         if rows < 0:
             # UNKNOWN. Only refuses while a flip is actually armed; outside
-            # one there is nothing to protect. #746 (the exact arm-time
-            # snapshot) is what removes this last wholesale case.
+            # one there is nothing to protect. #746 confined this case to a
+            # flip whose ARM-TIME extent measurement itself failed -- the
+            # snapshot otherwise exists from arm to exit.
             return -2 if self._flip_armed() else -1
         if rows == 0:
             return -1
@@ -3144,20 +3145,52 @@ def kv_backing_provider(
     def _flip_pending():
         """#744 line 1: ``(rows, max_row_id)`` the flip has parked.
 
-        Consulted only while a flip is armed, which is what makes the sticky
-        value on ``live_fn`` safe: outside a flip this answers "nothing
-        parked" unconditionally, so the rung stays fully live and #688's
-        funding path is untouched. While armed and with no enumeration on
-        record yet, the honest answer is UNKNOWN -- which blocks.
+        #746: answered from the controller's ARM-TIME SNAPSHOT
+        (``PhaseFlipRuntime.parked_extent``), which is exact -- "the rows
+        this flip will pack" is fixed at arm, where the flip measures it.
+        The sticky last-enumeration value this replaced was stale by
+        construction and absent for a flip that armed before any
+        enumeration ran.
 
-        #802: that safety argument covers TIME but not LAYOUT -- the extent
-        also outlives the CUTOVER, and a row id from the released layout
-        priced a floor above the resident pool's whole cap (348106 against
-        212992 rows), which left the rung permanently unable to fund and the
-        seam permanently unfundable. The active layout is passed in so the
-        reader can discard an extent that provably belongs to the other pool,
-        exactly as ``_active_layout_pool`` below resolves the pool itself.
+        Outside a flip this answers "nothing parked" unconditionally, so
+        the rung stays fully live and #688's funding path is untouched.
+
+        #808 MERGE RESOLUTION -- TWO PROTECTIONS, NEITHER DROPPED. #746 and
+        #802 fixed the SAME wholesale refusal from opposite ends and landed
+        on branches that never met:
+
+          * #746 makes the extent EXACT (a snapshot taken at arm), which
+            removes staleness at the source.
+          * #802 makes a STALE extent survivable by discarding one that
+            provably belongs to the released layout -- the case that priced
+            a floor above the resident pool's whole cap (348106 against
+            212992 rows) and left the seam permanently unfundable. Measured
+            again on 2026-08-22 as 354774 against 204800.
+
+        Taking #746 alone would drop the layout discriminator on the path
+        that still needs it: when the arm-time measurement FAILS, #746
+        returns UNKNOWN, and UNKNOWN-while-armed is exactly the state that
+        closes the rung (see ``_parked_ceiling``). That is the state #808
+        died in, so falling back to nothing would leave the defect reachable
+        by a second route.
+
+        So: the snapshot is consulted FIRST and wins whenever it is
+        readable; the layout-discriminated sticky value is the FALLBACK.
+        When the snapshot is readable this is #746 verbatim. When it is not,
+        this is exactly the behaviour that shipped before #746 -- never
+        worse, and strictly better than either branch alone.
         """
+        if not _flip_armed():
+            return (0, -1)
+        rt = getattr(scheduler, "phase_flip_runtime", None)
+        snap = None
+        if rt is not None:
+            try:
+                snap = rt.parked_extent()
+            except Exception:  # noqa: BLE001 - unreadable is UNKNOWN, not empty
+                snap = None
+        if snap is not None:
+            return (int(snap[0]), int(snap[1]))
         # #748: delegated to a module-level function so the decision is
         # testable without a pool, an allocator and a live-set function. The
         # previous inline form could only be exercised by building the whole
