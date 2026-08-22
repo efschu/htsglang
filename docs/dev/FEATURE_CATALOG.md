@@ -2171,6 +2171,38 @@ parked session can be in `_by_id`, so the module half-knew. Pinned by
 `test_gdn_slot_runtime.TestUnparkedStraightIntoRunning`, whose two core tests go
 red against the pre-fix classification.
 
+Second-opinion family (#748): when a SIMULATION gates an escape hatch, it must
+ask the same oracle the real actuator asks, or the two answer one question two
+ways and the escape fires against a premise the running system contradicts
+seconds later. The IDLE-LOCK escape (#688/#689) arms a PP<->TP flip when
+`nothing_can_run` -- correct as a deadlock break, and priced twice already
+(#748's own earlier fixes, #759's damper). Neither moved the signature, because
+the escape was never MISPRICED: `Scheduler._layout_admits`
+(`managers/scheduler.py:3377`) hardcoded "TP may only decode under drain
+purity", which is true only for `strict`, and never read the boot's
+`--phase-flip-purity` rule. Under `prefill_in_tp` it early-falsed on
+`running_bs <= 0`, so an idle box with QUEUED prefill reported that TP could run
+nothing at all -- while the same log, seconds apart, carries the batch builder
+holding that exact prefill in TP and executing it, because
+`prefill_suppressed_in_tp` (`managers/phase_policy.py:850`) lifts drain
+suppression outright at `running_bs == 0`. Specimen: 160 armings in 1022 s
+(9.4/min), 0 economic, 80 tp-side on the false premise and 79 pp-side return
+legs of flips that should never have been proposed. Fixed by routing
+`_layout_admits` through the BATCH BUILDER'S oracle and factoring the prefill
+and decode arithmetic into shared helpers (`scheduler.py:3450`, `:3469`) -- the
+"ONE SIMULATION" docstring held across the two PHASES and was false across the
+two CLASSES, which is the shape to look for. Second finding, same commit: a
+persistence damper is only as good as the clock it reads. #759 keyed on
+`idle_since`, which `observe_idle` stamps only while `running_bs == 0 and
+pending == 0` -- the definitional OPPOSITE of a lock, which has work queued --
+so 160 of 160 arms took the "no idle observation" escape and every fixture
+passed the clock in by hand. Fixed with `nothing_can_run_since`
+(`phase_policy.py:1213`), stamped from the same term the escape is keyed on and
+cleared at `note_flip_completed` (`:2382`), since a lock measured in a layout
+that is gone is not evidence. Pinned by `test_idle_lock_root_748.py` (22 tests,
+11 red against the pre-fix tree). The rule: a probe that gates an action must
+be the same function the action runs, not a restatement of it.
+
 Equivalent-fallback family (#552): a decline is only worth its name when the
 fallback it hands off to does something DIFFERENT. `try_spill` declined
 outright whenever speculative decoding was active and the FCFS/minimal-eviction
