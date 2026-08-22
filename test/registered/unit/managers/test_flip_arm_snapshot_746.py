@@ -204,7 +204,18 @@ class TestTheSnapshotCannotOutliveItsFlip(CustomTestCase):
 
         from sglang.srt.managers import phase_flip_runtime as m
 
-        logging.getLogger(m.__name__).setLevel(logging.CRITICAL)
+        # Silencing this module's abandon logging is local to this test, but
+        # the logger is process-global: left at CRITICAL it also swallows the
+        # ERROR records that #800's `test_the_abandonment_names_this_rank_s_
+        # own_withhold` asserts on, and that test then fails for every reader
+        # as "no abandonment was logged" -- with nothing in its own file to
+        # point at. caplog raises the ROOT level, which cannot undo a level
+        # pinned on the module logger itself, so the restore has to happen
+        # here.
+        _flip_logger = logging.getLogger(m.__name__)
+        _prev_level = _flip_logger.level
+        self.addCleanup(_flip_logger.setLevel, _prev_level)
+        _flip_logger.setLevel(logging.CRITICAL)
 
         def _fresh():
             rt = _runtime(pending=m.PP_TO_TP, snapshot=(PARKED_ROWS, PARKED_TOP))
