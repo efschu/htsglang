@@ -1299,18 +1299,39 @@ class KvBackingRelief:
         next line then clamps the target to the eviction floor -- and when the
         floor binds, the surviving distance is below one granule again.
 
-        MEASURED, boot_798_0822_0737.log, 15 occurrences of "reported 0 MiB but
-        the driver's free column did not move". PP2's shape: current=126976,
-        floor=88945, granule=229376. The round-up asks 229376; the clamp yields
-        88945; the real distance is 38031 rows, one sixth of a granule. The cap
-        engaged, decommit_range cleared no extent, and the rank lost capacity in
-        exchange for nothing.
+        THE NUMBERS THIS DOCSTRING FIRST CARRIED WERE NOT MEASURED, and the
+        correction matters more than the guard. It read "PP2's shape:
+        current=126976, floor=88945, granule=229376 ... the granule EXCEEDS
+        the whole pool, so no shrink on that rank can ever pay at this chunk
+        size", attributed to boot_798_0822_0737.log. The string "229376" does
+        not occur in that log. It is 28 * 8192 and it is the fixture constant
+        from test_shrink_cannot_pay_reason_796.py (256 MiB * 28 / 32 KiB),
+        carried across as if it had been read off metal.
 
-        Note the granule can EXCEED the whole pool (229376 > 126976 here), in
-        which case no shrink on that rank can ever pay at this chunk size. That
-        is a sizing question (--flip-seam-chunk-mib) and is deliberately not
-        papered over here: this function's job is to stop paying a cap for a
-        release that cannot happen, not to pretend it can.
+        What that boot actually recorded for PP2:
+
+            :1325  32768 B/row over 32 arena buffers
+            :16    flip_seam_chunk_mib=8, enable_vram_dial=False
+                   -> arena commit chunk 8 MiB
+            :3382  current=126976 floor=88945 slack=38031
+
+            _min_release_rows() = ceil(8 MiB * 32 / 32 KiB) = 8192 rows
+
+        The granule is 8192, which is 6.4% of the pool, and PP2's post-floor
+        distance of 38031 rows is 4.64 granules. So the clamp does NOT defeat
+        the granule on that rank, the granule does not exceed any pool seen so
+        far, and chunk sizing (--flip-seam-chunk-mib) is not the lever the old
+        text sent the next reader after.
+
+        WHAT IS STILL UNEXPLAINED: all 15 zero-byte shrinks in that boot asked
+        at least three whole granules deep, so granularity cannot account for
+        any of them. The guard below is correct and cheap, but it would not
+        have prevented one of them. The open question is why
+        runtime_set_backing_rows reported zero released bytes at that depth.
+
+        The guard stays because the shape it refuses is real arithmetic: when
+        the floor clamp does leave less than one granule, attempting the shrink
+        costs a cap and returns nothing. It is simply not what PP2 hit.
 
         DIRECTION OF SAFETY, which is why this cannot revive #717: the guard only
         ever turns a shrink into NO shrink. It never deepens one, so it cannot

@@ -56,9 +56,19 @@ BUFFERS = 28
 CHUNK_BYTES = 256 * 1024 * 1024
 
 #: One commit chunk in EVERY buffer, in rows: 256 MiB x 28 / 32 KiB = 229376.
-#: Worth stating as a number because it is startlingly large -- on this
-#: geometry an ask has to exceed 224 Ki ROWS before it can release a single
-#: byte, which is more rows than several plausible pools hold in total.
+#:
+#: THIS GEOMETRY IS CONSTRUCTED, NOT SHIPPED. It was once described as "the
+#: shipped geometry", and that description escaped into a commit message and
+#: into release_rows_after_floor's docstring as a measured fact about PP2.
+#: It is not one. boot_798_0822_0737.log:1325 records 32768 B/row over 32
+#: arena buffers, and that boot's server_args records flip_seam_chunk_mib=8
+#: with enable_vram_dial=False, so the real granule there is
+#: ceil(8 MiB * 32 / 32 KiB) = 8192 rows -- 28 times smaller than this
+#: fixture's, and comfortably inside every pool that boot showed.
+#:
+#: The large value is kept because these cases are about the WORDING of a
+#: refusal, and a granule bigger than the ask is the cleanest way to reach
+#: the branch under test. It says nothing about any rank on this rig.
 GRANULARITY_ROWS = CHUNK_BYTES * BUFFERS // ROW_BYTES
 
 CURRENT = 1_000_000
