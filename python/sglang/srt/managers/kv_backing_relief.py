@@ -1288,6 +1288,50 @@ class KvBackingRelief:
             return None
         return rows if rows > 0 else None
 
+    def release_rows_after_floor(
+        relief, rows_wanted, current, floor, page
+    ) -> int:
+        """Apply the granularity round-up, then RE-CHECK it after the floor clamp.
+
+        THE CLAMP UNDOES THE ROUND-UP, and until 2026-08-22 nothing noticed.
+        The caller rounds the ask up to one release granularity because a shrink
+        smaller than one commit chunk per buffer clears no extent anywhere. The
+        next line then clamps the target to the eviction floor -- and when the
+        floor binds, the surviving distance is below one granule again.
+
+        MEASURED, boot_798_0822_0737.log, 15 occurrences of "reported 0 MiB but
+        the driver's free column did not move". PP2's shape: current=126976,
+        floor=88945, granule=229376. The round-up asks 229376; the clamp yields
+        88945; the real distance is 38031 rows, one sixth of a granule. The cap
+        engaged, decommit_range cleared no extent, and the rank lost capacity in
+        exchange for nothing.
+
+        Note the granule can EXCEED the whole pool (229376 > 126976 here), in
+        which case no shrink on that rank can ever pay at this chunk size. That
+        is a sizing question (--flip-seam-chunk-mib) and is deliberately not
+        papered over here: this function's job is to stop paying a cap for a
+        release that cannot happen, not to pretend it can.
+
+        DIRECTION OF SAFETY, which is why this cannot revive #717: the guard only
+        ever turns a shrink into NO shrink. It never deepens one, so it cannot
+        pull backing below the highest live row -- the fault that reverted
+        c4e557963e and killed boots.
+        """
+        rows_wanted = max(int(rows_wanted), int(relief._min_release_rows()))
+        target = max(int(floor), int(current) - rows_wanted)
+        target = int(math.ceil(target / page) * page)
+        if target >= int(current):
+            return 0
+        granularity = int(relief._min_release_rows())
+        if granularity > 0 and (int(current) - target) < granularity:
+            # Below one granule after the clamp: decommit_range would clear no
+            # extent in any buffer and return address space rather than memory.
+            # Refuse BEFORE engaging the cap -- discovering this by attempting it
+            # costs the rank its capacity and returns nothing.
+            return 0
+        return relief._shrink_to(target, int(current))
+
+
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
 
@@ -2207,12 +2251,9 @@ class KvBackingRelief:
         # no-op. Over-delivering is not a failure -- the guard re-probes the
         # driver and stops asking once the target is met -- whereas
         # under-delivering is silent and costs a wasted cap.
-        rows_wanted = max(rows_wanted, self._min_release_rows())
-        target = max(floor, current - rows_wanted)
-        target = int(math.ceil(target / page) * page)
-        if target >= current:
-            return 0
-        return self._shrink_to(target, current)
+        return self.release_rows_after_floor(
+            rows_wanted, current, floor, page
+        )
 
     def _shrink_to(self, target: int, current: int) -> int:
         """Cap to ``target`` rows, unmap above it, and report DRIVER bytes."""
