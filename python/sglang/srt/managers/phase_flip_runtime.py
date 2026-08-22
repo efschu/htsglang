@@ -905,52 +905,19 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             # to know the other's plumbing.
             _live.last_split = split
             scheduler.flip_live_split = split
-            # #808 MERGE NOTE: #746 made the controller's arm-time snapshot
-            # the PRIMARY source for the parked extent, and the rung now
-            # prefers it. This sticky, layout-tagged value is kept as the
-            # FALLBACK for the one case #746 cannot answer -- an arm-time
-            # measurement that failed -- because UNKNOWN-while-armed is
-            # precisely the state that closes the rung (#748's last
-            # wholesale refusal) and is what #808 died in. Writing it costs
-            # one tuple per enumeration and keeps that route survivable.
+            # #744 kept a sticky "last enumeration that saw requests" here
+            # for the KV rung to consult while a flip was armed. #746
+            # replaced that channel: the rung now reads the exact extent the
+            # controller snapshots at ARM (``PhaseFlipRuntime.parked_extent``),
+            # which cannot be stale and exists even when no enumeration ran
+            # before the flip armed. The split above remains the snapshot's
+            # measurement source.
             #
-            # #744: REMEMBER THE LAST ENUMERATION THAT SAW REQUESTS. A flip
-            # quiesces its requests before packing them, so by the time the
-            # KV rung asks, this same function reports req_rows=0 -- which is
-            # indistinguishable from an idle box and is what let the rung
-            # evict 127,731 rows the flip was about to read (ANALYSE_741).
-            # The rung consults this ONLY while a flip is armed, so a stale
-            # value cannot outlive the flip and cannot leave the rung dead
-            # outside one.
-            #
-            # #802 -- THAT ARGUMENT COVERS TIME, NOT LAYOUT, and the gap is a
-            # deadlock. "Outlive the flip" is true; what it misses is that the
-            # extent OUTLIVES THE CUTOVER. There is exactly one writer here
-            # and no reader anywhere clears it, so an extent enumerated in the
-            # PP phase is still on this function when tp_to_pp arms later --
-            # by which time the resident pool is the TP one and the row ids
-            # are from a DIFFERENT, LARGER id space.
-            #
-            # Measured on metal (boot_802_staged1_0822_1528): the rung latched
-            # at floor=348106 -> max_live 344009, against a TP pool whose
-            # entire cap is 212992 rows. A live row at id 344009 cannot exist
-            # in a 212992-row pool, so the ceiling was not describing the
-            # resident layout at all. Same floor reported against three
-            # different caps (212992 / 133120 / 124928), which is the tell: it
-            # had stopped tracking the active pool. Unlatched samples priced
-            # floor 148253/164758 with 48234-64739 rows of real slack.
-            #
-            # So the extent is TAGGED with the layout it was measured under,
-            # and the reader ignores one from the other layout. This is the
-            # rule _active_layout_pool already states one call away: the two
-            # layouts are two pools, only one is backed, and a value bound to
-            # the released one cannot describe the resident one.
-            if int(split["req_rows"]) > 0:
-                _live.last_req_extent = (
-                    int(split["req_rows"]),
-                    int(split["req_max"]),
-                    _active_layout_tag(scheduler),
-                )
+            # #808: #802's layout-tagged sticky record is NOT kept as a
+            # fallback. It was the authoritative-but-wrong-layout value that
+            # priced the unfundable floor in the first place; re-admitting it
+            # when the snapshot is unreadable would restore the defect to
+            # guard a rarer one. See _flip_pending in kv_backing_relief.py.
         except Exception as e:  # pragma: no cover - an instrument, never a gate
             logger.warning("%s live-split instrument failed: %s", LOG_PREFIX, e)
             _live.last_split = None

@@ -3155,30 +3155,39 @@ def kv_backing_provider(
         Outside a flip this answers "nothing parked" unconditionally, so
         the rung stays fully live and #688's funding path is untouched.
 
-        #808 MERGE RESOLUTION -- TWO PROTECTIONS, NEITHER DROPPED. #746 and
-        #802 fixed the SAME wholesale refusal from opposite ends and landed
-        on branches that never met:
+        While armed with no readable snapshot (the arm-time measurement
+        failed), the honest answer is UNKNOWN -- which #748's exclusion
+        ceiling turns into its one remaining wholesale refusal.
 
-          * #746 makes the extent EXACT (a snapshot taken at arm), which
-            removes staleness at the source.
-          * #802 makes a STALE extent survivable by discarding one that
-            provably belongs to the released layout -- the case that priced
+        #808 MERGE RESOLUTION, and the reasoning is recorded because a
+        first attempt got it wrong. #746 and #802 fixed the SAME wholesale
+        refusal from opposite ends, on branches that never met:
+
+          * #802 made a STALE extent survivable, by discarding one that
+            provably belongs to the RELEASED layout -- the case that priced
             a floor above the resident pool's whole cap (348106 against
-            212992 rows) and left the seam permanently unfundable. Measured
-            again on 2026-08-22 as 354774 against 204800.
+            212992 rows; measured again 2026-08-22 as 354774 against
+            204800) and left the seam permanently unfundable.
+          * #746 removes the staleness AT THE SOURCE: the extent is
+            measured at ARM, by the controller that decides to arm, so it
+            cannot describe a layout the flip has already left.
 
-        Taking #746 alone would drop the layout discriminator on the path
-        that still needs it: when the arm-time measurement FAILS, #746
-        returns UNKNOWN, and UNKNOWN-while-armed is exactly the state that
-        closes the rung (see ``_parked_ceiling``). That is the state #808
-        died in, so falling back to nothing would leave the defect reachable
-        by a second route.
+        The tempting resolution -- snapshot first, layout-tagged sticky
+        value as fallback -- was tried and is WRONG. #746 asserts
+        structurally that the sticky channel is gone from the writer, and a
+        fallback re-opens the stale path it exists to close. It also
+        misreads #808: that defect was never "the snapshot was unreadable",
+        it was "the sticky value was authoritative and described the other
+        pool". Keeping the sticky value to soften an error case would have
+        re-introduced the actual failure mode to guard a rarer one.
 
-        So: the snapshot is consulted FIRST and wins whenever it is
-        readable; the layout-discriminated sticky value is the FALLBACK.
-        When the snapshot is readable this is #746 verbatim. When it is not,
-        this is exactly the behaviour that shipped before #746 -- never
-        worse, and strictly better than either branch alone.
+        RESIDUAL, NAMED RATHER THAN PATCHED: an arm-time measurement that
+        fails still yields UNKNOWN, and UNKNOWN-while-armed still closes
+        the rung wholesale (``_parked_ceiling`` returns -2). That path is
+        now the only remaining route into #808's shape. It is not softened
+        here, because softening it means trusting an extent nobody
+        measured; if it is ever observed on metal the fix belongs at the
+        snapshot, not at this reader.
         """
         if not _flip_armed():
             return (0, -1)
@@ -3189,18 +3198,9 @@ def kv_backing_provider(
                 snap = rt.parked_extent()
             except Exception:  # noqa: BLE001 - unreadable is UNKNOWN, not empty
                 snap = None
-        if snap is not None:
-            return (int(snap[0]), int(snap[1]))
-        # #748: delegated to a module-level function so the decision is
-        # testable without a pool, an allocator and a live-set function. The
-        # previous inline form could only be exercised by building the whole
-        # rung, which is why the idle-box case went unnoticed until comp4
-        # wedged on it.
-        from sglang.srt.managers.phase_flip_runtime import _active_layout_tag
-
-        return flip_pending_from_live_fn(
-            live_fn, _flip_armed, lambda: _active_layout_tag(scheduler)
-        )
+        if snap is None:
+            return (-1, -1)
+        return (int(snap[0]), int(snap[1]))
 
     return KvBackingRelief(
         pool,

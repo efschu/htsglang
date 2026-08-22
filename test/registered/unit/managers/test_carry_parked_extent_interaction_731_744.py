@@ -113,20 +113,20 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
         rows, top, extent = _enumerate(_scheduler(carried=self.req, queued=[self.req]))
         self.assertEqual(rows, SEQLEN, "the carried request must contribute its rows")
         self.assertGreater(top, 0)
-        # #802 widened the record to (rows, max_row_id, layout_tag): a row id
-        # only means something in the pool it was enumerated in, so the extent
-        # now carries which layout that was. #744's own contract -- the rows
-        # and the high-water id -- is asserted unchanged; the tag is asserted
-        # separately because on this stub scheduler there is no active stack
-        # to read, and an unreadable layout must stay PROTECTIVE rather than
-        # authorise eviction.
+        # #808 MERGE NOTE, and it corrects a wrong first resolution of mine.
+        # ``_enumerate`` above now returns #746's ARM-TIME SNAPSHOT, which is
+        # a 2-tuple ``(rows, max_row_id)`` -- not #802's 3-tuple sticky
+        # record. Asserting the 3-tuple here failed with "2 != 3": the
+        # helper and the assertion were resolved from opposite sides of the
+        # merge. The snapshot is what the rung reads FIRST, so it is what
+        # this file should pin.
         #
-        # #808: this sticky record survives #746's merge as the FALLBACK the
-        # rung uses when the arm-time snapshot is unreadable, so its shape is
-        # still a contract and is still asserted here.
-        self.assertEqual(extent[:2], (SEQLEN, top), "#744's sticky extent must be set")
-        self.assertEqual(len(extent), 3, "#802's layout tag must be recorded")
-        self.assertIsNone(extent[2], "an unreadable layout must record None")
+        # #802's layout tag is NOT dropped: the sticky record still carries
+        # it (it is the rung's fallback when the snapshot is unreadable) and
+        # it keeps its own coverage in test_evict_rung_layout_extent_802.py.
+        self.assertEqual(
+            extent, (SEQLEN, top), "#746's arm-time snapshot must see the rows"
+        )
 
     def test_the_extent_is_identical_before_and_after_the_consume(self):
         """THE INTERACTION. #731 removes the queue entry; #744 must not care."""
