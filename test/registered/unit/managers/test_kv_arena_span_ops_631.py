@@ -115,6 +115,12 @@ def _bare_arena(backing, chunk=CHUNK):
     arena._retain_handles = False
     arena._retained = {}
     arena._retained_bytes = 0
+    # #464: mirrors the real constructor's first line, which defaults this OFF
+    # -- and off is the per-#330-chunk plan these span assertions are written
+    # against. Set explicitly rather than resolved from the environment, so
+    # flipping the #464 lever on for a measurement cannot change the shape of
+    # the plan under test.
+    arena._coalesce_resume = False
     return arena
 
 

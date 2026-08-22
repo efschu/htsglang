@@ -114,6 +114,13 @@ def _bare_arena(backing, retain_handles, chunk=CHUNK):
     arena._retain_handles = retain_handles
     arena._retained = {}
     arena._retained_bytes = 0
+    # #464: the real constructor sets this FIRST and defaults it OFF, and off
+    # reproduces the per-#330-chunk plan byte-for-byte -- which is the plan
+    # every assertion in this file is written against. Mirrored here rather
+    # than resolved from the environment, so the #631 hole/plan cases stay
+    # deterministic and do not silently change shape when the #464 lever is
+    # flipped on for a measurement.
+    arena._coalesce_resume = False
     return arena
 
 
