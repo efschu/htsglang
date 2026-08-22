@@ -85,6 +85,7 @@ class LRUFileEvictor:
             Callable[[], Iterable[Tuple[str, os.stat_result]]]
         ] = None,
         pins: Optional[Any] = None,
+        require_watermark: bool = False,
     ) -> None:
         # #410: the pin ledger, or None. None is the default and every code
         # path guards on it, so a store without checkpoints behaves exactly as
@@ -132,6 +133,39 @@ class LRUFileEvictor:
         self._load_config(extra_config or {})
 
         self._eviction_configured = self.max_size_bytes > 0 or self.min_free_bytes > 0
+        if require_watermark and not self._eviction_configured:
+            # #810: refused, not auto-armed. Arming needs a NUMBER, and there
+            # is no honest source for one here. `max_size` would have to be
+            # invented; `min_free` likewise; and the one derivation that does
+            # exist -- `_clamp_max_size_to_fs` -- clamps a cap that was already
+            # given and is not itself a bound, since the filesystem's own
+            # capacity permits the store to consume all of it. An invented
+            # default would read to the next operator as a considered budget.
+            #
+            # Refusing costs a launch. Not refusing costs the retention tier:
+            # with a small staging host tier in front, this store holds the
+            # only copy, and an unbounded store fills its filesystem until
+            # `HiCacheFile.set` starts rolling back reservations on ENOSPC --
+            # which the ack path reports as a partial backup, i.e. as a cache
+            # miss. The capacity loss would be silent and permanent.
+            raise ValueError(
+                "--hicache-host-role staging requires a bounded file backend, "
+                "and this one has no watermark: neither `max_size` nor "
+                "`min_free_space` is set (checked in the per-backend "
+                "extra_config first, then in "
+                "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE / "
+                "SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE).\n"
+                "Under 'staging' the pinned host tier is a small write-through "
+                "buffer and THIS store is the retention tier, so an unbounded "
+                "store is not a cache that grows -- it is the only copy of the "
+                "cache, growing until the filesystem is full. At that point "
+                "writes are refused page by page and the retention loss shows "
+                "up as a hit-rate decay, not as an error.\n"
+                'Set one, e.g. --hicache-storage-backend-extra-config \'{"max_size": '
+                '"200G"}\' or \'{"min_free_space": "100G"}\'. No default is '
+                "chosen for you: the right number depends on what else shares "
+                "this filesystem, which this process cannot know."
+            )
         self._eviction_enabled = self._eviction_configured and self._is_storage_owner
         if self._eviction_configured and not self._is_storage_owner:
             logger.info(

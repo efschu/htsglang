@@ -750,6 +750,8 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            # #810: a staging host tier makes this backend the retention tier.
+            host_role=getattr(server_args, "hicache_host_role", "retention"),
             # Weighted uneven-DCP: KV pages are token-sharded with FULL
             # replicated kv-heads -> owner-written, rank-shared page files.
             dcp_owner_mode=self._dcp_owner_ctx() is not None,

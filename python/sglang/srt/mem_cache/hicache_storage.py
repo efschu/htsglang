@@ -115,6 +115,13 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # #810: `--hicache-host-role`. Carried here rather than re-derived because
+    # a backend has to know whether it is the RETENTION tier: under 'staging'
+    # the pinned host tier in front of it is deliberately small, so an
+    # unbounded backend is no longer a cache that merely grows -- it is the
+    # only copy, growing without a bound. Defaulted, so every other
+    # construction site and the whole retention path are unchanged.
+    host_role: str = "retention"
     # Weighted uneven-DCP owner mode (task #60): KV pages are token-sharded
     # with FULL replicated kv-heads, so a KV page's bytes are complete on its
     # owner rank and rank-independent. KV page keys drop the _{tp_rank}_{tp_size}
@@ -774,6 +781,15 @@ class HiCacheFile(HiCacheStorage):
             path_for_stem=self._existing_path,
             iter_existing=self._iter_existing_files,
             pins=self.pins,
+            # #810: under `--hicache-host-role staging` this store IS the
+            # retention tier, so it may not run unbounded. Decided from the
+            # config the evictor itself resolved, one line below, rather than
+            # from a second reading of the same knobs at parse time -- the two
+            # readings would be free to drift, and the one that refuses would
+            # not be the one that evicts.
+            require_watermark=(
+                getattr(storage_config, "host_role", "retention") == "staging"
+            ),
         )
 
     def _pin_path(self, stem: str) -> str:
