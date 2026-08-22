@@ -4213,6 +4213,25 @@ class ServerArgs:
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
     ] = 0
+    hicache_host_role: A[
+        str,
+        Arg(
+            choices=["retention", "staging"],
+            help="#810: what the PINNED host tier is FOR. 'retention' (the "
+            "default, today's behaviour) sizes it as an L2 cache from "
+            "--hicache-ratio, so its pinned footprint scales with the device "
+            "pool. 'staging' declares it a small write-through staging area "
+            "in front of the storage tier, per DESIGN_706_BOOT ('the host "
+            "tier is staging; the disk tier is retention'): retention then "
+            "belongs to --hicache-storage-backend, and the pinned host "
+            "budget stops scaling with the device pool. 'staging' REFUSES "
+            "--hicache-ratio and requires an explicit --hicache-size, "
+            "because a staging area is sized from write-through bandwidth x "
+            "latency, which a ratio of the device pool does not express. It "
+            "also requires a storage backend: staging with nothing to stage "
+            "INTO would discard the tier rather than relocate it.",
+        ),
+    ] = "retention"
     hicache_write_policy: A[
         str,
         Arg(
@@ -6835,6 +6854,7 @@ class ServerArgs:
         self._handle_kv_pressure_ladder()
 
         # #410 session checkpoints: HiCache dependency and age ladder.
+        self._handle_hicache_host_role()
         self._handle_session_checkpoints()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
@@ -8592,6 +8612,72 @@ class ServerArgs:
             raise ValueError(
                 f"--admission-release-hysteresis must be >= 1, got "
                 f"{self.admission_release_hysteresis}."
+            )
+
+    def _handle_hicache_host_role(self):
+        """#810: fail fast when the host tier is declared staging but sized
+        like a retention cache.
+
+        WHY A REFUSAL AND NOT A SILENT OVERRIDE. `--hicache-size` already
+        overrides `--hicache-ratio` wherever both are given
+        (`pool_host/base.py`, the `host_size > 0` branch), so a staging boot
+        that also carries a ratio would BOOT, quietly ignoring the ratio. The
+        operator would then read the ratio back out of their own launch line
+        and believe the tier is ratio-sized. The two flags express opposite
+        intents here -- one scales the pinned footprint with the device pool,
+        the other pins it to an absolute staging budget -- so the combination
+        is a stated contradiction, not a precedence question.
+
+        The role is declarative on purpose: it does not compute a size. The
+        staging size is `--hicache-size`, derived from write-through
+        bandwidth x latency plus margin and emitted by the planner, which is
+        the sole VRAM/host-budget authority (#584/#785). A role that also
+        picked a number would be a second authority.
+
+        With the role left at 'retention' nothing in this method runs and no
+        other argument changes meaning."""
+        if self.hicache_host_role == "retention":
+            return
+        if not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--hicache-host-role staging requires "
+                "--enable-hierarchical-cache: without it there is no host "
+                "tier to give a role to."
+            )
+        ratio_default = ServerArgs.__dataclass_fields__["hicache_ratio"].default
+        if self.hicache_ratio != ratio_default:
+            raise ValueError(
+                "--hicache-host-role staging refuses --hicache-ratio "
+                f"({self.hicache_ratio}).\n"
+                "A ratio sizes the host tier as a fraction of the DEVICE "
+                "pool, which is a retention-cache shape: the pinned host "
+                "footprint then grows with every device-pool increase. A "
+                "staging area is sized from write-through bandwidth x "
+                "latency plus margin -- an absolute budget that does not "
+                "follow the device pool at all.\n"
+                "Use --hicache-size (GB, absolute) instead. Retention moves "
+                "to --hicache-storage-backend, per DESIGN_706_BOOT: 'the "
+                "host tier is staging; the disk tier is retention'.\n"
+                "Note --hicache-size would have silently won over the ratio "
+                "here; this refuses rather than letting the launch line "
+                "claim a sizing it does not get."
+            )
+        if self.hicache_size <= 0:
+            raise ValueError(
+                "--hicache-host-role staging requires an explicit "
+                "--hicache-size (GB, absolute).\n"
+                "Falling back to the default ratio would restore exactly the "
+                "device-pool-scaled pinned pool this role exists to remove, "
+                "and it would do so silently."
+            )
+        if not self.hicache_storage_backend:
+            raise ValueError(
+                "--hicache-host-role staging requires "
+                "--hicache-storage-backend.\n"
+                "Staging is a buffer in FRONT of a retention tier. With no "
+                "storage backend there is nothing to stage into, so a small "
+                "host tier would not relocate the cache -- it would discard "
+                "it, turning a capacity change into a hit-rate collapse."
             )
 
     def _handle_session_checkpoints(self):
