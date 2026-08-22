@@ -1034,6 +1034,35 @@ def pp_chunked_local_match(req) -> Optional[int]:
     return max(0, int(end))
 
 
+def pp_chunked_req_for_slot(holder, mb_id) -> Optional[object]:
+    """#798: the chunked request the NAMED microbatch slot carries, or None.
+
+    A module-level function looked up through this module's globals at call
+    time, like `pp_chunked_local_match` and `pp_void_keeps_request` beside it,
+    and for the same two reasons. It is the single point at which the slot
+    ring enters the admission reconcile, so it is the single point a can-fail
+    proof can neuter to show the rest of the machinery depends on it; and a
+    module global is neuterable WITHOUT every existing holder having to bind a
+    new method, which a mixin method is not.
+
+    Never raises and never guesses. A holder with no ring (a stand-in, a
+    fixture, a boot predating the per-slot snapshot) and an `mb_id` outside it
+    both answer None -- which is precisely the shipped behaviour, the lookup
+    that existed before #798. Raising on the admission path would turn one
+    defect into two on the path least able to afford it.
+    """
+    ring = getattr(holder, "_pp_chunked_req_before_by_slot", None)
+    if not ring:
+        return None
+    try:
+        slot = int(mb_id)
+    except (TypeError, ValueError):
+        return None
+    if slot < 0 or slot >= len(ring):
+        return None
+    return ring[slot]
+
+
 def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
     """#797/#797b: is this batch member SCHEDULER-owned rather than round-owned?
 
@@ -4489,6 +4518,8 @@ class SchedulerPPMixin:
         by_rid = {req.rid: req for req in self.waiting_queue}
         chunked = getattr(self, "chunked_req", None)
         chunked_rid = getattr(chunked, "rid", None)
+        slot_chunked = pp_chunked_req_for_slot(self, decision.mb_id)
+        slot_chunked_rid = getattr(slot_chunked, "rid", None)
         local_match_lens: Dict[str, int] = {}
         for entry in decision.entries:
             if not entry.admitted or entry.retracted:
@@ -4497,6 +4528,31 @@ class SchedulerPPMixin:
             if req is None:
                 if chunked_rid is not None and entry.rid == chunked_rid:
                     computed = pp_chunked_local_match(chunked)
+                    if computed is not None:
+                        local_match_lens[entry.rid] = computed
+                        continue
+                # #798: AND THE SLOT THE DECISION NAMES, which is the lookup
+                # whose absence livelocked boot_798_0822_0829 for 13 minutes
+                # without serving one request. `self.chunked_req` is a single
+                # scheduler-wide field, but `_pp_void_own_batch` restores it
+                # PER SLOT out of `_pp_chunked_req_before_by_slot[mb_id]`, so
+                # with more than one microbatch slot in flight the value
+                # standing there belongs to whichever slot wrote it last --
+                # not to the slot this decision is about. The miss then
+                # defaulted to 0 and was consumed as a MEASUREMENT: 2212
+                # consecutive `told=98304 local=0` retractions for a rank
+                # holding all 98304 tokens, voids alternating slot 2, 0, 2, 0
+                # with no exception, each void restoring the other slot's
+                # snapshot and so re-arming the next one.
+                #
+                # ONLY THE NAMED SLOT MAY ANSWER. Scanning the whole ring for
+                # a rid would be the same defect with a wider blast radius --
+                # answering a question about slot 2 with slot 0's progress.
+                # `PPAdmissionDecision.mb_id` is documented as "one PP
+                # microbatch slot" and has been on the wire since #791; this
+                # is an unread field, not a missing one.
+                if slot_chunked_rid is not None and entry.rid == slot_chunked_rid:
+                    computed = pp_chunked_local_match(slot_chunked)
                     if computed is not None:
                         local_match_lens[entry.rid] = computed
                         continue
