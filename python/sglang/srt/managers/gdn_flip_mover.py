@@ -666,6 +666,138 @@ def flip_mamba_slots(scheduler) -> torch.Tensor:
     return torch.unique(torch.cat([resident, tree_vals]))
 
 
+def agree_mamba_slots(
+    slots: torch.Tensor,
+    group,
+    local_capacity: int,
+    all_reduce=None,
+) -> Tuple[torch.Tensor, str]:
+    """Make every rank move the SAME mamba slot set. Returns (slots, refusal).
+
+    THE DEFECT THIS CLOSES, measured 2026-08-22. ``flip_mamba_slots`` is
+    rank-local: resident slots UNION the radix tree's checkpoints. The
+    resident half is rank-replicated, the TREE half is not -- each rank caches
+    what its own traffic put there. On the 17:22 boot the three ranks
+    enumerated 150695 / 159848 / 151656 rows, and because the sender packs
+    from ITS list while the receiver sizes from ITS OWN
+    (``move``: ``_pair_nbytes(..., len(slots), ...)``), the receive was short.
+    Four independent misses let that through silently -- the receive buffer is
+    ``torch.empty`` and never zeroed, NCCL p2p with unequal counts does not
+    raise, the length check passes because an underfilled buffer keeps its
+    ``numel``, and ``bounded_collective`` checks ``is_completed()`` and never a
+    byte count -- so allocator garbage landed exactly where the checksum
+    trailer is read. #802's byte handshake (98f8f790eb) turned that into a
+    loud, collective refusal BEFORE the transfer. It reports the divergence;
+    this function removes it.
+
+    THE PATTERN IS THE KV LEG'S, DELIBERATELY NOT A NEW ONE. The KV leg has
+    solved exactly this in ``phase_flip_runtime._agree_live_slots``: build a
+    presence vector, reduce it so the result is the OR, and adopt the group's
+    UNION. The union is the only reconciliation safe in both directions -- a
+    rank-0 broadcast would drop a peer's live slots and lose that request's
+    state at the seam, and an intersection would do the same to everyone. A
+    union never removes a slot from the rank that holds it.
+
+    WHAT A RANK SENDS FOR A SLOT IT DOES NOT LOCALLY HOLD, answered by reading
+    the packer rather than assuming. ``_pack_pp_side`` indexes
+    ``pools.pp_conv[li, s]`` and ``pools.pp_temporal[li, s]`` -- a direct index
+    into the pool tensor by slot id. A slot with no checkpoint behind it on
+    this rank is therefore a pool row that EXISTS and holds whatever was last
+    written there. It is copied, and on the receiving side nothing reads it,
+    because no request on that rank is behind it. That is the KV leg's own
+    answer ("the extra rows carry whatever the holder's pool holds and nothing
+    reads them on a rank that has no request behind them") and it holds here
+    for the same structural reason: the destination of a slot is a pure
+    function of its ID, so adding slots moves no other slot's destination.
+
+    THE ONE BOUND THAT IS NOT NEGOTIABLE, also inherited. A slot id at or
+    above a rank's pool capacity is not a pool row at all; indexing it is
+    out of bounds, and on device that is an illegal address, which kills every
+    rank instead of raising. So the union is refused when it reaches the
+    GROUP'S MINIMUM capacity. The refusal is returned, not raised: the caller
+    keeps the local set and #802's byte handshake -- deliberately left in
+    place as the back-stop -- turns the resulting divergence into its own
+    loud, collective abandon.
+
+    THIS FUNCTION IS A COLLECTIVE AND RUNS UNCONDITIONALLY ON EVERY RANK.
+    That sentence is the whole hazard, and #802 hit it in its own first draft:
+    a rank-local early return strands the group. Its guard checked "what my
+    peers announce against what I expect", so in a three-rank group where one
+    rank packed short, ranks 0 and 2 refused while rank 1 saw nothing, entered
+    ``batch_isend_irecv`` and hung forever on peers that had already left --
+    its test HUNG at 60 s instead of failing at 5.2 s. There is therefore NO
+    early return above the reductions here, not for an empty local set, not
+    for a single-rank group, not for a missing tree. Every branch that could
+    skip work is below the last collective. A guard that strands the group is
+    worse than the corruption it prevents.
+    """
+    reduce_fn = all_reduce if all_reduce is not None else _default_all_reduce
+    local = slots.detach().to("cpu", torch.int64).reshape(-1)
+    local_max = int(local.max().item()) if local.numel() else -1
+
+    # COLLECTIVE 1, and it carries both agreed scalars at once. MAX over
+    # [max_slot_id, -capacity] yields the group's highest slot id and the
+    # NEGATED group minimum capacity -- the same [x, -x] inversion the KV
+    # leg's fit verdict uses to get two directions out of one reduction.
+    header = torch.tensor([local_max, -int(local_capacity)], dtype=torch.int64)
+    reduce_fn(header, group)
+    group_max = int(header[0].item())
+    min_capacity = -int(header[1].item())
+
+    span = group_max + 1
+    if span <= 0:
+        # Nobody enumerated anything. Still AFTER the reduction, so every
+        # rank reaches this together and leaves together.
+        return local, ""
+
+    # COLLECTIVE 2: the union itself. A 0/1 membership vector reduced with
+    # MAX is exactly the OR -- 1 wherever ANY rank holds the slot. (The KV
+    # leg spells the same OR as -1/0 under MIN because that is the channel
+    # its rung already had; here the channel is free, so the direct form is
+    # used and the inversion is not repeated.)
+    presence = torch.zeros(span, dtype=torch.int64)
+    in_span = local[local < span]
+    if in_span.numel():
+        presence[in_span] = 1
+    reduce_fn(presence, group)
+    union = presence.nonzero().flatten().to(torch.int64)
+
+    highest = int(union[-1].item()) if union.numel() else -1
+    if highest >= min_capacity:
+        return local, (
+            f"mamba slot set divergence cannot be repaired this round: the "
+            f"group's union reaches slot {highest} and the poorest rank has "
+            f"only {min_capacity} pool slots, so framing the union would have "
+            f"that rank index outside its own pool. This rank enumerated "
+            f"{int(local.numel())} slots, the union has {int(union.numel())}. "
+            f"The local set is kept and the #802 byte handshake refuses the "
+            f"transfer collectively if the divergence still shows"
+        )
+    added = int(union.numel()) - int(local.numel())
+    if added:
+        logger.warning(
+            "%s mamba slot SET agreed by union: this rank enumerated %d "
+            "slots, the group holds %d (%+d), group pool floor %d. The "
+            "sender's list and the receiver's size are now the same set by "
+            "construction, so the #802 byte handshake becomes a back-stop "
+            "rather than the operating mechanism. No rank gives up a slot it "
+            "holds, so no request loses its mamba state",
+            LOG_PREFIX,
+            int(local.numel()),
+            int(union.numel()),
+            added,
+            min_capacity,
+        )
+    return union, ""
+
+
+def _default_all_reduce(tensor: torch.Tensor, group) -> None:
+    """In-place MAX all-reduce on ``group``. Injectable above for tests."""
+    import torch.distributed as dist
+
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=group)
+
+
 def install_phase_aware_mamba_state_pool(scheduler) -> None:
     """Point the tree cache's mamba STATE-byte operations at the pool of
     the phase that is actually computing (#767 residual).
@@ -726,12 +858,37 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
             gdn_geometry=tp_model_config.hf_text_config,
         )
 
-    def _slots() -> torch.Tensor:
-        return flip_mamba_slots(scheduler)
-
     install_phase_aware_mamba_state_pool(scheduler)
 
     flip_tp = get_phase_flip_group("tp")
+
+    def _local_slot_capacity() -> int:
+        """This rank's pool slot count -- the hard index bound, both stacks.
+
+        ``conv`` is ``[L, S, ...]`` so ``S`` is the slot axis. The MINIMUM of
+        the two stacks is taken because the mover indexes BOTH within one leg
+        (``_pack_pp_side`` reads the PP pool, ``_pack_tp_side`` the TP pool);
+        a slot that fits one and not the other is still out of bounds.
+        """
+        pp_s = int(pp_req_pool.mamba_pool.mamba_cache.conv[0].shape[1])
+        tp_s = int(tp_req_pool.mamba_pool.mamba_cache.conv[0].shape[1])
+        return min(pp_s, tp_s)
+
+    def _slots() -> torch.Tensor:
+        # AGREED, NOT LOCAL. flip_mamba_slots is rank-local by construction
+        # (the radix half caches per-rank traffic), and a sender packing from
+        # one list while the receiver sizes from another is the 2026-08-22
+        # short-receive. The agreement is a COLLECTIVE and is called on every
+        # rank on every leg, unconditionally -- see agree_mamba_slots for why
+        # there is no early return in it.
+        local = flip_mamba_slots(scheduler)
+        agreed, refusal = agree_mamba_slots(
+            local, flip_tp.device_group, _local_slot_capacity()
+        )
+        if refusal:
+            logger.error("%s %s", LOG_PREFIX, refusal)
+        return agreed
+
     device = pp_req_pool.mamba_pool.mamba_cache.temporal.device
     mover = GdnFlipMover(
         n_ranks=n,
