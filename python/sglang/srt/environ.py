@@ -628,6 +628,13 @@ class Envs:
     # bytes and wall time at the two chokepoints every crossing passes through,
     # which is the only way to put a number on a boundary that spans two hosts.
     SGLANG_PP_BOUNDARY_STATS = EnvInt(0)
+
+    # PP: how long an UNDECLARED tensor-dict kind may hold the phase flip's
+    # presence gate before it is retired loudly (#800). Deliberately shorter
+    # than the flip's 60 s presence deadline: an escape that expires after the
+    # abandonment it exists to prevent is decoration, not an actuator. Kinds
+    # with a declared disposition are unaffected -- see pp_stash_disposition.
+    SGLANG_PP_STASH_ESCAPE_S = EnvFloat(20.0)
     # #201 slice 3: cache the pickled tensor-dict METADATA at the pipeline
     # stage boundary. At bs=1 the gloo-pickled metadata costs MORE than the
     # hidden-state payload itself (measured slice 2: 249 us vs 142 us

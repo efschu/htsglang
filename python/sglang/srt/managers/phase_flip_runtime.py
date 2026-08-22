@@ -1531,12 +1531,23 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         assert_no_orphan_resident_reqs(scheduler)
         resident_before = resident_req_identity(scheduler)
         # WHAT init_pp_loop_state IS ABOUT TO DESTROY, on the record.
-        # It clears pp_outputs, last_rank_comm_queue, send_output_work and
-        # the tensor-dict inbox with no drain and no carry. The request
-        # side has a carry and a membership pin; the OUTPUT side has
-        # neither, and a discarded output is a token the client never sees
-        # (#631). Quiescence is supposed to make all of these empty -- this
-        # line is what says so out loud instead of assuming it.
+        # It clears pp_outputs, last_rank_comm_queue and send_output_work
+        # with no drain and no carry. The request side has a carry and a
+        # membership pin; the OUTPUT side has neither, and a discarded
+        # output is a token the client never sees (#631). Quiescence is
+        # supposed to make all of these empty -- this line is what says so
+        # out loud instead of assuming it.
+        #
+        # #800 CORRECTION: this sentence used to include "and the tensor-dict
+        # inbox", and that stopped being true at #753, which moved the inbox
+        # off the scheduler onto the pp_group so the crossing wire could share
+        # it. init_pp_loop_state explicitly does not touch it any more
+        # (scheduler_pp_mixin.py, "NOT assigned here any more"), and nothing
+        # else did either -- so this instrument was counting an inbox under the
+        # heading CUTOVER DISCARDS while the cutover discarded nothing, and a
+        # message parked there outlived the whole TP phase and was handed to
+        # the next PP epoch's receive. pp_flip_retire_pp_loop_stash below makes
+        # the discard real, and names what it discarded.
         _inflight = (
             getattr(scheduler, "pp_outputs", None) is not None,
             len(getattr(scheduler, "last_rank_comm_queue", None) or ()),
@@ -1589,6 +1600,20 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 "dict on the wire",
                 LOG_PREFIX,
             )
+        # #800: retire the PP-loop-only stash BEFORE the ring is rebuilt. Its
+        # messages name a pass in the ring this call is about to destroy, so
+        # after this point no consumer can ever take them; leaving them would
+        # hand them to the NEXT PP epoch's receive. Getattr for the same reason
+        # #787 uses it here: these paths are driven in tests by stand-ins that
+        # carry only the fields the logic reads.
+        _retire_fn = getattr(scheduler, "pp_flip_retire_pp_loop_stash", None)
+        if _retire_fn is not None:
+            try:
+                _retire_fn()
+            except Exception as exc:  # noqa: BLE001 - a sweep may never kill a flip
+                logger.warning(
+                    "%s #800 cutover stash retirement failed: %s", LOG_PREFIX, exc
+                )
         scheduler.init_pp_loop_state()
         # 6b. The TP loops read ``running_batch``, not the slot array, so
         # the TP leg moves the re-seeded set over (and empties the slots,
@@ -2734,6 +2759,14 @@ class PhaseFlipRuntime:
         #: rank still owed a chain send (clause (i)). A non-zero count on a
         #: healthy boot is normal -- it is the flush being waited out.
         self.presence_withheld_rounds = 0
+        #: #800: why THIS rank last withheld, or None if it announced. The
+        #: abandonment log used to name exactly one of the two states that put
+        #: a rank in the `missing` list -- "blocked upstream of the entry" --
+        #: while the other one, "at the entry and declining to announce", is
+        #: the one both 2026-08-22 wedges were in. A rank that holds the reason
+        #: locally can say which it was instead of sending every reader
+        #: upstream.
+        self._last_presence_withhold_reason: Optional[str] = None
         self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
         self.join_deadline_aborts = 0
         self._exchange = exchange
@@ -3993,13 +4026,36 @@ class PhaseFlipRuntime:
             try:
                 unclean = self._channels_empty_fn()
             except Exception as exc:  # noqa: BLE001
+                # #800: A BROKEN PROBE IS NOT A CLEAN ONE. This used to set
+                # `unclean = None`, which is the value that means "channels
+                # empty" -- so a probe that raised made the rank announce and
+                # enter the reduction with whatever live state the probe had
+                # been about to report. One return value carrying both "nothing
+                # to report" and "I could not tell" is the error shape this
+                # change exists to remove.
+                #
+                # Treated as unclean, which is bounded: the rank withholds and
+                # the pre-entry deadline below turns it into a LOUD abandonment
+                # within `presence_deadline_s`. A loud abandon is strictly
+                # better than a silent entry across a live channel, which
+                # misframes the post-flip stream long after the flip.
                 logger.warning("%s channel probe failed: %s", LOG_PREFIX, exc)
-                unclean = None
+                unclean = (
+                    f"the channel probe RAISED ({exc!r}), so this rank cannot "
+                    "prove its channels are empty. Withholding rather than "
+                    "assuming clean (#800)"
+                )
         if unclean:
             self.presence_withheld_channels += 1
 
         if owes or unclean:
             self.presence_withheld_rounds += 1
+            # #800: hold the reason, not just the count, so the abandonment
+            # that follows can say WHICH of the two missing-rank states this
+            # was instead of naming only the other one.
+            self._last_presence_withhold_reason = (
+                "still owes a chain send" if owes else str(unclean)
+            )
             # SAY WHY, PERIODICALLY. A withholding rank is invisible in the
             # log -- it simply does not announce -- and the only symptom is
             # an abandonment 60 s later naming it as "never reached the
@@ -4027,6 +4083,7 @@ class PhaseFlipRuntime:
                 )
         else:
             self._last_withhold_log = None
+            self._last_presence_withhold_reason = None
             self._presence.announce(
                 epoch, note=f"pending={self._pending}", round_=entry_round
             )
@@ -4059,7 +4116,17 @@ class PhaseFlipRuntime:
                 try:
                     late = self._channels_empty_fn()
                 except Exception as exc:  # noqa: BLE001
+                    # #800: same separation as the withhold probe above. A
+                    # raising probe left `late` as None, which reads as "empty",
+                    # and this rank entered the re-formation on the strength of
+                    # a check that never ran. Abandoning here is free -- nothing
+                    # has been entered and no request has been touched.
                     logger.warning("%s entry channel probe failed: %s", LOG_PREFIX, exc)
+                    late = (
+                        f"the entry channel probe RAISED ({exc!r}), so this "
+                        "rank cannot prove its channels are empty at the "
+                        "instant of entry (#800)"
+                    )
             if late:
                 self.entry_channel_violations += 1
                 logger.error(
@@ -4221,13 +4288,42 @@ class PhaseFlipRuntime:
         self._armed_at = None
         self._last_hold_reason = None
         self.presence_timeouts += 1
+        # #800: NAME BOTH CAUSES, and say which one this rank was in.
+        #
+        # A rank lands in `missing` when it did not announce, and there are
+        # exactly TWO ways to not announce: never having reached the gate at
+        # all (blocked upstream of it), or having reached it and WITHHELD. The
+        # sentence here used to assert the first as though it were the only
+        # one, and both 2026-08-22 wedges were the second -- so every reader
+        # this line reached was sent upstream, away from the rank that was
+        # sitting at the entry with a stashed message it could not place.
+        # One indicator that reads the same in two different states is not a
+        # finding; this one now separates them for the rank it can speak for.
+        # getattr for the reason #787 documents twenty lines above: these paths
+        # are driven in tests by stand-ins that carry only the fields the logic
+        # reads, and a stand-in without this one must abandon exactly as before.
+        withheld = getattr(self, "_last_presence_withhold_reason", None)
+        self._last_presence_withhold_reason = None
+        if withheld is not None:
+            local = (
+                f"THIS rank withheld its own presence for "
+                f"{self.presence_withheld_rounds} round(s): {withheld}. It "
+                f"reached the entry and declined to announce -- do not look "
+                f"upstream of the entry for it."
+            )
+        else:
+            local = (
+                "THIS rank announced. A peer named above either never reached "
+                "the entry (look upstream of it) or reached it and withheld "
+                "-- its own WITHHOLDING presence line for this epoch and round "
+                "says which, and its absence from the log means the former."
+            )
         logger.error(
             "%s FLIP ABANDONED (no quorum): %s waited %.1fs for epoch %d "
-            "and rank(s) %s never reached the flip entry (deadline %gs). "
+            "and rank(s) %s did not announce presence (deadline %gs). "
             "NOTHING was entered and no request was touched -- serving "
             "continues on the %s stack and the policy may re-arm, which "
-            "mints a new epoch. A rank that never reaches the entry is "
-            "blocked upstream of it: look there, not at the flip.",
+            "mints a new epoch. %s",
             LOG_PREFIX,
             direction,
             waited,
@@ -4235,6 +4331,7 @@ class PhaseFlipRuntime:
             missing,
             self._presence_deadline_s,
             self._phase,
+            local,
         )
         return None
 
