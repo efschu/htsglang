@@ -119,6 +119,76 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         self.assertEqual(rows, 0)
         self.assertIn("evictable", _reason(r).lower())
 
+    def test_a_floor_above_the_high_water_is_not_reported_as_liveness(self):
+        """The zero that means NOTHING, and used to be read as health.
+
+        `_floor_rows(x) == x + 1 + margin + reserve`, so a resident ceiling
+        within (margin + reserve) rows of the high-water lifts the PRICED floor
+        past the high-water row. `evictable_rows_above` is then asked for rows
+        in a region the tree cannot hold anything in, and returns zero for that
+        reason alone. Branch 8 reported that zero as "the pool is genuinely
+        live" -- a claim about liveness drawn from a query that measured none.
+
+        Measured on metal, boot_798_0822_0737.log 07:50:19Z: priced floor
+        167440 against high-water row 164055, plain floor 168152, reported as
+        health while the flip stayed wedged in TP.
+        """
+        # req_max just under the high-water: past the PINNED guard, below the
+        # plain floor, but far enough up that the priced floor clears max_live.
+        r = _relief({"req_max": MAX_LIVE - 100, "req_rows": 3})
+        with mock.patch(
+            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            return_value=(0, 0),
+        ):
+            floor, rows = r._evict_floor_rows(MAX_LIVE)
+        self.assertEqual(rows, 0)
+        reason = _reason(r)
+        self.assertNotIn(
+            "genuinely live",
+            reason,
+            "an empty query region is not evidence of liveness; this is the "
+            f"mislabelling that cost a boot to diagnose. Got: {reason!r}",
+        )
+        self.assertIn("above the high-water", reason.lower())
+
+    def test_a_real_band_with_nothing_priced_stays_a_named_suspicion(self):
+        """The OTHER zero: a genuine band the tree prices at nothing.
+
+        Sample A on the same boot -- priced floor 97643, high-water row 134148,
+        so 36506 rows lie above the resident ceiling and at or below the
+        high-water and the tree prices none of them. That may be health, or it
+        may be the ~94000 unaccounted rows the POOL CENSUS reports. The message
+        must not decide which; it must point at the reading that settles it.
+        """
+        r = _relief({"req_max": 1_000, "req_rows": 3})
+        with mock.patch(
+            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            return_value=(0, 0),
+        ):
+            floor, rows = r._evict_floor_rows(MAX_LIVE)
+        self.assertEqual(rows, 0)
+        reason = _reason(r).lower()
+        self.assertIn("evictable", reason)
+        self.assertIn("census", reason, "name where the answer is read")
+
+    def test_the_two_zero_branches_return_identically(self):
+        """This change is instrumentation. It must not move the ladder.
+
+        Both branches return `(plain, 0)` exactly as the single branch did, so
+        no shrink decision anywhere changes as a result of distinguishing them.
+        """
+        results = []
+        for split in ({"req_max": MAX_LIVE - 100, "req_rows": 3},
+                      {"req_max": 1_000, "req_rows": 3}):
+            r = _relief(split)
+            with mock.patch(
+                "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+                return_value=(0, 0),
+            ):
+                results.append(r._evict_floor_rows(MAX_LIVE))
+        plain = MAX_LIVE + 1 + 1 + 511
+        self.assertEqual(results, [(plain, 0), (plain, 0)])
+
     def test_a_priced_eviction_reports_that_it_priced_one(self):
         """The success path is named too, or absence of a reason is ambiguous."""
         r = _relief({"req_max": -1, "req_rows": 0})

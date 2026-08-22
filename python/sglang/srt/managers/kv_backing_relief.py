@@ -1623,11 +1623,45 @@ class KvBackingRelief:
             )
             return plain, 0
         if rows <= 0:
-            self._last_evict_floor_reason = (
-                f"NO EVICTABLE rows above the priced floor {floor} (plain floor "
-                f"{plain}, high-water row {int(max_live)}) -- healthy, the pool "
-                f"is genuinely live, but it still vetoes the group's shrink"
-            )
+            # TWO DIFFERENT CONDITIONS REACH THIS ZERO, and until 2026-08-22
+            # both were reported as the first one. Branch 8 claimed "the pool is
+            # genuinely live" without having measured liveness anywhere.
+            #
+            # When the priced floor sits ABOVE the high-water row, the query
+            # just asked for evictable rows in a region that does not exist:
+            # the tree cannot hold rows above the pool's own high-water mark, so
+            # the zero is a TAUTOLOGY and carries no information about what is
+            # live. This is #714 arriving here rather than at the pool cap --
+            # `_floor_rows(x) == x + 1 + margin + reserve`, so a resident
+            # ceiling within (margin + reserve) rows of the high-water lifts the
+            # priced floor past it. Measured on metal (boot_798_0822_0737.log):
+            # priced floor 167440 against high-water row 164055.
+            #
+            # The guards above cover req_max >= max_live (PINNED) and
+            # floor >= plain, but neither covers this, so it fell through to the
+            # pricing call and was mislabelled by it.
+            #
+            # The return is unchanged in BOTH cases -- this distinguishes the
+            # message only, so the ladder's behaviour is byte-identical.
+            if floor > int(max_live):
+                self._last_evict_floor_reason = (
+                    f"the priced floor {floor} is ABOVE the high-water row "
+                    f"{int(max_live)} (plain floor {plain}), so the eviction "
+                    f"query covered an EMPTY region and its zero says nothing "
+                    f"about what is live -- #714 at the high-water mark; the "
+                    f"floor still vetoes the group's shrink"
+                )
+            else:
+                self._last_evict_floor_reason = (
+                    f"NO EVICTABLE rows above the priced floor {floor} (plain "
+                    f"floor {plain}, high-water row {int(max_live)}) -- the "
+                    f"radix tree prices nothing in a REAL band of "
+                    f"{int(max_live) - floor + 1} rows above the resident "
+                    f"ceiling. Healthy if those rows are genuinely live; a "
+                    f"DEFECT if they are unaccounted, which the POOL CENSUS "
+                    f"line is the place to check. Either way it vetoes the "
+                    f"group's shrink"
+                )
             return plain, 0
         self._last_evict_floor_reason = (
             f"PRICED an eviction: floor {floor} instead of the plain {plain}, "
