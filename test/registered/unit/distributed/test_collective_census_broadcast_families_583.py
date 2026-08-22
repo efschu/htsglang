@@ -48,6 +48,17 @@ def _coordinator(world_size=2):
     g.barlink_comm = None
     g.device_group = object()
     g.unique_name = "tp:0"
+    # #631 (9c5ffaaab0) introduced ``_census_wire`` as a real __init__-time
+    # attribute: ``_CENSUS_ON and self.world_size > 1`` (parallel_state.py:740).
+    # ``object.__new__`` skips __init__ so it is never set here; every dispatch
+    # site now reads it before touching the census (parallel_state.py:1999 et
+    # al.). Every caller of this fixture in this file runs the collective
+    # inside the ``_CENSUS_ON = True`` patch block in ``_drive`` (and the one
+    # inline case in TestTheDispatchSitesCount does the same), so the formula
+    # reduces to ``world_size > 1`` for every instance this fixture builds --
+    # bind that reduction, not a bare True, so a fixture ever constructed with
+    # world_size=1 still gets the correct (false) wire state.
+    g._census_wire = world_size > 1
     # Set positionally and WITHOUT tuple-unpacking the whole return value, so
     # this harness builds against a tree that has not added the two families
     # yet. That is deliberate: the can-fail for this slice has to be "the

@@ -114,6 +114,16 @@ def _bare_arena(backing, retain_handles, chunk=CHUNK):
     arena._retain_handles = retain_handles
     arena._retained = {}
     arena._retained_bytes = 0
+    # #464 (dce55c1430 / 17e7c8e36a): __init__ resolves this via
+    # ``resolve_coalesce_resume(explicit)`` (kv_vmm_backing.py:469), consulted
+    # by ``commit_range`` at kv_vmm_backing.py:667. Bind the real resolver
+    # rather than stub a bool: it is already the defensive, DEFAULT-OFF
+    # function (explicit None falls through to the unset
+    # SGLANG_VMM_COALESCE_RESUME env var -> False in this process), which is
+    # exactly the state a real arena has when nothing asked for coalescing --
+    # and this file is about handle RETENTION (``_retain_handles`` above), not
+    # about #464's coalescer, so it must not silently start exercising it.
+    arena._coalesce_resume = backing.resolve_coalesce_resume(None)
     return arena
 
 
