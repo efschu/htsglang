@@ -5733,6 +5733,26 @@ class ServerArgs:
             "actively asserting against the runtime's own measurement.",
         ),
     ] = "pin"
+    uneven_token_vector_provenance: A[
+        Optional[str],
+        Arg(
+            help="WHERE --uneven-token-vector came from: the investigation, "
+            "task id or tool that produced it, e.g. '#602', 'planner', "
+            "'measured' (#797). "
+            "This exists because an investigation can be RETRACTED while the "
+            "numbers it emitted keep riding -- by then the value is just an "
+            "integer in a launch line, with no lineage attached for anything "
+            "to notice. The rule the runtime enforces is that an ACTIVE token "
+            "vector must never originate from a retracted investigation "
+            "(planner/retracted.py), and it is a hard refusal at boot, not a "
+            "warning. "
+            "Declaring a lineage that is NOT retracted also switches off the "
+            "fallback value-match, which is what catches a retracted vector "
+            "whose provenance was never stated at all -- so state it if you "
+            "know it. 'measured' is reserved for a vector this boot derived "
+            "from its own profiled per-rank capacity and is never refused.",
+        ),
+    ] = None
     barlink: A[
         Optional[bool],
         Arg(help="Enable barlink. Promoted from SGLANG_BARLINK (#781)."),
@@ -17475,6 +17495,17 @@ class ServerArgs:
         os.environ["SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"] = str(
             self.uneven_token_vector_role
         )
+        # #797: the PROVENANCE travels with the vector for the same reason the
+        # role does -- the resolver and the retraction gate both run inside the
+        # flip's second stack build, where this object is not consulted.
+        # Published only when stated: unlike the role, "not stated" is a
+        # meaningful answer here, and it is the answer that arms the fallback
+        # value-match against the retraction register. Publishing "None" as a
+        # string would read as a declared lineage and disarm it.
+        if self.uneven_token_vector_provenance is not None:
+            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE"] = str(
+                self.uneven_token_vector_provenance
+            )
         # One definition, called from here and from the early hoist in
         # __post_init__ that the VRAM ledger depends on (#786).
         self._publish_barlink_ownership_env()

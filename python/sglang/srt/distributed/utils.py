@@ -531,6 +531,93 @@ def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     return total // 2**20
 
 
+def _token_vector_role(server_args) -> str:
+    """'pin' or 'seed' (#797), read the same way at every gate.
+
+    The env is authoritative because it is what survives into the flip's
+    SECOND stack build, where this ServerArgs object is not the one consulted;
+    the flag is the fallback for a direct call that never published. An EMPTY
+    env value reads as "not stated" and defers to the flag, deliberately: an
+    empty override silently meaning 'pin' is how a stale, blank
+    SGLANG_UNEVEN_TOKEN_VECTOR entry once rode along unnoticed, and a gate that
+    turns itself off when handed an empty string is the same defect again.
+    """
+    from sglang.srt.environ import envs as _envs
+
+    role = str(_envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get() or "").strip().lower()
+    if not role:
+        role = str(getattr(server_args, "uneven_token_vector_role", "") or "").lower()
+    return role.strip() or "pin"
+
+
+def _token_vector_provenance(server_args) -> Optional[str]:
+    """The declared lineage of the token vector, or None when unstated.
+
+    None is a real answer, not a missing one: it ARMS the register's fallback
+    value-match. Same env-over-flag precedence and same empty-is-unstated rule
+    as the role.
+    """
+    from sglang.srt.environ import envs as _envs
+
+    declared = (
+        str(_envs.SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE.get() or "").strip() or None
+    )
+    if declared is None:
+        declared = (
+            str(
+                getattr(server_args, "uneven_token_vector_provenance", "") or ""
+            ).strip()
+            or None
+        )
+    return declared
+
+
+def _refuse_retracted_token_vector(server_args, vector, source: str) -> None:
+    """THE PROVENANCE RULE (#797): an ACTIVE token vector must never originate
+    from a retracted investigation.
+
+    Refuses a PIN outright -- a pinned vector is the number the server serves,
+    and serving on withdrawn evidence is the thing being prevented. A SEED is
+    allowed past this point and warned about instead, because a seed is by
+    definition superseded in-process by the measured optimum before anything
+    runs on it; the promise is checked where it can actually be broken, at the
+    install site, rather than assumed here. A seed that fails to be superseded
+    is refused there.
+
+    So this is not a softened rule for seeds. It is the same rule applied at
+    the moment the vector becomes ACTIVE, which for a pin is now and for a seed
+    is after the calibration has had its chance.
+    """
+    from sglang.srt.planner.retracted import (
+        RetractedProvenanceError,
+        find_retracted_token_vector,
+        token_vector_refusal_text,
+    )
+
+    entry = find_retracted_token_vector(vector, _token_vector_provenance(server_args))
+    if entry is None:
+        return
+    if _token_vector_role(server_args) == "seed":
+        logger.warning(
+            "#797 PROVENANCE: the token vector seeded via %s traces to "
+            "RETRACTED investigation %s. Permitted ONLY because role='seed' "
+            "means this boot's measured per-rank capacity supersedes it before "
+            "anything serves on it. If that install does not happen, the boot "
+            "is refused rather than served on withdrawn evidence. Why %s was "
+            "retracted: %s",
+            source,
+            entry.investigation,
+            entry.investigation,
+            entry.retracted_because,
+        )
+        return
+    raise RetractedProvenanceError(
+        token_vector_refusal_text(
+            entry, vector, f"it is PINNED as the active vector via {source}"
+        )
+    )
+
+
 def resolve_cp_token_ratios(
     server_args, checkpoint_size_mib: Optional[int] = None
 ) -> Optional[list]:
@@ -609,6 +696,9 @@ def resolve_cp_token_ratios(
                 f"SGLANG_UNEVEN_TOKEN_VECTOR must be {dcp_size} positive "
                 f"integers (one per DCP rank), got {env_vec!r}."
             )
+        _refuse_retracted_token_vector(
+            server_args, parsed, "SGLANG_UNEVEN_TOKEN_VECTOR"
+        )
         if len(set(parsed)) == 1:
             return None
         g = math.gcd(*parsed)
@@ -621,6 +711,7 @@ def resolve_cp_token_ratios(
     # ownership = the even-modulo owner rule (return None).
     kv_flag = getattr(server_args, "rank_kv_ratio", None)
     if isinstance(kv_flag, list) and len(kv_flag) == dcp_size:
+        _refuse_retracted_token_vector(server_args, kv_flag, "--rank-kv-ratio")
         if len(set(kv_flag)) == 1:
             return None
         g = math.gcd(*kv_flag)

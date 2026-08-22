@@ -697,6 +697,13 @@ class Envs:
     # measured optimum may supersede in-process). Unset reads as "pin", so a
     # process that never sets it behaves exactly as before.
     SGLANG_UNEVEN_TOKEN_VECTOR_ROLE = EnvStr(None)
+    # #797: where the token vector came from -- the investigation, task id or
+    # tool that produced it ("#602", "planner", "measured"). An ACTIVE vector
+    # whose provenance names a RETRACTED investigation is refused at boot
+    # (planner/retracted.py). Unset falls back to matching the vector's VALUE
+    # against the values each retraction recorded, which is what catches a
+    # retracted vector nobody declared a lineage for.
+    SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE = EnvStr(None)
     # Log one per-rank residency census line once everything permanent is
     # resident (planner/residency_census.py). Read-only instrument for
     # calibrating the #485 cut gate against exclusively-owned, measured bytes
