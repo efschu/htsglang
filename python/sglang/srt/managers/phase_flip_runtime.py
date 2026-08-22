@@ -774,6 +774,31 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
     return _ready
 
 
+#: Tag meaning "the layout was not readable". Readers must treat it as "I
+#: cannot rule this extent out" and keep protecting -- the safe direction.
+LAYOUT_TAG_UNKNOWN = None
+
+
+def _active_layout_tag(scheduler) -> Optional[str]:
+    """Which of the two flip layouts is RESIDENT right now, as a plain tag.
+
+    #802. The flip's two layouts are two pools with two id spaces, and only
+    one is backed at a time -- the same fact ``_active_layout_pool`` resolves
+    per call in ``kv_backing_relief``. A row id only means something relative
+    to the pool it was enumerated in, so anything that stores a row id across
+    a possible cutover has to store WHICH pool it came from.
+
+    Returns None when the answer is not unambiguous, and every reader treats
+    None as "cannot rule it out". An unreadable layout must never be the
+    reason a live row gets unmapped (#722/#744).
+    """
+    try:
+        tag = getattr(scheduler, "phase_flip_active_stack", None)
+        return LAYOUT_TAG_UNKNOWN if tag is None else str(tag)
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        return LAYOUT_TAG_UNKNOWN
+
+
 def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
     """Live slots = radix tree values UNION parked requests' rows.
 
@@ -888,10 +913,34 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
             # The rung consults this ONLY while a flip is armed, so a stale
             # value cannot outlive the flip and cannot leave the rung dead
             # outside one.
+            #
+            # #802 -- THAT ARGUMENT COVERS TIME, NOT LAYOUT, and the gap is a
+            # deadlock. "Outlive the flip" is true; what it misses is that the
+            # extent OUTLIVES THE CUTOVER. There is exactly one writer here
+            # and no reader anywhere clears it, so an extent enumerated in the
+            # PP phase is still on this function when tp_to_pp arms later --
+            # by which time the resident pool is the TP one and the row ids
+            # are from a DIFFERENT, LARGER id space.
+            #
+            # Measured on metal (boot_802_staged1_0822_1528): the rung latched
+            # at floor=348106 -> max_live 344009, against a TP pool whose
+            # entire cap is 212992 rows. A live row at id 344009 cannot exist
+            # in a 212992-row pool, so the ceiling was not describing the
+            # resident layout at all. Same floor reported against three
+            # different caps (212992 / 133120 / 124928), which is the tell: it
+            # had stopped tracking the active pool. Unlatched samples priced
+            # floor 148253/164758 with 48234-64739 rows of real slack.
+            #
+            # So the extent is TAGGED with the layout it was measured under,
+            # and the reader ignores one from the other layout. This is the
+            # rule _active_layout_pool already states one call away: the two
+            # layouts are two pools, only one is backed, and a value bound to
+            # the released one cannot describe the resident one.
             if int(split["req_rows"]) > 0:
                 _live.last_req_extent = (
                     int(split["req_rows"]),
                     int(split["req_max"]),
+                    _active_layout_tag(scheduler),
                 )
         except Exception as e:  # pragma: no cover - an instrument, never a gate
             logger.warning("%s live-split instrument failed: %s", LOG_PREFIX, e)

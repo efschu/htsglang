@@ -5253,9 +5253,101 @@ class SchedulerPPMixin:
             -1 if epoch is None else int(epoch),
         )
 
-    def _pp_wait_for_proxy_readiness(self: Scheduler, mb_id: int) -> None:
-        """#789: refuse to enter the blocking proxy receive until there is
+    def _pp_wait_for_dict_readiness(
+        self: Scheduler, mb_id: int, kind: str = "proxy"
+    ) -> None:
+        """#789: refuse to enter a blocking CHAN_DICT receive until there is
         POSITIVE evidence a message is actually coming.
+
+        #802-ring: PARAMETERISED BY WIRE KIND, AND THAT IS THE WHOLE OF
+        STAGE A. This gate was written for the proxy receive and shipped
+        guarding only that one, while `_pp_recv_dict_from_prev_stage` -- the
+        OUTPUT receive -- entered its blocking call with nothing in front of
+        it. `_pp_recv_proxy_tensors`' own docstring names the shape that
+        costs: CORPSE R ends with "PP0 `_pp_recv_dict_from_prev_stage` -- the
+        OUTPUT wire" as one arc of a closed cycle, so the file already knew
+        this wire could be the blocking one and guarded the other.
+
+        MEASURED, specimen /spinning/evidence-665-f1/wedge_802f_1712/ (PP=3,
+        --enable-phase-flip, py-spy of all three ranks):
+
+            PP0  _pp_commit_comm_work <- _pp_commit_pending_req_work
+                 (scheduler_pp_mixin.py:4071/2262) -- flushing the request
+                 chain PP1 can only take at the top of its NEXT pass
+            PP1  _pp_recv_dict_from_prev_stage <- _do_recv
+                 (scheduler_pp_mixin.py:5608/6069) -- blocked HERE, in the
+                 unguarded output receive, so it never reaches that top
+            PP2  PpChainReceiver.recv <- recv_requests
+                 (pp_chain_receiver.py:329) -- waiting on PP1's chain send
+
+        A closed three-arc ring, and the arc that can be cut without a new
+        protocol is PP1's: it is the only one waiting on a message that was
+        never posted at all, rather than on a peer's scheduling.
+
+        WHY THE OUTPUT WIRE CAN OWE NOTHING WHILE A RECEIVER EXPECTS ONE.
+        The two ends of the intermediate hop apply unrelated predicates.
+        `_do_recv` decides to receive from THIS rank's own slot state
+        (`mbs[next_mb_id]` non-None, not prebuilt, not
+        `_pp_can_skip_output_comm`); the non-last sender at
+        `_pp_send_output_to_next_stage` decides to forward on `if
+        pp_outputs:`, which is whatever it received LAST iteration. The
+        last-rank hop is matched by construction because it consults
+        `_pp_output_expected_for_slot`, but that flag answers "did the FIRST
+        rank say it will receive an output for this slot" -- PP0's verdict,
+        published for PP0's ring arc. No rank publishes the same thing for
+        the intermediate hop, so an intermediate receiver's expectation is
+        an independent variable and the two ends can disagree. Closing that
+        disagreement is a protocol extension (a per-slot expectation every
+        non-first rank publishes to its predecessor, two hops around this
+        ring) and is deliberately NOT what this function does. This makes
+        the resulting wait BOUNDED and LOUD instead of permanent; it does
+        not make the missing send appear.
+
+        THE FALSE-POSITIVE DIRECTION IS THE SAFE ONE, which is what makes
+        widening the gate to a second wire defensible at all. Every exit
+        that is not the timeout is an early `return` into the caller's
+        ordinary blocking receive -- byte for byte the behaviour that
+        shipped before this gate existed. The function can only CHANGE an
+        outcome by raising, and it raises only when the counters never moved
+        for the entire budget, which is precisely the state in which the
+        receive would otherwise have blocked for ever.
+
+        THE COUNTER IS NOT PROXY-SPECIFIC, only its old name was.
+        `_pp_send_dict_to_next_stage` bumps CHAN_DICT for EVERY dict it
+        posts, proxy and output alike, and `_pp_recv_typed_dict` bumps
+        `local_consumed` off the wire before the demultiplex -- deliberately
+        one counter for one wire, as its own comment says: "ONE counter for
+        this wire, shared by 'proxy' and 'output' -- they are demultiplexed
+        by __msg_type__ AFTER coming off it, so counting them apart would
+        let a rank call a wire empty while a message of the other kind was
+        still on it." So this gate reads the same true statement about the
+        same wire whichever kind its caller is about to ask for. `kind` is
+        used for ONE thing only: the non-destructive inbox peek, which is
+        per-`(src, kind)` and must match the key the caller's own receive
+        will use a moment later.
+
+        THAT SHARED COUNTER IS ALSO THIS GATE'S PRECISION LIMIT, and saying
+        so is not a caveat but the reason the budget exists. A message of
+        the OTHER kind in flight reads as positive evidence here, so the
+        caller may proceed into a receive whose own message is still not
+        posted. That is not a regression -- it is exactly the unguarded
+        behaviour, and the caller's `_pp_recv_typed_dict` stashes a
+        wrong-kind message and receives again, which is the demultiplexer
+        working as designed. The gate's guarantee is therefore one-sided and
+        precisely stated: a rank never waits FOR EVER on a wire its upstream
+        has posted nothing to, and never refuses a wire its upstream has.
+
+        THE DEFECT THIS CLOSES. Measured py-spy specimen (evidence-665-f1,
+        2026-08-20, PP=3 with --enable-phase-flip): PP0 and PP1 both idle
+        (cur_batch=None, server_is_idle=True), parked in
+        ``_pp_commit_pending_req_work``; PP2 (cur_batch not None) blocked in
+        the plain gloo receive inside ``_pp_recv_typed_dict``, forever -- an
+        unbounded wait for a proxy that no upstream ever scheduled. WHY the
+        two upstreams never scheduled a batch for this slot is a
+        request-admission question, out of scope here (a separate
+        investigation thread owns it); this function's only job is to make
+        the wait BOUNDED and LOUD instead of silent, without changing
+        anything about a healthy pass.
 
         THE DEFECT THIS CLOSES. Measured py-spy specimen (evidence-665-f1,
         2026-08-20, PP=3 with --enable-phase-flip): PP0 and PP1 both idle
@@ -5390,7 +5482,7 @@ class SchedulerPPMixin:
         src = resolve_src(self.pp_group, None)
         deadline = None
         while True:
-            if typed_inbox(self.pp_group).get((src, "proxy")):
+            if typed_inbox(self.pp_group).get((src, kind)):
                 # Already fully off the wire and stashed for this exact
                 # consumer -- the ordinary receive below will find it with
                 # no further wire activity. Return immediately rather than
@@ -5433,30 +5525,66 @@ class SchedulerPPMixin:
                 time.sleep(PROXY_READINESS_POLL_STEP_S)
                 continue
             budget = _pp_proxy_readiness_budget_s()
+            label = str(kind).upper()
             logger.error(
-                "%s #789 PROXY READINESS TIMEOUT: mb_id=%s -- this rank's "
+                "%s #789 %s READINESS TIMEOUT: mb_id=%s -- this rank's "
                 "upstream (rank %s) has posted %d dict message(s) on CHAN_DICT "
                 "(entered %d) and this rank has consumed %d; no new message "
                 "appeared within %.1fs. No upstream scheduled work for this "
-                "slot -- refusing to enter the blocking proxy receive rather "
+                "slot -- refusing to enter the blocking %s receive rather "
                 "than wedge.",
                 "PHASE-FLIP",
+                label,
                 mb_id,
                 upstream,
                 posted,
                 attempted,
                 consumed,
                 budget,
+                kind,
+            )
+            # #802-ring: the OUTPUT spelling names the asymmetry that
+            # produces it, because the counters alone read identically for
+            # both wires and the next reader would otherwise re-derive it.
+            hint = (
+                (
+                    " This is the intermediate output hop: this rank decided "
+                    "to receive from its OWN slot state while its upstream "
+                    "decided to forward on `if pp_outputs:`, and nothing "
+                    "publishes this rank's per-slot expectation to that "
+                    "upstream (`_pp_output_expected_for_slot` is the FIRST "
+                    "rank's verdict, not this one's). The missing send is "
+                    "upstream of this line; see #802-ring."
+                )
+                if kind == "output"
+                else ""
             )
             raise RuntimeError(
-                f"#789 PROXY READINESS TIMEOUT: mb_id={mb_id}: this rank's "
+                f"#789 {label} READINESS TIMEOUT: mb_id={mb_id}: this rank's "
                 f"upstream (rank {upstream}) posted {posted} dict message(s) "
                 f"on CHAN_DICT (entered {attempted}), this rank has consumed "
                 f"{consumed}, and no new "
                 f"message appeared within {budget:.1f}s. No upstream scheduled "
                 f"work for this slot; refusing to enter an unbounded blocking "
-                f"receive. See #789."
+                f"receive. See #789.{hint}"
             )
+
+    #: #802-ring: AN ALIAS, NOT A WRAPPER, and the difference is the whole
+    #: reason this line exists. The gate was born proxy-only and roughly ten
+    #: stand-in holders across the #631/#757/#787/#789/#791/#795/#797/#798
+    #: test family bind it BY THIS NAME, one method at a time, via
+    #: `setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))`.
+    #: A wrapper that delegated to `_pp_wait_for_dict_readiness` would resolve
+    #: that second name on the HOLDER, which binds only what its own tuple
+    #: lists -- so every one of those holders would raise AttributeError the
+    #: moment it entered a receive. Measured, not predicted: the wrapper form
+    #: turned 9 green tests in test_pp_drain_completeness_787.py and
+    #: test_pp_proxy_readiness_rendezvous_789.py into 5 failures.
+    #: Binding the SAME function object under both names keeps every existing
+    #: holder working untouched, while the honest name is the one new code
+    #: reads. `kind` defaults to "proxy", so the old call signature
+    #: `self._pp_wait_for_proxy_readiness(mb_id)` is unchanged in meaning.
+    _pp_wait_for_proxy_readiness = _pp_wait_for_dict_readiness
 
     def _pp_recv_proxy_tensors(
         self: Scheduler, mb_id: int = -1
@@ -5604,7 +5732,16 @@ class SchedulerPPMixin:
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
+        mb_id: int = -1,
     ) -> Dict[str, torch.Tensor]:
+        # #802-ring: the OUTPUT wire gets the gate the PROXY wire has had
+        # since #789. This receive is where PP1 sat, for ever, in specimen
+        # wedge_802f_1712 while PP0 held a request-chain flush PP1 could only
+        # take at the top of its next pass and PP2 waited on PP1's own chain
+        # send -- a closed ring whose only cuttable arc is this one. A no-op
+        # when `pp_flip_counters` is None, and on every pass where the
+        # upstream has posted; see `_pp_wait_for_dict_readiness`.
+        self._pp_wait_for_dict_readiness(mb_id, kind="output")
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(
@@ -6066,7 +6203,10 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                raw_output = self._pp_recv_dict_from_prev_stage()
+                # #802-ring: the slot is passed so the readiness gate can name
+                # it. It is the slot this rank's own gate above just proved
+                # non-empty -- exactly the expectation no upstream is told.
+                raw_output = self._pp_recv_dict_from_prev_stage(next_mb_id)
             # #791b: a void carries no tokens and must not be turned into one.
             # `_pp_absorb_void_output` empties the slot, so the loop's "slot
             # non-empty => a result was received for it" invariant (the guard

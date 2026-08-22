@@ -100,7 +100,16 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
         rows, top, extent = _enumerate(_scheduler(carried=self.req, queued=[self.req]))
         self.assertEqual(rows, SEQLEN, "the carried request must contribute its rows")
         self.assertGreater(top, 0)
-        self.assertEqual(extent, (SEQLEN, top), "#744's sticky extent must be set")
+        # #802 widened the record to (rows, max_row_id, layout_tag): a row id
+        # only means something in the pool it was enumerated in, so the extent
+        # now carries which layout that was. #744's own contract -- the rows
+        # and the high-water id -- is asserted unchanged; the tag is asserted
+        # separately because on this stub scheduler there is no active stack
+        # to read, and an unreadable layout must stay PROTECTIVE rather than
+        # authorise eviction.
+        self.assertEqual(extent[:2], (SEQLEN, top), "#744's sticky extent must be set")
+        self.assertEqual(len(extent), 3, "#802's layout tag must be recorded")
+        self.assertIsNone(extent[2], "an unreadable layout must record None")
 
     def test_the_extent_is_identical_before_and_after_the_consume(self):
         """THE INTERACTION. #731 removes the queue entry; #744 must not care."""
