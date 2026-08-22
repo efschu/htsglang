@@ -1445,6 +1445,17 @@ class Scheduler(
 
             self.phase_flip_stacks = build_phase_flip_tp_stack(self)
 
+        # #797: hold a SEED vector to its claim, here and not earlier. Every
+        # stack that can size a KV pool is built by this point -- the PP stack
+        # from init_memory_pools() above and, under --enable-phase-flip, the TP
+        # decode stack just above -- so "no measured vector ever superseded the
+        # estimate" is a finished fact rather than a not-yet. Under the flip it
+        # is the TP stack that carries the DCP layout, so a check placed after
+        # init_memory_pools() alone would refuse every flip boot.
+        from sglang.srt.distributed.utils import assert_seed_superseded
+
+        assert_seed_superseded()
+
         model_runner = self.tp_worker.model_runner
         # post_capture_kv_active gate: the #330 vram-dial lane also sets the
         # pool's post_capture_active (its buffers are VMM-backed), but its

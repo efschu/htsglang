@@ -5,8 +5,22 @@ vector`` computes the OPTIMAL token-ownership vector from each rank's MEASURED
 capacity, compares it against the active vector, and -- when an explicit vector
 is present -- throws the result away as a log line asking a human to restart
 with it. The advisory is correct, is printed on every boot, and nothing
-consumes it. On this fork's reference rig that gap left roughly 10 % of the KV
-pool unreachable while every boot named the better vector.
+consumes it. Every boot named the better vector and none of them used it.
+
+WHAT THIS IS WORTH, measured rather than projected. On this rig's flip
+configuration: NOTHING, today. Boot_798_0822_0646 installed the measured
+[29, 17, 18] in place of the shipped [29, 19, 16] and the world pool did not
+move -- 990656 tokens either way. The phase-flip boot caps every TP rank at the
+PP id space (448910 tokens, phase_flip_boot.py:206), which clips rank 0 from
+its profiled 620560 and makes rank 0 the binding rank under BOTH vectors, since
+both give it ratio 29. The vector cannot pay while that cap binds. The
+threshold is cap0 > 29 * min(360392//17, 375560//18) = 605056, i.e. about 35 %
+above today's operating point; lifting it belongs to the PP cut (#723/#702),
+where the cut and the vector have to be solved together.
+
+The DEFECT is real regardless of that. A predicate that refuses the install to
+the pool-owning runner is a bug on any cut, any model and any rig without this
+ceiling, and it pays the moment the ceiling moves.
 
 The cause is that ``SGLANG_UNEVEN_TOKEN_VECTOR`` is read as a BOOLEAN: "a
 vector is present" was conflated with "the operator asserts THIS vector". #797

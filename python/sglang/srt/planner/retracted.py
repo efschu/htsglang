@@ -63,6 +63,7 @@ __all__ = [
     "reduce_vector",
     "find_retracted_token_vector",
     "RetractedProvenanceError",
+    "SeedNotSupersededError",
 ]
 
 #: The provenance a vector carries when the runtime derived it from this
@@ -73,6 +74,16 @@ PROVENANCE_MEASURED = "measured"
 
 class RetractedProvenanceError(ValueError):
     """An active config value traces to a retracted investigation."""
+
+
+class SeedNotSupersededError(RuntimeError):
+    """A vector admitted as a SEED was never replaced by a measured one.
+
+    The companion of :class:`RetractedProvenanceError`. That one refuses a bad
+    LINEAGE; this one refuses a broken PROMISE -- a value that claimed to be
+    provisional and then rode into the pools unchanged. Both exist so that
+    provenance is enforced at boot rather than described in a comment.
+    """
 
 
 @dataclasses.dataclass(frozen=True)

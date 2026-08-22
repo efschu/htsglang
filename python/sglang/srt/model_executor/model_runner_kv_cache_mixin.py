@@ -5804,6 +5804,14 @@ class ModelRunnerKVCacheMixin:
             and not self.is_draft_pool_worker
         )
 
+        # #797 seed liveness: record that a site which COULD supersede a seed
+        # was reached, BEFORE any branch is taken and regardless of the verdict
+        # above. This is what separates "the install was declined" from "no
+        # calibration ever ran", and only the first is a broken seed promise.
+        from sglang.srt.distributed.utils import note_seed_calibration_site
+
+        note_seed_calibration_site(self.dcp_size, allow_install)
+
         # --rank-kv-ratio speed: the objective is the DECODE step, not the
         # context budget, so the vector is shifted from the capacity
         # proportion toward the per-rank memory-bandwidth proportion. Under
@@ -5856,7 +5864,22 @@ class ModelRunnerKVCacheMixin:
                 optimal, c_optimal = speed_vec, c_speed
 
         if install:
-            from sglang.srt.distributed.utils import set_cp_token_ratios
+            from sglang.srt.distributed.utils import (
+                note_seed_superseded,
+                set_cp_token_ratios,
+            )
+
+            # #797 seed liveness: the seed's claim is "the MEASURED optimum
+            # supersedes this estimate", and reaching a verdict here satisfies
+            # it -- including the two verdicts that install nothing. `optimal
+            # == active` means the measurement CONFIRMED the estimate, and
+            # `not improves` means it examined the alternative and kept the
+            # estimate on purpose. Both are the calibration doing its job, so
+            # the latch is disarmed on the verdict rather than on the write.
+            # Disarming only on a changed value would refuse a boot whose seed
+            # happened to be right, which is the one boot nobody should have to
+            # explain.
+            note_seed_superseded(optimal)
 
             # 'speed' deliberately accepts a SMALLER context budget than the
             # active vector -- that is the trade it exists to make -- so it
@@ -5896,10 +5919,24 @@ class ModelRunnerKVCacheMixin:
                         str(v) for v in optimal
                     )
                 if self.tp_rank == 0:
+                    # READ THE "-> ~%d" AS A CEILING, NOT AS A RESULT. Both
+                    # figures are scored on the UNCAPPED profiled capacities
+                    # gathered above, and a later cap can erase the whole
+                    # difference: under --enable-phase-flip the TP pool is
+                    # capped at the PP id space (phase_flip_boot.py:206), and
+                    # on boot_798_0822_0646 that clipped rank 0 from 620560 to
+                    # 448910, made rank 0 binding under the old AND the new
+                    # vector, and left the world pool at 990656 either way --
+                    # this line still announced 1213952 -> ~1335296. The
+                    # realised pool is the one the sizing pass logs
+                    # ("Uneven-DCP token sizing"), which is where the cap is
+                    # already applied. Quoting this projection as a delivered
+                    # gain is a mistake this comment exists to prevent.
                     logger.info(
                         "Uneven DCP %s mode (--rank-kv-ratio %s): installed "
                         "measured KV-token ownership vector %s (pre-boot "
                         "estimate was %s), max_total_num_tokens %d -> ~%d "
+                        "before any later pool cap "
                         "(per-rank profiled capacity %s).",
                         mode,
                         mode,

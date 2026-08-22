@@ -245,6 +245,109 @@ def get_cp_token_ratios() -> Optional[list]:
 
 
 # ---------------------------------------------------------------------------
+# #797 SEED LIVENESS: the other half of the provenance rule.
+#
+# `--uneven-token-vector-role seed` is not a description of a value, it is a
+# CLAIM ABOUT THE FUTURE: "this vector is a pre-boot estimate that the measured
+# per-rank capacity will supersede in-process, before the pools are built from
+# it." The retracted-provenance gate refuses a vector whose LINEAGE is bad.
+# This gate refuses a boot whose seed claim never came true -- the seed rode
+# all the way into the pools while calling itself provisional.
+#
+# That is not hypothetical: it is exactly the boot this task exists to end.
+# Before the is_draft_pool_worker fix, boot_798_0822_0629 reached three
+# install-capable sizing sites at dcp_size=3 with allow_install=True and
+# role='seed', declined every one on a predicate about the worker's LABEL, and
+# served the seed [29, 19, 16] as if it were a decision. Nothing failed. The
+# advisory printed and was ignored. A logged-but-never-enforced path is the
+# defect class this whole task is about, so the seed claim is enforced here
+# rather than described in a comment.
+#
+# Three signals, because refusing on fewer would refuse correct boots:
+#   armed        -- a seed vector was actually resolved
+#   calibration  -- some site could really have superseded it (dcp_size > 1
+#                   AND allow_install), so "never superseded" means declined,
+#                   not "never had the chance"
+#   superseded   -- an install landed
+# Refuse iff armed AND calibration AND NOT superseded. A genuine draft-pool
+# worker declining its own install does NOT trip this: the target runner in the
+# same process installs and disarms the latch, which is why the latch is
+# process-global and not per-ModelRunner.
+# ---------------------------------------------------------------------------
+
+_SEED_AWAITING: Optional[list] = None
+_SEED_CALIBRATION_REACHED: bool = False
+_SEED_SUPERSEDED_BY: Optional[list] = None
+
+
+def note_seed_awaiting_supersession(vector: Optional[Sequence[int]]) -> None:
+    """Arm the seed claim: `vector` is provisional and must be superseded."""
+    global _SEED_AWAITING
+    _SEED_AWAITING = list(vector) if vector else None
+
+
+def note_seed_calibration_site(dcp_size: int, allow_install: bool) -> None:
+    """Record that a site which COULD have superseded the seed was reached.
+
+    Without this, a boot that never runs a DCP calibration at all (dcp_size 1
+    everywhere) would be refused for declining an install it was never in a
+    position to make.
+    """
+    global _SEED_CALIBRATION_REACHED
+    if allow_install and dcp_size > 1:
+        _SEED_CALIBRATION_REACHED = True
+
+
+def note_seed_superseded(vector: Optional[Sequence[int]]) -> None:
+    """Disarm the seed claim: a measured vector replaced the estimate."""
+    global _SEED_SUPERSEDED_BY
+    _SEED_SUPERSEDED_BY = list(vector) if vector else None
+
+
+def seed_liveness_state() -> tuple:
+    """(awaiting, calibration_reached, superseded_by) -- for tests and logs."""
+    return (_SEED_AWAITING, _SEED_CALIBRATION_REACHED, _SEED_SUPERSEDED_BY)
+
+
+def reset_seed_liveness() -> None:
+    """Clear the latch (test support; a fresh process starts clear anyway)."""
+    global _SEED_AWAITING, _SEED_CALIBRATION_REACHED, _SEED_SUPERSEDED_BY
+    _SEED_AWAITING = None
+    _SEED_CALIBRATION_REACHED = False
+    _SEED_SUPERSEDED_BY = None
+
+
+def assert_seed_superseded() -> None:
+    """Refuse a boot whose seed vector was never superseded.
+
+    Called once, late, after every stack that could size a KV pool has been
+    built -- so that "no install happened" is a finished fact and not a
+    not-yet. Raises rather than warns: a warning here is precisely what the
+    pre-fix boot already emitted, and it changed nothing.
+    """
+    if _SEED_AWAITING is None or not _SEED_CALIBRATION_REACHED:
+        return
+    if _SEED_SUPERSEDED_BY is not None:
+        return
+    from sglang.srt.planner.retracted import SeedNotSupersededError
+
+    raise SeedNotSupersededError(
+        "#797 SEED WAS NEVER SUPERSEDED. The KV-token ownership vector "
+        f"{_SEED_AWAITING} was admitted as a SEED "
+        "(--uneven-token-vector-role seed), which declares it a pre-boot "
+        "estimate that the measured per-rank capacity supersedes in-process. "
+        "An install-capable sizing site was reached (dcp_size > 1, "
+        "allow_install=True) and no install landed, so the pools were built "
+        "from the estimate while it was still calling itself provisional. "
+        "This is refused rather than warned about, because the warning is what "
+        "the boot before this gate already printed. Either fix the install "
+        "path so the measured vector lands, or state the vector honestly with "
+        "--uneven-token-vector-role pin, which asserts it and suppresses the "
+        "supersession claim."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Weightless-KV fast lane (Variant C Stage 1).
 #
 # The fast lane DECOUPLES the head/weight partition from the token/KV (DCP)
@@ -702,7 +805,15 @@ def resolve_cp_token_ratios(
         if len(set(parsed)) == 1:
             return None
         g = math.gcd(*parsed)
-        return [v // g for v in parsed]
+        reduced = [v // g for v in parsed]
+        # #797: a SEED claims it will be superseded in-process. Arm the claim
+        # here, where the estimate actually enters the boot, so that
+        # assert_seed_superseded() can hold the boot to it later. Armed with
+        # the gcd-reduced form because that is the form the install compares
+        # against. A 'pin' asserts its value instead and arms nothing.
+        if _token_vector_role(server_args) == "seed":
+            note_seed_awaiting_supersession(reduced)
+        return reduced
 
     # Explicit pin via --rank-kv-ratio a,b,c (task #88): the decoupled
     # KV-token ownership vector, below the env override (family-flag
