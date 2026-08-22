@@ -143,3 +143,68 @@ class TestDescribeStagingSize(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheDerivationTouchesNoBudgetRegistryTest(CustomTestCase):
+    """#810 follow-up: deriving a size must have no allocation side effect.
+
+    An earlier `fits_pinned_host_budget()` in this module called
+    `check_and_register_pinned_post`, i.e. it registered a #729 post in the
+    PLANNER process. That registry credits earlier posts back against live
+    availability on the stated precondition that their bytes are already
+    resident (`pinned_host_budget.py`: "the already-allocated posts must be
+    credited back"). A planner allocates nothing, so such a post is precisely
+    what that same comment calls "the real hazard" -- registered and never
+    allocated, hence credited back without ever having been resident, charging
+    the NEXT admission too little and waving through the over-commitment the
+    registry exists to refuse.
+
+    The function had no caller and no test anywhere in the tree, so nothing
+    would have failed if it had grown one. This pins the property behaviourally
+    instead of by absence: the whole derivation path runs and the registry is
+    untouched. A re-added registering helper fails here.
+    """
+
+    def test_deriving_a_size_registers_nothing(self):
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            clear_registered_posts,
+            registered_posts,
+        )
+
+        clear_registered_posts()
+        try:
+            staging_size_gb(
+                drain_bytes_per_s=0.5e9,
+                drain_latency_s=0.2,
+                max_concurrent_prefetch=64,
+                page_bytes=1 << 20,
+            )
+            describe_staging_size(
+                drain_bytes_per_s=0.5e9,
+                drain_latency_s=0.2,
+                max_concurrent_prefetch=64,
+                page_bytes=1 << 20,
+            )
+            sustainable(0.4e9, 0.5e9)
+            self.assertEqual(
+                registered_posts(),
+                (),
+                "the planner's size derivation registered a pinned-host post: "
+                "a post that never allocates is credited back as if it had, "
+                "and the next admission is charged too little",
+            )
+        finally:
+            clear_registered_posts()
+
+    def test_the_module_exposes_no_budget_helper(self):
+        """The removed name, pinned. A future reader reaching for it is sent to
+        `ServerArgs._post_hicache_staging_host_ledger`, which prices the posts
+        jointly and by the RANK PRODUCT rather than per rank."""
+        import sglang.srt.planner.hicache_staging as mod
+
+        self.assertFalse(
+            hasattr(mod, "fits_pinned_host_budget"),
+            "fits_pinned_host_budget is back; if a planner-side pre-check is "
+            "wanted it must be PURE (joint_pinned_host_error, no registration) "
+            "and rank-aware",
+        )
