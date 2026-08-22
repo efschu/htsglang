@@ -499,6 +499,67 @@ def _guard_geometry_before_backend_build(tp_worker, where: str) -> None:
         )
 
 
+#: #690's reference, kept with the conditions that make it transferable --
+#: without them it is not a baseline, it is a number. Measured on the PINNED
+#: image path (which predates the file-backed arm entirely), pp_to_tp, as a
+#: mean over 14 flips with all three ranks moving 9614.9 MiB each:
+#: rank1 4.93 GB/s (3080, PCIe x4), rank0 7.08 GB/s (5090, x8), rank2
+#: 8.88 GB/s (3080, x8). NOTE_690_gdn_state_spread.md:58-85.
+_PINNED_REF_LO_GBPS = 4.93
+_PINNED_REF_HI_GBPS = 8.88
+
+
+def refill_report(
+    direction: str, elapsed: float, nbytes: int, file_backed: bool
+) -> str:
+    """One line describing a refill leg, comparable to something real.
+
+    WHY THIS IS NOT A ONE-LINER. The previous form printed the leg's duration
+    beside "the ~3.1 s pinned baseline". That comparison is invalid three ways
+    and on 2026-08-22 it produced a briefing that called the flip economy
+    broken and went looking for a silent host-RAM fallback:
+
+      SCOPE -- ~3.1 s is a WHOLE FLIP (NOTE_677_floor_components.md:135-143
+        uses it as "Against a ~3.1 s flip"), not a refill leg.
+      PATH  -- it was measured on the pinned arm, which predates the
+        file-backed arm, so it is not a baseline this path ever held.
+      BYTES -- it moved 9614.9 MiB/rank; these legs move 8574-16363 MiB, and
+        the elapsed time tracks bytes moved (r ~ 0.80), so seconds are not
+        comparable across them at all.
+
+    A rate against a rate is comparable; seconds against seconds are not. The
+    file-backed arm IS slower, and the line still says so -- what it must not
+    do is let that read as a regression against a baseline that never existed
+    for it. The arm is an explicit opt-in whose help text names what it buys:
+    without it the images are ~68.7 GiB of unreclaimable host RAM on a
+    swapless box and the boot is OOM-killed during init.
+    """
+    mib = nbytes / 1048576.0
+    rate = (mib / elapsed) if elapsed > 0 else 0.0
+    head = (
+        f"REFILL {direction} took {elapsed:.3f} s for {mib:.1f} MiB "
+        f"({rate:.0f} MiB/s)"
+    )
+    if not file_backed:
+        # The pinned arm IS the reference path, so it is measured against the
+        # reference directly and buys nothing it needs to justify.
+        return (
+            f"{head} -- pinned images, the same path as the "
+            f"{_PINNED_REF_LO_GBPS:.2f}-{_PINNED_REF_HI_GBPS:.2f} GB/s "
+            "reference (#690, per rank, pp_to_tp)."
+        )
+    return (
+        f"{head} -- file-backed images. Reference for this leg is a RATE, not "
+        f"a duration: #690 measured {_PINNED_REF_LO_GBPS:.2f}-"
+        f"{_PINNED_REF_HI_GBPS:.2f} GB/s per rank on the PINNED path "
+        "(pp_to_tp, 9614.9 MiB/rank), and the ~3.1 s often quoted alongside it "
+        "is a whole flip, not this leg. The file-backed arm is slower by "
+        "design, not by regression: it is what makes the image post "
+        "reclaimable, and without it the images are ~68.7 GiB of "
+        "unreclaimable host RAM on a swapless box."
+    )
+
+
 @dataclass
 class PhaseFlipStacks:
     """Everything the scheduler flip protocol needs from the boot build."""
@@ -670,17 +731,15 @@ class PhaseFlipStacks:
         except Exception:  # noqa: BLE001 - economics may never break a flip
             pass
         try:
-            nbytes = int(layout.total_bytes)
             logger.info(
-                "%s REFILL %s took %.3f s for %.1f MiB (%.0f MiB/s) -- %s images. "
-                "Compare against the ~3.1 s pinned baseline: this is the price the "
-                "file-backed arm pays for making the image post reclaimable.",
+                "%s %s",
                 LOG_PREFIX,
-                direction,
-                elapsed,
-                nbytes / 1048576.0,
-                (nbytes / 1048576.0) / elapsed if elapsed > 0 else 0.0,
-                "file-backed" if self._images_are_file_backed() else "pinned",
+                refill_report(
+                    direction,
+                    elapsed,
+                    int(layout.total_bytes),
+                    self._images_are_file_backed(),
+                ),
             )
         except Exception:  # noqa: BLE001 - an instrument may never break a flip
             pass
