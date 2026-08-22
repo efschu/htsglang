@@ -263,6 +263,28 @@ class Envs:
     # persistent filesystem; refuses (never silently pins) otherwise.
     SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
     SGLANG_PHASE_FLIP_IMAGE_DIR = EnvStr("")
+    # #802: refill a FILE-BACKED image by READING the file into a pinned
+    # staging ring, instead of copying straight off the mapping and taking one
+    # synchronous major fault per 4 KiB page. Measured on this rig 2026-08-22
+    # for the 16 699 408 904-byte PP0 image: the mapping path costs 4 077 045
+    # faults and 12 572 ms (1266 MiB/s) on a pool that writes at ~3500 MiB/s.
+    # Advisory hints do NOT fix it here and this arm deliberately does not use
+    # them -- on this OpenZFS pool MADV_WILLNEED populates nothing (12 564 ms,
+    # 4 077 052 faults, mincore residency 0.0 after the call) and per-chunk
+    # MADV_SEQUENTIAL is a 15.6x regression (196 200 ms).
+    # Only affects the file-backed arm; the default pinned image path never
+    # reaches it. Set to 0 for the comparand arm of the A/B on one binary.
+    SGLANG_PHASE_FLIP_REFILL_STAGED = EnvBool(True)
+    # Staging chunk and ring depth. The ring is allocated ONCE and charged to
+    # the pinned-host registry (#720's ReadBufferPool), so the whole new host
+    # post is CHUNK_MIB x DEPTH per rank -- bounded, unlike the image itself.
+    # 32 MiB x 2 measured fastest of the sweep at 1 918 ms / 8 304 MiB/s, a
+    # 7.50x improvement on the 14 377 ms mapping baseline. Buffered reads of
+    # the same shape reach only 2 242 MiB/s because they pay a second pass
+    # into the ARC, so the read path prefers O_DIRECT and falls back to
+    # buffered only when the filesystem refuses it.
+    SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB = EnvInt(32)
+    SGLANG_PHASE_FLIP_REFILL_DEPTH = EnvInt(2)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

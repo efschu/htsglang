@@ -37,6 +37,7 @@ than half-supported.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Set, Tuple
 
@@ -420,6 +421,231 @@ def host_image_mode() -> str:
     return "pinned"
 
 
+#: O_DIRECT requires the file offset, the length and the buffer address to be
+#: aligned to the device's logical block size. 4096 satisfies every device this
+#: runs on, and CUDA's pinned host allocations are page-aligned already.
+_DIRECT_ALIGN = 4096
+
+
+@dataclass(frozen=True)
+class _FileBackedImage:
+    """The read side of a file-backed flip image: fds, and how big it is.
+
+    Held so ``arena_refill`` can pull the bytes with ``preadv`` instead of
+    walking the mapping and taking one synchronous fault per 4 KiB page.
+
+    TWO fds, because the fast one cannot serve the whole file. ``fd_direct``
+    is O_DIRECT -- it bypasses the ARC and reads at device rate (8 304 MiB/s
+    measured, against 2 595 MiB/s for the same reads buffered, because the
+    ARC copy is a second pass over every byte and the ARC is capped at 5 GiB
+    against a 16 GiB image). But O_DIRECT can only serve block-aligned
+    offsets and lengths, and the image is payload + an 8-byte checksum, so
+    the last few bytes are not aligned. ``fd`` is the plain buffered fd that
+    finishes the tail, and the fallback if O_DIRECT is refused outright.
+    """
+
+    fd: int
+    nbytes: int
+    path: str
+    fd_direct: Optional[int] = None
+
+
+#: Keyed by the image tensor's ``data_ptr()``. These images are allocated once
+#: per rank and live for the process, so the key is stable; ``nbytes`` is
+#: re-checked at use so a recycled address cannot silently read a wrong file.
+_FILE_BACKED_IMAGES: Dict[int, _FileBackedImage] = {}
+
+_staged_pool = None
+
+
+def _register_file_backed_image(
+    image: torch.Tensor,
+    fd: int,
+    total: int,
+    path: str,
+    fd_direct: Optional[int] = None,
+) -> None:
+    _FILE_BACKED_IMAGES[image.data_ptr()] = _FileBackedImage(
+        fd=fd, nbytes=total, path=path, fd_direct=fd_direct
+    )
+
+
+def _file_backed_meta(image: torch.Tensor) -> Optional[_FileBackedImage]:
+    """The read fd for ``image``, or None if it is not a file-backed image.
+
+    None is the ordinary answer for the DEFAULT pinned-image path, which must
+    keep taking the untouched ``dst.copy_`` below.
+    """
+    meta = _FILE_BACKED_IMAGES.get(image.data_ptr())
+    if meta is None:
+        return None
+    if meta.nbytes != int(image.numel()):
+        # Address reuse, not our image. Refusing here is cheap; reading the
+        # wrong file would be caught by the checksum but only after the arena
+        # had already been overwritten.
+        logger.warning(
+            "#802 file-backed image registry has %d bytes at this address but "
+            "the image holds %d; ignoring the fd and using the fault path.",
+            meta.nbytes,
+            int(image.numel()),
+        )
+        return None
+    return meta
+
+
+def _refill_staging_pool(chunk_bytes: int, depth: int):
+    """The pinned staging ring, allocated ONCE and reused by every flip.
+
+    Reuses #720's ``ReadBufferPool`` rather than adding a second ring: it is
+    a fixed ring that charges its bytes to the pinned-host registry BEFORE
+    allocating them, which is what keeps this new host post inside the ledger
+    on a swapless box instead of beside it.
+    """
+    global _staged_pool
+    if _staged_pool is not None:
+        if _staged_pool.page_bytes == chunk_bytes and _staged_pool.capacity == depth:
+            return _staged_pool
+        _staged_pool.close()
+        _staged_pool = None
+    from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+
+    _staged_pool = ReadBufferPool(
+        name="phase_flip_refill_staging",
+        flag="--phase-flip-image-file-backed",
+        capacity=depth,
+        page_bytes=chunk_bytes,
+        factory=lambda: torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True),
+    )
+    return _staged_pool
+
+
+def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) -> None:
+    """Move ``nbytes`` of the image file into ``dst`` as READS, not faults.
+
+    WHY THIS EXISTS (#802, measured on this rig 2026-08-22). The previous path
+    was one ``dst.copy_`` over the whole file-backed mapping. That takes one
+    synchronous major fault per 4 KiB page -- 4 077 045 of them for the
+    16 699 408 904-byte PP0 image, confirmed by ``/proc/self/stat`` -- and
+    reaches 1266 MiB/s on a pool that writes at ~3500 MiB/s. No DMA takes
+    part on either side, which is why all three ranks converged on the same
+    rate despite PCIe links differing by 1.80x.
+
+    THE HINTS DO NOT WORK HERE, and that is measured, not assumed. On this
+    OpenZFS pool ``madvise(MADV_WILLNEED)`` over the cold mapping returns 0
+    and populates NOTHING: 12 564 ms against a 12 572 ms baseline, with
+    4 077 052 faults against 4 077 045, and ``mincore`` residency 0.0 after
+    the call. ``MADV_SEQUENTIAL`` per chunk is worse than useless -- 196 200
+    ms, a 15.6x REGRESSION. An advisory hint that the filesystem ignores is
+    the #738 class of defect (mechanism present, actuator absent), so this
+    path does not rely on one.
+
+    What it does instead: bounded ``preadv`` into a pinned staging ring, with
+    the next read overlapping the previous chunk's H2D DMA. The reads are
+    real reads, so the pool serves them at its own rate; the copies leave
+    from PINNED memory, so they are real DMA.
+
+    MEASURED, full cold sweep on the production-sized image, baseline taken
+    both first and last so the floor is not assumed::
+
+        mmap_copy (first)       14 377 ms   4 077 015 flt   1 108 MiB/s
+        mmap_copy (last)        16 998 ms   4 077 005 flt     937 MiB/s
+        willneed_ahead_16x4     20 472 ms   4 077 005 flt     778 MiB/s
+        pread_staged_8           6 138 ms          20 flt   2 595 MiB/s
+        pread_staged_32          7 103 ms           0 flt   2 242 MiB/s
+        pread_staged_32_direct   1 918 ms           0 flt   8 304 MiB/s
+
+    O_DIRECT is 3.2x the buffered read because the buffered path pays a
+    second pass over every byte into the ARC -- an ARC capped at 5 GiB here,
+    against a 16 GiB image it can never retain. It is also the only arm
+    whose ``read_bytes`` (16 056 MiB) matches the file size; ZFS serves
+    buffered reads from kernel threads that the caller is never charged for,
+    which is why ``read_bytes`` is not a usable instrument on the other arms
+    and the fault count is.
+    """
+    pool = _refill_staging_pool(_refill_chunk_bytes(), _refill_depth())
+    chunk = pool.page_bytes
+    depth = pool.capacity
+    # O_DIRECT serves only block-aligned offsets and lengths. Chunks are a
+    # multiple of the alignment and start at multiples of the chunk, so the
+    # ONLY unaligned piece is the tail past the last aligned boundary -- the
+    # image is payload + an 8-byte checksum, so a tail is the normal case,
+    # not an edge case. The buffered fd finishes it.
+    direct_limit = (nbytes // _DIRECT_ALIGN) * _DIRECT_ALIGN if meta.fd_direct else 0
+    bufs = [pool.acquire() for _ in range(depth)]
+    try:
+        streams = [torch.cuda.Stream() for _ in range(depth)]
+        events = [torch.cuda.Event() for _ in range(depth)]
+        inflight = [False] * depth
+        views = [b.numpy() for b in bufs]
+        off = 0
+        i = 0
+        while off < nbytes:
+            n = min(chunk, nbytes - off)
+            if inflight[i]:
+                # This buffer's previous H2D must land before it is refilled,
+                # or the read would overwrite bytes still in flight.
+                events[i].synchronize()
+                inflight[i] = False
+            got = 0
+            while got < n:
+                at = off + got
+                use_direct = at < direct_limit and at % _DIRECT_ALIGN == 0
+                if use_direct:
+                    want = min(n - got, direct_limit - at)
+                    want -= want % _DIRECT_ALIGN
+                if not use_direct or want == 0:
+                    fd, want = meta.fd, n - got
+                else:
+                    fd = meta.fd_direct
+                r = os.preadv(fd, [memoryview(views[i])[got : got + want]], at)
+                if r == 0:
+                    raise WeightsArenaError(
+                        f"#802 short read on flip image {meta.path!r}: got "
+                        f"{at} of {nbytes} bytes"
+                    )
+                got += r
+            with torch.cuda.stream(streams[i]):
+                dst[off : off + n].copy_(bufs[i][:n], non_blocking=True)
+                events[i].record(streams[i])
+            inflight[i] = True
+            off += n
+            i = (i + 1) % depth
+        for j in range(depth):
+            if inflight[j]:
+                events[j].synchronize()
+        # The checksum below reads ``dst`` on the CURRENT stream, which never
+        # saw these copies. Without this the verify could race the transfer.
+        cur = torch.cuda.current_stream()
+        for j in range(depth):
+            cur.wait_event(events[j])
+    finally:
+        for b in bufs:
+            pool.release(b)
+
+
+def _staged_refill_enabled() -> bool:
+    """Read per call, never frozen at import.
+
+    A value captured at import survives a test override and yields a silently
+    single-armed measurement -- the same reason #695's opt-out reads per call.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_PHASE_FLIP_REFILL_STAGED.get())
+
+
+def _refill_chunk_bytes() -> int:
+    from sglang.srt.environ import envs
+
+    return max(1, int(envs.SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB.get())) << 20
+
+
+def _refill_depth() -> int:
+    from sglang.srt.environ import envs
+
+    return max(1, int(envs.SGLANG_PHASE_FLIP_REFILL_DEPTH.get()))
+
+
 def _file_backed_image(total: int) -> torch.Tensor:
     """Flip host image as a FILE-BACKED shared mapping -- reclaimable, not
     pinned.
@@ -481,7 +707,40 @@ def _file_backed_image(total: int) -> torch.Tensor:
         )
     path = os.path.join(image_dir, f"flip-image-{os.getpid()}-{uuid.uuid4().hex}.img")
     image = torch.from_file(path, shared=True, size=total, dtype=torch.uint8)
+    # #802: keep a read fd BEFORE the unlink, so the refill can READ these
+    # bytes instead of faulting them. Without an fd the only way back to the
+    # data is the mapping, and touching the mapping is precisely the 4 KiB
+    # synchronous fault path that costs ~12.5 s per 16 GiB leg on this pool.
+    # The unlink still happens: the inode stays alive for the mapping AND the
+    # fd, and neither survives the process, so a crash leaves nothing behind.
+    try:
+        refill_fd = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        # Not fatal: the mapping is valid and the fault path still works. The
+        # refill just does not get its fast route, and says so once.
+        refill_fd = None
+        logger.warning(
+            "#802 could not open a read fd for flip image %s (%s); the refill "
+            "falls back to the page-fault path.",
+            path,
+            exc,
+        )
+    direct_fd = None
+    if refill_fd is not None:
+        try:
+            direct_fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except OSError as exc:
+            # Degrades, never kills: the buffered fd still beats the mapping
+            # (2 595 MiB/s vs 1 108), it just does not reach device rate.
+            logger.warning(
+                "#802 O_DIRECT unavailable for flip image %s (%s); the refill "
+                "reads buffered instead, which pays the ARC copy.",
+                path,
+                exc,
+            )
     os.unlink(path)
+    if refill_fd is not None:
+        _register_file_backed_image(image, refill_fd, total, path, direct_fd)
     logger.info(
         "flip host image FILE-BACKED (reclaimable): %d bytes mapped from "
         "%s (unlinked; pages are page cache and may be written back and "
@@ -809,7 +1068,15 @@ def arena_refill(
     payload = image[: layout.total_bytes]
     want = int(image[layout.total_bytes :].clone().view(torch.int64).item())
     dst = arena[: layout.total_bytes]
-    dst.copy_(payload)
+    # #802: a FILE-BACKED image is refilled by reading the file, not by
+    # faulting the mapping (see _staged_file_refill for the measurements).
+    # The default PINNED path is untouched: _file_backed_meta returns None for
+    # it and the original copy_ below runs unchanged, byte for byte.
+    meta = _file_backed_meta(image) if _staged_refill_enabled() else None
+    if meta is not None and dst.is_cuda:
+        _staged_file_refill(dst, meta, layout.total_bytes)
+    else:
+        dst.copy_(payload)
     have = uint8_checksum(dst)
     if want != have:
         restored = ""
