@@ -75,8 +75,7 @@ def pytest_sessionfinish(session, exitstatus):
             "where mock's restore stack races between ranks. Patch process "
             "globals ONCE, in the main thread, around the threaded section.\n"
             "The baseline was restored after each, so the failures you see "
-            "elsewhere in this run are NOT consequences of these:\n"
-            + "\n".join(lines),
+            "elsewhere in this run are NOT consequences of these:\n" + "\n".join(lines),
             file=sys.stderr,
         )
         session.exitstatus = 1
@@ -215,8 +214,6 @@ def pytest_runtest_teardown(item, nextitem):
             continue
         if _LEAK_BASELINE[key] is not value:
             modname, attr = key
-            _LEAKS_SEEN.append(
-                (item.nodeid, f"{modname}.{attr} -> {value!r}")
-            )
+            _LEAKS_SEEN.append((item.nodeid, f"{modname}.{attr} -> {value!r}"))
             # Repair, so this leak does not become the next fifty failures.
             setattr(sys.modules[modname], attr, _LEAK_BASELINE[key])

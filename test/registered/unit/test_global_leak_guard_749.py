@@ -73,8 +73,16 @@ def _run(body: str):
         (d / "conftest.py").write_text(_CONFTEST.read_text())
         (d / "test_generated_749.py").write_text(textwrap.dedent(body))
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", str(d), "-q", "--tb=line",
-             "-p", "no:randomly"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(d),
+                "-q",
+                "--tb=line",
+                "-p",
+                "no:randomly",
+            ],
             capture_output=True,
             text=True,
             cwd=str(_REPO),
