@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -715,11 +716,31 @@ def check_admission_wedge_once(
     return alarm, detail
 
 
-def create_admission_wedge_watchdog(
-    scheduler: Scheduler,
-    poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
-) -> threading.Thread:
-    """#699: log-only admission-wedge watchdog, wired to the real progress clock.
+def _rank_label(scheduler: Scheduler) -> str:
+    """A stable per-process name for the published verdict file (#799).
+
+    The detector runs in EVERY scheduler process, so the published files must
+    not collide -- and the label is also the only thing that tells an operator
+    which rank went quiet. Ranks are read through ``scheduler.ps`` where the
+    parallel state keeps them, with a pid fallback: a label that raises during
+    telemetry would take down the scheduler it is describing, and a wrong-but-
+    unique label is strictly better than no signal at all.
+    """
+    ps = getattr(scheduler, "ps", None)
+    pp = getattr(ps, "pp_rank", None)
+    tp = getattr(ps, "tp_rank", None)
+    if pp is None and tp is None:
+        return f"pid{os.getpid()}"
+    return f"pp{pp if pp is not None else 'x'}-tp{tp if tp is not None else 'x'}"
+
+
+def make_admission_wedge_poller(scheduler: Scheduler) -> Callable[[], Optional[bool]]:
+    """#699: one admission-wedge poll, wired to the real progress clock.
+
+    Split out of :func:`create_admission_wedge_watchdog` by #799 so the poll
+    the production thread runs is the same callable a test can drive, without
+    a thread and without a sleep. The thread factory below is now a loop and
+    nothing else.
 
     Deliberately NOT a ``WatchdogRaw``: that class's signal is forward_ct
     staleness, which #699 (commit 9c686ca936) proved blind to this exact
@@ -767,6 +788,32 @@ def create_admission_wedge_watchdog(
 
     recovery_attempted_this_episode = False
 
+    def _publish(alarm: bool, detail: str) -> None:
+        """#799: carry this poll's verdict OUT of the scheduler process.
+
+        The report above is a log line, and a log line has no consumer that
+        can act. On boot 0822_0829 this detector was RIGHT 146 times across
+        thirteen minutes with zero decode batches, and nothing restarted the
+        lane, because the only reader was a human who was not reading. The
+        publish makes the verdict a passive, machine-readable fact a
+        supervisor can poll without asking the suspect server anything.
+
+        Published on EVERY poll, not only on alarm. A file that appears only
+        when things are broken cannot be distinguished from a file that never
+        appears, so the healthy verdict is what gives the reader's staleness
+        check something to measure against.
+
+        Best-effort by construction: ``publish_verdict`` swallows its own I/O
+        errors, and this wrapper catches anything else. A telemetry sink must
+        never be able to kill the scheduler it observes.
+        """
+        try:
+            from sglang.srt.managers import wedge_status
+
+            wedge_status.publish_verdict(_rank_label(scheduler), alarm, detail)
+        except Exception as e:  # noqa: BLE001 - telemetry must not kill serving
+            logger.warning("%s status publish failed: %s", ADMISSION_WEDGE, e)
+
     def _attempt_recovery(age: float, threshold: float) -> None:
         logger.error(
             "%s RECOVERY: wedge has been continuously alarming for %.1fs "
@@ -795,33 +842,74 @@ def create_admission_wedge_watchdog(
             verdict,
         )
 
-    def _loop() -> None:
+    def _poll_once() -> Optional[bool]:
+        """One poll: check, PUBLISH, then maybe recover.
+
+        Extracted from the loop so the publish edge and the recovery edge are
+        reachable from a test without a thread or a sleep. A helper that a
+        test can call proves only that the helper works; this is the function
+        the running thread actually executes, so a mutant that drops the
+        publish here dies in the suite instead of at 03:00 on a wedged rig.
+
+        Returns the alarm verdict, or ``None`` when the check itself failed.
+        """
         nonlocal recovery_attempted_this_episode
+        try:
+            alarm, detail = check_admission_wedge_once(scheduler, log_on_alarm=True)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.error(f"admission-wedge watchdog check failed: {e}")
+            return None
+        _publish(alarm, detail)
+        if not alarm:
+            recovery_attempted_this_episode = False
+            return False
+        if recovery_attempted_this_episode:
+            return True
+        threshold = _admission_wedge_recovery_threshold()
+        age = time.perf_counter() - scheduler.last_first_token_progress_time
+        if age < threshold:
+            return True
+        recovery_attempted_this_episode = True
+        try:
+            _attempt_recovery(age, threshold)
+        except Exception as e:  # noqa: BLE001 - a watchdog must not die
+            logger.error("%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e)
+        return True
+
+    return _poll_once
+
+
+def create_admission_wedge_watchdog(
+    scheduler: Scheduler,
+    poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
+    stop: Optional[threading.Event] = None,
+) -> threading.Thread:
+    """The #699 watchdog thread: sleep, poll, repeat. All logic is in the poll.
+
+    Deliberately NOT a ``WatchdogRaw``: that class's signal is forward_ct
+    staleness, which #699 (commit 9c686ca936) proved blind to this exact wedge
+    shape -- chunked prefill keeps forward_ct advancing for tens of seconds
+    while zero requests reach a first token.
+    """
+    poll = make_admission_wedge_poller(scheduler)
+
+    # #799: an optional stop, for callers that must be able to END this
+    # thread. In serving the thread is daemon and lives for the process, so
+    # nothing passes one. A TEST must: an unstoppable daemon thread outlives
+    # the test that created it and keeps publishing -- observed during this
+    # ticket's own development, when the thread survived its test, fell back
+    # to the DEFAULT status directory once the test popped its env override,
+    # and left a stale verdict in the real /run path that the next production
+    # smoke then read. A loop with no exit is a loop that escapes.
+    def _loop() -> None:
         while True:
             time.sleep(poll_interval)
-            try:
-                alarm, _detail = check_admission_wedge_once(
-                    scheduler, log_on_alarm=True
-                )
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.error(f"admission-wedge watchdog check failed: {e}")
-                continue
-            if not alarm:
-                recovery_attempted_this_episode = False
-                continue
-            if recovery_attempted_this_episode:
-                continue
-            threshold = _admission_wedge_recovery_threshold()
-            age = time.perf_counter() - scheduler.last_first_token_progress_time
-            if age < threshold:
-                continue
-            recovery_attempted_this_episode = True
-            try:
-                _attempt_recovery(age, threshold)
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.error(
-                    "%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e
-                )
+            # Checked AFTER the sleep and BEFORE the poll: a stop requested
+            # while this thread was sleeping must not buy one more publish
+            # into a directory the caller is already tearing down.
+            if stop is not None and stop.is_set():
+                return
+            poll()
 
     t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
     t.start()

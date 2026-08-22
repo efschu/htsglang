@@ -3771,10 +3771,48 @@ taxonomy and the global importance ladder.
   `:188` (`orphan_pids`), `:226` (`reap_orphans`);
   probes `turnkey/probe.py:99` (`generation_ok`), `:75` (`LIVENESS_PATH`).
   Units in `deploy/turnkey/`, installer `scripts/turnkey_539_install.sh`.
+  SIGNAL SOURCE (#799): the watchdog's liveness verdict no longer comes from
+  an HTTP status. `LIVENESS_PATH` is `/get_model_info`, which answers from the
+  HTTP process WITHOUT touching the scheduler and is therefore structurally
+  blind to the wedge class (alive, port open, serving nobody); the generation
+  probe that could see it is retired by user order (`watchdog.py:88`). The
+  replacement is the #699/#739 admission-wedge verdict, published passively by
+  the scheduler that already computes it and read as a file:
+  publish `managers/wedge_status.py:126` (`publish_verdict`), read `:172`
+  (`read_wedge_signal`), tri-state `:98` (`WedgeSignal`); the detector's own
+  publish edge `invariant_checker.py` (`make_admission_wedge_poller`, the
+  callable the live thread runs); consumed at `turnkey/runner.py`
+  (`WatchdogRunner.tick`) into `watchdog.py` (`Observation.wedged`).
+  RESTART VETO (#799): `turnkey/runner.py` (`restart_target_drift`) refuses a
+  restart whose configured `--model-path` disagrees with the one the lane last
+  booted. Measured 2026-08-22: stack.toml, `start-serving-30030.sh` and the
+  running instance named THREE different models. A sighted watchdog that
+  "recovers" into a stale configuration replaces the service instead of
+  restoring it.
+  OPERATOR STOP (#799): `turnkey/runner.py` (`operator_stop_reason`) honours
+  `/spinning/PRODUCTION_STOPPED`. The legacy shell watchdog inherits that guard
+  through its start script (`start-serving-30030.sh:16`, exit 3); the turnkey
+  path restarts via `systemctl` and did NOT, so arming it without this check
+  would boot into GPU windows an operator had closed.
+  NAMED BLIND SPOT (#799, inherited from #536): the transported verdict is
+  `admission_wedge_verdict`'s unchanged, and that returns "not wedged" whenever
+  `running > 0` (`invariant_checker.py:585-588`). The fast-lane starvation
+  class -- a request starved behind a co-tenant that IS running -- produces no
+  alarm, no published wedge and no watchdog action. Transporting a verdict does
+  not widen it; closing that class is #536's own work.
   GATE: `/etc/htsglang/stack.toml` must exist and name cards by UUID; the
   units ship DISABLED (enabling them reverses the standing "do not restore
   production" order, `/spinning/GPU_WINDOWS.md:71`). `plan.mode="pinned"`
   additionally requires a plan file written by `turnkey plan-pin`.
+  ARMING IS STILL BLOCKED after #799, and by three separate things, none of
+  which #799 can decide on its own. (a) The standing order above: the units
+  are disabled deliberately, not by oversight. (b) The installed units name
+  `PYTHONPATH=/spinning/htsglang-gpu/python`, a worktree that does NOT contain
+  `sglang.srt.turnkey` at all -- `ExecStart` would die on ModuleNotFoundError.
+  (c) `/etc/htsglang/stack.toml` is stale against what actually boots (see the
+  restart veto above), so a restart would boot the wrong lane. #799 makes the
+  watchdog SEE; it does not arm it, and arming it before (b) and (c) are fixed
+  would trade blindness for a supervisor that actively replaces the service.
   REACH NOTE, and it is why this is a separate entry from the one below:
   `liveness/watchdog.py` (`ConsumerWatchdog`) is IN-PROCESS liveness of an
   attached consumer holding resource claims. This is process-level

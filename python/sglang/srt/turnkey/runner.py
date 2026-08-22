@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -54,6 +55,16 @@ class RunnerDeps:
     api_probe: Callable[[], P.ProbeResult] = None
     gen_probe: Callable[[], P.ProbeResult] = None
     port_probe: Callable[[], bool] = None
+    #: #799: read the scheduler's published admission-wedge verdict. Passive:
+    #: it opens a file, never the server under suspicion.
+    wedge_probe: Callable[[], "object"] = None
+    #: #799: the operator stop marker, if any. Returns a reason or None.
+    operator_stop: Callable[[], Optional[str]] = None
+    #: #799: append one line per alarm to a durable ledger.
+    append_alarm: Callable[[str], None] = None
+    #: #799: veto a restart that would boot a DIFFERENT configuration than
+    #: the one that was running. Returns a reason, or None to allow.
+    restart_drift: Callable[[], Optional[str]] = None
     restart_unit: Callable[[str], bool] = None
     log: Callable[[str, str], None] = None
 
@@ -92,16 +103,157 @@ def _default_log(level: str, msg: str) -> None:
     getattr(logger, level, logger.info)(msg)
 
 
+#: #799: the operator's "production is stopped" marker. Already honoured by
+#: ``/root/bin/start-serving-30030.sh`` (which exits 3 when it exists), so the
+#: legacy shell watchdog inherits the guard for free through its start script.
+#: The turnkey path restarts via ``systemctl restart``, which does NOT run that
+#: script -- so without this check, arming this watchdog would drive boots into
+#: GPU windows that an operator had explicitly closed. That is the collision
+#: the marker was created for (two strands restored into each other's window
+#: and OOM-killed both boots).
+OPERATOR_STOP_MARKER = "/spinning/PRODUCTION_STOPPED"
+
+#: Rate limit for the "supervision suspended" line. The marker can sit for a
+#: whole GPU window; one line every five minutes says so without burying the
+#: journal.
+_STOP_LOG_EVERY_S = 300.0
+
+#: #799 alarm sink. The honest position first: there is NO push notification
+#: channel on this box -- no mail relay, no ntfy, no webhook, nothing in
+#: /root/bin -- and #604 did not build one either; its "alarm" is a greppable
+#: ``TURNKEY-ALARM`` line in a journal nobody was reading on 2026-08-22.
+#:
+#: This file is the smallest thing that is genuinely better: one short,
+#: append-only, dated line per alarm, at a fixed path, so an operator or an
+#: agent starting a session can answer "did serving fail while I was away?"
+#: by reading a handful of lines instead of grepping a 4.8 MB boot log. It is
+#: a durable ledger, NOT a notification: nothing wakes anyone up. Building a
+#: real out-of-band channel needs a transport decision that is not mine to
+#: make, and is filed rather than guessed.
+ALARM_LEDGER = "/spinning/SERVING_ALARM.log"
+
+
+def _append_alarm(line: str, path: str = ALARM_LEDGER) -> None:
+    """Append one alarm line. Never raises: an unwritable ledger must not
+    take down the watchdog that is trying to report an outage."""
+    try:
+        with open(path, "a") as fh:
+            fh.write(line.rstrip("\n") + "\n")
+    except OSError as e:
+        logger.warning("%s alarm ledger %s unwritable: %s", ALARM, path, e)
+
+
+def argv_model_path(argv: Sequence[str]) -> Optional[str]:
+    """The ``--model-path`` a restart WOULD boot, out of the lane's argv."""
+    argv = list(argv or ())
+    for i, tok in enumerate(argv):
+        if tok == "--model-path" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--model-path="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+#: Bytes of boot log to scan for the running instance's identity. The
+#: ``server_args=`` line is emitted within the first few seconds of a boot, so
+#: the head of the file is where it lives; reading the whole file would mean
+#: pulling multi-megabyte logs into a watchdog tick.
+_BOOT_LOG_HEAD_BYTES = 256 * 1024
+_MODEL_PATH_RE = re.compile(r"model_path='([^']+)'")
+
+
+def boot_log_model_path(path: str) -> Optional[str]:
+    """The ``--model-path`` the instance that wrote this log ACTUALLY booted."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            head = fh.read(_BOOT_LOG_HEAD_BYTES)
+    except OSError:
+        return None
+    m = _MODEL_PATH_RE.search(head)
+    return m.group(1) if m else None
+
+
+def restart_target_drift(configured: Optional[str],
+                         booted: Optional[str]) -> Optional[str]:
+    """#799: refuse to "restore" service as a DIFFERENT service.
+
+    Measured on 2026-08-22, and this is why the check exists rather than a
+    hypothetical:
+
+    * ``/etc/htsglang/stack.toml`` (15 Aug) boots
+      ``Qwen3.8-27B-INT8-yarn1.5`` with ``--pp-stage-ratio 14,10,8``;
+    * ``/root/bin/start-serving-30030.sh`` (8 Aug), which the legacy shell
+      watchdog runs on every restart, boots ``Qwen3.6-27B-INT8-W8A8`` at
+      ``--tp-size 3`` -- a superseded model AND a different parallel layout;
+    * the instance actually running that morning was
+      ``Qwen3.8-27B-INT8-vocabint8-embed`` at ``--pp-stage-ratio 32,18,14``.
+
+    All three differ. A watchdog that can finally SEE an outage and then
+    "recovers" it by booting a two-week-old configuration has not restored
+    anything -- it has silently replaced the service while reporting success,
+    which is strictly worse than the blindness it just fixed. Drift is
+    therefore a hard veto on the restart, never a warning that scrolls past.
+
+    ``None`` on either side means the comparison could not be made (no argv,
+    no boot log yet, a first boot). That is NOT drift: refusing a restart
+    because a lane has never booted would make the watchdog useless exactly
+    when a lane is down. The veto needs positive evidence of disagreement.
+    """
+    if not configured or not booted:
+        return None
+    if configured == booted:
+        return None
+    return (f"restart target has DRIFTED: the configuration would boot "
+            f"{configured!r}, but the instance that last ran was {booted!r}. "
+            f"Restarting would replace the service, not restore it")
+
+
+def _read_wedge(directory: Optional[str]):
+    """Read the published wedge verdict, or ``None`` if it cannot be read.
+
+    ``None`` is a legitimate answer and NOT an error path to be hidden: it is
+    the "no measurement" state the state machine already knows how to hold.
+    """
+    try:
+        from sglang.srt.managers import wedge_status
+
+        return wedge_status.read_wedge_signal(directory)
+    except Exception as e:  # noqa: BLE001 - a watchdog must not die on a read
+        logger.warning("%s wedge-status read failed: %s", ALARM, e)
+        return None
+
+
+def operator_stop_reason(path: str = OPERATOR_STOP_MARKER) -> Optional[str]:
+    """The reason production is stopped, or ``None`` if it is not.
+
+    An unreadable-but-present marker still stops the watchdog: the file's
+    EXISTENCE is the order, and its contents are only the explanation.
+    """
+    try:
+        with open(path, "r") as fh:
+            return fh.read().strip() or "no reason given"
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"marker present but unreadable ({e})"
+
+
 class WatchdogRunner:
     """One lane's supervision loop."""
 
     def __init__(self, unit: str, base_url: str, policy: W.Policy,
                  deps: Optional[RunnerDeps] = None,
-                 generation_timeout_s: float = 60.0):
+                 generation_timeout_s: float = 60.0,
+                 wedge_status_dir: Optional[str] = None,
+                 lane_argv: Optional[Sequence[str]] = None,
+                 boot_log: Optional[str] = None):
         self.unit = unit
         self.base_url = base_url.rstrip("/")
         self.policy = policy
         self.generation_timeout_s = generation_timeout_s
+        self.wedge_status_dir = wedge_status_dir
+        self.lane_argv = list(lane_argv or ())
+        self.boot_log = boot_log
         d = deps or RunnerDeps()
         host, port = _split(self.base_url)
         d.api_probe = d.api_probe or (lambda: P.api_ok(self.base_url))
@@ -109,10 +261,18 @@ class WatchdogRunner:
             lambda: P.generation_ok(self.base_url,
                                     timeout=self.generation_timeout_s))
         d.port_probe = d.port_probe or (lambda: P.port_open(host, port))
+        d.wedge_probe = d.wedge_probe or (lambda: _read_wedge(
+            self.wedge_status_dir))
+        d.operator_stop = d.operator_stop or operator_stop_reason
+        d.append_alarm = d.append_alarm or _append_alarm
+        d.restart_drift = d.restart_drift or (lambda: restart_target_drift(
+            argv_model_path(self.lane_argv),
+            boot_log_model_path(self.boot_log) if self.boot_log else None))
         d.restart_unit = d.restart_unit or _systemctl_restart
         d.log = d.log or _default_log
         self.deps = d
         self.state = W.initial(d.now(), policy)
+        self._stop_logged_at: Optional[float] = None
 
     # -- one iteration ----------------------------------------------------
 
@@ -120,10 +280,40 @@ class WatchdogRunner:
         """Probe, decide, act. Returns the decision for tests and logging."""
         d = self.deps
         now = d.now()
-        api = d.api_probe()
-        obs = W.Observation(port_open=d.port_probe(), api_ok=api.ok,
-                            generation=None)
 
+        # #799: an operator stop outranks every probe. Serving is MEANT to be
+        # down, so neither DEAD nor WEDGED is a fault, and a restart would
+        # walk a boot into a GPU window somebody closed on purpose. The state
+        # is re-armed to BOOTING on every stopped tick so that lifting the
+        # marker gives the lane its full boot grace instead of a watchdog that
+        # convicts it for having been down.
+        stop = d.operator_stop()
+        if stop is not None:
+            self.state = W.initial(now, self.policy)
+            if (self._stop_logged_at is None
+                    or now - self._stop_logged_at >= _STOP_LOG_EVERY_S):
+                self._stop_logged_at = now
+                d.log("info", f"[{self.unit}] supervision suspended: "
+                              f"{OPERATOR_STOP_MARKER} exists ({stop})")
+            return W.Decision(state=self.state, action=W.ACT_NONE,
+                              reason=f"operator stop in force: {stop}")
+        self._stop_logged_at = None
+
+        api = d.api_probe()
+        # #799: the passive wedge verdict. Read on EVERY tick, unconditionally
+        # -- gating the read on api.ok would blind the watchdog in exactly the
+        # case where the scheduler is alive and publishing while the HTTP
+        # layer has gone, which is the second half of boot 0822_0829.
+        wedged = None
+        if self.policy.wedge_signal_enabled:
+            sig = d.wedge_probe()
+            wedged = getattr(sig, "verdict", None)
+            if wedged or getattr(sig, "stale", False):
+                d.log("info", f"wedge signal: {getattr(sig, 'detail', sig)}")
+        obs = W.Observation(port_open=d.port_probe(), api_ok=api.ok,
+                            generation=None, wedged=wedged)
+
+        before = self.state
         decision = W.step(self.state, obs, now, self.policy)
 
         if decision.action == W.ACT_PROBE_GENERATION:
@@ -135,6 +325,17 @@ class WatchdogRunner:
             decision = W.step(self.state,
                               W.Observation(obs.port_open, obs.api_ok, g.ok),
                               d.now(), self.policy)
+
+        if decision.action == W.ACT_RESTART:
+            drift = self.deps.restart_drift()
+            if drift is not None:
+                # The state is rolled back to BEFORE the decision on purpose:
+                # a restart we refused must not spend the restart budget, or a
+                # drifted lane would walk itself to GIVEN_UP without a single
+                # restart ever having been attempted.
+                decision = W.Decision(state=before, action=W.ACT_ALARM,
+                                      reason=f"{decision.reason} -- REFUSED: "
+                                             f"{drift}")
 
         self._emit(decision)
         self.state = decision.state
@@ -151,6 +352,10 @@ class WatchdogRunner:
         prefix = f"{ALARM} " if decision.alarming else ""
         self.deps.log(level, f"{prefix}[{self.unit}] {decision.state.phase}: "
                              f"{decision.reason}")
+        if decision.alarming:
+            self.deps.append_alarm(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {self.unit} "
+                f"{decision.state.phase}: {decision.reason}")
 
     def run(self, max_ticks: Optional[int] = None) -> None:
         """Loop forever, or ``max_ticks`` times (tests, dry runs)."""

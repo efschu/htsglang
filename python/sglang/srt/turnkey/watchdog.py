@@ -93,6 +93,20 @@ class Policy:
     #: reintroduce the probe by omission; the config key of the same name
     #: is the only way to turn it back on.
     generation_probe_enabled: bool = False
+    #: #799: consume the #699/#739 admission-wedge verdict, published passively
+    #: by the scheduler that computes it (``managers/wedge_status.py``).
+    #:
+    #: This is what replaces the retired generation probe, and it is ON by
+    #: default deliberately. The probe was retired because proving liveness by
+    #: GENERATING on a timer is forbidden on this box; reading a file the
+    #: scheduler already wrote is not that. Leaving the replacement off by
+    #: default would recreate the exact condition this flag exists to end --
+    #: a correct detector with no consumer, which is how boot 0822_0829 spent
+    #: thirteen minutes serving nobody while every supervisor read "healthy".
+    wedge_signal_enabled: bool = True
+    #: Consecutive confirmations required, shared by the generation probe and
+    #: the wedge signal. ONE budget, not two: ``_systemctl_restart`` documents
+    #: what two rate limiters in series cost when only one of them is visible.
     wedge_confirmations: int = 3
     backoff_s: Tuple[int, ...] = (30, 60, 120, 300, 600)
     max_restarts: int = 5
@@ -123,6 +137,19 @@ class Observation:
     port_open: bool
     api_ok: bool
     generation: Optional[bool] = None
+    #: #799: the scheduler's own admission-wedge verdict, read passively from
+    #: the file it publishes. Tri-state for the same reason ``generation`` is:
+    #: ``None`` means "not measured this tick" -- export off, no file yet, or
+    #: every file stale -- and must never be read as "fine".
+    #:
+    #: What this channel CANNOT see, stated here rather than discovered later:
+    #: it carries ``admission_wedge_verdict``'s verdict unchanged, and that
+    #: function returns "not wedged" whenever ``running > 0``
+    #: (``invariant_checker.py``). The #536 fast-lane starvation class -- a
+    #: request starved behind a co-tenant that is genuinely running -- is
+    #: therefore invisible to this watchdog too. Transporting a verdict does
+    #: not widen it.
+    wedged: Optional[bool] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +157,11 @@ class WatchdogState:
     phase: str = BOOTING
     #: Consecutive FAILED generation probes. Reset by any success.
     gen_failures: int = 0
+    #: #799: consecutive ticks on which the scheduler published a wedge.
+    #: A separate counter from ``gen_failures`` because they are separate
+    #: pieces of evidence; sharing one would make a single failed generation
+    #: probe and a single wedge report add up to a conviction neither earned.
+    wedge_hits: int = 0
     #: Monotonic timestamps of restarts we asked for, within the window.
     restarts: Tuple[float, ...] = ()
     last_gen_probe_at: Optional[float] = None
@@ -196,6 +228,7 @@ def _want_restart(state: WatchdogState, now: float, policy: Policy,
         state,
         phase=BOOTING,
         gen_failures=0,
+        wedge_hits=0,
         restarts=restarts + (now,),
         boot_deadline=now + policy.boot_grace_s,
         next_restart_at=now + delay,
@@ -221,14 +254,28 @@ def step(state: WatchdogState, obs: Observation, now: float,
     """
     # 1. absorbing state
     if state.phase == GIVEN_UP:
-        if obs.api_ok and obs.generation is True:
+        recovered_by_wedge_signal = (policy.wedge_signal_enabled
+                                     and obs.wedged is False)
+        if obs.api_ok and (obs.generation is True or recovered_by_wedge_signal):
             # It came back on its own (an operator restarted it, or a long
             # stall cleared). Resume supervision rather than stay blind.
+            #
+            # #799 added the second door on purpose. With the generation probe
+            # retired, ``obs.generation`` is permanently None, so the original
+            # condition could never be satisfied: GIVEN_UP was absorbing in
+            # the strict sense -- an operator who fixed the lane got a
+            # watchdog that kept alarming and never supervised again. A
+            # POSITIVE no-wedge verdict from the scheduler is evidence of the
+            # same kind and reopens supervision; a missing verdict (None) does
+            # not, because that is not a measurement.
             return Decision(
                 state=dataclasses.replace(state, phase=HEALTHY, gen_failures=0,
-                                          last_gen_probe_at=now),
+                                          wedge_hits=0, last_gen_probe_at=now),
                 action=ACT_NONE,
-                reason="recovered from GIVEN_UP: generation probe succeeded")
+                reason=("recovered from GIVEN_UP: "
+                        + ("the scheduler reports no admission wedge"
+                           if recovered_by_wedge_signal
+                           else "generation probe succeeded")))
         return Decision(state=state, action=ACT_ALARM,
                         reason="still GIVEN_UP; not restarting")
 
@@ -253,15 +300,65 @@ def step(state: WatchdogState, obs: Observation, now: float,
                              + (" while the port stays open"
                                 if obs.port_open else " and the port is shut"))
 
-    # 3. reachable. With the generation probe retired, passive reachability
-    #    IS the verdict, and what that gives up is named rather than hidden:
-    #    the #622 wedge (HTTP 200, no tokens) cannot be detected without
-    #    generating. It is covered by the one-shot verify at teardown/restore,
-    #    not by this loop. Crash detection is unaffected -- a lane that stops
-    #    answering still reaches DEAD and still restarts, above.
+    # 3. reachable, and the scheduler has told us what it sees (#799).
+    #
+    #    This is evaluated BEFORE reachability is allowed to mean "healthy",
+    #    because the whole failure class is a server that is reachable and
+    #    serving nobody. An HTTP 200 outranking the scheduler's own wedge
+    #    verdict would reproduce the blindness this channel exists to remove.
+    #
+    #    Restart is the action, and the reasoning is not "restart is what
+    #    watchdogs do". The cheap in-process remedy already ran and lost: the
+    #    detector makes ONE forced-admission attempt per episode
+    #    (``invariant_checker``'s #788 rung) sixty seconds before this
+    #    watchdog can convict, and boot 0822_0829 alarmed 146 times after it
+    #    with zero decode batches. The wedge is also not self-clearing --
+    #    #698 measured 52 minutes of it. What bounds the damage is not
+    #    refusing to restart, it is the budget below: ``max_restarts`` inside
+    #    ``restart_window_s`` and then GIVEN_UP, loud and terminal. A lane
+    #    that wedges again after five restarts is a human problem, and
+    #    thrashing it destroys the evidence needed to solve it.
+    if policy.wedge_signal_enabled and obs.wedged is not None:
+        if obs.wedged:
+            hits = state.wedge_hits + 1
+            if hits < policy.wedge_confirmations:
+                return Decision(
+                    state=dataclasses.replace(state, phase=SUSPECT,
+                                              wedge_hits=hits),
+                    action=ACT_NONE,
+                    reason=(f"suspect: the scheduler reports an admission "
+                            f"wedge {hits}/{policy.wedge_confirmations} while "
+                            f"the API returns 200"))
+            return _want_restart(
+                dataclasses.replace(state, wedge_hits=hits), now, policy, WEDGED,
+                f"WEDGED -- the scheduler published an admission-wedge verdict "
+                f"on {hits} consecutive polls while the API kept answering "
+                f"(#699/#739 signal: queue age against first-token progress, "
+                f"which forward_ct and health-200 cannot see)")
+        was = state.phase
+        return Decision(
+            state=dataclasses.replace(state, phase=HEALTHY, wedge_hits=0,
+                                      gen_failures=0),
+            action=ACT_NONE,
+            reason=("healthy: the scheduler reports no admission wedge"
+                    if was == HEALTHY else
+                    f"recovered ({was} -> healthy): the scheduler reports no "
+                    "admission wedge"))
+
+    # 3b. reachable, no wedge measurement. With the generation probe retired,
+    #    passive reachability IS the verdict, and what that gives up is named
+    #    rather than hidden:
+    #    with neither a generation verdict nor a wedge verdict, an HTTP 200 is
+    #    the only evidence there is, and the #622 wedge (HTTP 200, no tokens)
+    #    is invisible again. Reaching this branch is therefore a DEGRADED
+    #    supervision mode, not the intended one: it means the scheduler is
+    #    publishing nothing -- export disabled, or a publisher that stopped.
+    #    Crash detection is unaffected either way; a lane that stops answering
+    #    still reaches DEAD and still restarts, above.
     if obs.generation is None and not policy.generation_probe_enabled:
         was = state.phase
-        new = dataclasses.replace(state, phase=HEALTHY, gen_failures=0)
+        new = dataclasses.replace(state, phase=HEALTHY, gen_failures=0,
+                                  wedge_hits=0)
         return Decision(
             state=new, action=ACT_NONE,
             reason=("healthy: API answers; generation probe retired"
