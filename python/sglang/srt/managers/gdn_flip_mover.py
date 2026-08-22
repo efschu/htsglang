@@ -41,7 +41,10 @@ from sglang.srt.layers.dcp.gdn_flip_plan import (
 )
 from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
-from sglang.srt.model_executor.weights_arena import uint8_checksum
+from sglang.srt.model_executor.weights_arena import (
+    checksum_is_representable,
+    uint8_checksum,
+)
 from sglang.srt.managers.kv_reshard import _CHECKSUM_BYTES, _checksum
 
 logger = logging.getLogger(__name__)
@@ -59,9 +62,7 @@ def derive_pp_linear_layer_map(
 
     ids = [int(x) for x in linear_layer_ids]
     if ids != sorted(set(ids)):
-        raise KvReshardError(
-            f"linear layer ids must be strictly ascending, got {ids}"
-        )
+        raise KvReshardError(f"linear layer ids must be strictly ascending, got {ids}")
     bounds = [get_pp_indices(num_hidden_layers, r, pp_size) for r in range(pp_size)]
     if bounds[0][0] != 0 or bounds[-1][1] != num_hidden_layers:
         raise KvReshardError(
@@ -222,8 +223,7 @@ def gdn_flip_preconditions(
     else:
         sub_shards = tuple(
             tuple(
-                tp_partition_size(sub_full, n_ranks, r, units)
-                for r in range(n_ranks)
+                tp_partition_size(sub_full, n_ranks, r, units) for r in range(n_ranks)
             )
             for sub_full in sub_sizes
         )
@@ -305,9 +305,7 @@ class GdnFlipMover:
         self._rank = int(rank)
         self._stage_ids = tuple(tuple(int(g) for g in s) for s in stage_layer_ids)
         if len(self._stage_ids) != self._n:
-            raise KvReshardError(
-                f"{len(self._stage_ids)} stages for {self._n} ranks"
-            )
+            raise KvReshardError(f"{len(self._stage_ids)} stages for {self._n} ranks")
         self._pools_fn = pools_fn
         self._slots_fn = slots_fn
         self._exchange = exchange
@@ -340,9 +338,7 @@ class GdnFlipMover:
                     .view(torch.uint8)
                     .reshape(-1)
                 )
-        flat = (
-            torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
-        )
+        flat = torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
         return torch.cat([flat, _checksum(flat)])
 
     def _pack_tp_side(
@@ -357,14 +353,9 @@ class GdnFlipMover:
                     pools.tp_conv[li, s].contiguous().view(torch.uint8).reshape(-1)
                 )
                 parts.append(
-                    pools.tp_temporal[li, s]
-                    .contiguous()
-                    .view(torch.uint8)
-                    .reshape(-1)
+                    pools.tp_temporal[li, s].contiguous().view(torch.uint8).reshape(-1)
                 )
-        flat = (
-            torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
-        )
+        flat = torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
         return torch.cat([flat, _checksum(flat)])
 
     def _verify(self, payload: torch.Tensor, want: int, peer: int) -> torch.Tensor:
@@ -375,16 +366,62 @@ class GdnFlipMover:
                 f"{want} -- layer map, shard spec or slot set diverged"
             )
         data = payload[:-_CHECKSUM_BYTES]
-        stored = int(
-            payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item()
-        )
+        stored = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
+        # #802: IS THE TRAILER A CHECKSUM AT ALL? Ask before comparing.
+        #
+        # `uint8_checksum` is an exact int64 sum of UNSIGNED bytes, so its
+        # value always lies in [0, 255 * nbytes] -- it can never be negative
+        # and can never exceed that ceiling. A trailer outside that range was
+        # therefore never written by a sender at all: the bytes read as a
+        # checksum are something else, which means the payload was not framed
+        # the way this reader expected. The receive buffer in
+        # `kv_reshard._dist_exchange` is `torch.empty` and is never
+        # pre-zeroed, so an under-filled or mis-framed receive leaves the
+        # ORIGINAL GARBAGE exactly where this trailer is read from -- and the
+        # length check above cannot see it, because an under-filled buffer
+        # still has the allocated `numel`.
+        #
+        # WHY THIS IS ITS OWN ERROR AND NOT A MISMATCH. The two states need
+        # different readers and different next steps:
+        #   in range, different  -> the two ends framed the payload the same
+        #                           way and got different sums. The DATA is
+        #                           wrong. That is what this guard is for.
+        #   out of range         -> nobody wrote a checksum there. The data is
+        #                           not the thing that is wrong; the transport
+        #                           or the geometry is.
+        # Reporting the second as the first kills an instance for a corruption
+        # that did not happen. `checksum_is_representable` was written for
+        # exactly this discrimination (see its docstring: #656 register C22 is
+        # the same misreport, with a negative "sender" checksum) and this call
+        # site never asked it. Measured again 2026-08-22 17:22:44: PP0 died on
+        # `stored=-4664535355886616603` -- negative, impossible for any sum of
+        # unsigned bytes -- reported as a data corruption. Specimen
+        # /spinning/evidence-800/crash_1722_gdn_checksum/.
+        if not checksum_is_representable(stored, data.numel()):
+            raise KvReshardError(
+                f"{LOG_PREFIX} payload from peer {peer} carries NO CHECKSUM in "
+                f"its trailer: the last {_CHECKSUM_BYTES} bytes read as "
+                f"{stored}, which is outside [0, {255 * data.numel()}] and so "
+                f"cannot be uint8_checksum of ANY {data.numel()}-byte payload. "
+                "The trailer was never written, so this rank was handed a "
+                "buffer that was not filled the way it expected -- an "
+                "under-filled receive (the recv buffer is torch.empty and is "
+                "never pre-zeroed, and the length check passes on an allocated "
+                "but unfilled buffer) or a framing/geometry divergence, whose "
+                "byte counts are derived independently per rank and never "
+                "handshaked. THIS IS NOT EVIDENCE OF DATA CORRUPTION: no "
+                "comparison of contents has been made. Refusing to scatter."
+            )
         # Bounded-transient checksum (the weights_arena host-OOM family,
         # 2026-08-08): GDN payloads are GB-scale, a converted copy is 8x.
         have = uint8_checksum(data)
         if stored != have:
             raise KvReshardError(
                 f"{LOG_PREFIX} payload checksum mismatch from peer {peer} "
-                f"(stored {stored}, computed {have}); refusing to scatter"
+                f"(stored {stored}, computed {have}); refusing to scatter. "
+                f"Both values are representable for a {data.numel()}-byte "
+                "payload, so the two ends framed it the same way and summed "
+                "different bytes: the DATA differs (#802)."
             )
         return data
 
@@ -413,9 +450,9 @@ class GdnFlipMover:
                 )
                 off += conv_b
                 chunk = data[off : off + temp_b]
-                pools.tp_temporal[li, s] = chunk.view(
-                    pools.tp_temporal.dtype
-                ).view(h, d, n)
+                pools.tp_temporal[li, s] = chunk.view(pools.tp_temporal.dtype).view(
+                    h, d, n
+                )
                 off += temp_b
         if off != data.numel():
             raise KvReshardError(
@@ -528,16 +565,12 @@ class GdnFlipMover:
         # Local leg (my stage <-> my shard), pools disjoint per direction.
         if direction == PP_TO_TP:
             local = self._pack_pp_side(pools, slots, self._rank)
-            self._write_tp_side(
-                pools, slots, self._rank, local[:-_CHECKSUM_BYTES]
-            )
+            self._write_tp_side(pools, slots, self._rank, local[:-_CHECKSUM_BYTES])
             for peer, data in verified.items():
                 self._write_tp_side(pools, slots, peer, data)
         else:
             local = self._pack_tp_side(pools, slots, self._rank)
-            self._write_pp_side(
-                pools, slots, self._rank, local[:-_CHECKSUM_BYTES]
-            )
+            self._write_pp_side(pools, slots, self._rank, local[:-_CHECKSUM_BYTES])
             for peer, data in verified.items():
                 self._write_pp_side(pools, slots, peer, data)
 
