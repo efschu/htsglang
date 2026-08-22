@@ -1850,24 +1850,56 @@ class ModelRunnerKVCacheMixin:
             return per_req
         return (per_req // n_global) * n_local
 
+    def _mamba_demand_target_is_stated(self: ModelRunner) -> bool:
+        """Is there a REAL concurrency target to size the mamba pool against?
+
+        #773. The demand path needs a target, and the only question that
+        matters is whether the number means anything.
+        `_auto_mamba_target_concurrency` already draws exactly this line: a
+        USER-supplied `--max-running-requests` is a stated demand, while an
+        auto-defaulted one is not -- the speculative hook resets an unset
+        value to 48, and sizing a pool to that over-provisions several GB and
+        OOMs at pool init. This reuses that distinction rather than inventing
+        a second one, so the gate and the target cannot disagree about which
+        numbers are trustworthy.
+        """
+        sa = self.server_args
+        return sa.max_running_requests is not None and getattr(
+            sa, "max_running_requests_user_set", False
+        )
+
     def _auto_mamba_demand_active(self: ModelRunner) -> bool:
         """Whether to size the mamba state pool by DEMAND (concurrency) rather
         than by the fixed --mamba-full-memory-ratio fraction.
 
         Gated narrowly so stock behavior is byte-identical unless it is clearly
-        safe to diverge:
-          * uneven-DCP must be in force (a non-uniform token vector installed,
-            i.e. SGLANG_UNEVEN_DCP + _WEIGHTED). The default path, the
-            even-modulo DCP path, and single-GPU all keep the fixed fraction.
+        safe to diverge. ONE of two routes must supply a demand:
+          * uneven-DCP is in force (a non-uniform token vector installed,
+            i.e. SGLANG_UNEVEN_DCP + _WEIGHTED); or
+          * #773: the operator STATED the concurrency
+            (`_mamba_demand_target_is_stated`). Without this second route the
+            demand path was unreachable on any boot that is not uneven-DCP --
+            the PP phase runs dcp_size 1 -- so such a boot fell through to the
+            fraction branch, which takes 0.9/1.9 of post-weights VRAM and
+            produces a pool far larger than the running set needs. That is
+            what forced `--max-mamba-cache-size` to be pinned BY HAND, and a
+            hand-pinned VRAM number is precisely what the planner exists to
+            eliminate. A boot that never stated a concurrency still gets the
+            fraction path, byte-identical.
+        and in both cases:
           * the user must NOT have pinned --max-mamba-cache-size (handled by the
             explicit branch above) or --mamba-full-memory-ratio (an explicit
             fraction is honored as an override -> fixed-fraction path).
           * radix cache must be enabled (the disable-radix branch owns its own
             request-count sizing).
+
+        The size this produces is floored at `mamba_hard_floor` (#581) and
+        fitted to the budget (#307), so widening the gate cannot under-reserve
+        the running set nor overspend the card.
         """
         sa = self.server_args
         return (
-            uneven_dcp_active(sa.dcp_size)
+            (uneven_dcp_active(sa.dcp_size) or self._mamba_demand_target_is_stated())
             and sa.max_mamba_cache_size is None
             and not sa.disable_radix_cache
             and abs(sa.mamba_full_memory_ratio - MAMBA_FULL_MEMORY_RATIO_DEFAULT) < 1e-9
