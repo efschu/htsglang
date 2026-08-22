@@ -3603,8 +3603,141 @@ class PhaseFlipRuntime:
                 len(leaked),
                 sorted(leaked)[:12],
             )
+            self._census_owner_probe(when, direction, alloc, tree, leaked)
         except Exception as exc:  # noqa: BLE001 - a census never breaks a flip
             logger.warning("%s pool census (%s) failed: %s", LOG_PREFIX, when, exc)
+
+    @staticmethod
+    def _owner_pool_of(alloc_obj):
+        """The KV pool an allocator front-ends.
+
+        LIKE-FOR-LIKE MATTERS HERE. The census holds an ALLOCATOR
+        (`scheduler.token_to_kv_pool_allocator`) while the flip's own reshard
+        builder names POOLS (`...model_runner.token_to_kv_pool`,
+        phase_flip_runtime.py:2041-2042). Comparing an allocator id against a
+        pool id answers nothing, so both sides are reduced to the pool before
+        the ids are printed.
+        """
+        for attr in ("_kvcache", "kvcache"):
+            pool = getattr(alloc_obj, attr, None)
+            if pool is not None:
+                return pool
+        return None
+
+    @classmethod
+    def _owner_ident(cls, label, alloc_obj, tree_obj, pool_obj=None) -> str:
+        if pool_obj is None:
+            pool_obj = cls._owner_pool_of(alloc_obj)
+        return (
+            f"{label}: alloc_id={id(alloc_obj) if alloc_obj is not None else None} "
+            f"alloc_size={getattr(alloc_obj, 'size', '?')} "
+            f"pool_id={id(pool_obj) if pool_obj is not None else None} "
+            f"tree_id={id(tree_obj) if tree_obj is not None else None} "
+            f"tree_type={type(tree_obj).__name__ if tree_obj is not None else None}"
+        )
+
+    def _census_owner_probe(self, when, direction, alloc, tree, leaked) -> None:
+        """Name every pool object, not just the census's own.
+
+        WHY. `_pool_census` above derives `unaccounted` from EXACTLY ONE
+        allocator and ONE tree, both read off the scheduler, and
+        `all_values_flatten` collects only BASE-component DEVICE values. So a
+        row owned by a different pool object, or hanging off a different tree,
+        is unaccounted BY DEFINITION rather than by defect -- and the two are
+        indistinguishable in the census line. On the 2026-08-22 r5 flip that
+        ambiguity was load-bearing: ~94000 rows (21% of a 448698-row pool)
+        read as unaccounted, FLAT across four censuses, which is the signature
+        of an unenumerated owner rather than of a leak (a leak accumulates).
+        A second owner is known to be possible on exactly the stack those
+        flips wedge in -- `model_runner.py` splits `is_draft_pool_worker` from
+        `is_draft_worker` on `is_phase_flip_tp_stack`, so a runner there owns
+        pools the scheduler's handles do not name.
+
+        Also reports the SHAPE of the unaccounted set. The census prints
+        `sorted(leaked)[:12]`, and twelve consecutive ids at the minimum say
+        nothing about the rest -- a contiguity claim was made and withdrawn on
+        exactly that evidence. `runs`/`longest_run` answer it in bounded
+        output instead of dumping ~94000 ids.
+
+        Read-only and best effort, preserving the rule that a census can never
+        affect the flip it is watching.
+        """
+        try:
+            scheduler = self._census_scheduler
+            lines = [self._owner_ident("CENSUS", alloc, tree)]
+            # phase_flip_runtime.py:2041 -- the PP-side pool the reshard
+            # builder names. If CENSUS pool_id tracks this one in BOTH phases
+            # while the TP stack is live, the census is scoped to the PP stack
+            # and the "unaccounted" rows are a measurement artefact.
+            pp_runner = getattr(
+                getattr(scheduler, "tp_worker", None), "model_runner", None
+            )
+            lines.append(
+                self._owner_ident(
+                    "PP_STACK",
+                    getattr(pp_runner, "token_to_kv_pool_allocator", None),
+                    getattr(pp_runner, "tree_cache", None),
+                    pool_obj=getattr(pp_runner, "token_to_kv_pool", None),
+                )
+            )
+
+            stacks = getattr(scheduler, "phase_flip_stacks", None)
+            if stacks is None:
+                lines.append("STACKS: None at census time")
+            else:
+                for label, worker in (
+                    ("TP", getattr(stacks, "tp_worker", None)),
+                    ("DRAFT", getattr(stacks, "draft_worker", None)),
+                ):
+                    if worker is None:
+                        lines.append(f"{label}: worker None")
+                        continue
+                    # Mirrors draft_kv_pool()'s traversal exactly, so a null
+                    # result here means what it means there.
+                    inner = getattr(worker, "draft_worker", None) or worker
+                    runner = (
+                        getattr(inner, "model_runner", None)
+                        or getattr(inner, "draft_runner", None)
+                        or inner
+                    )
+                    lines.append(
+                        self._owner_ident(
+                            label,
+                            getattr(runner, "token_to_kv_pool_allocator", None),
+                            getattr(runner, "tree_cache", None),
+                            pool_obj=getattr(runner, "token_to_kv_pool", None),
+                        )
+                        + f" flip_tp={getattr(runner, 'is_phase_flip_tp_stack', '?')}"
+                        + f" draft_pool={getattr(runner, 'is_draft_pool_worker', '?')}"
+                    )
+
+            if leaked:
+                ids = sorted(leaked)
+                runs, longest, cur = 1, 1, 1
+                for a, b in zip(ids, ids[1:]):
+                    if b == a + 1:
+                        cur += 1
+                    else:
+                        runs += 1
+                        longest = max(longest, cur)
+                        cur = 1
+                longest = max(longest, cur)
+                lines.append(
+                    f"UNACCOUNTED: n={len(ids)} min={ids[0]} max={ids[-1]} "
+                    f"runs={runs} longest_run={longest}"
+                )
+            else:
+                lines.append("UNACCOUNTED: n=0")
+
+            logger.warning(
+                "%s POOL OWNERS %s %s | %s",
+                LOG_PREFIX,
+                when,
+                direction,
+                " | ".join(lines),
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe never breaks a flip
+            logger.warning("%s pool owner probe (%s) failed: %s", LOG_PREFIX, when, exc)
 
     def _log_not_ready(self) -> None:
         """Report what is holding this rank out of quiescence.
