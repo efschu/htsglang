@@ -90,6 +90,21 @@ def _relief(live_max, split, *, evicts_to=None):
     r._rows_at_boot = None
     r._exhausted = False
     r._bytes_per_row = 1024
+    # #796 (9aec623b2a, "Report measured state when a shrink cannot pay, not
+    # two candidate causes") made the cannot-pay warning name the measured
+    # state, and one of the things it names is the buffer count
+    # (kv_backing_relief.py:2457). This is a `__new__` relief, so nothing set
+    # it and the improved DIAGNOSTIC raised where the old two-cause message
+    # did not -- a better log line turning a passing test red, which is worth
+    # saying out loud because it is the least suspicious-looking way for this
+    # class of break to arrive.
+    #
+    # 1 is the honest value for this fixture and not a filler: `_Pool` above
+    # models a single backing pool. It cannot move any verdict here either --
+    # the only arithmetic that reads `_buffers` is `_min_release_rows`, which
+    # short-circuits on `chunk <= 0` first, and this `_Pool` exposes no
+    # `backing_commit_chunk_bytes` at all.
+    r._buffers = 1
     r._last_live_split = split
     r._tree_cache_fn = lambda: object()
     r.evicted_rows_total = 0
