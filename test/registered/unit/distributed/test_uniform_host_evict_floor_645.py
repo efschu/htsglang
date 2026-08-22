@@ -223,6 +223,33 @@ class _RankFixture:
         self.deleted_from_tree = []
 
     # -- the surface write_backup touches, and nothing else ----------------
+    #
+    # #773/#581 (703b05c723) added a gate to that surface: `write_backup`
+    # asks `self._mamba_write_through_pin_admissible(node, ...)` at
+    # unified_radix_cache.py:1921 before taking a write-through pin, and this
+    # fixture -- which IS the `self` that `_run_backup` passes in -- did not
+    # carry it.
+    #
+    # The SHIPPED predicate is bound rather than stubbed True, so the real
+    # admission rule keeps running here. `_mamba_pin_budget` is pinned to -1,
+    # which is not an invented number: it is the value the production property
+    # itself computes when there is no mamba pool to protect
+    # (unified_radix_cache.py:3426), and the predicate's first budget branch
+    # reads `budget < 0 -> admissible`. This fixture has a KV-only tree, so
+    # that is the branch a real cache of this shape would take, and the host
+    # evict floor under test sees exactly the admissions it saw before #773.
+    # Delegated rather than bound as a class attribute, because this file
+    # imports the cache inside the functions that need it (see `_run_backup`
+    # and `_build_group`) and a class body cannot reach that.
+    _mamba_pin_budget = -1
+
+    def _mamba_write_through_pin_admissible(self, node, write_back=False):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return UnifiedRadixCache._mamba_write_through_pin_admissible(
+            self, node, write_back=write_back
+        )
+
     def _build_sidecar_transfers(self, phase, kv_xfer, comp_xfers):
         return []
 

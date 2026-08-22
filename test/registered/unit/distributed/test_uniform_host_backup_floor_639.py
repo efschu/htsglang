@@ -115,6 +115,14 @@ BOOT_DEVICE_POOLS = [190400, 143840, 143906]
 #: This is the axis the defect is decided on.
 BOOT_HOST_POOLS = [359652, 287722, 273336]
 
+#: [#772] The configured prefill width every fixture rank reports for #794's
+#: corridor slot. Shared by the fake scheduler and by the fake collective's
+#: payload mirror below, because the two must agree by construction: the
+#: scheduler CONTRIBUTES this number and the collective REDUCES it, and a
+#: fixture where those two drifted apart would reduce a vector whose slots no
+#: longer line up -- silently, since MIN accepts any numbers at all.
+_CORRIDOR_WIDTH = 4096
+
 
 class _FakeAllocator:
     def __init__(self, avail):
@@ -190,6 +198,23 @@ class _FakeScheduler:
     uniform_budget_deficit = Scheduler.uniform_budget_deficit
     # #791b: and the PREFETCH BALLOT, same reason one release later again.
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
+    # #794 [#772]: and the CORRIDOR WIDTH CEILING, one release later again --
+    # the same shape as #791b directly above. `_update_uniform_pool_budget`
+    # calls `self._local_corridor_width_ceiling()` unconditionally while
+    # assembling the vote vector (scheduler.py:4896), so a stub without it
+    # raises AttributeError inside the reduce -- this file's baseline
+    # failure (masked by `CustomTestCase`'s retry wrapper down to
+    # `Exception: retry() exceed maximum number of retries.`; the real cause
+    # only shows under --tb=long).
+    #
+    # Bind the SHIPPED function rather than stub a number: it is written to
+    # be non-binding where it cannot price (every failure path returns the
+    # configured width), so this stub -- which has no admission gate --
+    # contributes `_CORRIDOR_WIDTH` to the MIN and cannot move the #639 host
+    # quantities under test.
+    chunked_prefill_size = _CORRIDOR_WIDTH
+    _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    uniform_corridor_width = Scheduler.uniform_corridor_width
 
 
 class _FakeDist:
@@ -221,6 +246,15 @@ class _FakeDist:
             -host_avail,
             m_absent,
             -m_absent,
+            # #794 [#772]: the corridor width ceiling rides BETWEEN the mamba
+            # pair and the ballot -- scheduler.py:4896, and the placement is
+            # deliberate there ("everything above is indexed from the head
+            # and the ballot is indexed from the TAIL, so inserting here
+            # leaves both readings intact"). This mirror has to insert it in
+            # the SAME place for that to hold: appending it after the ballot
+            # would keep the vector length right and every ballot reading
+            # wrong.
+            _CORRIDOR_WIDTH,
             # #791b: the prefetch ballot rides behind the mamba pair;
             # neutral on every fixture rank (empty queue).
             *build_prefetch_ballot_payload([], {}),

@@ -145,6 +145,25 @@ def _run_ranks(
                 tp_rank=rank,
                 server_args=_capacity_server_args(capacity_mode, solo_rank),
                 is_draft_worker=draft_worker,
+                # #797 split the POOL-geometry flag off the construction flag:
+                #
+                #   model_runner.py:512
+                #   self.is_draft_pool_worker = (
+                #       is_draft_worker and not is_phase_flip_tp_stack)
+                #
+                # The pool-shape decision sites in
+                # `model_runner_kv_cache_mixin` now consult the POOL flag and
+                # "never is_draft_worker directly" (:504-511), so this stub --
+                # which mirrors a ModelRunner rather than being one -- has to
+                # carry it or the mixin helpers bound below raise
+                # AttributeError before reaching the geometry under test.
+                #
+                # Written as the DERIVATION rather than a pinned literal: this
+                # fixture builds no phase-flip TP stack, so the second term is
+                # False and the pool flag simply equals the draft flag. If a
+                # case here ever does build one, the value has to move with it,
+                # and stating the rule is what makes that visible.
+                is_draft_pool_worker=draft_worker,
             )
             # The stub is not a ModelRunner, so bind the mixin helpers the
             # method calls on ``self`` explicitly.

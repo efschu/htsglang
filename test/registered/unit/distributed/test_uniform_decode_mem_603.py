@@ -97,6 +97,24 @@ class _FakeScheduler:
     # #791b: and the PREFETCH BALLOT, same reason one release later again.
     # The shipped drain no-ops with the storage flag off (set in __init__).
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
+    # #794 [#772]: and the CORRIDOR WIDTH CEILING, one release later again.
+    # `_update_uniform_pool_budget` calls `self._local_corridor_width_ceiling()`
+    # unconditionally while assembling the vote vector (scheduler.py:4896), so
+    # a stub without it raises AttributeError inside the reduce -- this file's
+    # baseline failure. Bind the SHIPPED function rather than stub a number:
+    # it is written to be non-binding where it cannot price (every failure
+    # path, including the AttributeError this stub's missing surface would
+    # otherwise cause inside `get_prefill_admission_gate`, returns the
+    # configured width), so this stub -- which has no admission gate -- always
+    # contributes a non-binding vote and the #603 quantities under test stay
+    # untouched. `chunked_prefill_size` only has to be a positive int; this
+    # file's `_FakeDist.all_reduce` ignores payload content and sets `t[0]`
+    # directly from `world_avails`, so the exact value is inert here and
+    # `_CORRIDOR_WIDTH` is not shared with a payload mirror the way the
+    # 616g/639/639b files need.
+    chunked_prefill_size = 4096
+    _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    uniform_corridor_width = Scheduler.uniform_corridor_width
 
 
 class _FakeDist:
