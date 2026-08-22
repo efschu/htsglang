@@ -2973,6 +2973,26 @@ class MHATokenToKVPool(KVCache):
             )
         prev = int(self.size)
         n = int(num_tokens)
+        # #796: this function had NO logging at all, which is why a shrink that
+        # reads `current` as one number while the target span implies another
+        # could not be told apart from outside. `prev` (the pool's own size) and
+        # `uniform_backed_rows` (what the arena actually has mapped in EVERY
+        # buffer) are the two quantities that can diverge here; neither was
+        # observable. Log them at the call, before any branch mutates state.
+        backed = int(self.uniform_backed_rows)
+        logger.info(
+            "BACKING-DIAL call: request=%d prev_size=%d uniform_backed_rows=%d "
+            "reserved_backing_rows=%d store_bound_rows=%d page_size=%d "
+            "delta=%+d branch=%s",
+            n,
+            prev,
+            backed,
+            int(self.reserved_backing_rows),
+            int(self.store_bound_rows),
+            int(self.page_size),
+            n - prev,
+            "noop" if n == prev else ("grow" if n > prev else "shrink"),
+        )
         if n == prev:
             return 0
         if n > prev:
@@ -2984,9 +3004,26 @@ class MHATokenToKVPool(KVCache):
                 if hi > lo:
                     buf[lo:hi].zero_()
             self.size = n
+            logger.info(
+                "BACKING-DIAL grow done: prev_size=%d -> size=%d "
+                "uniform_backed_rows %d -> %d released_bytes=0",
+                prev,
+                n,
+                backed,
+                int(self.uniform_backed_rows),
+            )
             return 0
         released = owner.shrink(n)
         self.size = n
+        logger.info(
+            "BACKING-DIAL shrink done: prev_size=%d -> size=%d "
+            "uniform_backed_rows %d -> %d released_bytes=%d",
+            prev,
+            n,
+            backed,
+            int(self.uniform_backed_rows),
+            int(released),
+        )
         return released
 
     def _clear_buffers(self):
