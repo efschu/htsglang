@@ -109,6 +109,21 @@ def test_seed_confirmed_by_measurement_passes():
     assert_seed_superseded()
 
 
+def test_a_verdict_disarms_even_when_it_carries_no_vector():
+    """The disarm keys on the VERDICT, not on the recorded vector.
+
+    Encoding "a verdict happened" as "the recorded vector is not None" would
+    make an empty or None vector fail to disarm silently, and a missed disarm
+    refuses a boot -- the gate's dangerous direction. Unreachable from today's
+    install site, where the vector is always a non-empty list, which is exactly
+    why it is pinned here rather than left to that call site's good behaviour.
+    """
+    note_seed_awaiting_supersession(SEED)
+    note_seed_calibration_site(dcp_size=3, allow_install=True)
+    note_seed_superseded(None)
+    assert_seed_superseded()
+
+
 def test_no_calibration_site_is_not_a_broken_promise():
     """dcp_size == 1: there is no per-rank vector to measure. Declining an
     install that was never possible is not a broken claim."""
@@ -134,9 +149,10 @@ def test_calibration_without_a_seed_is_not_refused():
 def test_state_is_readable_for_diagnosis():
     note_seed_awaiting_supersession(SEED)
     note_seed_calibration_site(dcp_size=3, allow_install=True)
-    awaiting, calibrated, superseded = seed_liveness_state()
+    awaiting, calibrated, verdict, superseded = seed_liveness_state()
     assert awaiting == SEED
     assert calibrated is True
+    assert verdict is False
     assert superseded is None
 
 

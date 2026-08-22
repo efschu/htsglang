@@ -277,6 +277,7 @@ def get_cp_token_ratios() -> Optional[list]:
 
 _SEED_AWAITING: Optional[list] = None
 _SEED_CALIBRATION_REACHED: bool = False
+_SEED_VERDICT_REACHED: bool = False
 _SEED_SUPERSEDED_BY: Optional[list] = None
 
 
@@ -299,21 +300,42 @@ def note_seed_calibration_site(dcp_size: int, allow_install: bool) -> None:
 
 
 def note_seed_superseded(vector: Optional[Sequence[int]]) -> None:
-    """Disarm the seed claim: a measured vector replaced the estimate."""
-    global _SEED_SUPERSEDED_BY
+    """Disarm the seed claim: the calibration reached a verdict.
+
+    The VERDICT is a separate boolean from the vector it produced, and the
+    disarm keys on the boolean. Encoding "a verdict happened" as "the recorded
+    vector is not None" would make an empty or None vector fail to disarm
+    SILENTLY, and the consequence of a missed disarm here is a refused boot --
+    the gate's dangerous direction. The vector is kept for diagnosis only.
+    """
+    global _SEED_VERDICT_REACHED, _SEED_SUPERSEDED_BY
+    _SEED_VERDICT_REACHED = True
     _SEED_SUPERSEDED_BY = list(vector) if vector else None
 
 
 def seed_liveness_state() -> tuple:
-    """(awaiting, calibration_reached, superseded_by) -- for tests and logs."""
-    return (_SEED_AWAITING, _SEED_CALIBRATION_REACHED, _SEED_SUPERSEDED_BY)
+    """(awaiting, calibration_reached, verdict_reached, superseded_by).
+
+    The verdict flag is reported separately from the vector it produced,
+    because those are the gate's real inputs: a verdict that recorded no vector
+    still disarms, and a reader that could not tell the two apart would face
+    the same ambiguity the gate itself no longer has.
+    """
+    return (
+        _SEED_AWAITING,
+        _SEED_CALIBRATION_REACHED,
+        _SEED_VERDICT_REACHED,
+        _SEED_SUPERSEDED_BY,
+    )
 
 
 def reset_seed_liveness() -> None:
     """Clear the latch (test support; a fresh process starts clear anyway)."""
-    global _SEED_AWAITING, _SEED_CALIBRATION_REACHED, _SEED_SUPERSEDED_BY
+    global _SEED_AWAITING, _SEED_CALIBRATION_REACHED
+    global _SEED_VERDICT_REACHED, _SEED_SUPERSEDED_BY
     _SEED_AWAITING = None
     _SEED_CALIBRATION_REACHED = False
+    _SEED_VERDICT_REACHED = False
     _SEED_SUPERSEDED_BY = None
 
 
@@ -327,7 +349,7 @@ def assert_seed_superseded() -> None:
     """
     if _SEED_AWAITING is None or not _SEED_CALIBRATION_REACHED:
         return
-    if _SEED_SUPERSEDED_BY is not None:
+    if _SEED_VERDICT_REACHED:
         return
     from sglang.srt.planner.retracted import SeedNotSupersededError
 
