@@ -643,5 +643,235 @@ class PPVoidSlotAdvance798(unittest.TestCase):
         )
 
 
+class _StoppedAtRecvProxy(Exception):
+    """The loop reached the proxy RECEIVE -- i.e. the defect is live."""
+
+
+class _StopAtDrain(Exception):
+    """The loop reached the drain branch -- i.e. the guard did its job."""
+
+
+class _LoopStubBatch:
+    """Minimum a `ScheduleBatch` slot needs to be truthy and clearable."""
+
+    def __init__(self):
+        self.reqs = ()
+
+    def __bool__(self):
+        return True
+
+
+class PPVoidWithoutUpstreamLaunchWiring798(unittest.TestCase):
+    """THE CALL SITE, not the helper -- and this class exists because the
+    rest of this file did not cover it.
+
+    THE GAP, MEASURED RATHER THAN REASONED. Every other case in this file
+    drives `_RankLoop` (:318), which is a re-implementation that MIRRORS
+    `_event_loop_pp_body`'s slot sequence and makes its own call to
+    `_pp_void_pass_without_upstream_launch` at :416. That proves the helper
+    behaves correctly inside a loop shaped like the real one. It proves
+    nothing about the SHIPPED loop. The check that showed this: disabling the
+    production call site at scheduler_pp_mixin.py:1384 (replacing it with
+    `pass`) and running this file left all four cases GREEN, in 39.70s. A fix
+    whose own suite cannot tell whether it is wired is the failure mode
+    recorded against #797d, one door earlier, and it had recurred here.
+
+    WHAT THIS RIG DOES INSTEAD, modelled on `PPVoidOwnBatchWiring797d` in
+    test_pp_retracted_pass_void_797.py, which drives the real loop for the
+    #797d gate. `_event_loop_pp_body`, `_pp_void_own_batch` and
+    `_pp_void_pass_without_upstream_launch` are bound FOR REAL off
+    `SchedulerPPMixin`; nothing about the gate under test is stubbed or
+    re-implemented. The loop is stopped by raising from the two branches that
+    can follow the gate, so which branch was taken is read off the exception
+    type rather than inferred from state:
+
+        `_pp_recv_proxy_tensors` raises `_StoppedAtRecvProxy`  -> defect live
+        `_pp_drain_voided_proxy` raises `_StopAtDrain`         -> guard fired
+
+    THE PRECONDITION IS THE FOURTH COMBINATION ITSELF, and it is set up so
+    that the #797d gate CANNOT be what produces the result: this rank has NOT
+    retracted anything, so `_pp_admission_pass_voided` is False when the
+    #797d call site at :1368 is reached and that gate is a no-op. The only
+    thing that can void this pass is #798's own gate at :1384. Meanwhile
+    `_pp_upstream_launched_incoming` is False and `get_next_batch_to_run`
+    hands back a non-empty batch -- upstream launched nothing, this rank
+    derived work from its own resident state.
+
+    VERIFIED TO GO RED, by me, on the tree this commit sits on: with
+    scheduler_pp_mixin.py:1384 replaced by `pass`,
+    `test_the_real_event_loop_drains_instead_of_receiving` fails with
+    `_StoppedAtRecvProxy` and
+    `test_the_forwarded_decision_already_carries_the_void` fails on
+    `launched` being True. Restoring the line returns both to green.
+    """
+
+    def _holder(self, upstream_launched: bool):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        calls = {"recv_proxy": 0, "drain": 0, "sent": []}
+        stub_batch = _LoopStubBatch()
+
+        h = types.SimpleNamespace(
+            ps=types.SimpleNamespace(pp_rank=1, pp_size=WORLD),
+            pp_group=types.SimpleNamespace(is_first_rank=False, is_last_rank=False),
+            pp_loop_size=WORLD,
+            running_mbs=[None] * WORLD,
+            last_mbs=[None] * WORLD,
+            mbs=[None] * WORLD,
+            mb_metadata=[None] * WORLD,
+            chunked_req=None,
+            request_receiver=types.SimpleNamespace(recv_requests=lambda: []),
+            server_args=types.SimpleNamespace(
+                pp_async_batch_depth=0, enable_phase_flip=False
+            ),
+            _pp_output_expected_incoming=False,
+            # THIS RANK RETRACTED NOTHING. Keeping this False is what makes
+            # the result attributable to #798's gate and not #797d's.
+            _pp_admission_pass_voided=False,
+            # A non-gapped set: the stage-boundary proxy exists, so the
+            # receive this guard prevents is one the loop would really make.
+            _pp_gapped_wire=False,
+            _pp_upstream_launched_incoming=upstream_launched,
+        )
+
+        from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
+
+        h._pp_flip_pass_tick = lambda mb_id: None
+        h._pp_forward_and_process_input_requests = lambda recv_reqs: None
+
+        def _recv_admission_decision():
+            # WHERE THE PER-HOP FACT ACTUALLY LANDS, and the rig has to put it
+            # here rather than on the holder. `_event_loop_pp_body` RESETS
+            # `_pp_upstream_launched_incoming` to False at :1295 on every pass
+            # (#791b's "a pass that receives nothing cannot inherit the
+            # previous pass's expectation"), and the real receive path writes
+            # it from `_PP_UPSTREAM_LAUNCHED_KEY` at :4364 immediately after.
+            # A value pre-set on the holder is therefore erased before the
+            # gate ever sees it -- setting it here is what reproduces the
+            # shipped ordering instead of an ordering convenient to the test.
+            h._pp_upstream_launched_incoming = upstream_launched
+            return PPAdmissionDecision(mb_id=0, entries=())
+
+        h._pp_recv_admission_decision = _recv_admission_decision
+        # A REAL decision object, not a bare `object()`: the gate under test
+        # re-voids whatever it finds in `_pp_admission_amended_to_forward` via
+        # `void_pp_admission_decision`, which reads `.entries`. Stubbing that
+        # away would remove half of what the gate does from the test.
+        h._pp_reconcile_incoming_admission = lambda incoming: (
+            {},
+            PPAdmissionDecision(mb_id=0, entries=()),
+        )
+        h._pp_forwarded_schedule_from = lambda amended: None
+        h._pp_note_output_expectation = lambda mb_id, expected, amended: None
+        h._pp_note_chunked_req_before_admission = lambda mb_id: None
+        # No retraction on this rank: the real `_pp_void_retracted_pass`
+        # would leave `_pp_admission_pass_voided` False here, and that is
+        # exactly what this stub reproduces.
+        h._pp_void_retracted_pass = lambda effective, amended: ({}, amended)
+
+        class _Plan:
+            def __init__(self, batch_to_run, running_batch):
+                self.batch_to_run = batch_to_run
+                self.running_batch = running_batch
+
+        def _get_next_batch_to_run(running_batch=None, last_batch=None):
+            # Resident work of this rank's own, on a pass the upstream did
+            # not launch -- the combination the wire never reconciled.
+            return _Plan(batch_to_run=stub_batch, running_batch=running_batch)
+
+        h.get_next_batch_to_run = _get_next_batch_to_run
+
+        def _recv_proxy_tensors(mb_id):
+            calls["recv_proxy"] += 1
+            raise _StoppedAtRecvProxy(
+                f"the loop entered a blocking proxy receive on mb_id={mb_id} "
+                "for a pass the upstream never launched"
+            )
+
+        h._pp_recv_proxy_tensors = _recv_proxy_tensors
+
+        def _drain_voided_proxy(mb_id):
+            calls["drain"] += 1
+            raise _StopAtDrain()
+
+        h._pp_drain_voided_proxy = _drain_voided_proxy
+
+        def _send_admission_decision(
+            amended, expects_output=None, pass_voided=None, launched=None
+        ):
+            calls["sent"].append({"pass_voided": pass_voided, "launched": launched})
+
+        h._pp_send_admission_decision = _send_admission_decision
+
+        # BOUND FOR REAL. If `_event_loop_pp_body` stops calling
+        # `_pp_void_pass_without_upstream_launch`, or calls it after the
+        # admission send, nothing in this rig papers over it.
+        for name in (
+            "_event_loop_pp_body",
+            "_pp_void_own_batch",
+            "_pp_void_pass_without_upstream_launch",
+        ):
+            setattr(h, name, getattr(SchedulerPPMixin, name).__get__(h))
+        return h, calls
+
+    def _run_one_pass(self, upstream_launched: bool):
+        h, calls = self._holder(upstream_launched)
+        with self.assertRaises((_StopAtDrain, _StoppedAtRecvProxy)) as caught:
+            h._event_loop_pp_body()
+        return h, calls, caught.exception
+
+    def test_the_real_event_loop_drains_instead_of_receiving(self):
+        """The shipped loop must not enter the receive. Red at :1384 disabled."""
+        h, calls, exc = self._run_one_pass(upstream_launched=False)
+        self.assertIsInstance(
+            exc,
+            _StopAtDrain,
+            "the shipped `_event_loop_pp_body` entered the proxy RECEIVE for a "
+            "pass its upstream never launched -- the #798 call site at "
+            f"scheduler_pp_mixin.py:1384 is not wired: {exc}",
+        )
+        self.assertEqual(calls["recv_proxy"], 0, "the proxy receive was entered")
+        self.assertEqual(calls["drain"], 1, "the drain branch was not taken")
+        self.assertIsNone(
+            h.mbs[0], "the voided slot was left non-empty by the real loop"
+        )
+
+    def test_the_forwarded_decision_already_carries_the_void(self):
+        """Ordering, not just presence.
+
+        The whole correctness argument for placing the gate at :1384 is that
+        the `launched=` this rank forwards is ALREADY the voided value, so the
+        ranks below decide off the same per-hop fact. A gate that ran after
+        the send would forward launched=True while sending no proxy -- the
+        same defect one hop down -- and would still pass the drain assertion
+        above. This is the test that separates those two.
+        """
+        _h, calls, _exc = self._run_one_pass(upstream_launched=False)
+        self.assertTrue(calls["sent"], "no admission decision was forwarded")
+        self.assertIs(
+            calls["sent"][0]["launched"],
+            False,
+            "the forwarded decision still claimed launched=True on a voided "
+            "pass, so the gate ran AFTER the send instead of before it",
+        )
+
+    def test_it_is_inert_when_the_upstream_did_launch(self):
+        """The control: same rig, upstream launched, nothing may be voided.
+
+        Without this, a guard that voided every pass unconditionally would
+        pass both tests above. Here the loop must reach the RECEIVE, because
+        a proxy really is on the wire for this pass.
+        """
+        h, calls, exc = self._run_one_pass(upstream_launched=True)
+        self.assertIsInstance(
+            exc,
+            _StoppedAtRecvProxy,
+            "the guard voided a pass whose upstream DID launch, which strands "
+            f"a proxy message on the wire: {exc}",
+        )
+        self.assertEqual(calls["drain"], 0, "the drain branch was taken wrongly")
+        self.assertIsNotNone(h.mbs[0], "a launched pass had its slot cleared")
+
+
 if __name__ == "__main__":
     unittest.main()
