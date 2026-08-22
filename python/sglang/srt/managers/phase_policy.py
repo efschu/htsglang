@@ -44,8 +44,27 @@ request, TTFT ~2.9 s on a 65-CHARACTER prompt.
 Resting in TP costs the opposite case: a long prompt arriving at a QUIET
 server now pays ~2.7 s of ``tp_to_pp`` inside its TTFT that it previously got
 free. That cost is bounded and, above the threshold N, repaid by the prefill
-saving by construction -- N is precisely the point where it is. Below N the
-prompt never wanted PP anyway and now prefills in TP without any flip at all.
+saving by construction -- N is precisely the point where it is.
+
+#777, AND READ THIS BEFORE QUOTING N AT A SINGLE PROMPT. This paragraph used
+to end "Below N the prompt never wanted PP anyway and now prefills in TP
+without any flip at all", which is a claim about ONE prompt that the code does
+not make. N is compared against ``inp.pending_prefill_tokens`` -- the AGGREGATE
+of admitted-but-not-yet-computed prompt tokens across the waiting queue, the
+chunked remainder and in-flight arrivals (see ``Scheduler._pending_prefill_
+tokens``). There is no per-request comparison against N anywhere in this
+module. Two consequences the old wording denied:
+
+  * a 1.8k-token prompt reaches PP prefill whenever it lands in a backlog
+    whose SUM crosses N, even though 1.8k is far below it;
+  * once the layout is resident in PP, every prompt admitted into it prefills
+    there at any size. The only ways back to TP are the aggregate exit rules,
+    the residency and stall caps, and the idle dwell -- none of which look at
+    the size of a newly arrived prompt.
+
+N is a phase-wide backlog break-even. It is not, and never was, a small-prompt
+shield. Whether it SHOULD also gate per request is a policy question and
+belongs to the planner, not to this docstring.
 
 The previous argument for PP-resting ("a long prompt gets PP-class prefill
 with ZERO flip cost") was written when prefill could not run in TP AT ALL, so
@@ -731,10 +750,95 @@ class FlipCostEstimator:
 _FLIP_COST_ESTIMATOR: Optional[FlipCostEstimator] = None
 
 
+#: What `config_from_env` actually froze into `PhasePolicyConfig.flip_tokens`,
+#: and the two throughputs it was priced with. Module-global for the same
+#: reason the estimator is: the seam that measures a flip and the config that
+#: priced it are built in different places on the same rank. None until a
+#: config has been built (a process that never arms the policy says nothing).
+_FLIP_TOKENS_AT_BOOT: Optional[int] = None
+_FLIP_TOKENS_PRICING: Optional[tuple] = None
+#: One-shot latch for the staleness warning (#777). The condition is true on
+#: every flip once it is true at all, and this is a boot-configuration fact,
+#: not a per-flip event.
+_FLIP_TOKENS_STALE_SAID = False
+
+
+def note_flip_tokens_pricing(flip_tokens, tp_tok_s, pp_tok_s, explicit) -> None:
+    """Record how N was priced, so a later measurement can say it went stale."""
+    global _FLIP_TOKENS_AT_BOOT, _FLIP_TOKENS_PRICING, _FLIP_TOKENS_STALE_SAID
+    _FLIP_TOKENS_AT_BOOT = int(flip_tokens)
+    _FLIP_TOKENS_PRICING = (float(tp_tok_s), float(pp_tok_s), bool(explicit))
+    _FLIP_TOKENS_STALE_SAID = False
+
+
+def repriced_flip_tokens() -> Optional[tuple]:
+    """(n_boot, n_now, seam_boot, seam_now), or None when there is nothing to say.
+
+    #777. N is priced once, at boot, off an UNMEASURED seam seed, and never
+    repriced; the estimator meanwhile tracks what flips really cost. This
+    reports what N would be if it were priced on the measurements taken since
+    -- a statement, not an action. Nothing here changes the live threshold.
+
+    None for every reason the comparison would be meaningless, and they are
+    kept apart at the call site rather than collapsed here: no config built
+    yet, no measurement yet, N pinned explicitly by the operator (then it is
+    an assertion, not a derivation), or a pricing the break-even formula
+    refuses.
+    """
+    est = _FLIP_COST_ESTIMATOR
+    if est is None or not est.calibrated:
+        return None
+    if _FLIP_TOKENS_AT_BOOT is None or _FLIP_TOKENS_PRICING is None:
+        return None
+    tp_tok_s, pp_tok_s, explicit = _FLIP_TOKENS_PRICING
+    if explicit or tp_tok_s <= 0:
+        return None
+    try:
+        n_now = break_even_tokens(est.value(), tp_tok_s, pp_tok_s)
+    except PhasePolicyError:
+        return None
+    return (_FLIP_TOKENS_AT_BOOT, int(n_now), est.seed_s, est.value())
+
+
 def observe_flip_cost(seconds) -> None:
-    """Feed one measured flip-leg duration to the estimator (#677)."""
-    if _FLIP_COST_ESTIMATOR is not None:
-        _FLIP_COST_ESTIMATOR.observe(seconds)
+    """Feed one measured flip-leg duration to the estimator (#677).
+
+    #777: and SAY IT when that measurement has left the live threshold behind.
+    The estimator following the regime while N stays frozen at the seed is the
+    counter-without-an-actuator shape; the actuator is the planner's call, but
+    the silence was this module's.
+    """
+    global _FLIP_TOKENS_STALE_SAID
+    if _FLIP_COST_ESTIMATOR is None:
+        return
+    _FLIP_COST_ESTIMATOR.observe(seconds)
+    if _FLIP_TOKENS_STALE_SAID:
+        return
+    repriced = repriced_flip_tokens()
+    if repriced is None:
+        return
+    n_boot, n_now, seam_boot, seam_now = repriced
+    if n_now == n_boot:
+        return
+    _FLIP_TOKENS_STALE_SAID = True
+    logger.warning(
+        "%s #777 N IS STALE AND STAYS STALE. The live threshold is N=%d tok, "
+        "priced at boot off the UNMEASURED seam seed %gs. Measured flips put "
+        "the seam at %gs, which prices the same break-even at %d tok (%.2fx). "
+        "N is built once, in config_from_env, and nothing reprices it, so the "
+        "server keeps arming against %d for the rest of this process. "
+        "Repricing is a policy decision (it moves when the server flips at "
+        "all) and belongs to the planner -- this line only refuses to let the "
+        "gap stay silent. Set %s to pin N deliberately.",
+        LOG_PREFIX,
+        n_boot,
+        seam_boot,
+        seam_now,
+        n_now,
+        (n_now / n_boot) if n_boot else float("nan"),
+        n_boot,
+        ENV_FLIP_TOKENS,
+    )
 
 
 def flip_cost_estimator() -> Optional[FlipCostEstimator]:
@@ -2588,9 +2692,27 @@ def config_from_env(
     # the seam knob never reached it. A solved number silently replaced by a
     # constant is exactly the provenance defect this policy exists to avoid.
     # #677: SEED, then measure. The env/constant is what the policy uses until
-    # the seam reports a real flip; from the first measurement on, the estimate
-    # wins. The live harvest boot priced 22-24 s flips at 3.2 s and derived
-    # N=7004 against a true break-even of ~49,250 -- 7.03x too cheap.
+    # the seam reports a real flip. The live harvest boot priced 22-24 s flips
+    # at 3.2 s and derived N=7004 against a true break-even of ~49,250 --
+    # 7.03x too cheap.
+    #
+    # #777, THE HALF THIS COMMENT USED TO OVERSTATE. It said "from the first
+    # measurement on, the estimate wins". The ESTIMATOR does follow the
+    # measurements -- it is process-global and `observe_flip_cost` feeds it
+    # after every real flip. N does NOT. `config_from_env` has exactly one
+    # caller (`Scheduler.__init__`), `flip_tokens` is assigned in exactly one
+    # place (the config built just below), and the only `dataclasses.replace`
+    # on the live config touches `decode_contention`. So the seam value read
+    # on the next line is whatever the estimator held AT BOOT -- necessarily
+    # the seed, because no flip has happened yet -- and it is frozen there for
+    # the life of the process. A calibrated estimator never reaches N.
+    #
+    # This is deliberately NOT fixed by repricing N here: moving N from 7004
+    # to a measured ~49,250 is a policy change with a 7x blast radius on when
+    # the server flips at all, and that decision is the planner's. What is
+    # fixed is the silence: `observe_flip_cost` now SAYS that N has gone stale
+    # and by how much, instead of the estimator quietly tracking a number
+    # nothing consumes.
     global _FLIP_COST_ESTIMATOR
     _seed_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
     if _FLIP_COST_ESTIMATOR is None or _FLIP_COST_ESTIMATOR.seed_s != _seed_s:
@@ -2617,6 +2739,13 @@ def config_from_env(
     else:
         flip_tokens = 0
         source = "unset (policy off)"
+
+    # #777: remember HOW N was priced, so the first real flip can say whether
+    # the measurement has left it behind. Recorded for the explicit case too --
+    # `repriced_flip_tokens` needs to know that N is an operator assertion
+    # rather than a derivation, which is a different reason to stay quiet than
+    # "no measurement yet".
+    note_flip_tokens_pricing(flip_tokens, tp_tok_s, pp_tok_s, explicit > 0)
 
     cfg = PhasePolicyConfig(
         enabled=enabled,
