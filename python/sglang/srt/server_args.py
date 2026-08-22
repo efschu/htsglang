@@ -7043,7 +7043,68 @@ class ServerArgs:
 
         materialize_declarations(self)
 
+        # #806: last, because it must read the RESOLVED value. Radix can be
+        # switched off by four handlers that run above (see the helper), so a
+        # check placed with the flip handler would pass a launch this one
+        # refuses.
+        self._validate_phase_flip_needs_a_tree_cache()
+
         self._dump_observation_ledger()
+
+    def _validate_phase_flip_needs_a_tree_cache(self):
+        """#806: refuse --enable-phase-flip x --disable-radix-cache at launch.
+
+        THE DEAD ARM. Without a radix cache the scheduler builds a
+        ``ChunkCache`` (``mem_cache/registry.py``, the
+        ``disable_radix_cache`` branch), and no ChunkCache variant --
+        ``ChunkCache``, ``SWAChunkCache``, ``PureSWAChunkCache`` -- implements
+        ``all_values_flatten``. The flip's own guard tests for exactly that
+        method (``phase_flip_runtime.py:1292``) and appends "tree cache
+        ChunkCache (no all_values_flatten enumeration)" to the guard list, so
+        EVERY flip is refused, every round, for the life of the process.
+
+        It cannot work, either: the flip has to enumerate the live KV slots to
+        move them, and a ChunkCache keeps no tree to enumerate. This is a
+        contradiction between two flags, not a tuning question.
+
+        WHY AT LAUNCH. The runtime refusal is correct and must stay -- it is
+        the guard that keeps the flip from moving KV it cannot enumerate. What
+        it cannot do is tell anyone in time: it fires once per flip attempt,
+        deep in a scheduler round, and says nothing at startup. Arm-1-v1 ran
+        that way to completion: 15 runtime refusals, a flip program that never
+        flipped once, and no hint at the start that it never could. A launch
+        line that cannot do the thing it asks for should not start.
+
+        BOTH EXITS ARE NAMED in the message on purpose. Which one is right
+        depends on what the operator wanted and the process cannot know: a
+        flip run needs the tree, a no-radix run cannot flip.
+
+        Nothing here runs unless BOTH are set, so every launch that sets one,
+        the other, or neither is byte-identical.
+        """
+        if not self.enable_phase_flip or not self.disable_radix_cache:
+            return
+        raise ValueError(
+            "--enable-phase-flip requires a radix cache, but "
+            "--disable-radix-cache is in effect.\n"
+            "Without radix the scheduler builds a ChunkCache, which has no "
+            "all_values_flatten enumeration; the flip guard tests for exactly "
+            "that method and refuses EVERY flip attempt for the life of the "
+            "process (phase_flip_runtime.py, 'tree cache ChunkCache (no "
+            "all_values_flatten enumeration)'). The flip must enumerate the "
+            "live KV slots to move them, and a ChunkCache keeps no tree to "
+            "enumerate -- so this launch would run a flip program that can "
+            "never flip, with no error until the first attempt.\n"
+            "Two ways out, and only you know which one you meant:\n"
+            "  * keep the flip and leave the radix cache ON (drop "
+            "--disable-radix-cache), or\n"
+            "  * keep radix off and drop --enable-phase-flip.\n"
+            "Note --disable-radix-cache can also be switched on for you: by "
+            "--enable-mis, by an HRM-text model, by Whisper, and by the "
+            "dual_chunk_flash_attn attention backend. Each logs its own reason "
+            "above this line; with any of them the second exit is the "
+            "applicable one."
+        )
 
     def _dump_observation_ledger(self) -> None:
         """Build the modelled ledger for the RECORD, not for sizing (#605).
