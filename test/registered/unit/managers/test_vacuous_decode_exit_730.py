@@ -67,7 +67,6 @@ def _cfg(**kw):
         rest_state="decode",
         drain_mode=True,
         pp_exit_tokens=0,
-        idle_locked_settle_s=0.0,
     )
     base.update(kw)
     return PhasePolicyConfig(**base)
