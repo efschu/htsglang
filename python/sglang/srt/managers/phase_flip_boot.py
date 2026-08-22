@@ -72,6 +72,181 @@ class PhaseFlipBootError(KvReshardError):
     """Loud failure of the phase-flip boot family (#631)."""
 
 
+# ---------------------------------------------------------------------------
+# #797 THE CALIBRATION EDGE AT THE TP CUTOVER.
+#
+# `parse_flip_token_vector` produces the SEED: a pre-boot estimate read from
+# --phase-flip-tp-vector or SGLANG_UNEVEN_TOKEN_VECTOR. It is installed
+# process-globally (step 1) and the TP stack's worker is constructed under it
+# (step 3). During that construction the TP runner reaches the install-capable
+# calibration sites (_resolve_memory_pool_config -> _maybe_suggest_dcp_token_
+# vector with allow_install=True) and may replace the global vector with the
+# MEASURED optimum -- safely, because at that point nothing has snapshotted it
+# and the TP pools, allocator, backends and graphs are all built AFTERWARDS,
+# i.e. under the measured vector.
+#
+# The seed was then frozen into PhaseFlipStacks.token_vector regardless, and
+# `phase_flip_runtime._cutover` reinstalls THAT at every flip. Two consequences,
+# and the second is the serious one:
+#
+#   1. the measured vector never reached the decode phase -- the flip served
+#      the estimate the calibration had already superseded;
+#   2. the owner rule was pointed at a DIFFERENT vector than the pools were
+#      SIZED under, which is exactly the out-of-bounds slot id that the
+#      cutover's own comment (phase_flip_runtime.py, at the set_cp_token_ratios
+#      call) warns about -- reached not by reinstalling the weight vector, but
+#      by reinstalling a stale token vector.
+#
+# The fix is to read the vector back after the stack is built instead of
+# assuming it. This edge INSTALLS NOTHING: `allow_install` inside the
+# calibration stays the one and only authority for when a vector goes live,
+# and this code only observes what that authority decided. That is also why
+# there is no collective here -- the install decision is already rank-uniform
+# (server args plus the all-gathered per-rank capacity), so every rank reads
+# back the identical vector from its own process-global state.
+#
+# Three states, reported apart. A single "None means something changed or
+# maybe did not" is the defect class this task is about: the verdict is named
+# together with its cause, so a log reader can tell "the seed was confirmed"
+# from "nothing could be read back".
+# ---------------------------------------------------------------------------
+
+FLIP_VECTOR_HOLDS = "holds"
+FLIP_VECTOR_RECALIBRATED = "recalibrated"
+FLIP_VECTOR_UNDECIDED = "undecided"
+
+
+@dataclass(frozen=True)
+class FlipTokenVectorVerdict:
+    """What the TP decode phase will actually run its owner rule under.
+
+    ``state`` is one of the three FLIP_VECTOR_* constants and ``reason`` always
+    names why, including for the two states that change nothing.
+    """
+
+    state: str
+    vector: Tuple[int, ...]
+    seed: Tuple[int, ...]
+    installed: Optional[Tuple[int, ...]]
+    reason: str
+
+
+def resolve_effective_flip_token_vector(seed, installed) -> FlipTokenVectorVerdict:
+    """Decide which token vector the flip's TP stack carries. Pure.
+
+    ``seed`` is what parse_flip_token_vector produced; ``installed`` is what
+    get_cp_token_ratios() reports once the TP stack is built. The pools were
+    built under ``installed``, so when the two disagree it is the SEED that is
+    stale, never the read-back.
+
+    UNDECIDED keeps the seed deliberately. A missing or wrong-length read-back
+    means the process-global state cannot be trusted to describe the pools, and
+    substituting a vector of the wrong length would turn an unclear situation
+    into a certain out-of-bounds slot id.
+    """
+    seed_vec = tuple(int(x) for x in seed)
+    if installed is None:
+        return FlipTokenVectorVerdict(
+            state=FLIP_VECTOR_UNDECIDED,
+            vector=seed_vec,
+            seed=seed_vec,
+            installed=None,
+            reason=(
+                "no token vector is installed after the TP stack build, so "
+                "there is no measurement to read back. The seed stands, which "
+                "is what every pre-#797 boot did unconditionally."
+            ),
+        )
+    installed_vec = tuple(int(x) for x in installed)
+    if len(installed_vec) != len(seed_vec):
+        return FlipTokenVectorVerdict(
+            state=FLIP_VECTOR_UNDECIDED,
+            vector=seed_vec,
+            seed=seed_vec,
+            installed=installed_vec,
+            reason=(
+                f"the installed vector {list(installed_vec)} has "
+                f"{len(installed_vec)} entries against the seed's "
+                f"{len(seed_vec)}. A length disagreement means the installed "
+                "vector does not describe these ranks, so it cannot be adopted "
+                "as the owner rule; the seed stands."
+            ),
+        )
+    if installed_vec == seed_vec:
+        return FlipTokenVectorVerdict(
+            state=FLIP_VECTOR_HOLDS,
+            vector=seed_vec,
+            seed=seed_vec,
+            installed=installed_vec,
+            reason=(
+                f"the calibration left {list(seed_vec)} in place -- either it "
+                "measured this vector to be the optimum, or no install-capable "
+                "site changed it. Either way the pools were built under the "
+                "seed and the decode phase runs under the same vector."
+            ),
+        )
+    return FlipTokenVectorVerdict(
+        state=FLIP_VECTOR_RECALIBRATED,
+        vector=installed_vec,
+        seed=seed_vec,
+        installed=installed_vec,
+        reason=(
+            f"the boot's own measurement superseded the seed {list(seed_vec)} "
+            f"with {list(installed_vec)}, and the TP pools were built under "
+            "the measured vector. Carrying the seed into the cutover would "
+            "point the owner rule at a split the pools do not have."
+        ),
+    )
+
+
+def effective_flip_token_vector(server_args, seed) -> FlipTokenVectorVerdict:
+    """The token vector the flip's TP stack carries, read back and vouched for.
+
+    Called ONCE, after the TP stack is fully built, so that "the calibration
+    installed nothing" is a finished fact rather than a not-yet -- the same
+    placement rule as assert_seed_superseded.
+
+    The provenance rule (#797) is applied HERE and not only in
+    resolve_cp_token_ratios, because the flip's vector never passes through
+    that function: parse_flip_token_vector reads --phase-flip-tp-vector and
+    SGLANG_UNEVEN_TOKEN_VECTOR directly, so a token vector traced to a
+    retracted investigation reached the decode phase unchecked. Refusing at
+    boot is the safe direction; the same check inside the cutover would take
+    down a serving instance mid-flip.
+    """
+    from sglang.srt.distributed.utils import (
+        _refuse_retracted_token_vector,
+        get_cp_token_ratios,
+    )
+
+    verdict = resolve_effective_flip_token_vector(seed, get_cp_token_ratios())
+    logger.info(
+        "%s #797 token-vector calibration at the TP cutover: %s. %s "
+        "(seed %s, read back %s, carried into the decode phase %s)",
+        LOG_PREFIX,
+        verdict.state.upper(),
+        verdict.reason,
+        list(verdict.seed),
+        None if verdict.installed is None else list(verdict.installed),
+        list(verdict.vector),
+    )
+    if verdict.state != FLIP_VECTOR_RECALIBRATED:
+        # The carried vector is the DECLARED one, so its declared lineage is
+        # what the register must be asked about. A recalibrated vector is
+        # exempt for a substantive reason, not for convenience: it was produced
+        # by this boot's own per-rank profiling, which is what
+        # PROVENANCE_MEASURED means. Asking the register about it would match
+        # it by VALUE against a retracted entry and refuse a measurement for
+        # resembling a withdrawn estimate.
+        _refuse_retracted_token_vector(
+            server_args,
+            list(verdict.vector),
+            "--phase-flip-tp-vector / SGLANG_UNEVEN_TOKEN_VECTOR "
+            "(the phase flip's TP decode stack)",
+        )
+    return verdict
+
+
 def parse_flip_vector(server_args) -> List[int]:
     vec = [int(x) for x in server_args.phase_flip_tp_vector.split(",")]
     if len(vec) != server_args.pp_size:
@@ -1461,6 +1636,12 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         (image_pp.numel() + image_tp.numel()) / 1048576.0,
         host_image_mode(),
     )
+    # #797: the vector the decode phase actually runs under is the one the TP
+    # pools were just built with, which is not necessarily the seed parsed at
+    # the top of this function -- the worker construction above may have
+    # installed the measured optimum. Read it back rather than assuming it.
+    token_verdict = effective_flip_token_vector(server_args, tok_vec)
+
     return PhaseFlipStacks(
         tp_worker=tp_worker,
         arena=arena,
@@ -1469,7 +1650,7 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         image_pp=image_pp,
         image_tp=image_tp,
         vector=tuple(vec),
-        token_vector=tuple(tok_vec),
+        token_vector=token_verdict.vector,
         draft_worker=draft_worker,
         arena_carrier=arena_carrier,
     )
