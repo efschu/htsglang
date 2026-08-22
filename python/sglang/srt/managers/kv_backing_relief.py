@@ -1288,9 +1288,7 @@ class KvBackingRelief:
             return None
         return rows if rows > 0 else None
 
-    def release_rows_after_floor(
-        relief, rows_wanted, current, floor, page
-    ) -> int:
+    def release_rows_after_floor(relief, rows_wanted, current, floor, page) -> int:
         """Apply the granularity round-up, then RE-CHECK it after the floor clamp.
 
         THE CLAMP UNDOES THE ROUND-UP, and until 2026-08-22 nothing noticed.
@@ -1351,7 +1349,6 @@ class KvBackingRelief:
             # costs the rank its capacity and returns nothing.
             return 0
         return relief._shrink_to(target, int(current))
-
 
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
@@ -2272,9 +2269,7 @@ class KvBackingRelief:
         # no-op. Over-delivering is not a failure -- the guard re-probes the
         # driver and stops asking once the target is met -- whereas
         # under-delivering is silent and costs a wasted cap.
-        return self.release_rows_after_floor(
-            rows_wanted, current, floor, page
-        )
+        return self.release_rows_after_floor(rows_wanted, current, floor, page)
 
     def _shrink_to(self, target: int, current: int) -> int:
         """Cap to ``target`` rows, unmap above it, and report DRIVER bytes."""
@@ -2402,9 +2397,7 @@ class KvBackingRelief:
             # ``supports_backing_spans`` gate -- and retention is a number
             # ``arena_census()`` already keeps, so naming an env var the reader
             # then has to go and check is strictly worse than printing it.
-            chunk_bytes = int(
-                getattr(self._pool, "backing_commit_chunk_bytes", 0) or 0
-            )
+            chunk_bytes = int(getattr(self._pool, "backing_commit_chunk_bytes", 0) or 0)
             retained = self._retained_bytes_clause()
             if claimed <= 0:
                 # THE POOL AND THE DRIVER AGREE, so there is nothing to
@@ -2981,7 +2974,7 @@ def rung_can_pay(scheduler: Any) -> bool:
     return row_bytes > 0
 
 
-def flip_pending_from_live_fn(live_fn, armed_fn) -> tuple:
+def flip_pending_from_live_fn(live_fn, armed_fn, active_layout_fn=None) -> tuple:
     """``(rows, max_row_id)`` the flip has parked. ``(-1, -1)`` = UNKNOWN.
 
     #748: THE IDLE BOX IS NOT UNKNOWN, and reading it as unknown is what
@@ -3016,6 +3009,27 @@ def flip_pending_from_live_fn(live_fn, armed_fn) -> tuple:
 
     extent = getattr(live_fn, "last_req_extent", None)
     if extent:
+        # #802: an extent is a row id, and a row id only means anything in the
+        # pool it was enumerated in. The extent survives the cutover (one
+        # writer, no clearer), so one enumerated in the PP phase is still here
+        # when tp_to_pp arms -- describing a pool the seam has since released.
+        #
+        # ONLY a POSITIVE mismatch discards it. An untagged extent (old
+        # writer, or a layout that would not read) and an unreadable current
+        # layout both keep the pre-#802 behaviour of protecting, because the
+        # cost of being wrong here is unmapping a row the flip is about to
+        # read (#722/#744). Discarding is allowed exactly when both sides are
+        # known AND different, which is the one case where the extent
+        # provably describes the layout that is NOT backed.
+        tag = extent[2] if len(extent) > 2 else None
+        active = None
+        if active_layout_fn is not None:
+            try:
+                active = active_layout_fn()
+            except Exception:  # noqa: BLE001 - unreadable stays protective
+                active = None
+        if tag is not None and active is not None and str(tag) != str(active):
+            return (0, -1)
         return (int(extent[0]), int(extent[1]))
 
     split = getattr(live_fn, "last_split", None)
@@ -3135,13 +3149,25 @@ def kv_backing_provider(
         parked" unconditionally, so the rung stays fully live and #688's
         funding path is untouched. While armed and with no enumeration on
         record yet, the honest answer is UNKNOWN -- which blocks.
+
+        #802: that safety argument covers TIME but not LAYOUT -- the extent
+        also outlives the CUTOVER, and a row id from the released layout
+        priced a floor above the resident pool's whole cap (348106 against
+        212992 rows), which left the rung permanently unable to fund and the
+        seam permanently unfundable. The active layout is passed in so the
+        reader can discard an extent that provably belongs to the other pool,
+        exactly as ``_active_layout_pool`` below resolves the pool itself.
         """
         # #748: delegated to a module-level function so the decision is
         # testable without a pool, an allocator and a live-set function. The
         # previous inline form could only be exercised by building the whole
         # rung, which is why the idle-box case went unnoticed until comp4
         # wedged on it.
-        return flip_pending_from_live_fn(live_fn, _flip_armed)
+        from sglang.srt.managers.phase_flip_runtime import _active_layout_tag
+
+        return flip_pending_from_live_fn(
+            live_fn, _flip_armed, lambda: _active_layout_tag(scheduler)
+        )
 
     return KvBackingRelief(
         pool,
