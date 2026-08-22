@@ -673,6 +673,10 @@ _HANDLE_MAX_MAMBA_CACHE_SELF_CALLS = (
     "_auto_mamba_target_concurrency",
     "_calculate_mamba_ratio",
     "_fit_mamba_pool_to_budget",
+    # #773: reached from _auto_mamba_demand_active, which widened the gate so
+    # a boot that STATED its concurrency can size by demand. Declared here for
+    # the same reason as every other name in this list.
+    "_mamba_demand_target_is_stated",
     "_mamba_pool_budget_cost_gb",
     "_stage_local_mamba_cache_per_req",
     "_stage_mamba_layer_counts",

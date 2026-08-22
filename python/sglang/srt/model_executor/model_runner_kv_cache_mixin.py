@@ -2481,7 +2481,32 @@ class ModelRunnerKVCacheMixin:
                 )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+
+        # #773: this constant family is a SECOND statement of "slots per
+        # running request", and `mamba_pool_floor` is declared the single
+        # source of truth for that number. They agreed for every shape that
+        # existed when they were written -- and then #755 taught the floor
+        # about the lock reorder and did not teach this. Measured across the
+        # shapes:
+        #
+        #   reorder OFF: identical everywhere except extra_buffer_lazy, where
+        #                the floor deliberately charges the transient second
+        #                ping-pong slot (5) and this ratio does not (4);
+        #   reorder ON : this ratio overstates by exactly one slot per request
+        #                in every configuration the reorder applies to.
+        #
+        # `min` is therefore the exact repair: it changes NOTHING that agreed
+        # before, keeps lazy's deliberately smaller sizing ratio, and stops
+        # this number claiming a slot the floor no longer reserves. Without it
+        # the demand path sizes a pool for 3 slots per request while the
+        # running set holds 2 -- on the standing boot that is 30 slots where
+        # 20 is the demand, i.e. MORE than the hand-pinned 24 it replaces.
+        from sglang.srt.mem_cache.mamba_pool_floor import (
+            mamba_slots_per_running_req,
+        )
+
+        return min(ratio, mamba_slots_per_running_req(self.server_args))
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,

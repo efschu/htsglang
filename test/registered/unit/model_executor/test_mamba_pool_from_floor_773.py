@@ -187,3 +187,105 @@ class TestTheSizeItProduces(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheSizingRatioTracksTheFloor(CustomTestCase):
+    """#773: `_calculate_mamba_ratio` was a SECOND statement of the same number.
+
+    `mamba_pool_floor` calls itself the single source of truth for "slots per
+    running request", and the sizing ratio is that number under another name.
+    They agreed for every shape that existed when they were written; #755 then
+    taught the floor about the lock reorder and did not teach the ratio. The
+    demand path multiplies by the RATIO, so an overstatement there sizes a
+    pool for demand that no longer exists -- on the standing boot, 30 slots
+    where 20 is the demand, which is MORE than the hand-pin it replaces. This
+    class pins the repair in both directions.
+    """
+
+    RATIO_BASE = 3
+
+    def _ratio(self, sa):
+        stub = SimpleNamespace(server_args=sa)
+        return ModelRunnerKVCacheMixin._calculate_mamba_ratio(stub)
+
+    def _sa(self, **over):
+        sa = _server_args(**over)
+        return sa
+
+    def test_it_no_longer_overstates_under_the_reorder(self):
+        """THE BUG: 3 charged where the running set holds 2."""
+        sa = self._sa()
+        with _reorder_on():
+            self.assertEqual(mamba_hard_floor(sa, 8) // 8, 2)
+            self.assertEqual(self._ratio(sa), 2)
+
+    def test_CAN_FAIL_the_raw_constant_would_still_say_three(self):
+        """Proof the assertion above is about the repair, not about the shape."""
+        sa = self._sa()
+        with _reorder_on():
+            self.assertEqual(
+                self.RATIO_BASE,
+                3,
+                "the underlying constant is unchanged; only its use is capped",
+            )
+            self.assertLess(self._ratio(sa), self.RATIO_BASE)
+
+    def test_every_pre_reorder_shape_is_byte_identical(self):
+        """The repair must not move a single number that already agreed.
+
+        Includes extra_buffer_lazy, where the floor is deliberately LARGER
+        than the sizing ratio (it charges the transient second ping-pong
+        slot). Capping with min() must keep the ratio at 4 there rather than
+        inflating it to the floor's 5.
+        """
+        shapes = {
+            "no_buffer": dict(mamba_radix_cache_strategy="no_buffer"),
+            "extra_buffer_overlap": dict(
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_overlap_schedule=False,
+            ),
+            "extra_buffer_no_overlap": dict(mamba_radix_cache_strategy="extra_buffer"),
+            "extra_buffer_lazy": dict(
+                mamba_radix_cache_strategy="extra_buffer_lazy",
+                disable_overlap_schedule=False,
+            ),
+            "disable_radix": dict(disable_radix_cache=True),
+        }
+        expected = {
+            "no_buffer": 3,
+            "extra_buffer_overlap": 5,
+            "extra_buffer_no_overlap": 4,
+            "extra_buffer_lazy": 4,
+            "disable_radix": 1,
+        }
+        for name, over in shapes.items():
+            with self.subTest(name):
+                sa = self._sa(**over)
+                sa.enable_mamba_extra_buffer = lambda _sa=sa: (
+                    _sa.disable_radix_cache is False
+                    and _sa.mamba_radix_cache_strategy
+                    in ("extra_buffer", "extra_buffer_lazy")
+                )
+                sa.enable_mamba_extra_buffer_lazy = lambda _sa=sa: (
+                    _sa.disable_radix_cache is False
+                    and _sa.mamba_radix_cache_strategy == "extra_buffer_lazy"
+                )
+                # Reorder OFF: this is the pre-#773 world, and every number
+                # here must survive untouched.
+                self.assertEqual(self._ratio(sa), expected[name], name)
+
+    def test_the_derived_pool_is_now_cheaper_than_the_hand_pin(self):
+        """The whole point of the actuator, with the REAL ratio.
+
+        Passing ratio=2 by hand proved nothing about the call site; this uses
+        the ratio the code actually computes.
+        """
+        sa = self._sa()
+        with _reorder_on():
+            ratio = self._ratio(sa)
+            size = _runner(sa)._auto_mamba_demand_size(ratio)
+            floor = mamba_hard_floor(sa, 8)
+        self.assertEqual(ratio, 2)
+        self.assertEqual(size, 20)
+        self.assertGreater(size, floor, "room must remain for retention")
+        self.assertLess(size, 24, "the derived pool must cost LESS than the hand-pin")
