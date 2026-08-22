@@ -3850,6 +3850,32 @@ taxonomy and the global importance ladder.
   (`collect`), pid discovery `:55`.
   GATE: none. Triage matches the collective-census output line
   (`debug_utils/wedge_triage.py:29`) — see §18.5.
+- **admission-wedge recovery channel (#800)** — the watchdog POSTS a
+  corridor-relief request and the SCHEDULER THREAD runs it, then the watchdog
+  consumes the named outcome: `ACTUATED`, `INERT` (carrying which of the
+  gate's exits was taken), or `UNCONSUMED` (the scheduler thread never
+  reached `process_input_requests` within the grace window — a statement
+  about the wedge, not about the gate). Two consecutive non-actuating
+  outcomes emit `ADMISSION-WEDGE-UNRECOVERED`, once, as a token distinct
+  from the repeating `ADMISSION-WEDGE` alarm so an external supervisor can
+  grip it.
+  ENTRY `managers/wedge_recovery.py:*` (channel, states, grace/retry
+  constants); drain edge `managers/scheduler.py` in
+  `process_input_requests` (the one function every loop family reaches once
+  per iteration); driver `scheduler_components/invariant_checker.py`
+  (`AdmissionWedgeRecovery`, `make_admission_wedge_poller`); named gate
+  exits `managers/corridor_admission.py` (`REASON_*`, `ACTUATING_REASONS`,
+  `guard_prefill_admission_explained`).
+  GATE: none — the channel is allocated by the first post, so a boot that
+  never wedges never builds one.
+  SUPERSEDES the #788 rung, which called `guard_prefill_admission` FROM THE
+  WATCHDOG THREAD and read its `None` as "the gate is off or inert". Both
+  halves were wrong on the 2026-08-22 11:22Z specimen: the gate was ARMED on
+  all three ranks and the `None` came from the healthy-corridor exit, and on
+  PP0 the cross-thread CUDA call was the last thing that rank ever logged.
+  NOTE: the relief ladder still cannot admit anything — `corridor_admission`
+  says so itself ("IT SPILLS. IT NEVER REFUSES") and no forced-admission
+  actuator exists. What the request buys is the diagnosis, not a cure.
 - **DeviceTimer / SplitDeviceTimer / GapTimer** — CUDA-event timers for a
   region, a split region, and the GAP between regions (the last is what
   turns "the kernel is fast" into "the kernel is fast and we wait 8 ms
