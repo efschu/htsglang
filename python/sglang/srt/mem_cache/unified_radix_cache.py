@@ -458,6 +458,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if hasattr(self.req_to_token_pool, "bind_tree_cache"):
             self.req_to_token_pool.bind_tree_cache(self)
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+        self._log_mamba_floor_posture()
+
+    def _log_mamba_floor_posture(self) -> None:
+        """State the floor, the pool and the retention budget once, at boot.
+
+        #773: none of these three numbers was observable on a healthy boot.
+        `_validate_max_mamba_cache_size` returns SILENTLY for any pool at or
+        above the floor, so the only way the floor ever reached a log was by
+        refusing a boot. That is why a pool sitting exactly ON the floor --
+        i.e. with no room at all for cache retention -- looked identical to a
+        comfortable one, and why the reduction taken by a lineage that does
+        not implement it went unnoticed.
+
+        A budget of 0 is not an error: it is the honest statement that this
+        pool is fully committed to the running set. It does mean every mamba
+        write-through backup will be declined, so it is worth saying out loud
+        rather than leaving to be inferred from a silent absence of host
+        anchors.
+        """
+        if ComponentType.MAMBA not in self.tree_components:
+            return
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        try:
+            from sglang.srt.mem_cache.mamba_pool_floor import (
+                describe_mamba_floor,
+                mamba_hard_floor,
+            )
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+            mrr = server_args.max_running_requests or 1
+            floor = mamba_hard_floor(server_args, mrr)
+            budget = self._mamba_pin_budget
+            logger.info(
+                "MAMBA-FLOOR pool=%d floor=%d retention_budget=%d (%s)%s",
+                mamba_pool.size,
+                floor,
+                budget,
+                describe_mamba_floor(server_args, mrr),
+                (
+                    " -- the pool is fully committed to the running set, so"
+                    " every mamba host backup will be declined; raise"
+                    " --max-mamba-cache-size to buy cache retention"
+                    if budget <= 0
+                    else ""
+                ),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument never breaks a boot
+            logger.debug("MAMBA-FLOOR posture unavailable", exc_info=True)
 
     def _wait_bounded(self, work, label: str) -> None:
         """Wait for ``work`` with a deadline, or raise a named error.

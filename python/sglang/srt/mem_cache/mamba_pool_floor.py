@@ -98,6 +98,49 @@ def mamba_ping_pong_slots(server_args: "ServerArgs") -> int:
 MAMBA_SLOT_REORDER_ENV = "SGLANG_MAMBA_SLOT_REORDER"
 
 
+#: #773: does the UNIFIED lineage implement the #755 lock reorder yet?
+#:
+#: Flip this to True in the same commit that ports the reorder into
+#: `unified_radix_cache` / `unified_cache_components.mamba_component`, and the
+#: floor reduction returns on its own. It is a constant rather than a config
+#: flag on purpose: it describes what the CODE can do, not what an operator
+#: may ask for, and an operator must never be able to assert it.
+UNIFIED_LINEAGE_IMPLEMENTS_SLOT_REORDER = False
+
+
+def mamba_reorder_lineage_supported(server_args: "ServerArgs") -> bool:
+    """Does the tree cache this config will actually BUILD do the reorder?
+
+    #773. The #755 gate asks three questions about the CONFIG and none about
+    the LINEAGE, and those turn out to select for opposite worlds:
+
+    * the gate requires `enable_hierarchical_cache`, because only a
+      write-through host tier can promise the released anchor still exists;
+    * but `registry.py` routes a hybrid-SSM model WITH hierarchical cache to
+      `UnifiedRadixCache`, and `MambaRadixCache` -- the only class carrying
+      the reorder -- is reachable only on the branch below it, i.e. only when
+      hierarchical cache is OFF.
+
+    So the reduction was taken exactly where the mechanism is absent, and the
+    mechanism sat available exactly where the reduction was not taken.
+    `CacheInitParams.mamba_slot_reorder` is filled from the same predicate on
+    every boot and read only by `MambaRadixCache`: always False where it is
+    read, always ignored where it is True.
+
+    The direction matters. A floor that is too HIGH costs VRAM; a floor that
+    is too LOW is #581 -- the boot validates a pool the runtime then
+    over-draws, and the shortfall surfaces as a late assert after minutes of
+    serving. This module's own rule is that a term may be dropped only if
+    EVERY path under the config stays inside the reduced budget; no path does
+    when the code that would is not built.
+    """
+    if UNIFIED_LINEAGE_IMPLEMENTS_SLOT_REORDER:
+        return True
+    # Mirrors registry.py's routing for the hybrid-SSM case. The caller has
+    # already required hierarchical cache, so this is the unified lineage.
+    return not bool(getattr(server_args, "enable_hierarchical_cache", False))
+
+
 def mamba_slot_reorder_active(server_args: "ServerArgs") -> bool:
     """True when the #755 lock reorder may drop the donation/pin double-count.
 
@@ -112,7 +155,11 @@ def mamba_slot_reorder_active(server_args: "ServerArgs") -> bool:
        ``load_back`` rather than to a dead anchor (NOTE_755 section 3). A
        device-only pool cannot offer that, and write-around/write-back cannot
        promise the backup EXISTS at release time;
-    3. the operator opted in.
+    3. the operator opted in;
+    4. #773: the lineage this config actually BUILDS implements the reorder.
+       Conditions 2 and 4 pull against each other today -- see
+       :func:`mamba_reorder_lineage_supported` -- and 4 is what keeps the
+       floor from promising a reduction no built class delivers.
 
     The predicate is CONFIG-level and decides the floor. The per-node question
     -- is THIS anchor backed up right now -- is asked again at the site, and a
@@ -128,6 +175,8 @@ def mamba_slot_reorder_active(server_args: "ServerArgs") -> bool:
     if not getattr(server_args, "enable_hierarchical_cache", False):
         return False
     if getattr(server_args, "hicache_write_policy", None) != "write_through":
+        return False
+    if not mamba_reorder_lineage_supported(server_args):
         return False
     return os.getenv(MAMBA_SLOT_REORDER_ENV, "") not in ("", "0", "false", "False")
 

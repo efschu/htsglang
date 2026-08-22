@@ -66,6 +66,22 @@ def _with_env(on: bool):
     )
 
 
+def _with_lineage():
+    """#773: assert the built lineage carries the reorder.
+
+    These cases are about the MECHANISM's arithmetic, and they used to get
+    admissibility for free from `enable_hierarchical_cache=True`. That is
+    exactly the condition #773 found to be inverted: hierarchical cache is
+    what routes a hybrid-SSM boot to `UnifiedRadixCache`, which does not
+    implement the reorder, so the floor may no longer take the reduction on
+    that basis alone. The mechanism itself is unchanged -- these tests state
+    what it is worth WHERE IT EXISTS, which is what they always meant.
+    """
+    import sglang.srt.mem_cache.mamba_pool_floor as floor_mod
+
+    return patch.object(floor_mod, "mamba_reorder_lineage_supported", lambda _sa: True)
+
+
 class TestTheFloorMovesOnlyWithTheMechanism(CustomTestCase):
     def setUp(self):
         os.environ.pop(MAMBA_SLOT_REORDER_ENV, None)
@@ -77,8 +93,8 @@ class TestTheFloorMovesOnlyWithTheMechanism(CustomTestCase):
         self.assertEqual(mamba_hard_floor(a, RUNNING), 12)
 
     def test_the_reorder_drops_it_to_two_and_the_specimen_to_eight(self):
-        """THE TARGET: 4 requests serve on 8 slots."""
-        with _with_env(True):
+        """THE TARGET: 4 requests serve on 8 slots, where the reorder exists."""
+        with _with_env(True), _with_lineage():
             a = _args()
             self.assertTrue(mamba_slot_reorder_active(a))
             self.assertEqual(mamba_slots_per_running_req(a), 2)
@@ -122,7 +138,7 @@ class TestTheFloorMovesOnlyWithTheMechanism(CustomTestCase):
             self.assertEqual(mamba_slots_per_running_req(a), 1)
 
     def test_the_derivation_string_names_the_sharing(self):
-        with _with_env(True):
+        with _with_env(True), _with_lineage():
             text = describe_mamba_floor(_args(), RUNNING)
         self.assertIn("#755", text)
         self.assertIn("donation/pinned checkpoint", text)
@@ -171,7 +187,9 @@ class TestThePerNodeGate(CustomTestCase):
     def test_the_root_is_never_released_early(self):
         """And the root is BACKED here, so only the root rule can refuse it."""
         c = self._cache(True)
-        self.assertTrue(c.root_node.mamba_backuped, "fixture must not refuse for the other reason")
+        self.assertTrue(
+            c.root_node.mamba_backuped, "fixture must not refuse for the other reason"
+        )
         self.assertFalse(c._mamba_early_release_admissible(c.root_node))
 
     def test_a_missing_node_is_refused_rather_than_assumed(self):
@@ -204,7 +222,7 @@ class TestTheReleaseWindowIsBounded(CustomTestCase):
 
     def test_the_happy_path_also_fits(self):
         """active + donated = 2, the donated slot becoming the new pin."""
-        with _with_env(True):
+        with _with_env(True), _with_lineage():
             per_req = mamba_slots_per_running_req(_args())
         active_plus_donated = 2
         self.assertLessEqual(active_plus_donated, per_req)
@@ -216,7 +234,7 @@ class TestTheReleaseWindowIsBounded(CustomTestCase):
         pointless and a silent fallback harmless. It does not fit -- which is
         precisely why the site must refuse rather than revert.
         """
-        with _with_env(True):
+        with _with_env(True), _with_lineage():
             per_req = mamba_slots_per_running_req(_args())
         active_plus_donated_plus_old_pin = 3
         self.assertGreater(active_plus_donated_plus_old_pin, per_req)
