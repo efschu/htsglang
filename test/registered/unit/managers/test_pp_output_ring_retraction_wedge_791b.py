@@ -280,6 +280,11 @@ def _make_holder(rank, wire, chain_group, out_dir):
         "_pp_void_output_payload",
         "_pp_absorb_void_output",
         "_pp_send_output_to_next_stage",
+        # #802-ring: the output receive now passes through the readiness
+        # gate, so the stand-in has to carry it. A no-op here -- this holder
+        # has no `pp_flip_counters` -- which is itself the backward-
+        # compatibility claim this file keeps exercising.
+        "_pp_wait_for_dict_readiness",
         "_pp_recv_dict_from_prev_stage",
         "_pp_send_recv_and_preprocess_output_tensors",
         "_pp_commit_send_output_work_and_preprocess_output_tensors",
