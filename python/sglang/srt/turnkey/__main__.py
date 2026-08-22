@@ -42,6 +42,7 @@ def _policy(cfg) -> W.Policy:
     w = cfg.watchdog
     return W.Policy(poll_s=w.poll_s, generation_probe_s=w.generation_probe_s,
                     generation_probe_enabled=w.generation_probe_enabled,
+                    wedge_signal_enabled=w.wedge_signal_enabled,
                     wedge_confirmations=w.wedge_confirmations,
                     backoff_s=tuple(w.backoff_s), max_restarts=w.max_restarts,
                     restart_window_s=w.restart_window_s)
@@ -135,7 +136,17 @@ def _cmd_watch(cfg, a) -> int:
     pol = W.Policy(**{**pol.__dict__, "boot_grace_s": float(lane.ready_timeout_s)})
     run = R.WatchdogRunner(
         unit=unit, base_url=f"http://127.0.0.1:{lane.port}", policy=pol,
-        generation_timeout_s=cfg.watchdog.generation_timeout_s)
+        generation_timeout_s=cfg.watchdog.generation_timeout_s,
+        # #799: both halves must name the SAME directory. Empty means "use
+        # wedge_status.DEFAULT_STATUS_DIR", which is also what the publishing
+        # scheduler falls back to, so the default configuration agrees by
+        # construction rather than by two matching literals.
+        wedge_status_dir=cfg.watchdog.wedge_status_dir or None,
+        # #799: what a restart WOULD boot, and what the lane last DID boot.
+        # Without both the drift veto is inert, so they are wired here rather
+        # than left to a caller that might not pass them.
+        lane_argv=lane.argv,
+        boot_log=lane.boot_log)
     run.run(max_ticks=a.ticks or None)
     return 0
 

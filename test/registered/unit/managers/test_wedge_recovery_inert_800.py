@@ -38,9 +38,14 @@ Hermetic: no CUDA, no scheduler boot. Every clock is injected except in the one
 test that must prove the real watchdog THREAD calls the poller.
 """
 
+import os
+import shutil
+import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.managers.corridor_admission import (
     ACTUATING_REASONS,
@@ -59,6 +64,7 @@ from sglang.srt.managers.corridor_admission import (
     guard_prefill_admission_explained,
     reason_is_defect,
 )
+from sglang.srt.managers import wedge_status
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     AdmissionWedgeRecovery,
@@ -413,38 +419,44 @@ class TestWatchdogThreadDoesNotActuate(CustomTestCase):
 
         MUTANT KILLED: drop the ``poll()`` call from ``_loop``.
 
-        THE THREAD IS A DAEMON AND HAS NO STOP. ``create_admission_wedge_
-        watchdog`` deliberately spawns a loop that never exits -- correct for
-        a server, hostile in a test process, because the thread outlives this
-        method and keeps polling for the rest of the pytest session. On an
-        ALARMING fake scheduler each of those polls also emits an ERROR line,
-        so a fast poll interval turns into a log flood that lands on whatever
-        test happens to run next. This method therefore quiets the scheduler
-        before it returns -- one running request is enough to make the verdict
-        non-alarming -- and uses an interval slow enough not to matter in the
-        window it is alive. It is the same class of mistake as the code under
-        test: a mechanism whose side effects reach past the thing it was
-        aimed at.
+        THE THREAD MUST BE STOPPED, and this test is why the ``stop`` event
+        exists. An earlier version of this method left the daemon running: it
+        outlived the test and kept polling an alarming fake scheduler at a
+        10 ms cadence, emitting an ERROR line each time, and the flood landed
+        on whatever ran next -- the full-suite run went from 44 failures to
+        45 and the extra one moved around. #799 hit the same unstoppable loop
+        from the other side (its thread survived its test, fell back to the
+        DEFAULT status directory once the env override popped, and left a
+        stale verdict in the real /run path). One loop, two tickets, two
+        symptoms. The event is the fix; this ``finally`` is what proves a
+        caller can use it.
         """
+        stop = threading.Event()
+        status = tempfile.mkdtemp(prefix="wedge800-")
         sched = _FakeScheduler(queued=2, running=0, age=200.0)
-        thread = create_admission_wedge_watchdog(sched, poll_interval=0.05)
-        try:
-            self.assertTrue(thread.is_alive())
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
+        with mock.patch.dict(os.environ, {wedge_status.ENV_DIR: status}):
+            thread = create_admission_wedge_watchdog(
+                sched, poll_interval=0.02, stop=stop
+            )
+            try:
+                self.assertTrue(thread.is_alive())
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    channel = getattr(sched, RECOVERY_CHANNEL_ATTR, None)
+                    if channel is not None and channel.requested_seq > 0:
+                        break
+                    time.sleep(0.02)
                 channel = getattr(sched, RECOVERY_CHANNEL_ATTR, None)
-                if channel is not None and channel.requested_seq > 0:
-                    break
-                time.sleep(0.02)
-            channel = getattr(sched, RECOVERY_CHANNEL_ATTR, None)
-            self.assertIsNotNone(channel, "the watchdog thread never ran a poll")
-            self.assertGreater(channel.requested_seq, 0)
-        finally:
-            # Make every subsequent poll read as "the box is serving", so the
-            # unstoppable daemon goes silent instead of following the rest of
-            # the session around.
-            sched.running_batch = SimpleNamespace(reqs=[object()] * 4)
-            sched.waiting_queue = []
+                self.assertIsNotNone(channel, "the watchdog thread never ran a poll")
+                self.assertGreater(channel.requested_seq, 0)
+            finally:
+                stop.set()
+                thread.join(timeout=5.0)
+        self.assertFalse(
+            thread.is_alive(),
+            "the stop event did not end the thread; it will follow the suite",
+        )
+        shutil.rmtree(status, ignore_errors=True)
 
 
 # --- part 4: outcomes are consumed, and silence escalates ----------------

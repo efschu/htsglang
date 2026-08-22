@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -832,6 +833,30 @@ class AdmissionWedgeRecovery:
         )
         return None
 
+    def recovery_status(self) -> Optional[dict]:
+        """This rank's recovery state, as a plain dict, or None if never tried.
+
+        #800 SEAM. The outcome has to leave the process or it is a log line
+        again, and a log line has no consumer -- that is the defect this whole
+        class exists to close, and publishing the wedge verdict WITHOUT it
+        just moves the blindness one layer out. ``None`` means no attempt has
+        been settled on this rank, which a reader must not read as "fine": a
+        missing measurement is not a measurement, the same rule
+        ``WedgeSignal.verdict`` already follows.
+        """
+        channel = getattr(self._scheduler, RECOVERY_CHANNEL_ATTR, None)
+        if channel is None or channel.last_outcome is None:
+            return None
+        outcome = channel.last_outcome
+        return {
+            "state": outcome.state,
+            "reason": outcome.reason,
+            "seq": outcome.seq,
+            "waited_s": round(float(outcome.waited_s), 3),
+            "consecutive_non_actuating": channel.consecutive_non_actuating,
+            "escalated": channel.escalated,
+        }
+
     def _settle(self, channel) -> RecoveryOutcome:
         outcome = channel.settle(self._clock(), self._grace_s)
         if outcome.state == STATE_PENDING:
@@ -908,6 +933,24 @@ class AdmissionWedgeRecovery:
         return outcome
 
 
+def _rank_label(scheduler: Scheduler) -> str:
+    """A stable per-process name for the published verdict file (#799).
+
+    The detector runs in EVERY scheduler process, so the published files must
+    not collide -- and the label is also the only thing that tells an operator
+    which rank went quiet. Ranks are read through ``scheduler.ps`` where the
+    parallel state keeps them, with a pid fallback: a label that raises during
+    telemetry would take down the scheduler it is describing, and a wrong-but-
+    unique label is strictly better than no signal at all.
+    """
+    ps = getattr(scheduler, "ps", None)
+    pp = getattr(ps, "pp_rank", None)
+    tp = getattr(ps, "tp_rank", None)
+    if pp is None and tp is None:
+        return f"pid{os.getpid()}"
+    return f"pp{pp if pp is not None else 'x'}-tp{tp if tp is not None else 'x'}"
+
+
 def make_admission_wedge_poller(scheduler: Scheduler):
     """One watchdog poll, as a callable. The thread calls this; so do tests.
 
@@ -919,16 +962,61 @@ def make_admission_wedge_poller(scheduler: Scheduler):
     """
     driver = AdmissionWedgeRecovery(scheduler)
 
-    def _poll_once() -> None:
+    def _publish(alarm: bool, detail: str, recovery: Optional[dict]) -> None:
+        """#799: carry this poll's verdict OUT of the scheduler process.
+
+        The report above is a log line, and a log line has no consumer that
+        can act. On boot 0822_0829 this detector was RIGHT 146 times across
+        thirteen minutes with zero decode batches, and nothing restarted the
+        lane, because the only reader was a human who was not reading.
+
+        #800 ADDS ``recovery`` AND MOVES THE CALL. Without the field the
+        published verdict says a rank is wedged and cannot say whether
+        anything was tried or what came back, so a supervisor reading it is
+        blind in exactly the way that produced the wrong diagnosis on
+        2026-08-22. Published on EVERY poll, alarm or not, so the healthy
+        verdict gives the reader's staleness check something to measure
+        against.
+
+        Best-effort by construction: ``publish_verdict`` swallows its own I/O
+        errors, and this wrapper catches anything else. A telemetry sink must
+        never be able to kill the scheduler it observes.
+        """
         try:
-            alarm, _detail = check_admission_wedge_once(scheduler, log_on_alarm=True)
+            from sglang.srt.managers import wedge_status
+
+            wedge_status.publish_verdict(
+                _rank_label(scheduler), alarm, detail, recovery=recovery
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry must not kill serving
+            logger.warning("%s status publish failed: %s", ADMISSION_WEDGE, e)
+
+    def _poll_once() -> Optional[bool]:
+        """One poll: check, RECOVER, then publish. Returns the alarm verdict.
+
+        THE ORDER IS THE #800 FIX AND IT IS THE WHOLE POINT OF THIS FUNCTION.
+        #799 published BEFORE the recovery attempt, so the file it wrote could
+        never contain that attempt's outcome -- every published recovery
+        statement was structurally one poll stale at best and absent at worst.
+        A status that cannot report whether recovery did anything is what let
+        an operator read "the gate is off" off a boot where the gate was
+        armed. Stepping first costs nothing: the driver's own rate limits
+        decide whether an attempt is even made, and on the common path
+        ``step`` is a couple of comparisons.
+
+        Returns the alarm verdict, or ``None`` when the check itself failed.
+        """
+        try:
+            alarm, detail = check_admission_wedge_once(scheduler, log_on_alarm=True)
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
             logger.error(f"admission-wedge watchdog check failed: {e}")
-            return
+            return None
         try:
             driver.step(alarm)
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
             logger.error("%s RECOVERY: attempt wrapper failed: %s", ADMISSION_WEDGE, e)
+        _publish(alarm, detail, driver.recovery_status())
+        return bool(alarm)
 
     return _poll_once
 
@@ -936,6 +1024,7 @@ def make_admission_wedge_poller(scheduler: Scheduler):
 def create_admission_wedge_watchdog(
     scheduler: Scheduler,
     poll_interval: float = ADMISSION_WEDGE_POLL_SECONDS,
+    stop: Optional[threading.Event] = None,
 ) -> threading.Thread:
     """#699: log-only admission-wedge watchdog, wired to the real progress clock.
 
@@ -986,9 +1075,22 @@ def create_admission_wedge_watchdog(
 
     poll = make_admission_wedge_poller(scheduler)
 
+    # #799: an optional stop, for callers that must be able to END this
+    # thread. In serving the thread is daemon and lives for the process, so
+    # nothing passes one. A TEST must: an unstoppable daemon thread outlives
+    # the test that created it and keeps polling -- #799 observed it fall back
+    # to the DEFAULT status directory once its test popped the env override
+    # and leave a stale verdict in the real /run path, and #800 observed the
+    # same thread flood every later test in the suite with ERROR lines at a
+    # 10 ms cadence. Two tickets, two symptoms, one unstoppable loop.
     def _loop() -> None:
         while True:
             time.sleep(poll_interval)
+            # Checked AFTER the sleep and BEFORE the poll: a stop requested
+            # while this thread was sleeping must not buy one more publish
+            # into a directory the caller is already tearing down.
+            if stop is not None and stop.is_set():
+                return
             poll()
 
     t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
