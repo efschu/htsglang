@@ -59,6 +59,23 @@ ELAPSED_S = 183.6
 
 
 def _cfg(**kw):
+    """A config for the specimen's decision point.
+
+    WITHDRAWAL (#713 -> #772). This dict used to pin ``idle_locked_settle_s=0.0``
+    as well. ``4a16043d1a`` reverted #713 ("IDLE-LOCKED post-cutover settle") and
+    took the field out of ``PhasePolicyConfig``, but it deleted only #713's OWN
+    test file -- this one kept naming the field and every case here died in
+    ``_cfg`` with ``TypeError: unexpected keyword argument``, before reaching a
+    single assertion.
+
+    Dropping it is SEMANTICS-PRESERVING, which is why the tests below are
+    unchanged rather than rewritten: the pinned value was ``0.0``, i.e. the
+    settle window switched OFF, so these cases were always deciding against a
+    policy that did not settle. Removing a field whose only value here was its
+    own neutral element cannot move the verdicts -- and the verdicts are what
+    this file pins (an empty decode phase must not read as a drained one, and
+    the direction stays TP_TO_PP either way).
+    """
     base = dict(
         enabled=True,
         flip_tokens=7004,
@@ -67,7 +84,6 @@ def _cfg(**kw):
         rest_state="decode",
         drain_mode=True,
         pp_exit_tokens=0,
-        idle_locked_settle_s=0.0,
     )
     base.update(kw)
     return PhasePolicyConfig(**base)

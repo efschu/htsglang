@@ -224,22 +224,26 @@ class WallClockAbortGateTest(unittest.TestCase):
             entry = now - timeout_s - 0.5 if rank == 0 else now - timeout_s + 0.5
             queue = [make_req("rid-0", entry)]
             harness = TimeoutHarness(collective, queue)
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
-                    lambda: timeout_s,
-                ),
-            ):
-                harness._abort_on_waiting_timeout()
+            harness._abort_on_waiting_timeout()
             return harness
 
-        results, errors = run_ranks(body)
+        # #749: patched ONCE in the main thread. `unittest.mock.patch`
+        # mutates process globals and is not thread-safe; entered from inside
+        # `body` every rank thread patches and unpatches the same globals
+        # concurrently and a lost restore leaks for the whole process.
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "all_reduce", collective.all_reduce
+            ),
+            unittest.mock.patch.object(
+                torch.distributed, "get_world_size", collective.get_world_size
+            ),
+            unittest.mock.patch(
+                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
+                lambda: timeout_s,
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         return results, errors
 
@@ -274,22 +278,26 @@ class WallClockAbortGateTest(unittest.TestCase):
             req = make_req("rid-0", 0.0, forward_time=fwd)
             batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
             harness = TimeoutHarness(collective, [])
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.managers.scheduler.envs.SGLANG_REQ_RUNNING_TIMEOUT.get",
-                    lambda: timeout_s,
-                ),
-            ):
-                harness._abort_on_running_timeout(batch)
+            harness._abort_on_running_timeout(batch)
             return req.to_finish is not None
 
-        results, errors = run_ranks(body)
+        # #749: patched ONCE in the main thread. `unittest.mock.patch`
+        # mutates process globals and is not thread-safe; entered from inside
+        # `body` every rank thread patches and unpatches the same globals
+        # concurrently and a lost restore leaks for the whole process.
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "all_reduce", collective.all_reduce
+            ),
+            unittest.mock.patch.object(
+                torch.distributed, "get_world_size", collective.get_world_size
+            ),
+            unittest.mock.patch(
+                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_RUNNING_TIMEOUT.get",
+                lambda: timeout_s,
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         self.assertEqual(errors, [], f"a rank broke a collective: {errors}")
         self.assertEqual(
@@ -553,6 +561,27 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     #: the predicate raised AttributeError on both ranks -- the same drift
     #: shape, this time introduced by the fix rather than by a reduce.
     adder.fundable_extend_floor = None
+    #: #701 added the CROSS-PASS RESERVATION tail to ``rem_total_tokens``: when
+    #: ``chunked_admission_enabled`` the budget is further reduced by the
+    #: scheduler-owned ``commitment_ledger``. Third instance of the same drift
+    #: shape after #624 and #681, and the third time the guard below is what
+    #: named it rather than a stack trace fifty tests away.
+    #:
+    #: WITHDRAWAL, deliberate and scoped. This stub opts OUT of the #701 tail
+    #: (``False`` -> ``rem_total_tokens`` returns the budget unreduced, which is
+    #: exactly the predicate these S3 cases were written against). The subject
+    #: here is COLLECTIVE UNIFORMITY -- that two ranks with different pool
+    #: ownership admit against the same budget -- not the ledger's arithmetic.
+    #: Enabling it would make every case in this class depend on a quantity
+    #: that is identical on both ranks by construction, testing nothing extra
+    #: while coupling this file to #701's semantics. The ledger term has its own
+    #: coverage in ``test_chunked_commitment_701.py``, which is the only file in
+    #: the tree that exercises ``effective_rem_total_tokens``.
+    #:
+    #: ``commitment_ledger`` is still set, because the guard asserts on every
+    #: name the property READS, not on the names this configuration reaches.
+    adder.chunked_admission_enabled = False
+    adder.commitment_ledger = None
     adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
     adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
     adder.dcp_avail_deficit = deficit
@@ -609,22 +638,43 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
 
         def body(rank):
             harness = BudgetHarness(collective, self.AVAIL[rank], self.EVICT[rank])
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.distributed.utils.uneven_dcp_active", lambda *a: True
-                ),
-            ):
-                harness._update_uniform_pool_budget()
+            harness._update_uniform_pool_budget()
             local = self.AVAIL[rank] + self.EVICT[rank]
             return local - harness.uniform_budget_deficit()
 
-        results, errors = run_ranks(body)
+        # #749: THE PATCHES LIVE IN THE MAIN THREAD, NOT IN `body`.
+        #
+        # `unittest.mock.patch` mutates a process-global module attribute and
+        # restores it on exit. It is NOT thread-safe. Entered from inside
+        # `body`, all `_NRANKS` threads patch and unpatch the SAME three
+        # globals concurrently, and the restore stack races: one lost restore
+        # leaves `uneven_dcp_active` permanently `lambda *a: True` for the
+        # whole process.
+        #
+        # The consequence was invisible here and loud elsewhere. Every later
+        # test in the process then takes scheduler.py:4615's pinned-admission
+        # branch, and at :4622 asks its tree cache for `evictable_size()` --
+        # which the minimal fakes in the distributed/ collective-floor suites
+        # do not implement. ~50 tests across six error signatures, and
+        # INTERMITTENT, because whether the restore is lost depends on thread
+        # interleaving: the same commit produced 0 and 50 failures on two runs
+        # of one command.
+        #
+        # Patching once, here, is both correct and sufficient: the threads only
+        # need the globals to be patched WHILE they run, not to own the
+        # patching.
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "all_reduce", collective.all_reduce
+            ),
+            unittest.mock.patch.object(
+                torch.distributed, "get_world_size", collective.get_world_size
+            ),
+            unittest.mock.patch(
+                "sglang.srt.distributed.utils.uneven_dcp_active", lambda *a: True
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         return results, errors
 
