@@ -597,7 +597,7 @@ def admission_wedge_verdict(
         return False, "no queue: nothing is waiting, so nothing is wedged"
     if r > 0:
         return False, (
-            f"{r} request(s) running: the box is serving, not wedged " f"(queued {q})"
+            f"{r} request(s) running: the box is serving, not wedged (queued {q})"
         )
     if age < float(threshold):
         return False, (
@@ -723,9 +723,83 @@ def check_admission_wedge_once(
         f"(perf_counter={scheduler.last_first_token_progress_time:.1f}): "
         f"{verdict_detail}"
     )
+    # #739: SAY WHICH OF THE TWO WEDGES THIS IS.
+    #
+    # The predicate above is true of a dead pipeline AND of a busy one whose
+    # pool is full, and reporting them as one thing mixed two populations into
+    # every root hunt on 2026-08-22 (see wedge_class for both specimens). The
+    # class is appended to the SAME alarm line so no future reader has to
+    # correlate two logs, and the numbers it was reached on travel with it.
+    #
+    # The window is stamped when the alarm STARTS and cleared when it ends, so
+    # `forward_delta` is "forward passes completed since this wedge began" --
+    # not a rate over an arbitrary interval.
+    if alarm:
+        stamp = getattr(scheduler, "_wedge_class_sample", None)
+        fwd_now = int(getattr(scheduler, "forward_ct", 0) or 0)
+        if stamp is None:
+            stamp = (now, fwd_now)
+            scheduler._wedge_class_sample = stamp
+        detail = f"{detail} | {_wedge_class_for(scheduler, stamp, fwd_now, now)}"
+    else:
+        # Cleared: the next wedge is a new window, never this one's tail.
+        if getattr(scheduler, "_wedge_class_sample", None) is not None:
+            scheduler._wedge_class_sample = None
     if alarm and log_on_alarm:
         logger.error(detail)
     return alarm, detail
+
+
+def _wedge_class_for(scheduler, stamp, fwd_now: int, now: float) -> str:
+    """#739: render this alarm's A/B class, or UNCLEAR, never raising.
+
+    An instrument may not kill the thing it measures, so every probe here is
+    defensive and any failure degrades to UNCLEAR with the reason named --
+    which is itself a legitimate verdict of this classifier rather than a
+    silent fallback into one of the two classes.
+    """
+    from sglang.srt.managers.wedge_class import CLASS_UNCLEAR, classify_wedge
+
+    try:
+        started_at, fwd_then = stamp
+        delta = max(0, fwd_now - int(fwd_then))
+        window_s = max(0.0, float(now) - float(started_at))
+        post_state = None
+        try:
+            from sglang.srt.managers.wedge_recovery import get_recovery_channel
+
+            channel = get_recovery_channel(scheduler)
+            outcome = getattr(channel, "last_outcome", None) if channel else None
+            post_state = getattr(outcome, "state", None)
+        except Exception:  # noqa: BLE001 - no channel is "no verdict yet"
+            post_state = None
+        return classify_wedge(
+            delta,
+            post_state,
+            window_s=window_s,
+            usage_at_ceiling=_pool_at_ceiling(scheduler),
+        ).render()
+    except Exception as exc:  # noqa: BLE001
+        return f"CLASS={CLASS_UNCLEAR} (classifier failed: {exc!r})"
+
+
+def _pool_at_ceiling(scheduler) -> Optional[bool]:
+    """Corroboration only: is a request-admitting pool at its limit?
+
+    Deliberately NOT a discriminator. Slot saturation was already true minutes
+    before the 2026-08-22 18:45 alarm began, while the server was decoding
+    normally, so a classifier that keyed on it would have called that specimen
+    a wedge before it was one.
+    """
+    try:
+        pool = getattr(scheduler, "req_to_token_pool", None)
+        size = getattr(pool, "size", None)
+        free = getattr(pool, "free_slots", None)
+        if size and free is not None:
+            return len(free) == 0
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 class AdmissionWedgeRecovery:
