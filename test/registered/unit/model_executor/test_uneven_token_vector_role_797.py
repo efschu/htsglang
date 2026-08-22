@@ -31,6 +31,7 @@ Covered here:
 
 import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
@@ -395,6 +396,204 @@ class CanFail797(CustomTestCase):
     def test_the_role_is_read_case_insensitively(self):
         installed, _, _env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="Seed")
         self.assertNotEqual(installed, _ACTIVE)
+
+
+def _skip_infos(
+    *,
+    dcp_size: int,
+    ratios: list,
+    world_size: int = 3,
+    caps: list = None,
+    allow_install: bool = True,
+    ratios_override=None,
+):
+    """Drive ONE rank and return the INFO lines the method emitted.
+
+    Deliberately not folded into ``_run``: that helper collects warnings from
+    rank 0 of a full simulated group, and every gate under test here returns
+    before the collective, so a group is the wrong shape for it entirely.
+    """
+    caps = caps or [600000, 360000, 372000]
+    prev = {k: os.environ.get(k) for k in (_VEC_ENV, _ROLE_ENV)}
+    set_cp_token_ratios(list(ratios) if ratios else [])
+
+    def fake_all_gather_object(gathered, payload, group=None):
+        gathered[:world_size] = [
+            (r, max(caps[r], 0), None, None) for r in range(world_size)
+        ]
+
+    try:
+        stub = SimpleNamespace(
+            dcp_size=dcp_size,
+            page_size=1,
+            tp_rank=0,
+            server_args=_server_args(False),
+            is_draft_worker=False,
+        )
+        stub._is_solo_draft_kv_host = lambda s=stub: (
+            ModelRunnerKVCacheMixin._is_solo_draft_kv_host(s)
+        )
+        stub._solo_host_capacity_curve = lambda *a, s=stub: (
+            ModelRunnerKVCacheMixin._solo_host_capacity_curve(s, *a)
+        )
+        stub._solo_fixed_point_capacity = (
+            ModelRunnerKVCacheMixin._solo_fixed_point_capacity
+        )
+        stub._hybrid_kv_token_cap = lambda: None
+        stub._corridor_local_capacity = lambda cfg: None
+
+        world_group = mock.Mock(world_size=world_size, cpu_group=None)
+        parallel = mock.Mock(attn_dcp_rank=0)
+        base = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+        with ExitStack() as stack:
+            log = stack.enter_context(mock.patch(f"{base}.logger"))
+            stack.enter_context(
+                mock.patch(f"{base}.get_world_group", return_value=world_group)
+            )
+            stack.enter_context(
+                mock.patch(f"{base}.get_parallel", return_value=parallel)
+            )
+            stack.enter_context(
+                mock.patch(
+                    "sglang.srt.model_executor.pool_configurator"
+                    ".create_memory_pool_configurator",
+                    side_effect=lambda mr: _StubConfigurator(caps[0]),
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "torch.distributed.all_gather_object",
+                    side_effect=fake_all_gather_object,
+                )
+            )
+            if ratios_override is not None:
+                # The method imports get_cp_token_ratios INSIDE its body, so
+                # the patch has to land on the source module, not on a name
+                # bound in the mixin's namespace.
+                stack.enter_context(
+                    mock.patch(
+                        "sglang.srt.distributed.utils.get_cp_token_ratios",
+                        return_value=ratios_override,
+                    )
+                )
+            ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector(
+                stub, 1 << 30, allow_install=allow_install
+            )
+        return [c.args[0] % c.args[1:] for c in log.info.call_args_list]
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class TheSilentGatesNowNameThemselves797(CustomTestCase):
+    """#797: the four uniform refusals stop being invisible.
+
+    WHY THIS EXISTS AT ALL. A boot on which the token vector never calibrates
+    and a boot on which it calibrates and agrees are, in the log, the same
+    boot: both print nothing. That ambiguity is the reason #797 was argued
+    from inference ("the vector must be refused somewhere upstream") instead
+    of read off a line. Every early return in
+    ``_maybe_suggest_dcp_token_vector`` now names itself and carries the three
+    numbers that decide it -- dcp_size, world_size, allow_install.
+
+    These are assertions about DIAGNOSABILITY, which is a real property: the
+    fix for #797 is chosen by which gate fires, so a gate that fires silently
+    makes the fix a guess.
+    """
+
+    def test_the_length_mismatch_gate_names_itself(self):
+        """THE #797 SUSPECT ITSELF.
+
+        A vector of three entries against dcp_size=1 -- which is the shape at
+        PP-phase sizing -- is refused by ``uneven_dcp_active`` at
+        distributed/utils.py:329. Before this, that refusal was the silent
+        ``return`` that made the whole ticket an inference.
+        """
+        infos = _skip_infos(dcp_size=1, ratios=[29, 19, 16])
+        self.assertEqual(len(infos), 1, f"expected exactly one skip line: {infos}")
+        line = infos[0]
+        self.assertIn("#797 token-vector calibration SKIPPED", line)
+        self.assertIn("uneven DCP is not active", line)
+        # The numbers are the point. A reason without dcp_size does not let a
+        # reader tell this gate from the world-size gate.
+        self.assertIn("dcp_size=1", line)
+        self.assertIn("world_size=3", line)
+
+    def test_the_world_size_gate_names_itself_and_is_distinguishable(self):
+        """Two gates, two different readings -- not one generic line twice."""
+        infos = _skip_infos(dcp_size=3, ratios=[29, 19, 16], world_size=1)
+        self.assertEqual(len(infos), 1, f"expected exactly one skip line: {infos}")
+        self.assertIn("world size is 1", infos[0])
+        self.assertIn("dcp_size=3", infos[0])
+        # If both gates printed the same text, a log could not tell an
+        # unsplittable group from a stale vector, and the #797 fix would still
+        # be a guess. Assert they are actually different sentences.
+        other = _skip_infos(dcp_size=1, ratios=[29, 19, 16])[0]
+        self.assertNotEqual(
+            infos[0].split(":")[1], other.split(":")[1], "both gates read alike"
+        )
+
+    def test_the_post_gather_gate_names_the_capacities(self):
+        """The one refusal that happens AFTER the collective.
+
+        It must be distinguishable from never having reached the collective at
+        all, and it must print the capacities: a zero here is a budget defect
+        on a named rank, not a calibration opt-out.
+        """
+        infos = _skip_infos(
+            dcp_size=3, ratios=[29, 19, 16], caps=[600000, 0, 372000], world_size=3
+        )
+        self.assertEqual(len(infos), 1, f"expected exactly one skip line: {infos}")
+        self.assertIn("no usable capacity", infos[0])
+        self.assertIn("600000", infos[0])
+        self.assertIn("0", infos[0])
+
+    def test_the_install_flag_is_reported_because_it_selects_the_call_site(self):
+        """``allow_install`` is what separates the two sizing call sites from
+        the hint-only post-capture pass. A skip line that omits it cannot say
+        WHICH of the three calls refused, which is exactly the question #797
+        resolution (a) has to answer."""
+        install = _skip_infos(dcp_size=1, ratios=[29, 19, 16], allow_install=True)[0]
+        hint = _skip_infos(dcp_size=1, ratios=[29, 19, 16], allow_install=False)[0]
+        self.assertIn("allow_install=True", install)
+        self.assertIn("(install)", install)
+        self.assertIn("allow_install=False", hint)
+        self.assertIn("(hint-only)", hint)
+
+    def test_a_calibrating_boot_prints_no_skip_line(self):
+        """THE CONTROL, and the one that makes the others mean anything.
+
+        An instrumentation that printed on every boot would satisfy every
+        assertion above while telling a reader nothing. A run that passes all
+        four gates must be silent on this channel.
+        """
+        infos = _skip_infos(dcp_size=3, ratios=[29, 19, 16], world_size=3)
+        skips = [i for i in infos if "SKIPPED" in i]
+        self.assertEqual(skips, [], f"a calibrating run still printed a skip: {skips}")
+
+    def test_the_third_gate_is_documented_as_unreachable_in_production(self):
+        """AN HONEST NEGATIVE RESULT, recorded rather than papered over.
+
+        The third gate reads ``active = get_cp_token_ratios()`` and refuses on
+        ``not active or len(active) != dcp_size``. Both that call and
+        ``uneven_dcp_active`` read the SAME module-level ``_CP_TOKEN_RATIOS``
+        (utils.py:244 and :326), so by the time control reaches it, gate one
+        has already established that the vector is truthy and that its length
+        equals dcp_size. It cannot fire in production.
+
+        It is kept because it is a cheap defence against those two functions
+        drifting apart, and it is tested here through an explicit patch so
+        that the branch is known to be wired -- while this test states plainly
+        that a passing assertion here is NOT evidence of a reachable path.
+        Deleting the gate would also be defensible; silently counting it as
+        covered would not be.
+        """
+        infos = _skip_infos(dcp_size=3, ratios=[29, 19, 16], ratios_override=[29, 19])
+        self.assertEqual(len(infos), 1, f"expected exactly one skip line: {infos}")
+        self.assertIn("no usable active vector", infos[0])
 
 
 if __name__ == "__main__":

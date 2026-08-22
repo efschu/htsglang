@@ -2418,9 +2418,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -2444,9 +2444,9 @@ class ModelRunnerKVCacheMixin:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                assert not self.server_args.enable_mamba_extra_buffer_lazy(), (
+                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -2673,9 +2673,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-hybrid-Mamba yet"
+        )
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -2753,9 +2753,9 @@ class ModelRunnerKVCacheMixin:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-SWA hybrid yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:
@@ -4287,9 +4287,9 @@ class ModelRunnerKVCacheMixin:
                     self._kv_sess_attach_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
+                    )
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
@@ -5437,12 +5437,44 @@ class ModelRunnerKVCacheMixin:
             uneven_dcp_active,
         )
 
+        # #797: these four refusals used to be silent. A boot where the vector
+        # never self-calibrates is indistinguishable, from the log alone, from
+        # a boot where it calibrated and agreed with the active vector -- both
+        # print nothing. That ambiguity is what made #797 an inference rather
+        # than a reading, so each refusal now names itself and its numbers.
+        # Cost is bounded: this function runs at most three times per rank per
+        # boot (two install call sites in _resolve_memory_pool_config plus the
+        # hint-only post-capture pass), so this is not a hot path.
+        def _skip(reason: str) -> None:
+            logger.info(
+                "#797 token-vector calibration SKIPPED (%s): %s. "
+                "dcp_size=%d world_size=%d allow_install=%s. No vector is "
+                "derived on this path; the active vector stands unchanged.",
+                "install" if allow_install else "hint-only",
+                reason,
+                self.dcp_size,
+                get_world_group().world_size,
+                allow_install,
+            )
+
         if not uneven_dcp_active(self.dcp_size):
+            # The dominant suspect for #797: resolve_cp_token_ratios refuses a
+            # vector whose length does not match dcp_size (distributed/utils.py
+            # :321), and during PP-phase sizing dcp_size is 1 while the vector
+            # has one entry per DCP rank. That is a length mismatch, not an
+            # opt-out, and it is why a seeded vector can arrive and still never
+            # be calibrated against.
+            _skip("uneven DCP is not active for this dcp_size")
             return
         if get_world_group().world_size <= 1:
+            _skip("world size is 1, so there is no split to optimise")
             return
         active = get_cp_token_ratios()
         if not active or len(active) != self.dcp_size:
+            _skip(
+                f"no usable active vector to compare against (active={active!r}, "
+                f"expected {self.dcp_size} entries)"
+            )
             return
 
         # Local physical token capacity P_r of this rank's budget (full-kv-head
@@ -5510,6 +5542,12 @@ class ModelRunnerKVCacheMixin:
                 if rank_curve is not None:
                     solo_host_rank, solo_curve = dcp_rank, rank_curve
         if any(p <= 0 for p in p_by_rank):
+            # #797: the one refusal that happens AFTER the collective, so it
+            # cannot be confused with never having reached it. Naming the
+            # capacities matters -- a zero here means a rank profiled no usable
+            # token capacity at all, which is a budget defect on that rank
+            # rather than a calibration opt-out.
+            _skip(f"a rank gathered no usable capacity (P_r by DCP rank: {p_by_rank})")
             return
 
         # ``p_measured`` is the truth UNDER THE ACTIVE VECTOR (what the pools
@@ -7199,9 +7237,9 @@ class ModelRunnerKVCacheMixin:
             # caller-supplied pool config it is supposed to RESOLVE, and
             # every rank died here with "Draft worker requires
             # memory_pool_config" (measured, boot 15, 2026-08-08).
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
