@@ -5621,6 +5621,94 @@ class SchedulerPPMixin:
             self.chunked_req = chunked_before
         parked = _park_chunked_prefill_chunk(self, chunked_before)
 
+        # THE INSTR19 STATE, AND HERE IT IS REACHED RATHER THAN MERELY
+        # GUARDED AGAINST. The own-void twin of this site (`#797d own-void`,
+        # earlier in this file) carries the identical eight lines above and
+        # then this identical check, and its comment argues the state should
+        # be unreachable: `chunked_before` is a snapshot taken at the top of
+        # THIS pass, so if its `extend_range` were already None going into the
+        # pass, `get_next_batch_to_run`'s own unconditional read of
+        # `self.chunked_req.extend_range.end` would have raised earlier in the
+        # same pass. THAT ARGUMENT DOES NOT CARRY OVER TO THIS SITE, and the
+        # difference is the whole reason this guard has to exist here too:
+        # void-OUTPUT is driven by the retraction arriving from downstream and
+        # fires ONCE PER SLOT, several times in a row, with no
+        # `get_next_batch_to_run` in between. Each call restores ITS OWN
+        # slot's `chunked_before` and then, in the loop below, calls
+        # `reset_for_retract` on every batch member that is not kept for THAT
+        # slot. A request that is slot B's carried chunk but only an ordinary
+        # member of slot A's batch is therefore reset by slot A's loop and
+        # then reinstated, already reset, as `self.chunked_req` by slot B's
+        # restore. `pp_void_keeps_request` cannot prevent it: it is asked per
+        # slot, and per slot it answers correctly.
+        #
+        # MEASURED, boot_798_0822_0646.log, commit 9478e774b6: rank 0 logged
+        # three `#791b PP-ADMISSION void output` messages back to back on
+        # slots 2, 0 and 1 at 06:51:15-06:51:16 (releasing 1 of 2, 1 of 2, and
+        # then 0 of 1 -- the last request kept precisely because it was that
+        # slot's chunked request), and the very next line is the scheduler
+        # exception: `AttributeError: 'NoneType' object has no attribute
+        # 'end'` at `self.chunked_req.extend_range.end`, raised on the
+        # following pass out of `_event_loop_pp_body`. PP1 and PP2 then died
+        # on gloo `Connection closed by peer`, a cascade rather than three
+        # independent faults. This path only became reachable once the seam
+        # could fund a cutover at all (#796): nothing survived a committed
+        # `tp_to_pp` before, because the flip never committed.
+        #
+        # `_park_chunked_prefill_chunk` cannot repair it -- it treats
+        # `extend_range is None` on the way in as "already parked, already
+        # reset, or never prepared, nothing to give back" and leaves it
+        # untouched, which is right for the KV-release question it answers and
+        # silent on this site's obligation. Whatever is left in
+        # `self.chunked_req` is what the next pass dereferences with no guard
+        # of its own. Clearing it is the correct disposal and not a loss: the
+        # request keeps its pages, is re-admitted from the waiting queue by
+        # the ordinary path, and a chunk that was reset has no stashed tree
+        # handles left to honour. The rid and slot are logged so the next boot
+        # names the cross-slot pair rather than leaving it to be re-derived.
+        #
+        # THE CONDITION NAMES THE CLASS, NOT THE SYMPTOM, and that is
+        # deliberate. `extend_range` is merely the field the next reader
+        # happens to touch FIRST; `reset_for_retract` clears seventeen more in
+        # the same breath (`last_node`, `swa_uuid_for_lock`, `mamba_pool_idx`,
+        # `routed_experts`, `prefix_indices` back to empty, ...), and a
+        # None-check on one of them would leave the next edit to rediscover
+        # this bug through whichever field a future reader dereferences first.
+        # `is_retracted` is the marker of the shape itself: `reset_for_retract`
+        # sets it (schedule_batch.py:1590) and only `prepare_for_extend` clears
+        # it (schedule_batch.py:2439), so it is True over exactly the window in
+        # which the request has been reset and not yet re-prepared -- which is
+        # exactly the window in which it must not be carried as the scheduler's
+        # chunked request. The `extend_range` test is kept beside it as the
+        # narrower belt: it is what actually raised, and a request could in
+        # principle reach the reset shape by a path that does not set the flag.
+        # `getattr` rather than a plain attribute read, matching the idiom the
+        # eight lines above already use. A scheduler that has never set
+        # `chunked_req` is a real shape here -- the restore above only assigns
+        # the attribute when the carried value DIFFERS from the current one, so
+        # a holder that never had the attribute and carries None still does not
+        # have it by this line. `test_ring_survives_the_retraction_with_the_fix`
+        # is the case that proves it, and a plain read raised there.
+        chunked_carry = getattr(self, "chunked_req", None)
+        if chunked_carry is not None and (
+            getattr(chunked_carry, "is_retracted", False)
+            or getattr(chunked_carry, "extend_range", None) is None
+        ):
+            logger.warning(
+                "#791b void-output: the chunked request for slot %d (rid=%s) "
+                "is in the reset_for_retract shape that "
+                "_park_chunked_prefill_chunk cannot repair "
+                "(is_retracted=%s, extend_range=%s), produced by an earlier "
+                "slot's disposal loop in this same retraction -- clearing "
+                "self.chunked_req instead of carrying a request the next "
+                "pass's get_next_batch_to_run cannot read.",
+                mb_id,
+                getattr(chunked_carry, "rid", None),
+                getattr(chunked_carry, "is_retracted", False),
+                getattr(chunked_carry, "extend_range", None),
+            )
+            self.chunked_req = None
+
         # #797: A RESIDENT REQUEST MUST NOT BE RELEASED HERE, and this is not
         # a hardening detail -- it is a double-free. `_release_dynamic_chunk_
         # probe` hands back the request's KV pages, mamba slot and req-pool
