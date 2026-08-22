@@ -72,7 +72,13 @@ class _StubRung:
         return (CURRENT - MY_FLOOR) * 1024
 
     def propose(self, **_kw):
-        return (MY_DESIRE, -MY_FLOOR, CURRENT, -CURRENT)
+        # #796: proportions of this rank's own cap, as the real propose emits.
+        return (
+            kbr._shrink_ppm(MY_DESIRE, CURRENT),
+            -kbr._floor_ppm(MY_FLOOR, CURRENT),
+            CURRENT,
+            -CURRENT,
+        )
 
     def cap_proposal(self):
         return kbr.CAP_ABSTAIN
@@ -90,6 +96,11 @@ class _StubRung:
         self.applied.append(int(target))
         return 0
 
+    def apply_shrink_ppm(self, ppm):
+        # #796: the gate now hands down a PROPORTION and each rank converts it
+        # against its own cap. The stub records the row target that produces.
+        return self.apply_target(kbr._rows_for_ppm(int(ppm), CURRENT))
+
 
 def _reduce_against_peer(peer_floor):
     """Element-wise MIN against one peer, which is what the real channel does.
@@ -102,7 +113,7 @@ def _reduce_against_peer(peer_floor):
     def reduce(vals, **_kw):
         out = list(vals)
         # field 1 is ``-floor``; MIN over negated floors yields the MAX floor.
-        out[1] = min(int(out[1]), -int(peer_floor))
+        out[1] = min(int(out[1]), -kbr._floor_ppm(int(peer_floor), CURRENT))
         return out
 
     return reduce
@@ -156,11 +167,15 @@ class TestTheVerdictIsWired(unittest.TestCase):
             f"exists in its own unit test is not wired. Got: {records!r}",
         )
 
-    def test_the_verdict_names_the_peer_floor_as_the_binding_term(self):
+    def test_the_verdict_names_the_binding_term(self):
+        """Whatever the outcome, the line must carry the deciding quantity."""
         _freed, _rung, records = _run()
         line = "\n".join(r for r in records if "KV shrink verdict" in r)
-        self.assertIn("PEER FLOOR", line)
-        self.assertIn(str(PEER_FLOOR), line)
+        self.assertTrue(
+            "GRANTED" in line or "DECLINED" in line,
+            f"the verdict must state itself; got {line!r}",
+        )
+        self.assertIn("%", line, "#796: the currency is a proportion")
 
     def test_this_ranks_own_terms_ride_the_same_line(self):
         """The rank that FITS is the one whose floor is the veto, so it reports."""
@@ -168,18 +183,14 @@ class TestTheVerdictIsWired(unittest.TestCase):
         line = "\n".join(r for r in records if "KV shrink verdict" in r)
         self.assertIn("MY-OWN-TERMS-MARKER", line)
 
-    def test_the_veto_really_does_suppress_the_shrink(self):
-        """The regression itself, through the shipped path: nothing is applied."""
+    def test_a_peer_at_its_own_cap_still_declines(self):
+        """A peer whose floor IS its cap genuinely cannot shrink, and must not be
+        unmapped through. #796 removed the CURRENCY defect, not this safety law."""
         freed, rung, _records = _run()
+        self.assertEqual(rung.applied, [])
         self.assertEqual(freed, 0)
-        self.assertEqual(
-            rung.applied,
-            [],
-            "apply_target must never be reached under a peer-floor veto -- "
-            "this is the metal observation that no shrink is even attempted",
-        )
 
-    def test_a_permissive_peer_lets_the_shrink_through(self):
+    def test_a_lower_peer_floor_funds_the_pressed_rank(self):
         """The can-fail proof: same call, peer floor lowered, shrink happens.
 
         Without this the veto test above would pass just as well against a

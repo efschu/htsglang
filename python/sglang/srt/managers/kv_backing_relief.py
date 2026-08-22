@@ -106,6 +106,86 @@ KV_RELIEF_TRACE_ENV = "SGLANG_KV_RELIEF_TRACE"
 #: A desire no reduction can lower: the neutral element of an element-wise MIN.
 _UNBOUNDED_ROWS = 1 << 40
 
+#: #796: THE GROUP'S SHRINK IS AGREED AS A PROPORTION, NOT AS A ROW ID.
+#:
+#: Parts per million of each rank's own current cap, so 1000000 means "no
+#: change" and is the true neutral element of the MIN below.
+#:
+#: WHY THE CURRENCY HAD TO CHANGE, measured on metal 2026-08-22
+#: (boot_798_0822_0629.log, 114 identical declines under live load). The ranks
+#: of this fork do NOT have equally sized pools -- that is the whole point of
+#: uneven TP shards, uneven DCP tokens and the KV ratio -- and on that boot they
+#: were 204800 / 135168 / 112640 rows. The seam's funder was the one axis still
+#: agreeing an ABSOLUTE row id, and an absolute row id cannot express a shrink
+#: across pools of different sizes. Two faults stacked:
+#:
+#: 1. ``propose`` encoded "no change" as ``desire = current``. PP2 needed
+#:    nothing (deficit -55 MiB) and proposed 112640, which -- because its pool
+#:    is the SMALLEST -- was the smallest desire in the group and therefore won
+#:    the MIN that this module documents as "the most-pressed rank sets the
+#:    ambition". It does the opposite: the least-pressed rank with the smallest
+#:    pool sets it.
+#: 2. Even repaired, PP0's genuine ambition of 154376 lies ABOVE PP2's entire
+#:    pool of 112640, so it can never fall below ``min_current`` and the group
+#:    concludes nobody asked for anything.
+#:
+#: So PP0 sat 295 MiB short of seam staging while its own rung offered 1576 MiB
+#: from 185271 rows of slack, the flip abandoned, the decode bundle had already
+#: been drained to arm it, and the instance idled with 473499 tokens waiting.
+#:
+#: A PROPORTION IS THE CONGRUENT CURRENCY, and not merely a convenient one. The
+#: uneven DCP token vector is calibrated against the ranks' capacity RATIO, so a
+#: shrink that preserves the ratio leaves admission congruent, while shrinking
+#: one rank alone would invalidate the vector -- which is HANDOFF_675 §1a's
+#: desync in a new dress. On an even fleet this degrades exactly to the previous
+#: behaviour, which the pp_to_tp legs of that same boot exercise as a built-in
+#: regression (all three ranks at 450560, GRANTED).
+_SHRINK_SCALE = 1_000_000
+
+
+def _shrink_ppm(desire_rows: int, current_rows: int) -> int:
+    """This rank's ambition as a proportion of its own cap.
+
+    ``desire >= current`` means NO CHANGE, and it must map to exactly
+    ``_SHRINK_SCALE`` -- the neutral element of the MIN. Encoding it as the
+    rank's own row count is the #796 defect: on an uneven fleet the smallest
+    pool's "no change" is the smallest number in the group and silently wins.
+    """
+    if current_rows <= 0:
+        return _SHRINK_SCALE
+    if desire_rows >= current_rows:
+        return _SHRINK_SCALE
+    # Rounded DOWN, so the proportion never asks for less than the rank did.
+    return max(1, (int(desire_rows) * _SHRINK_SCALE) // int(current_rows))
+
+
+def _floor_ppm(floor_rows: int, current_rows: int) -> int:
+    """This rank's floor as a proportion, rounded UP so the limit never slips."""
+    if current_rows <= 0:
+        return _SHRINK_SCALE
+    if floor_rows >= current_rows:
+        return _SHRINK_SCALE
+    return min(
+        _SHRINK_SCALE,
+        -((-int(floor_rows) * _SHRINK_SCALE) // int(current_rows)),
+    )
+
+
+def _rows_for_ppm(ppm: int, current_rows: int) -> int:
+    """The group's proportion as THIS rank's row count, rounded UP.
+
+    Up, because rounding a shrink target down would take the rank slightly
+    deeper than the group agreed, and the safe direction for a target that
+    unmaps pages is always the shallower one.
+    """
+    if current_rows <= 0:
+        return 0
+    return min(
+        int(current_rows),
+        -((-int(ppm) * int(current_rows)) // _SHRINK_SCALE),
+    )
+
+
 #: Rows this rung refuses to give up ON TOP of the live high-water mark, so a
 #: shrink leaves a pool that can still ADMIT. See :meth:`KvBackingRelief._floor_rows`.
 KV_ADMISSION_RESERVE_ENV = "SGLANG_KV_ADMISSION_RESERVE_ROWS"
@@ -139,7 +219,7 @@ DEFAULT_ADMISSION_RESERVE_ROWS = 512
 ABSTAIN = (_UNBOUNDED_ROWS, 0, 0, 0)
 
 
-def collective_kv_target(reduced):
+def collective_kv_shrink_ppm(reduced):
     """The group's shared row target, from an element-wise MIN of proposals.
 
     ``reduced`` is what a MIN all-reduce returns over the four-field proposals
@@ -176,9 +256,36 @@ def collective_kv_target(reduced):
         # make uniformly, so it is not a shrink the group makes.
         return None
     target = max(desire, max_floor)
-    if target >= min_current:
+    # #796: the comparison is against the NO-CHANGE proportion, not against the
+    # group's smallest cap. Against ``min_current`` this asked "does any rank
+    # want to go below the SMALLEST rank's pool", which on an uneven fleet is a
+    # question no healthy rank ever answers yes to -- PP0 wanting its own
+    # 204800-row pool cut to 154376 is not below PP2's 112640-row cap, so the
+    # group read it as nobody asking for anything at all.
+    if target >= _SHRINK_SCALE:
         return None
     return int(target)
+
+
+def collective_kv_target(reduced, current_rows=None):
+    """The group's agreed target as a ROW COUNT for a pool of ``current_rows``.
+
+    #796: the group agrees a PROPORTION, because the pools are uneven by design
+    and a row id is meaningless to a peer. Every rank still needs a row count in
+    the end, and this is where the proportion becomes one.
+
+    ``current_rows`` defaults to the group's smallest cap, which is field 2 of
+    the reduction. On an EVEN fleet that IS every rank's own cap, so the default
+    reproduces the pre-#796 return value exactly -- which is why the suites that
+    predate this change still read as they did. A rank on an uneven fleet must
+    pass its OWN cap, and :meth:`KvBackingRelief.apply_shrink_ppm` does.
+    """
+    ppm = collective_kv_shrink_ppm(reduced)
+    if ppm is None:
+        return None
+    if current_rows is None:
+        current_rows = int(reduced[2])
+    return _rows_for_ppm(int(ppm), int(current_rows))
 
 
 def explain_kv_target(reduced) -> str:
@@ -236,33 +343,36 @@ def explain_kv_target(reduced) -> str:
             f"ABSTAIN line names the precondition it failed."
         )
     target = max(desire, max_floor)
-    if target >= min_current:
-        if max_floor >= min_current:
+    if target >= _SHRINK_SCALE:
+        if max_floor >= _SHRINK_SCALE:
             return (
-                f"DECLINED by a PEER FLOOR: the deepest target any rank asked for "
-                f"is {desire} rows, but the group's highest floor is {max_floor} "
-                f"rows -- at or above the group's smallest cap of {min_current} -- "
-                f"so NO uniform target below the cap clears every rank's live set. "
-                f"A rank under no pressure can veto the shrink a pressed rank "
-                f"needs, and the pressed rank's slack stays unreachable. The "
-                f"answer is on the FLOOR side (lower the highest floor by evicting "
-                f"its recomputable prefix), never on the ambition side."
+                f"DECLINED by a PEER FLOOR: the deepest proportion any rank "
+                f"asked for is {desire / 10000:.1f}% of its own cap, but the "
+                f"group's highest floor is {max_floor / 10000:.1f}% -- at or "
+                f"above the no-change proportion -- so NO shrink clears every "
+                f"rank's live set. A rank under no pressure can veto the shrink "
+                f"a pressed rank needs. The answer is on the FLOOR side (lower "
+                f"the highest floor by evicting its recomputable prefix), never "
+                f"on the ambition side."
             )
         return (
-            f"DECLINED because no rank asked to go below the group's smallest cap "
-            f"(deepest desire {desire} rows against cap {min_current}): the cheaper "
-            f"tiers covered every rank's gap, which is the tier law working."
+            f"DECLINED because no rank asked to shrink at all (deepest "
+            f"proportion {desire / 10000:.1f}% of its own cap, smallest pool "
+            f"{min_current} rows): the cheaper tiers covered every rank's gap, "
+            f"which is the tier law working."
         )
     if max_floor > desire:
         return (
-            f"GRANTED {target} rows, RAISED from the deepest ask of {desire} by the "
-            f"group's highest floor {max_floor}: the pressed rank wins less than it "
+            f"GRANTED {target / 10000:.1f}% of each rank's own cap, RAISED from "
+            f"the deepest ask of {desire / 10000:.1f}% by the group's highest "
+            f"floor {max_floor / 10000:.1f}%: the pressed rank wins less than it "
             f"priced, because a peer's live set sits above what it asked for."
         )
     return (
-        f"GRANTED {target} rows: the most-pressed rank set the ambition ({desire}), "
-        f"the group's highest floor ({max_floor}) permits it, and the group's "
-        f"smallest cap is {min_current} rows."
+        f"GRANTED {target / 10000:.1f}% of each rank's own cap: the most-pressed "
+        f"rank set the ambition ({desire / 10000:.1f}%), the group's highest floor "
+        f"({max_floor / 10000:.1f}%) permits it, and the smallest pool in the "
+        f"group is {min_current} rows."
     )
 
 
@@ -1745,7 +1855,43 @@ class KvBackingRelief:
             desire=desire,
             skipped=skipped,
         )
-        return (int(desire), -int(floor_rows), int(current), -int(current))
+        # #796: the first two fields leave in PARTS PER MILLION OF THIS RANK'S
+        # OWN CAP. Rows are this rank's private unit -- the pools are uneven by
+        # design -- so a row id is meaningless to a peer, while a proportion is
+        # the same statement on every rank. ``current`` stays in rows in field
+        # 2 because its only job is to detect an abstention (a non-positive
+        # value), and field 3 stays its negation for the diagnostic maximum.
+        return (
+            _shrink_ppm(desire, current),
+            -_floor_ppm(floor_rows, current),
+            int(current),
+            -int(current),
+        )
+
+    def apply_shrink_ppm(self, ppm: int) -> int:
+        """Apply the group's agreed PROPORTION to this rank's own pool.
+
+        The group agrees the proportion; each rank converts it against its own
+        cap and its own floor. That is the split #796 turned on: the DECISION
+        is uniform, the ROW COUNT is rank-local, and the floor -- which protects
+        this rank's live set from an unmap -- can only ever be applied here.
+        """
+        current = self._current_rows()
+        if current <= 0:
+            return 0
+        rows = _rows_for_ppm(int(ppm), current)
+        max_live = self._max_live_row()
+        floor_rows, _evictable = (
+            self._evict_floor_rows(max_live) if max_live >= 0 else (current, 0)
+        )
+        target = max(int(floor_rows), int(rows))
+        if target >= current:
+            # This rank's own floor already sits at or above the group's
+            # proportion, so it wins nothing this round. Not an error, and not
+            # a reason to deny the ranks that can pay -- which is precisely the
+            # veto #796 removed.
+            return 0
+        return int(self.apply_target(target))
 
     def _abstain(self, reason: str):
         """Return ABSTAIN and say so. Never silently.

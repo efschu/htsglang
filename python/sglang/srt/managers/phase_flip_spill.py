@@ -1816,7 +1816,7 @@ def collective_kv_backing_relief(
                 LOG_PREFIX,
                 e,
             )
-    target = kbr.collective_kv_target(reduced[:4])
+    target = kbr.collective_kv_shrink_ppm(reduced[:4])
     # #796: THE GROUP'S VERDICT, AND THIS RANK'S TERMS BEHIND IT, ON EVERY RANK.
     #
     # The shrink target is a MAX over per-rank floors, so the rank that decides
@@ -1855,7 +1855,11 @@ def collective_kv_backing_relief(
         # this round, and applying it from proposals made BEFORE the shrink
         # would act on a state that no longer exists.
         try:
-            return int(relief.apply_target(target))
+            # #796: ``target`` is a PROPORTION of each rank's own cap, not a row
+            # id. The group agrees the proportion; the rank converts it against
+            # its own pool and its own floor, because the pools are uneven by
+            # design and a row id is meaningless to a peer.
+            return int(relief.apply_shrink_ppm(target))
         except Exception as e:
             logger.error(
                 "%s KV relief failed to apply the agreed target %d: %s. This "

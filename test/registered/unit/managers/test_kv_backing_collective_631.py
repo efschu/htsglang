@@ -146,11 +146,21 @@ class TheTargetIsOneNumberForTheWholeGroupTest(unittest.TestCase):
 
         self.assertIsNotNone(target, "the pressed rank should have driven a shrink")
         # The unpressed peers proposed no shrink at all...
-        self.assertEqual(proposals[1][0], 500000)
-        self.assertEqual(proposals[2][0], 500000)
+        self.assertEqual(
+            proposals[1][0],
+            kbr._SHRINK_SCALE,  # #796: "no change" is now the NEUTRAL element of the
+            # MIN (a proportion of 1.0), not this rank's own row count. Encoding
+            # it as `current` is what let the smallest pool in an uneven fleet
+            # silently set the group's ambition.
+        )
+        self.assertEqual(proposals[2][0], kbr._SHRINK_SCALE)
         # ...and still land on the pressed rank's number, which is the point.
         self.assertLess(target, 500000)
-        self.assertEqual(target, proposals[0][0])
+        # #796: the group's decision is a PROPORTION and ``target`` is that
+        # proportion converted against this pool's 500000 rows, so the two are
+        # compared in one unit. The law is unchanged -- the pressed rank's
+        # number is the group's -- only its currency is.
+        self.assertEqual(target, kbr._rows_for_ppm(proposals[0][0], 500000))
 
     def test_applying_the_agreed_target_leaves_every_rank_at_the_same_rows(self):
         reliefs = [
@@ -252,7 +262,11 @@ class AFutileRankDoesNotStopAWorkingOneTest(unittest.TestCase):
 
         target, proposals = _agree([futile, pressed])
 
-        self.assertEqual(proposals[0][0], 500000, "an exhausted rank stops asking")
+        self.assertEqual(
+            proposals[0][0],
+            kbr._SHRINK_SCALE,
+            "an exhausted rank stops asking (#796: as the neutral proportion)",
+        )
         self.assertIsNotNone(target)
         futile.apply_target(target)
         self.assertEqual(int(futile_pool.size), target)
@@ -303,7 +317,7 @@ class TheProposalAccountsForCheaperReliefFirstTest(unittest.TestCase):
             delta_bytes=256 * MIB,
             cheap_relief_bytes=4000 * MIB,
         )
-        self.assertEqual(proposal[0], 500000)
+        self.assertEqual(proposal[0], kbr._SHRINK_SCALE)
 
 
 class RecoveryIsStillTheThingThatMakesThisNotASmallerPoolTest(unittest.TestCase):
