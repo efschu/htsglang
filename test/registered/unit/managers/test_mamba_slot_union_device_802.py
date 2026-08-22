@@ -10,25 +10,51 @@ THE CRASH, on metal, first real flip of the 18:49 Arm-1 boot
     RuntimeError: No backend type associated with device type cpu
 
 ``agree_mamba_slots`` builds ``header`` and ``presence`` as CPU tensors, but
-the caller hands it ``flip_tp.device_group`` -- an NCCL group with no CPU
-backend. Both collectives therefore die before the union can agree anything.
+the caller hands it ``flip_tp.device_group``, which is CUDA-only and has no
+CPU backend. Both collectives therefore die before the union can agree
+anything.
+
+THE TRANSPORT IS NOT THE DEFECT. On this rig that group is barlink-bar1,
+not NCCL -- every group logs ``requested=bar1, ACHIEVED=bar1`` and PyNccl
+construction is skipped. ``No backend type associated with device type cpu``
+is the GENERIC torch.distributed error for a device-only group handed a CPU
+tensor and reads identically under either transport. Calling it "the NCCL
+group" would send the next reader hunting a barlink-standard violation that
+never happened.
 The KV leg on the very next line got this right:
 ``_dist_exchange(flip_tp.device_group, device)`` pairs the device group WITH
 the device. The union was simply never told.
 
-WHY THE SHIPPED TESTS DID NOT CATCH IT, and this is the lesson worth more
-than the patch. ``agree_mamba_slots`` takes an injectable ``all_reduce`` so
-its logic can be tested in-process. Every existing case supplies one, so the
-DEFAULT path -- ``_default_all_reduce``, the only one a boot ever runs --
-was never executed against a real group. The injectable made the union's
-arithmetic green while the wire it actually uses was never touched. A
-seam that is only ever crossed by a stand-in is not covered.
+WHY THE SHIPPED TESTS WERE GREEN THROUGH IT, and this is the lesson worth
+more than the patch.
+
+The obvious explanation is wrong, and it was checked rather than assumed:
+``agree_mamba_slots`` accepts an injectable ``all_reduce``, so the tempting
+story is that every case injected one and the real ``_default_all_reduce``
+never ran. It is false. ``grep -c 'all_reduce=' test_mamba_slot_union_801.py``
+returns 0, and all five cases call
+``agree_mamba_slots(local, dist.group.WORLD, ...)`` over a REAL process
+group. The boot path WAS exercised.
+
+The actual gap is subtler and more useful: that group is
+``dist.init_process_group("gloo", ...)``, and **gloo is more permissive than
+production**. It accepts CPU tensors; the boot's device-only group does not.
+So the collectives were genuinely executed, on a backend that could not
+refuse the one thing that later refused them. "Exercise the default path"
+would NOT have caught this defect -- the default path was already being
+exercised.
+
+THE GENERALISATION, which is the part to carry forward: a hermetic harness
+must be, in every dimension it claims to cover, AT LEAST AS STRICT AS THE
+PRODUCTION PATH. A more permissive stand-in does not merely weaken a test,
+it inverts its meaning -- green becomes evidence that the strict case was
+never posed. That is a test-harness-fidelity failure, not a missing case.
 
 So this file pins the DEVICE CONTRACT rather than the arithmetic: whatever
 the caller names as the collective device is where the reduced tensors must
-be. It stays hermetic -- the recording reduce below asserts the contract the
-NCCL backend enforces ("a device-only group refuses a cpu tensor") without
-needing a GPU, which is exactly the check the injectable was hiding.
+be. It stays hermetic, and the recording reduce below is deliberately
+STRICTER than gloo -- it refuses a foreign-device tensor exactly as the
+production group does, which is the strictness the gloo harness lacked.
 """
 
 import types
@@ -41,10 +67,13 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class _DeviceOnlyGroup:
-    """Stands in for an NCCL process group: it has no CPU backend.
+    """Stands in for a device-only process group: it has no CPU backend.
 
-    The real one raises `RuntimeError: No backend type associated with device
-    type cpu`; this reproduces that contract exactly, in-process.
+    Transport-agnostic on purpose -- barlink-bar1 (what this rig actually
+    runs) and NCCL both raise the same `RuntimeError: No backend type
+    associated with device type cpu`, because the error comes from
+    torch.distributed's device-to-backend lookup rather than from either
+    transport. This reproduces that contract exactly, in-process.
     """
 
     def __init__(self, kind: str = "cuda"):

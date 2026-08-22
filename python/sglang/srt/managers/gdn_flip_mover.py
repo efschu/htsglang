@@ -736,10 +736,20 @@ def agree_mamba_slots(
     local = slots.detach().to("cpu", torch.int64).reshape(-1)
     local_max = int(local.max().item()) if local.numel() else -1
     # #802: THE COLLECTIVES RUN ON THE GROUP'S OWN DEVICE. The caller passes
-    # `flip_tp.device_group`, an NCCL group with NO CPU backend, so reducing
-    # a CPU tensor on it raises "No backend type associated with device type
-    # cpu" -- which is exactly how the first real flip of the 18:49 boot died
-    # (specimen: /spinning/evidence-665-f1/boot_802ab_arm1_0822_1849.log).
+    # `flip_tp.device_group`, which is CUDA-ONLY and has no CPU backend, so
+    # reducing a CPU tensor on it raises "No backend type associated with
+    # device type cpu" -- exactly how the first real flip of the 18:49 boot
+    # died (specimen:
+    # /spinning/evidence-665-f1/boot_802ab_arm1_0822_1849.log).
+    #
+    # THE TRANSPORT IS NOT THE POINT, and saying so prevents a false reading.
+    # On this rig that group is barlink-bar1, not NCCL: every group logs
+    # "requested=bar1, ACHIEVED=bar1" and PyNccl construction is skipped
+    # outright. "No backend type associated with device type cpu" is the
+    # GENERIC torch.distributed error for a device-only group handed a CPU
+    # tensor, and it reads identically under bar1 and under NCCL. The defect
+    # was tensor placement; describing it as an "NCCL group" would invite the
+    # next reader to hunt a barlink-standard violation that never occurred.
     # The KV leg on the very next line of the caller already pairs the two:
     # `_dist_exchange(flip_tp.device_group, device)`. This one was simply
     # never told which device its group speaks.
@@ -758,6 +768,12 @@ def agree_mamba_slots(
         [local_max, -int(local_capacity)], dtype=torch.int64, device=device
     )
     reduce_fn(header, group)
+    # #802 note, documented rather than optimised: on a CUDA device these two
+    # reads are host syncs, twice per leg. At the flip seam -- where the whole
+    # point is that the ranks are already rendezvoused and quiescent -- that
+    # cost is negligible, and paying it keeps the union's arithmetic in plain
+    # Python where it can be read. Recorded so a later profiler does not
+    # rediscover it as a mystery.
     group_max = int(header[0].item())
     min_capacity = -int(header[1].item())
 
@@ -905,8 +921,9 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
         local = flip_mamba_slots(scheduler)
         # #802: the same (group, device) pairing the KV leg uses below at
         # `_dist_exchange(flip_tp.device_group, device)`. Without the device
-        # the union reduces CPU tensors on an NCCL group and the first real
-        # flip dies with "No backend type associated with device type cpu".
+        # the union reduces CPU tensors on a device-only group (barlink-bar1
+        # on this rig) and the first real flip dies with "No backend type
+        # associated with device type cpu".
         agreed, refusal = agree_mamba_slots(
             local,
             flip_tp.device_group,
