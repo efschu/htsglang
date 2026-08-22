@@ -7564,6 +7564,27 @@ class PhaseFlipRuntime:
                         )
             # Abandoned before any byte moved: there is no seam to attribute.
             seam_census.reset()
+            # #814: AND THE CAP MUST NOT SURVIVE THE ABANDON. Recovery is what
+            # lifts KvRowCap, and its only other call sites are post-cutover
+            # hooks -- so a cap that helps REFUSE the flip would keep itself
+            # alive for the life of the process (measured: pool parked at 26.8%
+            # of its id space, six refused returns, not one post-cutover
+            # census). Safe precisely here and nowhere earlier: nothing moved,
+            # no seam is owed the memory, and this exit is reached by the whole
+            # group together -- it is downstream of the bit-identical
+            # ``reduced_fit`` MIN above, with no return and no raise in
+            # between, which is what a collective needs. The grow inside stays
+            # rank-local and corridor-bounded; see recover_kv_backing_on_abandon.
+            from sglang.srt.managers.phase_flip_spill import (
+                recover_kv_backing_on_abandon,
+            )
+
+            recover_kv_backing_on_abandon(
+                self._census_scheduler,
+                self._collective_min,
+                direction=direction,
+                why="seam fit refused",
+            )
             return None
 
         # The group is going through, so this direction's delay budget is

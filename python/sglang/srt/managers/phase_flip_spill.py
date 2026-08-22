@@ -1329,6 +1329,98 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
     return grown
 
 
+def recover_kv_backing_on_abandon(
+    scheduler: Any, reduce_fn, direction: str = "", why: str = ""
+) -> int:
+    """#814: lift the KV cap when a flip is ABANDONED, not only when one commits.
+
+    THE RATCHET THIS BREAKS. ``recover_kv_backing`` is the only thing that
+    lifts ``KvRowCap``, and until this existed its only two call sites were
+    post-cutover hooks (phase_flip_runtime.py:1818 and :1835). That is fine
+    while flips commit. It is a trap once one does not, and the trap closes on
+    itself:
+
+      1. a corridor-bounded recovery leaves the ranks unequal (measured on this
+         rig, one boot: 210944 / 124928 / 131072 backed rows);
+      2. the cap agreement levels the group to the poorest -- correct, since
+         under pure PP an id a peer cannot map aborts all three ranks inside
+         store_kvcache's bounds assert -- so the allocator is capped at 124928
+         of 465190, 26.8% of the id space;
+      3. the capped pool fills, so the group's live floor is 100% of what is
+         left;
+      4. the next flip is therefore DECLINED for want of fit;
+      5. no cutover, so no recovery, so the cap is never lifted -- back to 3.
+
+    Measured shape of the trap in that boot: 27 pool censuses, three ranks,
+    NINE events, and not one of them ``post-cutover tp_to_pp``. All six return
+    attempts stopped at ``at-arm``. ``recovered to N of M rows`` appears zero
+    times. The pool sat at 26.8% for the life of the process and a user got an
+    overloaded_error against a pool that had been sized 3.7x larger.
+
+    ``recover``'s own docstring rests on the assumption this breaks -- "an
+    admission-capacity loss, which is recoverable ON ANY LATER LEG" -- and
+    ``recover_kv_backing``'s names the outcome as forbidden: "a cap that is
+    never lifted turns dynamic residency into a permanently smaller pool, which
+    is the one fix the standing rule forbids."
+
+    WHY THE ABANDON EXIT IS THE RIGHT LEG, and not the arm or the shrink.
+    Growing must not happen where the seam is about to spend the memory: the
+    first metal boot of a GROWING cap agreement hit ``cuMemCreate failed:
+    CUDA_ERROR_OUT_OF_MEMORY`` on all three ranks, rank 0 driven to 3 MiB free
+    (kv_backing_relief.py:2710-2745, 2026-08-13). At an abandon there is no
+    seam to fund -- the flip is over, nothing moved, and the layout the group
+    is parked in is the one it will keep serving from. That is precisely where
+    a withheld cap is pure loss.
+
+    NOTHING HERE WEAKENS THAT GUARD. The bound lives inside ``recover`` itself
+    (kv_backing_relief.py:2503-2505): a fresh per-rank ``mem_get_info`` read at
+    call time, minus this card's own corridor law, and ``rows <= was`` defers
+    without committing a byte. It is intrinsic to the function, not to the
+    caller, so this call site inherits exactly the protection the two
+    post-cutover sites already rely on. The split the design asks for is kept:
+    the grow stays rank-local and corridor-bounded, the LEVELLING stays
+    collective and strictly non-allocating.
+
+    CALLER CONTRACT, and it is the load-bearing one: this enters a COLLECTIVE
+    through ``reduce_fn``, so it may only be called where EVERY rank arrives.
+    Its one call site is the group-unanimous abandon exit in ``_execute``,
+    downstream of ``reduced_fit = self._collective_min(payload)`` -- a MIN
+    reduction that is bit-identical on every rank, with no return and no raise
+    between it and the exit. Without a channel this is a no-op, matching
+    ``recover_kv_backing``'s own behaviour on single-rank shapes.
+
+    NEVER RAISES. A lost flip must not become a dead rank: an abandon is
+    already the unhappy path, and an exception escaping here would take down an
+    instance that was merely declining to flip.
+    """
+    if reduce_fn is None:
+        return 0
+    try:
+        grown = int(recover_kv_backing(scheduler, reduce_fn=reduce_fn))
+    except Exception as e:  # noqa: BLE001 - an abandon must not kill the rank
+        logger.error(
+            "%s KV backing recovery at the abandoned %s seam failed (%s). The "
+            "cap stays where it was, so admission capacity remains reduced -- "
+            "a capacity loss, never a fault",
+            LOG_PREFIX,
+            direction or "flip",
+            e,
+        )
+        return 0
+    if grown:
+        logger.warning(
+            "%s recovered %d KV rows at the ABANDONED %s seam%s. The flip did "
+            "not commit, so the post-cutover recovery hook never ran; without "
+            "this leg the cap that helped refuse the flip would have stayed on "
+            "for the life of the process (#814)",
+            LOG_PREFIX,
+            grown,
+            direction or "flip",
+            f" ({why})" if why else "",
+        )
+    return grown
+
+
 def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
     """#656 C22: ONE exposed row level for the whole group, every seam round.
 
