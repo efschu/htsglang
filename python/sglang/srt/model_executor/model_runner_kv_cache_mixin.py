@@ -5458,13 +5458,33 @@ class ModelRunnerKVCacheMixin:
             )
 
         if not uneven_dcp_active(self.dcp_size):
-            # The dominant suspect for #797: resolve_cp_token_ratios refuses a
-            # vector whose length does not match dcp_size (distributed/utils.py
-            # :321), and during PP-phase sizing dcp_size is 1 while the vector
-            # has one entry per DCP rank. That is a length mismatch, not an
-            # opt-out, and it is why a seeded vector can arrive and still never
-            # be calibrated against.
-            _skip("uneven DCP is not active for this dcp_size")
+            # THE GATE #797 ACTUALLY DIES ON, and it has THREE distinct causes
+            # that this line must keep apart, because they call for three
+            # different fixes (utils.py:326-330):
+            #   no vector installed yet -- ratios is None. On a phase-flip boot
+            #     this is the real one: the only install-capable site runs from
+            #     init_memory_pools (scheduler.py:1429), which is BEFORE
+            #     build_phase_flip_tp_stack (scheduler.py:1446) performs the
+            #     first set_cp_token_ratios (phase_flip_boot.py:971-990).
+            #     Whoever may install does not yet have a vector to improve on.
+            #   uniform vector -- an all-equal vector is the even fast path.
+            #   length mismatch -- len(ratios) != dcp_size, e.g. a three-entry
+            #     vector against a dcp_size of 1.
+            # Reporting only "not active" would collapse all three, which is
+            # how "the vector is refused somewhere upstream" stayed an
+            # inference. The installed vector itself is therefore printed.
+            _installed = get_cp_token_ratios()
+            if not _installed:
+                _why = "no token vector is installed at this point yet"
+            elif len(set(_installed)) == 1:
+                _why = f"the installed vector {_installed!r} is uniform"
+            else:
+                _why = (
+                    f"the installed vector {_installed!r} has "
+                    f"{len(_installed)} entries against dcp_size "
+                    f"{self.dcp_size}"
+                )
+            _skip(f"uneven DCP is not active: {_why}")
             return
         if get_world_group().world_size <= 1:
             _skip("world size is 1, so there is no split to optimise")

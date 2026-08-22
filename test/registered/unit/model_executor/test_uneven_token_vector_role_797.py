@@ -521,6 +521,37 @@ class TheSilentGatesNowNameThemselves797(CustomTestCase):
         # reader tell this gate from the world-size gate.
         self.assertIn("dcp_size=1", line)
         self.assertIn("world_size=3", line)
+        # And the vector itself, so this cause is separable from the two below.
+        self.assertIn("3 entries against dcp_size 1", line)
+
+    def test_the_three_causes_of_the_first_gate_are_told_apart(self):
+        """ONE GATE, THREE CAUSES, THREE FIXES.
+
+        ``uneven_dcp_active`` refuses for no-vector-installed, for a uniform
+        vector, and for a length mismatch (utils.py:326-330). They are not
+        interchangeable: on a phase-flip boot the real one is the FIRST --
+        the only install-capable call site runs from init_memory_pools
+        (scheduler.py:1429), before build_phase_flip_tp_stack
+        (scheduler.py:1446) performs the first set_cp_token_ratios, so there
+        is no vector installed yet for it to improve on. A line that said only
+        "not active" would collapse the three and leave #797 an inference,
+        which is exactly the state this whole class exists to end.
+        """
+        absent = _skip_infos(dcp_size=3, ratios=[])[0]
+        uniform = _skip_infos(dcp_size=3, ratios=[8, 8, 8])[0]
+        mismatch = _skip_infos(dcp_size=1, ratios=[29, 19, 16])[0]
+
+        self.assertIn("no token vector is installed", absent)
+        self.assertIn("is uniform", uniform)
+        self.assertIn("entries against dcp_size", mismatch)
+
+        # Pairwise distinct, asserted rather than eyeballed: three reasons that
+        # happened to share a substring would pass the three checks above.
+        self.assertEqual(
+            len({absent, uniform, mismatch}),
+            3,
+            "two of the three causes produced the same line",
+        )
 
     def test_the_world_size_gate_names_itself_and_is_distinguishable(self):
         """Two gates, two different readings -- not one generic line twice."""
