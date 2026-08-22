@@ -3668,7 +3668,36 @@ class PhaseFlipRuntime:
             free = set(alloc.free_pages.tolist()) | set(alloc.release_pages.tolist())
             cached = set(tree.all_values_flatten().tolist())
             size = int(alloc.size)
-            leaked = set(range(1, size + 1)) - free - cached
+            # #814: WITHHELD CAPACITY IS NOT A LEAK, and this census read it as
+            # one for 73% of a live pool. When ``KvRowCap`` is engaged the ids
+            # above the cap are in NEITHER the free lists nor the tree -- and
+            # ``alloc.size`` still reports the full pre-shrink id space, since
+            # the shrink never rewrites it (allocator/base.py:38). So they fell
+            # straight into ``leaked``: measured on this rig, a cap at 124928
+            # of 465190 rows printed ``unaccounted=340262``, one contiguous
+            # block, flat for the life of the boot.
+            #
+            # This is the SAME mistake the scheduler's idle invariant made and
+            # ``KvRowCap._publish`` (kv_backing_relief.py:530-549) was written
+            # to fix -- "without a term of its own it reads as a LEAK -- and it
+            # is a fatal one". It publishes ``residency_withheld_slots`` for
+            # that check; this census simply never asked for it.
+            #
+            # SUBTRACT THE RANGE, NOT THE COUNT. The cap withholds every id
+            # ABOVE it, so the withheld set is the TOP of the id space and is
+            # known exactly. Subtracting a bare count would also swallow an
+            # equal number of genuinely unexplained rows below the cap, which
+            # is the one thing this census exists to see.
+            #
+            # The field is published in TOKENS ("the unit available_size()
+            # reports"), so a paged lane must divide by page_size to get ids.
+            page = max(1, int(getattr(alloc, "page_size", 1) or 1))
+            withheld_n = int(getattr(alloc, "residency_withheld_slots", 0) or 0) // page
+            withheld_n = max(0, min(withheld_n, size))
+            withheld = (
+                set(range(size - withheld_n + 1, size + 1)) if withheld_n else set()
+            )
+            leaked = set(range(1, size + 1)) - free - cached - withheld
             reqs = _live_reqs(scheduler)
             # SLOT SCOPE MATTERS AND IS EASY TO MISREAD. Under
             # event_loop_pp, scheduler.running_batch / last_batch are
@@ -3688,7 +3717,7 @@ class PhaseFlipRuntime:
                     slots_with_reqs.append(i)
             logger.warning(
                 "%s POOL CENSUS %s %s: size=%d free=%d cached=%d "
-                "available=%s cur_slot_reqs=%d resident_reqs=%d "
+                "withheld=%d available=%s cur_slot_reqs=%d resident_reqs=%d "
                 "resident_slots=%s unaccounted=%d %s",
                 LOG_PREFIX,
                 when,
@@ -3696,6 +3725,11 @@ class PhaseFlipRuntime:
                 size,
                 len(free),
                 len(cached),
+                # Reported, never merely subtracted: ids out of circulation are
+                # the single most important fact about a capped pool, and a fix
+                # that only hid them would trade a false leak for a silent
+                # capacity loss -- the worse of the two.
+                len(withheld),
                 getattr(alloc, "available_size", lambda: "?")(),
                 len(reqs),
                 resident,
@@ -7530,6 +7564,27 @@ class PhaseFlipRuntime:
                         )
             # Abandoned before any byte moved: there is no seam to attribute.
             seam_census.reset()
+            # #814: AND THE CAP MUST NOT SURVIVE THE ABANDON. Recovery is what
+            # lifts KvRowCap, and its only other call sites are post-cutover
+            # hooks -- so a cap that helps REFUSE the flip would keep itself
+            # alive for the life of the process (measured: pool parked at 26.8%
+            # of its id space, six refused returns, not one post-cutover
+            # census). Safe precisely here and nowhere earlier: nothing moved,
+            # no seam is owed the memory, and this exit is reached by the whole
+            # group together -- it is downstream of the bit-identical
+            # ``reduced_fit`` MIN above, with no return and no raise in
+            # between, which is what a collective needs. The grow inside stays
+            # rank-local and corridor-bounded; see recover_kv_backing_on_abandon.
+            from sglang.srt.managers.phase_flip_spill import (
+                recover_kv_backing_on_abandon,
+            )
+
+            recover_kv_backing_on_abandon(
+                self._census_scheduler,
+                self._collective_min,
+                direction=direction,
+                why="seam fit refused",
+            )
             return None
 
         # The group is going through, so this direction's delay budget is
