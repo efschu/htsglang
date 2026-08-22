@@ -80,6 +80,18 @@ class _Args:
         )
 
 
+def _lineage_unsupported():
+    """Pretend the built lineage does NOT carry the reorder.
+
+    The can-fail direction: if the capability went away, the floor must climb
+    back to 1+P+1+1 on its own. This is what stops the reduction from being a
+    constant someone can flip without shipping the mechanism.
+    """
+    return mock.patch.object(
+        floor_mod, "mamba_reorder_lineage_supported", lambda _sa: False
+    )
+
+
 def _lineage_supported():
     """Pretend the built lineage carries the reorder.
 
@@ -105,24 +117,38 @@ class _EnvOn:
 
 
 class TestTheReductionRequiresTheMechanism(CustomTestCase):
-    def test_the_unified_lineage_does_not_support_the_reorder(self):
-        """The lineage predicate states the fact the floor has to respect."""
-        with _EnvOn():
-            self.assertFalse(
-                mamba_reorder_lineage_supported(_Args()),
-                "hybrid SSM + hierarchical cache is built as UnifiedRadixCache, "
-                "which does not implement the #755 reorder",
-            )
+    def test_the_unified_lineage_now_supports_the_reorder(self):
+        """The predicate tracks the CODE, and the code now has the mechanism.
 
-    def test_the_standing_boot_shape_does_not_take_the_reduction(self):
-        """THE REGRESSION THIS FILE EXISTS FOR.
-
-        Every other condition of the #755 gate is satisfied on the standing
-        boot -- radix on, hierarchical on, write_through, operator opted in --
-        and the reduction must still be refused, because the class that would
-        honour it is not the class that gets built.
+        `UnifiedRadixCache.cache_unfinished_req` releases the old anchor's
+        mamba pin before the donation alloc, gated per node by
+        `MambaComponent.anchor_release_admissible`. When that port landed the
+        capability constant flipped, and the floor follows it -- which is the
+        entire point of routing the reduction through a capability instead of
+        through a config flag.
         """
         with _EnvOn():
+            self.assertTrue(mamba_reorder_lineage_supported(_Args()))
+
+    def test_the_standing_boot_shape_takes_the_reduction(self):
+        """The standing boot's own shape, now that the mechanism exists."""
+        with _EnvOn():
+            args = _Args()
+            self.assertTrue(mamba_slot_reorder_active(args))
+            self.assertEqual(mamba_slots_per_running_req(args), 2)
+            self.assertEqual(mamba_hard_floor(args, 8), 16)
+
+    def test_THE_REGRESSION_a_lineage_without_the_mechanism_is_refused(self):
+        """THE REGRESSION THIS FILE EXISTS FOR.
+
+        Every other condition of the #755 gate is satisfiable on the standing
+        boot -- radix on, hierarchical on, write_through, operator opted in --
+        so if the capability is ever claimed without the mechanism, the floor
+        silently under-reserves one slot per running request and the boot
+        validates a pool the runtime over-draws. That is the #581 direction,
+        and it is what this gate refuses.
+        """
+        with _EnvOn(), _lineage_unsupported():
             args = _Args()
             self.assertFalse(mamba_slot_reorder_active(args))
             self.assertEqual(mamba_slots_per_running_req(args), 3)
@@ -176,7 +202,8 @@ class TestTheDirectionOfTheError(CustomTestCase):
     def test_the_refused_reduction_raises_the_floor_it_does_not_lower_it(self):
         with _EnvOn():
             args = _Args()
-            refused = mamba_hard_floor(args, 8)
+            with _lineage_unsupported():
+                refused = mamba_hard_floor(args, 8)
             with _lineage_supported():
                 taken = mamba_hard_floor(args, 8)
         self.assertGreater(

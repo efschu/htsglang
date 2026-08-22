@@ -61,7 +61,10 @@ MAX_CONTEXT_LEN = 256
 MAX_NUM_REQS = 16
 
 
-def _build():
+def _build(
+    mamba_pool_size: int = MAMBA_POOL_SIZE,
+    max_running_requests: int = MAX_RUNNING_REQUESTS,
+):
     """Live UnifiedRadixCache with a mamba component, pinned to CPU.
 
     Mirrors `test_unified_radix_cache_unittest.build_fixture`'s mamba branch,
@@ -74,7 +77,7 @@ def _build():
     server_args = ServerArgs(model_path="dummy", page_size=1)
     # The property would otherwise load the HF config of the dummy model.
     server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
-    server_args.max_running_requests = MAX_RUNNING_REQUESTS
+    server_args.max_running_requests = max_running_requests
     set_global_server_args_for_scheduler(server_args)
 
     mamba_layers = [i for i in range(NUM_LAYERS) if i not in FULL_ATTENTION_LAYER_IDS]
@@ -92,7 +95,7 @@ def _build():
 
     req_to_token_pool = HybridReqToTokenPool(
         size=MAX_NUM_REQS,
-        mamba_size=MAMBA_POOL_SIZE,
+        mamba_size=mamba_pool_size,
         mamba_spec_state_size=MAX_NUM_REQS,
         max_context_len=MAX_CONTEXT_LEN,
         device=device,

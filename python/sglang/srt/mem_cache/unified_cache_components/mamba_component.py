@@ -85,13 +85,13 @@ class MambaComponent(TreeComponent):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
-        assert isinstance(
-            cache.req_to_token_pool, HybridReqToTokenPool
-        ), f"MambaComponent requires HybridReqToTokenPool, got {type(cache.req_to_token_pool)}"
+        assert isinstance(cache.req_to_token_pool, HybridReqToTokenPool), (
+            f"MambaComponent requires HybridReqToTokenPool, got {type(cache.req_to_token_pool)}"
+        )
         if not params.enable_mamba_extra_buffer:
-            assert (
-                cache.page_size == 1
-            ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {cache.page_size}"
+            assert cache.page_size == 1, (
+                f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {cache.page_size}"
+            )
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
@@ -519,6 +519,43 @@ class MambaComponent(TreeComponent):
         if self.cache._pin_trace_every:
             self.cache.record_pin_trace_mamba("inc", host=lock_host)
         return result
+
+    def anchor_release_admissible(self, node: Optional[UnifiedTreeNode]) -> bool:
+        """#773/#755: may THIS node's mamba pin be released before the alloc?
+
+        The #755 reorder turns `alloc -> insert -> dec(old) -> inc(new)` into
+        `dec(old) -> alloc -> insert -> inc(new)`, so the old and new anchors
+        never coexist and a running request holds `active + donated` instead
+        of `active + donated + old pin`. That is the whole slot it saves.
+
+        Between the release and the new pin the old node's state slot is
+        evictable, so the release is only safe when losing it costs a
+        `load_back` rather than the anchor itself. Two facts, both required,
+        and neither of them is a config question:
+
+        * the node carries a HOST copy -- `is_resume_candidate(...,
+          device_only=False)` is what makes an evicted-but-backed anchor a
+          valid match, and that is exactly the degradation being relied on;
+        * that copy has LANDED. #767: write-through publishes `host_value`
+          the moment the transfer is handed to the controller, and the same
+          block records the node in `ongoing_write_through`. Between those
+          two facts the anchor exists as an intention only, and releasing
+          there is precisely the dead anchor this guard exists to prevent.
+
+        A node whose mamba value is already gone has no pin to release, so it
+        answers False rather than pretending it did something.
+        """
+        if node is None or node is self.cache.root_node:
+            return False
+        ct = self.component_type
+        if len(node.component_data) <= int(ct):
+            return False
+        cd = node.component_data[ct]
+        if cd.value is None:
+            return False
+        if cd.host_value is None:
+            return False
+        return node.id not in self.cache.ongoing_write_through
 
     def release_component_lock(
         self,

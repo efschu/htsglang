@@ -105,7 +105,7 @@ MAMBA_SLOT_REORDER_ENV = "SGLANG_MAMBA_SLOT_REORDER"
 #: floor reduction returns on its own. It is a constant rather than a config
 #: flag on purpose: it describes what the CODE can do, not what an operator
 #: may ask for, and an operator must never be able to assert it.
-UNIFIED_LINEAGE_IMPLEMENTS_SLOT_REORDER = False
+UNIFIED_LINEAGE_IMPLEMENTS_SLOT_REORDER = True
 
 
 def mamba_reorder_lineage_supported(server_args: "ServerArgs") -> bool:

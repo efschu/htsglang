@@ -970,6 +970,52 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, dec_params)
 
+    def dec_mamba_lock_only(self, node: UnifiedTreeNode) -> bool:
+        """Release ONLY the mamba portion of a request's tree lock on `node`.
+
+        #773. The per-component lock model makes this lineage's #755 reorder
+        strictly safer than the original: `MambaRadixCache` releases the whole
+        node lock early, which also drops the FULL component's KV lock on
+        every ancestor up to the root, so the request's own matched prefix is
+        evictable inside the window. Here only the MAMBA component's lock is
+        dropped -- the KV path stays protected, and the only thing made
+        evictable is the one state slot the reorder is trying not to
+        double-count.
+
+        `dec_swa_lock_only` is the same shape for the SWA component.
+        """
+        if self.disable or node is None or node is self.root_node:
+            return False
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return False
+        comp.release_component_lock(node, None)
+        return True
+
+    def _mamba_anchor_early_release(self, req) -> bool:
+        """Decide, per request, whether to take the #755 reorder this step.
+
+        Returns True when the old anchor's mamba lock was released early, so
+        the caller must not release it a second time at the normal site.
+
+        A config that promised the reduced floor but meets a node that is not
+        host-backed does NOT silently revert to the three-slot order -- the
+        floor no longer reserves that slot, and claiming it is the #581 late
+        failure. It takes the reduced-budget path instead: the old pin simply
+        stays held, which is `active + old pin = 2` and still fits.
+        """
+        if ComponentType.MAMBA not in self.tree_components:
+            return False
+        from sglang.srt.mem_cache.mamba_pool_floor import mamba_slot_reorder_active
+        from sglang.srt.runtime_context import get_server_args
+
+        if not mamba_slot_reorder_active(get_server_args()):
+            return False
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None or not comp.anchor_release_admissible(req.last_node):
+            return False
+        return self.dec_mamba_lock_only(req.last_node)
+
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
@@ -1092,6 +1138,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             chunked=chunked,
             priority=req.priority or 0,
         )
+        # #773/#755: THE LOCK REORDER. Release the OLD anchor's mamba pin
+        # BEFORE the donation alloc below, so the old and new anchors never
+        # coexist and the request holds `active + donated` rather than
+        # `active + donated + old pin`. Only admissible for a node whose host
+        # copy has actually landed -- see MambaComponent.anchor_release_admissible.
+        mamba_anchor_released = self._mamba_anchor_early_release(req)
+
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
@@ -1110,6 +1163,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         if effective_cache_len <= 0:
+            if mamba_anchor_released:
+                # #773: nothing was inserted, so no new anchor will take over
+                # the pin we dropped -- and `req.last_node` is unchanged, so
+                # the NEXT dec_lock_ref for it would decrement a mamba ref
+                # this step already released (#583's lock-ref pairing bug).
+                # Restore the exact pre-call state instead of carrying the
+                # imbalance forward. Re-acquiring a node whose state was
+                # evicted inside the window is still correct: the component
+                # records the skip and the paired release honours it.
+                self.components[ComponentType.MAMBA].acquire_component_lock(
+                    node=req.last_node, result=IncLockRefResult()
+                )
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
@@ -1147,10 +1212,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-        )
+        dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        if mamba_anchor_released:
+            # #773: the mamba half of this lock was already released above, so
+            # only the FULL/SWA halves are still outstanding. The skip set is
+            # the mechanism the components already use for exactly this
+            # question (a ref that was never taken must not be given back).
+            dec_params.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                req.last_node.id
+            )
+        self.dec_lock_ref(req.last_node, dec_params)
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
