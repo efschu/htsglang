@@ -586,6 +586,40 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   still lowering `pool.size` — measured on metal driving a card from 3040 to
   460 MiB free and ending in `cuMemCreate OUT_OF_MEMORY`, because the failure
   path re-committed. It is now a registration disqualifier.
+  **THREE FOLLOW-ON DEFECTS OF THE CAP, each measured on this rig** (#814,
+  #816). (a) *The census read the withheld block as a leak.* `_pool_census`
+  derives `range(1, size+1) - free - cached`, and the shrink never rewrites
+  `alloc.size` (`allocator/base.py:38`), so 340262 withheld ids of 465190 fell
+  into `leaked` — flat for a whole boot, on all three ranks. A cap is a solid
+  top block whose size equals the cap; a leak is fragmented and accumulates.
+  The census now subtracts the RANGE, never a bare count, because a count
+  would swallow an equal number of genuinely unexplained rows BELOW the cap,
+  which is the one thing the census exists to see. `KvRowCap._publish`
+  (`kv_backing_relief.py:530-549`) already existed for this exact mistake on
+  the scheduler's idle invariant — this census simply never asked for it.
+  (b) *The lift was reachable only from a cutover.* `recover_kv_backing`'s only
+  call sites were post-cutover hooks (`phase_flip_runtime.py:1818`, `:1835`),
+  which is a trap that closes on itself: cap agreement levels the group to the
+  poorest rank, the capped pool fills, the next leg is DECLINED by that peer
+  floor (#812), and with no cutover the cap is never lifted. One boot sat at
+  26.8% of its id space for the life of the process and answered a user with
+  `overloaded_error` against a pool 3.7x larger; the log carries 27 census
+  lines and NOT ONE `post-cutover tp_to_pp`. The lift now also fires at an
+  ABANDONED seam. So #812 and #813 are consequences of the cap, not its cause.
+  (c) *Exposure could exceed the backing.* `recover()` compared the committed
+  row count against the REMEMBERED boot target instead of the allocator's id
+  space, so between those two values it engaged nothing while the `release()`
+  above it had already re-exposed the whole id space: 417850 rows exposed over
+  105413 committed, 312437 with no page behind them, and the first prefill
+  whose tail landed above the backing took the device-side assert in
+  `masked_set_kv_buffer_kernel` (`memory_pool.py:4978`).
+  `clamp_exposure_to_backing()` guards all three sites (recover,
+  `apply_cap_agreement`, the failed-shrink error path) and only ever LOWERS
+  exposure toward a MEASURED `_current_rows()`, so it cannot re-create the
+  #722/#717 direction where the cap landed below rows that were still live.
+  The writer's bound is deliberately NOT widened: `graph_safe_store_bound`
+  (`memory_pool.py:131`) is graph-stable and widening it would re-admit the
+  silent-corruption band it exists to exclude.
 - **Local relief tier** (`corridor_guard.RELIEF_LOCAL`): torch's unused cached
   blocks handed back to the driver. Sorts ahead of rebalance/park/host because
   it moves no payload anywhere. The seam already did this, but inside
@@ -836,6 +870,40 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   a segfault in `transfer_kv_all_layer_direct_lf_pf` (#436, cu12/cu13
   `cudaMemcpyBatchAsync` ABI split); unblocked by the cu13 `sgl_kernel`
   rebuild.
+- **HiCache staging write-through ring** (`planner/hicache_staging.py`, #810):
+  under `--hicache-host-role staging` the pinned host tier stops being an L2
+  retention cache and becomes a small write-through buffer, which changes what
+  a full tier MEANS. Nothing at runtime bounded write-through into it — the
+  tier bounded itself by running out, which is not a bound but TWO silent
+  failures. The read consumer starves: a prefetch takes its landing slot from
+  `mem_pool_host.alloc()` BEFORE issuing the storage read, so a tier full of
+  undrained write-through pages makes it evict, retry, truncate and abandon —
+  a correct miss, invisible to every capacity metric and visible only as
+  latency. And the write refusal was silent: `write_backup` learned about
+  exhaustion by reading a None back out of an allocation that had already
+  happened, then took `evict_host()`, a RANK-LOCAL tree edit with no
+  rank-uniform floor published, i.e. the #645 divergence. The ring bounds the
+  write-through and COUNTS the refusals. Not #720's `ReadBufferPool` — that
+  answers a different question on the read side. Two companion refusals ship
+  with it. (1) **A staging tier in front of an UNBOUNDED file tier is refused
+  at launch.** `LRUFileEvictor` is default-off (`_eviction_configured` is
+  `max_size_bytes > 0 or min_free_bytes > 0`), which is defensible while the
+  host tier is a retention cache and the disk tier is a second copy — and
+  indefensible under staging, where the file store becomes the ONLY copy. An
+  unbounded only-copy grows until the filesystem is full, at which point
+  `HiCacheFile.set` rolls its reservation back and returns False, which the ack
+  path already treats as a partial backup, i.e. a silent and permanent
+  capacity loss. (2) **The staging tier is on the boot preflight's ledger.**
+  The preflight could not see the largest pinned-host consumer on this rig: the
+  launcher-side joint pinned-host check (#550/#729) is reached only inside the
+  `--enable-kv-session-offload` x hierarchical-cache branch and only with a
+  non-zero spill pool, and the default `--hicache-ratio` sizing cannot be
+  priced before the device pool exists — so the standing boot's 22.01 GB of
+  `MHATokenToKVPoolHost` across three PP ranks reached the preflight as
+  NOTHING. Under staging `--hicache-size` is mandatory and absolute, so the
+  number is exact at parse time and is declared. The planner's
+  `fits_pinned_host_budget` helper was dropped in the same lane: it registered
+  a post nothing allocates.
 - **KV session offload (kvso)**: FCFS spill of youngest sessions to RAM (KV
   only — `bundle_spillable_sizes` returns `[("kv", kv)]` and nothing else,
   `managers/kv_session_offload.py:126`, so GDN stays resident), budgets
@@ -1467,6 +1535,25 @@ captured decode, at the CUDA-graph replay boundary
 read would be illegal. Knobs:
 `SGLANG_BARLINK_BAR1_ABORT_CHECK=0` (restore the old silence),
 `..._CHECK_EVERY=N`, `..._CHECK_REPLAY=0`.
+**Peer liveness at the wait (#818).** The abort gate could wait forever on a
+peer that no longer exists. Rank PP1 died of a device-side assert four times on
+2026-08-22/23, and each time the instance was lost not to the assert but to the
+WAIT: every usable py-spy generation showed both survivors in
+`_wait_ctl_event / _read_status_for_check / check_aborted / _after_transport /
+all_reduce`, with PP1 in none, while the only line they emitted said the
+compute stream "has not retired the copy" — true, and useless, because the
+reason it had not was that the peer was dead. Two gates stood between an expiry
+and an escalation and a dead peer walked past both: `Bar1CollectiveStalled`
+fires after N CONSECUTIVE expiries and `_ctl_stall_run` is reset by EVERY
+resolved read, so the INTERMITTENT expiries a dead peer produces never
+escalate (the 23:57 specimen logged 20 CUMULATIVE expiries in ~36 s and never
+escalated); and `defer_stall_for_building_peer` can extend the wait to
+`SGLANG_BARLINK_BUILD_WINDOW_CAP_S` (900 s default) off a published build
+marker, but a process that no longer exists is not building. **This is not a
+shorter timeout — it is a different question, asked at the three points that
+can wait: is the peer still there?** A gone peer now fails fast with a NAMED
+error. Pinned by `test_barlink_abort_gate_liveness_818.py` (hermetic,
+CPU-only).
 **Guard cost, and where it lands** (#476 measured, #517 named). The blocking
 read cost -9.22 % of code decode_TPS against the same-tree NCCL baseline;
 removing both seams gives +2.68 %, reproducing #424's pre-#431 BAR1 advantage.
@@ -2477,6 +2564,65 @@ warmed-up point and a cold one wrote the same file. Any run property a later
 verdict rests on (warm-up discarded, draws back-to-back, gap between draws) is
 recorded as a measured NUMBER plus the verdict derived from it, so the claim can
 be refuted from the file rather than taken on the harness's word.
+
+Contradictory-flag family (#806): two flags whose combination is not a tuning
+question but a contradiction must be refused at PARSE time, not discovered by
+the runtime guard that correctly refuses it. `--disable-radix-cache` builds a
+`ChunkCache` (`mem_cache/registry.py`), and no ChunkCache variant — ChunkCache,
+SWAChunkCache, PureSWAChunkCache — implements `all_values_flatten`, which is
+exactly the method the flip guard tests for (`phase_flip_runtime.py:1292`). So
+under `--enable-phase-flip --disable-radix-cache` EVERY flip is refused, every
+round, for the life of the process. It cannot work either: the flip must
+enumerate live KV slots to move them and a ChunkCache keeps no tree to
+enumerate. The runtime guard is correct and stays; what it cannot do is say so
+in time. Pinned by `test_phase_flip_needs_radix_806.py`. **A guard that will
+refuse identically on every round for the whole process is a launch
+precondition wearing a runtime guard's clothes.**
+
+Read-back-after-construction family (#797): a value parsed as a SEED, installed
+process-globally, and then read back from the object that was built under it is
+two different values whenever construction is itself allowed to replace it.
+`build_phase_flip_tp_stack` installs a seed token vector and then builds the TP
+decode worker, whose construction reaches the install-capable calibration site
+(`_resolve_memory_pool_config` -> `_maybe_suggest_dcp_token_vector` with
+`allow_install=True`) and may replace the global vector with the MEASURED
+optimum — while `PhaseFlipStacks.token_vector` stayed frozen from the
+pre-construction seed and `_cutover` reinstalled that stale value at every
+flip. Two consequences, the second being the serious one: the measured vector
+never reached the decode phase, and the owner rule was pointed at a DIFFERENT
+vector than the pools were SIZED under — the out-of-bounds slot id the
+cutover's own comment warns about, reached by a stale TOKEN vector rather than
+the weight vector it anticipated. The edge now reads the vector back after the
+stack is built and reports HOLDS / RECALIBRATED / UNDECIDED, each naming its
+own cause; a length disagreement yields UNDECIDED and the seed stands, because
+adopting a wrong-length vector would turn an unclear read-back into a certain
+out-of-bounds slot id. It INSTALLS NOTHING — `allow_install` inside the
+calibration remains the single authority, so this carries no collective.
+Pinned by `test_flip_token_vector_calibration_797.py`. **Read the value back
+off the built object; do not assume the seed survived construction.**
+
+Denylist-of-reasons family (#817, #820): a gate that decides by matching
+SUBSTRINGS of a human-readable reason string cannot distinguish an
+UNRECOGNISED case from an exempt one, and it fails toward swallowing. `decide()`
+wrapped every `PP_TO_TP` arm in the #677 layout hold unless the reason started
+with `IDLE_LOCKED` or contained `"DRAINED"` or `"decode starvation cap"`. The
+blocked-admission exit was simply unrecognised — an exit added ONE DAY EARLIER
+UNDER THE SAME TICKET (3f49f51c51, "PP must leave when admission is BLOCKED,
+not only when it drains"), whose commit spends a paragraph establishing that
+the missing exit is NOT another timer, since that distinction is the whole
+rule. Converted into a hold, it then announced over the specimen's own frozen
+token count that "the timer does not get to take it" — the wedge it existed to
+break. The hold is now an ALLOWLIST carried by the arm itself rather than
+recovered from its prose, exactly as the wrapper's own comment prescribed
+("If a fourth exemption ever appears, invert this into an allowlist rather
+than adding it"); the stopwatch is the last bound, so it exits too and the
+allowlist ends up EMPTY. #820 then removed the hold's TP mirror: `decide()`
+consults `layout_hold_verdict` at exactly one place, under
+`d.direction == PP_TO_TP`, and every arm that can carry that direction is built
+under `inp.phase == PHASE_PP`, so the `phase == "tp"` branch was dead — and
+wiring it would have been wrong rather than merely redundant. Pinned by
+`test_hold_allowlist_817.py` and `test_tp_mirror_removed_820.py`. **Carry the
+exemption as a field on the decision, never as a substring of its explanation.**
 
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
@@ -3628,6 +3774,22 @@ taxonomy and the global importance ladder.
   GATE `--enable-vram-dial` (`server_args.py:5229`, `:7133`); chunk size
   `environ.py:371`. Control surface `managers/io_struct.py:1474`,
   `managers/tokenizer_control_mixin.py:316`.
+- **hicache staging sizing (#810)** — the arithmetic behind a write-through
+  staging host tier: what write-through puts in per second, what the read
+  consumer needs standing as landing space, whether the two are sustainable,
+  and the resulting size. Pure functions, no allocation and no I/O, so the
+  boot preflight and the operator-facing describe path cannot disagree about
+  a number.
+  ENTRY `planner/hicache_staging.py:93` (`write_staging_bytes`), `:120`
+  (`read_landing_bytes`), `:136` (`sustainable`), `:147` (`staging_size_gb`),
+  `:167` (`describe_staging_size`).
+  GATE: only meaningful under `--hicache-host-role staging`, where
+  `--hicache-size` is mandatory and absolute; the default `--hicache-ratio`
+  sizing is deliberately NOT priced here because it cannot be known before the
+  device pool exists. Note the deletion in the same lane: a
+  `fits_pinned_host_budget` helper was REMOVED because it registered a post
+  nothing allocates — do not reintroduce a budget check on this surface, the
+  joint pinned-host check lives launcher-side (#550/#729).
 - **memtier registry (#407)** — the tier registry: what storage tiers exist,
   what each costs, and what each REFUSES, with named-post reservations
   against a tier ledger. The generic answer to "where can this asset live".
@@ -4034,6 +4196,33 @@ taxonomy and the global importance ladder.
   GATE: none (test-side). Note the standing limits before designing a gate
   around it: GDN prefill is non-reproducible above ~109 tokens (upstream),
   and GPTQ/AWQ-marlin offload is intrinsically ~1e-2 — see §10.
+- **mamba carry instrument (#767, gated by #790)** — the open-question probe on
+  the mamba carry/COW/checkpoint family. The sync-free half was already in the
+  tree (`sync_free_tensor_repr` reports shape/dtype/device/id and never the
+  slot value, and all four sites route through it), which stopped the
+  instrument WEDGING admission but not it being EMITTED. **A rate limit is not
+  a gate**: `n <= 3 or n % 500 == 0` still fired at WARNING level on a healthy
+  server, from inside prefill admission
+  (`alloc` <- `alloc_for_extend` <- `prepare_for_extend` <-
+  `get_new_batch_prefill`). The line answers an open question, is not an
+  operator-actionable event, and **an instrument must not charge the path it
+  observes**. It now runs only when asked for.
+  GATE `SGLANG_DEBUG_MAMBA_CARRY` (`EnvBool(False)`, declared in `Envs` per the
+  project's env-var conventions rather than a raw `os.getenv`).
+- **flip break-even N, honestly scoped (#777)** — what `cfg.flip_tokens` gates
+  and when its printed figure has gone stale. ~1.8k-token prompts routed into
+  PP prefill while the policy logged a break-even of 7004 tokens, and both
+  halves were true: N really is the number printed AND the number compared.
+  The defect was the CLAIM. SCOPE: the module docstring promised "below N the
+  prompt never wanted PP anyway", which is a statement about ONE prompt, while
+  N is compared against `inp.pending_prefill_tokens` — the AGGREGATE of
+  admitted-but-not-yet-computed tokens across the waiting queue, the chunked
+  remainder and in-flight arrivals. There is no per-request comparison against
+  N anywhere in the module, so a 1.8k prompt reaches PP without contradicting
+  anything. This is the #708 shape twice over: **a diagnostic that claims what
+  the code does not do.** The figure now says what it actually gates and
+  reports when it has gone stale.
+  Pinned by `test_flip_threshold_honesty_777.py`.
 
 ### 18.7 Small primitives that keep getting rewritten
 
