@@ -1047,6 +1047,33 @@ def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
     return 2.0 * cfg.flip_cost_s
 
 
+def drain_stall_deadline_s(cfg: "PhasePolicyConfig") -> float:
+    """How long drain mode waits on an admitted set that is NOT shrinking.
+
+    #833. Drain mode's exit condition is an empty decode bundle, and under
+    sustained load that is a state admission structurally never revisits: it
+    refills every slot the bundle frees. The bound here is what makes the wait
+    terminate, so its size is the whole trade-off:
+
+    * too SHORT and it re-creates the defect #677 hot fix 2 closed -- a bundle
+      cut in half, its carriers coming back unfinished window after window;
+    * too LONG and the instance serves single-phase indefinitely, which is the
+      22-minute drought measured on boot_window3_0823_1733.
+
+    SOLVED, not chosen: one full decode window. ``solved_tp_decode_floor_s`` is
+    already this module's answer to "the shortest TP residency that is worth
+    its own cutovers" (2 x flip_cost_s), and a bundle that has not retired a
+    single request in that long is not being served by waiting longer. The
+    floor keeps it meaningful when ``flip_cost_s`` is unset or tiny, where an
+    unfloored deadline would arm on the first observation and read as thrash.
+
+    Booted values, for the record: flip_cost_s 3.2 s gives 6.4 s, which the
+    10 s floor raises to 10 s -- so a genuinely draining bundle keeps a full
+    decode window, and a stalled one costs at most that.
+    """
+    return max(10.0, solved_tp_decode_floor_s(cfg))
+
+
 def with_decode_contention(
     cfg: "PhasePolicyConfig", value: object
 ) -> "PhasePolicyConfig":
@@ -1441,6 +1468,18 @@ class PhasePolicyState:
     #: What pending was at the previous observation, so a DECREASE can be
     #: recognised. Compared, never trusted as a level.
     last_pending_prefill_tokens: Optional[int] = None
+    #: #833: when the ADMITTED SET last got smaller, and what it was.
+    #:
+    #: The #677(a) pair above measures PENDING, and that is the wrong axis for
+    #: drain mode: pending is the quantity PRESSURE inflates, so under load it
+    #: keeps moving and always "reads as progress" -- the failure this module
+    #: already records at the `nothing_can_run` rule ("it needs pending FROZEN,
+    #: and pending was still creeping ... which reads as progress"). Drain mode
+    #: waits on the admitted set, so the admitted set is what has to be watched
+    #: for a stall. Same shape, honest axis.
+    last_bundle_progress_at: Optional[float] = None
+    #: The previous observation's ``running_bs``. Compared, never a level.
+    last_running_bs: Optional[int] = None
     #: #677 hot fix 2: how many requests were decoding when this TP window
     #: opened, so the exit receipt can name the BUNDLE it finished rather than
     #: only the instant it ended. Set by ``observe_idle`` at the phase change.
@@ -2146,11 +2185,64 @@ def _decide_from_load(
             # untouched underneath -- this changes what ends a HEALTHY window,
             # never what rescues a broken one.
             if inp.running_bs > 0:
-                return _no(
-                    f"decode bundle running: {inp.running_bs} of "
+                # #833: THE WAIT IS BOUNDED BY THE ADMITTED SET'S OWN PROGRESS.
+                #
+                # `running_bs == 0` is an exit condition sustained load never
+                # revisits. With `--max-running-requests 8` and ~42k-token
+                # prompts chunked at 4096 (~11 chunks each), an admitted
+                # request occupies the bundle for many rounds and admission
+                # refills every slot it frees, so the set never reaches zero.
+                #
+                # MEASURED, boot_window3_0823_1733: pending prefill was driven
+                # to 836,048 tok -- 119x the bar N=7004 and 65x the scaled
+                # ceiling -- across three escalating load shapes, and the arm
+                # refused under every one of them, 151 times, naming the same
+                # bundle. Driving pending HARDER made it worse, because more
+                # pressure lengthens the admitted set's occupancy. A condition
+                # that recedes as you approach it is divergent, and no amount
+                # of load will ever satisfy it.
+                #
+                # THE BINDING QUANTITY IS THE ONE THAT CONVERGES. The bundle
+                # getting smaller is progress toward an empty set; the bundle
+                # holding station is not, however much work it retires. So the
+                # wait is bounded by a STALL on that axis, and the direction of
+                # the pressure derivative is inverted by construction: more
+                # pressure keeps the set full, which makes the stall trip
+                # SOONER, so the refusal rate falls with load instead of rising
+                # with it. #677's semantics are untouched where they were ever
+                # true -- a bundle that is genuinely draining is never cut, and
+                # a set that empties still exits through the branch below.
+                #
+                # THE NEIGHBOURING TICKET, NOT BUILT HERE: #819 would let
+                # admission itself stop refilling the bundle while a flip is
+                # pending, which is the other half of this and a policy change
+                # of its own. This ticket only bounds the wait.
+                stall_s = (
+                    0.0
+                    if state.last_bundle_progress_at is None
+                    else inp.now - state.last_bundle_progress_at
+                )
+                deadline_s = drain_stall_deadline_s(cfg)
+                if stall_s < deadline_s:
+                    return _no(
+                        f"decode bundle running: {inp.running_bs} of "
+                        f"{max(state.bundle_at_phase_entry, inp.running_bs)} req "
+                        f"still decoding, {inp.pending_prefill_tokens} tok prefill "
+                        f"waiting -- drain mode finishes the bundle before "
+                        f"flipping (bundle last shrank {stall_s:.1f}s ago, "
+                        f"stall deadline {deadline_s:.1f}s)"
+                    )
+                return PhasePolicyDecision(
+                    TP_TO_PP,
+                    f"decode bundle STALLED, not draining: {inp.running_bs} of "
                     f"{max(state.bundle_at_phase_entry, inp.running_bs)} req "
-                    f"still decoding, {inp.pending_prefill_tokens} tok prefill "
-                    f"waiting -- drain mode finishes the bundle before flipping"
+                    f"still decoding and the set has not shrunk for "
+                    f"{stall_s:.1f}s (deadline {deadline_s:.1f}s), while "
+                    f"{inp.pending_prefill_tokens} tok of prefill waits. "
+                    f"Admission is refilling the bundle as fast as it retires, "
+                    f"so waiting for it to empty cannot converge -- more "
+                    f"pressure would only lengthen its occupancy (#833). "
+                    f"Flipping is what makes that backlog runnable",
                 )
             in_phase = (
                 None if state.phase_since is None else inp.now - state.phase_since
@@ -2509,6 +2601,11 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
         # #677 hot fix 2: the bundle this window inherits. Recorded at the
         # boundary because by the time it drains there is nothing left to count.
         state.bundle_at_phase_entry = int(inp.running_bs)
+        # #833: the admitted-set stall clock restarts with the phase, for the
+        # same reason the prefill one does -- a wedge must be demonstrated in
+        # THIS residency and never inherited from the last.
+        state.last_bundle_progress_at = inp.now
+        state.last_running_bs = None
     # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
     # frozen at a value while every slot is held by a carried decode, so the
     # observable that separates it from a slow drain is whether the backlog
@@ -2519,6 +2616,15 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     if prev is None or inp.pending_prefill_tokens < prev:
         state.last_prefill_progress_at = inp.now
     state.last_pending_prefill_tokens = inp.pending_prefill_tokens
+    # #833 ADMITTED-SET PROGRESS, on the axis drain mode actually waits on.
+    # "Progress" here is the bundle getting SMALLER. A bundle that is refilled
+    # as fast as it retires is not progress toward an empty set, however much
+    # work it completes -- and that distinction is the whole difference between
+    # a drain that ends and one that does not.
+    prev_bs = state.last_running_bs
+    if prev_bs is None or int(inp.running_bs) < int(prev_bs):
+        state.last_bundle_progress_at = inp.now
+    state.last_running_bs = int(inp.running_bs)
 
 
 def note_flip_armed(
