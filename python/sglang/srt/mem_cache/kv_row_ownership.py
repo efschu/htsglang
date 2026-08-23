@@ -109,7 +109,17 @@ import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -549,7 +559,7 @@ class RowOwnershipAuthority:
     def observe_census(
         self,
         *,
-        free_rows: Iterable[int],
+        free_rows: Optional[Iterable[int]],
         cached_rows: Iterable[int],
         withheld_rows: Iterable[int] = (),
         resident_rows: Mapping[str, Iterable[int]] = None,
@@ -563,8 +573,15 @@ class RowOwnershipAuthority:
         whole world -- which is why an un-enumerated second owner reads as a
         leak. Routed through here, the same three sets become four named law
         outcomes, and "unaccounted" stops being a number without a verdict.
+
+        #832: ``free_rows=None`` means the free rows exist but their ids do not
+        -- a watermark allocator. No ``free_list`` claim is declared, because a
+        claim over an empty set is not the absence of a claim: it asserts that
+        nothing is free, which is the one reading that turns available capacity
+        into an ownership violation.
         """
-        self.declare("free_list", free_rows)
+        if free_rows is not None:
+            self.declare("free_list", free_rows)
         self.declare("radix_cache", cached_rows)
         self.declare("cap_withheld", withheld_rows)
         for owner, rows in (resident_rows or {}).items():
@@ -604,15 +621,298 @@ def authority_for(
     return found
 
 
+# ----------------------------------------------------------------------
+# #832: how an allocator reports its FREE rows, asked instead of assumed
+# ----------------------------------------------------------------------
+#: Class attribute an allocator sets to declare the SHAPE of its free
+#: accounting. The only declared value is :data:`FREE_WATERMARK`; an allocator
+#: that says nothing is read as a page-list allocator, which is what every
+#: page-list allocator in this tree already is.
+#:
+#: WHY A DECLARATION AND NOT AN ``isinstance`` CHECK. The two composite
+#: allocators live in ``multi_ended_allocator.py``, which imports the whole
+#: unified-buffer stack; importing it here to name them would make the
+#: ownership law depend on the memory backend it audits. A class attribute
+#: inverts that: the allocator states its own shape, this module never has to
+#: know the class.
+FREE_ACCOUNTING_ATTR = "census_free_accounting"
+
+#: Free capacity is a WATERMARK COUNT, not a list of ids. ``free_pages`` /
+#: ``release_pages`` on such an allocator are empty by construction and mean
+#: "not applicable", never "nothing is free".
+FREE_WATERMARK = "watermark"
+
+#: The reading kinds :func:`read_free_rows` can return.
+FREE_ENUMERATED = "enumerated"  # a real page list; ids are known
+FREE_COUNTED = "counted"  # a declared watermark; only the COUNT is known
+FREE_COUNTED_UNDECLARED = "counted-undeclared"  # page list empty, but the
+#: allocator's own ``available_size()`` contradicts it -- an undeclared
+#: composite, read through its watermark and named as such
+FREE_UNKNOWN = "unknown"  # no page list, no declaration, no watermark
+
+
+@dataclass(frozen=True)
+class FreeRowReading:
+    """What one allocator can honestly say about its free rows.
+
+    #832. ``_pool_census`` used to compute::
+
+        free = set(alloc.free_pages.tolist()) | set(alloc.release_pages.tolist())
+
+    which ASSUMES a page-list allocator. On the two unified composite
+    allocators both fields are stubbed to a permanently empty tensor at
+    construction -- "we use watermark math, not free-lists"
+    (``multi_ended_allocator.py:1734``) -- so ``free`` came out
+    UNCONDITIONALLY EMPTY and every genuinely free row fell into
+    ``unaccounted``.
+
+    THE SIZE OF THAT ERROR IS RECORDED BUT NOT CONFIRMED, and the distinction
+    is kept because this module exists to stop numbers travelling further than
+    their evidence. The tree cites ~94000 rows, 21% of a 448698-row pool, FLAT
+    across four censuses on a 2026-08-22 r5 flip
+    (``phase_flip_runtime.py:4167``). That log was not retained. The three
+    2026-08-23 window boots that WERE retained all ran ``enable_unified_memory
+    =False``, so neither composite was ever constructed in them; their
+    ``free=`` is nonzero and dynamic throughout (a stubbed composite can only
+    ever report ``free=0``) and their ``unaccounted`` drifts rather than
+    sitting flat. So the ~94000 figure is UNDECIDABLE from retained evidence.
+
+    This fix does not rest on it. It rests on the construction fact above,
+    which is checkable by reading the two ``__init__`` bodies: the fields are
+    empty by design, so on those classes the old expression could not have
+    returned anything but the empty set.
+
+    That reading did not stay in the log line. ``audit_pool_census`` declares
+    the same set as the ``free_list`` owner, so on a composite allocator the
+    #822 audit derived one FALSE ownership violation per free row, every
+    census.
+
+    THE POINT OF THIS TYPE IS THAT "HOW MANY" AND "WHICH ONES" ARE DIFFERENT
+    QUESTIONS. A watermark allocator can answer the first and genuinely cannot
+    answer the second: free space above the watermark has never been minted as
+    ids, so there is no set to return. Collapsing the two -- returning an empty
+    set for "I cannot enumerate" -- is exactly the defect being fixed, one
+    level up. ``rows is None`` therefore means UNANSWERABLE and is propagated
+    as such, the same way ``resident_rows=None`` already is.
+    """
+
+    kind: str
+    #: The free ids, or ``None`` when the allocator cannot enumerate them.
+    rows: Optional[FrozenSet[int]]
+    #: How many rows are free, or ``None`` when even the count is unknown.
+    count: Optional[int]
+    #: ``type(alloc).__name__``, so a census line names what it read.
+    allocator: str
+    detail: str
+
+    @property
+    def is_enumerable(self) -> bool:
+        return self.rows is not None
+
+    @property
+    def is_answerable(self) -> bool:
+        """Whether the allocator answered at all. ``False`` is the #606 state:
+        a value that must be printed as UNKNOWN and never as ``0``."""
+        return self.count is not None
+
+    def __str__(self) -> str:
+        n = "UNKNOWN" if self.count is None else str(self.count)
+        return f"{self.kind}:{n}"
+
+
+def _read_available_size(alloc) -> Optional[int]:
+    """``alloc.available_size()`` as an int, or ``None`` if it cannot answer.
+
+    Never substitutes ``0``: on this path a missing answer and "nothing is
+    free" are opposite conclusions, and conflating them is the #606 getattr
+    family in one line.
+    """
+    fn = getattr(alloc, "available_size", None)
+    if not callable(fn):
+        return None
+    try:
+        value = fn()
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_free_rows(alloc) -> FreeRowReading:
+    """Ask the allocator for its free rows in ITS OWN accounting shape.
+
+    ONE authority, used by both consumers. The census line and the #822 audit
+    read this function, not the allocator, so the two can never again disagree
+    about what "free" meant -- the audit's false-violation storm existed
+    because it re-derived the census's assumption instead of sharing its
+    source.
+
+    Dispatch order, and each step's reason:
+
+    1. **The allocator declared its shape** (:data:`FREE_ACCOUNTING_ATTR`).
+       A declaration outranks the field inspection below because the composite
+       allocators DO carry ``free_pages``/``release_pages`` -- deliberately, as
+       empty tensors, "for the leak checker" (``multi_ended_allocator.py:2070``).
+       Inspecting the fields first would classify them as page-list allocators
+       and reproduce the defect exactly.
+    2. **A real page list** -- both fields present and not ``None``. Base init
+       leaves them ``None`` (``allocator/base.py:47-48``) and page-list
+       subclasses fill them, so this discriminates without a class check.
+    3. **Neither** -- :data:`FREE_UNKNOWN`, named in the output.
+
+    THE CORROBORATION IN STEP 2 IS THE PART THAT GENERALISES. A future
+    composite that forgets to declare would fall into step 2, read ``free=0``,
+    and silently rebuild the 94000-row band. So an enumerated reading of ZERO
+    is checked against the allocator's own ``available_size()``, and a
+    contradiction (nothing in the list, capacity on the watermark) is reported
+    as :data:`FREE_COUNTED_UNDECLARED` rather than believed. The two authorities
+    disagreeing is information; picking the one that happens to be empty is
+    how this class of defect survives a rewrite.
+    """
+    name = type(alloc).__name__ if alloc is not None else "None"
+    if alloc is None:
+        return FreeRowReading(
+            kind=FREE_UNKNOWN,
+            rows=None,
+            count=None,
+            allocator=name,
+            detail="no allocator to read",
+        )
+
+    declared = getattr(alloc, FREE_ACCOUNTING_ATTR, None)
+    if declared == FREE_WATERMARK:
+        available = _read_available_size(alloc)
+        if available is None:
+            return FreeRowReading(
+                kind=FREE_UNKNOWN,
+                rows=None,
+                count=None,
+                allocator=name,
+                detail=(
+                    f"{name} declares watermark free accounting but its "
+                    f"available_size() did not answer; the free count is "
+                    f"UNKNOWN, not zero"
+                ),
+            )
+        return FreeRowReading(
+            kind=FREE_COUNTED,
+            rows=None,
+            count=available,
+            allocator=name,
+            detail=(
+                f"{name} accounts free capacity by watermark; "
+                f"available_size()={available} rows free, ids not enumerable"
+            ),
+        )
+
+    free_pages = getattr(alloc, "free_pages", None)
+    release_pages = getattr(alloc, "release_pages", None)
+    if free_pages is not None and release_pages is not None:
+        try:
+            rows = frozenset(free_pages.tolist()) | frozenset(release_pages.tolist())
+        except Exception as exc:  # noqa: BLE001 -- an instrument, never a gate
+            return FreeRowReading(
+                kind=FREE_UNKNOWN,
+                rows=None,
+                count=None,
+                allocator=name,
+                detail=f"{name} page lists could not be read: {exc}",
+            )
+        if rows:
+            return FreeRowReading(
+                kind=FREE_ENUMERATED,
+                rows=rows,
+                count=len(rows),
+                allocator=name,
+                detail=f"{name} page list: {len(rows)} free id(s)",
+            )
+        # An EMPTY page list is the ambiguous case, and the only one worth a
+        # second opinion: it is the truth on a full page-list pool and the
+        # permanent state of an undeclared composite.
+        available = _read_available_size(alloc)
+        if available:
+            return FreeRowReading(
+                kind=FREE_COUNTED_UNDECLARED,
+                rows=None,
+                count=available,
+                allocator=name,
+                detail=(
+                    f"{name} presents EMPTY page lists while its own "
+                    f"available_size() reports {available} free row(s). Read as "
+                    f"a watermark allocator that has not declared "
+                    f"{FREE_ACCOUNTING_ATTR}={FREE_WATERMARK!r}; set it on that "
+                    f"class. Believing the empty list here is #832 (~94000 rows, "
+                    f"21% of the pool, misreported as unaccounted)"
+                ),
+            )
+        return FreeRowReading(
+            kind=FREE_ENUMERATED,
+            rows=rows,
+            count=0,
+            allocator=name,
+            detail=f"{name} page list: 0 free id(s), corroborated by available_size()",
+        )
+
+    available = _read_available_size(alloc)
+    if available is not None:
+        return FreeRowReading(
+            kind=FREE_COUNTED_UNDECLARED,
+            rows=None,
+            count=available,
+            allocator=name,
+            detail=(
+                f"{name} has no page list (free_pages/release_pages are None) "
+                f"but available_size() reports {available} free row(s)"
+            ),
+        )
+    return FreeRowReading(
+        kind=FREE_UNKNOWN,
+        rows=None,
+        count=None,
+        allocator=name,
+        detail=(
+            f"{name} reports free capacity in no form this census knows: no "
+            f"{FREE_ACCOUNTING_ATTR} declaration, no page list, no "
+            f"available_size(). The free count is UNKNOWN -- reporting it as 0 "
+            f"would turn the whole pool into a phantom leak"
+        ),
+    )
+
+
+def free_reading_of(value) -> FreeRowReading:
+    """Normalise a caller's ``free`` argument into a :class:`FreeRowReading`.
+
+    #832. A :class:`FreeRowReading` passes through. Anything else is a caller
+    that HANDED OVER IDS -- so it is an enumerated reading by construction, not
+    an assumption about an allocator's shape. This exists so the one call site
+    that already had the ids (and the specimen tests that pass them literally)
+    do not have to build a reading to say what they already said.
+    """
+    if isinstance(value, FreeRowReading):
+        return value
+    rows = frozenset(value)
+    return FreeRowReading(
+        kind=FREE_ENUMERATED,
+        rows=rows,
+        count=len(rows),
+        allocator="caller-supplied",
+        detail=f"caller enumerated {len(rows)} free row(s)",
+    )
+
+
 def audit_pool_census(
     authority: RowOwnershipAuthority,
     *,
     exposed: int,
     committed: Optional[int],
-    free_rows: Iterable[int],
+    free_rows: Optional[Iterable[int]],
     cached_rows: Iterable[int],
     withheld_rows: Iterable[int] = (),
     resident_rows: Optional[Mapping[str, Iterable[int]]] = None,
+    free_count: Optional[int] = None,
+    free_detail: str = "",
     why: str = "",
 ) -> List[Violation]:
     """Turn one ``_pool_census`` reading into a verdict instead of an integer.
@@ -672,13 +972,39 @@ def audit_pool_census(
         for owner in authority.owners():
             if owner.startswith("resident:"):
                 authority.withdraw(owner)
+    # #832: THE FREE LIST IS AN OWNER LIKE ANY OTHER, AND IT CAN ALSO BE
+    # UNENUMERABLE.
+    #
+    # ``free_rows=None`` means the allocator accounts free capacity by
+    # watermark: ``free_count`` rows are free and their ids do not exist as a
+    # set. Before this, the census handed over the empty set that a composite
+    # allocator's stubbed ``free_pages`` produces, and the coverage law read
+    # every one of those rows as belonging to nobody -- ~94000 false violations
+    # per census on a 448698-row pool, 21% of it.
+    #
+    # Treated exactly like an unenumerable ``resident_rows``: withdraw the
+    # stale claim so it cannot keep vouching for rows, and drop full-coverage,
+    # because a partial view can miss an owner but must never invent a hole.
+    # Double-ownership checking is unaffected -- that law needs only the owners
+    # that ARE enumerable.
+    if free_rows is None:
+        authority.withdraw("free_list")
+        logger.info(
+            "%s census audit (%s): free rows are COUNTED, not enumerable "
+            "(%s free); the unowned-rows law is suppressed for this reading "
+            "rather than answered from an empty set. %s",
+            LOG_PREFIX,
+            why,
+            "UNKNOWN" if free_count is None else free_count,
+            free_detail,
+        )
     authority.set_backing(exposed=int(exposed), committed=int(committed))
     found = authority.observe_census(
         free_rows=free_rows,
         cached_rows=cached_rows,
         withheld_rows=withheld_rows,
         resident_rows=resident_rows,
-        expect_full_coverage=resident_rows is not None,
+        expect_full_coverage=resident_rows is not None and free_rows is not None,
     )
     if found:
         logger.warning(format_violations(found, why=why))

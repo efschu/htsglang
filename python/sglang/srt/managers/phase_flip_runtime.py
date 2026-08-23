@@ -4241,6 +4241,14 @@ class PhaseFlipRuntime:
         flip it is only watching.
         """
         try:
+            # Local, like every other kv_row_ownership import in this file: the
+            # ownership module must not become an import-time dependency of the
+            # flip runtime.
+            from sglang.srt.mem_cache.kv_row_ownership import (
+                FREE_ENUMERATED,
+                read_free_rows,
+            )
+
             scheduler = self._census_scheduler
             if scheduler is None:
                 return
@@ -4248,7 +4256,26 @@ class PhaseFlipRuntime:
             tree = getattr(scheduler, "tree_cache", None)
             if alloc is None or tree is None:
                 return
-            free = set(alloc.free_pages.tolist()) | set(alloc.release_pages.tolist())
+            # #832: ASK THE ALLOCATOR HOW IT ACCOUNTS FREE ROWS, DO NOT ASSUME.
+            # This line used to be
+            #     free = set(alloc.free_pages.tolist()) | set(...release_pages...)
+            # which hard-codes a PAGE-LIST allocator. The two unified composite
+            # allocators stub both fields to a permanently empty tensor at
+            # construction -- "we use watermark math, not free-lists"
+            # (multi_ended_allocator.py:1734) -- so on those flavors `free` came
+            # out unconditionally EMPTY and every genuinely free row fell into
+            # `unaccounted`. The reading did not stay in this log line: the #822
+            # audit below declares the same set as the `free_list` owner, so it
+            # derived one false ownership violation per free row, every census.
+            #
+            # ONE AUTHORITY, TWO CONSUMERS. The census line and the audit both
+            # read `free_reading` -- never the allocator's fields directly --
+            # so they cannot drift apart again. `read_free_rows` also refuses to
+            # answer `0` for an allocator it does not understand: an UNKNOWN
+            # free count is reported as UNKNOWN, because zero is the one wrong
+            # answer that turns the whole pool into a phantom leak (#606).
+            free_reading = read_free_rows(alloc)
+            free = set(free_reading.rows) if free_reading.is_enumerable else set()
             cached = set(tree.all_values_flatten().tolist())
             size = int(alloc.size)
             # #814: WITHHELD CAPACITY IS NOT A LEAK, and this census read it as
@@ -4280,7 +4307,54 @@ class PhaseFlipRuntime:
             withheld = (
                 set(range(size - withheld_n + 1, size + 1)) if withheld_n else set()
             )
-            leaked = set(range(1, size + 1)) - free - cached - withheld
+            # #832: THE SET DIFFERENCE ONLY EXISTS WHEN THE IDS DO.
+            #
+            # A watermark allocator can say HOW MANY rows are free and
+            # genuinely cannot say WHICH -- space above the watermark has never
+            # been minted as ids, so there is no set to subtract. Two different
+            # arithmetics, kept visibly apart rather than blended:
+            #
+            #   enumerable -> the id difference, exactly as before. `leaked` is
+            #                 a real set and its sample is meaningful.
+            #   counted    -> a COUNT difference. `leaked` stays empty because
+            #                 naming ids here would be inventing them, and the
+            #                 sample prints as empty for the same reason.
+            #   unknown    -> no arithmetic at all. `unaccounted` prints UNKNOWN.
+            #                 Substituting 0 free rows would report the entire
+            #                 pool as leaked; substituting 0 unaccounted would
+            #                 report a clean bill of health. Both are lies with
+            #                 opposite signs, which is why neither is used.
+            leaked = set()
+            if free_reading.is_enumerable:
+                leaked = set(range(1, size + 1)) - free - cached - withheld
+                unaccounted = len(leaked)
+            elif free_reading.count is None:
+                unaccounted = "UNKNOWN"
+            else:
+                # WHAT THE NUMBER MEANS ON A COMPOSITE, because `size` is not
+                # a fixed id space there. `UnifiedMambaTokenToKVPoolAllocator.
+                # size` is a DYNAMIC property, `full.schedulable_available_size()
+                # + full.allocated_count()` (multi_ended_allocator.py:1759-1766),
+                # and its `available_size()` is the first of those two terms
+                # exactly. So `size - free` cancels to `allocated_count()`, and
+                # `unaccounted` becomes "rows the allocator says are live that
+                # no enumerated owner claims" -- which is the question this
+                # census exists to ask, arrived at without ever enumerating an
+                # id. The SWA composite is not as tidy: its `size` is the static
+                # `min(_size_full, _size_swa)` while `available_size()` is a
+                # joint BYTE budget, so the difference there is a bound rather
+                # than an identity. Named because the two composites are not
+                # interchangeable, and a reader who assumes they are will
+                # over-read the SWA number.
+                #
+                # Count arithmetic cannot see overlaps, so it can come out
+                # NEGATIVE when the enumerated owners overlap the watermark's
+                # count. That is reported as it falls: a negative unaccounted
+                # means the allocator's own free count and the tree disagree
+                # about the same rows, which is a finding, not a display glitch
+                # to be clamped away.
+                in_space = (cached | withheld) & set(range(1, size + 1))
+                unaccounted = size - free_reading.count - len(in_space)
             reqs = _live_reqs(scheduler)
             # SLOT SCOPE MATTERS AND IS EASY TO MISREAD. Under
             # event_loop_pp, scheduler.running_batch / last_batch are
@@ -4299,14 +4373,18 @@ class PhaseFlipRuntime:
                     resident += n
                     slots_with_reqs.append(i)
             logger.warning(
-                "%s POOL CENSUS %s %s: size=%d free=%d cached=%d "
+                "%s POOL CENSUS %s %s: size=%d free=%s cached=%d "
                 "withheld=%d available=%s cur_slot_reqs=%d resident_reqs=%d "
-                "resident_slots=%s unaccounted=%d %s",
+                "resident_slots=%s unaccounted=%s %s alloc=%s free_src=%s",
                 LOG_PREFIX,
                 when,
                 direction,
                 size,
-                len(free),
+                # #832: the allocator's OWN free count, whatever shape it keeps
+                # it in -- not `len(free)`, which is 0 on every watermark
+                # allocator and was the whole defect. "UNKNOWN" when the
+                # allocator answered in no form this census understands.
+                "UNKNOWN" if free_reading.count is None else free_reading.count,
                 len(cached),
                 # Reported, never merely subtracted: ids out of circulation are
                 # the single most important fact about a capped pool, and a fix
@@ -4317,9 +4395,26 @@ class PhaseFlipRuntime:
                 len(reqs),
                 resident,
                 slots_with_reqs,
-                len(leaked),
+                unaccounted,
                 sorted(leaked)[:12],
+                # #832 Fenster-4 criterion: a census that does not name the
+                # allocator it read cannot be checked against the allocator's
+                # own semantics afterwards -- which is why settling the ~94000
+                # reading needed a live probe instead of the existing logs.
+                free_reading.allocator,
+                free_reading,
             )
+            # The reason, verbatim, whenever the reading is anything other than
+            # a plain corroborated page list. Kept off the ordinary path so the
+            # census line stays one line per census on a healthy pool.
+            if free_reading.kind != FREE_ENUMERATED:
+                logger.warning(
+                    "%s POOL CENSUS %s %s free accounting: %s",
+                    LOG_PREFIX,
+                    when,
+                    direction,
+                    free_reading.detail,
+                )
             self._census_owner_probe(when, direction, alloc, tree, leaked)
             # #822: the same three sets, asked as a LAW instead of printed as
             # an integer. `unaccounted` above cannot distinguish a leak from an
@@ -4341,7 +4436,18 @@ class PhaseFlipRuntime:
             try:
                 audit = getattr(self, "_census_ownership_audit", None)
                 if audit is not None:
-                    audit(f"{when} {direction}", alloc, size, free, cached, withheld)
+                    # #832: the READING, not the set. Passing `free` here is
+                    # what made the audit re-derive the census's page-list
+                    # assumption and report every free row on a composite
+                    # allocator as an ownership violation.
+                    audit(
+                        f"{when} {direction}",
+                        alloc,
+                        size,
+                        free_reading,
+                        cached,
+                        withheld,
+                    )
             except Exception:  # noqa: BLE001 -- an instrument, never a gate
                 logger.debug(
                     "%s census ownership audit skipped", LOG_PREFIX, exc_info=True
@@ -4402,8 +4508,20 @@ class PhaseFlipRuntime:
         except Exception:  # noqa: BLE001 -- an instrument, never a gate
             return None
 
-    def _census_ownership_audit(self, why, alloc, size, free, cached, withheld) -> None:
+    def _census_ownership_audit(
+        self, why, alloc, size, free_reading, cached, withheld
+    ) -> None:
         """Route one census reading through the #822 authority.
+
+        #832: ``free_reading`` is a :class:`FreeRowReading`, not a set of ids.
+        The audit used to receive the census's ``free`` set and so inherited
+        its page-list assumption wholesale -- on a composite allocator that set
+        is empty by construction, and every genuinely free row was declared
+        unowned. A non-enumerable reading is forwarded as ``free_rows=None``,
+        which the authority already understands as "this owner could not be
+        enumerated" and which suppresses the unowned half exactly as it does
+        for an unenumerable resident set. A count is not a set, and pretending
+        otherwise is the defect.
 
         Read-only and best effort, under the same rule as the census that calls
         it: an auditor must never be able to affect the flip it is watching.
@@ -4416,8 +4534,13 @@ class PhaseFlipRuntime:
             from sglang.srt.mem_cache.kv_row_ownership import (
                 audit_pool_census,
                 authority_for,
+                free_reading_of,
             )
 
+            # A caller that hands over ids has enumerated them; a caller that
+            # hands over a reading has asked the allocator. Both are accepted,
+            # neither is inferred (#832).
+            free_reading = free_reading_of(free_reading)
             authority = authority_for(self, exposed=int(size))
             # #822 root A: the fourth owner. Rows held by in-flight requests
             # are in neither free list nor tree, and without this term every
@@ -4430,7 +4553,9 @@ class PhaseFlipRuntime:
                 authority,
                 exposed=int(size),
                 committed=self._committed_backing_rows(),
-                free_rows=free,
+                free_rows=(free_reading.rows if free_reading.is_enumerable else None),
+                free_count=free_reading.count,
+                free_detail=free_reading.detail,
                 cached_rows=cached,
                 withheld_rows=withheld,
                 resident_rows=None if resident is None else {"requests": resident},
