@@ -7666,7 +7666,16 @@ class PhaseFlipRuntime:
                 f"{int(slots.numel())} rows, the union has {int(union.numel())}. "
                 f"The rung's cap agreement and free-list normalisation run "
                 f"every round underneath this, so the rows above the group's "
-                f"backing drain as their requests finish"
+                f"backing drain as their requests finish. "
+                f"READ {min_backed} AS A DEFECT REPORT, NOT A CAPACITY VERDICT "
+                f"(#833): no rank 'binds' this pool. An id above the group "
+                f"floor can only exist because some rank EXPOSED one, and the "
+                f"exposure clamp is supposed to hold every rank's id space at "
+                f"the group floor precisely so this set cannot be built. If "
+                f"this line repeats while ids above {min_backed} keep being "
+                f"issued, the defect is in exposure, upstream of the seam -- "
+                f"look for the '#833 group exposure floor' line and check "
+                f"whether the floor ever reached the clamp on every rank"
             )
         self.slot_set_agreements = getattr(self, "slot_set_agreements", 0) + 1
         added = int(union.numel()) - int(slots.numel())

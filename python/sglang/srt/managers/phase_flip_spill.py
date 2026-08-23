@@ -139,6 +139,11 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP-SPILL"
 
+#: #833: whether the "this rung cannot take the group backing floor" warning
+#: has already been emitted. Once per process is enough to make an inert path
+#: visible; once per seam round would drown the log it has to be found in.
+_GROUP_FLOOR_UNSUPPORTED_LOGGED = False
+
 # The ladder is CUMULATIVE: depth N performs every rung up to and including
 # N. Rung 1 was added by #656 successor 21 and deliberately sits BELOW the
 # draft rungs, because it is the only rung whose worth was measured before it
@@ -1715,6 +1720,7 @@ def collective_kv_backing_relief(
     max_live_row: int = -1,
     slot_ballot_out: Optional[dict] = None,
 ) -> int:
+    global _GROUP_FLOOR_UNSUPPORTED_LOGGED
     """#656 item 12, the device half: ONE shrink target for the whole group.
 
     A REFUSAL MAY BE DECIDED LOCALLY. A CAPACITY MAY NOT. The corridor guard
@@ -1900,10 +1906,47 @@ def collective_kv_backing_relief(
     else:
         slot_fields = kbr.slot_proposal(slots_digest, max_live_row, kbr.SLOT_ABSTAIN[3])
     reduced = list(reduce_fn(list(proposal) + list(cap_proposal) + list(slot_fields)))
-    if slot_ballot_out is not None:
-        verdict = kbr.collective_slot_ballot(reduced[8:12])
-        if verdict is not None:
-            slot_ballot_out.update(verdict)
+    verdict = kbr.collective_slot_ballot(reduced[8:12])
+    if slot_ballot_out is not None and verdict is not None:
+        slot_ballot_out.update(verdict)
+    # #833: FEED THE GROUP FLOOR BACK TO THE THING THAT SETS EXPOSURE.
+    #
+    # The reduction already carries the group's MIN backed rows -- it is what
+    # the frame ballot refuses a union against. Until now nothing told the
+    # exposure clamp about it, so each rank capped its id space at its OWN
+    # backing and the group's exposures diverged by exactly the amount its
+    # pools differ (uneven vectors: by design, and never zero). The widest rank
+    # then issues ids the narrowest cannot map, and every subsequent tp_to_pp
+    # abandons on the union bound. Measured: boot_window3_0823_1733, seven
+    # cutovers then a 22-minute drought, all twelve abandon lines naming the
+    # same 120832.
+    #
+    # Every rank decodes this out of the SAME reduced payload in the SAME
+    # round, so adopting it cannot make the ranks disagree -- it is the only
+    # value in reach that makes them agree.
+    #
+    # A RUNG THAT CANNOT TAKE THE FLOOR MUST NOT RAISE INTO THE SEAM, AND MUST
+    # NOT BE SILENT EITHER. A stub rung or a peer on an older tree has no such
+    # method, and letting the AttributeError climb would kill a cutover over a
+    # bookkeeping call. But swallowing it is the W9 failure -- 105 silent
+    # AttributeError fallbacks that left a shipped fix inert with no log line
+    # saying so. So it is skipped AND announced, once per process.
+    if cap_relief is not None and verdict is not None:
+        note = getattr(cap_relief, "note_group_backing_floor", None)
+        if callable(note):
+            note(int(verdict["min_backed_rows"]))
+        elif not _GROUP_FLOOR_UNSUPPORTED_LOGGED:
+            _GROUP_FLOOR_UNSUPPORTED_LOGGED = True
+            logger.warning(
+                "%s this rung cannot take the group backing floor (#833): %s "
+                "has no note_group_backing_floor, so this rank will cap its "
+                "exposure at its OWN backing. Under unequal pools that lets it "
+                "issue ids a narrower peer cannot map, and every subsequent "
+                "tp_to_pp will abandon on the union bound. This is the #816 "
+                "behaviour, stated rather than assumed",
+                LOG_PREFIX,
+                type(cap_relief).__name__,
+            )
     # #656 C22-d, THE SOURCE HALF: make the free-list ORDER a function of
     # MEMBERSHIP alone on EVERY rank, EVERY seam round, whatever the cap
     # agreement below decides to do. ``reconcile_to`` ends with this sort, but

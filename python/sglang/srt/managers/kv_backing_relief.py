@@ -566,6 +566,69 @@ def exposure_over_backing(exposed_rows: int, backed_rows: int) -> int:
     return max(0, int(exposed_rows) - int(backed_rows))
 
 
+#: A group backing floor that has not been observed yet. Distinct from 0, which
+#: is a real floor meaning "no rank has anything backed"; see
+#: :func:`group_exposure_ceiling` for why the two must not collapse.
+GROUP_FLOOR_UNKNOWN = -1
+
+
+def group_exposure_ceiling(local_backed_rows: int, group_backed_floor: int) -> int:
+    """The id ceiling that keeps the group's exposure IDENTICAL across ranks.
+
+    #833, and it is the half of #816 that fix could not see from one rank.
+
+    ``exposed_rows`` states the contract in its own docstring: the exposed id
+    space "has to be identical across the group ... it decides which ids the
+    flip's live-slot enumeration can encounter". #816 closed a real crash by
+    capping exposure at each rank's OWN committed backing -- and under the
+    mandated uneven configuration (uneven token vector, uneven TP vector,
+    uneven DCP) the ranks' backings differ BY DESIGN, so a per-rank cap makes
+    the exposures differ too. #816's own acceptance evidence records exactly
+    that, and nobody read it as a second defect::
+
+        boot 0516  PP2 exposed 449306  committed 126976  withdrew 322330
+                   PP1 exposed 449306  committed 120832  withdrew 328474
+                   PP0 exposed 449306  committed 204800  withdrew 244506
+
+    Three ranks enter at ONE exposure and leave at THREE. From that moment the
+    widest rank hands out ids the narrowest rank has no page for, and
+    ``_agree_live_slots`` (phase_flip_runtime.py) must refuse the union the
+    moment the live id space grows past the narrowest backing -- permanently,
+    because sustained load keeps re-issuing high ids faster than they drain.
+
+    MEASURED, boot_window3_0823_1733: reservations 204334 / 119782 / 126828
+    rows on PP0 / PP1 / PP2; seven cutovers completed in the first two minutes
+    while the id space was still small, then every ``tp_to_pp`` from 17:43:12
+    onward abandoned, all twelve lines naming PP1's 120832 as "the poorest
+    rank has only 120832 rows BACKED". The instance served single-phase for the
+    remaining 22 minutes. W6 PASSED on the previous window only because that
+    boot died in 75 s, before the id space could reach the floor.
+
+    WHY THIS IS A DEFECT AND NOT A CAPACITY VERDICT. Per the standing law, a
+    finding of the form "rank A has surplus but it is unreachable because rank
+    B binds" is ALWAYS a defect report and NEVER a capacity verdict. The
+    surplus is real -- PP0's 204800 rows exist -- and stranding it is a cost
+    this function makes VISIBLE (the caller logs it) rather than silent. The
+    federated fix that would spend it is the standing #795 debt; what is
+    unacceptable in the meantime is issuing ids that no consumer can honour.
+
+    ``GROUP_FLOOR_UNKNOWN`` (or any negative value) means no group verdict has
+    been observed, and the answer is then the local backing -- i.e. exactly
+    #816's behaviour, unchanged. That default matters: this runs on paths that
+    have no collective (a rank-local recovery, a stub, a hermetic test), and
+    guessing a floor there would strand rows for no reason.
+
+    A floor of 0 is a REAL floor and is honoured as one. Collapsing it into
+    "unknown" is the sentinel collision #714 paid for, where "none" and
+    "unknown" shared ``-1`` and eviction pricing silently skipped.
+    """
+    local = max(0, int(local_backed_rows))
+    floor = int(group_backed_floor)
+    if floor < 0:
+        return local
+    return min(local, floor)
+
+
 class KvRowCap:
     """Withhold slot ids above ``cap`` from the allocator's free list.
 
@@ -905,6 +968,18 @@ class KvBackingRelief:
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
+        #: #833: the group's MIN backed rows, as last decoded from the rung's
+        #: own reduction. Every rank decodes the SAME reduced value in the same
+        #: round, so storing it here cannot make the ranks disagree -- which is
+        #: the entire point, since the quantity it bounds
+        #: (:meth:`exposed_rows`) is documented as having to be identical
+        #: across the group. ``GROUP_FLOOR_UNKNOWN`` until a ballot is seen, so
+        #: a rank with no collective behaves exactly as it did before #833.
+        self._group_backed_floor: int = GROUP_FLOOR_UNKNOWN
+        #: Rows this rank has backed but may not expose, because a peer cannot
+        #: map them. Reported, never hidden: it is the #795 federation debt
+        #: made countable rather than a silent capacity loss.
+        self._stranded_by_group_floor = 0
         #: -1 means "nothing reported yet", so the FIRST proposal always logs
         #: and a run can never be silent about this rung again.
         self._last_deficit_sign = -1
@@ -2750,6 +2825,24 @@ class KvBackingRelief:
             return int(self._cap.cap)
         return self._reservation_rows()
 
+    def note_group_backing_floor(self, rows: int) -> None:
+        """Record the group's MIN backed rows, as the rung just reduced it.
+
+        #833. Called with the value ``collective_slot_ballot`` decoded, which
+        every rank reads identically out of the same reduction -- so this can
+        never be a source of divergence, and it is the only value in this
+        object that is allowed to bound :meth:`exposed_rows`.
+
+        A negative argument is discarded rather than stored: the abstain
+        sentinel and a truncated payload both arrive that way, and treating
+        either as a floor of zero would withdraw the entire id space on a rank
+        whose peer merely failed to report.
+        """
+        floor = int(rows)
+        if floor < 0:
+            return
+        self._group_backed_floor = floor
+
     def clamp_exposure_to_backing(self, why: str) -> int:
         """Never leave the allocator exposing an id with no page behind it.
 
@@ -2790,10 +2883,44 @@ class KvBackingRelief:
         """
         exposed = self.exposed_rows()
         backed = self._current_rows()
-        over = exposure_over_backing(exposed, backed)
+        # #833: THE CEILING IS A GROUP QUANTITY, NOT A RANK-LOCAL ONE.
+        # ``exposed_rows`` documents that this id space "has to be identical
+        # across the group". Capping at the local backing alone -- #816's
+        # behaviour -- makes it differ by exactly the amount the ranks' pools
+        # differ, which under the mandated uneven vectors is by design and
+        # never zero. See ``group_exposure_ceiling`` for the measured cost.
+        ceiling = group_exposure_ceiling(backed, self._group_backed_floor)
+        stranded = max(0, int(backed) - int(ceiling))
+        if stranded != self._stranded_by_group_floor:
+            self._stranded_by_group_floor = stranded
+            if stranded:
+                # NOT a capacity verdict -- a defect report with a price on it.
+                logger.warning(
+                    "%s group exposure floor (%s): this rank has %d rows "
+                    "BACKED but the group's poorest rank has only %d, so %d "
+                    "rows are backed-but-unexposable on this rank. They are "
+                    "withheld because an id above the group floor is one a "
+                    "peer cannot map, and the flip's live-slot union would "
+                    "have to refuse it -- which is how a single narrow rank "
+                    "silently ends every cutover for the rest of a boot "
+                    "(#833). This surplus is REAL and reaching it is the "
+                    "standing #795 federation debt, not a property of the "
+                    "hardware: no rank 'binds' a pool.",
+                    LOG_PREFIX,
+                    why,
+                    int(backed),
+                    int(self._group_backed_floor),
+                    stranded,
+                )
+        over = exposure_over_backing(exposed, ceiling)
         if not over:
             return 0
         live = self._max_live_row()
+        # The #722 test stays on the COMMITTED backing, never on the group
+        # ceiling: a live row between the ceiling and this rank's own backing
+        # is mapped here and is not the #722 crash. Testing it against the
+        # ceiling would raise a false unmapped-live-rows alarm on every rank
+        # wider than the group's poorest one -- i.e. on almost every rank.
         if live >= 0 and live >= backed:
             # The #722 shape, and it is ALREADY true before this function acts.
             # Say so loudly and separately: clamping to ``backed`` here is
@@ -2812,7 +2939,7 @@ class KvBackingRelief:
                 backed,
                 backed,
             )
-        self._cap.engage(backed)
+        self._cap.engage(ceiling)
         logger.warning(
             "%s exposure clamp (%s): the allocator could hand out %d rows "
             "while only %d are committed, so %d rows had no page behind them. "
@@ -2825,7 +2952,7 @@ class KvBackingRelief:
             exposed,
             backed,
             over,
-            backed,
+            ceiling,
         )
         return over
 
