@@ -66,13 +66,23 @@ class TestTheBlockedExitIsNeverHeld(CustomTestCase):
     """The decided half, and the falsification the escalation asked for."""
 
     def _blocked_arm(self):
-        """The arm as `_decide_from_load` builds it, reason text and all."""
-        return PhasePolicyDecision(
-            PP_TO_TP,
-            "blocked admission: pending frozen at 403779 tok for 30.0s with "
-            "bs 4 carried (no chunk admitted in 12.0s) -- exit condition: "
-            "admission blocked",
-        )
+        """The REAL arm, taken from the rules rather than hand-written.
+
+        An earlier draft typed the reason string out by hand and got its tail
+        backwards ("admission blocked" for "blocked admission"). The denylist
+        replay below would not have noticed -- it keys on three OTHER
+        substrings -- which is exactly how a test comes to assert something
+        about a string that no code produces. So the specimen is built by
+        driving the rules and is therefore always the string being shipped.
+        """
+        cfg = _cfg()
+        state = pp.PhasePolicyState()
+        window = pp.pp_progress_stall_window_s(cfg)
+        _drive(cfg, state, 403779, 4, 0.0)
+        d = _drive(cfg, state, 403779, 4, window + 1.0)
+        self.assertEqual(PP_TO_TP, d.direction, d.reason)
+        self.assertIn("blocked admission", d.reason)
+        return d
 
     def test_the_blocked_arm_is_not_eligible(self):
         self.assertFalse(self._blocked_arm().hold_eligible)
