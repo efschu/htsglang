@@ -16,9 +16,12 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
+import logging
 from typing import TYPE_CHECKING
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -196,14 +199,92 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def backup_state(self):
         return (self.free_pages, self.release_pages)
 
+    def _apply_free_group(self) -> int:
+        """Apply the staged frees EXACTLY ONCE, emptying the list as it goes.
+
+        #827 W10, and the whole fix is the order of these two statements. The
+        staged list is taken and replaced with an empty one BEFORE anything is
+        freed, so a window can never be applied twice. ``free_group_end`` used
+        to read ``self.free_group`` and free it without ever clearing it, which
+        left the window armed after it had closed: a second ``free_group_end``
+        -- an outer window closing after an inner one, or a retry path -- freed
+        the same rows a SECOND time. The allocator's ``free`` concatenates
+        without checking membership (paged.py:300-302), so those ids would land
+        in the free list twice and ``available_size`` -- which is
+        ``len(free_pages) + len(release_pages)``, a RAW length that does not
+        deduplicate -- would count them twice.
+
+        Returns the number of slots applied, so callers and tests can assert on
+        the action rather than on the absence of a symptom.
+        """
+        if not self.free_group:
+            return 0
+        staged, self.free_group = self.free_group, []
+        applied = int(sum(int(chunk.numel()) for chunk in staged))
+        self.free(torch.cat(staged))
+        return applied
+
+    def reclaim_abandoned_free_group(self) -> int:
+        """Apply staged frees left behind by a window nobody closed. Returns
+        the slot count recovered; 0 (and silent) on the ordinary path.
+
+        #827 W10. STAGED ROWS ARE IN NO BUCKET AT ALL, and that is what makes
+        an abandoned window fatal rather than merely wasteful. While a group is
+        open ``free`` appends to ``self.free_group`` instead of to a free list
+        (token.py:71-80, paged.py:297-307), so the rows are: out of the radix
+        tree, because ``release_kv_cache`` already ran; not in ``free_pages``
+        or ``release_pages``, so ``available_size`` cannot see them; and held
+        by no request, so they are neither protected nor session-held. The
+        scheduler's idle ledger -- ``available + evictable + protected +
+        session_held + uncached + withheld == total``
+        (invariant_checker.py:127-129) -- therefore reports them as a LEAK, and
+        the leak is fatal under the default
+        ``SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE``.
+
+        WHY THIS CANNOT BE LEFT TO THE NEXT ``free_group_begin``. Recovering
+        there is necessary but NOT sufficient, and the difference is the whole
+        reason this method exists: ``is_fully_idle`` does not consult
+        ``free_group`` at all (scheduler.py:8947-8972 -- it asks about batches,
+        queues and microbatch drain), so a group that is abandoned and then
+        goes quiet reaches ``on_idle`` -- and raises -- BEFORE any next window
+        is ever opened. The reclaim has to run on the idle path itself, which
+        is where ``on_idle`` calls it, next to the ``flush_opportunistic``
+        housekeeping that is there for the same kind of reason.
+
+        Applying is the conservative direction, not the bold one. These rows
+        were already destined for the free list; the caller that failed to
+        close its window is not the one entitled to decide they are lost. See
+        ``flush_free_group`` below for why applying a staged free early is
+        safe -- there the window is still live, here it is already abandoned,
+        so the argument only gets stronger.
+        """
+        if self.is_not_in_free_group or not self.free_group:
+            return 0
+        self.is_not_in_free_group = True
+        recovered = self._apply_free_group()
+        logger.warning(
+            "reclaimed %d slot(s) staged in a free group that was never "
+            "closed; without this they are in no ledger bucket and the idle "
+            "pool invariant reports them as a memory leak (#827).",
+            recovered,
+        )
+        return recovered
+
     def free_group_begin(self):
+        # A WINDOW THAT WAS NEVER CLOSED STILL HOLDS STAGED FREES, and this is
+        # the mirror defect of the double free above. Clearing the list here,
+        # which is what this method used to do unconditionally, made that state
+        # permanent: the rows are gone for the life of the process. Recover
+        # them instead. This is the second line of defence -- the idle path
+        # (``reclaim_abandoned_free_group``) is the first, because a quiet
+        # group never reaches another ``free_group_begin``.
+        self.reclaim_abandoned_free_group()
         self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        self._apply_free_group()
 
     def flush_free_group(self) -> int:
         """Apply staged frees NOW, without closing the group. Returns pages.
@@ -235,6 +316,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         if self.is_not_in_free_group or not self.free_group:
             return 0
+        # DELIBERATELY NOT ROUTED THROUGH ``_apply_free_group``. This method is
+        # bound onto a duck-typed stand-in by its own regression suite
+        # (test_deferred_free_eviction_681.py:68) so that the PRODUCTION body
+        # is what gets exercised; calling a second private method from here
+        # would silently couple that suite to an attribute the stand-in does
+        # not have. The three shared lines are worth less than that guarantee.
         staged, self.free_group = self.free_group, []
         applied = int(sum(int(chunk.numel()) for chunk in staged))
         self.is_not_in_free_group = True
@@ -293,8 +380,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return
         if new_size % self.page_size != 0:
             raise ValueError(
-                f"grow_size({new_size}) not a multiple of page_size "
-                f"{self.page_size}"
+                f"grow_size({new_size}) not a multiple of page_size {self.page_size}"
             )
         old_pages = self.size // self.page_size
         new_pages = new_size // self.page_size
