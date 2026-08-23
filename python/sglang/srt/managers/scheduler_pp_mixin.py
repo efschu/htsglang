@@ -843,9 +843,14 @@ def pp_first_retracting_rank(decision: Optional[PPAdmissionDecision]) -> Optiona
     after they had already gone.
 
     `None` when nothing in the decision names a retracting rank: an ordinary
-    pass, or a void produced by something other than a #791 retraction. Every
-    consumer reads that as "do not forward", which is the behaviour that
-    shipped before this function existed.
+    pass, or a void produced by something other than a #791 retraction.
+
+    #801: WHAT A CONSUMER MAY CONCLUDE FROM THAT `None` IS NOT "do not
+    forward", and reading it that way was the intermediate-hop wedge. It
+    says only that this decision names no retraction; on a void it therefore
+    says every rank still RAN the pass, which is the case in which the void
+    must travel FURTHEST. `pp_void_relay_stop_rank` turns the two states
+    into a ring position instead of into silence.
     """
     if decision is None:
         return None
@@ -855,6 +860,48 @@ def pp_first_retracting_rank(decision: Optional[PPAdmissionDecision]) -> Optiona
         if e.retracted and e.retracted_by_rank is not None
     ]
     return min(ranks) if ranks else None
+
+
+def pp_void_relay_stop_rank(
+    first_retracting_rank: Optional[int], pp_size: Optional[int]
+) -> Optional[int]:
+    """#801: the first ring position that will NOT receive this void.
+
+    THE DEFAULT IS THE WHOLE FIX, and the defect it closes is a DEFAULT and
+    not a missing branch. `pp_first_retracting_rank` answers `None` for two
+    unrelated states -- "this decision names no retraction" and "this void
+    carries no decision at all" -- and #797 read both as "stop here". On a
+    ring, "stop" is the one answer that cannot be taken back: the successor's
+    blocking receive is already posted, and no later pass can satisfy it.
+    Specimen wedge_802f_1712 is that shape, with PP1 parked in
+    `_pp_recv_dict_from_prev_stage` while PP0 held a void it forwarded
+    nowhere.
+
+    WHAT THE ABSENCE ACTUALLY MEANS, and it points the other way. The void
+    arm of `_pp_send_output_to_next_stage` fires when the LAST rank has no
+    output to give for a slot the first rank published an expectation for.
+    If no rank retracted, then no rank voided its own pass, so every rank
+    except that last one still holds a launched batch for the slot and has a
+    receive posted for it. The void must then reach `pp_size - 2` and stop
+    one hop short of its own source -- the widest travel, not the narrowest.
+
+    THE STOP IS STILL A STOP, and that half is unchanged: when a retraction
+    IS named, ranks from it down have empty slots and their receives
+    early-return, so a hop past `first_retracting_rank - 1` would leave an
+    unmatched message on the channel -- the bounded-recv corpse, from the
+    sender's side, which is exactly what #796's law forbids. This function
+    widens the default; it does not remove the rule.
+
+    `None` only when `pp_size` is unknown. No production `Scheduler` is in
+    that state (`ps.pp_size` is set at init), and a stand-in that lacks it
+    keeps the pre-#801 behaviour rather than having a ring size guessed for
+    it.
+    """
+    if first_retracting_rank is not None:
+        return int(first_retracting_rank)
+    if pp_size is None:
+        return None
+    return max(int(pp_size) - 1, 0)
 
 
 def pp_void_forward_payload(
@@ -882,9 +929,23 @@ def pp_void_forward_payload(
     stopping point is not guessed -- it is `pp_first_retracting_rank` of the
     decision the void already carries.
 
+    #801 -- THE RELAY INVARIANT, AND IT IS WHY THIS FUNCTION IS THE FIX SITE.
+    A non-last rank that took exactly one message off this wire for a ring
+    generation must put exactly one back on it, void included; the ring is
+    then a strict relay and the message count on hop r -> r+1 equals the
+    count the last rank emitted. #797 held that for the one state it could
+    name -- a decision with a retraction in it -- and fell SILENT for the two
+    it could not: a void carrying no decision, and a void whose decision
+    names no retracting rank (the last rank simply had no batch for a slot
+    PP0 expected an output for). Both are states in which every intermediate
+    rank still holds a launched batch, so both are states in which silence
+    parks the successor for ever. `pp_void_relay_stop_rank` supplies the
+    ring position for those two, and the argument for the value it picks is
+    in its own docstring.
+
     Returns the payload VERBATIM (a copy), decision included, so the next hop
     can apply the identical rule. None whenever the rule does not fire, which
-    is every ordinary pass and every rank at or past the retraction.
+    is every ordinary pass and every rank at or past the stop position.
     """
     if not isinstance(message, dict):
         return None
@@ -895,12 +956,17 @@ def pp_void_forward_payload(
     if rank is None:
         return None
     raw = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
-    if raw is None:
-        return None
-    first = pp_first_retracting_rank(
-        pp_admission_decision_from_wire({_ADMISSION_DECISION_PAYLOAD_KEY: raw})
+    first = (
+        pp_first_retracting_rank(
+            pp_admission_decision_from_wire({_ADMISSION_DECISION_PAYLOAD_KEY: raw})
+        )
+        if raw is not None
+        else None
     )
-    if first is None or int(rank) + 1 >= int(first):
+    stop = pp_void_relay_stop_rank(
+        first, getattr(getattr(holder, "ps", None), "pp_size", None)
+    )
+    if stop is None or int(rank) + 1 >= int(stop):
         return None
     return dict(message)
 
@@ -5881,6 +5947,28 @@ class SchedulerPPMixin:
                     )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
+            # #801 -- THE INTERMEDIATE HOP, AND WHAT `if pp_outputs:` NOW
+            # MEANS. This predicate is not a decision about whether the
+            # successor expects a message; it is the relay invariant of
+            # `pp_void_forward_payload`: this rank forwards exactly when it
+            # took a message off the wire for this ring generation, and a
+            # void it absorbed reaches here as a truthy `pp_outputs` because
+            # `_do_recv` republishes it. Before #801 a void could be absorbed
+            # and forwarded NOWHERE whenever its decision named no retracting
+            # rank or carried no decision at all, and the successor -- whose
+            # receive is unconditional once its own slot is non-empty -- sat
+            # in `_pp_recv_dict_from_prev_stage` for ever (wedge_802f_1712).
+            #
+            # WHAT THIS PREDICATE STILL DOES NOT COVER, stated where a reader
+            # will look for it: the case where this rank received NOTHING
+            # because its OWN slot was empty while the successor's was not.
+            # No rank publishes its per-slot expectation to its PREDECESSOR,
+            # so this end cannot see that disagreement -- closing it is a
+            # wire against the ring direction and is a separate posting, not
+            # part of this one. That case is bounded and loud rather than
+            # silent since #802-ring: `_pp_recv_dict_from_prev_stage` enters
+            # through `_pp_wait_for_dict_readiness(kind="output")`, whose
+            # timeout text names this exact asymmetry.
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
