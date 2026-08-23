@@ -143,3 +143,63 @@ def prefetch_done_under_ballot(
     if verdict is None:
         return False
     return verdict
+
+
+#: #823: log cadence for a PERSISTING queue-head divergence.
+#:
+#: The first diverged pass is always reported, then the cadence widens
+#: geometrically and is capped, so a divergence that never heals costs a
+#: handful of lines per minute instead of one per TP-loop iteration. The cap
+#: matters: the boot this was written for emitted 7710 void lines in seven
+#: seconds on a neighbouring code path, which is exactly what an unbounded
+#: per-iteration warning turns into on a hot loop.
+PREFETCH_BALLOT_MISMATCH_LOG_CAP = 512
+
+
+def should_log_mismatch_streak(streak: int) -> bool:
+    """Is this the pass whose divergence gets a log line?
+
+    Reports streak 1, 2, 4, 8, ... up to the cap, then every
+    ``PREFETCH_BALLOT_MISMATCH_LOG_CAP`` passes. Pure arithmetic on a
+    counter -- no clock, no state -- so it is testable without a scheduler
+    and cannot itself become a source of divergence between ranks.
+    """
+    if streak <= 0:
+        return False
+    if streak >= PREFETCH_BALLOT_MISMATCH_LOG_CAP:
+        return streak % PREFETCH_BALLOT_MISMATCH_LOG_CAP == 0
+    return streak & (streak - 1) == 0
+
+
+def advance_mismatch_streak(streak: int, total: int, diverged: bool):
+    """The queue-head divergence state machine, as pure arithmetic.
+
+    Returns ``(streak, total, event)``, where ``event`` is one of:
+
+        None                  nothing to say this pass
+        ("diverged", streak)  a diverged pass the cadence selects for logging
+        ("restored", streak)  the pass on which agreement came back, carrying
+                              the length of the divergence that just ended
+
+    EXTRACTED RATHER THAN INLINED, for the reason this module already gives
+    for `dcp_weighted_read_slots`' sibling: the part that DECIDES belongs in a
+    pure function that can be driven directly. Inline in
+    `Scheduler._pass_uniform_reduce` this logic sits behind a real
+    `all_reduce` and a full scheduler, so the only thing a test could check
+    is whether the source text still mentions a recovery branch -- and a
+    source-text probe cannot tell a live branch from an `elif False:`.
+    Measured, not predicted: with this logic inline, a mutant that disabled
+    the recovery edge left every test in
+    test_prefetch_ballot_divergence_823.py green.
+    """
+    total = int(total)
+    streak = int(streak)
+    if diverged:
+        streak += 1
+        total += 1
+        if should_log_mismatch_streak(streak):
+            return streak, total, ("diverged", streak)
+        return streak, total, None
+    if streak:
+        return 0, total, ("restored", streak)
+    return 0, total, None

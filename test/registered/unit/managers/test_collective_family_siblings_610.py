@@ -462,6 +462,16 @@ class HiRadixPrefetchParticipationTest(unittest.TestCase):
 
 class BudgetHarness:
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
+    # #823: the reduce grew a queue-head-divergence STREAK pair, the fourth
+    # time this harness has drifted behind the production reduce after #616g,
+    # #639 and #639b -- and the fourth time the drift guard below is what
+    # named it rather than an AttributeError in an unrelated assertion.
+    # Plain counters, not bindings: `advance_mismatch_streak` is called on the
+    # module and only its RESULT is stored here, so class-level zeros are the
+    # whole requirement. Starting at 0 is also the real initial state, since
+    # production reads them through `getattr(self, ..., 0)`.
+    _prefetch_ballot_mismatch_streak = 0
+    _prefetch_ballot_mismatch_total = 0
     # #639: the reduce grew a HOST-tier pair. Bound here so this harness keeps
     # modelling the real class; its tree cache has no `cache_controller`, so
     # the sentinel rides and no host floor is published.

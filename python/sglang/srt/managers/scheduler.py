@@ -211,6 +211,7 @@ from sglang.srt.managers.phase_purity import (
 # process without touching anything else (the instr-boot can-fail
 # discipline).
 from sglang.srt.managers import prefetch_ballot
+from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
@@ -4777,16 +4778,22 @@ class Scheduler(
             # matches. That is the measured cause of a pipeline deadlock, so
             # the condition should be readable from the boot log rather than
             # inferred from source months later.
-            if not getattr(self, "_uniform_floor_scope_logged", False):
-                self._uniform_floor_scope_logged = True
-                logger.info(
-                    "#788 UNIFORM-FLOOR SCOPE: tp_cpu_group world=%d -> floors OFF "
-                    "(evict/host/mamba). pp_size=%d tp_size=%d. With pp_size>1 the "
-                    "ranks that must agree are NOT in this reduce group.",
-                    0 if grp is None else int(torch.distributed.get_world_size(grp)),
-                    int(getattr(self.server_args, "pp_size", 1) or 1),
-                    int(getattr(self.server_args, "tp_size", 1) or 1),
-                )
+            # #824: REPORT THE TRANSITION, NOT THE FIRST SIGHTING. Under
+            # --enable-phase-flip this scope is not a boot constant:
+            # phase_flip_runtime rebuilds the TP group per phase
+            # (`want_tp_size = n if tp_phase else 1`), so the floors are ON
+            # through the TP decode phase and OFF through the PP prefill
+            # phase, switching at every cutover. The once-per-process latch
+            # this replaces meant a boot that flipped four times in 55 s
+            # reported its coverage once, at the first PP iteration, and never
+            # again -- so "off for the whole run" and "off for the prefill
+            # half of every cutover" read identically in the log, and coverage
+            # coming BACK was never reported at all.
+            uniform_floor_scope.report_scope(
+                self,
+                None if grp is None else int(torch.distributed.get_world_size(grp)),
+                logger,
+            )
             self._uniform_min_avail = local_avail
             self._uniform_budget_deficit = 0
             # One rank: nothing to diverge from, so the floor stays OFF and
@@ -4802,6 +4809,11 @@ class Scheduler(
             # the group decision, taken at the call site.
             self._uniform_corridor_width = None
             return
+        # #824: the ON side had no report at all, so coverage COMING BACK --
+        # every pp_to_tp cutover -- was invisible. Same call, same predicate.
+        uniform_floor_scope.report_scope(
+            self, int(torch.distributed.get_world_size(grp)), logger
+        )
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
         # `available_size() + evictable_size()` -- rank-LOCAL under uneven DCP,
@@ -4935,23 +4947,84 @@ class Scheduler(
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
             t[_ballot_at:].tolist(), _ballot_rids
         )
-        if self._uniform_prefetch_ballot is None and not getattr(
-            self, "_prefetch_ballot_mismatch_logged", False
-        ):
-            # A divergent queue HEAD is a deeper breakage than a divergent
-            # prefetch verdict; say so once and fall back to the local
-            # verdict (the status quo ante) rather than papering over it.
-            self._prefetch_ballot_mismatch_logged = True
-            logger.warning(
-                "#791b PREFETCH-BALLOT digest mismatch: the TP ranks disagree "
-                "about the first %d rids of waiting_queue (this rank digest=%d, "
-                "group min=%d max=%d). Ballot void for this pass; admission "
-                "falls back to the rank-local prefetch verdict.",
-                prefetch_ballot.PREFETCH_BALLOT_SLOTS,
-                prefetch_ballot.prefetch_ballot_digest(_ballot_rids),
-                int(t[_ballot_at].item()),
-                -int(t[_ballot_at + 1].item()),
-            )
+        # #823: A DIVERGENT QUEUE HEAD IS A DURATION, NOT AN EVENT.
+        #
+        # This branch used to latch `_prefetch_ballot_mismatch_logged` and log
+        # ONCE PER PROCESS. Its own comment called a divergent queue head "a
+        # deeper breakage than a divergent prefetch verdict" and then recorded
+        # it exactly once -- so the log can say THAT the TP replicas' queue
+        # heads parted, and can never say for how long, whether it got worse,
+        # or whether it ever healed.
+        #
+        # Measured cost of that, specimen /spinning/evidence-816-18f/
+        # wedge_0823_055757 (boot 0516, 2026-08-23): the three ranks logged
+        # this line once each at 05:55:38 and never again. 37 s later forward
+        # progress stopped for good; at 05:56:15 the flip back to PP was
+        # abandoned over "live slot set divergence"; at 05:56:18 the three
+        # ranks each built a DIFFERENT prefill batch (#new-seq 1 vs 3,
+        # #cached-token 0 vs 16384, #queue-req 6 vs 3); by 05:57:57 py-spy
+        # showed two ranks in the spec VERIFY arm and one in the EXTEND arm of
+        # `eagle_worker_v2.forward_batch_generation` (:2246 vs :2151), all
+        # three GPUs pinned at 100% with frozen stacks, until an external
+        # SIGTERM at 06:00:43. The one warning this code emitted was the
+        # EARLIEST evidence of that whole chain, and the latch made it a
+        # single line with no duration attached.
+        #
+        # SO: keep the fall-back behaviour EXACTLY as it was -- this change
+        # decides nothing differently and admits nothing differently -- and
+        # make the signal legible: count it, log the onset, log again on a
+        # bounded cadence while it persists, and log the RECOVERY EDGE, which
+        # is the half a latch can never report ("it healed after N passes" and
+        # "it never healed" are the same silence to a latched logger).
+        #
+        # NOT UNBOUNDED LOGGING, and this specimen is the reason. The same
+        # boot emitted 7710 #797d/#798 void lines in seven seconds; a
+        # per-iteration warning on a hot loop is how that happens. The cadence
+        # below is geometric-then-capped, so a persistent divergence costs a
+        # handful of lines per minute, not thousands.
+        # The DECISION is `advance_mismatch_streak` (pure, in prefetch_ballot);
+        # everything here is wiring and formatting. That split is deliberate:
+        # inline, the recovery edge could only be checked by grepping this
+        # source, and a source grep cannot tell a live branch from `elif
+        # False:` -- a mutant that disabled the recovery edge survived exactly
+        # that test.
+        (
+            self._prefetch_ballot_mismatch_streak,
+            self._prefetch_ballot_mismatch_total,
+            _mismatch_event,
+        ) = prefetch_ballot.advance_mismatch_streak(
+            getattr(self, "_prefetch_ballot_mismatch_streak", 0),
+            getattr(self, "_prefetch_ballot_mismatch_total", 0),
+            self._uniform_prefetch_ballot is None,
+        )
+        if _mismatch_event is not None:
+            _kind, _streak = _mismatch_event
+            if _kind == "diverged":
+                logger.warning(
+                    "#791b PREFETCH-BALLOT digest mismatch: the TP ranks "
+                    "disagree about the first %d rids of waiting_queue (this "
+                    "rank digest=%d, group min=%d max=%d). Ballot void for "
+                    "this pass; admission falls back to the rank-local "
+                    "prefetch verdict. Consecutive diverged passes: %d "
+                    "(total this process: %d).",
+                    prefetch_ballot.PREFETCH_BALLOT_SLOTS,
+                    prefetch_ballot.prefetch_ballot_digest(_ballot_rids),
+                    int(t[_ballot_at].item()),
+                    -int(t[_ballot_at + 1].item()),
+                    _streak,
+                    int(self._prefetch_ballot_mismatch_total),
+                )
+            else:
+                # THE RECOVERY EDGE. A divergence that heals and one that
+                # never heals are the same silence under a latch, and they
+                # call for opposite responses.
+                logger.warning(
+                    "#791b PREFETCH-BALLOT digest agreement restored after %d "
+                    "consecutive diverged pass(es) (total this process: %d). "
+                    "The TP replicas' queue heads match again.",
+                    _streak,
+                    int(self._prefetch_ballot_mismatch_total),
+                )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
         self._uniform_budget_deficit = (
