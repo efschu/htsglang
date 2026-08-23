@@ -5,9 +5,12 @@ Every number in this file was measured on this rig. None is illustrative.
 SOURCES
 =======
 
-#816 -- /spinning/evidence-665-f1/boot_816_core_0823_0608.log, the three
-    "KV-BACKING exposure clamp (after recovery)" firings at 06:14:21, 06:18:15
-    and 06:19:43 (log lines 11241ff / 13047ff / 13770ff), one per rank::
+#816 -- /spinning/evidence-665-f1/boot_816_core_0823_0608.log,
+    "KV-BACKING exposure clamp (after recovery)". TWELVE firings, four per
+    rank, at five distinct second-marks (06:14:21, 06:14:22, 06:18:15,
+    06:19:43, 06:32:05). The brief for this task said three; three was the
+    number of cited log POSITIONS, not the rate. Each rank reported the SAME
+    three numbers on all four of its firings::
 
         rank   exposed   committed   unbacked
         PP0    466994    212992      254002
@@ -58,7 +61,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
-# Measured, 2026-08-23 06:14:21 / 06:18:15 / 06:19:43, one clamp firing per rank.
+# Measured, boot 2026-08-23 06:08: identical on all four firings of each rank.
+# That the numbers do not drift across the boot is itself the finding -- a leak
+# accumulates, a structural over-exposure does not.
 SPECIMEN_816 = (
     ("PP0", 466994, 212992, 254002),
     ("PP1", 466994, 124928, 342066),
@@ -102,7 +107,7 @@ class TestExposureLaw(CustomTestCase):
     """#816: exposed id space must not exceed the committed backing."""
 
     def test_three_measured_ranks(self):
-        """All three clamp firings, with their exact unbacked deltas."""
+        """All three ranks, with the exact unbacked delta each clamp reported."""
         for rank, exposed, committed, unbacked in SPECIMEN_816:
             with self.subTest(rank=rank):
                 space = RowSpace(exposed=exposed, committed=committed)
@@ -699,3 +704,99 @@ class TestMutantsInTheDangerDirection(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClampFiringRateIsAMetric(CustomTestCase):
+    """#822 item 5: the #816 clamp stays, and its firing rate is the metric.
+
+    A law with no actuator under it is a comment, so `clamp_exposure_to_backing`
+    keeps its job. What changes is that its firing rate now has a PARSER and a
+    MEASURED baseline, so "under the authority the clamp has nothing left to
+    correct" is a claim a later boot can falsify instead of a promise.
+    """
+
+    LOG = "/spinning/evidence-665-f1/boot_816_core_0823_0608.log"
+
+    def test_parser_reads_a_firing(self):
+        """Always runs, log or no log: the parser itself must be exercised."""
+        from sglang.srt.mem_cache.kv_row_ownership import parse_clamp_firings
+
+        line = (
+            "[2026-08-23 06:14:21 PP1] KV-BACKING exposure clamp (after "
+            "recovery): the allocator could hand out 466994 rows while only "
+            "124928 are committed, so 342066 rows had no page behind them. "
+            "Capped at 124928."
+        )
+        (firing,) = parse_clamp_firings([line])
+        self.assertEqual(firing.rank, "PP1")
+        self.assertEqual((firing.exposed, firing.committed), (466994, 124928))
+        self.assertEqual(firing.unbacked, 342066)
+        self.assertTrue(firing.is_self_consistent)
+
+    def test_parser_ignores_everything_else(self):
+        """A counter that counts the wrong lines is worse than no counter.
+
+        The INDIKATOR-GESETZ, applied to this indicator: proven in BOTH
+        directions -- it finds the firing above, and it finds nothing in lines
+        that merely mention the same subsystem.
+        """
+        from sglang.srt.mem_cache.kv_row_ownership import parse_clamp_firings
+
+        noise = [
+            "[2026-08-23 06:14:21 PP1] KV-BACKING proposal rows current=407051",
+            "[2026-08-23 06:14:21 PP1] PHASE-FLIP POOL CENSUS at-arm: unaccounted=340384",
+            "",
+        ]
+        self.assertEqual(parse_clamp_firings(noise), [])
+
+    def test_measured_baseline_against_the_real_boot_log(self):
+        """The baseline is READ OFF the boot, never asserted.
+
+        Twelve firings, four per rank. The brief for this task said three --
+        that was the number of cited log POSITIONS, not the rate. A metric
+        seeded from three would have scored a nine-firing boot as an
+        improvement.
+        """
+        import os
+
+        from sglang.srt.mem_cache.kv_row_ownership import (
+            CLAMP_BASELINE_0823,
+            CLAMP_BASELINE_ROWS_0823,
+            clamp_firing_census,
+            parse_clamp_firings,
+        )
+
+        if not os.path.exists(self.LOG):
+            self.skipTest(f"specimen boot log not present: {self.LOG}")
+
+        with open(self.LOG, errors="replace") as fh:
+            firings = parse_clamp_firings(fh)
+
+        self.assertEqual(len(firings), 12)
+        with open(self.LOG, errors="replace") as fh:
+            self.assertEqual(clamp_firing_census(fh), CLAMP_BASELINE_0823)
+
+        # Every firing self-consistent, and every rank's numbers IDENTICAL on
+        # all four of its firings: a structural defect, not a drifting leak.
+        for firing in firings:
+            self.assertTrue(firing.is_self_consistent, firing)
+            self.assertEqual(
+                (firing.exposed, firing.committed, firing.unbacked),
+                CLAMP_BASELINE_ROWS_0823[firing.rank],
+            )
+
+    def test_the_law_reproduces_every_logged_firing(self):
+        """Close the loop: the authority's verdict must equal what the clamp saw.
+
+        If the law and the actuator under it disagreed on a single one of the
+        twelve, one of them would be wrong and there would be no way to tell
+        which -- which is the state this whole task exists to leave.
+        """
+        from sglang.srt.mem_cache.kv_row_ownership import CLAMP_BASELINE_ROWS_0823
+
+        for rank, (exposed, committed, unbacked) in CLAMP_BASELINE_ROWS_0823.items():
+            with self.subTest(rank=rank):
+                space = RowSpace(exposed=exposed, committed=committed)
+                auth = RowOwnershipAuthority(space)
+                full_owner(auth, space)
+                self.assertEqual(only(auth.audit(), Law.EXPOSURE).rows, unbacked)

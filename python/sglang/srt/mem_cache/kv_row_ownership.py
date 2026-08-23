@@ -105,6 +105,7 @@ than asserted here.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -628,3 +629,91 @@ def audit_pool_census(
             authority.epoch,
         )
     return found
+
+
+# ----------------------------------------------------------------------
+# the #816 clamp's firing rate, as a regression metric with a parser
+# ----------------------------------------------------------------------
+#: the marker `clamp_exposure_to_backing` emits when it withdraws over-exposed
+#: ids (``kv_backing_relief.py``, LOG_PREFIX "KV-BACKING").
+CLAMP_LOG_MARKER = "KV-BACKING exposure clamp"
+
+_CLAMP_RE = re.compile(
+    r"\b(?P<rank>[A-Z]{2}\d+)\].*?"
+    + re.escape(CLAMP_LOG_MARKER)
+    + r".*?hand out (?P<exposed>\d+) rows while only (?P<committed>\d+) are "
+    r"committed, so (?P<unbacked>\d+) rows"
+)
+
+
+@dataclass(frozen=True)
+class ClampFiring:
+    """One firing of the #816 clamp, as the log recorded it."""
+
+    rank: str
+    exposed: int
+    committed: int
+    unbacked: int
+
+    @property
+    def is_self_consistent(self) -> bool:
+        return self.unbacked == self.exposed - self.committed
+
+
+def parse_clamp_firings(lines: Iterable[str]) -> List[ClampFiring]:
+    """Every #816 clamp firing in a boot log, with its numbers.
+
+    #822 item 5. The clamp STAYS -- it is the belt under the exposure law, and
+    a law with no actuator under it is a comment. But its firing rate is the
+    thing that says whether the law above it is working: under the authority
+    the clamp must have nothing left to correct, so a boot that still fires it
+    is a boot where an id space got over-exposed without anyone noticing.
+
+    A rate is only a metric if it has a BASELINE, and the baseline has to be
+    read off a real boot rather than asserted. See
+    :data:`CLAMP_BASELINE_0823` and the test that pins it against the log.
+    """
+    out: List[ClampFiring] = []
+    for line in lines:
+        m = _CLAMP_RE.search(line)
+        if m:
+            out.append(
+                ClampFiring(
+                    rank=m.group("rank"),
+                    exposed=int(m.group("exposed")),
+                    committed=int(m.group("committed")),
+                    unbacked=int(m.group("unbacked")),
+                )
+            )
+    return out
+
+
+def clamp_firing_census(lines: Iterable[str]) -> Dict[str, int]:
+    """Firings per rank. The number a later boot is compared against."""
+    counts: Dict[str, int] = {}
+    for firing in parse_clamp_firings(lines):
+        counts[firing.rank] = counts.get(firing.rank, 0) + 1
+    return counts
+
+
+#: MEASURED BASELINE, boot 2026-08-23 06:08
+#: (/spinning/evidence-665-f1/boot_816_core_0823_0608.log): TWELVE firings,
+#: four per rank, at five distinct second-marks (06:14:21, 06:14:22, 06:18:15,
+#: 06:19:43, 06:32:05).
+#:
+#: RECORDED BECAUSE THE BRIEF FOR THIS TASK SAID THREE. Three was the number of
+#: log POSITIONS someone had cited, not the firing rate; the rate is 12. A
+#: regression metric seeded from the wrong baseline would have called a boot
+#: with nine firings an improvement.
+CLAMP_BASELINE_0823 = {"PP0": 4, "PP1": 4, "PP2": 4}
+
+#: And what each rank reported, IDENTICALLY on all four of its firings. The
+#: exposed figure is the same on every rank while the backing is rank-local --
+#: the structural signature of a global id space over a per-rank arena. It does
+#: not drift across the boot, which is what tells a structural defect from a
+#: leak.
+CLAMP_BASELINE_ROWS_0823 = {
+    "PP0": (466994, 212992, 254002),
+    "PP1": (466994, 124928, 342066),
+    "PP2": (466994, 133120, 333874),
+}

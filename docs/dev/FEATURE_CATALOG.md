@@ -666,8 +666,14 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   **SCOPE.** This arms the AUDIT, not enforcement — the allocator does not yet
   REFUSE a stale-epoch id, and cross-rank cutover atomicity under load is a
   property of the flip's commit protocol provable only on metal. The #816
-  clamp stays as belt-and-suspenders; its firing rate is the regression metric
-  (baseline: three firings across three ranks, boot 2026-08-23 06:08).
+  clamp stays as belt-and-suspenders; its firing rate is the regression metric,
+  with a parser (`parse_clamp_firings` / `clamp_firing_census`) and a baseline
+  READ OFF a real boot rather than asserted: **12 firings, four per rank**, at
+  five second-marks of boot 2026-08-23 06:08. The #822 brief said three — that
+  was the number of cited log POSITIONS, and a metric seeded from three would
+  have scored a nine-firing boot as an improvement. Each rank reported the same
+  three numbers on all four of its firings, which is what distinguishes a
+  structural over-exposure from a leak: a leak accumulates, this did not.
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
   per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
