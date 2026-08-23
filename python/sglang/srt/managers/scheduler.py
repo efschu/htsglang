@@ -5254,6 +5254,79 @@ class Scheduler(
             )
         return canonical, matches
 
+    def _tp_head_enforcer_enabled(self) -> bool:
+        """#823 W9: is the group's batch-formation decision in force?
+
+        Requires a real TP group -- a world of one has nothing to agree
+        with, and the votes published above are then just this rank's own
+        numbers. ``SGLANG_TP_HEAD_CONGRUENCE=0`` is the kill switch, and it
+        restores the pre-#823 rank-local formation exactly.
+        """
+        if os.environ.get("SGLANG_TP_HEAD_CONGRUENCE", "1") != "1":
+            return False
+        # `self.ps` itself is read with getattr, not just its members: this
+        # predicate sits on the admission path and is reached by harnesses
+        # that model a Scheduler without a ParallelState. Absent -> no group
+        # to agree with -> the pre-#823 rank-local formation.
+        ps = getattr(self, "ps", None)
+        if ps is None:
+            return False
+        return int(getattr(ps, "tp_size", 1) or 1) > 1
+
+    def _uniform_allocatable_reqs(self, running_bs: int) -> int:
+        """#823 W9 COUNT arm: how many of the head this rank may admit.
+
+        The group's MIN, so every rank stops at the same candidate count.
+        Falls back to the local number whenever the group has no opinion,
+        which is the pre-#823 expression unchanged.
+        """
+        local = self.get_num_allocatable_reqs(running_bs)
+        limit, _source = tp_head_congruence.admit_limit_decision(
+            local,
+            getattr(self, "_uniform_admit_limit", None),
+            self._tp_head_enforcer_enabled(),
+        )
+        return local if limit is None else int(limit)
+
+    def _apply_uniform_head_order(self) -> None:
+        """#823 W9 ORDER arm: put ``waiting_queue``'s head in the GROUP's order.
+
+        Runs immediately after ``calc_priority``, so it overrides exactly the
+        rank-local `_sort_by_longest_prefix` result that diverges
+        (schedule_policy.py:225-232) and nothing else. Requests the group did
+        not name -- deeper than the head, or not held everywhere -- keep
+        their relative order behind it, so this REORDERS and never drops:
+        a request the group omitted waits for a later pass rather than
+        disappearing.
+        """
+        if not self._tp_head_enforcer_enabled():
+            return
+        canonical = getattr(self, "_pass_head_canonical", None)
+        group_lens = getattr(self, "_uniform_head_match_lens", None)
+        if not canonical or not group_lens:
+            return
+        try:
+            order, _source = tp_head_congruence.head_decision(
+                canonical,
+                group_lens,
+                [req.rid for req in self.waiting_queue],
+                {},
+                digest_agreed=self._uniform_prefetch_ballot is not None,
+                enforcer_enabled=True,
+            )
+            by_rid = {req.rid: req for req in self.waiting_queue}
+            head = [by_rid[rid] for rid in order if rid in by_rid]
+            named = {id(req) for req in head}
+            self.waiting_queue[:] = head + [
+                req for req in self.waiting_queue if id(req) not in named
+            ]
+        except Exception as exc:  # noqa: BLE001 - never break admission
+            logger.warning(
+                "#823 head-congruence: could not apply the group head order "
+                "(%s); this pass forms rank-locally",
+                exc,
+            )
+
     def _local_admit_limit(self) -> Optional[int]:
         """#823 W9: this rank's vote for HOW MANY of the head may be admitted.
 
@@ -7402,6 +7475,13 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        # #823 W9: and then put its HEAD in the group's order. calc_priority
+        # sorts by this rank's own num_matched_prefix_tokens, which is read
+        # from the rank-local radix tree and therefore differs between TP
+        # replicas whose prefix caches evolved apart (#616B family). Same
+        # queue, same policy, different order -- and a different order is a
+        # different batch.
+        self._apply_uniform_head_order()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -7649,7 +7729,13 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            # #823 W9 COUNT arm: the GROUP's allocatable count, not this
+            # rank's. Equal order with an unequal stop is still an unequal
+            # batch -- it is what put "#new-seq 1 vs 3" in the 0516 specimen
+            # beside the "#cached-token 0 vs 16384" the order arm explains.
+            # MIN, so this can only stop EARLIER than the local number would:
+            # admit fewer, never more.
+            if len(adder.can_run_list) >= self._uniform_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
