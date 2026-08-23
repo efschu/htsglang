@@ -325,6 +325,51 @@ class APostIsCreditedByWhatItDelivered(unittest.TestCase):
         self.assertEqual(drawn["allocator-cache"], 100 * MIB)
 
 
+class ThePreflightForTheBatchedWindow(unittest.TestCase):
+    """WINDOW-PROTOCOL gate 2: prove at the desk that the boot CAN pass.
+
+    All four figures are read off ``boot_827_review_0823_0910c.log`` at
+    09:11:05 PP0. The ordering that makes the arithmetic valid is stated in
+    ``_corridor_gate``'s own comment: ``collective_kv_backing_relief`` runs
+    BEFORE the guard's probe, "so what it frees is money the guard can see".
+
+    THIS IS NOT A PASS CERTIFICATE. It says the shortfall is covered by a
+    margin large enough that the run is worth a window; it cannot say the flip
+    completes, because completion depends on the in-cutover draw that only
+    metal measures.
+    """
+
+    WANT_MIB = 1746  # guard ask = staging 1234 + C20 entry margin 512
+    FREE_MIB = 1436  # driver free at the refusal
+    ARMING_FLOOR_MIB = 1255
+    LAW_MIB = 1024
+
+    def test_the_released_band_clears_the_gate_the_boot_refused_at(self):
+        pool = _StubPool(PP0_SIZE, PP0_BACKED)
+        released_mib = _dial(pool, PP0_TARGET) // MIB
+        self.assertEqual(released_mib, 1801)
+
+        free_at_probe = self.FREE_MIB + released_mib
+        self.assertGreaterEqual(
+            free_at_probe,
+            self.WANT_MIB,
+            "the rung's own draw still does not clear the gate",
+        )
+        # ``ok = free_now >= want`` (corridor_guard.py). And the residual must
+        # not dip under the corridor law, or the entry clears while breaching
+        # the thing the gate defends.
+        self.assertGreaterEqual(free_at_probe - self.WANT_MIB, self.LAW_MIB)
+        self.assertGreaterEqual(free_at_probe, self.ARMING_FLOOR_MIB)
+
+    def test_the_draw_never_cuts_into_the_live_set(self):
+        """21468 live rows enumerated on PP0; the target must clear them with
+        the rung's own floor to spare, or this trades a refusal for a crash."""
+        live_rows = 21468
+        rung_floor_rows = 25564
+        self.assertGreater(PP0_TARGET, rung_floor_rows)
+        self.assertGreater(rung_floor_rows, live_rows)
+
+
 class TheSeamCensusSpendsTheMeasurement(unittest.TestCase):
     """The wiring edge. A law connected to nothing is the failure mode this
     corpus has shipped repeatedly -- ``_funding_post_census`` is guarded by a
