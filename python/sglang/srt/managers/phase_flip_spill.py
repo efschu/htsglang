@@ -2190,9 +2190,12 @@ def get_corridor_guard(scheduler: Any):
     # breaches as passed checks. So a configured value may raise the derived
     # one and may not lower it.
     measured_draw_mib = _measured_seam_draw_mib(scheduler, server_args)
+    # #826: resolved reserve, not the shipped constant -- see the twin site
+    # in phase_flip_seam_reserve.py. A flag that only moved the default
+    # argument would be inert here, which is the defect being closed.
     derived_mib = cg.arming_floor_mib(
         seam_entry_reserve_mib=max(
-            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, measured_draw_mib
+            cg.seam_entry_reserve_mib_resolved(), measured_draw_mib
         ),
         law_mib=law_mib,
     )

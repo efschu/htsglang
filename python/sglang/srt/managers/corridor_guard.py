@@ -301,8 +301,129 @@ def corridor_band_mib():
     return corridor_band_floor_mib(), corridor_law_mib(), corridor_band_ceiling_mib()
 
 
+#: #826: OPT-IN ADOPTION OF THE SOLVED ARMING FLOOR.
+#:
+#: #770 shipped `solve_arming_floor` as an OBSERVER -- its only consumer turns
+#: it into advice text and sets no floor -- so the shipped reserve stayed at
+#: 512 and `arming_floor_mib()` stayed at 1331 against a band ceiling of 1229.
+#: 294 MiB short by construction, on every card, on every boot. The solver's
+#: own docstring names the missing half: "the caller decides whether to adopt
+#: it or refuse at boot. What must never happen again is the third option the
+#: tree shipped: neither adopting nor refusing".
+#:
+#: This is that caller, and it is OPT-IN because cutting the reserve from 512
+#: to 218 changes what the seam may spend WHILE IT RUNS -- a behaviour change
+#: to the flip that needs metal, which is exactly why it is a flag and not a
+#: new default.
+#:
+#: SCOPE, held deliberately narrow: this adopts the floor VALUE. It does not
+#: revive the withdrawn floor clamp (a cap under live rows, withdrawn in
+#: 3b2bbde3ad; `test_residency_cap_flip_levelling_792` is that watchdog) and
+#: it takes no kv-slack draws.
+SOLVED_FLOOR_ENV = "SGLANG_ARMING_FLOOR_SOLVED"
+
+_ARMING_FLOOR_PROVENANCE_LOGGED = False
+
+
+class ArmingFloorUnsatisfiable(RuntimeError):
+    """No seam-entry reserve fits under the corridor band ceiling.
+
+    Raised AT BOOT, by name. The alternative the tree shipped was to advise at
+    runtime that the flip "is retried when occupancy drops" -- which describes
+    a state the corridor law forbids, and which 18f measured directly:
+    draining the load did not lift the lock. A configuration that cannot arm
+    from inside its own acceptance band must say so before it serves, not
+    livelock after.
+    """
+
+
+def _reset_arming_floor_provenance() -> None:
+    """Test seam: the provenance line is logged once per process."""
+    global _ARMING_FLOOR_PROVENANCE_LOGGED
+    _ARMING_FLOOR_PROVENANCE_LOGGED = False
+
+
+def _arming_margin_mib_for_solver() -> int:
+    """The margin the arming gate wants on top of the floor.
+
+    Indirected through a function so the solve can be driven in tests without
+    monkeypatching another module's constant, and so this module does not take
+    an import-time dependency on the seam reserve module.
+    """
+    from sglang.srt.managers.phase_flip_seam_reserve import DEFAULT_ARMING_MARGIN_MIB
+
+    return int(DEFAULT_ARMING_MARGIN_MIB)
+
+
+def seam_entry_reserve_mib_resolved() -> int:
+    """The seam-entry allowance the arming floor is built on.
+
+    Default: the shipped 512, byte-identical to the pre-#826 path.
+    With ``SGLANG_ARMING_FLOOR_SOLVED=1``: the largest reserve that fits under
+    the band ceiling, as solved by `funding_authority.solve_arming_floor`.
+
+    Raises `ArmingFloorUnsatisfiable` when the flag is set and NOTHING fits.
+    That is the whole point of the flag: adopt, or refuse by name.
+    """
+    global _ARMING_FLOOR_PROVENANCE_LOGGED
+    raw = os.environ.get(SOLVED_FLOOR_ENV, "")
+    if raw.strip().lower() not in ("1", "true", "yes", "on"):
+        return int(DEFAULT_SEAM_ENTRY_RESERVE_MIB)
+
+    from sglang.srt.managers.funding_authority import solve_arming_floor
+
+    floor = corridor_band_floor_mib()
+    ceiling = corridor_band_ceiling_mib()
+    margin = _arming_margin_mib_for_solver()
+    sol = solve_arming_floor(
+        floor, ceiling, int(DEFAULT_SEAM_ENTRY_RESERVE_MIB), margin
+    )
+    # CONTRACT, and it is easy to misread: `satisfiable` means the REQUESTED
+    # reserve (512) fits under the ceiling -- on the shipped numbers it never
+    # does. The SOLVED answer is `max_seam_entry_reserve_mib`, the largest
+    # reserve that does fit (218 here). Refusal is reserved for the case where
+    # nothing fits at all. Reading `satisfiable` as "a solution exists" would
+    # make this actuator refuse every boot it was built to enable.
+    reserve = (
+        int(sol.seam_entry_reserve_mib)
+        if sol.satisfiable
+        else int(sol.max_seam_entry_reserve_mib)
+    )
+    if reserve <= 0:
+        raise ArmingFloorUnsatisfiable(
+            f"{LOG_PREFIX} #826 arming floor is unsatisfiable and this boot "
+            f"asked for the solved floor ({SOLVED_FLOOR_ENV}=1): band floor "
+            f"{floor} MiB, band ceiling {ceiling} MiB, arming margin {margin} "
+            f"MiB, requested seam entry reserve "
+            f"{int(DEFAULT_SEAM_ENTRY_RESERVE_MIB)} MiB. {sol.detail} "
+            f"Refusing at boot rather than arming a gate that cannot be "
+            f"reached from inside the corridor band."
+        )
+    if not _ARMING_FLOOR_PROVENANCE_LOGGED:
+        _ARMING_FLOOR_PROVENANCE_LOGGED = True
+        logger.warning(
+            "%s #826 arming floor %d MiB, solver-derived, corridor ceiling "
+            "%d MiB (band floor %d + seam entry reserve %d, arming margin "
+            "%d; shipped reserve %d would have put the floor at %d, which is "
+            "%d MiB past the ceiling once the margin is added)",
+            LOG_PREFIX,
+            floor + reserve,
+            ceiling,
+            floor,
+            reserve,
+            margin,
+            int(DEFAULT_SEAM_ENTRY_RESERVE_MIB),
+            floor + int(DEFAULT_SEAM_ENTRY_RESERVE_MIB),
+            floor + int(DEFAULT_SEAM_ENTRY_RESERVE_MIB) + margin - ceiling,
+        )
+    return reserve
+
+
+seam_entry_reserve_mib = seam_entry_reserve_mib_resolved
+
+
 def arming_floor_mib(
-    seam_entry_reserve_mib: int = DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+    seam_entry_reserve_mib: Optional[int] = None,
     law_mib: int = CORRIDOR_LAW_MIB,
 ) -> int:
     """The gate's watermark, derived from the law it protects.
@@ -322,6 +443,11 @@ def arming_floor_mib(
     what the self-correcting margin aims at; the floor is what the gate
     defends.
     """
+    # #826: resolved at CALL time, not bound as a default at def time -- a
+    # default argument would freeze the shipped 512 into the signature and
+    # make the flag inert, which is the shape of the bug this closes.
+    if seam_entry_reserve_mib is None:
+        seam_entry_reserve_mib = seam_entry_reserve_mib_resolved()
     return corridor_band_floor_mib() + max(0, int(seam_entry_reserve_mib))
 
 

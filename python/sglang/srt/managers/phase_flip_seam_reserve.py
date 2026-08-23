@@ -190,6 +190,7 @@ SHORTFALL_FORGET_BYTES = 16 << 20
 #: about it is derived from this rig's card sizes or layout.
 POOL_LATCH_TOLERANCE_BYTES = 64 << 20
 
+
 @dataclasses.dataclass(frozen=True)
 class SizingPin:
     """A shipped pool size WITH the regime it was derived under (#678).
@@ -607,9 +608,17 @@ def arming_floor_target_bytes(
     """
     from sglang.srt.managers import corridor_guard as cg
 
+    # #826: the RESOLVED reserve, not the shipped constant. Both production
+    # consumers passed `DEFAULT_SEAM_ENTRY_RESERVE_MIB` explicitly, so a flag
+    # that only changed the DEFAULT ARGUMENT would have been inert on exactly
+    # the path it was built for -- the same inert-observer shape as the #770
+    # solver this closes. The max() with the measured draw is kept: a seam
+    # that demonstrably draws more than the solved reserve must still raise
+    # the floor, and if that puts the floor back over the ceiling that is a
+    # finding to see at boot, not one to hide.
     derived_mib = cg.arming_floor_mib(
         seam_entry_reserve_mib=max(
-            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB, max(0, int(measured_draw_mib or 0))
+            cg.seam_entry_reserve_mib_resolved(), max(0, int(measured_draw_mib or 0))
         ),
         law_mib=cg.corridor_law_mib(),
     )
