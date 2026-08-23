@@ -515,6 +515,40 @@ class BudgetHarness:
     # cannot price.
     chunked_prefill_size = 4096
     _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    # #823: the reduce grew the HEAD-CONGRUENCE block -- a TP_HEAD_SLOTS-wide
+    # prefix-match vote and a one-slot admission-count vote. Seventh drift of
+    # this harness after #616g, #639, #639b, #791b, #794 and #701, and the
+    # first one the guard caught in the SAME change that caused it rather
+    # than a quarter later.
+    #
+    # Both are bound from Scheduler rather than stubbed, so this harness keeps
+    # modelling the real contract, and both ride NEUTRALLY here for reasons
+    # the harness already has: `waiting_queue` is empty, so the head vote is
+    # an empty canonical set and every slot carries the absent sentinel; and
+    # this harness has no `get_num_allocatable_reqs`, so the limit vote takes
+    # its own "no opinion" path and rides the unpriced sentinel. That is the
+    # same shape as the host and mamba tiers above -- the sentinel rides and
+    # nothing is published.
+    _local_head_prefix_matches = Scheduler._local_head_prefix_matches
+    _local_admit_limit = Scheduler._local_admit_limit
+
+    def get_num_allocatable_reqs(self, running_bs):
+        """A STAND-IN, which is what the guard's own message offers as the
+        alternative to binding -- and the right choice here.
+
+        The shipped method is bounded by `admission_limiter.current` and
+        carries the #677 decode-parking branch; binding it would oblige this
+        harness to model a limiter and a phase policy to answer a question it
+        is not asking. The budget reduce is what this file is about, and the
+        count vote occupies its own slot, so a constant priced vote exercises
+        the priced path without touching any assertion here.
+
+        Constant and equal on both ranks deliberately: a DIVERGENT count is
+        the subject of test_tp_head_congruence_823, not of this harness, and
+        making it diverge here would put a second unrelated variable into the
+        budget cases.
+        """
+        return 8
     uniform_corridor_width = Scheduler.uniform_corridor_width
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.

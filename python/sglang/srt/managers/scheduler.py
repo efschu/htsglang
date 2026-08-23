@@ -211,6 +211,7 @@ from sglang.srt.managers.phase_purity import (
 # process without touching anything else (the instr-boot can-fail
 # discipline).
 from sglang.srt.managers import prefetch_ballot
+from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
@@ -5040,6 +5041,46 @@ class Scheduler(
         # AFTER the mamba pair, so every existing index below keeps its
         # meaning. See prefetch_ballot.py for the layout and the MIN==AND
         # argument.
+        # #823 W9: THE HEAD-CONGRUENCE BLOCK rides this reduce too, and it is
+        # placed HERE for the same reason the corridor width is -- between the
+        # mamba pair and the ballot. Everything above is indexed from the
+        # HEAD, the ballot below is indexed from the TAIL
+        # (`len(vals) - (PREFETCH_BALLOT_SLOTS + 2)`), so an insertion at this
+        # seam leaves both readings intact. Both blocks below capture their
+        # own explicit index BEFORE appending; nothing here is read back by a
+        # negative offset, which is the mistake #639b's note records ("the
+        # `t[-2]`/`t[-1]` the host floor used to read would have silently
+        # started reading MAMBA availability").
+        #
+        # Payload order, in full, after this block:
+        #   [avail, (admission,) -avail, host, -host, mamba, -mamba,
+        #    corridor, head_match[0..TP_HEAD_SLOTS-1], admit_limit,
+        #    ballot_digest, -ballot_digest, ballot_v0..v{K-1}]
+        #
+        # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
+        # (`num_matched_prefix_tokens`) is normally populated inside
+        # `calc_priority`, which runs LATER in the pass -- so at reduce time
+        # it is either zero or last pass's value, and reducing that would
+        # agree on a stale number. The fix is the one #791b already used in
+        # this function for the prefetch verdicts: pull the RANK-LOCAL
+        # computation forward to here (no collective, and this site runs
+        # exactly once per TP-loop iteration) and memoise it for the batch
+        # formation to consume. Same move, same reason.
+        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
+        self._pass_head_canonical = _head_canonical
+        _head_at = len(vals)
+        vals = vals + tp_head_congruence.build_head_order_payload(
+            _head_canonical, _head_local_matches
+        )
+        # The COUNT arm's vote. Its own slot rather than a derivation from
+        # `avail` above, because `get_num_allocatable_reqs` is bounded by
+        # `admission_limiter.current` (:6526-6529) -- rank-local floating
+        # state that the availability floor does not capture, so a count
+        # derived from the uniform avail would still diverge.
+        _limit_at = len(vals)
+        vals = vals + tp_head_congruence.build_admit_limit_payload(
+            self._local_admit_limit()
+        )
         _ballot_verdicts = self._drain_prefetch_progress()
         self._pass_prefetch_verdicts = _ballot_verdicts
         _ballot_rids = [
@@ -5054,6 +5095,13 @@ class Scheduler(
         # #794: the group's tightest corridor width, read back before the
         # ballot so a later change to the ballot layout cannot silently move it.
         self._uniform_corridor_width = int(t[_corridor_at])
+        # #823 W9: read back by the indices captured above, before the ballot,
+        # so a later change to the ballot layout cannot silently move them --
+        # the same discipline the corridor width is read under.
+        self._uniform_head_match_lens = t[
+            _head_at : _head_at + tp_head_congruence.TP_HEAD_SLOTS
+        ].tolist()
+        self._uniform_admit_limit = int(t[_limit_at])
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
             t[_ballot_at:].tolist(), _ballot_rids
@@ -5159,6 +5207,68 @@ class Scheduler(
         self._publish_uniform_mamba_floor(
             int(t[mamba_at].item()), max_mamba_avail=-int(t[mamba_at + 1].item())
         )
+
+    def _local_head_prefix_matches(self):
+        """#823 W9: this rank's vote for the head's prefix lengths.
+
+        THE PULL-FORWARD, and it is the same one #791b made for the prefetch
+        verdicts a few lines below. ``num_matched_prefix_tokens`` is normally
+        populated by ``calc_priority``, which runs LATER in this pass, so at
+        reduce time it is zero or last pass's value. Computing it here --
+        rank-local, no collective, once per TP-loop iteration -- is what lets
+        the group agree on a CURRENT number instead of a stale one, and
+        ``calc_priority`` then finds the head already matched.
+
+        Bounded to the canonical head, so this is at most TP_HEAD_SLOTS
+        lookups against a tree ``calc_priority`` was about to walk in full
+        anyway.
+
+        Never raises: a rank that cannot price its head contributes nothing
+        for those rids and the group's MIN treats them as absent, which
+        delays them rather than splitting the group.
+        """
+        canonical: List[str] = []
+        matches: Dict[str, int] = {}
+        try:
+            # Local import: schedule_policy imports from this module's
+            # package at load time, so binding this at module scope would
+            # close an import cycle.
+            from sglang.srt.managers.schedule_policy import match_prefix_for_req
+
+            by_rid = {req.rid: req for req in self.waiting_queue}
+            canonical = tp_head_congruence.canonical_head_rids(list(by_rid.keys()))
+            tree = getattr(self, "tree_cache", None)
+            can_match = tree is not None and tree.supports_fast_match_prefix()
+            for rid in canonical:
+                req = by_rid.get(rid)
+                if req is None:
+                    continue
+                if can_match:
+                    match_prefix_for_req(tree, req, include_req=True)
+                matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+        except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
+            logger.warning(
+                "#823 head-congruence: could not price this rank's head (%s); "
+                "contributing an empty vote, which can only delay admissions",
+                exc,
+            )
+        return canonical, matches
+
+    def _local_admit_limit(self) -> Optional[int]:
+        """#823 W9: this rank's vote for HOW MANY of the head may be admitted.
+
+        Its own slot rather than a derivation from the availability floor,
+        because ``get_num_allocatable_reqs`` is bounded by
+        ``admission_limiter.current`` -- rank-local floating state the
+        availability reduce does not capture. ``None`` means "no opinion" and
+        rides as the sentinel, leaving every rank's local limit untouched.
+        """
+        try:
+            running = getattr(self, "running_batch", None)
+            running_bs = len(running.reqs) if running is not None else 0
+            return int(self.get_num_allocatable_reqs(running_bs))
+        except Exception:  # noqa: BLE001 - a vote may never break the reduce
+            return None
 
     def _publish_uniform_evict_floor(
         self, min_avail: Optional[int], max_avail: Optional[int] = None
