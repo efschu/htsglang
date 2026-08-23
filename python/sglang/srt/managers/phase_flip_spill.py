@@ -1235,11 +1235,45 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
     conditional path. Without a channel (single-rank shapes) the levelling is
     skipped, which is correct: one rank is level with itself.
     """
+    #: #834 B step 1: THE TWO HALVES ARE NOW NAMED, and this function is their
+    #: composition. Nothing about the shipped behaviour changes -- the same
+    #: grow runs, then the same levelling, in the same order, on the same
+    #: values -- but the halves are separately callable, which is the whole
+    #: prerequisite the #830 F2 design note put first: "Split
+    #: recover_kv_backing into grow (rank-local) and level (collective) as
+    #: separate callables. The seam then runs grow-then-level as today, with no
+    #: behaviour change, and the split is provable by test before anything
+    #: moves."
+    grown = grow_kv_backing_local(scheduler)
+    level_kv_backing_to_group(scheduler, reduce_fn)
+    return grown
+
+
+def grow_kv_backing_local(scheduler: Any) -> int:
+    """#834 B: the RANK-LOCAL half of the recovery. Grows, never agrees.
+
+    This is the expensive half and the whole reason the split exists.
+    ``relief.recover()`` reaches ``runtime_set_backing_rows`` and from there
+    cuMemCreate/cuMemMap, and #830 F2 measured this call at 99-101% of the
+    cutover term across 63 rank-flips in two independent boots -- 3448.9 and
+    3773.0 ms mean, against 50.2 ms with HiCache off.
+
+    NOT ONE COLLECTIVE IS REACHED HERE, and that is a checkable claim rather
+    than a comfortable one: ``kv_backing_relief.py`` contains no collective
+    anywhere, which is what makes this half safe to run at a rank-local cadence
+    while the levelling below is not.
+
+    IT DOES, HOWEVER, RAISE THIS RANK'S EXPOSURE. ``recover()`` ends in
+    ``clamp_exposure_to_backing``, which lifts the allocator to this rank's own
+    new backing -- correct when the levelling follows immediately, and the
+    precise hazard when it does not. A caller that defers the levelling MUST
+    re-clamp; see ``clamp_kv_exposure_to_level``.
+    """
     relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
     if relief is None:
         return 0
     try:
-        grown = int(relief.recover())
+        return int(relief.recover())
     except Exception as e:
         logger.error(
             "%s KV backing recovery failed: %s. The pool is still capped, so "
@@ -1248,9 +1282,69 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
             LOG_PREFIX,
             e,
         )
-        grown = 0
-    if reduce_fn is None:
-        return grown
+        return 0
+
+
+def clamp_kv_exposure_to_level(scheduler: Any, level: int) -> int:
+    """#834 B step 2: hold exposure at a level the GROUP has agreed to.
+
+    THE INVARIANT THE DEFERRED GROW IS BUILT AGAINST, written as its own
+    callable because the #830 F2 design note says it is the first thing to
+    write a red arm against: "keep the pool's exposure clamped to the pre-grow
+    group level until the levelling runs, so no rank can expose an id a peer
+    has not backed."
+
+    Why this is safe and cheap: it is an ID decision and nothing else. It uses
+    the same ``KvRowCap`` primitive the levelling itself uses -- no pages are
+    released, no memory is committed, live allocations are not enumerated, not
+    moved and not touched. What it costs is capacity, temporarily, which is the
+    correct thing to spend here: the alternative is a rank handing out an id a
+    peer cannot map, which aborts ALL THREE inside ``store_kvcache``'s bounds
+    assert.
+
+    ``level`` None or <= 0 means "no agreed level to clamp to" and is a no-op --
+    an unknown must never be turned into a cap, the same rule #721 and #830 F4
+    both apply to refusals. None is the #792 DECLINE arriving here, and it is
+    the commonest way this is called with nothing to do, so it is handled
+    before the int() rather than inside it.
+    """
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+    if relief is None or level is None or int(level) <= 0:
+        return 0
+    try:
+        return int(relief.level_recovery_to(int(level)))
+    except Exception as e:
+        logger.error(
+            "%s could not clamp KV exposure to the agreed level %d (%s). This "
+            "rank may now expose ids the group has not levelled to, which the "
+            "seam's frame ballot refuses -- a lost flip, never a half-flipped "
+            "group",
+            LOG_PREFIX,
+            int(level),
+            e,
+        )
+        return 0
+
+
+def level_kv_backing_to_group(scheduler: Any, reduce_fn) -> Optional[int]:
+    """#834 B: the COLLECTIVE half. Agrees, never grows.
+
+    Returns the level the group agreed on, or None when no level was applied
+    (no channel, no relief, a declined level, or a group already even). The
+    return value is what a deferred grow needs in order to know which level it
+    must clamp itself back to, and it did not exist before this split.
+
+    THIS HALF CANNOT MOVE TO A RANK-LOCAL CADENCE, and the reason is recorded
+    at the call site in phase_flip_runtime.py rather than only here: entering a
+    blocking reduction at a local cadence can pair with a peer blocked in a
+    pipeline recv, which is the 2026-08-08 boots 9/10 PP wedge. "Just after a
+    cutover" is approximately synchronized, and approximately is what that
+    wedge punished.
+    """
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+    if relief is None or reduce_fn is None:
+        return None
+    applied: Optional[int] = None
     try:
         backed = int(relief.backed_rows())
         # #792: THE FLOOR RIDES ALONG, because the level this decides is
@@ -1271,6 +1365,15 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
         floor_known = len(reduced) > 2
         group_floor = -int(reduced[2]) if floor_known else -1
         unlevel = group_min > 0 and group_min < group_max
+        # #834 B: THE AGREED LEVEL IS group_min WHETHER OR NOT IT HAD TO BE
+        # APPLIED. An already-even group agreed just as much as an uneven one
+        # that had to be capped -- it simply needed no cap to get there. A
+        # deferred grow has to clamp itself back to that number either way, so
+        # reporting it only in the branch that moved rows would leave the
+        # commonest case (a level group) with no level to clamp to, which is
+        # the shape that silently exposes unlevelled ids.
+        if group_min > 0:
+            applied = group_min
         if unlevel and (not floor_known or group_floor > group_min):
             # THE ONE STATE THAT CANNOT BE ANSWERED, and the levelling used to
             # answer it anyway. The poorest rank cannot expose the rows the
@@ -1305,8 +1408,12 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
                 floor,
                 group_min,
             )
+            # DECLINED IS NOT AGREED. A caller holding a deferred grow must not
+            # read this as a level it may expose to.
+            applied = None
         elif unlevel:
             moved = int(relief.level_recovery_to(group_min))
+            applied = group_min
             logger.warning(
                 "%s KV recovery levelled to the group: this rank backs %d "
                 "rows, the group's poorest backs %d, so the allocator is "
@@ -1331,7 +1438,7 @@ def recover_kv_backing(scheduler: Any, reduce_fn=None) -> int:
             LOG_PREFIX,
             e,
         )
-    return grown
+    return applied
 
 
 def recover_kv_backing_on_abandon(

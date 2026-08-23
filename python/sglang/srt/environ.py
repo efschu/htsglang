@@ -282,6 +282,56 @@ class Envs:
     # a boot shows the refusal firing on drains that complete harmlessly --
     # that is data, and this number should move on data.
     SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS = EnvInt(1094)
+    # #834: THE SEAM SHRINK. Off by default, and "off" means the shipped path
+    # runs unchanged -- every new branch in phase_flip_runtime.py and
+    # phase_flip_spill.py is entered only through this gate.
+    #
+    # WHAT IT CHANGES, in one sentence per half:
+    #
+    #   A  the #760 device-tier quiesce moves to ARM TIME. The device tier is
+    #      disarmed and its in-flight copies drained while the pipeline is
+    #      still serving, instead of the flip arming first and then waiting
+    #      for those copies inside the no-return window with the requests
+    #      parked. The seam's own quiesce is NOT removed -- it stays exactly
+    #      where it is and becomes the confirmation that the drain already
+    #      happened (#830 M11: removing it re-opens two SIGSEGVs that no
+    #      Python-side shape check can catch).
+    #   B  the rank-local half of ``recover_kv_backing`` -- the
+    #      cuMemCreate/cuMemMap grow that #830 F2 measured as ~99% of the
+    #      cutover term -- moves OUT of the no-return window and runs after
+    #      the cutover. The COLLECTIVE levelling stays in the seam, because
+    #      that is the half that cannot move: it is what stops one rank
+    #      exposing an id a peer has not backed, and running it at a
+    #      rank-local cadence is the 2026-08-08 boots 9/10 PP wedge shape.
+    #
+    # THE HAZARD THIS GATE EXISTS FOR is that both halves change WHEN work
+    # happens relative to a collective, and both of B's failure modes -- a
+    # three-rank abort inside store_kvcache's bounds assert, and #814's
+    # permanent pool shrink -- are invisible to a hermetic suite. So the
+    # default is the measured, booted path, and the shrink is what a GPU
+    # window turns on deliberately.
+    SGLANG_SEAM_SHRINK = EnvBool(False)
+    # Per-half overrides, for attributing a window's result to one half rather
+    # than to "the shrink". -1 = follow SGLANG_SEAM_SHRINK, 0 = force off,
+    # 1 = force on. A window that moves both at once cannot say which moved
+    # the number, and this family has already paid twice for reading adjacency
+    # as attribution.
+    SGLANG_SEAM_SHRINK_PREARM_QUIESCE = EnvInt(-1)
+    SGLANG_SEAM_SHRINK_DEFER_GROW = EnvInt(-1)
+    # #834 B step 4: the RATCHET GUARD's patience, in flip-runtime rounds.
+    #
+    # A deferred grow that no levelling has consumed is #814's trap wearing a
+    # new shape: the rows are backed but not exposed, so the pool stays small
+    # while the memory is already spent. After this many rounds with a grow
+    # still outstanding the runtime says so LOUDLY and names #814, the way the
+    # abort window's "drain missed" check does. It never self-heals by
+    # exposing unlevelled rows -- that is the abort this design refuses.
+    #
+    # 32 is a patience, not a measurement: the levelling runs at the seam's
+    # funding-verdict cadence, which is asked at least once per arm, and an
+    # instance that has not armed in 32 rounds has a different problem. It
+    # should move on data from the first window that turns the shrink on.
+    SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS = EnvInt(32)
     SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
     SGLANG_PHASE_FLIP_IMAGE_DIR = EnvStr("")
     # #802: refill a FILE-BACKED image by READING the file into a pinned

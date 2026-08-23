@@ -1289,6 +1289,122 @@ def flip_seam_budget_verdict(
     )
 
 
+#: #834 A: the arm-time refusal reason, spelled once so a boot greps one token.
+#: Distinct from ``SEAM_BUDGET_REFUSED`` on purpose -- that one refuses INSIDE
+#: ``_execute``, after the group has already agreed to go through, and it
+#: projects from the PREVIOUS flip's drain. This one refuses at ``arm``, before
+#: anything is pending, on a drain THIS arm just measured.
+PREARM_DRAIN_REFUSED = "PREARM-DRAIN-REFUSED"
+
+#: #834 B: the two names a boot log needs to follow a deferred grow. The debt
+#: line fires when a grow is still outstanding after the guard's patience; the
+#: refusal fires when a rank would expose an id the group has not levelled to.
+GROW_DEBT_UNPAID = "GROW-DEBT-UNPAID"
+UNLEVELLED_EXPOSURE_REFUSED = "UNLEVELLED-EXPOSURE-REFUSED"
+
+
+def _seam_shrink_master() -> bool:
+    """#834: the master gate. Off by default; see ``SGLANG_SEAM_SHRINK``."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_SEAM_SHRINK.get())
+    except Exception:  # noqa: BLE001 - a gate lookup must never break a flip
+        return False
+
+
+def _seam_shrink_half(name: str) -> bool:
+    """One half of the shrink, with its own -1/0/1 override.
+
+    The overrides exist so a GPU window can attribute a result to ONE half.
+    Moving both at once and then reporting "the shrink helped" is the shape
+    this family has twice paid for (ANALYSE_830's F2 was aimed at the wrong
+    call for exactly that reason), so the ability to cut them apart ships
+    with the feature rather than being added after the first ambiguous boot.
+    """
+    try:
+        from sglang.srt.environ import envs
+
+        override = int(getattr(envs, name).get())
+    except Exception:  # noqa: BLE001 - an override lookup must not break a flip
+        override = -1
+    if override == 0:
+        return False
+    if override >= 1:
+        return True
+    return _seam_shrink_master()
+
+
+def seam_shrink_prearm_quiesce_enabled() -> bool:
+    """#834 A: is the #760 drain pulled forward to arm time?"""
+    return _seam_shrink_half("SGLANG_SEAM_SHRINK_PREARM_QUIESCE")
+
+
+def seam_shrink_defer_grow_enabled() -> bool:
+    """#834 B: is the rank-local KV grow pulled out of the no-return window?"""
+    return _seam_shrink_half("SGLANG_SEAM_SHRINK_DEFER_GROW")
+
+
+def release_prearm_quiesce(holder, why: str) -> None:
+    """#834 A: drop a pre-arm hold on a holder that may not have one.
+
+    THE W12 CONVENTION, AND FOR THE SAME REASON IT WAS INVENTED. #795's arm
+    epoch is read through ``pp_flip_epoch_of`` so that "a holder with no
+    accessor keeps pre-#795 behaviour"; this is that rule applied to the seam
+    shrink, and it is not defensive decoration. The abandon and disarm paths
+    are driven throughout ``unit/managers`` by minimal duck-typed stubs -- a
+    bare object carrying the four or five attributes the path under test
+    touches -- because that is the only way to test an abandon without a live
+    three-rank group.
+
+    A NEW HARD ATTRIBUTE ON AN ABANDON PATH IS THE WORST PLACE TO PUT ONE.
+    That path exists to survive trouble; making it raise AttributeError turns
+    every abandon into a crash the moment a caller is anything other than a
+    fully constructed runtime. Measured, not imagined: the first cut of this
+    change called the method directly and took out 11 tests across
+    test_phase_policy.py and test_pp_presence_withholding_deadlock_800.py,
+    every one of them a pin on "this rank abandons instead of wedging".
+    """
+    fn = getattr(holder, "_release_prearm_quiesce", None)
+    if fn is None:
+        return
+    fn(why)
+
+
+def prearm_quiesce_held(holder) -> bool:
+    """#834 A: is a pre-arm hold up? False on a holder that cannot say.
+
+    Same convention as ``release_prearm_quiesce``. False is the safe answer
+    here in the precise sense that matters: it means the #760 insurance clear
+    still runs, which is the shipped behaviour.
+    """
+    fn = getattr(holder, "_prearm_quiesce_held", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:  # noqa: BLE001 - insurance must not depend on a predicate
+        return False
+
+
+def pay_deferred_grow(holder) -> None:
+    """#834 B: run a booked grow on a holder that may not book any."""
+    fn = getattr(holder, "_pay_deferred_grow", None)
+    if fn is None:
+        return
+    fn()
+
+
+def seam_shrink_grow_debt_rounds() -> int:
+    """#834 B step 4: rounds of patience before an unpaid grow is shouted."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS.get()))
+    except Exception:  # noqa: BLE001 - never break a flip on a patience lookup
+        return 0
+
+
 _DISK_TIER_ARM_WARNED = False
 
 
@@ -1580,6 +1696,63 @@ def build_gdn_flip_guard(scheduler) -> Callable[[str], None]:
             )
 
     return _guard
+
+
+def seam_kv_recover(scheduler, reduce_fn, direction: str) -> None:
+    """#834 B: the recovery, with the expensive half optionally out of the seam.
+
+    ONE CALL SITE SHAPE FOR BOTH LEGS, so the two cannot drift apart. With the
+    gate off this is exactly ``recover_kv_backing(scheduler,
+    reduce_fn=reduce_fn)`` and nothing else -- the shipped path, byte for byte.
+
+    WITH THE GATE ON, the halves are separated along the line the #830 F2
+    design note draws, and the direction each half moves is NOT symmetric:
+
+      * the COLLECTIVE levelling STAYS HERE, inside the no-return window. This
+        is the load-bearing judgement and it is a refusal to be clever. The
+        levelling is what stops one rank exposing an id a peer cannot map --
+        which aborts all three inside ``store_kvcache``'s bounds assert -- and
+        every rank reaches this point exactly once per cutover, unanimously,
+        because the cutover itself is unanimous. Moving it to a rank-local
+        cadence is the 2026-08-08 boots 9/10 PP wedge shape: a blocking
+        reduction entered at a local cadence pairing with a peer blocked in a
+        pipeline recv. It is also CHEAP -- one reduction over three integers
+        and, at most, one non-allocating cap engage -- so moving it would buy
+        almost nothing for that risk.
+      * the RANK-LOCAL grow LEAVES. It is the cuMemCreate/cuMemMap work that
+        #830 F2 measured at 99-101% of the cutover term, it touches no
+        collective anywhere in kv_backing_relief.py, and it is therefore the
+        one half whose timing is free.
+
+    WHAT THE SEAM LEVELS TO WHEN THE GROW HAS LEFT. The pre-grow backing --
+    which is the honest answer, not a degraded one. Every rank enters this
+    cutover with the backing it actually has; levelling that is exactly the
+    invariant the seam needs. The grow that follows adds BACKED rows which stay
+    UNEXPOSED until a later collective raises the level, so at no instant does
+    any rank offer an id the group has not agreed on.
+
+    AND SKIPPING THE RECOVERY IS NOT AN OPTION, which is why the deferral is
+    booked as a DEBT rather than dropped. ``recover_kv_backing_on_abandon``'s
+    docstring records what that costs: the cap never lifts, the pool sits at
+    26.8% of its id space for the life of the process, and a user is served
+    overloaded_error against a pool sized 3.7x larger (#814). The debt is
+    counted, has a deadline, and says so loudly when it is not paid.
+    """
+    from sglang.srt.managers.phase_flip_spill import (
+        level_kv_backing_to_group,
+        recover_kv_backing,
+    )
+
+    runtime = getattr(scheduler, "phase_flip_runtime", None)
+    if not seam_shrink_defer_grow_enabled() or runtime is None:
+        # THE SHIPPED PATH, and the ``runtime is None`` half of that condition
+        # is not defensive noise: without a runtime there is nobody to hold the
+        # debt or to run the deferred grow, and a grow deferred to nobody is
+        # #814's ratchet with extra steps. No runtime, no deferral.
+        recover_kv_backing(scheduler, reduce_fn=reduce_fn)
+        return
+    level = level_kv_backing_to_group(scheduler, reduce_fn)
+    runtime.book_deferred_grow(direction, level)
 
 
 def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], None]:
@@ -2060,9 +2233,10 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             # pool would come back smaller after every tp_to_pp and never
             # climb. The grow is corridor-bounded inside ``recover``, so it
             # cannot breach the law to do it.
-            from sglang.srt.managers.phase_flip_spill import recover_kv_backing
+            # #834 B: routed through ``seam_kv_recover`` below, which is
+            # ``recover_kv_backing`` unchanged with the gate off.
 
-            recover_kv_backing(scheduler, reduce_fn=reduce_fn)
+            seam_kv_recover(scheduler, reduce_fn, direction)
             _mark("kv_recover")
         else:
             # ``stacks.draft_worker``, not ``want_draft``: want_draft is None
@@ -2078,7 +2252,8 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             # it during the TP phase must be handed back. A cap that is never
             # lifted is a permanently smaller pool, which the standing rule
             # forbids; recovering here bounds the reduction to one phase.
-            from sglang.srt.managers.phase_flip_spill import recover_kv_backing
+            # #834 B: routed through ``seam_kv_recover`` below, which is
+            # ``recover_kv_backing`` unchanged with the gate off.
 
             # #656 C22-e: the grow is rank-local by necessity, the ID SPACE it
             # produces may not be. See recover_kv_backing.
@@ -2161,7 +2336,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             # alone would be the "green mock suite" this file already refuses
             # to accept once, seventy lines up.
             # ==============================================================
-            recover_kv_backing(scheduler, reduce_fn=reduce_fn)
+            seam_kv_recover(scheduler, reduce_fn, direction)
             _mark("kv_recover")
 
             # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
@@ -3117,6 +3292,22 @@ class PhaseFlipRuntime:
         #: outgoing phase's backing is scheduled for release, so a copy
         #: enqueued now races the release whatever phase it names.
         self.hicache_seam_active = False
+        #: #834 A: the direction whose ARM raised the guard above, or None.
+        #: Non-None means the device tier is held down deliberately across the
+        #: armed window rather than momentarily across the seam.
+        self._prearm_hold_direction = None
+        #: The drain that hold measured, in ms, and the consecutive count of
+        #: arms refused because it was over budget.
+        self._prearm_drain_ms = None
+        self._prearm_drain_defers = 0
+        #: #834 B: rows this rank grew locally that the group has NOT levelled
+        #: to yet, and the round at which that debt was taken on. The rows are
+        #: BACKED but must not be EXPOSED until a collective agrees -- see
+        #: ``_deferred_grow_debt_check``.
+        self._deferred_grow_rows = 0
+        self._deferred_grow_round = None
+        self._deferred_grow_level = None
+        self._deferred_grow_pending = False
         # #760: hand the guard THIS object as its phase authority. The
         # routing global (parallel_state) toggles INSIDE the cutover, one
         # step among many, so it cannot express the seam; this runtime's
@@ -3725,6 +3916,41 @@ class PhaseFlipRuntime:
         # its verdict across the group. Ignoring the return value here is what
         # makes that structural rather than a promise in a docstring.
         self._prearm_floor_relief(direction)
+        # #834 A: QUIESCE THE DEVICE TIER HERE, WHERE THE PIPELINE STILL RUNS.
+        #
+        # Deliberately the LAST thing before ``_pending`` is set, and after the
+        # floor relief: everything above this line can still refuse cheaply,
+        # and refusing after having disarmed the device tier means disarming it
+        # for nothing. Below this line the arm is going through, so the hold is
+        # the beginning of the flip rather than a speculative pause.
+        #
+        # UNLIKE ``_prearm_floor_relief`` DIRECTLY ABOVE, THIS VERDICT IS NOT
+        # DISCARDED, and the asymmetry is the point. The floor relief's verdict
+        # is thrown away because it is a RANK-LOCAL AFFORDABILITY judgement and
+        # a rank-local refusal splits the arm -- one rank armed, its peers not,
+        # the armed one parked at the entry for ever. This verdict is different
+        # in kind: it refuses BEFORE anything is pending, so a rank that refuses
+        # here is in exactly the state it was in before the call, which is the
+        # same state a rank whose guards refused at the top of this method is
+        # in. Nothing is armed, no collective is reached, and the ranks cannot
+        # disagree about whether this attempt happened -- the #485 argument for
+        # declining here rather than in ``_execute``, applied unchanged.
+        prearm_ok, prearm_drain_ms, prearm_detail = self._prearm_quiesce(direction)
+        if not prearm_ok:
+            logger.warning("%s [#834] %s", LOG_PREFIX, prearm_detail)
+            return False, prearm_detail
+        if seam_shrink_prearm_quiesce_enabled():
+            self._prearm_drain_defers = 0
+            logger.warning(
+                "%s [#834] PREARM DRAIN %s: device-tier streams quiesced in "
+                "%.1f ms BEFORE arming, with the pipeline still serving. The "
+                "seam's own quiesce still runs at the no-return point and is "
+                "now a confirmation rather than a wait. %s",
+                LOG_PREFIX,
+                direction,
+                prearm_drain_ms,
+                prearm_detail,
+            )
         self._pending = direction
         # A fresh arm starts a fresh round sequence. The epoch already
         # distinguishes this arm from any earlier one, so the round
@@ -3829,6 +4055,11 @@ class PhaseFlipRuntime:
         # applied to the variable it was actually true of.
         if not require_armed_and_parked:
             self._round += 1
+        # #834 B: PAY THE DEFERRED GROW HERE, and pay the debt guard's
+        # attention with it. Rank-local work only -- no collective is reached
+        # on this path, which is what makes a local cadence legal for it and
+        # illegal for the levelling it was split from.
+        pay_deferred_grow(self)
         ready = 1 if (armed and self._ready_fn()) else 0
         expired = 1 if self._park_expired(armed, ready) else 0
         # #631 QUIESCENT-ANNOUNCE. An armed rank that is NOT yet quiescent
@@ -4051,7 +4282,18 @@ class PhaseFlipRuntime:
             # guard reporting a seam forever -- that would silently kill the
             # device tier for the life of the process, the #742 inert-state
             # class. On the ordinary path the cutover already cleared it.
-            self.hicache_seam_active = False
+            #
+            # #834 A: EXCEPT WHILE A PRE-ARM HOLD IS DELIBERATELY DOWN. This
+            # `finally` runs after EVERY `_execute`, and the great majority
+            # return without flipping because the group is not yet quiescent --
+            # so an unconditional clear here drops a pre-arm guard on the very
+            # next round and leaves its drain covering nothing. The insurance
+            # is not weakened: the hold is only honoured while `_pending` is
+            # set (`_prearm_quiesce_held`), which the park deadline already
+            # bounds and which every abandon path clears, so a raise in the
+            # seam still ends with the guard down.
+            if not prearm_quiesce_held(self):
+                self.hicache_seam_active = False
 
     def _reconcile_trees_if_diverged(self, direction: str) -> None:
         """#825: repair the prefix trees before the TP phase demands identity.
@@ -4228,6 +4470,366 @@ class PhaseFlipRuntime:
                 e,
             )
             return 0.0
+
+    def _prearm_quiesce(self, direction: str) -> Tuple[bool, float, str]:
+        """#834 A: disarm the device tier and drain it BEFORE the flip arms.
+
+        ANALYSE_830 F1 filed the shape and named both candidates: "quiesce
+        BEFORE arming (so the wait happens while the pipeline still runs), or
+        refuse to arm while device-tier I/O is in flight instead of arming and
+        then waiting". This does the first and uses the second as its ceiling,
+        because the two are the same measurement read twice.
+
+        WHY THIS IS A LATENCY MOVE AND NOT A CORRECTNESS CHANGE. The seam's
+        drain closes a real race: a HiCache copy enqueued before the seam rides
+        the controller's private streams, outlives its Python call, and lands
+        in pool memory the seam has already released (two SIGSEGVs, 2026-08-19,
+        each three seconds after a cutover). Closing it requires two things to
+        hold together -- no NEW device-tier I/O, and no OLD device-tier I/O
+        still in flight -- and today BOTH are established at the no-return
+        point, with the requests parked and the ring mid-rebuild. Nothing about
+        the race requires that timing. Establishing the same two conditions at
+        ARM time closes the same race, and the waiting happens while the
+        pipeline is still serving instead of while it is stopped.
+
+        THE ORDER IS THE WHOLE THING, and it is the same order the seam uses:
+        raise the guard FIRST, then drain. Raised second, the drain would race
+        exactly the admissions it was supposed to cover -- ``quiesce_device_io``
+        only waits for what is already enqueued, it does not stop enqueueing
+        (cache_controller.py, ``stream.synchronize()`` per stream). So the
+        guard goes up, and it STAYS up across the armed window; see
+        ``_prearm_quiesce_held``.
+
+        THE COST IS NAMED. Between this call and the cutover the device tier is
+        disarmed, so HiCache device-tier writes do not happen in that span. That
+        span is bounded by the park deadline the arm itself sets, and every path
+        that clears ``_pending`` drops the hold. It is a real capability pause,
+        not a free win, and it is why this is behind a flag.
+
+        Returns ``(allow, drain_ms, detail)``. ``allow`` is False only when the
+        drain this arm just measured is over the #830 F4 budget -- the refusal
+        ANALYSE_830 F1 asked for, now resting on a number measured moments ago
+        rather than on the previous flip's.
+        """
+        if not seam_shrink_prearm_quiesce_enabled():
+            return True, 0.0, "prearm quiesce off"
+        # THE GUARD BEFORE THE DRAIN. Same ordering law as the seam's own, and
+        # the same reason: the drain finishes OLD I/O, the guard refuses NEW.
+        self.hicache_seam_active = True
+        self._prearm_hold_direction = direction
+        drain_ms = self._quiesce_hicache(f"{direction} (prearm)")
+        self._prearm_drain_ms = drain_ms
+        # THE BUDGET'S PROJECTION GETS BETTER HERE, and that is a side effect
+        # worth stating. #830 F4 projects the seam window from the LAST flip's
+        # drain because "the drain's duration is a property of the backlog on
+        # the controller's private streams, which nothing at arm time can
+        # enumerate". With the drain pulled forward, arm time CAN enumerate it:
+        # it just did. So the seam-budget consumer in ``_execute`` reads a
+        # number from this arm rather than from the previous flip, and F4's own
+        # stated limitation -- "cannot catch a one-off spike, only a standing
+        # condition" -- is narrowed rather than argued away.
+        self._seam_drain_ms = drain_ms
+        allow, escalated, detail = flip_seam_budget_verdict(
+            drain_ms, int(getattr(self, "_prearm_drain_defers", 0))
+        )
+        if allow:
+            if escalated:
+                self._prearm_drain_defers = 0
+                logger.warning(
+                    "%s [#834] prearm drain ESCALATED %s: %s",
+                    LOG_PREFIX,
+                    direction,
+                    detail,
+                )
+            return True, drain_ms, detail
+        # REFUSED, AND THE HOLD IS RELEASED WITH IT. A refused arm leaves
+        # nothing pending, so nothing would ever clear a guard left up here --
+        # that is the #742 inert-state class, a capability silently dead for
+        # the life of the process.
+        self._prearm_drain_defers = int(getattr(self, "_prearm_drain_defers", 0)) + 1
+        self._release_prearm_quiesce("arm refused on the drain it measured")
+        return (
+            False,
+            drain_ms,
+            (
+                f"{PREARM_DRAIN_REFUSED}: {detail} The drain was measured AT "
+                f"THIS ARM, not projected from the last flip, and the device "
+                f"tier has been re-armed -- nothing is pending, so nothing is "
+                f"holding it down."
+            ),
+        )
+
+    def _prearm_quiesce_held(self) -> bool:
+        """#834 A: is a pre-arm disarm currently holding the device tier down?
+
+        Read by ``on_round``'s insurance ``finally``, which unconditionally
+        clears ``hicache_seam_active`` after EVERY ``_execute`` -- including
+        the great majority that return without flipping, because the group is
+        not yet quiescent. That clear is correct insurance for a seam and fatal
+        for a pre-arm hold: it would drop the guard on the very next round and
+        leave the drain covering nothing.
+        """
+        if getattr(self, "_prearm_hold_direction", None) is None:
+            return False
+        # BOUND BY THE ARM, NOT BY A TIMER OF ITS OWN. The hold lives exactly
+        # as long as something is pending; the park deadline already bounds
+        # that, and every path that abandons or completes a flip clears
+        # ``_pending``. A second independent deadline here would be a third
+        # damper on one decision, which #662 measured the cost of.
+        return self._pending is not None
+
+    def _release_prearm_quiesce(self, why: str) -> None:
+        """#834 A: drop the pre-arm hold and re-arm the device tier."""
+        if getattr(self, "_prearm_hold_direction", None) is None:
+            return
+        self._prearm_hold_direction = None
+        self.hicache_seam_active = False
+        logger.info(
+            "%s [#834] prearm device-tier hold released (%s)", LOG_PREFIX, why
+        )
+
+    # -- #834 B: the deferred KV grow ---------------------------------------
+
+    def book_deferred_grow(self, direction: str, level) -> None:
+        """Record that the seam levelled but did NOT grow (#834 B step 2).
+
+        Called from ``seam_kv_recover`` with the level the group just agreed
+        on, or None when no level could be agreed (the #792 decline). The
+        agreed level is the ceiling the grow that follows must clamp itself
+        back to; without one there is no ceiling, and a grow with no ceiling is
+        the id-space divergence this whole split exists to prevent -- so the
+        grow is booked either way and refuses to expose either way.
+        """
+        self._deferred_grow_pending = True
+        self._deferred_grow_level = None if level is None else int(level)
+        self._deferred_grow_round = int(getattr(self, "_round", 0))
+        logger.warning(
+            "%s [#834] GROW DEFERRED %s: the collective levelling ran inside "
+            "the seam and agreed level=%s; the rank-local grow "
+            "(cuMemCreate/cuMemMap, ~99%% of the cutover term per #830 F2) is "
+            "booked for the next round, OUTSIDE the no-return window. It will "
+            "back rows without exposing them until a later collective raises "
+            "the level.",
+            LOG_PREFIX,
+            direction,
+            self._deferred_grow_level,
+        )
+
+    def _grow_relief(self):
+        """The relief object, or None. Reached through the census scheduler,
+        the same handle the drain and the census use."""
+        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:
+            return None
+        return getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+
+    def _pay_deferred_grow(self) -> None:
+        """Run the booked rank-local grow, then CLAMP (#834 B steps 2 and 4).
+
+        ORDER IS THE INVARIANT. ``relief.recover()`` ends in
+        ``clamp_exposure_to_backing``, which raises this rank's exposure to its
+        OWN new backing -- correct when the levelling follows immediately, and
+        exactly the hazard when it does not. So the clamp back to the group's
+        agreed level is not a tidy-up after the grow, it is the second half of
+        it, and the two are never separated by a return.
+
+        NOT WHILE A FLIP IS PENDING. The seam prices its own affordability at
+        the gate, and a grow landing between that pricing and the seam would
+        spend memory the gate has already promised to the staging fund. There
+        is no urgency that justifies it: the debt has a deadline measured in
+        rounds, and an armed flip resolves in far fewer.
+
+        NEVER RAISES. This runs on the ordinary round path with requests live;
+        a raise here would take the instance down for a capacity repair.
+        """
+        if not getattr(self, "_deferred_grow_pending", False):
+            self._deferred_grow_debt_check()
+            return
+        if self._pending is not None:
+            return
+        relief = self._grow_relief()
+        if relief is None:
+            # Nothing to grow against. Clear the booking rather than carry a
+            # debt nobody can pay -- an unpayable debt is a permanent alarm,
+            # which is how a real one gets ignored.
+            self._deferred_grow_pending = False
+            return
+        level = getattr(self, "_deferred_grow_level", None)
+        try:
+            from sglang.srt.managers.phase_flip_spill import (
+                clamp_kv_exposure_to_level,
+                grow_kv_backing_local,
+            )
+
+            scheduler = self._census_scheduler
+            grown = int(grow_kv_backing_local(scheduler))
+            if level is None:
+                # NO AGREED LEVEL MEANS NO EXPOSURE, and this branch is the
+                # #792 decline arriving here rather than being ignored. The
+                # rows are backed and stay invisible until a collective can
+                # say how far the group can see. That costs capacity and
+                # costs no correctness, which is the right way round.
+                clamped = 0
+            else:
+                clamped = int(clamp_kv_exposure_to_level(scheduler, level))
+        except Exception as e:  # noqa: BLE001 - a grow must not kill a round
+            logger.error(
+                "%s [#834] deferred KV grow failed (%s). The pool keeps the "
+                "level the seam agreed, so this is a capacity loss and not an "
+                "id-space divergence -- the next recovery retries it",
+                LOG_PREFIX,
+                e,
+            )
+            self._deferred_grow_pending = False
+            return
+        self._deferred_grow_pending = False
+        self._deferred_grow_rows = self._unlevelled_rows(relief, level)
+        if grown or self._deferred_grow_rows:
+            logger.warning(
+                "%s [#834] GROW PAID at round %d: %d row(s) backed "
+                "rank-locally OUTSIDE the no-return window, exposure held at "
+                "the group's agreed level=%s (%+d rows moved). %d row(s) are "
+                "backed but not yet exposed and stay that way until a "
+                "collective levels the group up to them.",
+                LOG_PREFIX,
+                int(getattr(self, "_round", 0)),
+                grown,
+                level,
+                clamped,
+                self._deferred_grow_rows,
+            )
+        self._deferred_grow_debt_check()
+
+    @staticmethod
+    def _unlevelled_rows(relief, level) -> int:
+        """Rows this rank has BACKED but may not EXPOSE, or 0 if unknowable."""
+        try:
+            backed = int(relief.backed_rows())
+        except Exception:  # noqa: BLE001 - a debt reading must not break a round
+            return 0
+        if level is None:
+            # Backed with no agreed level at all: every grown row is unexposed.
+            # Reported as the full backing rather than 0, because 0 here would
+            # read as "no debt" for the state with the LARGEST debt.
+            return max(0, backed)
+        return max(0, backed - int(level))
+
+    def _deferred_grow_debt_check(self) -> None:
+        """#834 B step 4: an unpaid grow debt is #814's ratchet. Say so.
+
+        THE DESIGN NOTE'S FOURTH STEP, verbatim: "Guard the ratchet explicitly:
+        a deferred grow that has not drained after N rounds is a loud error
+        naming #814's trap, the way the abort window's 'drain missed' check
+        does."
+
+        WHAT IT DOES NOT DO IS SELF-HEAL. The tempting repair -- expose the
+        rows once the wait gets embarrassing -- is precisely the abort this
+        design exists to prevent: an id one rank exposes and a peer cannot map
+        aborts all three inside ``store_kvcache``'s bounds assert. So the guard
+        is an alarm and never an actuator. It shouts, repeatedly and at ERROR,
+        with the numbers a reader needs to act, and it leaves the id space
+        alone.
+        """
+        rows = int(getattr(self, "_deferred_grow_rows", 0) or 0)
+        if rows <= 0:
+            self._deferred_grow_round = None
+            return
+        relief = self._grow_relief()
+        level = getattr(self, "_deferred_grow_level", None)
+        # RE-READ, never trust the booking. A later collective may already have
+        # levelled the group up to these rows, in which case the debt is paid
+        # and there is nothing to shout about. Reading it fresh is what stops
+        # this guard becoming a latched alarm for a condition that has gone.
+        if relief is not None:
+            rows = self._unlevelled_rows(relief, level)
+            self._deferred_grow_rows = rows
+        if rows <= 0:
+            self._deferred_grow_round = None
+            return
+        since = getattr(self, "_deferred_grow_round", None)
+        patience = seam_shrink_grow_debt_rounds()
+        if since is None or patience <= 0:
+            return
+        waited = int(getattr(self, "_round", 0)) - int(since)
+        if waited < patience:
+            return
+        logger.error(
+            "%s [#834] %s: %d row(s) have been BACKED but not EXPOSED for %d "
+            "rounds (agreed level=%s). This is #814's ratchet in a new shape "
+            "-- the memory is spent and the pool is not getting it, so "
+            "admission is capped against capacity that physically exists. The "
+            "levelling that would release it runs on the seam's collective "
+            "cadence; if no flip is arming, none will. NOT SELF-HEALED ON "
+            "PURPOSE: exposing unlevelled ids is what aborts all three ranks "
+            "inside store_kvcache's bounds assert.",
+            LOG_PREFIX,
+            GROW_DEBT_UNPAID,
+            rows,
+            waited,
+            level,
+        )
+        # Re-base so the alarm repeats on a cadence instead of once, and so a
+        # reader can tell a standing debt from one that keeps recurring.
+        self._deferred_grow_round = int(getattr(self, "_round", 0))
+
+    def _unlevelled_exposure_refusal(self) -> Optional[str]:
+        """#834 B: is this rank exposing ids the group has not levelled to?
+
+        Returns a named refusal detail, or None when the exposure is within
+        the agreed level (which includes every configuration where the gate is
+        off, because nothing books a debt there).
+
+        READ FROM THE ALLOCATOR, NOT FROM THE BOOKING. The booking says what
+        this runtime intended; the allocator says what the pool will actually
+        hand out, and only the second one can abort a peer. An indicator that
+        reports the intention would pass cleanly through the exact bug it
+        exists to catch.
+
+        AN UNREADABLE EXPOSURE IS NOT A REFUSAL. If the relief object cannot
+        answer, this returns None and the flip proceeds: a refusal is the thing
+        with a service cost, so it must never rest on a number we do not have
+        (#721's rule, applied here unchanged).
+        """
+        if not seam_shrink_defer_grow_enabled():
+            return None
+        level = getattr(self, "_deferred_grow_level", None)
+        relief = self._grow_relief()
+        if relief is None:
+            return None
+        pending = bool(getattr(self, "_deferred_grow_pending", False))
+        debt = int(getattr(self, "_deferred_grow_rows", 0) or 0)
+        if not pending and debt <= 0:
+            return None
+        try:
+            exposed = int(relief.exposed_rows())
+        except Exception:  # noqa: BLE001 - an unknown must not refuse a flip
+            return None
+        if level is None:
+            # A grow booked with NO agreed level. There is no number the
+            # exposure may legally sit at, so any exposure at all against an
+            # outstanding grow is the divergence.
+            if debt <= 0 and not pending:
+                return None
+            return (
+                f"{UNLEVELLED_EXPOSURE_REFUSED}: a deferred KV grow is "
+                f"outstanding and the group agreed NO level to expose it at "
+                f"(the #792 decline). This rank exposes {exposed} row(s). "
+                f"Entering the seam would risk handing out an id a peer "
+                f"cannot map, which aborts all three inside store_kvcache's "
+                f"bounds assert -- so the flip is refused instead, which "
+                f"loses a flip and no ranks."
+            )
+        if exposed <= int(level):
+            return None
+        return (
+            f"{UNLEVELLED_EXPOSURE_REFUSED}: this rank exposes {exposed} "
+            f"row(s) against a group-agreed level of {int(level)}, with "
+            f"{debt} row(s) of deferred grow still unlevelled. An id one rank "
+            f"exposes and a peer cannot map aborts ALL THREE inside "
+            f"store_kvcache's bounds assert; the flip is refused instead."
+        )
 
     def _pool_census(self, when: str, direction: str) -> None:
         """#631 defect J: the allocator's own view, straddling the cutover.
@@ -5278,6 +5880,11 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        # #834 A: nothing is pending any more, so nothing may keep the
+        # device tier disarmed. Released HERE rather than left to the
+        # round hook's insurance so the tier comes back in the same
+        # step the flip ends in, not one round later.
+        release_prearm_quiesce(self, "nothing pending")
         self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.presence_timeouts += 1
@@ -5395,6 +6002,11 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        # #834 A: nothing is pending any more, so nothing may keep the
+        # device tier disarmed. Released HERE rather than left to the
+        # round hook's insurance so the tier comes back in the same
+        # step the flip ends in, not one round later.
+        release_prearm_quiesce(self, "nothing pending")
         self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.join_deadline_aborts += 1
@@ -5428,6 +6040,11 @@ class PhaseFlipRuntime:
         direction = self._pending
         self._pending = None
         self._armed_at = None
+        # #834 A: nothing is pending any more, so nothing may keep the
+        # device tier disarmed. Released HERE rather than left to the
+        # round hook's insurance so the tier comes back in the same
+        # step the flip ends in, not one round later.
+        release_prearm_quiesce(self, "nothing pending")
         self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._last_hold_reason = None
         self.park_deadline_aborts += 1
@@ -8393,6 +9010,28 @@ class PhaseFlipRuntime:
                 exc,
             )
 
+        # #834 B: AN UNLEVELLED EXPOSURE REFUSES THE FLIP BY NAME.
+        #
+        # THE HAZARD THIS IS THE ACTUATOR FOR. A deferred grow backs rows that
+        # the group has not levelled to. If anything ever exposes them anyway
+        # -- a bug here, a peer on a tree without this split, a levelling that
+        # DECLINED under #792 and left no ceiling -- then this rank will hand
+        # out an id a peer cannot map, and the result is not a slow flip: it is
+        # all three ranks dying inside ``store_kvcache``'s bounds assert.
+        #
+        # SO IT REFUSES, AND REFUSING IS THE POINT. The alternative shapes are
+        # both worse and both have been paid for in this tree: exposing anyway
+        # is the three-rank abort, and blocking until the group agrees is a
+        # collective entered at a local cadence, which is the boots 9/10 wedge.
+        # A refused flip is a lost flip and nothing more -- the same trade
+        # ``collective_cap_target`` and the #792 decline already make -- and it
+        # votes through ``too_small`` so the whole GROUP declines together
+        # rather than this rank declining alone.
+        refusal = self._unlevelled_exposure_refusal()
+        if refusal is not None:
+            logger.error("%s [#834] %s", LOG_PREFIX, refusal)
+            too_small.append(refusal)
+
         # #830 F4: THE SEAM WINDOW GETS A NAMED CEILING.
         #
         # Placed beside #721's host-RAM guard because it is the same kind of
@@ -8540,6 +9179,11 @@ class PhaseFlipRuntime:
             )
             self._pending = None
             self._armed_at = None
+            # #834 A: nothing is pending any more, so nothing may keep the
+            # device tier disarmed. Released HERE rather than left to the
+            # round hook's insurance so the tier comes back in the same
+            # step the flip ends in, not one round later.
+            release_prearm_quiesce(self, "nothing pending")
             self._parked_extent = None  # #746: cleared on EVERY exit
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
@@ -9041,6 +9685,11 @@ class PhaseFlipRuntime:
         self.hicache_seam_active = False
         self._pending = None
         self._armed_at = None
+        # #834 A: nothing is pending any more, so nothing may keep the
+        # device tier disarmed. Released HERE rather than left to the
+        # round hook's insurance so the tier comes back in the same
+        # step the flip ends in, not one round later.
+        release_prearm_quiesce(self, "nothing pending")
         # #746: the commit is an exit too -- the packed rows are moved, the
         # extent has no referent, and a surviving snapshot would pin the
         # rung into the next phase for ever (the M5 failure mode).
