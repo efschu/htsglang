@@ -206,6 +206,18 @@ class HiRadixCache(RadixCache):
         # served, so every rank enters the capacity reduce from the same point.
         self._symmetrize_prefetch_capacity()
 
+        # #810: bound the write-through consumer of a STAGING host tier. Built
+        # AFTER `_symmetrize_prefetch_capacity` above, so the capacity is the
+        # complement of the group-agreed prefetch reservation rather than of a
+        # rank-local one -- a rank-dependent admission bound on this path is
+        # exactly the #645 defect. None under `--hicache-host-role retention`,
+        # which is the default and leaves this path unchanged.
+        from sglang.srt.mem_cache.staging_write_ring import build_staging_write_ring
+
+        self.staging_write_ring = build_staging_write_ring(
+            server_args, self.cache_controller
+        )
+
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
@@ -709,6 +721,11 @@ class HiRadixCache(RadixCache):
                     logger.exception(
                         "Failed to release host protection for backup op %s", ack_id
                     )
+                # #810: the page leaves the drain here, so its ring charge does
+                # too. A forced release that skipped this would shrink the ring
+                # for the rest of the process's life.
+                if self.staging_write_ring is not None:
+                    self.staging_write_ring.release(ack_id)
                 self.ongoing_backup.pop(ack_id, None)
         except Exception:
             logger.exception("Force release pending backup ops failed.")
@@ -761,6 +778,13 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
+                # #810: the storage write acked -- this is the drain the
+                # staging ring measures its residency against. Outside the
+                # `entry is not None` arm on purpose: the charge is keyed by
+                # the operation, so it is retired whenever the operation
+                # retires, whether or not the node survived to be found.
+                if self.staging_write_ring is not None:
+                    self.staging_write_ring.release(ack_id)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -1030,6 +1054,17 @@ class HiRadixCache(RadixCache):
             if host_avail < len(node.value):
                 return 0
 
+        # #810: the STAGING bound, taken BEFORE the allocation rather than
+        # after it fails. Under `--hicache-host-role staging` the tier is a
+        # drain buffer, so the undrained write-through set must leave room for
+        # the read consumer; a refusal here costs one un-backed-up node, the
+        # same thing an exhausted tier costs today, but it is COUNTED and it
+        # never reaches the rank-local `evict_host` below. `None` under the
+        # default role skips the whole gate.
+        ring = self.staging_write_ring
+        if ring is not None and not ring.admit(node.id, len(node.value)):
+            return 0
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -1068,6 +1103,8 @@ class HiRadixCache(RadixCache):
                         "radix replicas. Logged once per published floor.",
                         len(node.value),
                     )
+                if ring is not None:
+                    ring.abort(node.id)
                 return 0
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
@@ -1087,6 +1124,10 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            # #810: the write failed after the ring admitted it, so the page
+            # never reaches the drain and its admission must not stay charged.
+            if ring is not None:
+                ring.abort(node.id)
             return 0
 
         return len(host_indices)
@@ -1130,6 +1171,15 @@ class HiRadixCache(RadixCache):
                 node.write_through_pending_id = None
             # DMA confirmed -- block is now on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
+        # #810: end of the ADMITTED phase. The device->host copy has landed, so
+        # the admission taken in `write_backup` is retired here -- before the
+        # storage hand-off below, which takes its own charge keyed by the
+        # storage operation id. Releasing first keeps the two phases from
+        # double-counting the same page, and retiring the node-keyed charge at
+        # exactly one site keeps a node SPLIT (one ack fanning out into several
+        # storage backups) from stranding it.
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.release(ack_id)
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
@@ -1161,6 +1211,13 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        # #810: the DRAIN phase begins here. `protect_host` keeps these tokens
+        # resident until the backup acks, so they are the bytes a staging tier
+        # is sized from; the charge cannot be refused (the page is already on
+        # the host) but it must be counted, or the next admission decides
+        # against an occupancy that hides the whole drain queue.
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.occupy(operation_id, len(host_value))
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""

@@ -8679,6 +8679,90 @@ class ServerArgs:
                 "host tier would not relocate the cache -- it would discard "
                 "it, turning a capacity change into a hit-rate collapse."
             )
+        self._post_hicache_staging_host_ledger()
+
+    def _post_hicache_staging_host_ledger(self):
+        """#810: put the staging tier on the boot preflight's host ledger.
+
+        WHAT THE PREFLIGHT COULD NOT SEE. The launcher-side joint host check
+        exists (#550/#729) but it is reached only inside the
+        `--enable-kv-session-offload` x hierarchical-cache branch, and only
+        when the spill pool is non-zero. A boot without kv-session-offload
+        prices NO host tier at parse time at all -- and the default sizing is
+        `--hicache-ratio`, which `hicache_configured_host_bytes` correctly
+        refuses to price before the device pool exists. So the largest pinned
+        host consumer on this rig (22.01 GB across three PP ranks on the
+        standing boot) reached the preflight as nothing.
+
+        Under `staging` both obstacles are gone: `--hicache-size` is mandatory
+        and absolute, so the number is exact at parse time. Declaring it here
+        is what turns a smaller tier into VISIBLE headroom rather than into a
+        number nobody sums.
+
+        MULTIPLIED BY THE RANKS, deliberately. `--hicache-size` sizes ONE
+        rank's tier and every scheduler process allocates its own
+        (`sync_fixed_hicache_size` syncs the token COUNT to the group minimum
+        and each rank still allocates its own per-rank buffer for that count).
+        The joint check is about this machine's RAM, which all the ranks
+        share, so the group product is the honest demand. NOTE for the next
+        reader: the pre-existing check in the kv-session-offload branch passes
+        a SINGLE tier's bytes and therefore under-counts a multi-rank boot.
+        That is not corrected here -- it would change what a retention boot
+        accepts, and this role's contract is that retention stays
+        byte-identical.
+
+        PRICED, NOT REGISTERED. `joint_pinned_host_error` is a pure function.
+        The runtime registry in `pinned_host_budget` is PROCESS-LOCAL and the
+        pools are allocated in the worker processes, where `HostKVCache`
+        registers them already; a `register_pinned_post` here would create a
+        post in the launcher for bytes the launcher never pins.
+        """
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            PinnedHostPost,
+            hicache_configured_host_bytes,
+            joint_pinned_host_error,
+            pinned_host_memory_bytes,
+        )
+
+        per_rank_bytes = hicache_configured_host_bytes(self.hicache_size, 0)
+        if per_rank_bytes is None:
+            return
+        ranks = max(1, int(self.tp_size or 1)) * max(1, int(self.pp_size or 1))
+        posts = [
+            PinnedHostPost(
+                name=f"HiCache staging host tier x{ranks} rank(s)",
+                flag="--hicache-size (--hicache-host-role staging)",
+                nbytes=per_rank_bytes * ranks,
+            )
+        ]
+        kvso_bytes = int((self.kv_session_offload_host_ram_gib or 0) * (1024**3))
+        if kvso_bytes > 0:
+            posts.append(
+                PinnedHostPost(
+                    name="kv-session-offload spill pool",
+                    flag="--kv-session-offload-host-ram-gib",
+                    nbytes=kvso_bytes,
+                )
+            )
+        total_bytes, available_bytes = pinned_host_memory_bytes()
+        err = joint_pinned_host_error(posts, total_bytes, available_bytes)
+        if err is not None:
+            raise ValueError(err)
+        # The ledger entry itself. Without a line the operator can read, a
+        # tier that got smaller is invisible in exactly the same way it was
+        # when it was large.
+        logger.info(
+            "#810 host ledger: staging tier %.2f GB x %d rank(s) = %.2f GB "
+            "pinned host RAM (%s).",
+            per_rank_bytes / 1e9,
+            ranks,
+            per_rank_bytes * ranks / 1e9,
+            (
+                f"{int(available_bytes) / 1e9:.2f} GB available"
+                if available_bytes is not None
+                else "host availability unknown, unguarded"
+            ),
+        )
 
     def _handle_session_checkpoints(self):
         """#410: fail fast on an unusable session-checkpoint configuration.

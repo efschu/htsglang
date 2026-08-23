@@ -42,6 +42,24 @@ fallback -- which is a runtime mechanism and not a size. :func:`sustainable`
 answers the question so the caller can refuse rather than emit a number that
 cannot be correct; it does not invent a size for the unsustainable case.
 
+IT ALSO DOES NOT ASK WHETHER THE TIER FITS THIS MACHINE, and that is a
+correction rather than an omission. An earlier `fits_pinned_host_budget()`
+here called `check_and_register_pinned_post`, i.e. it REGISTERED a post in the
+planner process. The #729 registry exists to make the SECOND allocation in a
+process see the first, and it credits earlier posts back against live
+availability on the stated precondition that their bytes are already resident
+(`pinned_host_budget.py`, "the already-allocated posts must be credited
+back"). A planner allocates nothing, so that post is exactly what the same
+comment names as "the real hazard": registered and never allocated, therefore
+credited back without ever having been resident, charging the next admission
+too little. The machine-fit question is answered instead where the tier meets
+a machine, in `ServerArgs._post_hicache_staging_host_ledger`, which PRICES the
+posts through `joint_pinned_host_error` without registering any -- and prices
+the group product, since every rank allocates its own tier and a per-rank
+figure checked against machine-wide RAM under-counts by the rank factor. A
+planner-side pre-check, if one is ever wanted, must be pure and rank-aware for
+the same two reasons.
+
 This distinction matters because #720's `ReadBufferPool` made the opposite
 choice for READS on purpose: on exhaustion it allocates a fresh uncounted
 buffer rather than blocking, trading "a bounded spike for an unbounded
@@ -53,7 +71,6 @@ failure the budget exists to prevent.
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 #: Burst margin over the steady-state in-flight bytes. Write-through arrives
 #: in bursts (a prefill completing publishes many pages at once) while the
@@ -178,28 +195,3 @@ def describe_staging_size(
         f"{read_b / BYTES_PER_GB:.2f} GB = {max_concurrent_prefetch} "
         f"concurrent prefetch x {page_bytes} B/page; bound by {bound})"
     )
-
-
-def fits_pinned_host_budget(
-    size_gb: int,
-    name: str = "HiCache staging host tier",
-    flag: str = "--hicache-size (--hicache-host-role staging)",
-) -> Optional[str]:
-    """Ask the #729 authority whether this tier may be pinned.
-
-    Returns None when it fits, or the refusal text when it does not. This
-    REGISTERS the post, exactly as every other pinned producer does -- the
-    budget sums posts and never caps, so a tier that does not fit has to be
-    refused where it is derived rather than discovered at allocation time.
-    """
-    from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
-
-    try:
-        check_and_register_pinned_post(
-            name=name,
-            flag=flag,
-            requested_bytes=int(size_gb * BYTES_PER_GB),
-        )
-    except ValueError as exc:
-        return str(exc)
-    return None
