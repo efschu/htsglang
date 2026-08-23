@@ -537,6 +537,7 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     loud; see #624 for why this harness class keeps earning one.
     """
     from sglang.srt.managers.schedule_policy import PrefillAdder
+    from sglang.srt.planner.chunked_admission import ChunkedCommitmentLedger
 
     adder = PrefillAdder.__new__(PrefillAdder)
     adder.prefill_spill_deep_taken = False
@@ -553,6 +554,24 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     #: the predicate raised AttributeError on both ranks -- the same drift
     #: shape, this time introduced by the fix rather than by a reduce.
     adder.fundable_extend_floor = None
+    #: #815: the same drift shape a third time, from 97ceea2f19 [#701], which
+    #: gave ``rem_total_tokens`` a cross-pass reservation term. The guard test
+    #: below caught it and named both fields; this is that guard being obeyed.
+    #:
+    #: `True` is the production default and the documented one ("DEFAULT ON: a
+    #: wedge is strictly worse than a refusal"); nothing in the tree overrides
+    #: it except the dedicated A/B in test_chunked_commitment_701.py.
+    adder.chunked_admission_enabled = True
+    #: A REAL, EMPTY LEDGER RATHER THAN None, and the difference is not
+    #: cosmetic. `None` is the __init__ default, so it is the convenient value
+    #: -- but no real Scheduler ever passes it: `chunked_commitment_ledger` is a
+    #: lazy property that always constructs one, and the adder is always built
+    #: with `commitment_ledger=self.chunked_commitment_ledger`. The two happen
+    #: to agree numerically here only because `effective_rem_total_tokens`
+    #: special-cases `ledger is None` into the same no-op an empty ledger gives.
+    #: Modelling the object the system really hands over keeps this stub honest
+    #: if that special case is ever removed.
+    adder.commitment_ledger = ChunkedCommitmentLedger()
     adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
     adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
     adder.dcp_avail_deficit = deficit

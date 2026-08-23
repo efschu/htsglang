@@ -218,9 +218,7 @@ class TestTheMatchSeamAnchorRule(CustomTestCase):
         exactly the presence test both walks used before #747."""
         for depth in (0, 1, 7, CADENCE - 1):
             with self.subTest(depth=depth):
-                self.assertTrue(
-                    is_resume_candidate(depth, None, has_device_value=True)
-                )
+                self.assertTrue(is_resume_candidate(depth, None, has_device_value=True))
                 self.assertFalse(
                     is_resume_candidate(depth, None, has_device_value=False)
                 )
@@ -266,6 +264,16 @@ class TestUnifiedValidatorBehaviour(CustomTestCase):
 
         comp = object.__new__(MambaComponent)
         comp.mamba_checkpoint_interval = interval
+        # #815 STUB DRIFT. `object.__new__` skips `TreeComponent.__init__`,
+        # which is where `self.cache` is really assigned (tree_component.py:108).
+        # That was harmless until afa332e6bb [#783] made `_raw_token_pos` read
+        # `self.cache.is_eagle` to measure the checkpoint grid in raw tokens.
+        # The production default is False (CacheInitParams.is_eagle), and it is
+        # the case these tests model: they pass plain raw depths, i.e. the
+        # identity path the method's own docstring names. Setting the real
+        # default rather than bypassing the read keeps the EAGLE correction in
+        # this file's blast radius, where it belongs.
+        comp.cache = SimpleNamespace(is_eagle=False)
         return comp
 
     @staticmethod
@@ -276,9 +284,7 @@ class TestUnifiedValidatorBehaviour(CustomTestCase):
 
         return SimpleNamespace(
             component_data={
-                ComponentType.MAMBA: SimpleNamespace(
-                    value=value, host_value=host_value
-                )
+                ComponentType.MAMBA: SimpleNamespace(value=value, host_value=host_value)
             }
         )
 

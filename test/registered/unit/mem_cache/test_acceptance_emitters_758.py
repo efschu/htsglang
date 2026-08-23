@@ -80,6 +80,21 @@ class HostResume(unittest.TestCase):
         holder = types.SimpleNamespace(
             component_type="mamba", mamba_checkpoint_interval=interval
         )
+        # #815 STUB DRIFT: `create_match_validator` grew a third read of its
+        # holder when afa332e6bb [#783] started measuring the checkpoint grid in
+        # RAW tokens -- `self._raw_token_pos`, which in turn reads
+        # `self.cache.is_eagle`. This holder predates that (#758, 2026-08-18).
+        #
+        # THE REAL METHOD IS BOUND HERE, not a stand-in returning the depth. A
+        # lambda would pass today and would go on passing if `_raw_token_pos`
+        # ever changed -- which is precisely the EAGLE bigram correction #783
+        # exists to carry, so faking it would make this file blind to the thing
+        # it now depends on. `cache.is_eagle=False` is the production default
+        # (CacheInitParams.is_eagle), and it is the value these tests already
+        # assume: they pass plain raw depths, which is the identity case the
+        # docstring names ("Identity outside EAGLE").
+        holder.cache = types.SimpleNamespace(is_eagle=False)
+        holder._raw_token_pos = MambaComponent._raw_token_pos.__get__(holder)
         fn = MambaComponent.create_match_validator(holder, match_device_only=False)
         return fn, MambaComponent
 

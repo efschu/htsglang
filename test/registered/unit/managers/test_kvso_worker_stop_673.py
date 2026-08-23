@@ -272,11 +272,46 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
         )
 
     def test_it_is_called_on_the_graceful_flag_not_unconditionally(self):
+        """#815: THE ASSERTION IS THE SAME, THE INSTRUMENT CHANGED.
+
+        This used to locate the call by `src.index("release_kv_session_offload_
+        io(\\n")` -- a literal that required the call to be SPLIT across lines.
+        86d1cb1384 [#794] reflowed it onto one line to match its three sibling
+        `release_*` calls, a pure formatting change, and the search raised
+        ValueError. The test was pinning a line break, not a contract.
+
+        What it is actually for is unchanged, and it is NOT covered by the AST
+        existence check above: that the graceful flag threaded into the teardown
+        call is the scheduler's REAL exit state, rather than hardcoded True or
+        dropped to the parameter default. A regression doing either would leave
+        every other test in this file green -- the behaviour tests above drive
+        `release_kv_session_offload_io` directly and never see the call site.
+
+        So it is read off the syntax tree now, where a reflow cannot reach it.
+        """
+        import ast
         import inspect
 
         from sglang.srt.managers import scheduler as sched_mod
 
-        src = inspect.getsource(sched_mod)
-        idx = src.index("release_kv_session_offload_io(\n")
-        window = src[idx : idx + 200]
-        self.assertIn("graceful=scheduler.gracefully_exit", window)
+        tree = ast.parse(inspect.getsource(sched_mod))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "release_kv_session_offload_io"
+        ]
+        self.assertEqual(len(calls), 1, "expected exactly one teardown call site")
+        graceful = [k for k in calls[0].keywords if k.arg == "graceful"]
+        self.assertEqual(
+            len(graceful),
+            1,
+            "the teardown must pass `graceful` explicitly, not fall back to the "
+            "parameter default -- the default is not the scheduler's exit state",
+        )
+        self.assertEqual(
+            ast.unparse(graceful[0].value),
+            "scheduler.gracefully_exit",
+            "the flag must be the scheduler's real exit state, not a constant",
+        )

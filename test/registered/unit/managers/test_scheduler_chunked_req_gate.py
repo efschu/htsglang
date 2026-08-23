@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -154,6 +155,40 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.waiting_queue = []
     s.req_to_token_pool = tree_cache.req_to_token_pool
     s.congruent_prefill_lane = None
+    # #815 STUB DRIFT: `get_next_batch_to_run` grew a `self.ps.pp_size` read
+    # with 6f42d7f923 [#797] (2026-08-21), five days after this helper was last
+    # repaired. `ps` is not optional on a real Scheduler -- __init__ assigns it
+    # unconditionally -- so the helper, not production, is what lagged.
+    #
+    # A REAL ParallelState RATHER THAN A SimpleNamespace, following the
+    # construction the other suites use (test_pp_cp_rank_offsets.py:18-40):
+    # `ps` is a frozen, slotted, kw-only dataclass, so a loose namespace would
+    # accept a field name this class does not have and this file would go on
+    # passing after the next rename.
+    #
+    # pp_size=1 is the faithful value, not merely the convenient one: every
+    # other flag pinned above describes a single-stage, TP-only boot
+    # (enable_phase_flip=False, kv_reshard_vectors=None, regime_controller off),
+    # so a PP-sized rank here would model a machine this scenario is not about.
+    s.ps = ParallelState(
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=None,
+        dp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        attn_dp_rank=0,
+        attn_dp_size=1,
+        moe_ep_rank=0,
+        moe_ep_size=1,
+        moe_dp_rank=None,
+        moe_dp_size=1,
+        gpu_id=0,
+    )
     return s
 
 

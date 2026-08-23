@@ -59,6 +59,19 @@ ELAPSED_S = 183.6
 
 
 def _cfg(**kw):
+    # #815: `idle_locked_settle_s=0.0` USED TO BE HERE and is not an omission.
+    # It was #713's post-cutover settle, and this file set it to 0.0 to hold the
+    # knob OUT of the way while the reason strings below are read. That field no
+    # longer exists: 4a16043d1a reverted 97cb40bba4 whole, with no successor
+    # knob (`grep settle python/sglang/srt/managers/phase_policy.py` is empty).
+    #
+    # THE HISTORY IS A MERGE CONFLUENCE, NOT A MISSED UPDATE, and the difference
+    # matters to whoever merges next. This file was green when it was written:
+    # at its own commit 7592f3243e the field was still present in phase_policy
+    # (three occurrences), and the revert is NOT an ancestor of that commit. The
+    # two lines met later, and the meeting left a kwarg with nothing behind it.
+    # So the state this line modelled -- "the settle is not interfering" -- is
+    # now the only state there is, and expressing it is exactly the empty set.
     base = dict(
         enabled=True,
         flip_tokens=7004,
@@ -67,7 +80,6 @@ def _cfg(**kw):
         rest_state="decode",
         drain_mode=True,
         pp_exit_tokens=0,
-        idle_locked_settle_s=0.0,
     )
     base.update(kw)
     return PhasePolicyConfig(**base)
