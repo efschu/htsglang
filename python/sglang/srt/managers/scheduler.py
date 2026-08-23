@@ -2866,7 +2866,11 @@ class Scheduler(
             # only ever gave _pp_recv_typed_dict. Two of three ranks wedged
             # in here on boot_827 and the watchdog could not say so,
             # because nothing on this path recorded that it was blocked.
-            on_blocked=self._note_pp_chain_blocked,
+            # getattr, not a direct bind: this builder is exercised by
+            # holder-based tests that stand in for a Scheduler with only the
+            # attributes the builder reads, and a hard reference here turns
+            # a diagnostic hook into a construction dependency.
+            on_blocked=getattr(self, "_note_pp_chain_blocked", None),
         )
 
     def _note_pp_chain_blocked(self, arm, since):
