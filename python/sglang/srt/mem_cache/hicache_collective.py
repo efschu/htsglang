@@ -102,6 +102,82 @@ def _timeout_message(label: str, timeout_s: float, waited: float, rank_desc: str
     )
 
 
+#: ``parallel_state.py:619`` builds the groups these collectives run on with
+#: ``gloo_timeout=timedelta(seconds=120 * 60)``. Used only as the fallback when
+#: the live value cannot be read off the group.
+DEFAULT_PG_TIMEOUT_S = 120.0 * 60.0
+
+#: Bounds already checked in this process, so the guard costs one set lookup
+#: per wait rather than a torch introspection.
+_DISCRIMINABLE_BOUNDS: set = set()
+
+
+def process_group_timeout_s(group=None) -> Optional[float]:
+    """The process group's OWN timeout in seconds, or ``None`` if unreadable.
+
+    Read off the gloo backend's options, which is the only place the value
+    actually configured for this group appears;
+    ``distributed_c10d._get_default_timeout`` returns the LIBRARY default and
+    was measured lying about a group built with an explicit timeout (reported
+    30:00 for a group constructed with 20:34). Both are private APIs, so this
+    never raises: an unreadable value is answered with ``None`` and the caller
+    falls back to the documented constant.
+    """
+    try:
+        import torch.distributed as dist
+
+        grp = group if group is not None else dist.group.WORLD
+        backend = grp._get_backend(torch.device("cpu"))
+        return float(backend.options._timeout.total_seconds())
+    except Exception:  # noqa: BLE001 - introspection must never break a wait
+        return None
+
+
+def assert_bound_is_discriminable(
+    timeout_s: float, pg_timeout_s: Optional[float] = None
+) -> None:
+    """The bound must stay BELOW the process group's own timeout (#825).
+
+    WHY THIS IS A NAMED CHECK AND NOT A TIME RATIO. ``bounded_wait`` tells a
+    dead peer from an expired deadline by CONTROL FLOW: expiry returns from
+    ``ParkedWait.join`` as ``False``, transport failure re-raises. That
+    separation holds on exactly one condition -- that the parked, UNBOUNDED
+    ``work.wait()`` cannot itself expire while we are waiting on it. It cannot,
+    with room to spare, because the group's timeout is 7200 s against a default
+    bound of 600 s (``SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S``, ``environ.py``), a
+    12x margin.
+
+    But that is a CONFIGURATION fact, not a law. Raise the bound above the
+    group's timeout and the parked wait starts raising genuine expiries, which
+    would then be reported as transport failures -- #734's error, inverted.
+    The predecessor of this check was `waited < timeout_s * 0.95`, which tried
+    to cover that case with arithmetic on every single failure and paid for it
+    with a 5 %-wide band of mislabelled peer deaths. The condition is a
+    property of the configuration, so it is checked once, by name, where the
+    configuration is wrong -- not re-derived from a stopwatch at every raise.
+
+    Raises ``HiCacheCollectiveError`` naming both numbers.
+    """
+    limit = DEFAULT_PG_TIMEOUT_S if pg_timeout_s is None else float(pg_timeout_s)
+    if timeout_s < limit:
+        return
+    raise HiCacheCollectiveError(
+        f"HiCache collective bound of {timeout_s:g}s is not below the process "
+        f"group's own timeout of {limit:g}s, so an expiry inside the parked "
+        f"wait would be reported as a dead peer. Lower "
+        f"SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S below {limit:g}s, or raise the "
+        f"group's gloo_timeout (parallel_state.py, gloo_timeout=)."
+    )
+
+
+def _check_bound_once(timeout_s: float) -> None:
+    """Run :func:`assert_bound_is_discriminable` once per distinct bound."""
+    if timeout_s in _DISCRIMINABLE_BOUNDS:
+        return
+    assert_bound_is_discriminable(timeout_s, process_group_timeout_s())
+    _DISCRIMINABLE_BOUNDS.add(timeout_s)
+
+
 def bounded_wait(
     work: Optional[torch.distributed.Work],
     label: str,
@@ -122,6 +198,9 @@ def bounded_wait(
     if not timeout_s or timeout_s <= 0:
         work.wait()
         return
+    # #825: the control-flow discriminator below is only sound while the bound
+    # sits under the group's own timeout. Checked once per distinct bound.
+    _check_bound_once(timeout_s)
 
     # THE BOUND MUST NOT REPLACE THE PROGRESS. This loop used to be
     #
@@ -186,43 +265,73 @@ def bounded_wait(
     # with the deadline. Expiry returns control without touching the ``Work``,
     # so the pair is never poisoned.
     #
-    # ALL THREE CONTRACTS OF THIS FUNCTION ARE UNCHANGED: the terminal raise,
-    # the ``_timeout_message`` wording, and the #734 numeric discriminator
-    # below. What changes is only that a peer no longer dies for our deadline.
+    # TWO OF THIS FUNCTION'S CONTRACTS ARE UNCHANGED: the terminal raise and the
+    # ``_timeout_message`` wording. The third -- #734's numeric discriminator --
+    # is RETIRED here, because this redesign is what made it both unnecessary
+    # and harmful. See below.
     started = time.monotonic()
     parked = ParkedWait(work, label)
     try:
         completed = parked.join(timeout_s)
     except RuntimeError as exc:
         waited = time.monotonic() - started
-        # #734: A DEAD PEER IS NOT A SLOW PEER, and the log must not say it is.
+        # #734 IS SATISFIED BY CONTROL FLOW HERE, NOT BY ARITHMETIC (#825).
         #
-        # `Work.wait(timeout=...)` raises RuntimeError for BOTH expiry and
-        # transport failure, and reporting every one as a timeout produced a
-        # self-contradicting line on 2026-08-17:
+        # #734's finding stands and is not in question: a dead peer is not a
+        # slow peer, and reporting transport failure as timeout produced a
+        # self-contradicting line on 2026-08-17 --
         #
         #   'pp_sync/isend[2]->pp2' did not complete within 600s (waited 34.3s)
         #
-        # -- 34.3 s against a 600 s bound. The real cause was underneath:
-        # `gloo ... Connection closed by peer`, i.e. the peer process had died.
-        # An operator reading "timeout" goes looking for a slow rank and finds
-        # a healthy one, while the corpse is on another node.
+        # -- 34.3 s against a 600 s bound, whose real cause was one frame
+        # underneath: `gloo ... Connection closed by peer`.
         #
-        # The discriminator is NUMERIC, not a string match on the backend's
-        # wording: if the wait returned before its own deadline, the deadline
-        # is not what ended it. Backend messages change between versions;
-        # arithmetic does not.
-        if waited < timeout_s * 0.95:
-            raise HiCacheCollectiveError(
-                f"HiCache control collective '{label}' FAILED after "
-                f"{waited:.1f}s, well inside its {timeout_s:g}s bound, on "
-                f"[{rank_desc or collective_rank_desc(None)}]. This is NOT a "
-                f"timeout -- the transport ended the wait early, which usually "
-                f"means a peer process died or its connection dropped. Look for "
-                f"a dead rank, not a slow one. Underlying error: {exc}"
-            ) from exc
-        raise HiCacheCollectiveTimeoutError(
-            _timeout_message(label, timeout_s, waited, rank_desc)
+        # #734 separated the two causes with `waited < timeout_s * 0.95`,
+        # because at that time BOTH arrived here: `Work.wait(timeout=...)`
+        # raised for expiry AND for transport failure, so the only thing
+        # telling them apart was how long the wait had lasted. That was correct
+        # for that shape.
+        #
+        # THIS SHAPE IS DIFFERENT, AND THE COMPARISON BECAME A DEFECT. Since
+        # #829 the deadline lives on ``ParkedWait.join``, and the two causes no
+        # longer meet:
+        #
+        #   expiry            -> join() returns False, wait still parked
+        #                        -> the `if not completed:` raise below
+        #   transport failure -> the parked wait raised, join() re-raises it
+        #                        -> HERE
+        #
+        # So every RuntimeError arriving in this block is ALREADY a transport
+        # failure, whatever ``waited`` says. The comparison could no longer
+        # improve a verdict -- it could only downgrade a correct "dead peer"
+        # into a wrong "timeout", for any death landing in the last 5 % of the
+        # bound. That is 30 seconds wide at the 600 s default.
+        #
+        # MEASURED 2026-08-23, hermetic 2-process gloo, CVD="", both causes
+        # generated for real and both raise sites instrumented to name which
+        # branch fired:
+        #
+        #   real expiry, 4/4 trials      -> `not completed` path.  NEVER here.
+        #   real SIGKILL peer, 14 trials -> here, detection latency 15-21 ms.
+        #   peer death at 0.98/0.97/0.96 of the bound -> reached this block and
+        #       was relabelled HiCacheCollectiveTimeoutError by the comparison.
+        #       Three specimens, the exact wrong-instrument reading #734 exists
+        #       to prevent, still live in the band the comparison created.
+        #
+        # The replacement is not a string match either -- #734's objection to
+        # those ("backend messages change between versions") is upheld. It is
+        # control flow, which is stronger than both arithmetic and strings:
+        # nothing that is not a transport failure can reach this line.
+        #
+        # ``waited`` stays in the message as evidence. It is no longer the
+        # decision.
+        raise HiCacheCollectiveError(
+            f"HiCache control collective '{label}' FAILED after "
+            f"{waited:.1f}s, inside its {timeout_s:g}s bound, on "
+            f"[{rank_desc or collective_rank_desc(None)}]. This is NOT a "
+            f"timeout -- the transport ended the wait early, which usually "
+            f"means a peer process died or its connection dropped. Look for "
+            f"a dead rank, not a slow one. Underlying error: {exc}"
         ) from exc
     # Expiry. ``ParkedWait.join`` returns False with the wait STILL PARKED and
     # the pair intact; the raise below keeps this function's terminal contract,
