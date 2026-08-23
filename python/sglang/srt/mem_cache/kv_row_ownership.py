@@ -220,6 +220,41 @@ class RowSpace:
     #: it as "belongs to no owner" would be the #814 defect in miniature.
     reserved: int = 1
 
+    @property
+    def ownable_hi(self) -> int:
+        """Exclusive upper bound of the ids that can HAVE an owner.
+
+        TWO INDEPENDENT BOUNDS, AND THE QUESTION IS ONLY ANSWERABLE INSIDE
+        BOTH. #814 established the first: a row with no page behind it does not
+        exist, so ownership is asked over ``committed``, never over the exposed
+        id space. The second is its mirror and was missing -- a row the
+        allocator never MINTS has no owner to have, because ``free_pages`` is
+        ``arange(1, size + 1)`` (``allocator/token.py:39``) and ``exposed`` is
+        that ``size`` (set from ``alloc.size`` at
+        ``phase_flip_runtime.py:4040``). Hence ``exposed + 1``: the minted ids
+        are ``[reserved, exposed]`` INCLUSIVE.
+
+        WHY THE MISSING BOUND WAS NOT COSMETIC. The committed figure is a
+        MEASURED, page-rounded backing row count
+        (``KvBackingRelief._current_rows()``), and it legitimately exceeds the
+        id space. boot_window1_0823_1204 ran backing 473088 against
+        ``size=471314``, so ids 471315..473087 -- exactly 1773 -- were ranged
+        over and claimed by nobody, and the audit printed
+        ``[exclusivity] 1773 rows ... sample=[471315..471322]`` identically on
+        all three ranks: an owner enumerating rows beyond the pool, except no
+        owner was. The same 1773 sat inside the 1895 printed at 12:08:33
+        (1773 + the genuine 122).
+
+        THE DIRECTIONS ARE NOT SYMMETRIC. ``exposed > committed`` is #816 --
+        ids with no page behind them, a device-side assert waiting to happen,
+        and LAW.EXPOSURE's whole subject. ``committed > exposed`` is slack
+        backing: pages with no id in front of them, which nothing can write to
+        and nothing can leak. Reporting it as an ownership violation inflated
+        the per-law counter that #822 item 5 uses as its regression metric, so
+        the metric trended against a page-rounding artefact.
+        """
+        return min(self.committed, self.exposed + 1)
+
 
 class RowOwnershipAuthority:
     """The single place that says whether the row space is lawful.
@@ -479,7 +514,7 @@ class RowOwnershipAuthority:
             # statements of one fact is the shape this module exists to end --
             # it does not stop being that shape because both live in one
             # function.
-            lo, hi = space.reserved, space.committed
+            lo, hi = space.reserved, space.ownable_hi
             span = max(0, hi - lo)
             # Count only IN-RANGE claims: rows above the backing are LAW.COVERAGE's
             # business and must not be able to mask a hole below it.
@@ -518,6 +553,7 @@ class RowOwnershipAuthority:
         cached_rows: Iterable[int],
         withheld_rows: Iterable[int] = (),
         resident_rows: Mapping[str, Iterable[int]] = None,
+        expect_full_coverage: bool = True,
     ) -> List[Violation]:
         """Feed one ``_pool_census`` reading through the law.
 
@@ -533,7 +569,7 @@ class RowOwnershipAuthority:
         self.declare("cap_withheld", withheld_rows)
         for owner, rows in (resident_rows or {}).items():
             self.declare(f"resident:{owner}", rows)
-        return self.audit()
+        return self.audit(expect_full_coverage=expect_full_coverage)
 
 
 def format_violations(violations: Sequence[Violation], *, why: str = "") -> str:
@@ -576,6 +612,7 @@ def audit_pool_census(
     free_rows: Iterable[int],
     cached_rows: Iterable[int],
     withheld_rows: Iterable[int] = (),
+    resident_rows: Optional[Mapping[str, Iterable[int]]] = None,
     why: str = "",
 ) -> List[Violation]:
     """Turn one ``_pool_census`` reading into a verdict instead of an integer.
@@ -611,11 +648,37 @@ def audit_pool_census(
         )
         return []
 
+    # THE FOURTH OWNER, AND WHY ``None`` IS NOT ``{}``.
+    #
+    # Rows handed to an in-flight request are out of the free lists and not yet
+    # in the tree. They are owned -- by that request -- and until #822 the
+    # census had no term for them, so the working set read as a leak: 122 rows
+    # against ``resident_reqs=1`` on the first census of
+    # boot_window1_0823_1204, before anything had moved.
+    #
+    # ``resident_rows=None`` means the caller could not enumerate that owner.
+    # Then "this row belongs to nobody" is UNANSWERABLE, not false, and the
+    # unowned half is suppressed exactly as it is for any other partial view.
+    # Substituting an empty mapping would instead assert that requests hold no
+    # rows, which re-reports the whole working set as unowned -- the defect
+    # with an extra step. Double ownership is still checked either way: a
+    # partial view can miss an owner, it can never invent one.
+    #
+    # A CLAIM THAT IS NOT REFRESHED MUST NOT SURVIVE. ``declare`` overwrites an
+    # owner but never removes one, so a ``resident:*`` claim left by an earlier
+    # census would keep vouching for rows the requests have since returned, and
+    # a real hole underneath it would read as owned. Withdraw before observing.
+    if resident_rows is None:
+        for owner in authority.owners():
+            if owner.startswith("resident:"):
+                authority.withdraw(owner)
     authority.set_backing(exposed=int(exposed), committed=int(committed))
     found = authority.observe_census(
         free_rows=free_rows,
         cached_rows=cached_rows,
         withheld_rows=withheld_rows,
+        resident_rows=resident_rows,
+        expect_full_coverage=resident_rows is not None,
     )
     if found:
         logger.warning(format_violations(found, why=why))
