@@ -4867,6 +4867,13 @@ class Scheduler(
             # right close is to widen `update_dcp_admission_state`'s packed
             # reduce, where the reduce already lives.
             self._uniform_prefetch_ballot = None
+            # #823 W9b: and the head verdict with it. CLEARED ON EVERY
+            # EARLY RETURN, not left standing: this branch takes no reduce,
+            # so anything still published here is the LAST pass's group
+            # verdict, and a stale verdict is worse than none -- it would
+            # reorder and truncate this pass's queue on numbers computed for
+            # a different one, while every log line said "group".
+            self._uniform_head_inputs = None
             # #794: NAMED GAP, same shape as the #639 host floor above. This
             # branch takes no reduce of its own, so the corridor width stays
             # unreduced and the consumer declines to narrow rather than narrow
@@ -4917,6 +4924,12 @@ class Scheduler(
             # #791b: one rank -- nothing to diverge from, ballot off, the
             # local prefetch verdict is already the group verdict.
             self._uniform_prefetch_ballot = None
+            # #823 W9b: one rank in this group -- there is no group verdict
+            # to hand down, and the enforcer's own gate is off for the same
+            # reason (`enforcer_gate`: a MIN over a singleton is this rank's
+            # own vote). Cleared rather than left standing, so a phase flip
+            # back into PP cannot form on the TP phase's last verdict.
+            self._uniform_head_inputs = None
             # #794: one rank in this group -- the local corridor decision IS
             # the group decision, taken at the call site.
             self._uniform_corridor_width = None
@@ -5067,7 +5080,10 @@ class Scheduler(
         # exactly once per TP-loop iteration) and memoise it for the batch
         # formation to consume. Same move, same reason.
         _head_canonical, _head_local_matches = self._local_head_prefix_matches()
-        self._pass_head_canonical = _head_canonical
+        # #823 W9b: the canonical head is no longer published as its own
+        # attribute -- it goes into the single verdict value below, together
+        # with the two numbers this reduce is about to produce, so the four
+        # halves of one decision cannot get out of step with each other.
         _head_at = len(vals)
         vals = vals + tp_head_congruence.build_head_order_payload(
             _head_canonical, _head_local_matches
@@ -5098,13 +5114,31 @@ class Scheduler(
         # #823 W9: read back by the indices captured above, before the ballot,
         # so a later change to the ballot layout cannot silently move them --
         # the same discipline the corridor width is read under.
-        self._uniform_head_match_lens = t[
+        # THE PAYLOAD IS UNCHANGED BY W9b: same slots, same order, same
+        # head-captured indices. Only the DESTINATION changes, from four
+        # separate attributes to one value.
+        _head_match_lens = t[
             _head_at : _head_at + tp_head_congruence.TP_HEAD_SLOTS
         ].tolist()
-        self._uniform_admit_limit = int(t[_limit_at])
+        _admit_limit = int(t[_limit_at])
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
             t[_ballot_at:].tolist(), _ballot_rids
+        )
+        # #823 W9b: ONE VALUE, NOT FOUR ATTRIBUTES. Four attributes published
+        # here and read separately over there is what let one of them --
+        # #791b's consume-once ballot -- be destroyed between publication and
+        # use while the other three stayed live, and the batch formed
+        # rank-locally on all 105 passes of boot_window2_0823_1554 without
+        # anything noticing that three quarters of the verdict was intact.
+        # Bundled, the verdict is taken once by `_take_uniform_head_inputs`
+        # and handed to both consumers; there is no window in which it is
+        # partly present.
+        self._uniform_head_inputs = tp_head_congruence.build_uniform_head_inputs(
+            _head_canonical,
+            _head_match_lens,
+            _admit_limit,
+            self._uniform_prefetch_ballot is not None,
         )
         # #823: A DIVERGENT QUEUE HEAD IS A DURATION, NOT AN EVENT.
         #
@@ -5254,41 +5288,182 @@ class Scheduler(
             )
         return canonical, matches
 
-    def _tp_head_enforcer_enabled(self) -> bool:
-        """#823 W9: is the group's batch-formation decision in force?
+    def _tp_head_enforcer_gate(self) -> tp_head_congruence.GateVerdict:
+        """#823 W9: is the group's batch-formation decision in force, and WHY.
 
-        Requires a real TP group -- a world of one has nothing to agree
-        with, and the votes published above are then just this rank's own
-        numbers. ``SGLANG_TP_HEAD_CONGRUENCE=0`` is the kill switch, and it
-        restores the pre-#823 rank-local formation exactly.
+        #823 W9b: this used to return a bare ``bool`` and say nothing. That
+        is how the enforcer spent a whole GPU window unable to answer its own
+        criterion: on ``--tp-size 1 --pp-size 3`` it was off for 45 of the
+        boot's 51 prefill batches, and the log could not distinguish "gated
+        off, correctly, because the PP phase is #791's territory" from
+        "wired and inert". Those two need different fixes and the boot
+        offered no way to tell them apart.
+
+        The decision itself is pure and lives in ``tp_head_congruence``,
+        including the three code-anchored reasons the TP world of one is NOT
+        widened to cover the PP phase. ``self.ps`` is read with getattr, not
+        just its members: this predicate sits on the admission path and is
+        reached by harnesses that model a Scheduler without a ParallelState.
         """
-        if os.environ.get("SGLANG_TP_HEAD_CONGRUENCE", "1") != "1":
-            return False
-        # `self.ps` itself is read with getattr, not just its members: this
-        # predicate sits on the admission path and is reached by harnesses
-        # that model a Scheduler without a ParallelState. Absent -> no group
-        # to agree with -> the pre-#823 rank-local formation.
         ps = getattr(self, "ps", None)
-        if ps is None:
-            return False
-        return int(getattr(ps, "tp_size", 1) or 1) > 1
+        verdict = tp_head_congruence.enforcer_gate(
+            os.environ.get("SGLANG_TP_HEAD_CONGRUENCE", "1") == "1",
+            None if ps is None else int(getattr(ps, "tp_size", 1) or 1),
+            None if ps is None else int(getattr(ps, "pp_size", 1) or 1),
+        )
+        # Transition-reported, not latched: under --enable-phase-flip this
+        # gate switches at every cutover, so a once-per-process line would
+        # describe the first phase and never the run. Same rule as #824's
+        # uniform_floor_scope.report_scope, one line per change of state.
+        self._tp_head_gate_reason, _message = tp_head_congruence.advance_gate_report(
+            getattr(self, "_tp_head_gate_reason", None), verdict
+        )
+        if _message is not None:
+            logger.info("#823 head-congruence enforcer %s", _message)
+        return verdict
 
-    def _uniform_allocatable_reqs(self, running_bs: int) -> int:
+    def _tp_head_enforcer_enabled(self) -> bool:
+        """The gate as a bare predicate, for call sites that only branch."""
+        return self._tp_head_enforcer_gate().enabled
+
+    def _note_tp_head_degradation(self, arm: str, degraded: bool) -> None:
+        """#823 W9b: a rank-local formation under an ARMED enforcer is a DEFECT.
+
+        THE COUNT ARM HAD NO LINE AT ALL. ``_uniform_allocatable_reqs`` read
+        its memo through ``getattr(..., None)`` and fell back to the local
+        number in silence, so boot_window2_0823_1554 could report the ORDER
+        arm's inertness 105 times and say nothing whatsoever about the COUNT
+        arm -- and a future boot showing ZERO #823 lines would still say
+        nothing about it. Absence of a warning was not evidence of
+        enforcement; it was the absence of an instrument. So each arm gets a
+        named counter, and a counter is what a boot-log grep can actually
+        assert on.
+
+        NOT UNBOUNDED LOGGING, and the same specimen is the reason the
+        cadence is borrowed rather than invented: that boot emitted 7710
+        #797d/#798 void lines in seven seconds. ``advance_mismatch_streak``
+        is geometric-then-capped, so a persistent degradation costs a handful
+        of lines per minute -- and it reports the RECOVERY EDGE, which is the
+        half a latch can never report ("it healed after N passes" and "it
+        never healed" are the same silence to a latched logger).
+        """
+        _streak_attr = f"_tp_head_degrade_streak_{arm}"
+        _total_attr = f"_tp_head_degrade_total_{arm}"
+        streak, total, event = prefetch_ballot.advance_mismatch_streak(
+            getattr(self, _streak_attr, 0),
+            getattr(self, _total_attr, 0),
+            bool(degraded),
+        )
+        setattr(self, _streak_attr, streak)
+        setattr(self, _total_attr, total)
+        if event is None:
+            return
+        kind, run = event
+        if kind == "diverged":
+            logger.warning(
+                "#823 head-congruence DEGRADED: the %s arm formed rank-locally "
+                "while the enforcer is ARMED. This is the pre-#823 behaviour "
+                "the ticket exists to remove, not a fallback. Consecutive "
+                "degraded passes: %d (total this process: %d).",
+                arm,
+                run,
+                total,
+            )
+        else:
+            logger.info(
+                "#823 head-congruence RESTORED: the %s arm is group-uniform "
+                "again after %d degraded pass(es) (total this process: %d).",
+                arm,
+                run,
+                total,
+            )
+
+    def _uniform_allocatable_reqs(
+        self,
+        running_bs: int,
+        head_inputs: Optional[tp_head_congruence.UniformHeadInputs],
+    ) -> int:
         """#823 W9 COUNT arm: how many of the head this rank may admit.
 
         The group's MIN, so every rank stops at the same candidate count.
         Falls back to the local number whenever the group has no opinion,
         which is the pre-#823 expression unchanged.
+
+        #823 W9b: ``head_inputs`` IS A REQUIRED PARAMETER, and that is the
+        fix rather than a style preference. It used to read
+        ``getattr(self, "_uniform_admit_limit", None)`` -- and a
+        getattr-default cannot tell "the group priced this pass at zero"
+        apart from "nobody published anything and this arm is inert", so the
+        arm degraded to rank-local without a single line in a 74-second boot
+        that logged 105 lines about its sibling. A parameter has no default
+        to hide behind: the caller must have the decision in hand, and if it
+        does not, the absence is a value this method can COUNT (see
+        ``_note_tp_head_degradation``) instead of a hole it cannot see.
+
+        Called once per candidate in the admission loop, so the degradation
+        is recorded on the pass's FIRST degraded evaluation only -- one
+        accounting event per pass, matching the order arm, rather than one
+        per queued request.
         """
         local = self.get_num_allocatable_reqs(running_bs)
-        limit, _source = tp_head_congruence.admit_limit_decision(
+        gate = self._tp_head_enforcer_gate()
+        limit, source = tp_head_congruence.admit_limit_decision(
             local,
-            getattr(self, "_uniform_admit_limit", None),
-            self._tp_head_enforcer_enabled(),
+            None if head_inputs is None else head_inputs.admit_limit,
+            gate.enabled,
         )
+        if tp_head_congruence.degradation_is_a_defect(gate.enabled, source):
+            if not self._tp_head_count_degraded_this_pass:
+                self._tp_head_count_degraded_this_pass = True
+                self._note_tp_head_degradation(tp_head_congruence.ARM_COUNT, True)
         return local if limit is None else int(limit)
 
-    def _apply_uniform_head_order(self) -> None:
+    def _take_uniform_head_inputs(
+        self,
+    ) -> Optional[tp_head_congruence.UniformHeadInputs]:
+        """#823 W9b: take this pass's group verdict ONCE, at one point.
+
+        THE LIFECYCLE IS THE DEFECT THIS REPLACES, so it is worth stating
+        exactly. The verdict used to live as four separate attributes
+        published by ``_update_uniform_pool_budget`` and read, later and
+        separately, by the two consumers. One of the four --
+        ``_uniform_prefetch_ballot`` -- is ALSO #791b's consume-once memo,
+        and ``_get_new_batch_prefill_raw`` pops it off ``__dict__`` fifty-odd
+        lines before the order arm read it directly. Pop, then read: the read
+        raised ``AttributeError`` on every pass, the handler caught it, and
+        the batch formed rank-locally. 105 out of 105 passes, all three
+        ranks, boot_window2_0823_1554.
+
+        THE OBVIOUS REPAIR IS THE ONE NOT TAKEN. Giving that read a
+        ``getattr(..., None)`` like its three neighbours stops the exception
+        and produces the count arm's failure instead -- inert, and silent
+        about it. That is the #606 getattr-default family: a default that
+        converts a structural defect into a plausible number. So the four
+        attributes become ONE value, taken here, handed to both consumers as
+        a parameter. A parameter cannot be missing at the point of use, which
+        is a stronger guarantee than any default can offer.
+
+        CONSUME-ONCE IS KEPT, with a defined reset point: the pop is what
+        stops a PP-loop pass -- which never runs the budget site -- from
+        forming on a stale TP-loop verdict, and the reset point is the next
+        publication by ``_update_uniform_pool_budget``. What changes is that
+        the take happens BEFORE any consumer instead of between two of them,
+        and that an absent verdict under an ARMED enforcer is counted and
+        logged rather than silently absorbed.
+        """
+        # Reset the per-pass accounting flag for the count arm, which is
+        # evaluated once per candidate and must still report once per pass.
+        # The ORDER arm accounts for itself: it runs exactly once per pass
+        # and can degrade for reasons this point cannot see (an empty
+        # canonical head, a decision that came back rank-local), so
+        # accounting here as well would double-count the streak and make the
+        # cadence report a divergence twice as long as it was.
+        self._tp_head_count_degraded_this_pass = False
+        return self.__dict__.pop("_uniform_head_inputs", None)
+
+    def _apply_uniform_head_order(
+        self, head_inputs: Optional[tp_head_congruence.UniformHeadInputs]
+    ) -> None:
         """#823 W9 ORDER arm: put ``waiting_queue``'s head in the GROUP's order.
 
         Runs immediately after ``calc_priority``, so it overrides exactly the
@@ -5299,33 +5474,52 @@ class Scheduler(
         a request the group omitted waits for a later pass rather than
         disappearing.
         """
-        if not self._tp_head_enforcer_enabled():
-            return
-        canonical = getattr(self, "_pass_head_canonical", None)
-        group_lens = getattr(self, "_uniform_head_match_lens", None)
-        if not canonical or not group_lens:
-            return
+        gate = self._tp_head_enforcer_gate()
+        source = tp_head_congruence.SOURCE_RANK_LOCAL
         try:
-            order, _source = tp_head_congruence.head_decision(
-                canonical,
-                group_lens,
-                [req.rid for req in self.waiting_queue],
-                {},
-                digest_agreed=self._uniform_prefetch_ballot is not None,
-                enforcer_enabled=True,
-            )
-            by_rid = {req.rid: req for req in self.waiting_queue}
-            head = [by_rid[rid] for rid in order if rid in by_rid]
-            named = {id(req) for req in head}
-            self.waiting_queue[:] = head + [
-                req for req in self.waiting_queue if id(req) not in named
-            ]
+            if gate.enabled and head_inputs is not None:
+                # #823 W9b: NOTHING IS READ OFF `self` HERE ANY MORE. The
+                # group's verdict arrives as a value taken once at the top of
+                # the pass, so there is no attribute left for the pass's own
+                # consume-once pop to have removed -- which is precisely what
+                # `digest_agreed=self._uniform_prefetch_ballot is not None`
+                # did on every one of boot_window2_0823_1554's 105 passes.
+                #
+                # `digest_agreed` is passed for the record, not for the
+                # decision: `head_decision` deliberately does not branch on
+                # it, because the group order depends only on the canonical
+                # rid SET and the MIN, and is therefore still computable in
+                # exactly the pass where the digests disagree. That is change
+                # 2 of this ticket, and it is why an unreadable digest must
+                # never have been able to void the order in the first place.
+                order, source = tp_head_congruence.head_decision(
+                    head_inputs.canonical,
+                    head_inputs.group_match_lens,
+                    [req.rid for req in self.waiting_queue],
+                    {},
+                    digest_agreed=head_inputs.digest_agreed,
+                    enforcer_enabled=True,
+                )
+                by_rid = {req.rid: req for req in self.waiting_queue}
+                head = [by_rid[rid] for rid in order if rid in by_rid]
+                named = {id(req) for req in head}
+                self.waiting_queue[:] = head + [
+                    req for req in self.waiting_queue if id(req) not in named
+                ]
         except Exception as exc:  # noqa: BLE001 - never break admission
+            source = tp_head_congruence.SOURCE_RANK_LOCAL
             logger.warning(
                 "#823 head-congruence: could not apply the group head order "
                 "(%s); this pass forms rank-locally",
                 exc,
             )
+        # Counted on EVERY pass, degraded or not: the recovery edge is the
+        # half a latch can never report, and "it healed" is the answer the
+        # window criterion actually needs.
+        self._note_tp_head_degradation(
+            tp_head_congruence.ARM_ORDER,
+            tp_head_congruence.degradation_is_a_defect(gate.enabled, source),
+        )
 
     def _local_admit_limit(self) -> Optional[int]:
         """#823 W9: this rank's vote for HOW MANY of the head may be admitted.
@@ -7427,6 +7621,14 @@ class Scheduler(
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
         _prefetch_ballot = self.__dict__.pop("_uniform_prefetch_ballot", None)
+        # #823 W9b: take the group's batch verdict HERE, once, above every
+        # early return and above both consumers -- the same position and the
+        # same consume-once discipline as the two memos above it, and for the
+        # same reason. Taking it here rather than reading it where it is used
+        # is the fix: the read used to sit BELOW the pop on the line above,
+        # so it raised AttributeError on all 105 passes of
+        # boot_window2_0823_1554 and every batch formed rank-locally.
+        _head_inputs = self._take_uniform_head_inputs()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -7481,7 +7683,7 @@ class Scheduler(
         # replicas whose prefix caches evolved apart (#616B family). Same
         # queue, same policy, different order -- and a different order is a
         # different batch.
-        self._apply_uniform_head_order()
+        self._apply_uniform_head_order(_head_inputs)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -7735,7 +7937,9 @@ class Scheduler(
             # beside the "#cached-token 0 vs 16384" the order arm explains.
             # MIN, so this can only stop EARLIER than the local number would:
             # admit fewer, never more.
-            if len(adder.can_run_list) >= self._uniform_allocatable_reqs(running_bs):
+            if len(adder.can_run_list) >= self._uniform_allocatable_reqs(
+                running_bs, _head_inputs
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
