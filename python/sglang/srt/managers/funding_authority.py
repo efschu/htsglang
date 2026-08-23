@@ -641,7 +641,7 @@ def diagnose_floor_band(
         f"short of the watermark BY CONSTRUCTION. No funding post can close "
         f"this; it is a contradiction between the law and the gate derived "
         f"from it. Retrying when occupancy drops cannot help -- clearing the "
-        f"watermark means leaving the acceptance band from above."
+        f"watermark means leaving the acceptance band from above.",
     )
 
 

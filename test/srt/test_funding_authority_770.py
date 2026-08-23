@@ -152,9 +152,7 @@ class TestSpecimenTpLock(unittest.TestCase):
     def test_a_refusal_never_says_nothing(self):
         """Law 1. Even a total refusal enumerates every post and its reason."""
         auth = FundingAuthority(rank=0)
-        auth.declare_post(
-            Post("allocator-cache", 0, tier=RELIEF_LOCAL, cost=10)
-        )
+        auth.declare_post(Post("allocator-cache", 0, tier=RELIEF_LOCAL, cost=10))
         auth.declare_post(
             Post(
                 "draft-weights",
@@ -298,9 +296,7 @@ class TestGranularityForm(unittest.TestCase):
 
     def test_authority_reports_granularity_as_its_own_cause(self):
         auth = FundingAuthority()
-        auth.declare_post(
-            Post("kv-slack", 100 * MIB, granule_bytes=KV_GRANULE_BYTES)
-        )
+        auth.declare_post(Post("kv-slack", 100 * MIB, granule_bytes=KV_GRANULE_BYTES))
         v = auth.can_fund(50 * MIB)
         self.assertFalse(v.ok)
         self.assertEqual(v.cause, CAUSE_GRANULARITY)
@@ -345,9 +341,7 @@ class TestUserReserveIsNeverFundable(unittest.TestCase):
         """The trap: two things called 'reserve'. 819 MiB here is the seam
         staging reserve from phase_flip_seam_reserve, not the user's 1024."""
         auth = FundingAuthority()
-        auth.declare_post(
-            Post("seam-staging-reserve", SPEC_STAGING_RESERVE_MIB * MIB)
-        )
+        auth.declare_post(Post("seam-staging-reserve", SPEC_STAGING_RESERVE_MIB * MIB))
         self.assertIn("seam-staging-reserve", auth.posts)
 
     def test_duplicate_declaration_raises(self):
@@ -603,9 +597,7 @@ class TestBreakEvenProvenance(unittest.TestCase):
         self.assertFalse(p.is_fully_solved)
 
     def test_fully_solved_when_the_operator_supplied_both_rates(self):
-        p = BreakEvenProvenance(
-            3.0, PROV_MEASURED, 2000.0, PROV_ENV, 8000.0, PROV_ENV
-        )
+        p = BreakEvenProvenance(3.0, PROV_MEASURED, 2000.0, PROV_ENV, 8000.0, PROV_ENV)
         self.assertTrue(p.is_fully_solved)
         self.assertIn("every input is rig-local", p.describe())
 

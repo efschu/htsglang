@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""#770/#812 -- a per-rank floor is derived against that rank's OWN cap.
+"""#770/#812 -- an under-backed rank is NAMED, and never silently binds the group.
 
 Specimen: boot_816_core_0823_0608.log 06:32:05, all three ranks. The live set
 is genuinely replicated under PP (a request's tokens occupy KV on every stage),
@@ -21,8 +21,12 @@ so the floor is the SAME on every rank -- while the caps are unequal by design:
     PP1  backed 124928  floor 128549  -> 102.9%   <- the defect
     PP2  backed 133120  floor 128549  ->  96.6%
 
-PP1's 102.9% clamps to 100%, the group MAX takes that, and nobody shrinks --
-vetoing PP0's fully fundable 84443-row plan on the rank that needed it.
+PP1's 102.9% clamps to 100% in `_floor_ppm`, the group MAX takes that, and
+nobody shrinks -- vetoing PP0's fully fundable 84443-row plan on the rank that
+needed it.
+
+What this file pins is the DETECTION and the fact that the floor itself is NOT
+lowered to make the arithmetic tidy: see TestFloorRowsDetectsButDoesNotLower.
 
 Hermetic: no CUDA, no pool, no collectives.
 """
@@ -107,13 +111,18 @@ class TestFloorPpmNeverExceedsFullScale(unittest.TestCase):
         self.assertEqual(_shrink_ppm(124928, 124928), _SHRINK_SCALE)
 
 
-class TestFloorRowsClampedToOwnCap(unittest.TestCase):
-    """The clamp itself, on a stand-in rung.
+class TestFloorRowsDetectsButDoesNotLower(unittest.TestCase):
+    """The floor is DETECTED as under-backed and deliberately NOT lowered.
 
-    A real rung needs a pool, an allocator and a live-set function, so the
-    method is exercised UNBOUND against a stub -- the same technique the #717
-    suites in this tree already use, and the reason _floor_rows reads its
-    collaborators through getattr.
+    A first version clamped it down to the cap. That is wrong in the dangerous
+    direction: the floor is `live set + 1 + margin + reserve`, so lowering it
+    to a smaller cap authorises a cap BELOW rows that are still in use.
+    ``test_residency_cap_flip_levelling_792::TheLevellingMustNotCapBelowTheLiveSet``
+    failed on the clamp and passes without it -- the tree already carried the
+    invariant, and it is older than this ticket.
+
+    A real rung needs a pool and an allocator, so the method is exercised
+    UNBOUND against a stub, the technique the #717 suites already use.
     """
 
     def _rung(self, cap, page=1, margin=0, reserve=512):
@@ -131,26 +140,23 @@ class TestFloorRowsClampedToOwnCap(unittest.TestCase):
 
         return KvBackingRelief._floor_rows, _Stub()
 
-    def test_pp1_floor_is_clamped_to_its_own_backed_rows(self):
-        """THE LOAD-BEARING CASE. max_live chosen so the raw floor is the
-        specimen's 128549, against PP1's 124928 backed rows."""
+    def test_an_under_backed_rank_keeps_its_floor(self):
+        """THE LOAD-BEARING CASE, and the assert is the opposite of my first
+        draft: the floor must SURVIVE, because the live set is still live."""
         fn, stub = self._rung(cap=PP_BACKED[1])
         max_live = SPEC_FLOOR - 1 - 0 - 512
         floor = fn(stub, max_live)
-        self.assertEqual(floor, PP_BACKED[1])
-        self.assertLessEqual(floor, PP_BACKED[1])
+        self.assertEqual(floor, SPEC_FLOOR)
+        self.assertGreater(floor, PP_BACKED[1])
+        # ...and it is still recognisable as the defect it is.
+        self.assertTrue(floor_exceeds_local_cap(floor, PP_BACKED[1]))
 
-    def test_a_roomy_rank_is_not_clamped(self):
+    def test_a_roomy_rank_is_unaffected(self):
         fn, stub = self._rung(cap=PP_BACKED[0])
         max_live = SPEC_FLOOR - 1 - 0 - 512
-        self.assertEqual(fn(stub, max_live), SPEC_FLOOR)
-
-    def test_clamped_floor_yields_full_scale_not_more(self):
-        """After the clamp the proportion is exactly 100%, never above."""
-        fn, stub = self._rung(cap=PP_BACKED[1])
-        floor = fn(stub, SPEC_FLOOR - 1 - 0 - 512)
-        self.assertEqual(_floor_ppm(floor, PP_BACKED[1]), _SHRINK_SCALE)
-        self.assertFalse(floor_exceeds_local_cap(floor, PP_BACKED[1]))
+        floor = fn(stub, max_live)
+        self.assertEqual(floor, SPEC_FLOOR)
+        self.assertFalse(floor_exceeds_local_cap(floor, PP_BACKED[0]))
 
     def test_an_unreadable_cap_leaves_the_floor_alone(self):
         from sglang.srt.managers.kv_backing_relief import KvBackingRelief
@@ -165,25 +171,25 @@ class TestFloorRowsClampedToOwnCap(unittest.TestCase):
             def _current_rows(self):
                 raise RuntimeError("no pool")
 
-        floor = KvBackingRelief._floor_rows(_Broken(), SPEC_FLOOR - 513)
-        self.assertEqual(floor, SPEC_FLOOR)
+        self.assertEqual(
+            KvBackingRelief._floor_rows(_Broken(), SPEC_FLOOR - 513), SPEC_FLOOR
+        )
 
-    def test_page_alignment_is_preserved_by_the_clamp(self):
-        """The cap must NOT divide the page evenly, or this proves nothing.
-
-        124928 / 64 = 1952 exactly, so a clamp that rounds UP and one that
-        rounds DOWN give the identical answer and the fixture cannot tell them
-        apart -- a mutation run caught exactly that. 124900 is deliberately
-        not a multiple of 64.
-        """
+    def test_page_alignment_is_preserved(self):
         cap = 124900
         self.assertNotEqual(cap % 64, 0, "fixture must be non-divisible")
         fn, stub = self._rung(cap=cap, page=64)
         floor = fn(stub, SPEC_FLOOR)
         self.assertEqual(floor % 64, 0)
-        # DOWN, never up: a floor above the backing is the defect itself.
-        self.assertLessEqual(floor, cap)
-        self.assertEqual(floor, 124864)
+        self.assertGreaterEqual(floor, SPEC_FLOOR)
+
+    def test_the_floor_never_drops_below_the_live_set(self):
+        """The invariant 792 protects, asserted here directly so this file
+        cannot drift back toward the clamp."""
+        for cap in (1, 1000, PP_BACKED[1], PP_BACKED[0]):
+            fn, stub = self._rung(cap=cap)
+            max_live = 128036
+            self.assertGreater(fn(stub, max_live), max_live)
 
 
 if __name__ == "__main__":

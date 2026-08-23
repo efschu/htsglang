@@ -1534,45 +1534,54 @@ class KvBackingRelief:
             int(max_live) + 1 + self._margin_rows + self._admission_reserve_rows,
         )
         floor = int(math.ceil(floor / page) * page)
-        # #770/#812: DERIVE THE FLOOR AGAINST THIS RANK'S OWN CAP.
+        # #770/#812: DETECT AND NAME AN UNDER-BACKED RANK. DO NOT "FIX" IT HERE.
         #
-        # Every term above is absolute -- a high-water mark plus two constants
-        # -- and none of them knows how many rows this rank actually has. On an
-        # uneven fleet the live set is replicated (under PP a request's tokens
-        # occupy KV on EVERY stage) while the CAPS are not, so an absolute
-        # floor that is comfortable on a roomy rank lands above a lean rank's
-        # entire pool. Measured 06:32:05: floor 128549 on all three ranks
-        # against backed rows 212992 / 124928 / 133120 -- 102.9% on PP1.
+        # A FIRST VERSION OF THIS CLAMPED THE FLOOR DOWN TO THE CAP, and that
+        # was WRONG in the dangerous direction. The floor is `live set + 1 +
+        # margin + reserve`; lowering it to a cap that sits BELOW that value
+        # does not make the rank able to shrink, it authorises a cap below rows
+        # that are still in use. `test_residency_cap_flip_levelling_792
+        # ::TheLevellingMustNotCapBelowTheLiveSet` exists for exactly this and
+        # failed on the clamp while passing on the unclamped code -- the tree
+        # already knew, and the invariant is older than this ticket.
         #
-        # A floor above the rank's own cap is arithmetically meaningless: rows
-        # that are not backed cannot be reserved. Clamping it here keeps the
-        # quantity honest at the point it is COMPUTED, so the proportion built
-        # from it in `_floor_ppm` can never exceed 100% by construction rather
-        # than by a downstream `min()`. The condition is a defect about THIS
-        # rank's backing and is reported as one -- see floor_exceeds_local_cap
-        # -- never propagated as a capacity verdict for peers
-        # (kein-bindender-rang).
+        # So the floor STAYS. What changes is that the condition stops being
+        # invisible: a floor above this rank's own backing means the live set
+        # plus the admission reserve does not FIT the rows it has, which is a
+        # defect about THIS rank's backing whose only real answers are to grow
+        # the backing or to change what the group agrees on. Neither is
+        # available to a local floor computation, and pretending otherwise is
+        # how a correctness invariant gets traded for a funding win.
+        #
+        # It must still never propagate as a capacity verdict for peers
+        # (kein-bindender-rang): see floor_exceeds_local_cap and the caller
+        # that reports it.
+        #
+        # The measured shape, 06:32:05: floor 128549 on all three ranks --
+        # correct, the live set is replicated under PP -- against backed rows
+        # 212992 / 124928 / 133120, i.e. 102.9% of PP1's own cap.
+        #
         cap = 0
         try:
             cap = int(self._current_rows())
         except Exception:  # noqa: BLE001 - a floor must not raise
             cap = 0
-        if cap > 0 and floor > cap:
+        if floor_exceeds_local_cap(floor, cap):
             logger.warning(
-                "%s UNDER-BACKED RANK: computed floor %d rows exceeds the %d "
-                "rows this rank has backed (%.1f%% of its own cap). The live "
-                "set plus the admission reserve does not fit the backing. "
-                "Clamping the floor to the cap: an unbacked row cannot be "
-                "reserved. This is a defect about THIS rank's backing -- the "
-                "answer is to grow it -- and it must never be read as a "
-                "capacity verdict for peers, which under a proportional "
-                "agreement is exactly how it would otherwise freeze the group.",
+                "%s UNDER-BACKED RANK: floor %d rows exceeds the %d rows this "
+                "rank has backed (%.1f%% of its own cap). The live set plus the "
+                "admission reserve does not fit the backing. The floor is NOT "
+                "lowered -- capping below the live set would authorise a cap "
+                "over rows still in use -- so this rank simply has nothing to "
+                "give. That is a defect about THIS rank's backing, whose answer "
+                "is to grow it; it must never be read as a capacity verdict for "
+                "peers, which under a proportional agreement is exactly how it "
+                "would otherwise freeze the group.",
                 LOG_PREFIX,
                 floor,
                 cap,
                 100.0 * floor / cap,
             )
-            floor = int(math.floor(cap / page) * page)
         return int(floor)
 
     # -- #662: the watermark actuator -------------------------------------

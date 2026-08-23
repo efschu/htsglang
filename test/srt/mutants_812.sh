@@ -45,41 +45,35 @@ cp "$BAK" "$MOD"; run_suite
 echo
 echo "=== mutants ==="
 
-# MA1 -- THE ONE THE OPERATOR NAMED: the floor goes back to being ABSOLUTE,
-# i.e. never derived against the rank's own cap. PP1's 102.9% returns.
-mutate MA1-floor-absolute-again \
-  '        if cap > 0 and floor > cap:' \
-  '        if False:'
+# MA1 -- THE DANGEROUS ONE: the floor is lowered to the cap. This is the fix I
+# first shipped and had to withdraw -- it authorises a cap BELOW the live set,
+# which test_residency_cap_flip_levelling_792 exists to forbid.
+mutate MA1-floor-lowered-to-cap \
+  '        if floor_exceeds_local_cap(floor, cap):' \
+  '        if floor_exceeds_local_cap(floor, cap) and setattr(self, "_x", 0) is None and (floor := cap) is not None:'
 
-# MA2 -- the clamp overshoots and reports a FULL pool as under-backed, which
-# would turn a healthy rank into a defect report.
+# MA2 -- the detector reports a FULL pool as under-backed, turning a healthy
+# rank into a defect report.
 mutate MA2-healthy-misread-as-defect \
   'return int(current_rows) > 0 and int(floor_rows) > int(current_rows)' \
   'return int(current_rows) > 0 and int(floor_rows) >= int(current_rows)'
 
-# MA3 -- the clamp is applied but rounds UP past the cap, so the floor still
-# exceeds the backing by up to one page.
-mutate MA3-clamp-rounds-up-past-cap \
-  'floor = int(math.floor(cap / page) * page)' \
-  'floor = int(math.ceil(cap / page) * page)'
+# MA3 -- the detector goes silent, which is the state before this ticket: an
+# under-backed rank freezes the group and nothing says why.
+mutate MA3-detector-always-false \
+  'return int(current_rows) > 0 and int(floor_rows) > int(current_rows)' \
+  'return False'
 
-# MA4 -- a broken cap probe silently clamps the floor to zero instead of
-# leaving it alone, which would let a rank shrink below its live set.
-mutate MA4-broken-probe-clamps-to-zero \
-  '            cap = 0
-        if cap > 0 and floor > cap:' \
-  '            cap = 1
-        if cap > 0 and floor > cap:'
+# MA4 -- the floor stops covering the live set by one row.
+mutate MA4-floor-off-by-one \
+  'int(max_live) + 1 + self._margin_rows + self._admission_reserve_rows,' \
+  'int(max_live) + 0 + self._margin_rows + self._admission_reserve_rows,'
 
 # MA5 IS AN EQUIVALENT MUTANT AND IS DELIBERATELY NOT RUN.
 #   Removing the `min(_SHRINK_SCALE, ...)` guard in _floor_ppm changes nothing
 #   observable: the early return already handles floor >= current, so the
 #   expression is only reached with floor < current, where
-#   ceil(floor*1e6/current) <= 999999 < _SHRINK_SCALE. Verified numerically
-#   across several (floor, current) pairs: max observed 999999.
-#   The guard is kept as defence-in-depth against a future edit to the early
-#   return, but a harness that lists an unkillable mutant reports a permanent
-#   false gap, so it is recorded here instead of run.
+#   ceil(floor*1e6/current) <= 999999 < _SHRINK_SCALE. Verified numerically.
 
 echo
 if [ "$survived" -eq 0 ]; then echo "ALL MUTANTS KILLED"; else echo "$survived MUTANT(S) SURVIVED"; fi
