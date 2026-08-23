@@ -211,6 +211,7 @@ from sglang.srt.managers.phase_purity import (
 # process without touching anything else (the instr-boot can-fail
 # discipline).
 from sglang.srt.managers import prefetch_ballot
+from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
@@ -4777,16 +4778,22 @@ class Scheduler(
             # matches. That is the measured cause of a pipeline deadlock, so
             # the condition should be readable from the boot log rather than
             # inferred from source months later.
-            if not getattr(self, "_uniform_floor_scope_logged", False):
-                self._uniform_floor_scope_logged = True
-                logger.info(
-                    "#788 UNIFORM-FLOOR SCOPE: tp_cpu_group world=%d -> floors OFF "
-                    "(evict/host/mamba). pp_size=%d tp_size=%d. With pp_size>1 the "
-                    "ranks that must agree are NOT in this reduce group.",
-                    0 if grp is None else int(torch.distributed.get_world_size(grp)),
-                    int(getattr(self.server_args, "pp_size", 1) or 1),
-                    int(getattr(self.server_args, "tp_size", 1) or 1),
-                )
+            # #824: REPORT THE TRANSITION, NOT THE FIRST SIGHTING. Under
+            # --enable-phase-flip this scope is not a boot constant:
+            # phase_flip_runtime rebuilds the TP group per phase
+            # (`want_tp_size = n if tp_phase else 1`), so the floors are ON
+            # through the TP decode phase and OFF through the PP prefill
+            # phase, switching at every cutover. The once-per-process latch
+            # this replaces meant a boot that flipped four times in 55 s
+            # reported its coverage once, at the first PP iteration, and never
+            # again -- so "off for the whole run" and "off for the prefill
+            # half of every cutover" read identically in the log, and coverage
+            # coming BACK was never reported at all.
+            uniform_floor_scope.report_scope(
+                self,
+                None if grp is None else int(torch.distributed.get_world_size(grp)),
+                logger,
+            )
             self._uniform_min_avail = local_avail
             self._uniform_budget_deficit = 0
             # One rank: nothing to diverge from, so the floor stays OFF and
@@ -4802,6 +4809,11 @@ class Scheduler(
             # the group decision, taken at the call site.
             self._uniform_corridor_width = None
             return
+        # #824: the ON side had no report at all, so coverage COMING BACK --
+        # every pp_to_tp cutover -- was invisible. Same call, same predicate.
+        uniform_floor_scope.report_scope(
+            self, int(torch.distributed.get_world_size(grp)), logger
+        )
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
         # `available_size() + evictable_size()` -- rank-LOCAL under uneven DCP,
