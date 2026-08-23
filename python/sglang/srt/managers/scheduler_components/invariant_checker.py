@@ -1101,22 +1101,80 @@ def create_admission_wedge_watchdog(
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
+    def pp_receive_is_overdue() -> bool:
+        """#821: is this rank parked in a blocking PP receive far too long?
+
+        THE BLINDNESS THIS CLOSES. `is_active` below used to read exactly two
+        things, and a PP rank wedged in a mandatory dict receive shows neither:
+        `forward_ct` cannot advance (no forward is running) and
+        `cur_batch_for_debug` carries the PREVIOUS pass's value, which is None
+        whenever that pass was idle -- and an idle pass is precisely what
+        precedes a rank that never gets its next admission decision. Every
+        assignment to `cur_batch_for_debug` on the PP path
+        (scheduler_pp_mixin.py:1567 / :1799 / :1950) happens AFTER that
+        receive, so there is no ordering in which the old predicate could have
+        seen this state. The watchdog therefore stayed inactive through the
+        one failure it was best placed to diagnose, which is why the #816
+        specimen ends without a watchdog line: no SIGQUIT, no py-spy dump, no
+        evidence -- just the launcher, 119.7s later.
+
+        WHY A DURATION AND NOT A FLAG, and this is the whole care in this
+        function. A healthy PP rank blocks in that receive on nearly every
+        pass, and an IDLE server blocks in it almost continuously -- the ring
+        is paced by those receives. A flag would therefore make `is_active`
+        permanently true on a healthy idle boot, where `forward_ct` is also
+        frozen by definition, and the watchdog would SIGQUIT a server whose
+        only sin is having no work. The threshold is the watchdog's OWN
+        timeout: this arm can only contribute once a single receive has
+        outlasted the entire budget the watchdog already grants a frozen
+        counter, which no legitimate pass approaches (a slow upstream forward
+        is bounded by that forward, orders of magnitude below it).
+
+        This adds no new deadline to the wire and touches no transport: it
+        reads a timestamp the receive already records, and its only effect is
+        to let an EXISTING backstop see an existing state.
+        """
+        since = getattr(scheduler, "_pp_blocked_recv_since", None)
+        if since is None:
+            return False
+        return (time.monotonic() - since) > watchdog_timeout
+
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
-        return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
-        )
+        batch = scheduler.cur_batch_for_debug
+        if batch is None:
+            # #821: NOT DEFENSIVE PADDING -- WITHOUT THIS THE NEW ARM IS WORSE
+            # THAN NO ARM. This function used to dereference
+            # `cur_batch_for_debug` unconditionally, which was safe only while
+            # `is_active` could not be true with it set to None. The overdue-
+            # receive arm above makes exactly that combination the common
+            # firing case, and an AttributeError raised here does not merely
+            # spoil the dump: `WatchdogRaw._watchdog_thread` catches it, logs
+            # "watchdog thread crashed", and RETURNS -- so the thread dies, the
+            # SIGQUIT is never sent, and the process loses its watchdog for
+            # good. A silent wedge would have been traded for a silent wedge
+            # with no watchdog left.
+            since = getattr(scheduler, "_pp_blocked_recv_since", None)
+            waited = "unknown" if since is None else f"{time.monotonic() - since:.1f}s"
+            return (
+                "no cur_batch (the previous pass was idle); this rank is "
+                f"parked in a blocking PP dict receive, waited={waited}. See "
+                "scheduler_pp_mixin.py's #821 marker in _pp_recv_typed_dict.\n"
+                + "\n".join(messages)
+            )
+        return f"{batch.batch_size()=}\n" f"{batch.reqs=}\n" + "\n".join(messages)
 
     return WatchdogRaw(
         debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
         is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+            scheduler.is_initializing
+            or scheduler.cur_batch_for_debug is not None
+            or pp_receive_is_overdue()
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,

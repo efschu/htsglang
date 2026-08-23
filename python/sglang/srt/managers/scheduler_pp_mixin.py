@@ -32,13 +32,13 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.io_struct import PhaseFlipReqInput
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.phase_flip_counters import (
     CHAN_DICT,
     CHAN_PASS,
     CHAN_REQ,
     CHAN_SLOT,
 )
-from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
@@ -4328,13 +4328,42 @@ class SchedulerPPMixin:
             started[0] = time.perf_counter()
 
         started = [time.perf_counter()]
-        tensor_dict = recv_typed_tensor_dict(
-            self.pp_group,
-            expected_kind,
-            src=None,
-            all_gather_group=all_gather_group,
-            on_message=_off_the_wire,
-        )
+        # #821: MARK THE ONE PLACE A PP RANK CAN DISAPPEAR SILENTLY.
+        #
+        # Every blocking dict receive in this file funnels through the call
+        # below -- proxy, output, and the mandatory admission decision alike.
+        # A rank parked here is doing nothing a counter can see: `forward_ct`
+        # is frozen and `cur_batch_for_debug` still holds whatever the PREVIOUS
+        # pass left, which on an idle-then-wedged rank is None. The scheduler
+        # watchdog's own activity predicate reads exactly those two
+        # (invariant_checker.py, `create_scheduler_watchdog`), so it concludes
+        # "not active" and never fires: the wedge produces no SIGQUIT, no
+        # py-spy dump, no log line -- only silence until a launcher tears the
+        # tree down. That is why the #816 specimen has no watchdog line in it.
+        #
+        # This timestamp is the missing input, and it is deliberately a
+        # TIMESTAMP rather than a boolean: a healthy PP rank is blocked here
+        # for a few milliseconds on almost every pass (that is how the ring
+        # paces itself), and an idle server is blocked here nearly all the
+        # time, so a boolean would make `is_active` permanently true on a
+        # perfectly healthy idle boot and the watchdog would SIGQUIT it. The
+        # reader decides what is too long; this only records since when.
+        #
+        # Cleared in `finally` so a receive that RAISES -- the gloo
+        # "Connection closed by peer" a dead peer produces, see
+        # test_pp_dead_peer_is_not_the_wedge_801.py -- does not leave a stale
+        # timestamp behind that would later read as a wedge.
+        self._pp_blocked_recv_since = time.monotonic()
+        try:
+            tensor_dict = recv_typed_tensor_dict(
+                self.pp_group,
+                expected_kind,
+                src=None,
+                all_gather_group=all_gather_group,
+                on_message=_off_the_wire,
+            )
+        finally:
+            self._pp_blocked_recv_since = None
         if expected_kind == "default":
             logger.warning_once(
                 f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
