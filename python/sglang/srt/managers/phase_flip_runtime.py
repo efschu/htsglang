@@ -6117,8 +6117,49 @@ class PhaseFlipRuntime:
                 if bool(getattr(self, "armed_idle_locked", False))
                 else ""
             )
+            + self._arming_floor_advice()
             + self._kv_rung_verdict()
         )
+
+    def _arming_floor_advice(self) -> str:
+        """#770 Defect A: withdraw the retry advice when it names a forbidden state.
+
+        "the flip is retried when occupancy drops" is sound advice only while
+        the watermark is reachable at all. On the shipped constants it is not:
+        the gate arms at band floor 819 + seam entry reserve 512 = 1331 MiB and
+        wants a further 192 MiB margin, against a corridor band that tops out
+        at 1229 MiB. A card filled INSIDE its own acceptance band is 294 MiB
+        short by construction, so occupancy dropping far enough to clear the
+        watermark means leaving the band from above -- which is precisely the
+        state the corridor law calls a failed boot acceptance.
+
+        Telling an operator to wait for that is worse than saying nothing: it
+        describes the wait as normal when no amount of waiting can end it, and
+        18f measured exactly that (draining the load did not lift the lock).
+
+        Never raises: advice that cannot be computed is simply not given.
+        """
+        try:
+            from sglang.srt.managers import corridor_guard as cg
+            from sglang.srt.managers.funding_authority import solve_arming_floor
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                DEFAULT_ARMING_MARGIN_MIB,
+            )
+
+            sol = solve_arming_floor(
+                cg.corridor_band_floor_mib(),
+                cg.corridor_band_ceiling_mib(),
+                cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+                DEFAULT_ARMING_MARGIN_MIB,
+            )
+            if sol.satisfiable:
+                return ""
+            return (
+                f"RETRACTION OF THE RETRY ADVICE ABOVE -- waiting cannot work "
+                f"here: {sol.detail} "
+            )
+        except Exception:  # noqa: BLE001 - advice must not raise
+            return ""
 
     #: Minimum seconds between arm ATTEMPTS on one direction while a damper is
     #: standing down. Not a latch: it paces re-pricing, it never stops it, and
@@ -6894,7 +6935,81 @@ class PhaseFlipRuntime:
                 )
         else:
             self._corridor_pp_refusals = 0
-        return f"corridor gate refused the seam staging: {verdict.detail}"
+        return (
+            f"corridor gate refused the seam staging: {verdict.detail}"
+            f"{self._funding_post_census(int(ask_bytes))}"
+        )
+
+    def _funding_post_census(self, want_bytes: int) -> str:
+        """#770: name the posts a refusal considered, or say nothing at all.
+
+        STRICTLY OBSERVATIONAL. It takes no decision, spends nothing and
+        returns a suffix for the refusal line. The gate's verdict above is
+        already final by the time this runs.
+
+        It exists because ``reclaimed 0 MiB from [nothing]`` is three different
+        worlds in one string -- no providers, providers that paid zero, and a
+        funder that was never in the ladder's list -- and the specimen is the
+        third: the same second that printed ``[nothing]`` also printed
+        ``KV capacity is the funder`` with an exact draw. A reader could not
+        tell those apart, and on 2026-08-16 that cost a morning.
+
+        Like ``_staging_budget_census`` above, it must never raise: a refusal
+        that cannot explain itself is bad, and a refusal that CRASHES while
+        trying to is worse.
+        """
+        try:
+            from sglang.srt.managers.funding_authority import (
+                authority_from_seam_snapshot,
+            )
+            from sglang.srt.managers.phase_flip_spill import (
+                KV_BACKING_RELIEF_ATTR as _RUNG_ATTR,
+            )
+
+            cached = 0
+            try:
+                if torch.cuda.is_available():
+                    cached = int(
+                        torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+            sched = getattr(self, "_census_scheduler", None)
+            rung = getattr(sched, _RUNG_ATTR, None) if sched is not None else None
+            slack_rows = 0
+            row_bytes = 0
+            granule_rows = 0
+            if rung is not None:
+                # THE REAL ACCESSORS, verified against kv_backing_relief.py --
+                # `_last_proposal_terms` (:1036, keys `current`/`floor_rows`),
+                # `_bytes_per_row` and `_min_release_rows()` (:1375). Guessed
+                # attribute names would have been swallowed by the except below
+                # and left this census permanently silent, which is the exact
+                # failure shape the draft-weights provider comment warns about:
+                # inert, and indistinguishable in a log from never being needed.
+                terms = getattr(rung, "_last_proposal_terms", None)
+                if terms:
+                    slack_rows = max(
+                        0, int(terms["current"]) - int(terms["floor_rows"])
+                    )
+                row_bytes = int(getattr(rung, "_bytes_per_row", 0) or 0)
+                try:
+                    granule_rows = int(rung._min_release_rows())
+                except Exception:  # noqa: BLE001
+                    granule_rows = 0
+
+            auth = authority_from_seam_snapshot(
+                allocator_cache_bytes=cached,
+                kv_slack_rows=slack_rows,
+                row_bytes=row_bytes,
+                kv_granule_rows=granule_rows,
+                rank=int(getattr(self, "_rank", 0) or 0),
+            )
+            v = auth.can_fund(int(want_bytes))
+            return f". #770 FUNDING POSTS: {v.describe()}"
+        except Exception:  # noqa: BLE001 - a census must not raise
+            return ""
 
     def _seam_funding_verdict(self, staging_bytes: int, direction: str, **kw) -> str:
         """The gate's verdict, with #662-F4's per-direction injection on top.
