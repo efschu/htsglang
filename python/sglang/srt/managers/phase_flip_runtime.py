@@ -994,6 +994,55 @@ def _live_reqs(scheduler) -> List:
     return out
 
 
+def _resident_rows(scheduler) -> Optional[set]:
+    """KV rows held by RESIDENT REQUESTS -- the census's missing owner (#822).
+
+    THE DEFECT THIS CLOSES, stated as the specimen states it.
+    ``_pool_census`` names three owners: the allocator's free lists, the radix
+    tree, and the cap's withheld band. A row that is none of those is printed
+    as ``unaccounted``. But there is a fourth holder, and it is the most
+    ordinary one on the stack: a row handed to an in-flight request is out of
+    the free lists and not yet in the tree. It is OWNED, by that request, and
+    the census had no term for it.
+
+    boot_window1_0823_1204 shows the shape with nothing else moving. The FIRST
+    census of the boot, before any cutover, printed ``unaccounted=122 [1..12]``
+    against ``resident_reqs=1`` -- one live request, 122 rows, and every one of
+    them read as a leak. That is not accretion; it is the working set.
+
+    AND IT REFUTES THE RATCHET READING. The same boot's censuses go
+    122 -> 122 -> 122 -> 0 -> 0 -> 0 (12:09:02 onward, all three ranks) and
+    then up again as load returns. An unaccounted population that returns to
+    zero is not a leak that never comes back; it tracks what requests hold.
+    Naming the owner is what tells the two apart, which is the whole of #822.
+
+    Returns ``None`` when the enumeration cannot be trusted -- no request pool,
+    or a read that raised. ``None`` means "no verdict", NOT "no rows": handing
+    an empty set to the authority would declare an owner that holds nothing and
+    turn the working set back into a leak, which is the defect with an extra
+    step. The skip rules mirror ``build_flip_live_slots_fn`` exactly (a request
+    with no ``req_pool_idx`` owns no row in ``req_to_token``), because two
+    enumerations of "which rows does this request hold" that can disagree is
+    the shape #822 exists to end.
+    """
+    try:
+        pool = getattr(scheduler, "req_to_token_pool", None)
+        req_to_token = getattr(pool, "req_to_token", None)
+        if req_to_token is None:
+            return None
+        rows: set = set()
+        for req in _live_reqs(scheduler):
+            n = int(getattr(req, "seqlen", 0) or 0)
+            if n <= 0:
+                continue
+            if getattr(req, "req_pool_idx", None) is None:
+                continue
+            rows.update(int(r) for r in req_to_token[req.req_pool_idx, :n].tolist())
+        return rows
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        return None
+
+
 def _probe_allocated_extent(scheduler, reqs) -> None:
     """#631 defect J: MEASURE the gap between what the allocator owns and
     what this enumeration covers. Does not change what is moved.
@@ -4038,6 +4087,13 @@ class PhaseFlipRuntime:
             )
 
             authority = authority_for(self, exposed=int(size))
+            # #822 root A: the fourth owner. Rows held by in-flight requests
+            # are in neither free list nor tree, and without this term every
+            # one of them reads as unowned -- 122 rows against one resident
+            # request on the first census of boot_window1_0823_1204, before
+            # anything had moved. None means the enumeration had no verdict,
+            # and is passed through as such rather than as an empty owner.
+            resident = _resident_rows(self._census_scheduler)
             audit_pool_census(
                 authority,
                 exposed=int(size),
@@ -4045,6 +4101,7 @@ class PhaseFlipRuntime:
                 free_rows=free,
                 cached_rows=cached,
                 withheld_rows=withheld,
+                resident_rows=None if resident is None else {"requests": resident},
                 why=str(why),
             )
         except Exception:  # noqa: BLE001 -- an instrument, never a gate

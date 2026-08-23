@@ -228,6 +228,437 @@ class TestOwnershipLaw(CustomTestCase):
         self.assertEqual(auth.audit(), [])
 
 
+class TestBackingAboveTheIdSpace(CustomTestCase):
+    """#822 root B: rows BACKED above the id space have no owner to have.
+
+    THE SPECIMEN, and it is an exact one. boot_window1_0823_1204, census at
+    12:09:10 (post-cutover tp_to_pp), reported on ALL THREE ranks identically::
+
+        [exclusivity] 1773 rows belong to no enumerated owner,
+        sample=[471315..471322]
+
+    while the census on the same line read ``size=471314``. An owner was
+    enumerating ids ABOVE the pool size -- except no owner was. The authority
+    was: :meth:`RowOwnershipAuthority.audit` ranged the unowned question over
+    ``range(reserved, committed)`` with no upper bound from ``exposed``, and
+    the measured backing (``KvBackingRelief._current_rows()``,
+    phase_flip_runtime.py:4019) is a PAGE-ROUNDED row count that legitimately
+    exceeds the allocator's id space.
+
+    Backing 473088 against an id space of 471314 puts ids 471315..473087 --
+    exactly 1773 of them -- inside the ranged set and inside no owner's claim,
+    because ``free_pages`` is ``arange(1, size + 1)`` and those ids are never
+    minted. Both logged magnitudes fall out of that one number:
+
+        12:09:10  unaccounted=0    -> exclusivity 1773  = 0   + 1773
+        12:08:33  unaccounted=122  -> exclusivity 1895  = 122 + 1773
+
+    and the 1895 line's ``sample=[1..8]`` is the low allocated-but-unenumerated
+    ids sorting ahead of the above-size band, which is why the shape read as
+    two different defects.
+
+    THE DIRECTION MATTERS AND IS NOT SYMMETRIC. exposed > committed is #816:
+    ids with no page behind them, a real crash root, LAW.EXPOSURE. committed >
+    exposed is slack backing: pages with no id in front of them. Nothing can
+    write to them and nothing can leak them. Reporting that as an ownership
+    violation inflates the exact counter #822 item 5 uses as its regression
+    metric, so the metric would have trended against a page-rounding artefact.
+    """
+
+    # Measured, boot_window1_0823_1204: ``size=`` on the census line.
+    SPECIMEN_EXPOSED = 471314
+    # Derived from the violation the same boot printed, and cross-checked
+    # against BOTH logged magnitudes below.
+    SPECIMEN_COMMITTED = 473088
+    SPECIMEN_ABOVE_SIZE = 1773
+
+    def _space(self):
+        return RowSpace(
+            exposed=self.SPECIMEN_EXPOSED, committed=self.SPECIMEN_COMMITTED
+        )
+
+    def test_page_rounded_backing_is_not_an_ownership_violation(self):
+        """Every MINTABLE id owned -> silent. This is the 12:09:10 census."""
+        space = self._space()
+        auth = RowOwnershipAuthority(space)
+        # The census's own two sets at 12:09:10: free=471162, cached=152.
+        # Together they are exactly the ids arange(1, size + 1) mints.
+        auth.declare("free_list", range(1, 471163))
+        auth.declare("radix_cache", range(471163, self.SPECIMEN_EXPOSED + 1))
+
+        self.assertEqual(auth.audit(), [])
+
+    def test_the_logged_1773_is_reproduced_by_the_unbounded_range(self):
+        """The red half: pin the defect's arithmetic, so the fix is provably it.
+
+        Ranging to ``committed`` with no ``exposed`` bound yields the logged
+        count AND the logged sample. Asserting the sample matters: 1773 could
+        be coincidence, ``[471315..471322]`` cannot.
+        """
+        space = self._space()
+        unbounded = set(range(space.reserved, space.committed))
+        mintable = set(range(space.reserved, space.exposed + 1))
+        above = sorted(unbounded - mintable)
+
+        self.assertEqual(len(above), self.SPECIMEN_ABOVE_SIZE)
+        self.assertEqual(above[:8], list(range(471315, 471323)))
+
+    def test_the_1895_census_decomposes_into_122_plus_the_band(self):
+        """The 12:08:33 census, which is the same defect plus a real hole.
+
+        free=471192 cached=0 withheld=0, and the census's own ``unaccounted``
+        was 122. The authority printed 1895. 1895 - 122 = 1773: one number
+        explains both lines, which is what makes it the root and not a
+        coincidence.
+        """
+        space = self._space()
+        auth = RowOwnershipAuthority(space)
+        # 122 low ids are allocated to live requests and enumerated by nobody
+        # -- the census's own ``unaccounted=122 [1..12]``.
+        held = set(range(1, 13)) | set(range(100, 210))
+        self.assertEqual(len(held), 122)
+        auth.declare(
+            "free_list",
+            sorted(set(range(1, self.SPECIMEN_EXPOSED + 1)) - held),
+        )
+
+        found = auth.audit()
+        unowned = only(found, Law.EXCLUSIVITY)
+        # After the fix the band is gone and only the genuine 122 remain.
+        self.assertEqual(unowned.rows, 122)
+        self.assertEqual(unowned.sample[:8], tuple(range(1, 9)))
+        # And the defect's number is exactly this plus the band.
+        self.assertEqual(unowned.rows + self.SPECIMEN_ABOVE_SIZE, 1895)
+
+    def test_the_exposure_direction_is_untouched(self):
+        """The #816 direction must still fire. A bound is not a mute button.
+
+        exposed > committed is the crash root; the fix only bounds the
+        OPPOSITE direction, and this is the mutant-facing proof that it did
+        not weaken the law it sits next to.
+        """
+        space = RowSpace(exposed=466994, committed=124928)
+        auth = RowOwnershipAuthority(space)
+        full_owner(auth, space)
+
+        found = auth.audit()
+        self.assertEqual(laws(found), {Law.EXPOSURE})
+        self.assertEqual(only(found, Law.EXPOSURE).rows, 342066)
+
+    def test_the_highest_minted_id_is_inside_the_law(self):
+        """Mutant killer: ``min(committed, exposed)`` instead of ``exposed + 1``.
+
+        That off-by-one passes every other test in this class, because the one
+        id it stops checking is the LAST one and the other cases own it. It is
+        not cosmetic: ``arange(1, size + 1)`` mints ``size`` itself, and row
+        ``size`` going unowned is a leak the law would then never see. So the
+        boundary is asserted directly, from the side that can only be wrong.
+        """
+        space = self._space()
+        auth = RowOwnershipAuthority(space)
+        # Everything owned EXCEPT the single highest minted id.
+        auth.declare("free_list", range(1, self.SPECIMEN_EXPOSED))
+
+        found = auth.audit()
+        unowned = only(found, Law.EXCLUSIVITY)
+        self.assertEqual(unowned.rows, 1)
+        self.assertEqual(unowned.sample, (self.SPECIMEN_EXPOSED,))
+
+    def test_a_hole_below_the_id_space_still_reads_as_unowned(self):
+        """Can-fail proof: the bound must not swallow a REAL unowned set.
+
+        Same over-backed space, but 500 mintable ids owned by nobody. If the
+        bound were implemented as "skip the check when committed > exposed",
+        this test goes green-by-blindness and #814 stops being caught in every
+        page-rounded boot -- which is every boot.
+        """
+        space = self._space()
+        auth = RowOwnershipAuthority(space)
+        hole = set(range(9000, 9500))
+        auth.declare(
+            "free_list",
+            sorted(set(range(1, self.SPECIMEN_EXPOSED + 1)) - hole),
+        )
+
+        found = auth.audit()
+        self.assertEqual(only(found, Law.EXCLUSIVITY).rows, 500)
+
+
+class TestTheCensusIntegerCannotSeeDoubleOwnership(CustomTestCase):
+    """#822 root A: why ``unaccounted`` was never going to find this.
+
+    THE CENSUS'S OWN ARITHMETIC, ``phase_flip_runtime.py:3906``::
+
+        leaked = set(range(1, size + 1)) - free - cached - withheld
+
+    Set SUBTRACTION. A row in both ``free`` and ``cached`` is removed once and
+    contributes nothing, so the overlap is invisible to the integer by
+    construction -- not by oversight, and no amount of trending it would have
+    surfaced the shape. It took a law that asks whether the claims PARTITION
+    the space.
+
+    THE SPECIMEN, boot_window1_0823_1204, PP0. Three censuses printed both an
+    ``unaccounted`` figure and (through the #822 authority) a double-ownership
+    count whose owner pair was ALWAYS exactly ``('free_list','radix_cache')``,
+    never any other pair. Those two numbers are not independent: given the
+    census line's own ``size``/``free``/``cached``/``withheld``/``unaccounted``,
+    the overlap is forced::
+
+        |free| + |cached| + |withheld| - |union|,  |union| = size - unaccounted
+
+    and it reproduces all three logged counts exactly (16384 / 16211 / 8396).
+    That is what makes "rows are in the allocator's free lists AND in the radix
+    tree at the same instant" a measurement rather than an interpretation.
+
+    WHAT IT MEANS ON METAL. A row the allocator believes is free while the
+    radix cache still references its KV is handed to the next request, which
+    writes over a live prefix. Silent corruption, not a crash -- which is why
+    it survived a boot that was otherwise being watched closely.
+
+    AND THE SECOND DEFECT IN THE SAME FAMILY. PP1/PP2 at 12:09:34 read
+    free=436344 cached=16857 withheld=0 unaccounted=18113, whose overlap is
+    EXACTLY ZERO. The peers are duplicate-free and still carry 18113 unowned
+    rows. Two shapes, two causes, one ticket: the double claim is PP0's, and
+    the unowned population is everyone's.
+    """
+
+    SIZE = 471314
+
+    # (label, free, cached, withheld, unaccounted, double-claimed as logged)
+    SPECIMEN_PP0 = (
+        ("12:09:14 at-arm pp_to_tp", 445743, 16491, 0, 25464, 16384),
+        ("12:09:22 at-arm tp_to_pp", 110301, 16502, 344338, 16384, 16211),
+        ("12:09:34 at-arm pp_to_tp", 444332, 16502, 0, 18876, 8396),
+    )
+    # The duplicate-free peer at the same instant as the third PP0 row.
+    SPECIMEN_PP1 = ("12:09:34 PP1", 436344, 16857, 0, 18113, 0)
+
+    @staticmethod
+    def _overlap(size, free, cached, withheld, unaccounted):
+        """The census line's numbers, solved for the size of the overlap."""
+        union = size - unaccounted
+        return free + cached + withheld - union
+
+    def test_every_logged_double_claim_falls_out_of_its_census_line(self):
+        for label, free, cached, withheld, unaccounted, logged in self.SPECIMEN_PP0:
+            with self.subTest(label):
+                self.assertEqual(
+                    self._overlap(self.SIZE, free, cached, withheld, unaccounted),
+                    logged,
+                )
+
+    def test_the_peers_carry_the_unowned_rows_without_any_overlap(self):
+        label, free, cached, withheld, unaccounted, logged = self.SPECIMEN_PP1
+        self.assertEqual(
+            self._overlap(self.SIZE, free, cached, withheld, unaccounted), logged
+        )
+        self.assertEqual(logged, 0)
+        # ...and the unowned population is real and large on that same rank.
+        self.assertEqual(unaccounted, 18113)
+
+    def test_the_census_integer_is_blind_to_the_overlap(self):
+        """Two states the census CANNOT tell apart, and the law can.
+
+        Same allocator, same tree size, same ``unaccounted``. In one, the free
+        list and the tree are disjoint; in the other they share 50 rows and 50
+        further rows are owned by nobody to keep the integer identical. The
+        census subtraction reports the same number for both. This is the
+        can-fail proof that the authority is buying something the integer never
+        could.
+        """
+        size = 1000
+        withheld = set()
+
+        # A: disjoint. free 1..899, cached 900..949 -> union 949.
+        free_a = set(range(1, 900))
+        cached_a = set(range(900, 950))
+        # B: overlapping. The tree's 50 rows are ALSO still free-listed. The
+        # free list reaches 50 rows further so the UNION -- hence the census
+        # integer -- is identical to A's.
+        free_b = set(range(1, 950))
+        cached_b = set(range(850, 900))
+
+        leaked_a = set(range(1, size + 1)) - free_a - cached_a - withheld
+        leaked_b = set(range(1, size + 1)) - free_b - cached_b - withheld
+        self.assertEqual(len(leaked_a), len(leaked_b))  # the census cannot tell
+
+        def audit(free, cached):
+            space = RowSpace(exposed=size, committed=size)
+            auth = RowOwnershipAuthority(space)
+            auth.declare("free_list", free)
+            auth.declare("radix_cache", cached)
+            return auth.audit(expect_full_coverage=False)
+
+        # The law can: one is silent, the other names the pair.
+        self.assertEqual(audit(free_a, cached_a), [])
+        found = audit(free_b, cached_b)
+        self.assertEqual(only(found, Law.EXCLUSIVITY).rows, 50)
+
+    def test_the_owner_pair_is_named_not_just_counted(self):
+        """``('free_list','radix_cache')`` is the finding; a bare count is not.
+
+        The pair was invariant across every violation in the specimen, and that
+        invariance is what localised the defect to the allocator/tree seam
+        rather than to the cap or a resident set. So the detail must carry the
+        owner names, and this asserts it does.
+        """
+        space = RowSpace(exposed=1000, committed=1000)
+        auth = RowOwnershipAuthority(space)
+        auth.declare("free_list", range(1, 900))
+        auth.declare("radix_cache", range(850, 950))
+
+        found = only(auth.audit(expect_full_coverage=False), Law.EXCLUSIVITY)
+        self.assertEqual(found.rows, 50)
+        self.assertIn("free_list", found.detail)
+        self.assertIn("radix_cache", found.detail)
+
+
+class TestTheFourthOwner(CustomTestCase):
+    """#822 root A: rows held by in-flight requests are OWNED, not leaked.
+
+    THE SPECIMEN, and it is the cleanest one in the boot because nothing else
+    is moving. boot_window1_0823_1204, the FIRST census of the boot
+    (12:08:33, at-arm pp_to_tp, before any cutover), on all three ranks::
+
+        size=471314 free=471192 cached=0 withheld=0
+        cur_slot_reqs=1 resident_reqs=1 unaccounted=122 [1..12]
+
+    One resident request. 122 rows. 471314 - 471192 = 122 exactly. Every row
+    that request was holding was printed as unaccounted, because
+    ``_pool_census`` names three owners -- free lists, radix tree, cap band --
+    and a row handed to an in-flight request is in none of them.
+
+    AND THIS REFUTES THE RATCHET READING OF THE SAME LOG. The censuses run
+    122 -> 122 -> 122 -> 0 -> 0 -> 0 (12:09:02 onward, all three ranks) and
+    then rise again with load. A population that returns to zero is not a leak
+    that never comes back; it is the working set, and it was never possible to
+    tell the two apart while the owner had no name. Naming it is the whole of
+    #822.
+    """
+
+    SIZE = 471314
+    FREE = 471192
+    RESIDENT = 122
+    # The pool holds ``size + 1`` physical rows: ids are ``arange(1, size + 1)``
+    # and row 0 is the cuda-graph padding row, so a fully-backed pool commits
+    # one more row than it mints. Using ``committed = SIZE`` here instead makes
+    # LAW.COVERAGE fire on the single id ``SIZE`` -- a genuine boundary
+    # disagreement between ``r >= committed`` (coverage) and
+    # ``exposed - committed`` (exposure), which is carried as its own item and
+    # deliberately NOT papered over by weakening either law.
+    COMMITTED = SIZE + 1
+
+    def _audit(self, resident_rows):
+        from sglang.srt.mem_cache.kv_row_ownership import (
+            RowOwnershipAuthority,
+            audit_pool_census,
+        )
+
+        auth = RowOwnershipAuthority(
+            RowSpace(exposed=self.SIZE, committed=self.COMMITTED)
+        )
+        held = set(range(1, self.RESIDENT + 1))
+        self.assertEqual(len(held), self.RESIDENT)
+        free = sorted(set(range(1, self.SIZE + 1)) - held)
+        self.assertEqual(len(free), self.FREE)
+        return auth, audit_pool_census(
+            auth,
+            exposed=self.SIZE,
+            committed=self.COMMITTED,
+            free_rows=free,
+            cached_rows=(),
+            withheld_rows=(),
+            resident_rows=resident_rows,
+            why="at-arm pp_to_tp",
+        )
+
+    def test_the_working_set_is_a_leak_while_the_owner_has_no_name(self):
+        """The RED half: this is exactly what the boot printed, 122 and all."""
+        auth = RowOwnershipAuthority(
+            RowSpace(exposed=self.SIZE, committed=self.COMMITTED)
+        )
+        held = set(range(1, self.RESIDENT + 1))
+        auth.declare("free_list", sorted(set(range(1, self.SIZE + 1)) - held))
+        auth.declare("radix_cache", ())
+
+        unowned = only(auth.audit(), Law.EXCLUSIVITY)
+        self.assertEqual(unowned.rows, self.RESIDENT)
+        self.assertEqual(unowned.sample, tuple(range(1, 9)))
+
+    def test_naming_the_owner_makes_the_census_silent(self):
+        """Same rows, same numbers, one more declared owner -> lawful."""
+        _, found = self._audit({"requests": range(1, self.RESIDENT + 1)})
+        self.assertEqual(found, [])
+
+    def test_no_enumeration_is_unanswerable_not_a_leak(self):
+        """``None`` must suppress the unowned verdict, and ``{}`` must not.
+
+        THE DISTINCTION IS THE WHOLE POINT. ``None`` says "I could not
+        enumerate that owner", and then "this row belongs to nobody" is
+        unanswerable. ``{}`` asserts requests hold NO rows, which republishes
+        the entire working set as a leak -- the defect with an extra step. A
+        checker that treated them alike would have been the #814 reading again
+        under a new name.
+        """
+        _, silent = self._audit(None)
+        self.assertEqual(silent, [])
+
+        _, loud = self._audit({})
+        self.assertEqual(only(loud, Law.EXCLUSIVITY).rows, self.RESIDENT)
+
+    def test_a_stale_resident_claim_cannot_vouch_for_returned_rows(self):
+        """``declare`` overwrites, never removes -- so an unrefreshed claim lies.
+
+        Census 1 enumerates the requests. Census 2 cannot. If the old claim
+        survived, its rows would still read as owned and a genuine hole
+        underneath would be invisible. This is the can-fail proof that the
+        withdrawal happens.
+        """
+        auth, _ = self._audit({"requests": range(1, self.RESIDENT + 1)})
+        self.assertIn("resident:requests", auth.owners())
+
+        from sglang.srt.mem_cache.kv_row_ownership import audit_pool_census
+
+        audit_pool_census(
+            auth,
+            exposed=self.SIZE,
+            committed=self.COMMITTED,
+            free_rows=range(1, self.SIZE + 1),
+            cached_rows=(),
+            withheld_rows=(),
+            resident_rows=None,
+            why="pre-cutover pp_to_tp",
+        )
+        self.assertNotIn("resident:requests", auth.owners())
+
+    def test_a_resident_row_still_in_the_free_list_is_a_double_claim(self):
+        """The new owner must not become a way to HIDE a defect.
+
+        A row an allocator believes is free while a request is writing to it is
+        the same silent corruption as the free_list/radix_cache pair. Adding
+        the fourth owner has to make that MORE visible, not less.
+        """
+        from sglang.srt.mem_cache.kv_row_ownership import (
+            RowOwnershipAuthority,
+            audit_pool_census,
+        )
+
+        auth = RowOwnershipAuthority(RowSpace(exposed=1000, committed=1000))
+        found = audit_pool_census(
+            auth,
+            exposed=1000,
+            committed=1000,
+            free_rows=range(1, 1000),  # everything free...
+            cached_rows=(),
+            withheld_rows=(),
+            resident_rows={"requests": range(1, 51)},  # ...and 50 in use
+            why="at-arm",
+        )
+        doubled = only(found, Law.EXCLUSIVITY)
+        self.assertEqual(doubled.rows, 50)
+        self.assertIn("resident:requests", doubled.detail)
+
+
 class TestCoverageLaw(CustomTestCase):
     """#717/#722: no live row may sit at or above the committed backing."""
 
@@ -524,6 +955,72 @@ class TestCallSiteAdapters(CustomTestCase):
         rt._retire_row_id_space("pp_to_tp")
         self.assertEqual(auth.epoch, 1)
         self.assertEqual(auth.owners(), ())
+
+    def test_the_resident_enumerator_reaches_the_real_request_rows(self):
+        """``_resident_rows`` is production code, so it is EXECUTED here.
+
+        The helper is what turns the working set from a leak into an owner, and
+        a helper that is only reasoned about is the desk-written-never-executed
+        class. So: a scheduler shaped like the real one, and the rows the
+        requests actually hold come back.
+
+        The skip rules are asserted alongside the happy path, because they are
+        the half that can be silently wrong: a request admitted before its slot
+        is allocated has ``req_pool_idx is None`` and owns no row in
+        ``req_to_token`` (indexing with ``None`` is numpy newaxis, which
+        changed the SHAPE and killed all three ranks on 2026-08-09), and a
+        zero-length request owns nothing either.
+        """
+        import torch
+
+        from sglang.srt.managers.phase_flip_runtime import _resident_rows
+
+        # req_to_token[i, :n] -> the rows request i holds.
+        table = torch.zeros((4, 8), dtype=torch.int64)
+        table[0, :3] = torch.tensor([11, 12, 13])
+        table[1, :2] = torch.tensor([21, 22])
+        table[2, :4] = torch.tensor([31, 32, 33, 34])
+
+        def req(idx, seqlen, rid="r"):
+            return type(
+                "Req", (), {"req_pool_idx": idx, "seqlen": seqlen, "rid": rid}
+            )()
+
+        mb = type("MB", (), {})()
+        mb.reqs = [
+            req(0, 3),
+            req(1, 2),
+            req(None, 5, "no-slot"),  # admitted, no slot yet -> owns nothing
+            req(2, 0, "empty"),  # zero-length -> owns nothing
+        ]
+        scheduler = type("Sched", (), {})()
+        scheduler.running_mbs = [mb]
+        scheduler.req_to_token_pool = type("Pool", (), {"req_to_token": table})()
+
+        self.assertEqual(_resident_rows(scheduler), {11, 12, 13, 21, 22})
+
+    def test_the_resident_enumerator_returns_none_when_it_cannot_answer(self):
+        """No request pool -> ``None``, never an empty set.
+
+        This is the distinction the adapter turns into "unanswerable" rather
+        than "the requests hold nothing". Returning ``set()`` here would make
+        every census on a scheduler without a pool report the whole working set
+        as unowned, which is the #814 reading restored.
+        """
+        from sglang.srt.managers.phase_flip_runtime import _resident_rows
+
+        self.assertIsNone(_resident_rows(type("Sched", (), {})()))
+
+        # THE OTHER DIRECTION, AND IT IS NOT THE SAME ANSWER. With a pool
+        # present and NO live requests, the empty set is the honest verdict --
+        # the requests really do hold nothing, and every committed row really
+        # should have another owner. Only an enumeration that could not be
+        # PERFORMED yields None. Collapsing these two would either hide a real
+        # leak at idle or invent one under load.
+        idle = type("Sched", (), {})()
+        idle.running_mbs = []
+        idle.req_to_token_pool = type("Pool", (), {"req_to_token": object()})()
+        self.assertEqual(_resident_rows(idle), set())
 
     def test_cutover_retires_before_the_post_cutover_census(self):
         """Order is load-bearing, so pin it against a reordering refactor.
