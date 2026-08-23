@@ -3738,6 +3738,31 @@ class PhaseFlipRuntime:
                 sorted(leaked)[:12],
             )
             self._census_owner_probe(when, direction, alloc, tree, leaked)
+            # #822: the same three sets, asked as a LAW instead of printed as
+            # an integer. `unaccounted` above cannot distinguish a leak from an
+            # unenumerated owner from an over-exposed id space -- and those are
+            # #814, the owner probe's ~94000 rows, and #816 respectively. The
+            # authority names which one it is, over the COMMITTED backing.
+            #
+            # GUARDED SEPARATELY, AND THE ATTRIBUTE LOOKUP IS PART OF WHAT IS
+            # GUARDED. The rule "a census must never affect the flip it is
+            # watching" extends one level down: an auditor must never affect
+            # the census it rides on. `_census_ownership_audit` has its own
+            # try/except, but that protects only its BODY -- an unbound
+            # `self` (this function is exercised bound to a plain namespace)
+            # raises AttributeError before the body is entered, which lands in
+            # the census's own handler and replaces its line with a failure
+            # message. Measured: six #814 census tests went red on exactly
+            # that, and the census's whole reason to exist is to still say
+            # something when the thing around it is broken.
+            try:
+                audit = getattr(self, "_census_ownership_audit", None)
+                if audit is not None:
+                    audit(f"{when} {direction}", alloc, size, free, cached, withheld)
+            except Exception:  # noqa: BLE001 -- an instrument, never a gate
+                logger.debug(
+                    "%s census ownership audit skipped", LOG_PREFIX, exc_info=True
+                )
         except Exception as exc:  # noqa: BLE001 - a census never breaks a flip
             logger.warning("%s pool census (%s) failed: %s", LOG_PREFIX, when, exc)
 
@@ -3769,6 +3794,107 @@ class PhaseFlipRuntime:
             f"tree_id={id(tree_obj) if tree_obj is not None else None} "
             f"tree_type={type(tree_obj).__name__ if tree_obj is not None else None}"
         )
+
+    def _committed_backing_rows(self) -> Optional[int]:
+        """Rows PHYSICALLY BACKED right now, or None when it cannot be measured.
+
+        #822. The census has ``alloc.size`` -- the id space -- and nothing
+        else, which is why it could only ever report an integer. The measured
+        committed span lives on ``KvBackingRelief._current_rows``
+        (kv_backing_relief.py:1171), whose docstring is explicit that reading
+        ``pool.size`` in its place cost a boot on 2026-08-11.
+
+        Returns None rather than a guess. An unmeasurable backing must produce
+        "unanswerable", never "sound": substituting the id space here would
+        report the #816 state as healthy, which is the whole defect.
+        """
+        try:
+            from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+            relief = getattr(self._census_scheduler, KV_BACKING_RELIEF_ATTR, None)
+            if relief is None:
+                return None
+            rows = int(relief._current_rows())
+            return rows if rows > 0 else None
+        except Exception:  # noqa: BLE001 -- an instrument, never a gate
+            return None
+
+    def _census_ownership_audit(self, why, alloc, size, free, cached, withheld) -> None:
+        """Route one census reading through the #822 authority.
+
+        Read-only and best effort, under the same rule as the census that calls
+        it: an auditor must never be able to affect the flip it is watching.
+        The authority is attached to this runtime, so its EPOCH is the one the
+        cutover retires -- a census taken after a cutover therefore reports any
+        surviving pre-cutover claim as a retirement violation rather than as an
+        out-of-range row.
+        """
+        try:
+            from sglang.srt.mem_cache.kv_row_ownership import (
+                audit_pool_census,
+                authority_for,
+            )
+
+            authority = authority_for(self, exposed=int(size))
+            audit_pool_census(
+                authority,
+                exposed=int(size),
+                committed=self._committed_backing_rows(),
+                free_rows=free,
+                cached_rows=cached,
+                withheld_rows=withheld,
+                why=str(why),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument, never a gate
+            logger.debug("%s census ownership audit skipped", LOG_PREFIX, exc_info=True)
+
+    def _retire_row_id_space(self, direction) -> None:
+        """The cutover retires the whole old id space in ONE step (#822).
+
+        THE GENERALIZATION OF THE LINE BELOW IT. ``self._parked_extent = None``
+        (#746) and ``last_req_extent``'s layout tag (#802, 689161de77) each
+        clear ONE holder of a pre-cutover row id by hand, because
+        ``_active_layout_tag`` states the rule correctly -- "a row id only
+        means something relative to the pool it was enumerated in, so anything
+        that stores a row id across a possible cutover has to store WHICH pool
+        it came from" -- and then leaves every holder to obey it individually.
+        #796's id 344009 surviving against a TP cap of 212992 is what one
+        missed holder costs.
+
+        Enumerating holders is the thing that kept being incomplete, so this
+        does not enumerate them: it retires the SPACE. Every id minted before
+        this instant is unlawful by epoch afterwards, without being touched.
+
+        SCOPE, STATED HONESTLY. This arms the AUDIT: after it, a claim carrying
+        a pre-cutover stamp is reported as a retirement violation. It does not
+        yet REFUSE such an id at the allocator -- that is enforcement, it
+        belongs on the hot path, and it cannot be validated anywhere but on
+        metal under a real flip. Carried as an 18-lane window item, not claimed
+        here.
+        """
+        try:
+            from sglang.srt.mem_cache.kv_row_ownership import authority_for
+
+            alloc = getattr(self._census_scheduler, "token_to_kv_pool_allocator", None)
+            exposed = int(getattr(alloc, "size", 0) or 0)
+            committed = self._committed_backing_rows()
+            authority = authority_for(self, exposed=exposed)
+            dropped = authority.retire(
+                exposed=exposed,
+                committed=exposed if committed is None else committed,
+            )
+            logger.info(
+                "%s ID-SPACE RETIRED at %s cutover: epoch=%d dropped=%d "
+                "exposed=%d committed=%s",
+                LOG_PREFIX,
+                direction,
+                authority.epoch,
+                dropped,
+                exposed,
+                "unmeasured" if committed is None else committed,
+            )
+        except Exception:  # noqa: BLE001 -- an instrument, never a gate
+            logger.debug("%s id-space retirement skipped", LOG_PREFIX, exc_info=True)
 
     def _census_owner_probe(self, when, direction, alloc, tree, leaked) -> None:
         """Name every pool object, not just the census's own.
@@ -7900,6 +8026,20 @@ class PhaseFlipRuntime:
         movers_ms = (self._clock() - t_movers0) * 1000.0
         t_cutover0 = self._clock()
         self._cutover_fn(direction)
+        # #822: THE commit instant, so THE retirement instant. Placed here and
+        # not beside `self._epoch += 1` below on purpose: the post-cutover
+        # census on the next line must already run under the new id space, or
+        # a surviving pre-cutover claim reads as an out-of-range row instead of
+        # as the #796 shape it is.
+        # Guarded including the attribute lookup, for the reason spelled out at
+        # the census call site -- and more so here, because this is inside the
+        # no-return region: nothing this instrument does may raise into it.
+        try:
+            retire = getattr(self, "_retire_row_id_space", None)
+            if retire is not None:
+                retire(direction)
+        except Exception:  # noqa: BLE001 -- an instrument, never a gate
+            logger.debug("%s id-space retirement skipped", LOG_PREFIX, exc_info=True)
         seam_census.mark("cutover")
         self._pool_census("post-cutover", direction)
         cutover_ms = (self._clock() - t_cutover0) * 1000.0
