@@ -1358,6 +1358,19 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 self._pp_flip_pass_tick(mb_id)
+                # #824 W4(b): honour a slot restore requested by the falling
+                # edge above. Restart the body on that slot rather than
+                # advancing, so this rank re-enters the pipeline where it
+                # armed -- the same guarantee _pp_flip_hold_slot gives a
+                # window long enough to reach it. Cleared before the jump,
+                # and set only on a falling edge, so it fires once per
+                # abandoned window and cannot loop.
+                resume_slot = getattr(self, "_pp_flip_resume_slot", None)
+                if resume_slot is not None:
+                    self._pp_flip_resume_slot = None
+                    if int(resume_slot) != mb_id:
+                        mb_id = int(resume_slot)
+                        continue
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                 self._pp_forward_and_process_input_requests(recv_reqs)
@@ -2495,6 +2508,11 @@ class SchedulerPPMixin:
         /dev/shm file per pass, which is the same discipline and the same
         directory the presence gate already uses.
         """
+        # #824 W4a: the slot this rank is CURRENTLY on, published for the
+        # chain-stall drain, which needs a live mb_id to tell an owed proxy
+        # from a leftover one. Set before the enable test so it is accurate
+        # for every caller that can reach it.
+        self._pp_live_mb_id = mb_id
         if not getattr(self.server_args, "enable_phase_flip", False):
             return
         try:
@@ -2532,6 +2550,45 @@ class SchedulerPPMixin:
             return
         self._pp_flip_armed_passes = None
         arm_mb = getattr(self, "_pp_flip_arm_mb_id", None)
+
+        # #824 W4(b): AN ARMED WINDOW THAT RAN NO ITERATIONS MUST NOT MOVE
+        # THE SLOT. This is the case the note above predicted -- "an armed
+        # rank must not ADVANCE its slot loop while it is doing no pipeline
+        # work" -- and boot_827 is its measurement:
+        #
+        #   rank 0 ran 0 slot iteration(s) (armed at mb_id=0,
+        #                                   disarmed at mb_id=1)
+        #
+        # _pp_flip_hold_slot is what normally guarantees every rank resumes
+        # on the slot it armed on, but it only engages once the armed window
+        # has run the pipeline DRY, which takes pp_loop_size parked
+        # iterations. A window that ends sooner never reaches it. The rank
+        # then advances its slot for an iteration in which it admitted
+        # nothing -- an armed rank's _pull_raw_reqs returns [] without
+        # touching the request chain -- so the slot moved while the chain
+        # that PACES it did not. Ranks that abandoned on a different clock
+        # re-enter the pipeline on different slots, and from then on stage
+        # k's hidden states pair with stage k+1's batch by an index the two
+        # no longer agree on (#631 defect Q).
+        #
+        # Restoring the arm slot is safe precisely in this case and is not
+        # claimed beyond it: with passes == 0 the rank launched no work
+        # (get_next_batch_to_run returns None while a flip is pending) and
+        # made no drain progress, so the slot it is sent back to is the one
+        # it was parked on. Longer windows keep going through the hold.
+        if passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id):
+            self._pp_flip_resume_slot = int(arm_mb)
+            logger.warning(
+                "%s SLOT RESTORE: the armed window ran 0 slot iterations and "
+                "abandoned at mb_id=%d after arming at mb_id=%s, so the hold "
+                "never engaged. Returning this rank to the slot it armed on; "
+                "without it the slot advances while the request chain that "
+                "paces it does not, and the ranks resume on different slots "
+                "(#824 W4b, #631 defect Q).",
+                "PHASE-FLIP",
+                mb_id,
+                arm_mb,
+            )
 
         # #757: THE FALLING EDGE IS THE ONLY PLACE EVERY DISARM PASSES THROUGH.
         # Disarm has three routes and two of them are purely rank-local --
@@ -4420,6 +4477,11 @@ class SchedulerPPMixin:
         # test_pp_dead_peer_is_not_the_wedge_801.py -- does not leave a stale
         # timestamp behind that would later read as a wedge.
         self._pp_blocked_recv_since = time.monotonic()
+        # #824 W5(b): stamp WHICH arm, not merely that some arm is blocked.
+        # Three channels ride this one call (proxy / output / admission) and
+        # a fourth blocking receive lives in the request-relay chain; the
+        # watchdog line named none of them on boot_827.
+        self._pp_blocked_recv_arm = f"typed-dict/{expected_kind}"
         try:
             tensor_dict = recv_typed_tensor_dict(
                 self.pp_group,
@@ -4430,6 +4492,7 @@ class SchedulerPPMixin:
             )
         finally:
             self._pp_blocked_recv_since = None
+            self._pp_blocked_recv_arm = None
         if expected_kind == "default":
             logger.warning_once(
                 f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"

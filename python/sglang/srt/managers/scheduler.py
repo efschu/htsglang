@@ -2862,7 +2862,107 @@ class Scheduler(
                 if counters is not None
                 else None
             ),
+            # #824 W5(b): give THIS funnel the blocked-recv marker #821
+            # only ever gave _pp_recv_typed_dict. Two of three ranks wedged
+            # in here on boot_827 and the watchdog could not say so,
+            # because nothing on this path recorded that it was blocked.
+            # getattr, not a direct bind: this builder is exercised by
+            # holder-based tests that stand in for a Scheduler with only the
+            # attributes the builder reads, and a hard reference here turns
+            # a diagnostic hook into a construction dependency.
+            on_blocked=getattr(self, "_note_pp_chain_blocked", None),
+            # #824 W4a: STATE-DRIVEN recovery. This is what lets the bound
+            # fire on metal without arming a wall clock -- see
+            # _pp_chain_abort_check.
+            abort_check=getattr(self, "_pp_chain_abort_check", None),
         )
+
+    def _note_pp_chain_blocked(self, arm, since):
+        """Publish the chain receive's blocked state on the scheduler.
+
+        Writes the SAME pair the #821 arm reads
+        (``invariant_checker.pp_receive_is_overdue``), so the existing
+        watchdog backstop covers this path with no second mechanism. The
+        threshold semantics are unchanged: it records since WHEN, and the
+        reader decides what is too long -- a healthy idle rank blocks here
+        continuously, so a flag would SIGQUIT an idle server.
+        """
+        if arm is None:
+            self._pp_blocked_recv_since = None
+            self._pp_blocked_recv_arm = None
+            return
+        self._pp_blocked_recv_since = since
+        self._pp_blocked_recv_arm = f"chain-recv/{arm}"
+
+    def _pp_chain_abort_check(self, arm, waited_s):
+        """#824 W4a: is this chain wait part of a CLOSED ring right now?
+
+        STATE, NOT A CLOCK. The wall-clock bound
+        (SGLANG_PP_CHAIN_RECV_STALL_S) stays off by default because an idle
+        PP rank legitimately blocks here until a request arrives -- there is
+        no duration that separates "idle" from "wedged". This predicate
+        separates them by evidence instead, and it is only consulted while
+        the receive is already overdue, so a healthy pass never reaches it.
+
+        THE EVIDENCE. ``bump_attempted`` publishes that a rank has ENTERED a
+        send BEFORE it posts it (phase_flip_counters.py:220-226) -- the one
+        counter whose timing can witness a peer that is parked INSIDE a send
+        rather than one that has completed it. So when this rank's CHAN_DICT
+        upstream has entered more dict sends than this rank has taken off
+        that wire, the peer is sitting in a send only this rank can drain,
+        while this rank sits in a receive that peer will never feed. That is
+        the boot_827 ring exactly: PP0 blocked in
+        _pp_commit_admission_send_work on the typed-dict channel, PP1 and
+        PP2 blocked in the request-relay chain receive.
+
+        THE FALSE-POSITIVE DIRECTION IS THE SAFE ONE, the same argument
+        _pp_wait_for_dict_readiness makes for the mirror gate (#789). A
+        spurious fire costs one drain turn and a resumed receive -- the
+        receive stays posted and framed throughout, so nothing is lost and
+        the late message still arrives. Missing a real one costs the boot.
+
+        Returns a reason string to abort by the named branch, or None to
+        keep waiting.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return None
+        try:
+            from sglang.srt.managers.phase_flip_counters import CHAN_DICT
+
+            upstream = self._pp_flip_upstream()
+            entered = counters.attempted(CHAN_DICT, upstream)
+            taken = counters.local_consumed(CHAN_DICT)
+        except Exception:  # noqa: BLE001 - a predicate may never break the loop
+            return None
+        if entered > taken:
+            return (
+                f"upstream rank {upstream} has ENTERED {entered - taken} "
+                f"CHAN_DICT send(s) this rank has not taken off the wire "
+                f"(attempted={entered} local_consumed={taken}); it is parked "
+                f"in a send only this rank can drain while this rank is "
+                f"parked in a receive it will never feed -- the boot_827 ring"
+            )
+        return None
+
+    def _pp_chain_stall_service(self):
+        """#824 W4a: break the ring the abort_check above just proved.
+
+        Takes the in-flight dict off the wire with the EXISTING #757 drain
+        rather than a new consumption path: it demultiplexes, stashes a
+        wrong-kind message in ``_pp_tensor_dict_inbox`` where its real
+        consumer already looks, and discards only a provably void proxy.
+        That is what makes servicing the dict wire out of the pass's normal
+        order safe -- nothing is eaten, it is only taken off the wire early,
+        which is precisely what releases the upstream's send.
+
+        Deliberately NOT a new protocol. #789's docstring declines to invent
+        one for the mirror case and this follows it: the ring is cut on the
+        arc that is waiting for a message nobody posted, using a primitive
+        that already runs on every disarm route.
+        """
+        live_mb_id = getattr(self, "_pp_live_mb_id", 0)
+        return self.pp_flip_drain_leftover_dicts(live_mb_id)
 
     def _build_pp_flip_counters(self):
         """#631 G: the pollable message-count channel, or None.
@@ -2960,6 +3060,17 @@ class Scheduler(
             # own sends that the downstream's counter proves consumed.
             phase_flip_service_hook=(
                 self.pp_flip_service if self.server_args.enable_phase_flip else None
+            ),
+            # #824 W5(b): mark the DIRECT chain receive too. That branch
+            # runs on every boot without the flip, and it was the last
+            # blocking PP receive with no marker at all.
+            on_blocked_recv=self._note_pp_chain_blocked,
+            # #824 W4a: cut a closed ring by draining the dict wire the
+            # upstream is parked in, then resume the same posted receive.
+            pp_chain_stall_service=(
+                self._pp_chain_stall_service
+                if self.server_args.enable_phase_flip
+                else None
             ),
         )
 

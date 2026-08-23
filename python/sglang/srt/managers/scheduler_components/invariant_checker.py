@@ -1234,13 +1234,41 @@ def create_scheduler_watchdog(
             # with no watchdog left.
             since = getattr(scheduler, "_pp_blocked_recv_since", None)
             waited = "unknown" if since is None else f"{time.monotonic() - since:.1f}s"
+            # #824 W5(b): NAME THE ARM. This line used to assert "a blocking
+            # PP dict receive" for every firing, because _pp_recv_typed_dict
+            # was the only site that set the marker. On boot_827 the two
+            # ranks that actually wedged were in the request-relay chain
+            # receive instead, so the one line an operator reads first named
+            # the wrong channel. The marker now carries its own arm.
+            arm = getattr(scheduler, "_pp_blocked_recv_arm", None) or "unnamed"
             return (
                 "no cur_batch (the previous pass was idle); this rank is "
-                f"parked in a blocking PP dict receive, waited={waited}. See "
-                "scheduler_pp_mixin.py's #821 marker in _pp_recv_typed_dict.\n"
-                + "\n".join(messages)
+                f"parked in a blocking PP receive on arm={arm}, "
+                f"waited={waited}. Arms are stamped by _pp_recv_typed_dict "
+                "(#821) and by the pp_chain_receiver / request_receiver "
+                "funnel (#824 W5).\n" + "\n".join(messages)
             )
         return f"{batch.batch_size()=}\n" f"{batch.reqs=}\n" + "\n".join(messages)
+
+    def describe_arm() -> str:
+        """#824 W5(a): which arm held this rank when the watchdog fired.
+
+        boot_827 is the case this exists for. The watchdog did its job --
+        fired at 09:17:58 on PP0, dumped py-spy, SIGQUIT at 09:18:03 -- and
+        the trigger line still named no arm, so "PP0 was blocked in a SEND,
+        not a typed-dict recv" had to be recovered from the py-spy output
+        afterwards. The marker is already maintained; this only reads it.
+        """
+        parts = []
+        if scheduler.is_initializing:
+            parts.append("initializing")
+        if scheduler.cur_batch_for_debug is not None:
+            parts.append("forward-counter-frozen(cur_batch set)")
+        since = getattr(scheduler, "_pp_blocked_recv_since", None)
+        if since is not None:
+            arm = getattr(scheduler, "_pp_blocked_recv_arm", None) or "unnamed"
+            parts.append(f"blocked-recv[{arm}] waited={time.monotonic() - since:.1f}s")
+        return ", ".join(parts)
 
     return WatchdogRaw(
         debug_name="Scheduler",
@@ -1253,4 +1281,5 @@ def create_scheduler_watchdog(
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        describe_arm=describe_arm,
     )

@@ -27,6 +27,7 @@ work and kept raw blocking calls on the same collectives.
 from __future__ import annotations
 
 import datetime
+import threading
 import time
 from typing import Any, Optional
 
@@ -226,3 +227,121 @@ def bounded_recv(
         tag=tag,
     )
     bounded_wait(work, label, timeout_s, rank_desc)
+
+
+class ParkedWait:
+    """A RESUMABLE bound on one ``Work``: the caller gets a deadline, the
+    transfer keeps its unbounded ``wait()``, and nothing is destroyed.
+
+    WHY THIS EXISTS NEXT TO ``bounded_wait`` (#824 W4)
+    --------------------------------------------------
+    ``bounded_wait`` above is terminal by design and says so:
+    ``bounded_recv``'s docstring ends "Do not 'recover' from this exception
+    and reuse ``tensor``". That is the right contract for a HiCache control
+    collective, where a missed deadline means the process is on its way
+    down.
+
+    It is the WRONG contract for the PP request chain. That stream is a
+    two-step size-then-payload protocol whose receiver must stay framed
+    across a stall: a rank that gives up mid-protocol and later re-posts
+    would read a payload AS a size and misframe every later message
+    (``managers/pp_chain_receiver.py``, module docstring). It has to be
+    able to wait again on the SAME posted receive.
+
+    ``bounded_wait`` cannot provide that, and the reason is measured, not
+    argued (2026-08-23, hermetic 2-process gloo, CVD=""):
+
+      * ``Work.wait(timeout=...)`` does fire on time -- and closes the gloo
+        pair while doing it. The waiter then gets "Application timeout
+        caused pair closure" from every later call, and the PEER gets
+        "Connection closed by peer" from its next send. One expired wait
+        takes the whole group down, on both sides.
+      * ``Work.is_completed()`` is no way out either: it never reports True
+        on this build even seconds after the payload has landed (the
+        "corpse F" measurement pinned in
+        ``test_pp_chain_receiver.test_measured_gloo_does_not_progress_a_posted_irecv_by_polling``).
+        A poll loop absorbs nothing and bounds nothing.
+
+    So the bound cannot live in the wait. It lives in the CALLER: the
+    unbounded ``wait()`` -- the one call with positive evidence that it
+    drives the transfer -- is parked on a dedicated thread, and the caller
+    joins that thread with a deadline. Expiry returns control without
+    touching the ``Work``, so:
+
+      * the pair is never poisoned (the wait was never interrupted),
+      * the posted receive stays posted and stays framed,
+      * a peer that sends LATE still completes this very wait, and the
+        payload arrives intact.
+
+    All three are measured green in the same hermetic harness, and the last
+    one is asserted on the wire by
+    ``test_pp_ring_abort_recovery.test_aborted_flip_does_not_wedge_the_pp_ring``.
+
+    ONE THREAD PER POSTED WORK, and the object owning the ``Work`` owns the
+    ``ParkedWait`` too -- two threads waiting on one ``Work``, or a second
+    receive posted on a stream whose first is still parked, is the
+    misframing this class exists to avoid.
+    """
+
+    __slots__ = ("_work", "_label", "_done", "_error", "_thread", "_started_at")
+
+    def __init__(self, work: Optional[torch.distributed.Work], label: str):
+        self._work = work
+        self._label = label
+        self._error: Optional[BaseException] = None
+        self._done = threading.Event()
+        self._started_at = time.monotonic()
+        if work is None:
+            # Single-rank groups return None rather than a Work; that is a
+            # completed no-op, exactly as in bounded_wait.
+            self._thread = None
+            self._done.set()
+            return
+        self._thread = threading.Thread(
+            target=self._park,
+            name=f"parked-wait-{label}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _park(self) -> None:
+        try:
+            self._work.wait()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in join()
+            self._error = exc
+        finally:
+            self._done.set()
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    @property
+    def waited_s(self) -> float:
+        return time.monotonic() - self._started_at
+
+    @property
+    def completed(self) -> bool:
+        return self._done.is_set()
+
+    def join(self, timeout_s: Optional[float]) -> bool:
+        """Wait up to ``timeout_s`` for the parked wait to finish.
+
+        Returns True when it completed (the transfer is done and the
+        buffer is filled), False when the deadline expired with the
+        receive STILL POSTED -- call again to keep waiting on the same one.
+        A transport error raised inside the parked wait is re-raised here,
+        on the caller's thread, so it is not swallowed by the waiter.
+
+        ``timeout_s`` of None or <= 0 restores the raw blocking wait.
+        """
+        if timeout_s is None or timeout_s <= 0:
+            self._done.wait()
+        else:
+            self._done.wait(timeout=timeout_s)
+        if not self._done.is_set():
+            return False
+        if self._error is not None:
+            err, self._error = self._error, None
+            raise err
+        return True
