@@ -6326,9 +6326,19 @@ class PhaseFlipRuntime:
         from_driver = max(0, driver_free - reserve)
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
             before = driver_free
+            cache_promised = int(cached_free)
             self._reclaim_cached_blocks()
             driver_free, cached_free = probe()
             from_driver = max(0, driver_free - reserve)
+            # #828 LAW 2, MEASURED HERE AND SPENT BY THE CENSUS BELOW. This is
+            # the only place in the refusal path that observes what the torch
+            # cache ACTUALLY handed the driver. Without it the census prices
+            # the same post at `memory_reserved() - memory_allocated()` -- a
+            # figure that counts fragmented segments `empty_cache()` cannot
+            # return -- and boot_827 printed `covered 1870 MiB ... cause=funded`
+            # in the same second this line printed `(+0 returned)`.
+            self._last_cache_promised_bytes = cache_promised
+            self._last_cache_delivered_bytes = max(0, int(driver_free - before))
             mib = 1024 * 1024
             logger.info(
                 "%s staging reclaim: driver free %.0f -> %.0f MiB "
@@ -7303,6 +7313,19 @@ class PhaseFlipRuntime:
             except Exception:  # noqa: BLE001
                 pass
 
+            # #828: what the SAME gate pass measured this post actually paying.
+            # None when no reclaim was attempted in this pass, which law 2
+            # reads as "unobserved -- trust it once", so a refusal that never
+            # tried the cache is priced exactly as it was before.
+            delivered = getattr(self, "_last_cache_delivered_bytes", None)
+            promised = getattr(self, "_last_cache_promised_bytes", None)
+            if delivered is not None and promised is not None:
+                # Price the post at what it PROMISED when the draw was taken,
+                # so the ratio is delivered-over-promised for the SAME probe.
+                # Using the post-reclaim `cached` as the denominator would
+                # derate against a number the draw never saw.
+                cached = int(promised)
+
             sched = getattr(self, "_census_scheduler", None)
             rung = getattr(sched, _RUNG_ATTR, None) if sched is not None else None
             slack_rows = 0
@@ -7329,6 +7352,7 @@ class PhaseFlipRuntime:
 
             auth = authority_from_seam_snapshot(
                 allocator_cache_bytes=cached,
+                allocator_cache_delivered_bytes=delivered,
                 kv_slack_rows=slack_rows,
                 row_bytes=row_bytes,
                 kv_granule_rows=granule_rows,

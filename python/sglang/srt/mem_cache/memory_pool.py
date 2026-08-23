@@ -2978,6 +2978,42 @@ class MHATokenToKVPool(KVCache):
         ceiling first on shrink (rows above ``num_tokens`` must be dead).
         Newly grown rows are zeroed: a fresh boot's pools are torch.zeros and
         the flush identity (zero_kv_data_buffers rationale) must keep holding.
+
+        #828: THE BACKING IS THE AXIS THIS CONVERGES, AND IT IS NOT ``size``.
+        Until 2026-08-23 the whole function branched on ``self.size`` -- the
+        EXPOSED id space -- while its callers plan against the COMMITTED
+        BACKING, which is what ``kv_backing_relief._current_rows()`` reads and
+        what #796 proved it must read. Those two diverge, and every target that
+        landed between them took the grow branch and released nothing::
+
+            boot_827_review_0823_0910c 09:11:05 PP0
+            rung: current=473088 -> 357801   (115287 rows, 1801 MiB deep)
+            dial: request=357801 prev_size=349973 uniform_backed_rows=473088
+                  delta=+7828 branch=grow ... released_bytes=0
+
+        That answers ``kv_backing_relief.py:1367``'s open question in writing
+        ("all 15 zero-byte shrinks asked at least three whole granules deep, so
+        granularity cannot account for any of them"). It is also a LATCH: the
+        zero-byte shrink still assigned ``self.size = n``, so the exposed size
+        drifted down while the backing stayed at the boot reservation, the band
+        between them widened, and the next plan was even more certainly inside
+        it. Once diverged, the dial could never release again.
+
+        The two axes are now separated, which is what they always were:
+
+        * the BACKING converges against ``uniform_backed_rows`` -- finalize
+          above it, decommit below it;
+        * ``self.size`` is assigned either way;
+        * rows this call RE-EXPOSES are zeroed whenever ``n > prev``, not only
+          on the grow branch. That clause is the danger direction: under the
+          old code the grow branch zeroed ``[prev, n)`` as a side effect of
+          being the grow branch, and re-routing alone would have handed out
+          rows still carrying another request's KV.
+
+        Decommitting above ``n`` is safe in every branch for the same reason it
+        was safe in the old shrink branch: ``self.size`` is ``n`` when the call
+        returns, so rows above it are not exposed, and decommit unmaps pages
+        behind a VA that never moves.
         """
         owner = self._post_capture_owner
         if owner is None:
@@ -2995,10 +3031,17 @@ class MHATokenToKVPool(KVCache):
         # buffer) are the two quantities that can diverge here; neither was
         # observable. Log them at the call, before any branch mutates state.
         backed = int(self.uniform_backed_rows)
+        # ``branch`` stays keyed on the EXPOSED axis, because that is what it
+        # has always reported and what test_backing_dial_logging_796 pins.
+        # ``backing`` is the new field and the one that decides the work: the
+        # #828 specimen is exactly the row where the two disagree
+        # (branch=grow, backing=shrink), and a single label could not say it.
+        branch = "noop" if n == prev else ("grow" if n > prev else "shrink")
+        backing_branch = "noop" if n == backed else ("grow" if n > backed else "shrink")
         logger.info(
             "BACKING-DIAL call: request=%d prev_size=%d uniform_backed_rows=%d "
             "reserved_backing_rows=%d store_bound_rows=%d page_size=%d "
-            "delta=%+d branch=%s",
+            "delta=%+d branch=%s backing=%s",
             n,
             prev,
             backed,
@@ -3006,33 +3049,29 @@ class MHATokenToKVPool(KVCache):
             int(self.store_bound_rows),
             int(self.page_size),
             n - prev,
-            "noop" if n == prev else ("grow" if n > prev else "shrink"),
+            branch,
+            backing_branch,
         )
-        if n == prev:
+        if n == prev and n == backed:
             return 0
-        if n > prev:
+        # MAP first, so the zeroing below always writes to mapped rows.
+        if n > backed:
             owner.finalize(n)
+        # ZERO every row this call re-exposes, on whichever backing branch.
+        if n > prev:
             buffers = list(self.k_buffer) + list(self.v_buffer)
             for desc, buf in zip(self._kv_buffer_descs, buffers):
                 lo = desc._rows(prev + self.page_size)
                 hi = desc._rows(n + self.page_size)
                 if hi > lo:
                     buf[lo:hi].zero_()
-            self.size = n
-            logger.info(
-                "BACKING-DIAL grow done: prev_size=%d -> size=%d "
-                "uniform_backed_rows %d -> %d released_bytes=0",
-                prev,
-                n,
-                backed,
-                int(self.uniform_backed_rows),
-            )
-            return 0
-        released = owner.shrink(n)
+        # DECOMMIT last: rows above ``n`` are dead the moment ``size`` is ``n``.
+        released = int(owner.shrink(n)) if n < backed else 0
         self.size = n
         logger.info(
-            "BACKING-DIAL shrink done: prev_size=%d -> size=%d "
+            "BACKING-DIAL %s done: prev_size=%d -> size=%d "
             "uniform_backed_rows %d -> %d released_bytes=%d",
+            branch if branch != "noop" else backing_branch,
             prev,
             n,
             backed,

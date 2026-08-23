@@ -503,6 +503,7 @@ def uniform_absolute_floor(
 def authority_from_seam_snapshot(
     *,
     allocator_cache_bytes: int = 0,
+    allocator_cache_delivered_bytes: Optional[int] = None,
     kv_slack_rows: int = 0,
     row_bytes: int = 0,
     kv_granule_rows: int = 0,
@@ -521,14 +522,48 @@ def authority_from_seam_snapshot(
 
     A post with nothing to give is still DECLARED, with its reason, because law
     1 requires a refusal to name what it considered.
+
+    #828: ``allocator_cache_delivered_bytes`` IS LAW 2, FINALLY CONNECTED.
+    ``allocator_cache_bytes`` is ``memory_reserved() - memory_allocated()``,
+    which counts fragmented segments ``empty_cache()`` cannot hand back. The
+    module has carried the derating machinery for that since it was written and
+    this constructor never passed a measurement into it, so every post was
+    trusted at face value forever. On ``boot_827_review_0823_0910c`` 09:11:05
+    PP0 the seam measured the truth in the same second the census priced the
+    promise::
+
+        staging reclaim: driver free 1436 -> 1436 MiB (+0 returned),
+          334 MiB still cached
+        #770 FUNDING POSTS: want 1746 MiB, covered 1870 MiB from
+          [allocator-cache[local] 334 MiB; ...], cause=funded
+
+    A verdict of ``funded`` on a post that had just delivered nothing is worse
+    than no verdict: it tells the caller to retry a draw that cannot pay. With
+    the delivery wired through, that record reads ``cause=phantom_capacity``.
+
+    ``None`` -- the default, and what every pre-#828 caller passes -- means NO
+    draw has been observed, which law 2 defines as "trust it once". So this is
+    additive: an unmeasured post keeps exactly its old credit.
     """
     auth = FundingAuthority(rank=rank)
+    cache_promised = max(0, int(allocator_cache_bytes))
+    cache_derate_num, cache_derate_den = 1, 1
+    if allocator_cache_delivered_bytes is not None:
+        cache_derate_den = cache_promised
+        # A ratio above 1 means the MEASUREMENT is wrong, not the post -- the
+        # Post constructor refuses one, and clamping here keeps a noisy probe
+        # from turning a refusal into a crash on the refusal path.
+        cache_derate_num = min(
+            cache_promised, max(0, int(allocator_cache_delivered_bytes))
+        )
     auth.declare_post(
         Post(
             "allocator-cache",
-            max(0, int(allocator_cache_bytes)),
+            cache_promised,
             tier=RELIEF_LOCAL,
             cost=10,
+            derate_num=cache_derate_num,
+            derate_den=cache_derate_den,
             unavailable_reason=(
                 "" if allocator_cache_bytes > 0 else "torch cache already returned"
             ),

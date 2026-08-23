@@ -358,7 +358,7 @@ is a property of the rig after all, the phase-prefill joint gains
 (desk-predicted +1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on
 FP8, both bracketed, see below) stand unchanged, and the #475 backtest
 reproduces its four measured arms at rms 2.2 with `dcp_size` declared.
-`planner/placement.py:813` (`replicated = kv_heads < tp or dcp_replicated`)
+`planner/placement.py:838` (`replicated = kv_heads < tp or dcp_replicated`)
 uses ONE flag for both mechanisms and therefore reports the k/v projection
 heads as replicated under uneven DCP where the runtime shards them — an open
 defect, narrower than #500-B1 claimed and in the placement report rather than
@@ -492,7 +492,7 @@ unreachable; (L2) an ask of 3437 rows against a release granularity of 8192
 returning a SILENT ZERO, 256 MiB and 65 % of that shortfall; (L3) an ask of
 50233 rows returning `claimed=0` while the flip's own accounting reported "107
 MiB returned". The arming floor is SOLVED rather than asserted
-(`solve_arming_floor`, `:659`; `diagnose_floor_band`, `:585`): the shipped
+(`solve_arming_floor`, `:694`; `diagnose_floor_band`, `:620`): the shipped
 512 MiB seam entry reserve puts the arming floor at 819 + 512 = 1331 and, with
 the 192 MiB margin, needs 1523 against a 1229 ceiling — structurally
 unreachable, not merely tight — while 218 MiB is the largest reserve that fits.
@@ -643,7 +643,8 @@ by the test rather than by review. Pinned by `test_funding_authority_770.py`.
   above it had already re-exposed the whole id space: 417850 rows exposed over
   105413 committed, 312437 with no page behind them, and the first prefill
   whose tail landed above the backing took the device-side assert in
-  `masked_set_kv_buffer_kernel` (`memory_pool.py:4978`).
+  `masked_set_kv_buffer_kernel` (`memory_pool.py:4983`, the bound assert at
+  `:5032`).
   `clamp_exposure_to_backing()` guards all three sites (recover,
   `apply_cap_agreement`, the failed-shrink error path) and only ever LOWERS
   exposure toward a MEASURED `_current_rows()`, so it cannot re-create the
@@ -2726,7 +2727,7 @@ exemption as a field on the decision, never as a substring of its explanation.**
 Said-once family (#823): a fact that CHANGES during a process, reported ONCE at
 the moment it first became true, is a stale label for every moment after — and
 the log then reads as if the state still held. Two instances landed together.
-`_update_uniform_pool_budget` (`managers/scheduler.py:4684`) announced the
+`_update_uniform_pool_budget` (`managers/scheduler.py:4795`) announced the
 rank-uniformity floors' coverage — `world=1 -> floors OFF ... pp_size=3
 tp_size=1` — exactly three times, once per rank at startup, and then said
 nothing through FOUR cutovers in 55 s, each of which can change the answer. The
@@ -2766,7 +2767,11 @@ watchdog's activity predicate reads — `forward_ct` and `cur_batch_for_debug`
 therefore concluded "not active" and never fired: no SIGQUIT and no dump, for
 the wedge class it exists to catch. The three assignment sites that could have
 marked the rank all sit AFTER the receive
-(`managers/scheduler_pp_mixin.py:1567`, `:1799`, `:1950`). The receive is now
+— the `self.cur_batch_for_debug = cur_batch` statements in
+`_event_loop_pp_body` (`managers/scheduler_pp_mixin.py:1646`, `:1878`,
+`:2029`; cited by STATEMENT as well as by line, because that file takes
+inserts from several tickets and its numbers drift silently, see §18.8). The
+receive is now
 marked as a DURATION before it blocks. Four mutants, each killed by its own
 case (duration reduced to a boolean, dump guard removed, marker never cleared,
 arm removed), and the suite was red-first on the base at 5 of 15. Pinned by
@@ -4118,8 +4123,9 @@ taxonomy and the global importance ladder.
   GATE: none — plain library. It reuses `exposure_over_backing` from
   `managers/kv_backing_relief.py:547` through a lazy import at `:125`; that is
   import-cycle avoidance, not a behavioural gate.
-  CONSUMERS `managers/phase_flip_runtime.py:3838`, `:3839`
-  (`_census_ownership_audit`), `:3881` (`_retire_row_id_space`).
+  CONSUMERS `managers/phase_flip_runtime.py:4040`, `:4041` (both inside
+  `_census_ownership_audit`, `:4024`), `:4083` (inside `_retire_row_id_space`,
+  `:4053`).
   NOT WIRED at this commit, and said plainly rather than implied: the clamp
   firing-rate metric — `:663` (`parse_clamp_firings`), `:691`
   (`clamp_firing_census`), the baselines at `:708`/`:715` — and `:539`
@@ -4133,13 +4139,13 @@ taxonomy and the global importance ladder.
   ENTRY `managers/funding_authority.py:334` (`FundingAuthority`), `:350`
   (`declare_post`), `:378` (`can_fund` — this is the solve). Production builds
   it through `:503` (`authority_from_seam_snapshot`). Solvers alongside it:
-  `:659` (`solve_arming_floor`), `:585` (`diagnose_floor_band`), `:470`
-  (`uniform_absolute_floor`), `:813` (`slack_above_uniform_floor`).
+  `:694` (`solve_arming_floor`), `:620` (`diagnose_floor_band`), `:470`
+  (`uniform_absolute_floor`), `:848` (`slack_above_uniform_floor`).
   GATE: none — plain library; no env or `server_args` read anywhere in the
   module.
-  CONSUMERS `managers/phase_flip_runtime.py:6275` (`_arming_floor_advice`, via
-  `solve_arming_floor`), `:7128` (`_funding_post_census`, via
-  `authority_from_seam_snapshot`).
+  CONSUMERS `managers/phase_flip_runtime.py:6487` (inside
+  `_arming_floor_advice`, `:6462`, via `solve_arming_floor`), `:7353` (inside
+  `_funding_post_census`, `:7281`, via `authority_from_seam_snapshot`).
   NOT WIRED at this commit: `FundingAuthority` is never constructed directly in
   production, and `uniform_absolute_floor`, `diagnose_floor_band` and
   `slack_above_uniform_floor` have no production caller — the authority is so
@@ -4518,8 +4524,8 @@ taxonomy and the global importance ladder.
   at `:90` (`scope_transition`), `:79` (`scope_for_world`).
   GATE: none — plain library. The `server_args` read at `:140` supplies the
   pp/tp numbers for the log line only and gates no behaviour.
-  CONSUMERS `managers/scheduler.py:4792`, `:4814`, both inside
-  `_update_uniform_pool_budget` (`:4684`).
+  CONSUMERS `managers/scheduler.py:4903`, `:4925`, both inside
+  `_update_uniform_pool_budget` (`:4795`).
 - **prefetch ballot (#791b)** — the rank-uniform ballot for HiCache
   storage-prefetch admission: `check_prefetch_progress` is a RANK-LOCAL verdict
   because the storage backend loads each rank's KV shard at its own speed, so N
@@ -4537,9 +4543,9 @@ taxonomy and the global importance ladder.
   (`prefetch_ballot_digest`), `:174` (`advance_mismatch_streak`), `:159`
   (`should_log_mismatch_streak`).
   GATE: none — plain library of pure functions.
-  CONSUMERS `managers/scheduler.py:4938`, `:4947`, `:4995`, `:5011` (all inside
-  `_update_uniform_pool_budget` `:4684`) and `:7462` inside
-  `_get_new_batch_prefill_raw` (`:7085`). Unlike the two authorities in §18.3,
+  CONSUMERS `managers/scheduler.py:5049`, `:5058`, `:5106`, `:5122` (all inside
+  `_update_uniform_pool_budget` `:4795`) and `:7573` inside
+  `_get_new_batch_prefill_raw` (`:7196`). Unlike the two authorities in §18.3,
   this one is fully wired.
 
 ### 18.7 Small primitives that keep getting rewritten
@@ -4569,6 +4575,22 @@ Honest absences, so nobody reads silence as coverage:
   check-every trio again against your own status word.
 - `label_transform` (§18.6) currently transforms exactly one field
   (priority). Its value is the choke-point property, not its coverage.
+- **The §18 pointer checker does NOT catch line drift, and this was measured
+  rather than suspected.** `test_building_blocks_catalog_538.py` verifies that
+  a cited `file:line` RESOLVES — the file exists and is long enough — not that
+  the cited SYMBOL is on that line. Demonstrated on 2026-08-23 within one
+  merge train: `funding_authority.py` gained 37 lines in a later stage, moving
+  `solve_arming_floor` from `:659` to `:694`, `diagnose_floor_band` from
+  `:585` to `:620` and `slack_above_uniform_floor` from `:813` to `:848`,
+  while the checker stayed at 104 passed. All three then pointed at a comment
+  line, an `if` and a dataclass field. So a GREEN checker means "no citation
+  points past the end of a file", which is the unqualified-path class it does
+  catch, and says nothing about whether the numbers still mean anything. This
+  is the same evidence-pin drift that reddens
+  `test_rejected_evidence_pins.py` three times in a day, minus the redness —
+  and silent drift is the worse of the two, because the loud one gets fixed.
+  Until the checker resolves symbols, a merge that inserts lines into a cited
+  module must re-verify that module's citations by hand.
 
 ---
 
