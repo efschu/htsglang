@@ -364,6 +364,12 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # #790: the #767 mamba carry-without-copy instrument. Its log line sits on
+    # the prefill admission path (alloc <- alloc_for_extend <- prepare_for_
+    # extend <- get_new_batch_prefill), where a WARNING that fires on ordinary
+    # traffic is a cost every admission pays for a diagnosis nobody asked for.
+    # Off in production; the counters behind it keep incrementing either way.
+    SGLANG_DEBUG_MAMBA_CARRY = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())

@@ -68,6 +68,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
@@ -210,13 +211,29 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
 
         self.m = m
 
+    def test_the_line_is_silent_on_the_real_path_by_default(self):
+        """#790 second half, on the REAL branch: the instrument is off unless
+        asked for. A rate limit (`n <= 3 or n % 500 == 0`) is not a gate -- it
+        still emitted at WARNING level on a healthy server, from inside prefill
+        admission. The counters must keep counting regardless, which is what
+        makes the instrument still usable from a debugger on a process nobody
+        started with the gate on."""
+        req = _carry_req(torch.tensor([42], dtype=torch.int64))
+        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(False):
+            with _TensorTripwire() as trap:
+                with self.assertNoLogs(_LOGGER_NAME, level="DEBUG"):
+                    select_index = _drive_alloc(self.m, req)
+        self.assertEqual([], trap.calls)
+        self.assertEqual([0], select_index)
+
     def test_alloc_logs_the_carry_without_copy_line_without_touching_the_tensor(
         self,
     ):
         req = _carry_req(torch.tensor([42], dtype=torch.int64))
-        with _TensorTripwire() as trap:
-            with self.assertLogs(_LOGGER_NAME, level="WARNING") as cm:
-                select_index = _drive_alloc(self.m, req)
+        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+            with _TensorTripwire() as trap:
+                with self.assertLogs(_LOGGER_NAME, level="WARNING") as cm:
+                    select_index = _drive_alloc(self.m, req)
         self.assertEqual(
             [],
             trap.calls,
@@ -237,11 +254,12 @@ class TheAdmissionLogSiteIsSyncFree(unittest.TestCase):
         played back on a box with no GPU to actually hang on.
         """
         req = _carry_req(torch.tensor([42], dtype=torch.int64))
-        with mock.patch.object(self.m, "sync_free_tensor_repr", lambda v: v):
-            with self.assertRaises(_TripwireError):
-                with _TensorTripwire():
-                    with self.assertLogs(_LOGGER_NAME, level="WARNING"):
-                        _drive_alloc(self.m, req)
+        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+            with mock.patch.object(self.m, "sync_free_tensor_repr", lambda v: v):
+                with self.assertRaises(_TripwireError):
+                    with _TensorTripwire():
+                        with self.assertLogs(_LOGGER_NAME, level="WARNING"):
+                            _drive_alloc(self.m, req)
 
 
 if __name__ == "__main__":

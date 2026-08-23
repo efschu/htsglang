@@ -512,6 +512,56 @@ def sync_free_tensor_repr(value: Any) -> str:
     return str(value)
 
 
+def note_mamba_carry_without_copy(pool: Any, req: Any) -> None:
+    """#767 INSTRUMENT: count a request that KEEPS a mamba slot it already owns.
+
+    The branch this observes skips the state clear, which is correct for a
+    LEGITIMATE carrier (a chunked continuation holding its own in-progress
+    state, or a COW resume whose copy fills the slot) and silently wrong for a
+    request that arrived with a recycled slot nobody filled. The two are
+    indistinguishable at the call site, so they are counted and the log line
+    names whether a copy is actually pending.
+
+    #790, THE SECOND HALF OF THE FIX. Making the slot argument sync-free
+    (`sync_free_tensor_repr`) stopped this line from WEDGING admission; it did
+    not stop it from being EMITTED on ordinary traffic. A rate limit is not a
+    gate: `n <= 3 or n % 500 == 0` still fires at WARNING level on a healthy
+    server, and this sits on the prefill admission path
+    (`alloc` <- `alloc_for_extend` <- `prepare_for_extend` <-
+    `get_new_batch_prefill`). The instrument answers an open question (#767);
+    it is not an operator-actionable event. An instrument must not charge the
+    path it observes, so the line runs only when it is asked for.
+
+    The COUNTERS stay unconditional. They are two integer increments with no
+    device contact, and they remain readable from a debugger or py-spy on a
+    server that was never started with the gate on -- which is the situation
+    every incident is actually diagnosed in.
+
+    The slot argument must stay sync-free even behind the gate: a debug session
+    is exactly when the device is busy, and `sync_free_tensor_repr` is what
+    keeps `logging.emit` from waiting on it. See that helper for why the slot
+    NUMBER is deliberately not printed.
+    """
+    pool._m767_carry_total = getattr(pool, "_m767_carry_total", 0) + 1
+    if getattr(req, "mamba_cow_src_index", None) is not None:
+        return
+    pool._m767_carry_nocopy = n = getattr(pool, "_m767_carry_nocopy", 0) + 1
+    if not envs.SGLANG_DEBUG_MAMBA_CARRY.get():
+        return
+    if not (n <= 3 or n % 500 == 0):
+        return
+    logger.warning(
+        "#767 carry-without-copy #%d: rid=%s slot=%s "
+        "needs_clear=%s -- kept a slot with no pending COW "
+        "and no clear; legitimate only if this request "
+        "already wrote that state itself.",
+        n,
+        getattr(req, "rid", "?"),
+        sync_free_tensor_repr(getattr(req, "mamba_pool_idx", None)),
+        getattr(req, "mamba_needs_clear", None),
+    )
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -1556,50 +1606,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
         fresh_pingpong_reqs: list[Req] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
-                # #767 INSTRUMENT + FALSIFIER. This branch keeps a slot the
-                # request already owns and skips the clear, which is correct
-                # for a LEGITIMATE carrier (a chunked continuation holding its
-                # own in-progress state, or a COW resume whose copy fills the
-                # slot) and silently wrong for a request that arrived with a
-                # recycled slot nobody filled. The two are indistinguishable
-                # here today, so count them and name whether a copy is
-                # actually pending.
-                self._m767_carry_total = getattr(self, "_m767_carry_total", 0) + 1
-                if getattr(req, "mamba_cow_src_index", None) is None:
-                    self._m767_carry_nocopy = (
-                        getattr(self, "_m767_carry_nocopy", 0) + 1
-                    )
-                    n = self._m767_carry_nocopy
-                    if n <= 3 or n % 500 == 0:
-                        # #790: `mamba_pool_idx` is a device tensor -- do NOT
-                        # pass it (or `.item()`/`.cpu()`/an f-string of it)
-                        # to a log call. Any of those synchronize the stream
-                        # to materialize the value, and this line sits on the
-                        # admission hot path (`alloc` <- `alloc_for_extend`
-                        # <- `prepare_for_extend` <- `get_new_batch_prefill`).
-                        # A wedge on this exact call is the #790 metal
-                        # incident: PP0's MainThread stuck inside
-                        # `logging.emit` for 25+ minutes because the device
-                        # was busy and the sync never returned, starving
-                        # PP1/PP2 on `pp_chain_receiver.recv`. Log a sync-free
-                        # stand-in (shape/dtype/device + object id) instead --
-                        # see `sync_free_tensor_repr` for why the slot NUMBER
-                        # itself is deliberately not printed.
-                        logger.warning(
-                            "#767 carry-without-copy #%d: rid=%s slot=%s "
-                            "needs_clear=%s -- kept a slot with no pending COW "
-                            "and no clear; legitimate only if this request "
-                            "already wrote that state itself.",
-                            n,
-                            getattr(req, "rid", "?"),
-                            sync_free_tensor_repr(getattr(req, "mamba_pool_idx", None)),
-                            getattr(req, "mamba_needs_clear", None),
-                        )
-                    if _M767_FORCE_CLEAR:
-                        # Falsifier arm only: prove the defect is dirty initial
-                        # state. NOT a fix -- a blanket clear would also wipe a
-                        # legitimate carrier's own in-progress state.
-                        req.mamba_needs_clear = True
+                note_mamba_carry_without_copy(self, req)
+                if (
+                    getattr(req, "mamba_cow_src_index", None) is None
+                    and _M767_FORCE_CLEAR
+                ):
+                    # Falsifier arm only: prove the defect is dirty initial
+                    # state. NOT a fix -- a blanket clear would also wipe a
+                    # legitimate carrier's own in-progress state.
+                    req.mamba_needs_clear = True
             else:
                 mid = self._alloc_mamba_slots_or_evict(1)
                 if mid is None:

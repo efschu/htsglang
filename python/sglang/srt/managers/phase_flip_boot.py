@@ -902,7 +902,12 @@ class PhaseFlipStacks:
         # whole flip 12.121 -> 4.998 s) by reading the image instead of
         # faulting it. That is exactly why this feeds a MEASUREMENT and not a
         # constant: the regime changed underneath the number, and the estimator
-        # followed it without anyone editing a threshold.
+        # followed it.
+        # #777: the ESTIMATOR followed it. The THRESHOLD did not -- N is priced
+        # once in `config_from_env` and never rebuilt, so "without anyone
+        # editing a threshold" described a repricing that does not reach the
+        # policy. `observe_flip_cost` now says so on the first flip that proves
+        # it; repricing N itself is the planner's call.
         try:
             from sglang.srt.managers.phase_policy import observe_flip_cost
 
