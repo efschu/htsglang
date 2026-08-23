@@ -657,6 +657,15 @@ class Envs:
     # which is the only way to put a number on a boundary that spans two hosts.
     SGLANG_PP_BOUNDARY_STATS = EnvInt(0)
 
+    # PP: how many CONSECUTIVE passes a non-first rank may void because its
+    # upstream launched nothing, while still deriving a batch of its own, before
+    # the loop is refused by name (#801-spin; 0 or less disables the refusal).
+    # A voided pass runs no forward, so a streak is time in which this rank
+    # cannot have served anybody: specimen boot_802f_staged1_0822_1716 spun
+    # 2353 of them in five seconds. 512 is roughly one second of that spin and
+    # two orders of magnitude above any burst this corpus has measured.
+    SGLANG_PP_IDLE_VOID_STREAK_BOUND = EnvInt(512)
+
     # PP: how long an UNDECLARED tensor-dict kind may hold the phase flip's
     # presence gate before it is retired loudly (#800). Deliberately shorter
     # than the flip's 60 s presence deadline: an escape that expires after the

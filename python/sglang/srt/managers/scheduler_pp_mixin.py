@@ -904,6 +904,39 @@ def pp_void_relay_stop_rank(
     return max(int(pp_size) - 1, 0)
 
 
+def pp_idle_void_should_report(streak: int) -> bool:
+    """#801-spin: report a no-progress void streak on powers of two only.
+
+    THE FLOOD IS PART OF THE DEFECT, not merely a symptom of it. In specimen
+    boot_802f_staged1_0822_1716 PP1 emitted 2353 `#798` warnings and 2353
+    `#797d` warnings -- 4706 multi-line records in five seconds, from ONE rank,
+    while the other two emitted none. Nothing in that volume is information:
+    every record after the first says what the first already said, and the one
+    fact a reader needs -- that the rank is repeating a pass and getting
+    nowhere -- is the one fact no single line states.
+
+    Powers of two, so the count itself carries the duration: a streak of n
+    costs floor(log2(n)) + 1 lines, twelve for that specimen instead of 2353,
+    and the LAST line printed names the order of magnitude reached. This is
+    the "said once" shape #823/#824 applied to a state that changes, adapted
+    to a state that only ever grows.
+    """
+    return streak > 0 and (streak & (streak - 1)) == 0
+
+
+def pp_idle_void_streak_exceeded(streak: int, bound: int) -> bool:
+    """#801-spin: True once a no-progress void streak has reached its bound.
+
+    A NON-POSITIVE BOUND DISABLES THE REFUSAL and is the escape hatch: it
+    restores the pre-#801-spin behaviour exactly (spin for ever, silently),
+    which is what an operator who suspects a false positive needs to be able
+    to ask for without editing code. It is deliberately not the default,
+    because a rank that has taken 512 consecutive passes without its upstream
+    launching once is not serving anybody.
+    """
+    return bound > 0 and streak >= bound
+
+
 def pp_void_forward_payload(
     holder, message: Dict[str, object]
 ) -> Optional[Dict[str, object]]:
@@ -3756,6 +3789,11 @@ class SchedulerPPMixin:
         self._pp_admission_pass_voided: bool = False
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
+        # #801-spin: consecutive no-progress voids. Cleared here for the same
+        # reason as the flags above -- a cutover rebuilds the slot ring, so a
+        # streak counted against the old one names nothing in the new one.
+        self._pp_upstream_idle_void_streak: int = 0
+        self._pp_idle_void_suppress_log: bool = False
         # #791b: PER SLOT, refreshed every pass by
         # `_pp_note_output_expectation`, read on the last rank by
         # `_pp_send_output_to_next_stage`. Per slot rather than one scalar
@@ -5201,18 +5239,26 @@ class SchedulerPPMixin:
             self.waiting_queue.append(req)
             released += 1
 
-        logger.warning(
-            "#797d PP-ADMISSION own pass voided on slot %d: get_next_batch_to_run "
-            "still returned a batch for a pass this rank had already voided, so "
-            "it is being cleared here instead of launched. %d of %d request(s) "
-            "released and re-queued (the rest are resident in the running batch, "
-            "or are the chunked request, and keep their pages -- #797/#797b; "
-            "chunk parked=%s).",
-            mb_id,
-            released,
-            len(reqs),
-            parked,
-        )
+        # #801-spin: CONSUMED, never merely read. The #798 site sets this for
+        # the single pass it is suppressing; clearing it here means every other
+        # caller of this method -- the #797 retraction path above all -- logs
+        # exactly as it always did, and a stale True can never survive into a
+        # pass that did not ask for it.
+        suppress = getattr(self, "_pp_idle_void_suppress_log", False)
+        self._pp_idle_void_suppress_log = False
+        if not suppress:
+            logger.warning(
+                "#797d PP-ADMISSION own pass voided on slot %d: get_next_batch_to_run "
+                "still returned a batch for a pass this rank had already voided, so "
+                "it is being cleared here instead of launched. %d of %d request(s) "
+                "released and re-queued (the rest are resident in the running batch, "
+                "or are the chunked request, and keep their pages -- #797/#797b; "
+                "chunk parked=%s).",
+                mb_id,
+                released,
+                len(reqs),
+                parked,
+            )
         return True
 
     def _pp_void_pass_without_upstream_launch(self: Scheduler, mb_id: int) -> bool:
@@ -5305,22 +5351,79 @@ class SchedulerPPMixin:
         if getattr(self, "_pp_gapped_wire", False):
             return False
         if getattr(self, "_pp_upstream_launched_incoming", False):
+            # #801-spin: THE RESET, and it is the whole definition of progress
+            # here. The upstream launched, so this pass can run and this rank's
+            # resident state can change. Every other early return above is a
+            # shape in which the spin cannot occur at all (no upstream, no
+            # wire), and the empty-slot return below is the shape in which this
+            # rank has nothing to re-derive -- all of them clear the streak, so
+            # a streak counts consecutive passes of exactly one state: THIS
+            # RANK HAD WORK AND ITS UPSTREAM HAD NOTHING TO GIVE IT.
+            self._pp_upstream_idle_void_streak = 0
             return False
         batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
         if batch is None:
+            self._pp_upstream_idle_void_streak = 0
             return False
 
         self._pp_upstream_idle_voids = getattr(self, "_pp_upstream_idle_voids", 0) + 1
-        logger.warning(
-            "#798 PP-ADMISSION pass voided on slot %d: the upstream reported "
-            "launched=False for this pass, so no hidden states were posted for "
-            "it, but this rank still derived a batch from its own resident "
-            "state. Receiving here would take the NEXT pass's proxy and leave "
-            "every later receive one message ahead (the 2026-08-21 specimens). "
-            "Running the pass nowhere instead, and forwarding the void so the "
-            "ranks below take the same decision.",
-            mb_id,
-        )
+        streak = getattr(self, "_pp_upstream_idle_void_streak", 0) + 1
+        self._pp_upstream_idle_void_streak = streak
+
+        # #801-spin: the twin record this void is about to produce
+        # (`_pp_void_own_batch`'s `#797d`) is suppressed on the same passes
+        # this one is, so the pair stays a pair and the specimen's 4706 lines
+        # become 24. Consumed by that method, so it can never outlive this pass.
+        report = pp_idle_void_should_report(streak)
+        self._pp_idle_void_suppress_log = not report
+        if report:
+            logger.warning(
+                "#798 PP-ADMISSION pass voided on slot %d: the upstream reported "
+                "launched=False for this pass, so no hidden states were posted for "
+                "it, but this rank still derived a batch from its own resident "
+                "state. Receiving here would take the NEXT pass's proxy and leave "
+                "every later receive one message ahead (the 2026-08-21 specimens). "
+                "Running the pass nowhere instead, and forwarding the void so the "
+                "ranks below take the same decision. This is consecutive "
+                "no-progress void %d on this rank (reported on powers of two; a "
+                "streak of 1 is the ordinary post-retraction case #798 was "
+                "written for, a growing one is the #801-spin livelock).",
+                mb_id,
+                streak,
+            )
+
+        bound = envs.SGLANG_PP_IDLE_VOID_STREAK_BOUND.get()
+        if pp_idle_void_streak_exceeded(streak, bound):
+            # #801-spin: A VOID THAT NEITHER BLOCKS NOR PROGRESSES IS STILL A
+            # WEDGE, and until here it was the only one this file could not
+            # see. #801 and #802 closed the two ways the ring could BLOCK; this
+            # closes the way it could SPIN. Specimen
+            # boot_802f_staged1_0822_1716: PP1 alone took 2353 of these passes
+            # in five seconds -- ~470 per second, no forward, no output, and
+            # not one line saying so -- while PP0 and PP2 logged nothing at all.
+            # Refusing by name converts an instance that is silently not
+            # serving into one that says why it is not, which is the only
+            # difference this rank is in a position to make: the reason its
+            # upstream never launches is upstream state (see the ticket), and
+            # a rank cannot repair a peer's admission from here.
+            self._pp_upstream_idle_void_streak = 0
+            raise RuntimeError(
+                f"#801-spin PP IDLE-VOID LIVELOCK REFUSED: this rank (pp_rank="
+                f"{self.ps.pp_rank}) has voided {streak} CONSECUTIVE passes "
+                f"because its upstream reported launched=False for every one of "
+                f"them, while still deriving a batch of its own each time "
+                f"(currently slot {mb_id}). A voided pass runs no forward, so "
+                f"this is {streak} passes in which this rank served nothing and "
+                f"its state did not change -- it will re-derive the same batch "
+                f"from the same resident work next pass and void it again. The "
+                f"defect is NOT on this rank: the void handling did exactly what "
+                f"#798 requires each time. It is whatever leaves the upstream "
+                f"unable to launch while this rank holds resident work (in the "
+                f"1716 specimen, a chunked request parked here across every one "
+                f"of the 2353 passes). Raise or disable the bound with "
+                f"SGLANG_PP_IDLE_VOID_STREAK_BOUND (0 disables) if this streak "
+                f"is legitimate on your workload."
+            )
 
         # Both halves of the void, exactly as `_pp_void_retracted_pass`
         # arranges them, so that what this rank FORWARDS names the same empty
