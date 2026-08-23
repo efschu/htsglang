@@ -625,6 +625,55 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   it moves no payload anywhere. The seam already did this, but inside
   `_staging_affordable` — i.e. AFTER the gate had formed its verdict, so the
   gate judged against a free column understated by 1028-1426 MiB/card.
+- **KV row ownership authority** (`mem_cache/kv_row_ownership.py`, #822): the
+  one place the row-space law is written down, after seven crash roots in six
+  days (#684, #714, #717/#722, #744, #796, #814, #816) turned out to be the
+  same law broken in different places. Four named laws over three integers and
+  the claim sets: `EXPOSURE` (exposed ≤ committed, #816 — reuses
+  `exposure_over_backing`, `kv_backing_relief.py:504`, rather than restating
+  it), `COVERAGE` (every claimed row < committed, the #717/#722 counter-form a
+  downward clamp is blind to), `EXCLUSIVITY` (the claims partition the space —
+  none doubled, none unowned, #814), `RETIREMENT` (no claim outlives the
+  cutover that retired its id space, #796/#802). `audit()` returns EVERY
+  violation, never the first: #814 and #816 are the SAME rows under two laws
+  (340384/466994 = 73%, and the PP1 clamp delta is 342066), and a
+  short-circuiting checker is how they became two tickets.
+  **THE RANGE CHOICE IS THE #814 DEFECT.** Ownership is asked over the
+  COMMITTED backing, never over the exposed id space; the census asks it over
+  `range(1, alloc.size+1)`, so every exposed-but-unbacked row falls out as
+  "unaccounted". Ranging over `committed` also makes the laws
+  non-overlapping, which is what makes a per-law count a usable regression
+  metric instead of a double count.
+  **RETIREMENT IS ROUTED, EVERYTHING ELSE IS AUDITED.** The ~30 hot-path
+  writers (alloc/free/evict across token/paged/swa/hisparse/mamba, radix and
+  HiCache trees, `KvRowCap`, `base.resize`/`grow_size`,
+  `runtime_set_backing_tokens`) are covered by construction because the census
+  enumerates the RESULTING sets and the authority audits that closure — a lock
+  on the per-token path would be a new failure source. A state TRANSITION
+  cannot be reconstructed after the fact, so the cutover calls
+  `_retire_row_id_space` immediately after `_cutover_fn` and BEFORE the
+  post-cutover census (ordering pinned by test; reversed, a survivor reads as
+  an out-of-range row instead of as #796). Retirement invalidates the SPACE by
+  epoch rather than enumerating holders — enumerating holders is the thing
+  that kept being incomplete, and `self._parked_extent = None` (#746) plus
+  `last_req_extent`'s layout tag (#802) are two holders cleared by hand.
+  Mirrors `ReqToTokenPool.req_generation` (`memory_pool.py:377`, upstream
+  DSpark), which does exactly this for the REQ SLOT space and was never
+  extended to KV rows. `_committed_backing_rows` returns None rather than a
+  guess when the span cannot be measured: substituting `size` for the
+  committed backing reports the #816 state as healthy and cost a boot on
+  2026-08-11 (`kv_backing_relief.py:1180`).
+  **SCOPE.** This arms the AUDIT, not enforcement — the allocator does not yet
+  REFUSE a stale-epoch id, and cross-rank cutover atomicity under load is a
+  property of the flip's commit protocol provable only on metal. The #816
+  clamp stays as belt-and-suspenders; its firing rate is the regression metric,
+  with a parser (`parse_clamp_firings` / `clamp_firing_census`) and a baseline
+  READ OFF a real boot rather than asserted: **12 firings, four per rank**, at
+  five second-marks of boot 2026-08-23 06:08. The #822 brief said three — that
+  was the number of cited log POSITIONS, and a metric seeded from three would
+  have scored a nine-firing boot as an improvement. Each rank reported the same
+  three numbers on all four of its firings, which is what distinguishes a
+  structural over-exposure from a leak: a leak accumulates, this did not.
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
   per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
