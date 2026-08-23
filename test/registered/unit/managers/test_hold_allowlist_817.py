@@ -22,11 +22,27 @@ eligibility is a property of the ARM (`PhasePolicyDecision.hold_eligible`), set
 where the arm is built, defaulting to False. An arm nobody marked is an EXIT.
 The swallow becomes structurally impossible rather than string-dependent.
 
-STILL OPEN, NOT DECIDED HERE: whether the LEGACY STOPWATCH arm should be
-hold-eligible at all. It is the only member of the allowlist today, and three
-pre-existing tests demand it exit. See the #817 COORD -- this file pins the
-part that was decided, and pins the stopwatch's CURRENT membership so that
-changing it is a deliberate act with a failing test, not a silent drift.
+THE ADMISSION CONDITION, which is what the allowlist actually encodes:
+
+    An arm may carry hold_eligible=True only if, in EVERY state where that arm
+    fires, a SECOND INDEPENDENT anti-starvation bound is armed.
+
+The hold's licence to veto "the plain timer/economics exit" was never about the
+arm being a timer -- it rested on the unstated assumption that something else
+would still stop the layout pinning. The legacy pp_window stopwatch destroys
+that assumption: it is guarded by `cap <= 0`, so it fires ONLY when the
+decode-starvation cap is absent, making it the LAST bound in every state it
+fires in. Vetoing the last bound is an unbounded hold -- verbatim the condition
+"THE STARVATION REGRESSION" exists to prevent. So it fails the condition by
+construction and is an exit too.
+
+THE ALLOWLIST IS THEREFORE EMPTY, and that is the honest state rather than an
+oversight. The seam stays: it is the socket for a future arm that really is
+backstopped, and with no member no arm can be held at all. #677's economics is
+not lost with it -- it lives in the window-length machinery and in the
+threshold repricing (#819), on the flip-DECISION side where a flip can be
+weighed before it is chosen, rather than as a veto on an exit the rules have
+already decided.
 """
 
 import unittest
@@ -166,10 +182,10 @@ class TestTheWrapperBehavesBothWays(CustomTestCase):
         )
         self.assertIn("blocked admission", out.reason)
 
-    def test_the_eligible_stopwatch_arm_is_still_held(self):
-        # The other direction, and the reason the allowlist is not empty: the
-        # one arm that IS eligible must really reach the hold, or the fix would
-        # have deleted the lever instead of aiming it.
+    def test_the_stopwatch_arm_also_leaves_pp(self):
+        # The other direction, decided in #817: the stopwatch is the LAST
+        # anti-pinning bound in every state it fires in (`cap <= 0`), so
+        # vetoing it is an unbounded hold. It exits.
         cfg = _cfg(pp_window_s=15.0, flip_tokens=7004)
         state = pp.PhasePolicyState()
         # Prefill must be MOVING here, or the blocked-admission exit fires
@@ -178,39 +194,66 @@ class TestTheWrapperBehavesBothWays(CustomTestCase):
         self.assertIsNone(_drive(cfg, state, 302757, 2, 0.0).direction)
         self.assertIsNone(_drive(cfg, state, 302000, 2, 7.0).direction)
         out = _drive(cfg, state, 301000, 2, 15.0)
-        self.assertIsNone(out.direction, f"the eligible arm was not held: {out.reason}")
-        self.assertIn("HOLD", out.reason)
+        self.assertEqual(
+            PP_TO_TP, out.direction, f"the stopwatch was swallowed: {out.reason}"
+        )
+        self.assertIn("pp window", out.reason)
+
+    def test_no_arm_can_be_held_while_the_list_is_empty(self):
+        # The consequence of an empty allowlist, stated as behaviour rather
+        # than inferred from the count: no reachable PP_TO_TP arm becomes a
+        # HOLD. If a member is ever added, this fails and the author has to
+        # come argue the admission condition.
+        for cfg, series in (
+            (_cfg(), [(403779, 4, 0.0), (403779, 4, 40.0)]),
+            (_cfg(pp_window_s=15.0), [(9000, 2, 0.0), (8000, 2, 15.0)]),
+            (_cfg(flip_tokens=99999), [(10, 2, 0.0), (10, 2, 5.0)]),
+        ):
+            state = pp.PhasePolicyState()
+            for pending, bs, now in series:
+                out = _drive(cfg, state, pending, bs, now)
+                self.assertNotIn("HOLD", out.reason, f"held: {out.reason}")
 
 
 class TestTheAllowlistMembership(CustomTestCase):
     """Exactly one arm is eligible, and which one is pinned deliberately."""
 
-    def test_only_the_legacy_stopwatch_claims_eligibility(self):
-        # Enumerated from the source rather than asserted from memory: every
-        # PhasePolicyDecision built with hold_eligible=True inside the rules.
+    def test_the_allowlist_is_empty(self):
+        # Enumerated from the source rather than asserted from memory. Empty is
+        # the DECIDED state, not an oversight: no arm in the rules today meets
+        # the admission condition, so none claims eligibility.
         import inspect
 
         src = inspect.getsource(pp._decide_from_load)
         self.assertEqual(
             src.count("hold_eligible=True"),
-            1,
-            "the hold allowlist changed size -- that is a policy decision and "
-            "needs its own reasoning, not a passing test",
+            0,
+            "an arm claims hold eligibility -- that is admissible only if a "
+            "SECOND independent anti-starvation bound is armed in every state "
+            "where that arm fires. Argue that here, do not just add it.",
         )
-        # And it is the stopwatch: the marker sits above the pp-window arm.
-        marker = src.index("hold_eligible=True")
-        self.assertIn("HAND-SET STOPWATCH", src[marker : marker + 1200])
 
-    def test_the_stopwatch_arm_is_the_plain_timer(self):
-        # The wrapper's stated rule is that it may veto the plain timer and
-        # nothing else. This pins that the eligible arm really is guarded by a
-        # clock and by the ABSENCE of the starvation cap -- the fact that makes
-        # its membership arguable, and the reason the COORD leaves it open.
+    def test_the_admission_condition_is_written_down_where_it_binds(self):
+        # THE RULE ITSELF, pinned. A condition that lives only in a commit
+        # message is one refactor away from being lost, and the next author to
+        # add an arm reads the dataclass, not the history.
+        doc = pp.PhasePolicyDecision.__doc__ or ""
+        import inspect
+
+        src = inspect.getsource(pp.PhasePolicyDecision)
+        text = doc + src
+        self.assertIn("SECOND INDEPENDENT anti-starvation bound", text)
+        self.assertIn("EMPTY TODAY", text)
+
+    def test_the_stopwatch_is_the_arm_that_fails_the_condition(self):
+        # Why it fails, checked against the code rather than recited: the arm
+        # is guarded by the ABSENCE of the decode-starvation cap, so it is the
+        # last bound in every state it fires in.
         import inspect
 
         src = inspect.getsource(pp._decide_from_load)
-        marker = src.index("hold_eligible=True")
-        head = src[max(0, marker - 2000) : marker]
+        marker = src.index("HAND-SET STOPWATCH")
+        head = src[max(0, marker - 2500) : marker]
         self.assertIn("cap <= 0", head)
         self.assertIn("cfg.pp_window_s > 0", head)
 

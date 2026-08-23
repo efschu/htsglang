@@ -1471,7 +1471,36 @@ class PhasePolicyDecision:
     #: makes the safe direction the structural one: an arm nobody marked is an
     #: EXIT. A future arm added without reading this comment cannot be
     #: swallowed by forgetting to name it -- only by explicitly claiming to be
-    #: a timer.
+    #: eligible.
+    #:
+    #: THE ADMISSION CONDITION, and it is the whole rule:
+    #:
+    #:     An arm may carry hold_eligible=True only if, in EVERY state where
+    #:     that arm fires, a SECOND INDEPENDENT anti-starvation bound is armed.
+    #:
+    #: The hold's permission to veto "the plain timer/economics exit" was never
+    #: about the arm being a timer. It rested on the unstated assumption that
+    #: something else would still stop the layout from pinning. Veto the last
+    #: bound and the hold is unbounded, which is the exact condition the
+    #: starvation regression tests exist to prevent and the shape of the live
+    #: wedge family. The assumption outranks the prose.
+    #:
+    #: THE LIST IS EMPTY TODAY, and that is the honest state rather than an
+    #: oversight. The one arm that looked eligible -- the legacy pp_window
+    #: stopwatch -- sits behind a `cap <= 0` guard, so it fires ONLY when the
+    #: decode-starvation cap is absent and it is therefore the last bound in
+    #: every state it fires in. It fails the condition by construction.
+    #:
+    #: THE SEAM STAYS ANYWAY. It is the socket for a future arm that really is
+    #: backstopped, and keeping it means such an arm is added by stating the
+    #: claim rather than by re-deriving this whole argument. It also keeps the
+    #: swallow structurally impossible in the meantime: with no member, no arm
+    #: can be held at all.
+    #:
+    #: WHERE #677's ECONOMICS ACTUALLY LIVES, so nobody re-wires it here: in
+    #: the window-length machinery, and in the threshold repricing (#819). It
+    #: belongs on the flip-DECISION side, where it can weigh a flip before one
+    #: is chosen -- not as a veto on an exit the rules already decided.
     hold_eligible: bool = False
 
     @property
@@ -2239,17 +2268,19 @@ def _decide_from_load(
             )
             return PhasePolicyDecision(
                 PP_TO_TP,
-                # #817: THE ONE ARM THE #677 HOLD MAY VETO. This is the plain
-                # timer -- a hand-set stopwatch on the pp window, with no claim
-                # that the layout has stopped making progress. The hold's
-                # premise ("prefill pulled into this layout is still unserved,
-                # so a clock does not get to take it away") is a direct answer
-                # to THIS arm and to no other. Every sibling arm reports a
-                # STATE the hold cannot see -- drained, starved, blocked,
-                # idle -- and is therefore not eligible; see
-                # PhasePolicyDecision.hold_eligible for why that default is
-                # what makes the swallow structurally impossible.
-                hold_eligible=True,
+                # #817: NOT hold_eligible, and this is the arm that looked like
+                # it should be. The #677 hold was written to veto "the plain
+                # timer/economics exit", and this is that timer -- but that
+                # permission rests on an unstated assumption: that vetoing the
+                # timer leaves some OTHER backstop armed. Look at the guard
+                # this arm sits behind: `cap <= 0`. It fires only when the
+                # decode-starvation cap is absent, i.e. exactly in the states
+                # where it is the LAST anti-pinning bound there is. Vetoing the
+                # last bound is an unbounded hold, which is verbatim the
+                # condition test_sustained_backlog_still_leaves_pp_via_the_
+                # window exists to prevent ("returned 'holding in pp' on every
+                # call, without end") and the shape of the live wedge family.
+                # The assumption outranks the prose, so this arm is an EXIT.
                 reason=f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
                 f"{inp.running_bs} req waiting to decode "
                 f"({inp.pending_prefill_tokens} tok prefill deferred to the "
