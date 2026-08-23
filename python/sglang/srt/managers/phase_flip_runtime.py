@@ -4665,6 +4665,23 @@ class PhaseFlipRuntime:
 
             scheduler = self._census_scheduler
             grown = int(grow_kv_backing_local(scheduler))
+            # #839 B: THE BOOKED LEVEL IS A FLOOR UNDER THE CLAMP, NEVER A
+            # CEILING OVER IT. ``grow_kv_backing_local`` ends in the exposure
+            # publication, which since #839 puts this rank at the level of the
+            # most recent group verdict -- and that verdict may be HIGHER than
+            # the one booked when the grow was deferred, because the group's
+            # poorest rank has grown too in the meantime. Clamping back to the
+            # booking would then take the payment straight back off the table
+            # and re-book the same debt, which is the ratchet with an extra
+            # step. Take the higher of the two: both are levels a group
+            # verdict put this rank at, so neither exposes an unbacked id.
+            try:
+                reader = getattr(relief, "published_exposure", None)
+                published = None if reader is None else reader()
+            except Exception:  # noqa: BLE001 - a reading must not break a round
+                published = None
+            if published is not None:
+                level = published if level is None else max(int(level), published)
             if level is None:
                 # NO AGREED LEVEL MEANS NO EXPOSURE, and this branch is the
                 # #792 decline arriving here rather than being ignored. The
@@ -4709,12 +4726,36 @@ class PhaseFlipRuntime:
             backed = int(relief.backed_rows())
         except Exception:  # noqa: BLE001 - a debt reading must not break a round
             return 0
-        if level is None:
+        # #839 B: MEASURE THE DEBT AGAINST WHAT THE POOL ACTUALLY EXPOSES, not
+        # against the level that was booked when the grow was deferred.
+        #
+        # The booked level is a number this runtime wrote down once. The
+        # allocator's exposure is what admission is really priced against, and
+        # after #839 a seam ballot can RAISE it without this booking hearing
+        # about it. Reading the booking would leave the alarm shouting a debt
+        # the group has already settled -- a latched indicator for a condition
+        # that has gone, which is the failure mode the debt check's own
+        # docstring says it was written to avoid ("RE-READ, never trust the
+        # booking"). It read the booking anyway; this is the reading it meant.
+        exposed = None
+        try:
+            exposed = int(relief.exposed_rows())
+        except Exception:  # noqa: BLE001 - a debt reading must not break a round
+            exposed = None
+        if level is None and exposed is None:
             # Backed with no agreed level at all: every grown row is unexposed.
             # Reported as the full backing rather than 0, because 0 here would
             # read as "no debt" for the state with the LARGEST debt.
             return max(0, backed)
-        return max(0, backed - int(level))
+        if level is None:
+            settled = int(exposed)
+        elif exposed is None:
+            settled = int(level)
+        else:
+            # The HIGHER of the two, because both are levels this rank is
+            # entitled to expose and the debt is what neither covers.
+            settled = max(int(level), int(exposed))
+        return max(0, backed - settled)
 
     def _deferred_grow_debt_check(self) -> None:
         """#834 B step 4: an unpaid grow debt is #814's ratchet. Say so.

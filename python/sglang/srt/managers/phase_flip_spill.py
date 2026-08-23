@@ -2042,6 +2042,45 @@ def collective_kv_backing_relief(
         note = getattr(cap_relief, "note_group_backing_floor", None)
         if callable(note):
             note(int(verdict["min_backed_rows"]))
+            # #839: AND PUBLISHING IS PART OF TAKING IT.
+            #
+            # Recording the floor made it available to the next clamp; it did
+            # not make the exposure follow it. Two consequences, and they are
+            # the window-4 pair:
+            #
+            #   A  a rank that grew between ballots kept its own higher
+            #      exposure until something happened to call the clamp, and
+            #      what the clamp then compared against could be a row count
+            #      from the other layout.
+            #   B  a rank that grew rows it was not allowed to expose had no
+            #      creditor at all outside the seam's cutover -- so 83968 rows
+            #      sat BACKED and unexposed for 32 rounds while every flip was
+            #      abandoned for want of exactly that pool (#834 crit 13).
+            #
+            # This reduction already carries the group's MIN backed rows and
+            # already runs on every rank on every seam round, on the one path
+            # every rank reaches unconditionally. Publishing here therefore
+            # settles both without entering a single new collective -- which is
+            # the constraint that kept the levelling itself inside the seam
+            # (HANDOVER-S834: moving a collective at all is the 2026-08-08
+            # boots 9/10 wedge shape).
+            #
+            # Duck-typed, for the reason the note above is: a stub rung must
+            # survive this call and a real one must still be driven.
+            publish = getattr(cap_relief, "publish_group_exposure", None)
+            if callable(publish):
+                try:
+                    publish("seam ballot")
+                except Exception as e:
+                    logger.error(
+                        "%s could not publish this rank's exposure at the "
+                        "group floor (%s). The floor is recorded, so the next "
+                        "clamp still bounds this rank -- what is lost is the "
+                        "RAISE, which is the payment for a deferred grow "
+                        "(#839 B). Watch for GROW-DEBT-UNPAID",
+                        LOG_PREFIX,
+                        e,
+                    )
         elif not _GROUP_FLOOR_UNSUPPORTED_LOGGED:
             _GROUP_FLOOR_UNSUPPORTED_LOGGED = True
             logger.warning(

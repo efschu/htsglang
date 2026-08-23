@@ -92,7 +92,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -976,6 +976,39 @@ class KvBackingRelief:
         #: across the group. ``GROUP_FLOOR_UNKNOWN`` until a ballot is seen, so
         #: a rank with no collective behaves exactly as it did before #833.
         self._group_backed_floor: int = GROUP_FLOOR_UNKNOWN
+        #: #839 A: WHICH ARENA THE FLOOR ABOVE WAS MEASURED IN.
+        #:
+        #: The rung serves TWO layouts (:meth:`_rebind`) whose row counts are
+        #: different numbers for the same allocator. The floor arrives from the
+        #: seam ballot, which reads whichever layout was active THEN; the
+        #: exposure clamp compares it against whichever layout is active NOW.
+        #: A row count from the other arena is not comparable, and when the
+        #: stale reading is the WIDER one ``min(local, floor)`` stops binding
+        #: and every rank publishes its own backing.
+        #:
+        #: Measured, boot_window4A_0823_2059: three group-uniform rounds at
+        #: 122880 (floor narrow, clamp wide -- the floor bound), then at
+        #: 21:06:11-12 PP1/PP2/PP0 published 122880/131072/210944, each rank's
+        #: own backing to the row (floor wide, clamp narrow -- nothing bound).
+        #: The last completed flip is at 21:06:13; every ``tp_to_pp`` after it
+        #: abandoned, twelve of them naming PP0's 210944 against a group floor
+        #: of 122880.
+        self._group_floor_arena: Optional[int] = None
+        #: #839 A: the exposure ceiling this rank last PUBLISHED, PER ARENA.
+        #:
+        #: THE PUBLICATION RULE THIS EXISTS FOR: exposure may be LOWERED at any
+        #: time by any rank-local reading, and may be RAISED only by a group
+        #: verdict measured in the arena it is raised in. A rank-local grow may
+        #: commit pages whenever it likes -- what it may not do is announce
+        #: them.
+        #:
+        #: KEYED BY ARENA FOR THE SAME REASON THE FLOOR IS STAMPED WITH ONE: a
+        #: ceiling is a row id, and a row id from the other layout is not a
+        #: smaller or larger ceiling, it is a different quantity. A single
+        #: cross-arena "last published" would defend the wide layout's number
+        #: while the narrow layout is active, which caps nothing at all -- the
+        #: exact shape of the defect this closes.
+        self._published_exposure: Dict[int, int] = {}
         #: Rows this rank has backed but may not expose, because a peer cannot
         #: map them. Reported, never hidden: it is the #795 federation debt
         #: made countable rather than a silent capacity loss.
@@ -2772,9 +2805,51 @@ class KvBackingRelief:
         now = self._current_rows()
         # Pages first, cap second -- and the cap comes back at the level the
         # pages actually reached, not at the level they were aiming for.
+        #
+        # #839 A: AND IT COMES BACK BOUNDED BY THE GROUP, IN THE SAME BREATH.
+        # This used to re-engage at ``now`` -- this rank's own new backing --
+        # and leave the group bound to ``clamp_exposure_to_backing`` two
+        # statements later. The end state was the same, but the invariant
+        # "exposed <= min(local committed, group bound)" was false in between,
+        # and the ``else`` leg below left the WHOLE reservation exposed for
+        # that span. The invariant is meant to hold at every point, not only
+        # at the end of the function, so the ceiling is computed BEFORE the
+        # release and applied as part of the same release-and-re-engage.
+        ceiling = self._exposure_ceiling(now)
         self._cap.release()
+        if ceiling < self._reservation_rows():
+            self._cap.engage(ceiling)
+        self._record_published(ceiling)
+        # AND SAY WHAT WAS PUBLISHED, ON EVERY RANK, ON EVERY RECOVERY.
+        # The old sequence announced the ceiling only when the clamp below
+        # found something to withdraw, so the group-uniformity of the exposure
+        # was observable only in the rounds where it was already being
+        # corrected. Window 4's whole verdict rests on nine such lines. This
+        # one fires unconditionally, carries the group bound that decided it,
+        # and keeps the "Capped at" marker the existing checks grep for.
+        logger.warning(
+            "%s [#839] exposure published after recovery: %d rows committed "
+            "on this rank, group bound %s (%s). Capped at %d. Every rank "
+            "publishes the group bound in the same round, so three ranks "
+            "printing three different levels here is the #839 A divergence "
+            "and not a property of the pools.",
+            LOG_PREFIX,
+            now,
+            (
+                "unknown -- no ballot seen"
+                if self._group_backed_floor < 0
+                else int(self._group_backed_floor)
+            ),
+            (
+                "measured in this arena"
+                if self._group_floor_arena == self._arena_key()
+                else "measured in the OTHER arena, so it may lower but not "
+                "raise; this arena's last published level %s also holds"
+                % (self._published_exposure.get(self._arena_key()),)
+            ),
+            ceiling,
+        )
         if now < boot_rows:
-            self._cap.engage(now)
             logger.info(
                 "%s recovered to %d of %d rows (corridor-bounded); the cap "
                 "stays at that level and the boot reservation is remembered "
@@ -2842,6 +2917,171 @@ class KvBackingRelief:
         if floor < 0:
             return
         self._group_backed_floor = floor
+        # #839 A: AND STAMP THE ARENA IT WAS MEASURED IN. The ballot read
+        # ``backed_rows()``, which rebinds first, so this floor is a row count
+        # in whichever layout is active at THIS instant. Recording the value
+        # without recording which arena it counts is what let a wide reading
+        # be compared against a narrow backing -- see ``_group_floor_arena``.
+        self._group_floor_arena = self._arena_key()
+
+    def _arena_key(self):
+        """Identity of the layout the backing calls are currently pointed at.
+
+        ``id(self._pool)`` is already the key ``_rebind`` parks per-arena state
+        under, so this is the same notion of "which layout", named once rather
+        than spelled out at each comparison.
+        """
+        return id(self._pool)
+
+    def _record_published(self, level: int) -> None:
+        """Remember the ceiling that was just put on the wire. #839 A.
+
+        Every path that sets this rank's exposed id space ends here, so the
+        "never raise without a fresh in-arena verdict" rule has one number to
+        defend rather than one per caller.
+        """
+        self._published_exposure[self._arena_key()] = int(level)
+
+    def published_exposure(self) -> Optional[int]:
+        """The level a group verdict last put this rank at, in THIS arena.
+
+        #839 B: a public reading, because the deferred grow needs to know which
+        level it must not clamp back below and had no way to ask.
+
+        NOT ``exposed_rows()``. That returns the whole reservation whenever no
+        cap is engaged, and the reservation is a property of this rank's
+        allocator rather than anything the group agreed to -- using it as a
+        level would clamp every rank to its own id space, which is the #839 A
+        divergence arriving through the payment path instead of the clamp.
+        ``None`` means nothing has been published in this arena yet.
+        """
+        return self._published_exposure.get(self._arena_key())
+
+    def _exposure_ceiling(self, backed: int) -> int:
+        """The highest id this rank may EXPOSE right now. #839 A.
+
+        ONE RULE, IN ONE SENTENCE: exposure may be LOWERED by any reading at
+        any time, and may be RAISED only by a group verdict measured in the
+        arena the raise happens in.
+
+        1. NO GROUP VERDICT HAS EVER BEEN SEEN -- the answer is the local
+           backing, which is #816's behaviour and is what a single-rank shape,
+           a stub rung and every hermetic test get. Unchanged on purpose:
+           guessing a floor where no collective exists strands rows for no
+           reason (``group_exposure_ceiling`` states this).
+
+        2. A VERDICT EXISTS FOR THIS ARENA -- ``min(local, floor)``, exactly as
+           #833 shipped it, and this is the one case that may RAISE. It is
+           uniform by construction: the floor IS the group minimum of the
+           ranks' own backings in this same reduction, so no rank's local
+           reading is below it and every rank computes the same number.
+
+        3. A VERDICT EXISTS BUT WAS MEASURED IN THE OTHER ARENA. Its row count
+           is not comparable with this arena's, so ``min(local, floor)`` is no
+           longer a bound anyone agreed to -- and the failure is silent,
+           because when the stale reading is the WIDER one the ``min`` simply
+           stops binding and each rank publishes its own backing. So a stale
+           floor may still LOWER (it can only be wrong toward too little
+           exposure, which is a capacity loss and not an id a peer cannot map)
+           and may never RAISE: the level last published IN THIS ARENA caps
+           it. Before anything has been published in an arena there is nothing
+           to hold, and the ceiling is then ``min(local, floor)`` as before --
+           one round of the old behaviour at most, because the next seam
+           ballot stamps this arena and the raise becomes legal again.
+
+           Window 4 segment A is case 3 in both directions and shows why the
+           asymmetry is the whole fix. Rounds 1-3: floor 122880 measured
+           narrow, backing read wide -- the stale floor bound, and the group
+           was uniform. Round 4: floor measured wide, backing read narrow --
+           the same ``min`` bound nothing, and 122880/131072/210944 went out.
+           Capping by the last published ceiling holds round 4 at 122880,
+           which is where rounds 1-3 already were.
+        """
+        local = max(0, int(backed))
+        floor = int(self._group_backed_floor)
+        if floor < 0:
+            return local
+        arena = self._arena_key()
+        ceiling = group_exposure_ceiling(local, floor)
+        if self._group_floor_arena == arena:
+            return ceiling
+        held = self._published_exposure.get(arena)
+        if held is not None:
+            ceiling = min(ceiling, int(held))
+        return ceiling
+
+    def publish_group_exposure(self, why: str) -> int:
+        """Move this rank's exposed id space to the group's agreed level.
+
+        #839 A+B: THE SINGLE PUBLICATION POINT, and the two halves of the
+        window-4 pair are the two directions of this one call.
+
+        DOWN (#839 A) -- no rank may expose an id above the group's poorest
+        backing, so a rank that grew locally is brought back to the floor.
+
+        UP (#839 B) -- and this is the direction that did not exist. #834
+        splits the grow from the levelling so the expensive half can leave the
+        no-return window; the rows it backs then wait for "a later collective
+        to raise the level". The only collective that ever raised it ran inside
+        the seam's ``tp_to_pp`` cutover, which is downstream of the exposure it
+        gates: the pool was too small to flip, so no flip ran, so no levelling
+        ran, so the pool stayed too small. Measured, boot_window4B_0823_2116:
+        GROW DEFERRED 3 / GROW PAID 2 and 588 ``GROW-DEBT-UNPAID`` lines
+        standing at 83968 backed-but-unexposed rows for 32 rounds, with all 207
+        abandons reading "pool too small for the live set".
+
+        The ballot this is called from already carries the group's MIN backed
+        rows and already runs on every rank on every seam round, on the one
+        path every rank reaches unconditionally. So the debt is settled with a
+        reduction that is already on the wire: NO NEW COLLECTIVE IS ENTERED,
+        which is the constraint that ruled out moving the levelling itself
+        (the 2026-08-08 boots 9/10 wedge -- a blocking reduction at a local
+        cadence pairing with a peer blocked in a pipeline recv).
+
+        WHY RAISING HERE IS SAFE. ``floor`` is the group minimum of the ranks'
+        own ``backed_rows()`` in this same reduction, so every rank has the
+        pages behind every id at or below it, and every rank computes the same
+        number. It commits nothing: ``reconcile_to`` is an id decision and the
+        pages do not move.
+
+        Returns the signed change in exposed rows (0 when nothing moved).
+        """
+        floor = int(self._group_backed_floor)
+        if floor < 0:
+            return 0
+        self._rebind()
+        level = self._exposure_ceiling(self._current_rows())
+        if level <= 0:
+            return 0
+        if self._published_exposure.get(self._arena_key()) == level:
+            # NOTHING TO PUBLISH, and skipping is safe HERE specifically.
+            # ``reconcile_to`` documents that it has no early return because
+            # every rank must end with the same free-list ORDER -- but this
+            # call site follows ``normalize_free_lists()``, which sorts on
+            # every rank on every seam round whatever this decides. The order
+            # invariant is therefore already held by someone else, and re-doing
+            # a release-and-re-engage of the whole free list every round to
+            # re-establish it would be paying twice.
+            return 0
+        moved = int(self.level_recovery_to(level))
+        self._record_published(level)
+        self._group_floor_arena = self._arena_key()
+        if moved:
+            logger.warning(
+                "%s [#839] exposure published (%s): this rank moves %+d "
+                "exposed rows to the group's agreed level %d (its own backing "
+                "is %d). Exposure is only ever RAISED by a group verdict "
+                "measured in the arena it is raised in -- a rank-local grow "
+                "may commit pages, never announce them (#839 A) -- and this "
+                "is also the payment for a deferred grow, which previously "
+                "had no creditor outside the seam (#839 B, #834 crit 13).",
+                LOG_PREFIX,
+                why,
+                moved,
+                level,
+                int(self._current_rows()),
+            )
+        return moved
 
     def clamp_exposure_to_backing(self, why: str) -> int:
         """Never leave the allocator exposing an id with no page behind it.
@@ -2889,7 +3129,13 @@ class KvBackingRelief:
         # behaviour -- makes it differ by exactly the amount the ranks' pools
         # differ, which under the mandated uneven vectors is by design and
         # never zero. See ``group_exposure_ceiling`` for the measured cost.
-        ceiling = group_exposure_ceiling(backed, self._group_backed_floor)
+        # #839 A: AND THE FLOOR IT IS COMPARED AGAINST MUST BE A READING OF
+        # THE SAME ARENA. ``group_exposure_ceiling`` is still the arithmetic;
+        # ``_exposure_ceiling`` is the question of whether the floor in hand is
+        # allowed to answer for this layout at all. Comparing a row count from
+        # the other layout is how three group-uniform rounds became
+        # 122880/131072/210944 in one round on metal.
+        ceiling = self._exposure_ceiling(backed)
         stranded = max(0, int(backed) - int(ceiling))
         if stranded != self._stranded_by_group_floor:
             self._stranded_by_group_floor = stranded
@@ -2898,7 +3144,10 @@ class KvBackingRelief:
                 logger.warning(
                     "%s group exposure floor (%s): this rank has %d rows "
                     "BACKED but the group's poorest rank has only %d, so %d "
-                    "rows are backed-but-unexposable on this rank. They are "
+                    "rows are backed-but-unexposable on this rank (#839: the "
+                    "second number is the GROUP bound in force, which is the "
+                    "ballot's floor when it was measured in this arena and the "
+                    "last agreed level when it was not). They are "
                     "withheld because an id above the group floor is one a "
                     "peer cannot map, and the flip's live-slot union would "
                     "have to refuse it -- which is how a single narrow rank "
@@ -2909,7 +3158,7 @@ class KvBackingRelief:
                     LOG_PREFIX,
                     why,
                     int(backed),
-                    int(self._group_backed_floor),
+                    int(ceiling),
                     stranded,
                 )
         over = exposure_over_backing(exposed, ceiling)
@@ -2940,6 +3189,7 @@ class KvBackingRelief:
                 backed,
             )
         self._cap.engage(ceiling)
+        self._record_published(ceiling)
         logger.warning(
             "%s exposure clamp (%s): the allocator could hand out %d rows "
             "while only %d are committed, so %d rows had no page behind them. "
@@ -3194,6 +3444,31 @@ class KvBackingRelief:
         self._cap.release()
         if level < self._reservation_rows():
             self._cap.engage(level)
+        # #839 A: AND IT DELIBERATELY DOES NOT RECORD A PUBLISHED LEVEL.
+        #
+        # ``_record_published`` feeds the "never raise without a fresh in-arena
+        # verdict" rule, and that rule is only worth anything if what it
+        # defends is a level THE GROUP agreed to. This method is the raw
+        # actuator: ``level_recovery_to`` reaches it with a group target, but
+        # ``recover``'s own re-engage and every rank-local caller reach it with
+        # a rank-local one, and the two are indistinguishable from here.
+        # Recording here was written and REMOVED after it turned the window-4
+        # reproduction red again -- a rank-local ``reconcile_to(backed)`` had
+        # recorded 210944 as "published", which then licensed the very raise
+        # the rule exists to refuse. The recording therefore stays with the
+        # callers that know the level came from a verdict:
+        # ``publish_group_exposure`` and ``_exposure_ceiling``'s own consumers.
+        #
+        # RESIDUAL, stated rather than assumed: ``apply_cap_agreement`` reaches
+        # this method every seam round with ``collective_cap_target``'s level,
+        # which is the same group MIN over backed rows the ballot publishes, so
+        # the two agree. Where it can still differ is that ``cap_proposal``
+        # reads ``_current_rows()`` without rebinding first -- the same
+        # arena-blindness #839 closes at the clamp. It can only under-expose
+        # from here (``min(target, backed)`` never raises), so it costs
+        # capacity and cannot issue an id a peer has not backed. Named in W14b
+        # as the next thing to look at if a boot shows one level per rank with
+        # the clamp lines uniform.
         # #816: ``level`` is the GROUP minimum and the comparison is against
         # the id-space span, so the no-cap leg exposes every id this rank has
         # -- backed or not. The group level decides what the ranks AGREE on;
