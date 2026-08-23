@@ -2829,11 +2829,25 @@ the last at `pp_size = 3` — an object the production code can never meet, whic
 is the #630 lesson. Two `pp_*` stubs WERE fixable faithfully and were fixed
 (`test_pp_admission_wraparound_never_blocks.py`,
 `test_pp_slot_last_batch_631.py`); the seven remaining cases in
-`test_pp_flip_slot_hold_631.py` are left RED ON PURPOSE, awaiting a
-#791-shaped rewrite, because the faithful stub is a real rank identity and that
-drags the whole admission-receive path in with it. Pinned by the eight repaired
-files together (90 passed, 54 subtests). **A stub is repaired faithfully or the
-suite is left red; an impossible double is worse than a failing test.**
+`test_pp_flip_slot_hold_631.py` were left RED ON PURPOSE rather than made
+green by the cheap repair. Pinned by the eight repaired files together
+(90 passed, 54 subtests). **A stub is repaired faithfully or the suite is left
+red; an impossible double is worse than a failing test.**
+
+Those seven were then repaired faithfully under **#791**, which is what the
+rule above was holding the place for. `_Group` now takes a POSITION in a real
+ring — `_Group(rank=2, pp_size=3)` — so it is the last stage WITHOUT also
+claiming to be the first, and `_event_loop_pp_body`'s admission-decision
+branch takes the arm a real last rank takes instead of raising
+`AttributeError`. The cost the earlier note predicted was real and was paid
+rather than avoided: reaching that branch pulls the admission-receive path in
+with it. The part worth copying is `assert_faithful_pp_roles`, which makes the
+FORBIDDEN combination loud — `is_first_rank and is_last_rank` both true at
+`pp_size > 1` raises, so the shortcut cannot be reintroduced silently by a
+later edit. The falsifier is inverted and runs in both directions: 18 passed
+with the faithful stub, and planting `first == last` turns 16 of those 18 red.
+**A stub that cannot express the impossible state is better than a comment
+asking the next author not to write it.**
 
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
