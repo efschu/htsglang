@@ -6204,6 +6204,13 @@ class Scheduler(
                         flip_stats["direction"],
                         time.perf_counter(),
                     )
+                    # #819: PRICE THE WHOLE LEG, HERE, because this is the
+                    # only place that holds the completed flip's own stats.
+                    # `total_ms` contains movers and cutover; the refill leg
+                    # that used to be the sole feeder contains neither.
+                    from sglang.srt.managers.phase_policy import observe_flip_leg
+
+                    observe_flip_leg(flip_stats)
                 except Exception as e:  # pragma: no cover - bookkeeping only
                     logger.warning("PHASE-POLICY completion not recorded: %s", e)
             raise PhaseFlipLoopExit(flip_stats["direction"])
