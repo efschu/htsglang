@@ -9109,6 +9109,20 @@ class Scheduler(
             except Exception:
                 pass
 
+        # #827: a free group nobody closed still holds rows that are in NO
+        # ledger bucket -- out of the tree, in neither free list, held by no
+        # request -- so the check below would report them as a leak and kill
+        # the group. `is_fully_idle` above cannot see them (it asks about
+        # batches, queues and microbatch drain, never `free_group`), so this is
+        # the last point at which they can still be recovered. Reclaiming is
+        # not a licence: the rows are enumerable and already destined for the
+        # free list, and a shortfall with nothing staged still reports.
+        reclaim = getattr(
+            self.token_to_kv_pool_allocator, "reclaim_abandoned_free_group", None
+        )
+        if reclaim is not None:
+            reclaim()
+
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
