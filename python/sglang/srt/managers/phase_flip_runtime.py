@@ -2767,6 +2767,7 @@ class PhaseFlipRuntime:
         self.tree_divergence_rounds = 0
         self.tree_congruence_recoveries = 0
         self.tree_reconciles = 0
+        self._tree_reconcile_suppressed_logged = False
         #: #760: True from the seam's no-return point until the cutover has
         #: installed the new phase. Read by the HiCache phase guard through
         #: the authority registration below: while True, device-tier HiCache
@@ -3748,6 +3749,47 @@ class PhaseFlipRuntime:
         if verdict is None or verdict.must_reconcile is False:
             return
         if direction != PP_TO_TP:
+            return
+        # #825 FALSIFIED ON METAL, 2026-08-23 08:55:45, boot_826_review_0912.
+        #
+        # The reset is OFF by default because it took the instance down on its
+        # first real cutover, on all three ranks at once:
+        #
+        #   cache_finished_req -> dec_lock_ref
+        #   -> full_component.py:239  `if cur.id in skip_lock_node_ids`
+        #   AttributeError: 'NoneType' object has no attribute 'id'
+        #
+        # My premise was "requests are parked between the movers and the
+        # cutover, so dropping the tree is safe". PARKED IS NOT UNREFERENCED.
+        # The cutover carries RESIDENT requests across, and each holds a
+        # `last_node` with a lock ref. `reset()` rebuilds the root, orphaning
+        # those nodes, so the parent walk in `dec_lock_ref` no longer
+        # terminates at the live root and runs off the top into None.
+        #
+        # The DETECTION half of #825 is unaffected and stays on: the digest
+        # rides the consensus reduce, the verdict is group-decided, and the
+        # onset/recovery counters are what proved the divergence is real (3
+        # onsets inside 35 s of load on this very boot). What is withdrawn is
+        # the ACTION, because a reconcile that must not run while any node is
+        # locked needs to be built against the lock refs -- evicting only the
+        # unlocked portion, or reconciling at a point with no resident reqs --
+        # and that is a design, not a flag flip.
+        if os.environ.get("SGLANG_TREE_RECONCILE", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            if not self._tree_reconcile_suppressed_logged:
+                self._tree_reconcile_suppressed_logged = True
+                logger.warning(
+                    "%s #825 tree divergence detected but the reconcile is "
+                    "OFF (SGLANG_TREE_RECONCILE unset): resetting the tree "
+                    "under resident lock refs crashed dec_lock_ref on "
+                    "2026-08-23. Detection only. %s",
+                    LOG_PREFIX,
+                    verdict.reason,
+                )
             return
         scheduler = getattr(self, "_census_scheduler", None)
         tree = getattr(scheduler, "tree_cache", None)

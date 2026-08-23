@@ -265,7 +265,29 @@ def _diverged_pair():
     return rts, trees
 
 
-def test_reconcile_fires_on_pp_to_tp_and_resets_every_rank():
+def test_reconcile_is_off_by_default_after_the_metal_falsification(monkeypatch):
+    """#825's ACTION was falsified on metal, boot_826_review_0912, 08:55:45.
+
+    `reset()` at the cutover orphaned nodes that RESIDENT requests still held
+    via `last_node` with a lock ref, so `dec_lock_ref`'s parent walk ran off
+    the top: `full_component.py:239  cur.id` -> AttributeError on None, all
+    three ranks. "Requests are parked" is not "no live references".
+
+    Detection stays on; the action must be rebuilt against the lock refs. This
+    pins the default so the crash cannot come back by omission.
+    """
+    monkeypatch.delenv("SGLANG_TREE_RECONCILE", raising=False)
+    rts, trees = _diverged_pair()
+    for rt in rts:
+        rt._reconcile_trees_if_diverged(PP_TO_TP)
+    assert [t.resets for t in trees] == [0, 0]
+    assert [rt.tree_reconciles for rt in rts] == [0, 0]
+    # but the divergence was still SEEN
+    assert all(rt.tree_divergence_onsets == 1 for rt in rts)
+
+
+def test_reconcile_fires_on_pp_to_tp_and_resets_every_rank(monkeypatch):
+    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
     rts, trees = _diverged_pair()
     for rt in rts:
         rt._reconcile_trees_if_diverged(PP_TO_TP)
@@ -273,7 +295,8 @@ def test_reconcile_fires_on_pp_to_tp_and_resets_every_rank():
     assert [rt.tree_reconciles for rt in rts] == [1, 1]
 
 
-def test_reconcile_does_not_fire_on_tp_to_pp():
+def test_reconcile_does_not_fire_on_tp_to_pp(monkeypatch):
+    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
     """The PP phase does not require identical trees -- #791 says each PP rank
     re-derives its own verdict from its own radix state. Paying the capacity
     cost there would be a cost for nothing."""
@@ -284,7 +307,8 @@ def test_reconcile_does_not_fire_on_tp_to_pp():
     assert [rt.tree_reconciles for rt in rts] == [0, 0]
 
 
-def test_reconcile_never_raises_when_the_tree_cannot_be_reset():
+def test_reconcile_never_raises_when_the_tree_cannot_be_reset(monkeypatch):
+    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
     """This runs with requests parked between the movers and the cutover. A
     raise here takes the instance down for a cache-capacity repair."""
 
