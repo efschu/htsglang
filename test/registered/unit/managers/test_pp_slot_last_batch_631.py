@@ -28,6 +28,16 @@ stubbed to their production rule:
     ``running_batch`` reaches ``running_batch.merge_batch(last_batch)``
     (``scheduler.py`` :4435), which extends ``reqs`` IN PLACE.
 
+AND SINCE #791, THE LOOP ALSO RUNS AN ADMISSION PASS (#815). This rank is
+last-but-not-first, so it really receives a decision each round. Everything
+in that pass is the SHIPPING code, taken unbound like the loop itself; the
+harness supplies only the wire, as an EMPTY decision -- the value production
+builds when a rank has nothing to report. Empty entries make the
+reconciliation provably inert rather than accidentally inert, which is the
+condition the resident-carry leak was measured under. Nine of those methods
+run 100 times each per fixture; that was checked by counting calls, not
+assumed, and methods that never fired were not left in as decoration.
+
 THE CAN-FAIL LEVER
 ------------------
 ``_LeakyRank`` overrides ONE method -- ``_pp_record_slot_last_batch`` --
@@ -38,7 +48,9 @@ re-nesting the assignment and finding every test still green.
 """
 
 import unittest
+from collections import deque
 
+from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
 
@@ -73,9 +85,24 @@ class _Plan:
 
 class _PS:
     pp_size = 2
+    # #815: rank 1 OF 2, which is what `_Group` below already says -- last but
+    # not first. The two are one statement about one machine, so they are
+    # written next to each other rather than left to agree by accident.
+    pp_rank = 1
 
 
 class _Group:
+    # #815: `is_first_rank` is FALSE, and it has to be. f31fd5e43e [#791] gave
+    # the loop a `not self.pp_group.is_first_rank` read, and with pp_size=2 a
+    # rank that is last is not also first. Setting True to dodge the branch
+    # would model a rank that is simultaneously the head and the tail of a
+    # two-stage pipeline -- a machine that does not exist, and precisely the
+    # convenient-instead-of-faithful stub this class of repair exists to avoid.
+    #
+    # Being faithful means the loop now really enters the #791 admission
+    # receive, so the collaborators below are stubbed the same way this file
+    # already stubs its other two: to their production rule.
+    is_first_rank = False
     is_last_rank = True
 
 
@@ -100,6 +127,23 @@ class _Rank:
     _event_loop_pp_body = SchedulerPPMixin._event_loop_pp_body
     _pp_flip_hold_slot = SchedulerPPMixin._pp_flip_hold_slot
     _pp_record_slot_last_batch = SchedulerPPMixin._pp_record_slot_last_batch
+    # #815: taken unbound for the same reason the three above are -- the #791
+    # admission pass is now on this rank's path, and a model of it would be
+    # circular in exactly the way the docstring warns about. These are the
+    # SHIPPING methods, not stand-ins; the harness supplies only the wire.
+    _pp_reconcile_incoming_admission = SchedulerPPMixin._pp_reconcile_incoming_admission
+    _pp_void_retracted_pass = SchedulerPPMixin._pp_void_retracted_pass
+    _pp_forwarded_schedule_from = SchedulerPPMixin._pp_forwarded_schedule_from
+    _pp_note_output_expectation = SchedulerPPMixin._pp_note_output_expectation
+    _pp_note_chunked_req_before_admission = (
+        SchedulerPPMixin._pp_note_chunked_req_before_admission
+    )
+    _pp_void_pass_without_upstream_launch = (
+        SchedulerPPMixin._pp_void_pass_without_upstream_launch
+    )
+    _pp_send_admission_decision = SchedulerPPMixin._pp_send_admission_decision
+    _pp_commit_admission_send_work = SchedulerPPMixin._pp_commit_admission_send_work
+    _pp_drain_voided_proxy = SchedulerPPMixin._pp_drain_voided_proxy
 
     PP_LOOP_SIZE = 4
     CYCLES = 25
@@ -124,6 +168,14 @@ class _Rank:
         self.last_batch = None
         self.armed = False
         self.passes = 0
+        # #815: the state the #791 admission pass reads on the quiet path. All
+        # three are the values a rank holds when nothing has been admitted and
+        # no crossing wire is configured -- the condition under which the
+        # resident-carry leak was measured, so they are the scenario's own
+        # values rather than whatever silences the loop.
+        self.waiting_queue = []
+        self._pp_gapped_wire = False
+        self._pp_admission_pending_sends = deque()
 
         # THE SEEDED STATE, and it is the state a completed prefill really
         # leaves in a purity-idle slot. The prefill's request is ALREADY
@@ -160,6 +212,27 @@ class _Rank:
         # ``mbs`` entry None on exactly the rounds that must still refresh
         # its ``last_mbs`` entry.
         return _Plan(None, running_batch)
+
+    def _pp_recv_admission_decision(self):
+        """THE ONLY NEW STUB, and it is stubbed to a value production builds.
+
+        The real method reads a decision off the gloo wire, which this harness
+        has none of. What it returns on the quiet path is an EMPTY decision --
+        `PPAdmissionDecision(mb_id=..., entries=())` is what the shipping code
+        itself constructs when a rank has nothing to report
+        (scheduler_pp_mixin.py:1473 and :1556), not a shape invented here.
+
+        Empty entries make the reconciliation below provably inert rather than
+        incidentally inert: `reconcile_pp_admission_decision` loops over
+        `decision.entries`, so with none it returns the decision unchanged. That
+        is what keeps this file about the resident-carry leak: the #791 pass is
+        present and real, and it narrows nothing, which is the condition under
+        which the leak was measured on metal.
+        """
+        self._pp_output_expected_incoming = False
+        self._pp_pass_voided_incoming = False
+        self._pp_upstream_launched_incoming = False
+        return PPAdmissionDecision(mb_id=0, entries=())
 
     def _pp_recv_proxy_tensors(self, mb_id):
         return None

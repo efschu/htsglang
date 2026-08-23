@@ -161,6 +161,24 @@ class _RingWire:
         self.rank = rank
         self.rank_in_group = rank
         self.world_size = WORLD
+        # #815: DROPPED IN THE PORT, and the file it was copied from had
+        # already paid for them. `GroupCoordinator` exposes these as plain
+        # attributes and the mixin reads them directly --
+        # `_pp_send_admission_decision` opens with `if self.pp_group.is_last_
+        # rank: return` (scheduler_pp_mixin.py:4507), before any wire I/O. The
+        # source file carries these two lines with the note that "a stub
+        # without them dies as an AttributeError inside the worker, which is a
+        # harness gap, not a wiring finding" (test_pp_admission_wiring_791.py
+        # :132-136). That is exactly what happened here.
+        #
+        # IT ALSO EXPLAINS THE SECOND FAILURE, which does not look related. In
+        # the blocking test PP0 died on this AttributeError at i=0, long before
+        # it could reach the blocking receive it was supposed to wedge on -- so
+        # by the deadline PP0 was not a stuck rank, it was a dead one, and the
+        # ring readout came back [1, 2] instead of [0, 1, 2]. A crash that
+        # removes a rank from a liveness census reads as that rank being fine.
+        self.is_first_rank = rank == 0
+        self.is_last_rank = rank == WORLD - 1
 
     def send_tensor_dict(
         self, tensor_dict, dst=None, all_gather_group=None, async_send=False

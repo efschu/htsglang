@@ -90,6 +90,25 @@ def _relief(live_max, split, *, evicts_to=None):
     r._rows_at_boot = None
     r._exhausted = False
     r._bytes_per_row = 1024
+    # #815 STUB DRIFT, and this one needed a MEASUREMENT rather than an
+    # argument. 9aec623b2a [#796] added a `self._buffers` read to `_shrink_to`'s
+    # "the pool reported a release the driver's free column did not show"
+    # diagnostic; this helper builds the relief with `__new__` and never had the
+    # field. `_buffers` is real -- assigned unconditionally in __init__ and
+    # again on the restore path.
+    #
+    # 0 IS THE CONSTRUCTOR-FAITHFUL VALUE HERE, not a placeholder: the `buffers`
+    # parameter defaults to 0, this file's `_Pool` declares no buffer geometry
+    # at all (page_size=1, nothing else), so a real KvBackingRelief built over
+    # THIS pool would carry 0. Production treats `_buffers <= 0` as a modelled
+    # state, not an invalid one -- it guards the chunk-to-rows conversion with
+    # exactly that test.
+    #
+    # And the choice is not load-bearing, which was checked rather than assumed:
+    # the file was run with 0, 1 and 28, all 5 passed in each case. These tests
+    # assert on `_cap.engaged` and `_pool.backing_calls`, neither of which this
+    # value reaches. Recorded so the next reader does not re-derive it.
+    r._buffers = 0
     r._last_live_split = split
     r._tree_cache_fn = lambda: object()
     r.evicted_rows_total = 0

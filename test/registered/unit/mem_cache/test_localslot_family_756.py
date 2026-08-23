@@ -36,6 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 SET_ENV = "SGLANG_PP_LAYER_SET"
+WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
 
 
 class _CounterSpy:
@@ -141,14 +142,15 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
     behaviorally through the base init's own helper."""
 
     def setUp(self):
-        self._saved = os.environ.get(SET_ENV)
+        self._saved = {k: os.environ.get(k) for k in (SET_ENV, WIRE_ENV)}
         self.addCleanup(self._restore)
 
     def _restore(self):
-        if self._saved is None:
-            os.environ.pop(SET_ENV, None)
-        else:
-            os.environ[SET_ENV] = self._saved
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def test_both_wrappers_build_the_ownership_map_in_init(self):
         import inspect
@@ -174,10 +176,21 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
         import sglang.srt.distributed as dist
         from sglang.srt.mem_cache.memory_pool import _owned_layers_for_pool
 
+        # #815: THE CROSSING WIRE IS NOW PART OF THE PREMISE, not decoration.
+        # This test's whole point is a GAPPED ownership set, and 4b2e43465d
+        # [#753] made a gapped set illegal unless the crossing wire carries it
+        # (`parse_pp_layer_sets(..., allow_gapped=)` is only passed True by
+        # `get_pp_layer_set` when `pp_crossing_wire_enabled()`). Without the
+        # flag the refusal raises, `current_stage_layer_set` swallows it with a
+        # bare `except Exception: return None`, and this test saw None.
+        #
+        # So the fix is to state the configuration the scenario actually needs,
+        # NOT to drop the gap: a contiguous set would still map correctly under
+        # plain subtraction and would stop testing anything. #753 built the wire
+        # precisely so this configuration could be carried safely.
         os.environ[SET_ENV] = "0-15,32-39;16-31;40-47"
-        group = SimpleNamespace(
-            num_hidden_layers=48, rank_in_group=0, world_size=3
-        )
+        os.environ[WIRE_ENV] = "1"
+        group = SimpleNamespace(num_hidden_layers=48, rank_in_group=0, world_size=3)
         with mock.patch.object(dist, "get_pp_group", return_value=group):
             owned = _owned_layers_for_pool()
         self.assertIsNotNone(owned, "the layer set did not resolve")
@@ -186,6 +199,30 @@ class TestLayerSetsStillMapForReal(CustomTestCase):
         # subtraction would confidently say 32.
         self.assertEqual(mapping[32], 16)
         self.assertEqual(mapping[0], 0)
+
+    def test_the_gapped_set_is_refused_without_the_crossing_wire(self):
+        """TODAY'S CONTRACT, and the reason the test above must name the wire.
+
+        #753 refuses a gapped set the wire cannot carry. That refusal is not
+        visible at this seam -- `current_stage_layer_set` catches everything and
+        returns None -- so without this test the silent None would look like an
+        ordinary "no layer set configured" and the test above would be one env
+        var away from measuring nothing again.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import sglang.srt.distributed as dist
+        from sglang.srt.mem_cache.memory_pool import _owned_layers_for_pool
+
+        os.environ[SET_ENV] = "0-15,32-39;16-31;40-47"
+        os.environ.pop(WIRE_ENV, None)
+        group = SimpleNamespace(num_hidden_layers=48, rank_in_group=0, world_size=3)
+        with mock.patch.object(dist, "get_pp_group", return_value=group):
+            self.assertIsNone(
+                _owned_layers_for_pool(),
+                "a gapped set without the crossing wire must not resolve",
+            )
 
 
 class TestStandardPoolUnchanged(CustomTestCase):
