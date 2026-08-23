@@ -180,3 +180,48 @@ def mamba_checkpoint_track_target(
     if (target - prefix_len) % chunk_size != 0:
         return None
     return target
+
+
+def retention_shrinks_protected(
+    cache_len: Optional[int], protected_len: Optional[int]
+) -> bool:
+    """True when a proposed retention cap would truncate the protected prefix.
+
+    #824. ``cache_unfinished_req`` publishes ``req.cache_protected_len =
+    len(new_indices)`` at its end (unified_radix_cache.py:1234,
+    mamba_radix_cache.py:1013), so that length is COMMITTED: the tree owns the
+    KV below it and the caller writes only ``[protected, len(new_indices))``
+    back into the token pool. A later step that retains LESS leaves the range
+    between the two claimed by nobody. Both lineages assert on exactly that,
+    and the assert killed rank PP0 -- and with it the instance, PP1 and PP2
+    following seconds later on gloo peer-close -- on 2026-08-23 06:07:06::
+
+        req.cache_protected_len=16384, len(new_indices)=8192,
+        page_aligned_len=8192
+
+    Reachable rather than theoretical, because the caps are NOT monotone:
+    ``mamba_last_track_seqlen`` is set from ``mamba_branching_seqlen``
+    (schedule_batch.py:2660), which can sit below an earlier track, and it is
+    reset to ``None`` outright in several places.
+
+    A PREDICATE, NOT A CORRECTED LENGTH, and that is the whole design decision.
+    Raising the cap back up to ``protected_len`` is not available: the donated
+    mamba state sits at exactly the tracked position, and pairing a state with
+    a key at a different position is the silent corruption
+    mamba_component.py:684-687 already refuses in the other direction ("Never
+    floor"). Handing back a number would invite precisely that. Callers
+    instead route a True into the decline machinery they already have --
+    ``_decline_retention``, whose answer correctly differs by caller (0 for an
+    unfinished step, ``None`` for a finished one, #783) -- so this helper never
+    has to know which of those two is right.
+
+    ``None`` cache_len is False: a component that already declined has nothing
+    to shrink and must not be re-judged here.
+
+    SHRINKAGE ONLY. Whether a position sits on the checkpoint grid is
+    ``is_on_interval``'s decision and stays there; re-deciding it here would
+    restart the two-lineage drift #747 exists to end.
+    """
+    if cache_len is None or protected_len is None:
+        return False
+    return int(cache_len) < int(protected_len)

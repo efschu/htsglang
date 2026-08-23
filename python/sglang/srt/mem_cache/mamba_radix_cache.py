@@ -68,6 +68,7 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     is_on_interval,
     is_resume_candidate,
     protect_deepest_anchors,
+    retention_shrinks_protected,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -822,6 +823,30 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.mamba_checkpoint_interval,
                     req.rid,
                 )
+            return _skip_cache_unfinished_req(req)
+        # #824: the tracked position is NOT monotone
+        # (`mamba_branching_seqlen`, schedule_batch.py:2660, can sit under an
+        # earlier track), so it can land below what this request already
+        # published as `cache_protected_len` at the end of a previous call
+        # (:1013). Caching at the shallower length retains fewer indices than
+        # the tree already owns and the assert at :991 catches it by killing
+        # the rank -- measured 2026-08-23 06:07:06, protected 16384 against
+        # 8192 retained, which took the whole instance down with it.
+        #
+        # Skip rather than clip: the donated state sits exactly at `cache_len`,
+        # so raising the retained key back to `cache_protected_len` would pair
+        # a shallower state with a longer key -- the same silent corruption the
+        # off-grid branches above refuse in the other direction. Skipping keeps
+        # the KV with the request until it finishes.
+        if retention_shrinks_protected(cache_len, req.cache_protected_len):
+            logger.warning(
+                "mamba retention would truncate a protected prefix: tracked "
+                "position %s under cache_protected_len %d, skipping cache, "
+                "rid=%s",
+                cache_len,
+                int(req.cache_protected_len or 0),
+                req.rid,
+            )
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
