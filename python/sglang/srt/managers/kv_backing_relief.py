@@ -501,6 +501,28 @@ def collective_slot_ballot(reduced):
     }
 
 
+def exposure_over_backing(exposed_rows: int, backed_rows: int) -> int:
+    """Rows the allocator may hand out that have NO COMMITTED PAGE behind them.
+
+    #816. The one-line statement of an invariant this module maintained
+    everywhere except where it released the cap::
+
+        exposed_rows() <= committed backing rows
+
+    Pure and module-level so the decision can be tested without a pool, an
+    arena or a boot -- and so there is exactly ONE definition of "over-exposed"
+    for every caller, which is the "one consumer never got the treatment"
+    lesson #345, #352 and #355 each paid for separately.
+
+    ZERO IS THE ONLY SAFE ANSWER. A positive result means the allocator can
+    hand out an id whose pages went back to the driver, and the first write to
+    it is a device-side assert in the KV writer's bound check
+    (memory_pool.py:4978) -- the crash this function exists to make
+    impossible.
+    """
+    return max(0, int(exposed_rows) - int(backed_rows))
+
+
 class KvRowCap:
     """Withhold slot ids above ``cap`` from the allocator's free list.
 
@@ -2354,6 +2376,11 @@ class KvBackingRelief:
                 e,
             )
             self._cap.release()
+            # #816: the shrink failed, so the backing is wherever it already
+            # was -- which may be BELOW the id space this release just
+            # re-exposed. Undoing the cap must not hand out ids the failed
+            # shrink never backed.
+            self.clamp_exposure_to_backing("after a failed shrink")
             return 0
         measured = max(0, self._free_bytes() - before)
         if measured <= 0:
@@ -2592,6 +2619,14 @@ class KvBackingRelief:
         else:
             self._rows_at_boot = None
             self._exhausted_at_rows = None
+        # #816: the branch above compares against ``boot_rows`` -- the
+        # REMEMBERED recovery target -- not against the allocator's id space.
+        # When ``boot_rows <= now < _reservation_rows()`` it takes the else
+        # leg, engages nothing, and the release two lines up has just exposed
+        # the WHOLE id space over ``now`` committed rows. That is the #816
+        # crash, and it is why the clamp is unconditional rather than part of
+        # the condition: the condition is the thing that was wrong.
+        self.clamp_exposure_to_backing("after recovery")
         self.recover_count += 1
         return max(0, now - was)
 
@@ -2622,6 +2657,85 @@ class KvBackingRelief:
         if self._cap.engaged and self._cap.cap is not None:
             return int(self._cap.cap)
         return self._reservation_rows()
+
+    def clamp_exposure_to_backing(self, why: str) -> int:
+        """Never leave the allocator exposing an id with no page behind it.
+
+        #816, and it is the MIRROR of #717/#722. That one put the cap BELOW
+        rows that were still live and the next read was an illegal address;
+        this one leaves ids exposed ABOVE the rows that are still committed and
+        the next write is a device-side assert in the KV writer's bound check.
+        Same invariant, two directions:
+
+            highest live row  <=  committed backing  >=  exposed id space
+
+        MEASURED ON METAL, 2026-08-23 00:33:54, the crash this closes::
+
+            PP-ADMISSION verdict=ADMIT ... avail=97385 evictable=320465
+            Assertion `index >= 105414 (out of range): set_kv_buffer (MHA)'
+
+        105414 is ``self.size + page_size``, i.e. 105413 committed rows, while
+        admission was pricing against 97385 + 320465 = 417850 reachable ones.
+        312437 rows of pure exposure, and the first prefill whose tail landed
+        up there took the assert.
+
+        WHY A CLAMP AND NOT A WIDER BOUND. The writer's bound is deliberately
+        graph-stable (``graph_safe_store_bound``, memory_pool.py:131) and
+        widening it would re-admit the silent-corruption band it exists to
+        exclude. The id space is the thing that is wrong, so the id space is
+        what gets corrected.
+
+        WHY IT CANNOT RE-CREATE #722. It only ever LOWERS exposure toward
+        ``_current_rows()`` -- a MEASURED committed count, never a remembered
+        one (the #684 lesson) -- and it never lowers the BACKING. If the
+        backing already sits below the live set, that is the #722 state and it
+        is reported here rather than papered over: capping cannot repair it,
+        only a grow can, so this logs and leaves the decision to ``recover``.
+
+        Returns the number of over-exposed rows it withdrew (0 when the state
+        was already sound), so callers and tests can assert on the action
+        rather than on the absence of a symptom.
+        """
+        exposed = self.exposed_rows()
+        backed = self._current_rows()
+        over = exposure_over_backing(exposed, backed)
+        if not over:
+            return 0
+        live = self._max_live_row()
+        if live >= 0 and live >= backed:
+            # The #722 shape, and it is ALREADY true before this function acts.
+            # Say so loudly and separately: clamping to ``backed`` here is
+            # still strictly better than leaving 312k rows exposed, but it does
+            # not make those live rows addressable again.
+            logger.error(
+                "%s exposure clamp (%s) found the #722 state underneath: the "
+                "highest live row is %d but only %d rows are committed, so "
+                "live rows are already unmapped. Clamping exposure to %d "
+                "anyway -- it stops NEW ids escaping, it cannot repair the "
+                "ones already handed out. A grow, not a cap, is what fixes "
+                "this.",
+                LOG_PREFIX,
+                why,
+                live,
+                backed,
+                backed,
+            )
+        self._cap.engage(backed)
+        logger.warning(
+            "%s exposure clamp (%s): the allocator could hand out %d rows "
+            "while only %d are committed, so %d rows had no page behind them. "
+            "Capped at %d. Leaving them exposed is the #816 crash: the first "
+            "write above the backing is a device-side assert in "
+            "masked_set_kv_buffer (memory_pool.py:4978), which cost this "
+            "instance four boots on 2026-08-22/23.",
+            LOG_PREFIX,
+            why,
+            exposed,
+            backed,
+            over,
+            backed,
+        )
+        return over
 
     def backed_rows(self) -> int:
         """Rows this rank has PHYSICALLY BACKED, as a public reading.
@@ -2861,6 +2975,12 @@ class KvBackingRelief:
         self._cap.release()
         if level < self._reservation_rows():
             self._cap.engage(level)
+        # #816: ``level`` is the GROUP minimum and the comparison is against
+        # the id-space span, so the no-cap leg exposes every id this rank has
+        # -- backed or not. The group level decides what the ranks AGREE on;
+        # this rank's own committed backing decides what it may physically
+        # write. Both bind, and the tighter one wins.
+        self.clamp_exposure_to_backing("after the cap agreement")
         # AND MAKE THE ORDER A FUNCTION OF MEMBERSHIP ALONE.
         #
         # ``release`` sorts only when it actually had ids withheld, and
