@@ -148,13 +148,7 @@ BOTH_BLOCKED = "BOTH BLOCKED"
 #: worth of held layout. Holding longer than it costs to leave is never worth it.
 LAYOUT_HOLD_MAX_ROUNDS: int = 8
 
-#: #677 mirror bound: rounds a RUNNING decode batch is guaranteed before a
-#: prefill pull may take the layout. 2 is the minimum that means "did not
-#: preempt mid-batch"; larger belongs to the economic comparison, not here.
-MIN_DECODE_ROUNDS: int = 2
-
 HOLD_FOR_UNSERVED = "HOLD: work pending in this layout"
-PULL_FOR_DEMAND = "PULL: work pending for the other layout"
 
 
 def next_hold_rounds(
@@ -187,9 +181,6 @@ def layout_hold_verdict(
     max_hold_rounds: int = LAYOUT_HOLD_MAX_ROUNDS,
     seam_funded: bool = True,
     mid_flip: bool = False,
-    decode_serving: bool = False,
-    decode_rounds_so_far: int = 0,
-    min_decode_rounds: int = MIN_DECODE_ROUNDS,
 ):
     """``(allow_flip, reason)`` -- demand decides the layout, not the timer.
 
@@ -204,6 +195,13 @@ def layout_hold_verdict(
     So the same arriving-tokens signal that PULLS a cutover must also HOLD it
     until the work it pulled for is served. Demand overrides the timer in BOTH
     directions; that symmetry is the rule, not two rules.
+
+    THIS FUNCTION CARRIES ONE OF THE TWO DIRECTIONS -- the HOLD in pp. The pull
+    out of tp is a rule, not a veto, and it lives where the rules live: the
+    ``pending prefill > threshold`` arm and its DECODE FLOOR guard (see the
+    "THE DECODE FLOOR" comment in ``_decide_from_load``). #820 removed the
+    ``phase == "tp"`` branch that used to sit here; the argument is in that
+    comment, at the guard that actually does the job.
 
     SAFETY, in precedence order:
       * never mid-flip -- a cutover in progress owns the layout;
@@ -249,39 +247,20 @@ def layout_hold_verdict(
             f"(round {held + 1} of {max_hold_rounds})"
         )
 
-    if phase == "tp":
-        if pend <= 0:
-            return False, "no prefill pending: nothing pulls the layout out of tp"
-        # THE MIRROR, and without it this lever recreates the very defect it
-        # fixes. An unconditional pull on pend>0 means that after an EXHAUSTED
-        # release (pp->tp with prefill still pending) the next evaluation in TP
-        # sees pend>0 and pulls straight back -- decode loses the layout before
-        # serving anything, which is C2 with the phases swapped. Under sustained
-        # both-sides load the cycle degenerates to max_hold rounds of PP, ~0
-        # rounds of TP, and TWO seams per cycle: strictly worse than the timer
-        # it replaced. So the pull yields to a decode batch that is actually
-        # running, for a bounded minimum, and the both-sides tie goes to the
-        # economic comparison rather than to whoever asks last.
-        if decode_serving and int(decode_rounds_so_far) < int(min_decode_rounds):
-            return False, (
-                f"HOLD tp: {pend} prefill tokens wait, but a decode batch is "
-                f"RUNNING and has had {int(decode_rounds_so_far)} of "
-                f"{int(min_decode_rounds)} minimum rounds -- a pull here would "
-                f"preempt mid-batch and mirror the C2 defect; bounded, the pull "
-                f"proceeds once the minimum is met"
-            )
-        return True, (
-            f"{PULL_FOR_DEMAND}: {pend} prefill tokens are waiting for pp "
-            f"and cannot be served here"
-            + (
-                f" (decode had {int(decode_rounds_so_far)} rounds, minimum "
-                f"{int(min_decode_rounds)} met)"
-                if decode_serving
-                else ""
-            )
-        )
-
-    return False, f"unknown phase {phase!r}: no decision"
+    # NO VERDICT FOR ANY OTHER PHASE, AND IT ALLOWS -- #820.
+    #
+    # This used to return False, and False here means HOLD: the sole consumer
+    # is a veto (`decide`, "if not allow: return a wait"), so an unrecognised
+    # input fell toward SWALLOWING the arm. That is the exact failure mode
+    # #817 removed one level up, where an unrecognised arm used to be swallowed
+    # by a substring denylist. Removing the "tp" branch turned "tp" from a
+    # recognised phase into an unrecognised one, so leaving the old default
+    # would have GROWN that surface instead of shrinking it. An input this
+    # function does not understand cannot be grounds for holding a layout.
+    return True, (
+        f"no decision for phase {phase!r}: this lever only reads the pp-side "
+        f"hold, so the rules' own arm stands unmodified"
+    )
 
 
 PP_TO_TP = "pp_to_tp"
@@ -1682,6 +1661,16 @@ def decide(
         # to serve "pending work" is waiting inside a layout that cannot serve
         # it -- the zero-GPU window #688 exists to remove. The deadlock escape
         # is never held.
+        # #820 REMOVED TWO ARGUMENTS FROM THIS CALL, and what they were is the
+        # tell. `decode_serving` and `decode_rounds_so_far` were read ONLY by
+        # the verdict's "tp" branch -- a branch this call site can never reach,
+        # because every arm that can carry PP_TO_TP is built under
+        # `inp.phase == PHASE_PP`. A call site feeding arguments its own phase
+        # cannot consume is the fingerprint of a built-never-wired seam.
+        # `decode_rounds_so_far` was worse than unused: it passed `hold_rounds`,
+        # the HOLD counter, as a count of DECODE rounds. The caller never had
+        # the quantity that branch needed, so wiring it would have been wrong on
+        # day one.
         allow, hold_why = layout_hold_verdict(
             phase=inp.phase,
             prefill_pending_tokens=int(getattr(inp, "pending_prefill_tokens", 0) or 0),
@@ -1689,8 +1678,6 @@ def decide(
             hold_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
             seam_funded=True,
             mid_flip=False,
-            decode_serving=int(getattr(inp, "running_bs", 0) or 0) > 0,
-            decode_rounds_so_far=int(getattr(state, "hold_rounds", 0) or 0),
         )
         if not allow:
             return PhasePolicyDecision(direction=None, reason=hold_why)
@@ -2223,6 +2210,29 @@ def _decide_from_load(
             # fixes. Only applies while decode work actually exists: with
             # nothing decoding there is nothing to protect, and an arriving
             # long prompt should reach the PP layout inside its TTFT.
+            #
+            # #820: THIS IS WHERE THE "TP MIRROR" BELONGED, and it is already
+            # here. `layout_hold_verdict` used to carry a second, parallel
+            # version of exactly this protection (MIN_DECODE_ROUNDS: "a pull
+            # must not preempt a RUNNING decode batch mid-batch"), written in
+            # 332cb3b345 for the same reason this floor exists. It was never
+            # reachable: `decide` consults that verdict only for PP_TO_TP arms,
+            # and every PP_TO_TP arm is built under `inp.phase == PHASE_PP`.
+            # The author's own commit message records why the wiring stopped
+            # there -- "My first wiring vetoed EVERY arm, including the idle
+            # return leg -- 11 tests red" -- which is what a hold-veto does to
+            # a tp branch whose `pend <= 0` answer is "no pull": read as a veto,
+            # "no pull" becomes "never leave tp", unbounded, because that
+            # return never sees `max_hold_rounds`.
+            #
+            # The two branches answered DIFFERENT QUESTIONS. The pp branch asks
+            # "may the timer take the layout" -- a veto, which is what the
+            # wrapper consumes. The tp branch asks "does demand pull the layout
+            # out" -- an arm-CREATION, which that wrapper can never do by
+            # construction. So the mirror is not a hold at all; it is this rule,
+            # and this rule states it against the real phase clock in seconds
+            # rather than against a round counter the caller does not have.
+            # Removed there, recorded here.
             in_phase = (
                 None if state.phase_since is None else inp.now - state.phase_since
             )

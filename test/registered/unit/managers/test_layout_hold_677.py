@@ -47,17 +47,11 @@ class TestLayoutHold677(CustomTestCase):
         self.assertTrue(allow, why)
         self.assertIn("timer may have the layout", why)
 
-    def test_tp_pulls_for_waiting_prefill(self):
-        """The other direction of the same rule: work waiting for PP pulls the
-        cutover forward rather than waiting out the cycle."""
-        allow, why = layout_hold_verdict("tp", 22, 0)
-        self.assertTrue(allow, why)
-        self.assertIn("PULL", why)
-
-    def test_tp_stays_when_no_prefill_waits(self):
-        allow, why = layout_hold_verdict("tp", 0, 3)
-        self.assertFalse(allow, why)
-        self.assertIn("nothing pulls", why)
+    # THE OTHER DIRECTION MOVED, IT DID NOT DISAPPEAR (#820). This file used to
+    # test a `phase == "tp"` branch of the verdict here. That branch was never
+    # reachable from `decide` and has been removed; the pull out of tp is a
+    # RULE, not a veto, and its tests now drive the real rule -- see
+    # test_tp_mirror_removed_820.py.
 
     # ---- safety precedence -------------------------------------------------
 
@@ -70,9 +64,9 @@ class TestLayoutHold677(CustomTestCase):
                     self.assertFalse(allow)
                     self.assertIn("cutover is in progress", why)
 
-    def test_never_pulls_against_an_unfunded_seam(self):
-        """A pull that cannot pay is an abandon, which is worse than waiting."""
-        allow, why = layout_hold_verdict("tp", 99999, 0, seam_funded=False)
+    def test_never_flips_against_an_unfunded_seam(self):
+        """A flip that cannot pay is an abandon, which is worse than waiting."""
+        allow, why = layout_hold_verdict("pp", 99999, 0, seam_funded=False)
         self.assertFalse(allow, why)
         self.assertIn("unfunded", why)
 
@@ -120,10 +114,21 @@ class TestLayoutHold677(CustomTestCase):
         self.assertIn(f"{LAYOUT_HOLD_MAX_ROUNDS}", why)
         self.assertIn("4", why, "round n+1 of N must be visible")
 
-    def test_unknown_phase_makes_no_decision(self):
+    def test_unknown_phase_makes_no_decision_and_that_means_ALLOW(self):
+        """#820 FLIPPED THE DIRECTION OF FAILURE, and the content is unchanged:
+        a phase this lever does not understand must not produce a decision.
+
+        What changed is what "no decision" has to RETURN. The sole consumer is
+        a veto -- `decide` does `if not allow: return a wait` -- so returning
+        False for an unrecognised input meant SWALLOWING the arm, which is the
+        exact failure mode #817 removed one level up (an unrecognised arm
+        swallowed by a substring denylist). An input the lever cannot read is
+        never grounds for holding a layout, so the rules' arm stands.
+        """
         allow, why = layout_hold_verdict("flip_in_progress", 22, 0)
-        self.assertFalse(allow)
+        self.assertTrue(allow, why)
         self.assertIn("no decision", why)
+        self.assertIn("flip_in_progress", why, "the unread input must be named")
 
     def test_negative_and_degenerate_inputs_do_not_crash(self):
         for args in (("pp", -5, -5), ("tp", -1, 0), ("pp", 0, -3)):
@@ -137,55 +142,18 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestTpMirrorAndCounterLifecycle677(CustomTestCase):
-    """Review findings on the rule/decide() seam, both pinned here.
+class TestHoldCounterLifecycle677(CustomTestCase):
+    """FINDING 2 of 332cb3b345, THE COUNTER. ``hold_rounds_so_far`` is
+    caller-maintained; a stale counter makes the first hold of the next episode
+    start half-exhausted.
 
-    FINDING 1, THE MIRROR. An unconditional pull on pend>0 recreates the defect
-    this lever fixes, phases swapped: after an EXHAUSTED release (pp->tp with
-    prefill still pending) the next TP evaluation sees pend>0 and pulls straight
-    back, so decode loses the layout before serving anything. Under sustained
-    both-sides load that degenerates to max_hold PP rounds, ~0 TP rounds, and
-    TWO seams per cycle -- strictly worse than the timer it replaced.
-
-    FINDING 2, THE COUNTER. hold_rounds_so_far is caller-maintained; a stale
-    counter makes the first hold of the next episode start half-exhausted.
+    FINDING 1 OF THAT COMMIT, THE TP MIRROR, USED TO BE PINNED HERE and is gone
+    with #820. It was never reachable through `decide`, and the degenerate cycle
+    it guarded against -- a pull taking the layout back from a decode batch that
+    has not served anything -- is guarded in production by the DECODE FLOOR on
+    the pending-prefill arm. That guard is what test_tp_mirror_removed_820.py
+    now drives, through the real rules.
     """
-
-    def test_pull_does_not_preempt_a_running_decode_batch(self):
-        allow, why = layout_hold_verdict(
-            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=0
-        )
-        self.assertFalse(allow, why)
-        self.assertIn("preempt mid-batch", why)
-
-    def test_pull_proceeds_once_the_decode_minimum_is_met(self):
-        """CAN-FAIL for the mirror: it must be a BOUNDED yield, not a new
-        starvation of the prefill side."""
-        from sglang.srt.managers.phase_policy import MIN_DECODE_ROUNDS
-
-        allow, why = layout_hold_verdict(
-            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=MIN_DECODE_ROUNDS
-        )
-        self.assertTrue(allow, why)
-        self.assertIn("minimum", why)
-
-    def test_no_running_decode_means_no_yield(self):
-        """The mirror guards a RUNNING batch, not an idle TP layout."""
-        allow, _ = layout_hold_verdict("tp", 22, 0, decode_serving=False)
-        self.assertTrue(allow)
-
-    def test_the_exhausted_release_cannot_ping_pong_straight_back(self):
-        """THE DEGENERATE CYCLE, pinned. Release from PP under both-sides load,
-        then evaluate in TP with a decode batch now running: the pull must
-        YIELD, so the cycle cannot become 8 PP rounds + 0 TP rounds."""
-        allow_release, _ = layout_hold_verdict(
-            "pp", 22, 4, hold_rounds_so_far=LAYOUT_HOLD_MAX_ROUNDS
-        )
-        self.assertTrue(allow_release, "pp must release at the bound")
-        allow_back, why = layout_hold_verdict(
-            "tp", 22, 4, decode_serving=True, decode_rounds_so_far=0
-        )
-        self.assertFalse(allow_back, f"must not pull straight back: {why}")
 
     def test_counter_resets_on_phase_change(self):
         from sglang.srt.managers.phase_policy import next_hold_rounds
