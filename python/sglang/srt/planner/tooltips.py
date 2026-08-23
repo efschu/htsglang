@@ -566,6 +566,48 @@ TRADEOFFS: Dict[str, Tradeoff] = {
         cost="Needs disk room for the whole resident state, and the image is "
         "only valid for the exact configuration that wrote it.",
     ),
+    # ---- phase-flip seam (#837-promoted) ------------------------------------
+    # No `measured_from` on any of these. The pointer names a study that HAS
+    # a harness on this rig; the study that would put a number on the seam
+    # shrink is window-4 W13b, which has not been run, and pointing at it
+    # early would render "not measured on this rig" as though a harness were
+    # waiting. Add the pointer with the harness, per MEASUREMENT_SOURCES.
+    "seam_shrink": Tradeoff(
+        gain="Shortens the flip's no-return window: the device-tier quiesce "
+        "is paid before the arm and the KV grow afterwards.",
+        cost="Device-tier HiCache writes pause between the arm and the "
+        "cutover, and a grow that is never paid loses capacity silently.",
+    ),
+    "seam_shrink_prearm_quiesce": Tradeoff(
+        gain="Turns one half of the seam shrink on or off alone, so a "
+        "measurement can say which half moved the cutover.",
+        cost="A per-half setting is an experiment, not a configuration: it "
+        "silently outranks the master switch until it is set back to -1.",
+    ),
+    "seam_shrink_defer_grow": Tradeoff(
+        gain="Same one-half control for the deferred KV grow, the half that "
+        "carries the capacity risk.",
+        cost="Forcing this half on without the other defers a grow with no "
+        "pre-arm drain in front of it, which is the untested combination.",
+    ),
+    "seam_shrink_grow_debt_rounds": Tradeoff(
+        gain="How long an unpaid grow stays quiet: a shorter patience catches "
+        "a stuck ratchet in fewer rounds.",
+        cost="Too short and a slow but legitimate payment is reported as a "
+        "defect every round; the count is a patience, not a measurement.",
+    ),
+    "flip_seam_drain_budget_ms": Tradeoff(
+        gain="Refuses an arm whose projected quiesce is too long, by name, "
+        "instead of letting the seam hold the ring.",
+        cost="A refused arm is a lost flip. Set it too low and flips stop "
+        "happening; 0 disables the guard and only logs the projection.",
+    ),
+    "hicache_read_buffers": Tradeoff(
+        gain="Makes the HiCache read path's pinned footprint a fixed, "
+        "budget-visible number instead of one allocation per read.",
+        cost="Real pinned memory charged at attach, so it changes what fits; "
+        "too small a ring just falls back and counts overflows.",
+    ),
 }
 
 

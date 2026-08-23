@@ -899,6 +899,111 @@ _CURATED: Dict[str, dict] = {
         hover="Allow release/resume of GPU memory occupation (suspend-to-RAM). "
         "Pairs with the fork's SGLANG_MEMORY_SAVER_CUDA_GRAPH env var.",
     ),
+    # ---- fork: the #837-promoted phase-flip seam knobs ---------------------
+    #
+    # NO `requires` EDGE IS DECLARED BETWEEN THE MASTER AND THE TWO PER-HALF
+    # OVERRIDES, and that omission is the load-bearing part of this block.
+    # ``ServerArgs._handle_seam_shrink_flags_837`` says so at the code, in a
+    # comment it went out of its way to write: "A per-half override without
+    # the master is not an error -- -1 follows a master that is off, and 1 is
+    # exactly how a window turns ONE half on without the other. Refusing it
+    # would forbid the attribution run the overrides exist for." A
+    # ``requires=("seam_shrink",)`` here would grey out, in the dashboard,
+    # precisely the single-half configuration W13b needs to attribute its
+    # result -- the same inversion #500-I3 found on ``rank_tp_ratio`` and the
+    # reason test_flag_registry_contract_500.py exists.
+    "seam_shrink": dict(
+        source="fork",
+        group="phase-flip",
+        # CURATED TYPE, NOT INFERRED. ``_infer_type`` maps Optional[bool] to
+        # "str" (it tests ``base_type is bool``, and Union[bool, None] is not
+        # bool), which would make ``profile_argv`` emit "--seam-shrink 1" for
+        # a store_true flag. Fixed HERE rather than in ``_infer_type`` because
+        # this build has 16 Optional[bool] ServerArgs fields and 14 of them
+        # currently carry the inferred "str"; widening the inference would
+        # change the emitted argv of every one of them at once, which is a
+        # much larger claim than this ticket has evidence for.
+        type="bool",
+        hover="#834: shrink the flip's no-return window by moving two pieces "
+        "of work out of it -- the #760 device-tier quiesce runs at ARM time "
+        "(while the pipeline still runs), and the rank-local KV grow runs on "
+        "the round hook afterwards, clamped back to the group's agreed level "
+        "so rows are BACKED without being EXPOSED. The group levelling "
+        "deliberately STAYS in the seam (one MIN reduction; moving a "
+        "collective is what the 2026-08-08 wedge punished). Both hazard "
+        "directions are refusals, not hangs: UNLEVELLED-EXPOSURE-REFUSED and "
+        "PREARM-DRAIN-REFUSED cost a flip and never a rank. The named cost is "
+        "a real capability pause -- between the pre-arm quiesce and the "
+        "cutover, device-tier HiCache writes do not happen. OFF by default "
+        "until the window-4 W13b measurement passes; see "
+        "_seam_shrink_planner_default().",
+    ),
+    "seam_shrink_prearm_quiesce": dict(
+        source="fork",
+        group="phase-flip",
+        allowed=(-1, 0, 1),
+        hover="Per-half attribution override for #834's pre-arm quiesce: -1 "
+        "follow --seam-shrink, 0 force off, 1 force on. It exists so a window "
+        "can attribute a cutover change to ONE half instead of reading "
+        "adjacency as attribution, which this family has already paid for "
+        "twice. Legal WITHOUT --seam-shrink on purpose (1 is how a window "
+        "turns this half on alone). Not a count: any other integer is "
+        "refused at argv, because the runtime rule is 'override >= 1 means "
+        "force ON' -- so a typo'd 2 ARMS this half rather than falling back "
+        "to the master, and the window would name the other move.",
+    ),
+    "seam_shrink_defer_grow": dict(
+        source="fork",
+        group="phase-flip",
+        allowed=(-1, 0, 1),
+        hover="Per-half attribution override for #834's deferred rank-local "
+        "KV grow: -1 follow --seam-shrink, 0 force off, 1 force on. Same "
+        "contract as --seam-shrink-prearm-quiesce, including that it is legal "
+        "without the master. Read W13b criterion 13 whenever this half is on: "
+        "a GROW DEFERRED without a matching GROW PAID is #814's ratchet in a "
+        "new shape and is the one failure mode that loses capacity silently "
+        "and permanently.",
+    ),
+    "seam_shrink_grow_debt_rounds": dict(
+        source="fork",
+        group="phase-flip",
+        hover="How many flip-runtime rounds a deferred grow may stay unpaid "
+        "before the runtime shouts GROW-DEBT-UNPAID and names #814. A "
+        "PATIENCE, not a measurement: nothing in the tree has measured how "
+        "long a legitimate payment takes, so the in-code default 32 is a "
+        "round count chosen to be loud without being flaky, and it is not "
+        "derived from anything. The guard never self-heals by exposing "
+        "unlevelled rows -- that self-heal is the hazard it was written "
+        "against.",
+    ),
+    "flip_seam_drain_budget_ms": dict(
+        source="fork",
+        group="phase-flip",
+        hover="#830: the longest #760 device-tier quiesce the flip will carry "
+        "INTO the no-return window, in ms. Above it the arm is refused by "
+        "name (PREARM-DRAIN-REFUSED) instead of the seam silently holding the "
+        "ring; 0 disables the guard and still logs the projection. The "
+        "in-code default 1094 is DERIVED, not pinned -- it is the largest "
+        "cutover in the 1014-flip HiCache-off corpus (ANALYSE_830 section "
+        "2.1) -- but it is derived from a CORPUS, not from this rig; see "
+        "_seam_shrink_planner_default() for why the planner does not price it "
+        "from the local measurement store today.",
+    ),
+    "hicache_read_buffers": dict(
+        source="fork",
+        group="hicache",
+        hover="#720: how many reusable pinned read targets the HiCache read "
+        "path keeps per registered pool. 0 (the default) keeps today's "
+        "behaviour -- a fresh pinned page allocated per read, invisible to "
+        "the joint pinned budget because it scales with concurrent reads and "
+        "not with tier size. A non-zero ring makes that footprint a NUMBER "
+        "the budget can refuse at attach; it is real memory charged at attach, "
+        "so turning it on changes what fits. Undersizing is graceful, not "
+        "fatal: an exhausted ring falls back to a fresh allocation and counts "
+        "it in overflow_allocations rather than blocking the prefetch worker. "
+        "Left as a flag-with-default -- see _seam_shrink_planner_default() for "
+        "what a solver would have to count first.",
+    ),
 }
 
 
@@ -1055,6 +1160,15 @@ _FORK_FIELD_IDS = {
     "speculative_adaptive",
     "speculative_adaptive_config",
     "speculative_adaptive_graph_memory",
+    # #837: the promoted phase-flip seam knobs. Fork additions even though
+    # they are ServerArgs fields, on the same terms as the block above --
+    # #830/#834/#720 are fork work and no upstream build has these fields.
+    "seam_shrink",
+    "seam_shrink_prearm_quiesce",
+    "seam_shrink_defer_grow",
+    "seam_shrink_grow_debt_rounds",
+    "flip_seam_drain_budget_ms",
+    "hicache_read_buffers",
 }
 
 
@@ -1802,6 +1916,17 @@ _ARGV_ORDER = (
     "hicache_size",
     "hicache_storage_backend",
     "hicache_mem_layout",
+    # #837: the read-buffer ring belongs next to the other hicache flags, and
+    # the seam knobs travel as one block so a gate-on window's command diffs
+    # against the gate-off one in a single contiguous hunk. All six default to
+    # None, so an unset profile emits none of them and the reference argv is
+    # unchanged (profile_argv skips None before it ever consults this order).
+    "hicache_read_buffers",
+    "seam_shrink",
+    "seam_shrink_prearm_quiesce",
+    "seam_shrink_defer_grow",
+    "seam_shrink_grow_debt_rounds",
+    "flip_seam_drain_budget_ms",
 )
 
 #: serving-identity flags emitted even when they equal the catalog default
@@ -2340,6 +2465,152 @@ def _apply_capacity_rules(
 
 
 # ---------------------------------------------------------------------------
+# #837: THE PHASE-FLIP SEAM POLICY SEAT.
+#
+# The three knobs below used to be reachable only through SGLANG_* env vars,
+# which put the decision in whatever shell last exported one. They are flags
+# now, and this function is the seat that decides them for a generated
+# profile -- the same place _apply_capacity_rules decides context_length and
+# max_running_requests.
+#
+# BE PRECISE ABOUT WHAT THIS TICKET MOVED. The seat is built and every
+# generated profile passes through it, but it returns {} today, so what
+# actually decides these six for an unflagged process is still the EnvBool /
+# EnvInt default in environ.py -- and a shell that exports the key still
+# decides for that shell. What changed is that there is now one reviewable
+# place to make the decision, and a flag that outranks the env when it is
+# made. Claiming the authority has already transferred would be the same kind
+# of overstatement this family keeps paying for; it transfers when the seat
+# returns a value.
+#
+# The three answers below are deliberately NOT the same shape, because the
+# evidence behind them is not the same shape. Two are honest refusals.
+# ---------------------------------------------------------------------------
+
+
+def _seam_shrink_planner_default(
+    settings: Dict[str, Any], model_cfg: Optional[dict], gpus: Sequence
+) -> Dict[str, Any]:
+    """The planner's decision for the #837 seam knobs: ``{id: value}``.
+
+    An id ABSENT from the returned mapping means "the planner has nothing to
+    say"; the setting keeps its ``None`` default, no flag is emitted, and the
+    launch is byte-identical to one generated before this function existed.
+    That is the state of all three answers today, and each one is a different
+    kind of "not yet".
+
+    1. ``seam_shrink`` -- CONSERVATIVE OFF, PENDING A NAMED MEASUREMENT.
+       This is a policy default with an activation criterion, not a formula.
+       The criterion is the window-4 **W13b** measurement in
+       ``/spinning/gpu-arb/WINDOW-QUEUE.md`` (section "W13b", acceptance
+       criteria 8-14), read on a gate-ON boot segment against the gate-OFF
+       segment of the same boot:
+
+         * 8  -- cutover mean < 200 ms (the headline);
+         * 9  -- and ``kv_recover`` is a SMALL share of that total, so the
+                 term that moved is the term this branch moves;
+         * 10 + 11 -- the drain is paid before the arm: seam drain ~0 AND
+                 nonzero prearm drains. Clause 10 alone is a NON-ANSWER (the
+                 seam drain already reads 0.0 ms on the current tree), which
+                 is why 11 exists;
+         * 12 -- movers recorded, not gated;
+         * 13 -- **every ``GROW DEFERRED`` has a matching ``GROW PAID`` and
+                 ``GROW-DEBT-UNPAID`` count is 0.** A deferral without a
+                 payment is #814's ratchet in a new shape: it costs capacity
+                 SILENTLY and PERMANENTLY, and it is the one failure mode
+                 here that a passing headline number would happily hide;
+         * 14 -- neither ``UNLEVELLED-EXPOSURE-REFUSED`` nor
+                 ``PREARM-DRAIN-REFUSED`` fired.
+
+       When that measurement PASSES, the operator flips this default by
+       returning ``{"seam_shrink": True}`` from here -- one line, in the
+       planner, reviewable as a policy change. Until then OFF is not
+       timidity: both halves change WHEN work happens relative to a
+       collective, and the named cost (device-tier HiCache writes are paused
+       between the pre-arm quiesce and the cutover) is a real capability
+       pause that no hermetic suite can price.
+
+    2. ``hicache_read_buffers`` -- FLAG WITH DEFAULT. NO NUMBER IS INVENTED.
+       The tempting derivation does not survive being followed to the code.
+       ``hicache_staging.read_landing_bytes(max_concurrent_prefetch,
+       page_bytes)`` (planner/hicache_staging.py:120) sizes HOST-TIER BYTES
+       for ``--hicache-size``; this flag is a COUNT of pinned buffers in a
+       per-pool ring. They share only the word "concurrency", and that shared
+       term is exactly the one the planner cannot supply:
+
+         * ``max_running_requests`` -- the concurrency cap this module does
+           decide, in _apply_capacity_rules -- is a REQUEST count. It is not
+           a count of concurrent HiCache reads. A request issues many page
+           reads, and none of them is admitted by that cap.
+         * The ring is borrowed one buffer at a time, per read, and
+           ``HiCacheStorage._batch_io_v2`` (mem_cache/hicache_storage.py:1389)
+           walks a batch's keys with a SEQUENTIAL list comprehension. One
+           calling thread therefore holds at most one buffer. Peak concurrent
+           borrows per pool is a count of cache-controller IO THREADS inside
+           ``batch_get_v2``, and the tree starts a single
+           ``prefetch_io_aux_thread`` (managers/cache_controller.py:1423)
+           plus whatever the hybrid controller adds.
+
+       So the honest ring size is a thread count nothing in the planner
+       models, and it is plausibly ~1-2 rather than anything scaled to
+       request concurrency. Sizing it from ``max_running_requests`` would
+       over-allocate registered pinned memory -- charged at ATTACH, on a box
+       that refuses over-commitment -- to solve a concurrency that is not the
+       one that occurs.
+       FOLLOW-UP #837-F1 "solve the HiCache read-buffer ring from the read
+       path's own concurrency": count concurrent ``_read_page`` borrowers per
+       registered pool (controller IO threads, not requests), then size the
+       ring to that peak. The acceptance criterion already exists and the
+       solver must satisfy it -- docs/dev/DESIGN_706_BOOT.md section 3.3:
+       ``overflow_allocations`` must be ZERO under steady load, non-zero
+       meaning concurrent reads exceed the ring and the path has fallen back
+       to per-read allocation (correct, but the #720 spike returning).
+       Undersizing is graceful and instrumented, which is what makes this
+       measurable later instead of guessable now.
+
+    3. ``flip_seam_drain_budget_ms`` -- FLAG WITH DEFAULT, AND THE STORE
+       CANNOT PRICE IT TODAY. ``planner/stage_measure_store.py`` does hold
+       measured seam timings per rig, scraped by ``stage_measure_pass.py``,
+       and #819 already prices the flip THRESHOLD from them -- so the
+       question is fair. It fails on two counts, either of which is fatal
+       alone:
+
+         * WRONG QUANTITY. ``StageMeasurement.flip_cost_s`` is the MAXIMUM
+           instrumented duration of the whole move into a stage (#297 reshard
+           ``total_ms``, #330 commit, or the #631 seam census ``elapsed_ms``).
+           This budget bounds ONE sub-term of that move: the #760 device-tier
+           quiesce the flip carries into the no-return window. Feeding the
+           whole-flip maximum in as the sub-term's ceiling yields a guard
+           that can never refuse -- a budget that always passes is worse than
+           no budget, because it reads as one that was checked.
+         * NO RECORDS. ``StageMeasurementLibrary.load()`` reads
+           ``~/.cache/sglang/stage_measurements.json``; on this rig that file
+           does not exist and the library is empty. ``lookup`` correctly
+           refuses rather than guessing, and its refusal text is the right
+           answer: take the measurement first.
+
+       The shipped default 1094 ms is DERIVED (largest cutover across the
+       1014-flip HiCache-off corpus, ANALYSE_830 section 2.1) but derived
+       from a CORPUS, not from the rig being planned.
+       FOLLOW-UP #837-F2 "price the seam drain budget from the local measure
+       store": have the flip runtime record the #760 quiesce as its own
+       stage-measurement term (it is already logged as ``[#760] SEAM DRAIN
+       ... in N ms``, W13b clause 10), scrape it in ``stage_measure_pass``
+       alongside the cutover, and set the budget from that per-rig maximum
+       here. Until the store carries the sub-term, the corpus default stands
+       and says so.
+
+    ``settings`` / ``model_cfg`` / ``gpus`` are taken now because every
+    future answer needs them (a budget is per-rig; the ring is per-pool), not
+    because today's answers read them.
+    """
+    del settings, model_cfg, gpus  # see the docstring: no answer reads them yet
+    # W13b has not been run. Returning nothing leaves every knob unset, which
+    # leaves the env fallback intact and the emitted argv unchanged.
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Rig calibrations: measured, battery-stable per-quant values for known rigs
 # (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3).
 #
@@ -2786,6 +3057,28 @@ def profiles(
             info.append(
                 "overrode kv-cache-dtype fp8_e4m3 -> fp8_e5m2: an sm86 "
                 "(RTX 3080-class) card is in the rig and cannot run e4m3 KV."
+            )
+        # #837: the phase-flip seam policy, decided HERE (once, for every
+        # preset) rather than by whatever shell last exported SGLANG_*.
+        # An EXPLICIT user value in `base` always wins -- the planner holds
+        # the seat, it does not overrule the operator who sat down in it. No
+        # note is appended when the planner declines, because declining
+        # changes nothing about the profile; the reasons live in
+        # _seam_shrink_planner_default's docstring, where they can be read
+        # without generating a profile first.
+        for cid, value in _seam_shrink_planner_default(s, model_cfg, gpus).items():
+            if base_clean.get(cid) is not None or overrides.get(cid) is not None:
+                continue
+            s[cid] = value
+            info.append(
+                "phase-flip seam policy: planner "
+                + (
+                    f"armed {cat[cid].name}"
+                    if value is True
+                    else f"set {cat[cid].name} {value}"
+                )
+                + " (see _seam_shrink_planner_default for the criterion "
+                "this decision rests on)."
             )
         return s
 

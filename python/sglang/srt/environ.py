@@ -2310,6 +2310,37 @@ _warn_deprecated_env_to_cli_flag(
     "DFlash now auto-enables the min-free-slots delay; unset this env. To "
     "override the threshold, use '--min-free-slots-delay'.",
 )
+# #837: the round-4 seam knobs. These notices are load-bearing in a way the
+# ones above are not, and the mechanism is worth stating because it looks
+# self-inflicted otherwise. This module is imported long before ServerArgs
+# runs __post_init__, so a key found HERE was written by a human or a boot
+# script -- the value a flag publishes arrives later and is never warned
+# about. That is the intended asymmetry: the flag is the surface, the env is
+# an internal propagation detail this process writes from its own argv.
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SEAM_SHRINK",
+    "Please use '--seam-shrink' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SEAM_SHRINK_PREARM_QUIESCE",
+    "Please use '--seam-shrink-prearm-quiesce' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SEAM_SHRINK_DEFER_GROW",
+    "Please use '--seam-shrink-defer-grow' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS",
+    "Please use '--seam-shrink-grow-debt-rounds' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS",
+    "Please use '--flip-seam-drain-budget-ms' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_HICACHE_READ_BUFFERS",
+    "Please use '--hicache-read-buffers' instead.",
+)
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
 # when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,

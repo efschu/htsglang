@@ -43,6 +43,18 @@ added to any of these flags is checked automatically; the driver table is not,
 so a new FLAG must be added to ``_ACTIVATION`` (and
 ``test_every_audited_flag_has_a_driver`` fails until it is).
 
+#837 EXTENDS THIS FILE TO A SECOND FAMILY, and states plainly why it is a
+second family rather than four more entries in ``_AUDITED``: the promoted
+phase-flip seam knobs are validated by ``_handle_seam_shrink_flags_837``, not
+by ``_handle_uneven_tp``. Putting them in ``_AUDITED`` would drive them
+through a handler that has never heard of them, which accepts every value --
+a whole class of tests passing green while measuring nothing. So they get
+their own driver (``seam_refusal``), their own can-discriminate check, and
+their own classes below. What is checked for them is the same kind of thing:
+declared DOMAINS against the runtime's, the deliberate NON-edge between the
+master and its two per-half overrides, and that the family emits as argv
+rather than env.
+
 CAN-FAIL PROOF
 --------------
 Put ``"pp_size"`` back into ``rank_gpu_id``'s ``mutually_exclusive_with`` and
@@ -81,6 +93,27 @@ _ACTIVATION = {
     "base_gpu_id": (1, "--base-gpu-id"),
     "gpu_id_step": (2, "--gpu-id-step"),
     "pp_size": (2, "--pp-size"),
+    # #837: the promoted phase-flip seam knobs. Their driver is NOT
+    # `_handle_uneven_tp` (see `_SEAM_837` below), so they are not in
+    # `_AUDITED`; the rows are here because `_ACTIVATION` is this file's one
+    # table of "how do you make this flag active, and what does its refusal
+    # call it", and a second table would drift from this one.
+    "seam_shrink": (True, "--seam-shrink"),
+    "seam_shrink_prearm_quiesce": (1, "--seam-shrink-prearm-quiesce"),
+    "seam_shrink_defer_grow": (1, "--seam-shrink-defer-grow"),
+    "seam_shrink_grow_debt_rounds": (32, "--seam-shrink-grow-debt-rounds"),
+    "flip_seam_drain_budget_ms": (1094, "--flip-seam-drain-budget-ms"),
+    "hicache_read_buffers": (8, "--hicache-read-buffers"),
+}
+
+#: #837's family, and the value that is OUTSIDE each one's declared domain.
+#: The tri-states are a closed set (-1/0/1); the three counts are >= 0.
+_SEAM_837 = {
+    "seam_shrink_prearm_quiesce": 2,
+    "seam_shrink_defer_grow": -2,
+    "seam_shrink_grow_debt_rounds": -1,
+    "flip_seam_drain_budget_ms": -1,
+    "hicache_read_buffers": -1,
 }
 
 
@@ -312,6 +345,227 @@ class TestRankKvRatioEdgeMatchesTheRuntime(CustomTestCase):
                 rank_kv_ratio="speed",
             )
         )
+
+
+def seam_refusal(**kwargs):
+    """The #837 family's refusal message, or None if the runtime accepts.
+
+    A SECOND driver, not a reuse of `drive`: `_handle_uneven_tp` knows nothing
+    about these fields, so running them through it would accept every value
+    and the whole class below would pass by driving the wrong handler. The
+    same trap `TestTheDriverIsHonest` was written against, one handler over.
+    """
+    args = ServerArgs(model_path="dummy", **kwargs)
+    try:
+        args._handle_seam_shrink_flags_837()
+        return None
+    except ValueError as e:
+        return str(e)
+
+
+class TestTheSeam837DriverIsHonest(CustomTestCase):
+    """#837. Same rule as `TestTheDriverIsHonest`: this driver's verdicts do
+    not count until it is shown to discriminate on known-different inputs."""
+
+    def test_a_legal_configuration_is_accepted(self):
+        self.assertIsNone(
+            seam_refusal(
+                seam_shrink=True,
+                seam_shrink_prearm_quiesce=1,
+                seam_shrink_defer_grow=0,
+                seam_shrink_grow_debt_rounds=32,
+                flip_seam_drain_budget_ms=1094,
+                hicache_read_buffers=8,
+            )
+        )
+
+    def test_a_known_illegal_configuration_is_refused(self):
+        msg = seam_refusal(seam_shrink_prearm_quiesce=2)
+        self.assertIsNotNone(msg)
+        self.assertIn("--seam-shrink-prearm-quiesce", msg)
+
+    def test_every_seam_837_flag_has_a_driver(self):
+        for fid in _SEAM_837:
+            self.assertIn(fid, _ACTIVATION, f"{fid} has no activation value")
+
+
+class TestSeam837DeclaredDomainsAreRuntimePredicates(CustomTestCase):
+    """The catalog now DECLARES a domain for these flags (the tri-states carry
+    `allowed=(-1, 0, 1)`), and a declared domain the runtime does not enforce
+    is the same class of drift as a declared edge it does not enforce -- the
+    dashboard offering a value the boot then rejects, or greying one it would
+    have taken. Driven, not read.
+    """
+
+    def setUp(self):
+        self.cat = flags.catalog()
+
+    def test_declared_allowed_values_are_all_accepted(self):
+        for fid, spec in ((f, self.cat[f]) for f in _SEAM_837):
+            for value in spec.allowed or ():
+                with self.subTest(flag=fid, value=value):
+                    self.assertIsNone(
+                        seam_refusal(**{fid: value}),
+                        f"flags.py offers {fid}={value}, the runtime refuses it",
+                    )
+
+    def test_out_of_domain_values_are_refused_by_cli_name(self):
+        for fid, bad in _SEAM_837.items():
+            with self.subTest(flag=fid, value=bad):
+                msg = seam_refusal(**{fid: bad})
+                self.assertIsNotNone(
+                    msg, f"the runtime accepts {fid}={bad}, which is out of domain"
+                )
+                self.assertIn(_ACTIVATION[fid][1], msg)
+
+    def test_unset_is_always_legal(self):
+        """None is "the operator said nothing", never a value to validate --
+        it is what keeps the default path byte-identical."""
+        self.assertIsNone(seam_refusal())
+
+
+class TestTheSeam837NonEdge(CustomTestCase):
+    """THE EDGE THAT MUST NOT EXIST, pinned in both directions.
+
+    `_handle_seam_shrink_flags_837` says it in a comment rather than leaving it
+    to be inferred: "A per-half override without the master is not an error --
+    -1 follows a master that is off, and 1 is exactly how a window turns ONE
+    half on without the other. Refusing it would forbid the attribution run the
+    overrides exist for."
+
+    A `requires=("seam_shrink",)` in the curated overlay would therefore grey
+    out, in the dashboard, exactly the single-half configuration W13b's
+    criteria 8-14 need in order to attribute a cutover change to one half --
+    the same shape as #500-I3 on `rank_tp_ratio`, and this file exists because
+    that one was found by executing rather than by reading.
+
+    CAN-FAIL PROOF: add `requires=("seam_shrink",)` to either override in
+    `flags.py::_CURATED` and `test_no_requires_edge_is_declared` goes red
+    naming the flag.
+    """
+
+    def setUp(self):
+        self.cat = flags.catalog()
+
+    def test_no_requires_edge_is_declared(self):
+        for fid in ("seam_shrink_prearm_quiesce", "seam_shrink_defer_grow"):
+            with self.subTest(flag=fid):
+                self.assertNotIn("seam_shrink", self.cat[fid].requires)
+                self.assertNotIn(
+                    "seam_shrink", self.cat[fid].mutually_exclusive_with
+                )
+
+    def test_the_runtime_accepts_a_half_without_the_master(self):
+        for fid in ("seam_shrink_prearm_quiesce", "seam_shrink_defer_grow"):
+            for value in (-1, 0, 1):
+                with self.subTest(flag=fid, value=value):
+                    self.assertIsNone(seam_refusal(**{fid: value}))
+
+
+class TestSeam837IsEmittedAsFlagsNotEnv(CustomTestCase):
+    """#837's point: the flag is how the value reaches the server. A bool that
+    argparse registers with `store_true` must emit as a BARE token.
+
+    WHY THE CURATED `type="bool"` IS LOAD-BEARING, precisely. `_infer_type`
+    maps `Optional[bool]` to "str" (it tests `base_type is bool`, and
+    `Union[bool, None]` is not `bool`). `profile_argv` survives that for a
+    hand-built profile because it also checks `isinstance(v, bool)` -- but the
+    dashboard never sends a Python bool. `webui.py:11325` renders a checkbox
+    only for `type==='bool'`, and `webui.py:11475` reads back
+    `spec.type==='bool' ? el.checked : el.value.trim()`. Under the inferred
+    "str" the flag is a TEXT BOX whose value arrives as the string "1", and
+    `profile_argv` then emits `--seam-shrink 1`, which argparse's `store_true`
+    rejects. So the type is asserted directly, and the string path is driven
+    below rather than left to the bool path to cover.
+    """
+
+    def test_seam_shrink_is_a_bool_in_the_catalog(self):
+        self.assertEqual(flags.catalog()["seam_shrink"].type, "bool")
+
+    def test_a_dashboard_shaped_value_still_emits_the_bare_token(self):
+        """The string "1" is what `webui.py:11475` produces for a non-bool
+        type. It must NOT become a positional value."""
+        prof = flags.Profile(
+            "t", "custom", settings={"model_path": "/m", "seam_shrink": "1"}
+        )
+        argv = flags.profile_argv(prof)
+        self.assertIn("--seam-shrink", argv)
+        after = argv[argv.index("--seam-shrink") + 1 :]
+        self.assertTrue(not after or after[0].startswith("--"), argv)
+
+    def test_an_armed_profile_emits_the_bare_token(self):
+        prof = flags.Profile(
+            "t", "custom", settings={"model_path": "/m", "seam_shrink": True}
+        )
+        argv = flags.profile_argv(prof)
+        self.assertIn("--seam-shrink", argv)
+        # BARE: nothing follows it but another flag (or nothing at all). The
+        # inferred "str" type would have put a "1" here.
+        after = argv[argv.index("--seam-shrink") + 1 :]
+        self.assertTrue(not after or after[0].startswith("--"), argv)
+
+    def test_an_unset_profile_emits_nothing(self):
+        prof = flags.Profile("t", "custom", settings={"model_path": "/m"})
+        joined = " ".join(flags.profile_argv(prof))
+        for fid in ("seam_shrink", *_SEAM_837):
+            with self.subTest(flag=fid):
+                self.assertNotIn(_ACTIVATION[fid][1], joined)
+
+    def test_the_planner_seat_reaches_a_generated_profile(self):
+        """THE #837 SEAT, driven end to end.
+
+        `_seam_shrink_planner_default` returns `{}` today (W13b has not been
+        run), so on its own it proves nothing about being WIRED -- a seat that
+        is never called and a seat that declines look identical from outside.
+        Patching it to arm the flag separates the two: the decision has to
+        reach `_mk`, land in the profile's settings, and come out of
+        `profile_argv` as a bare token. This is what makes the operator's
+        post-measurement change a one-line edit rather than a hope.
+        """
+        gpus = [{"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607}]
+        base = {"model_path": "/m"}
+
+        declined = flags.profiles(None, gpus, base=dict(base))
+        self.assertTrue(declined)
+        for prof in declined:
+            self.assertIsNone(prof.settings.get("seam_shrink"))
+            self.assertNotIn("--seam-shrink", flags.profile_argv(prof))
+
+        with patch.object(
+            flags, "_seam_shrink_planner_default", lambda s, m, g: {"seam_shrink": True}
+        ):
+            armed = flags.profiles(None, gpus, base=dict(base))
+        self.assertTrue(armed)
+        for prof in armed:
+            self.assertIs(prof.settings.get("seam_shrink"), True)
+            self.assertIn("--seam-shrink", flags.profile_argv(prof))
+            self.assertTrue(
+                any("phase-flip seam policy" in i for i in prof.info), prof.info
+            )
+
+    def test_an_explicit_operator_value_outranks_the_planner(self):
+        """The planner holds the seat; it does not overrule the operator who
+        sat down in it. An explicit `base` value survives an armed default."""
+        gpus = [{"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607}]
+        with patch.object(
+            flags, "_seam_shrink_planner_default", lambda s, m, g: {"seam_shrink": True}
+        ):
+            profs = flags.profiles(
+                None, gpus, base={"model_path": "/m", "seam_shrink": False}
+            )
+        for prof in profs:
+            self.assertIs(prof.settings.get("seam_shrink"), False)
+            self.assertNotIn("--seam-shrink", flags.profile_argv(prof))
+
+    def test_the_family_is_never_env_typed(self):
+        """`profile_env` must not carry them: they are argv now, and the env
+        keys survive only as the deprecated fallback the SERVER publishes to
+        itself from its own argv."""
+        cat = flags.catalog()
+        for fid in ("seam_shrink", *_SEAM_837):
+            with self.subTest(flag=fid):
+                self.assertFalse(cat[fid].is_env)
+                self.assertEqual(cat[fid].source, "fork")
 
 
 if __name__ == "__main__":
