@@ -36,8 +36,13 @@ from sglang.srt.managers.funding_authority import (
     MIB,
     RELIEF_LOCAL,
     RELIEF_REBALANCE,
+    BreakEvenProvenance,
     FundingAuthority,
+    PROV_ENV,
+    PROV_FROZEN,
+    PROV_MEASURED,
     authority_from_seam_snapshot,
+    solve_arming_floor,
     FundingError,
     Post,
     diagnose_floor_band,
@@ -541,3 +546,71 @@ class TestVerdictHygiene(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSolveArmingFloor(unittest.TestCase):
+    """B: the arming floor is the free variable; the corridor band is not."""
+
+    def test_shipped_defaults_are_unsatisfiable_and_name_the_max_reserve(self):
+        from sglang.srt.managers import corridor_guard as cg
+        from sglang.srt.managers import phase_flip_seam_reserve as sr
+
+        sol = solve_arming_floor(
+            cg.corridor_band_floor_mib(),
+            cg.corridor_band_ceiling_mib(),
+            cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+            sr.DEFAULT_ARMING_MARGIN_MIB,
+        )
+        self.assertFalse(sol.satisfiable)
+        self.assertEqual(sol.arming_floor_mib, 1331)
+        # 1229 - 819 - 192 = 218, against the 512 shipped.
+        self.assertEqual(sol.max_seam_entry_reserve_mib, 218)
+        self.assertIn("UNSATISFIABLE", sol.detail)
+        self.assertIn("CANNOT help", sol.detail)
+
+    def test_a_reserve_within_the_headroom_is_satisfiable(self):
+        sol = solve_arming_floor(819, 1229, 218, 192)
+        self.assertTrue(sol.satisfiable)
+        self.assertEqual(sol.arming_floor_mib, 1037)
+
+    def test_one_mib_over_the_headroom_refuses(self):
+        self.assertFalse(solve_arming_floor(819, 1229, 219, 192).satisfiable)
+
+    def test_the_band_is_never_moved_to_make_it_fit(self):
+        """The solution may only change the reserve; the band is a user law."""
+        sol = solve_arming_floor(819, 1229, 512, 192)
+        self.assertEqual(sol.max_seam_entry_reserve_mib, 1229 - 819 - 192)
+
+
+class TestBreakEvenProvenance(unittest.TestCase):
+    """C/#819: 7004 is not a literal; the staleness is one level down."""
+
+    def test_all_frozen_is_reported_and_named(self):
+        p = BreakEvenProvenance(
+            3.2, PROV_FROZEN, 1681.0, PROV_FROZEN, 7245.5, PROV_FROZEN
+        )
+        self.assertFalse(p.is_fully_solved)
+        self.assertEqual(p.frozen_inputs, ("flip_cost_s", "tp_tok_s", "pp_tok_s"))
+        self.assertIn("STILL FROZEN", p.describe())
+
+    def test_the_real_shipped_shape_one_measured_two_frozen(self):
+        """Flip cost self-corrects via FlipCostEstimator.observe(); the two
+        prefill rates have no runtime measurement path at all."""
+        p = BreakEvenProvenance(
+            3.2, PROV_MEASURED, 1681.0, PROV_FROZEN, 7245.5, PROV_FROZEN
+        )
+        self.assertEqual(p.frozen_inputs, ("tp_tok_s", "pp_tok_s"))
+        self.assertFalse(p.is_fully_solved)
+
+    def test_fully_solved_when_the_operator_supplied_both_rates(self):
+        p = BreakEvenProvenance(
+            3.0, PROV_MEASURED, 2000.0, PROV_ENV, 8000.0, PROV_ENV
+        )
+        self.assertTrue(p.is_fully_solved)
+        self.assertIn("every input is rig-local", p.describe())
+
+    def test_7004_is_reproduced_by_the_shipped_inputs(self):
+        """The number the ticket calls a seed, derived from its three inputs."""
+        from sglang.srt.managers.phase_policy import break_even_tokens
+
+        self.assertEqual(break_even_tokens(3.2, 1681.0, 7245.5), 7004)

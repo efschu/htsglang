@@ -645,6 +645,171 @@ def diagnose_floor_band(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class ArmingFloorSolution:
+    """A gate watermark that is reachable inside the corridor band, or a refusal."""
+
+    satisfiable: bool
+    arming_floor_mib: int
+    seam_entry_reserve_mib: int
+    max_seam_entry_reserve_mib: int
+    detail: str
+
+
+def solve_arming_floor(
+    band_floor_mib: int,
+    band_ceiling_mib: int,
+    requested_seam_entry_reserve_mib: int,
+    arming_margin_mib: int = 0,
+) -> ArmingFloorSolution:
+    """Solve the arming floor as the FREE VARIABLE it is.
+
+    TWO LAWS MEET HERE AND ONLY ONE OF THEM MAY MOVE.
+
+    The corridor band (819-1229 MiB free per card under load) is a HARD user
+    rule: below it is a breach, above it the boot acceptance has FAILED because
+    VRAM is buying no tokens. It is not negotiable and this function never
+    touches it.
+
+    The arming floor is DERIVED -- ``band_floor + seam_entry_reserve`` -- and
+    the seam entry reserve is an allowance, not a law. So when the two are
+    inconsistent it is the FLOOR that must give, and the only honest answers
+    are (a) a floor that fits under the ceiling, or (b) a refusal that says so
+    BY NAME at boot.
+
+    On the shipped defaults there is no (a)::
+
+        band floor 819 + seam reserve 512          = 1331   arming floor
+        arming floor 1331 + arming margin 192      = 1523
+        band ceiling                                 1229   <- 294 MiB short
+
+    The largest reserve that fits is ``ceiling - floor - margin`` = 218 MiB
+    against the 512 shipped, so the shipped configuration cannot arm from
+    inside its own acceptance band, on any card, ever.
+
+    WHY THIS MUST NOT BE SILENTLY AUTO-CORRECTED. Cutting the reserve from 512
+    to 218 changes what the seam is allowed to spend while it runs; that is a
+    behaviour change to the flip and it needs metal, not a desk. So this
+    function SOLVES and REPORTS -- it returns the reachable floor and the
+    reserve it implies -- and the caller decides whether to adopt it or refuse
+    at boot. What must never happen again is the third option the tree shipped:
+    neither adopting nor refusing, and instead advising at runtime that the
+    flip "is retried when occupancy drops", which describes a state the
+    corridor law forbids.
+    """
+    floor_base = max(0, int(band_floor_mib))
+    ceiling = max(0, int(band_ceiling_mib))
+    margin = max(0, int(arming_margin_mib))
+    requested = max(0, int(requested_seam_entry_reserve_mib))
+
+    headroom = ceiling - floor_base - margin
+    max_reserve = max(0, headroom)
+    if requested <= max_reserve:
+        return ArmingFloorSolution(
+            True,
+            floor_base + requested,
+            requested,
+            max_reserve,
+            f"arming floor {floor_base + requested} MiB (band floor "
+            f"{floor_base} + seam reserve {requested}) plus margin {margin} "
+            f"fits under the band ceiling {ceiling} MiB",
+        )
+    return ArmingFloorSolution(
+        False,
+        floor_base + requested,
+        requested,
+        max_reserve,
+        f"UNSATISFIABLE ARMING FLOOR: the gate would arm at "
+        f"{floor_base + requested} MiB (band floor {floor_base} + seam entry "
+        f"reserve {requested} MiB) and with the {margin} MiB arming margin "
+        f"needs {floor_base + requested + margin} MiB free, but the corridor "
+        f"band tops out at {ceiling} MiB -- a card filled INSIDE its own "
+        f"acceptance band is {floor_base + requested + margin - ceiling} MiB "
+        f"short of the watermark by construction. The corridor band is a hard "
+        f"user rule and does not move; the seam entry reserve is the free "
+        f"variable and must be at most {max_reserve} MiB for the gate to be "
+        f"reachable at all. Until one of the two is changed the flip cannot "
+        f"arm from a correctly filled card, and waiting for occupancy to drop "
+        f"CANNOT help: clearing the watermark means leaving the acceptance "
+        f"band from above.",
+    )
+
+
+# -- #819: where the break-even inputs actually come from ---------------------
+
+#: A value measured at runtime and self-correcting.
+PROV_MEASURED = "measured"
+#: A value an operator supplied for this rig.
+PROV_ENV = "env"
+#: A value frozen in source from another rig's benchmark. The one that decides
+#: silently.
+PROV_FROZEN = "frozen-literal"
+
+
+@dataclasses.dataclass(frozen=True)
+class BreakEvenProvenance:
+    """Where each of the three break-even inputs came from, per #819.
+
+    THE BRIEFING'S FRAMING WAS THAT 7004 IS A FROZEN SEED. It is not a literal
+    anywhere: ``phase_policy.break_even_tokens`` computes
+    ``N = C / (1/X - 1/P)`` and 7004 is what the shipped inputs happen to
+    produce. The staleness is one level down, and it is UNEVEN across the
+    three -- which is the finding:
+
+      C  flip cost      SELF-CORRECTING. ``FlipCostEstimator.observe()`` is fed
+                        real cutover durations, seeded from
+                        ``DEFAULT_FLIP_COST_S = 3.2`` and overridable via
+                        ``SGLANG_PHASE_POLICY_FLIP_COST_S``.
+      X  TP prefill     ``DEFAULT_TP_PREFILL_TOK_S = 1681.0``, env-overridable
+                        (``SGLANG_PHASE_POLICY_TP_TOK_S``) but NEVER measured
+                        at runtime.
+      P  PP prefill     ``DEFAULT_PP_PREFILL_TOK_S = 7245.5``, same shape.
+
+    So one input self-corrects and two cannot. A rig whose prefill ladder
+    differs from the #631 mainrig silently solves N against another machine's
+    hardware unless a human sets two env vars -- and nothing tells them to.
+    This type makes that visible instead of leaving it implicit.
+    """
+
+    flip_cost_s: float
+    flip_cost_provenance: str
+    tp_tok_s: float
+    tp_provenance: str
+    pp_tok_s: float
+    pp_provenance: str
+
+    @property
+    def frozen_inputs(self) -> Tuple[str, ...]:
+        out = []
+        if self.flip_cost_provenance == PROV_FROZEN:
+            out.append("flip_cost_s")
+        if self.tp_provenance == PROV_FROZEN:
+            out.append("tp_tok_s")
+        if self.pp_provenance == PROV_FROZEN:
+            out.append("pp_tok_s")
+        return tuple(out)
+
+    @property
+    def is_fully_solved(self) -> bool:
+        return not self.frozen_inputs
+
+    def describe(self) -> str:
+        head = (
+            f"break-even inputs: C={self.flip_cost_s:g}s "
+            f"[{self.flip_cost_provenance}], X={self.tp_tok_s:g} tok/s "
+            f"[{self.tp_provenance}], P={self.pp_tok_s:g} tok/s "
+            f"[{self.pp_provenance}]"
+        )
+        if self.is_fully_solved:
+            return head + " -- every input is rig-local"
+        return (
+            head + f" -- STILL FROZEN: {', '.join(self.frozen_inputs)}. These "
+            "carry another rig's benchmark and no runtime measurement can "
+            "correct them, so the flip threshold is solved against hardware "
+            "this instance may not have."
+        )
+
+
 def slack_above_uniform_floor(cap: int, uniform_floor: int) -> int:
     """What one rank may give up once the group has agreed an absolute floor.
 

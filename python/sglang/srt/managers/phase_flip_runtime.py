@@ -6117,8 +6117,49 @@ class PhaseFlipRuntime:
                 if bool(getattr(self, "armed_idle_locked", False))
                 else ""
             )
+            + self._arming_floor_advice()
             + self._kv_rung_verdict()
         )
+
+    def _arming_floor_advice(self) -> str:
+        """#770 Defect A: withdraw the retry advice when it names a forbidden state.
+
+        "the flip is retried when occupancy drops" is sound advice only while
+        the watermark is reachable at all. On the shipped constants it is not:
+        the gate arms at band floor 819 + seam entry reserve 512 = 1331 MiB and
+        wants a further 192 MiB margin, against a corridor band that tops out
+        at 1229 MiB. A card filled INSIDE its own acceptance band is 294 MiB
+        short by construction, so occupancy dropping far enough to clear the
+        watermark means leaving the band from above -- which is precisely the
+        state the corridor law calls a failed boot acceptance.
+
+        Telling an operator to wait for that is worse than saying nothing: it
+        describes the wait as normal when no amount of waiting can end it, and
+        18f measured exactly that (draining the load did not lift the lock).
+
+        Never raises: advice that cannot be computed is simply not given.
+        """
+        try:
+            from sglang.srt.managers import corridor_guard as cg
+            from sglang.srt.managers.funding_authority import solve_arming_floor
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                DEFAULT_ARMING_MARGIN_MIB,
+            )
+
+            sol = solve_arming_floor(
+                cg.corridor_band_floor_mib(),
+                cg.corridor_band_ceiling_mib(),
+                cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+                DEFAULT_ARMING_MARGIN_MIB,
+            )
+            if sol.satisfiable:
+                return ""
+            return (
+                f"RETRACTION OF THE RETRY ADVICE ABOVE -- waiting cannot work "
+                f"here: {sol.detail} "
+            )
+        except Exception:  # noqa: BLE001 - advice must not raise
+            return ""
 
     #: Minimum seconds between arm ATTEMPTS on one direction while a damper is
     #: standing down. Not a latch: it paces re-pricing, it never stops it, and

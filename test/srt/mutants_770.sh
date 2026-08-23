@@ -15,7 +15,7 @@ trap 'cp "$BAK" "$MOD"; rm -f "$BAK"' EXIT
 
 run_suite() {
   cd "$ROOT" && CUDA_VISIBLE_DEVICES="" PYTHONPATH="$ROOT/python" \
-    timeout 120 python3 -m pytest test/srt/test_funding_authority_770.py -q 2>&1 | tail -1
+    timeout 200 /spinning/htsglang-gpu/.venv/bin/python -m pytest test/srt/test_funding_authority_770.py -q 2>&1 | tail -1
 }
 
 survived=0
@@ -97,6 +97,24 @@ mutate M7-floor-band-off-by-one \
 mutate M8-drop-zero-draws \
   'draws.append(Draw(post.name, post.tier, remaining, drawn, reason))' \
   'draws.append(Draw(post.name, post.tier, remaining, drawn, reason)) if drawn > 0 else None'
+
+# M9 -- the arming-floor solver accepts a reserve one MiB past the headroom,
+# so an unreachable watermark is reported as fine.
+mutate M9-arming-floor-off-by-one \
+  'if requested <= max_reserve:' \
+  'if requested <= max_reserve + 1:'
+
+# M10 -- the band CEILING is quietly moved to make the floor fit, violating the
+# hard user rule the solver exists to respect.
+mutate M10-band-ceiling-moved \
+  'headroom = ceiling - floor_base - margin' \
+  'headroom = ceiling - floor_base - margin + 512'
+
+# M11 -- a frozen break-even input stops being reported as frozen, which is the
+# whole of #819.
+mutate M11-frozen-input-hidden \
+  'if self.pp_provenance == PROV_FROZEN:' \
+  'if False:'
 
 echo
 if [ "$survived" -eq 0 ]; then

@@ -159,8 +159,51 @@ def _shrink_ppm(desire_rows: int, current_rows: int) -> int:
     return max(1, (int(desire_rows) * _SHRINK_SCALE) // int(current_rows))
 
 
+def floor_exceeds_local_cap(floor_rows: int, current_rows: int) -> bool:
+    """#770/#812: is this rank's floor ABOVE its own cap? Then it is a defect.
+
+    THE TWO CASES ``_floor_ppm`` USED TO COLLAPSE, and why collapsing them
+    silently froze the group. Both returned ``_SHRINK_SCALE``:
+
+        floor == current   HEALTHY. The rank is exactly at its floor and has
+                           no slack to give. A true fact about a full pool.
+        floor >  current   DEFECT. The rank's live set plus its admission
+                           reserve does not FIT the rows it has backed -- it
+                           is under-backed. Nothing about the group.
+
+    Measured, boot_816_core_0823_0608.log 06:32:05, all three ranks carrying
+    the SAME floor 128549 (correct: under PP a request's tokens occupy KV on
+    every stage, so the live set is genuinely replicated) against caps that
+    differ by design::
+
+        PP0  backed 212992   floor 128549   ->  60.4% of its own cap
+        PP1  backed 124928   floor 128549   -> 102.9%   <- THIS
+        PP2  backed 133120   floor 128549   ->  96.6%
+
+    PP1's 102.9% clamps to 100%, the group MAX takes it, ``explain_kv_target``
+    computes ``target = max(desire, max_floor)`` and NOBODY shrinks -- vetoing
+    PP0's fully fundable 84443-row plan on the very rank that needed it.
+
+    ``_shrink_ppm`` already documents this exact trap for the ambition side
+    ("on an uneven fleet the smallest pool's 'no change' is the smallest
+    number in the group and silently wins"). The lesson was never applied to
+    the floor side. Under the standing kein-bindender-rang law a floor above
+    a rank's own cap is a DEFECT REPORT about that rank's backing, never a
+    capacity verdict for its peers.
+    """
+    return int(current_rows) > 0 and int(floor_rows) > int(current_rows)
+
+
 def _floor_ppm(floor_rows: int, current_rows: int) -> int:
-    """This rank's floor as a proportion, rounded UP so the limit never slips."""
+    """This rank's floor as a proportion, rounded UP so the limit never slips.
+
+    A floor at or above the cap still returns the neutral element -- under a
+    PROPORTIONAL agreement a rank with no slack genuinely cannot be shrunk,
+    and answering otherwise would drive it below its own live set. What
+    changed is that the DEFECT case is no longer indistinguishable from the
+    healthy one: see :func:`floor_exceeds_local_cap`, which the callers use to
+    name an under-backed rank instead of reporting a group-wide veto.
+    """
     if current_rows <= 0:
         return _SHRINK_SCALE
     if floor_rows >= current_rows:
@@ -1490,7 +1533,47 @@ class KvBackingRelief:
             page,
             int(max_live) + 1 + self._margin_rows + self._admission_reserve_rows,
         )
-        return int(math.ceil(floor / page) * page)
+        floor = int(math.ceil(floor / page) * page)
+        # #770/#812: DERIVE THE FLOOR AGAINST THIS RANK'S OWN CAP.
+        #
+        # Every term above is absolute -- a high-water mark plus two constants
+        # -- and none of them knows how many rows this rank actually has. On an
+        # uneven fleet the live set is replicated (under PP a request's tokens
+        # occupy KV on EVERY stage) while the CAPS are not, so an absolute
+        # floor that is comfortable on a roomy rank lands above a lean rank's
+        # entire pool. Measured 06:32:05: floor 128549 on all three ranks
+        # against backed rows 212992 / 124928 / 133120 -- 102.9% on PP1.
+        #
+        # A floor above the rank's own cap is arithmetically meaningless: rows
+        # that are not backed cannot be reserved. Clamping it here keeps the
+        # quantity honest at the point it is COMPUTED, so the proportion built
+        # from it in `_floor_ppm` can never exceed 100% by construction rather
+        # than by a downstream `min()`. The condition is a defect about THIS
+        # rank's backing and is reported as one -- see floor_exceeds_local_cap
+        # -- never propagated as a capacity verdict for peers
+        # (kein-bindender-rang).
+        cap = 0
+        try:
+            cap = int(self._current_rows())
+        except Exception:  # noqa: BLE001 - a floor must not raise
+            cap = 0
+        if cap > 0 and floor > cap:
+            logger.warning(
+                "%s UNDER-BACKED RANK: computed floor %d rows exceeds the %d "
+                "rows this rank has backed (%.1f%% of its own cap). The live "
+                "set plus the admission reserve does not fit the backing. "
+                "Clamping the floor to the cap: an unbacked row cannot be "
+                "reserved. This is a defect about THIS rank's backing -- the "
+                "answer is to grow it -- and it must never be read as a "
+                "capacity verdict for peers, which under a proportional "
+                "agreement is exactly how it would otherwise freeze the group.",
+                LOG_PREFIX,
+                floor,
+                cap,
+                100.0 * floor / cap,
+            )
+            floor = int(math.floor(cap / page) * page)
+        return int(floor)
 
     # -- #662: the watermark actuator -------------------------------------
 
