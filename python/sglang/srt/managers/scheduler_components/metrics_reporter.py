@@ -84,6 +84,36 @@ def _active_phase_field() -> str:
         return ""
 
 
+def _layout_conformance_field() -> str:
+    """#838 emitter: the two cumulative detector counts, on the periodic line.
+
+    ON THE DECODE LINE AND NOT THE PREFILL ONE. This line is the recurring
+    one -- it is gated by ``decode_log_interval``, and it is already where
+    every other cumulative quantity in this reporter is flushed -- so the
+    counts appear at a bounded rate whatever the batch mix does. Putting them
+    on the prefill line as well would print the same two levels several times
+    a second during a prefill-dominated window.
+
+    A LEVEL, NOT A DELTA, and never reset: a reader comparing two lines gets
+    the delta, and a reader who joined late still sees that something fired
+    earlier in the boot.
+
+    SILENT WHEN THERE IS NO FLIP, exactly as ``_active_phase_field`` is: with
+    one layout the question is meaningless and the line stays byte-identical
+    to what every non-flip boot has always printed.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        if not getattr(get_server_args(), "enable_phase_flip", False):
+            return ""
+        from sglang.srt.managers.layout_conformance import counters
+
+        return f", {counters().as_field()}"
+    except Exception:  # noqa: BLE001 - a counter may never break the stats line
+        return ""
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -1253,6 +1283,8 @@ class SchedulerMetricsReporter:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+
+        msg += _layout_conformance_field()
 
         if self.is_stats_logging_rank:
             logger.info(msg)

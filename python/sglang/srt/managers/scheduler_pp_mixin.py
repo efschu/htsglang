@@ -2723,6 +2723,32 @@ class SchedulerPPMixin:
         would_restore = (
             passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id)
         )
+        # #838 CLASS 1, THE W12 FORM. Keyed on the SHAPE (zero armed passes
+        # across a ring rebuild) and NOT on `would_restore`, deliberately:
+        # the branch below speaks only when a jump was actually averted, and
+        # this file's own comment records that the epoch-4 crossing "survived
+        # only because all three ranks happened to carry the same retired
+        # slot -- agreement there was luck". A detector that stayed silent on
+        # the lucky crossing would report the same hazard as healthy exactly
+        # when it did no damage, and say nothing until the day it did.
+        try:
+            from sglang.srt.managers import layout_conformance
+
+            alarm, detail = layout_conformance.stale_ring_restore_verdict(
+                passes,
+                arm_epoch,
+                now_epoch,
+                arm_mb,
+                getattr(
+                    getattr(self, "phase_policy_state", None), "last_reason", None
+                ),
+            )
+            if alarm:
+                layout_conformance.note_conformance_violation(
+                    detail, time.perf_counter()
+                )
+        except Exception:  # noqa: BLE001 - a detector may never break the loop
+            pass
         # Reported only when a jump was actually averted. A commit whose
         # retired arm slot happens to equal the new ring's first slot
         # changes nothing and should say nothing -- which is every commit
