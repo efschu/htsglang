@@ -474,6 +474,37 @@ can-fail arm does NOT move: `gemm_format` / `gemm_lanes` come off `resolved` at
 `:4795-4796` whatever priced the numbers, so the artifact named the right lane
 while the arithmetic ran on the wrong one -- that is what kept the defect alive.
 
+**One funding authority: name the posts, or do not refuse (#770, #584, #819).**
+A refusal that reports only a shortfall cannot be acted on — the operator learns
+that something did not fit, not what was holding the money. `FundingAuthority`
+(`managers/funding_authority.py:334`, built in production through
+`authority_from_seam_snapshot` at `:503`) answers one question, "can this be
+funded and from where", against posts that are each DECLARED by name. The
+specimen it was written from is four lines of one second (06:19:43 PP0): the
+seam asked for 396 MiB with "spendable now 1625 MiB against a need of 2021
+MiB", the corridor gate refused "want 2533 MiB, free 2444 -> 2444 MiB,
+reclaimed 0 MiB from [nothing]", and the census behind it read "driver free
+2444, allocator cache 313, staging reserve kept free 819, seam fixed 228, ARENA
+DUE 437". Three losses were named and priced, which is the point of naming
+posts at all: (L1) a group-derived floor that exceeded PP1's own cap — see the
+invariant-for-funding family in §12 — leaving PP0's 84443 rows, 2638 MiB,
+unreachable; (L2) an ask of 3437 rows against a release granularity of 8192
+returning a SILENT ZERO, 256 MiB and 65 % of that shortfall; (L3) an ask of
+50233 rows returning `claimed=0` while the flip's own accounting reported "107
+MiB returned". The arming floor is SOLVED rather than asserted
+(`solve_arming_floor`, `:659`; `diagnose_floor_band`, `:585`): the shipped
+512 MiB seam entry reserve puts the arming floor at 819 + 512 = 1331 and, with
+the 192 MiB margin, needs 1523 against a 1229 ceiling — structurally
+unreachable, not merely tight — while 218 MiB is the largest reserve that fits.
+#819's break-even (`break_even_tokens`, `managers/phase_policy.py:831`) computes
+N = C / (1/X - 1/P) and carries its PROVENANCE with it, because the honest
+statement about the shipped inputs is that X = 1681.0 and P = 7245.5 are
+env-overridable defaults that are never runtime-measured — 7004 is what those
+inputs produce, not what this rig was observed to do. Process note worth
+keeping: the first draft of the L1 number was written from memory as 1638 MiB
+and went red against the measured 2638 — a 6.7x gap in the wrong direction, found
+by the test rather than by review. Pinned by `test_funding_authority_770.py`.
+
 ## 3. Memory tiers / offload / spill
 - **Phase-flip spill ladder** (`--phase-flip-spill-depth`, #656 spec item 6,
   `managers/phase_flip_spill.py`): what the INACTIVE phase's assets give back
@@ -630,8 +661,9 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   days (#684, #714, #717/#722, #744, #796, #814, #816) turned out to be the
   same law broken in different places. Four named laws over three integers and
   the claim sets: `EXPOSURE` (exposed ≤ committed, #816 — reuses
-  `exposure_over_backing`, `kv_backing_relief.py:504`, rather than restating
-  it), `COVERAGE` (every claimed row < committed, the #717/#722 counter-form a
+  `exposure_over_backing`, `kv_backing_relief.py:547`, rather than restating
+  it — the entry landed citing `:504`, which had already drifted onto a
+  docstring line by the time the stage merged), `COVERAGE` (every claimed row < committed, the #717/#722 counter-form a
   downward clamp is blind to), `EXCLUSIVITY` (the claims partition the space —
   none doubled, none unowned, #814), `RETIREMENT` (no claim outlives the
   cutover that retired its id space, #796/#802). `audit()` returns EVERY
@@ -1603,6 +1635,24 @@ shorter timeout — it is a different question, asked at the three points that
 can wait: is the peer still there?** A gone peer now fails fast with a NAMED
 error. Pinned by `test_barlink_abort_gate_liveness_818.py` (hermetic,
 CPU-only).
+**A dead PP peer is not the wedge (#801).** The premise underneath the #816
+survivor analysis — that the silent ranks were standing at the admission
+receive — is REFUTED by measurement rather than by argument. Two gloo processes,
+hermetic, four peer states: a peer that exits (`os._exit(1)`) and a peer killed
+with `SIGKILL` both make `_pp_recv_admission_decision` **RAISE after 1.02 s**,
+while a peer that is alive and never sends, and a peer under `SIGSTOP`, both
+**BLOCK unbounded (>8 s)**. The transport already reports the dead peer, so a
+rank silent for 119.7 s was not waiting on a corpse — whatever wedged it, it
+was not that. The two legs that can block are
+`GroupCoordinator.recv_tensor_dict`'s metadata leg
+(`distributed/parallel_state.py:2413`) and its payload leg (`:2434-2438`, an
+`irecv` followed by an unbounded `work.wait()`). Pinned by
+`test_pp_dead_peer_is_not_the_wedge_801.py` (6 cases). One near-miss is worth
+recording because it is the §12 stub-drift family arriving INSIDE the
+measurement meant to settle a transport question: an early run misread an
+`AttributeError` from a sender stub missing `is_last_rank` as a transport
+verdict. **Before attributing a silence to a dead peer, check what the
+transport does when a peer actually dies.**
 **Guard cost, and where it lands** (#476 measured, #517 named). The blocking
 read cost -9.22 % of code decode_TPS against the same-tree NCCL baseline;
 removing both seams gives +2.68 %, reproducing #424's pre-#431 BAR1 advantage.
@@ -2672,6 +2722,118 @@ under `inp.phase == PHASE_PP`, so the `phase == "tp"` branch was dead — and
 wiring it would have been wrong rather than merely redundant. Pinned by
 `test_hold_allowlist_817.py` and `test_tp_mirror_removed_820.py`. **Carry the
 exemption as a field on the decision, never as a substring of its explanation.**
+
+Said-once family (#823): a fact that CHANGES during a process, reported ONCE at
+the moment it first became true, is a stale label for every moment after — and
+the log then reads as if the state still held. Two instances landed together.
+`_update_uniform_pool_budget` (`managers/scheduler.py:4684`) announced the
+rank-uniformity floors' coverage — `world=1 -> floors OFF ... pp_size=3
+tp_size=1` — exactly three times, once per rank at startup, and then said
+nothing through FOUR cutovers in 55 s, each of which can change the answer. The
+scope is now a TRANSITION (`uniform_floor_scope.scope_transition`,
+`managers/uniform_floor_scope.py:90`), so the line is emitted when the answer
+MOVES rather than when it is first computed. In the same function, a divergent
+TP queue head was logged as an EVENT when it is a DURATION: the ballot said
+"diverged" once and fell silent while the divergence ran. The specimen
+(`/spinning/evidence-816-18f/wedge_0823_055757`) shows what that hides —
+digests PP0 887126098 against PP1+PP2 1471852626, the group's union reaching
+row 240831 while the poorest rank had 1208, and 7710 #797d/#798 lines in seven
+seconds. `advance_mismatch_streak` (`managers/prefetch_ballot.py:174`) carries
+the streak and its total under a log cap, so the divergence's LENGTH survives
+into the log. The mutant that proves the point: disabling the recovery edge
+left all 14 tests GREEN before the streak was extracted. Pinned by
+`test_prefetch_ballot_divergence_823.py` (20 cases, red-first 10 of 14) and
+`test_uniform_floor_scope_824.py` (16 cases). **A state that can change is
+reported as a transition; only an immutable fact may be said once.**
+
+NUMBER COLLISION, #823 vs #824 — read the branch, not the subject line.
+`9d13bf0fd9` carries the subject "[#824] The uniformity floors' coverage is a
+state that changes, said once" and names its test file `..._824.py`, but its
+canonical register entry is **#823** (floor-scope reporter, strand 16f); it
+rode in on `fix/801-admission-recv-liveness`. The canonical **#824** is
+`658d0c102a` on `fix/824-chunked-prefill-protected-len` (strand 18f), the
+retention/protected-prefix crash fix described below. The two address unrelated
+invariants. No rebase was done, so the commit titles stay as written and this
+note is the mapping.
+
+Blind-instrument family (#821): the instrument best placed to see a defect can
+be the one instrument structurally unable to see it, and its silence then reads
+as health. Every blocking dict receive in the PP scheduler funnels through one
+call, and a rank parked there freezes exactly the two values the scheduler
+watchdog's activity predicate reads — `forward_ct` and `cur_batch_for_debug`
+(`create_scheduler_watchdog`,
+`managers/scheduler_components/invariant_checker.py:1175`). The watchdog
+therefore concluded "not active" and never fired: no SIGQUIT and no dump, for
+the wedge class it exists to catch. The three assignment sites that could have
+marked the rank all sit AFTER the receive
+(`managers/scheduler_pp_mixin.py:1567`, `:1799`, `:1950`). The receive is now
+marked as a DURATION before it blocks. Four mutants, each killed by its own
+case (duration reduced to a boolean, dump guard removed, marker never cleared,
+arm removed), and the suite was red-first on the base at 5 of 15. Pinned by
+`test_pp_wedge_watchdog_is_honest_821.py`. **An instrument whose liveness
+signal is written by the code that is blocked cannot report that block.**
+
+Non-monotone-source family (#824): a bound computed from a tracker that is
+allowed to go BACKWARDS will eventually be smaller than something it is
+required to cover. `req.cache_protected_len` is a protected prefix and may only
+grow, while `mamba_last_track_seqlen` is assigned from
+`req.mamba_branching_seqlen` (`managers/schedule_batch.py:2660`) and is not
+monotone — so the retention cap derived from it could fall below the prefix it
+had to protect. On 2026-08-23 06:07:06 that landed as `unified_radix_cache.py`
+`cache_unfinished_req AssertionError: req.cache_protected_len=16384,
+len(new_indices)=8192, page_aligned_len=8192`, killing PP0 with PP1 and PP2
+following through gloo peer-close. The check is one predicate,
+`retention_shrinks_protected` (`mem_cache/mamba_ckpt_utils.py:185`), called by
+BOTH cache lineages rather than by the one that happened to crash — the #747
+pattern. Ten cases red-first against the measured 16384/8192 pair, 10/10 green
+after, 5/5 mutants killed. Pinned by
+`test_retention_never_shrinks_protected_824.py`. **A monotone guarantee may
+never be derived from a non-monotone source.**
+
+Invariant-for-funding family (#770, #812): a change that buys headroom by
+loosening a correctness invariant is not a tuning win, and the test that shows
+it is a regression has to exist before the change ships. The per-rank KV floor
+was derived from the GROUP, so a rank whose own cap was smaller than the
+group-derived floor was asked to hold more than it could: measured 06:32:05,
+PP0 backed 212992 against floor 128549 -> 60.4%, PP2 133120 -> 96.6%, and PP1
+124928 -> **102.9%**, which is the defect. `floor_exceeds_local_cap`
+(`managers/kv_backing_relief.py:162`) makes that a named predicate and the
+floor is now derived from the rank's OWN cap. The second half is the part worth
+keeping: a floor CLAMP that genuinely improved funding was WITHDRAWN again on
+the same ticket line because it broke the levelling invariant — with the clamp
+`test_residency_cap_flip_levelling_792::TheLevellingMustNotCapBelowTheLiveSet`
+had 1 failed, without it 12 passed. Pinned by `test_funding_authority_770.py`
+(48 cases) and `test_floor_local_cap_812.py` (16), with mutant scripts
+`test/srt/mutants_770.sh` and `mutants_812.sh` (11/11 and 4/4 killed; two
+survivors were examined and named — one numerically equivalent, one an exact
+page-divisibility coincidence at cap 124928). **A funding win that needs an
+invariant loosened is a regression with better arithmetic.**
+
+Stub-drift family (#815): a test double that has drifted behind the production
+object it stands in for does not fail loudly — it makes the test measure
+nothing, or measure the stub. Ten helper files had drifted, each behind a NAMED
+commit: `test_scheduler_chunked_req_gate.py` behind `6f42d7f923` [#797] (helper
+missing `self.ps.pp_size`), `test_collective_family_siblings_610.py` behind
+`97ceea2f19` [#701] (a cross-pass reservation term in `rem_total_tokens`),
+`test_evict_rung_floor_invariant_717.py` behind `9aec623b2a` [#796] (a
+`self._buffers` read whose stub value 0, 1 and 28 ALL give 5 passed — the tell
+that the assertion had stopped depending on it),
+`test_acceptance_emitters_758.py` and `test_mamba_anchor_seams_747.py` behind
+`afa332e6bb` [#783], `test_vacuous_decode_exit_730.py` behind `4a16043d1a`,
+`test_kvso_worker_stop_673.py` behind `86d1cb1384` [#794], and
+`test_localslot_family_756.py` behind `4b2e43465d` [#753]. THE RULE THE REPAIR
+FOLLOWS, and the reason this is a family and not a chore: a stub is repaired
+FAITHFULLY or not at all. Giving the #631 `_Group` stub `is_first_rank = True`
+beside `is_last_rank = True` would make one rank simultaneously the first and
+the last at `pp_size = 3` — an object the production code can never meet, which
+is the #630 lesson. Two `pp_*` stubs WERE fixable faithfully and were fixed
+(`test_pp_admission_wraparound_never_blocks.py`,
+`test_pp_slot_last_batch_631.py`); the seven remaining cases in
+`test_pp_flip_slot_hold_631.py` are left RED ON PURPOSE, awaiting a
+#791-shaped rewrite, because the faithful stub is a real rank identity and that
+drags the whole admission-receive path in with it. Pinned by the eight repaired
+files together (90 passed, 54 subtests). **A stub is repaired faithfully or the
+suite is left red; an impossible double is worse than a failing test.**
 
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
@@ -3929,6 +4091,47 @@ taxonomy and the global importance ladder.
   GATE `_assert_v1_scope` `:176` (scope refusal) and `_manifest_cards_present`
   `:246`; card identity resolves via `:54` (`current_gpu_nvml_uuid`), i.e.
   through NVML, never an index.
+- **RowOwnershipAuthority (#822)** — the one place the KV row-space law is
+  written down: four named laws (EXPOSURE, COVERAGE, EXCLUSIVITY, RETIREMENT)
+  over the exposed/committed integers and the claim sets, with `audit()`
+  returning EVERY violation rather than the first, because #814 and #816 were
+  the same rows under two laws and a short-circuiting checker is how they
+  became two tickets. Narrative entry in §3.
+  ENTRY `mem_cache/kv_row_ownership.py:224` (`RowOwnershipAuthority`),
+  `:267` (`declare`), `:308` (`retire`), `:357` (`audit`), `:514`
+  (`observe_census`). Production goes through the two call-site adapters, not
+  the constructor: `:553` (`authority_for`), `:571` (`audit_pool_census`).
+  GATE: none — plain library. It reuses `exposure_over_backing` from
+  `managers/kv_backing_relief.py:547` through a lazy import at `:125`; that is
+  import-cycle avoidance, not a behavioural gate.
+  CONSUMERS `managers/phase_flip_runtime.py:3838`, `:3839`
+  (`_census_ownership_audit`), `:3881` (`_retire_row_id_space`).
+  NOT WIRED at this commit, and said plainly rather than implied: the clamp
+  firing-rate metric — `:663` (`parse_clamp_firings`), `:691`
+  (`clamp_firing_census`), the baselines at `:708`/`:715` — and `:539`
+  (`format_violations`) have no production caller. They are read by tests and
+  by log analysis, which is what the §3 "12 firings, four per rank" baseline is
+  computed with.
+- **FundingAuthority (#770, #584, #819)** — one answer to "can this action be
+  funded, and from where", against posts that are each declared BY NAME, so a
+  refusal names what held the money instead of only reporting a shortfall.
+  Narrative entry, the three priced losses and the arming-floor solve, in §2.
+  ENTRY `managers/funding_authority.py:334` (`FundingAuthority`), `:350`
+  (`declare_post`), `:378` (`can_fund` — this is the solve). Production builds
+  it through `:503` (`authority_from_seam_snapshot`). Solvers alongside it:
+  `:659` (`solve_arming_floor`), `:585` (`diagnose_floor_band`), `:470`
+  (`uniform_absolute_floor`), `:813` (`slack_above_uniform_floor`).
+  GATE: none — plain library; no env or `server_args` read anywhere in the
+  module.
+  CONSUMERS `managers/phase_flip_runtime.py:6275` (`_arming_floor_advice`, via
+  `solve_arming_floor`), `:7128` (`_funding_post_census`, via
+  `authority_from_seam_snapshot`).
+  NOT WIRED at this commit: `FundingAuthority` is never constructed directly in
+  production, and `uniform_absolute_floor`, `diagnose_floor_band` and
+  `slack_above_uniform_floor` have no production caller — the authority is so
+  far consulted for the arming floor and the census, not yet for the refusal
+  itself. TRAP: the module docstring at `:56` refers to a `solve_funding`
+  function that does not exist; the solve is `can_fund` `:378`.
 
 ### 18.4 Sessions, tenants, liveness
 
@@ -4018,7 +4221,8 @@ taxonomy and the global importance ladder.
   an HTTP status. `LIVENESS_PATH` is `/get_model_info`, which answers from the
   HTTP process WITHOUT touching the scheduler and is therefore structurally
   blind to the wedge class (alive, port open, serving nobody); the generation
-  probe that could see it is retired by user order (`watchdog.py:88`). The
+  probe that could see it is retired by user order (`turnkey/watchdog.py:88`).
+  The
   replacement is the #699/#739 admission-wedge verdict, published passively by
   the scheduler that already computes it and read as a file:
   publish `managers/wedge_status.py:126` (`publish_verdict`), read `:172`
@@ -4272,6 +4476,39 @@ taxonomy and the global importance ladder.
   the code does not do.** The figure now says what it actually gates and
   reports when it has gone stale.
   Pinned by `test_flip_threshold_honesty_777.py`.
+- **uniform floor scope reporter (#823)** — reports the rank-uniformity floors'
+  COVERAGE as a transition, so a scope that changes mid-process is said again
+  instead of standing on the value it had at startup. Narrative entry, and the
+  reason the startup-only line was misleading, in §12's said-once family. NOTE
+  the commit and its test file carry a `[#824]` tag; the canonical register
+  number is #823 (see §12's collision note).
+  ENTRY `managers/uniform_floor_scope.py:116` (`report_scope`), pure decision
+  at `:90` (`scope_transition`), `:79` (`scope_for_world`).
+  GATE: none — plain library. The `server_args` read at `:140` supplies the
+  pp/tp numbers for the log line only and gates no behaviour.
+  CONSUMERS `managers/scheduler.py:4792`, `:4814`, both inside
+  `_update_uniform_pool_budget` (`:4684`).
+- **prefetch ballot (#791b)** — the rank-uniform ballot for HiCache
+  storage-prefetch admission: `check_prefetch_progress` is a RANK-LOCAL verdict
+  because the storage backend loads each rank's KV shard at its own speed, so N
+  TP replicas that agree only by determinism could admit differently; the local
+  verdicts are reduced into one group answer. `advance_mismatch_streak` is the
+  #823 addition that makes a divergence a duration rather than an event.
+  BACKFILLED ENTRY, provenance stated rather than absorbed: this module landed
+  in an EARLIER merge without its §18 line, which is a breach of rule 5 above.
+  It is recorded here because leaving it absent would keep the breach invisible
+  — the checker only tests citations that exist, so a missing entry costs
+  nothing and is therefore the failure mode rule 5 cannot catch.
+  ENTRY `managers/prefetch_ballot.py:77` (`build_prefetch_ballot_payload`),
+  `:101` (`unpack_prefetch_ballot`), `:124` (`prefetch_done_under_ballot` — the
+  per-request verdict the admission loop consumes), `:69`
+  (`prefetch_ballot_digest`), `:174` (`advance_mismatch_streak`), `:159`
+  (`should_log_mismatch_streak`).
+  GATE: none — plain library of pure functions.
+  CONSUMERS `managers/scheduler.py:4938`, `:4947`, `:4995`, `:5011` (all inside
+  `_update_uniform_pool_budget` `:4684`) and `:7462` inside
+  `_get_new_batch_prefill_raw` (`:7085`). Unlike the two authorities in §18.3,
+  this one is fully wired.
 
 ### 18.7 Small primitives that keep getting rewritten
 
