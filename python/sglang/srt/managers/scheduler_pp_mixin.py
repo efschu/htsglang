@@ -2442,6 +2442,11 @@ class SchedulerPPMixin:
         /dev/shm file per pass, which is the same discipline and the same
         directory the presence gate already uses.
         """
+        # #824 W4a: the slot this rank is CURRENTLY on, published for the
+        # chain-stall drain, which needs a live mb_id to tell an owed proxy
+        # from a leftover one. Set before the enable test so it is accurate
+        # for every caller that can reach it.
+        self._pp_live_mb_id = mb_id
         if not getattr(self.server_args, "enable_phase_flip", False):
             return
         try:

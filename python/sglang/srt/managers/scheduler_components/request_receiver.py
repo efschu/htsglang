@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -32,6 +33,8 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -89,6 +92,47 @@ class SchedulerRequestReceiver:
     # chain_receiver path, which is where two of three ranks wedged on
     # boot_827. The PpChainReceiver path stamps its own marker instead.
     on_blocked_recv: Optional[Callable[[Optional[str], Optional[float]], None]] = None
+    # #824 W4a: run one drain turn when the chain receive reports a CLOSED
+    # RING (PpChainRecvStalled), then resume the SAME posted receive. None
+    # keeps the pre-#824 behaviour of letting the stall propagate.
+    pp_chain_stall_service: Optional[Callable[[], Any]] = None
+
+    #: How many drain turns one chain receive may trigger before the stall
+    #: is allowed to propagate. A closed ring is cut by the FIRST turn; a
+    #: second means the drain did not release the peer, and spinning on it
+    #: would replace a loud wedge with a quiet one.
+    MAX_STALL_SERVICE_TURNS = 2
+
+    def _recv_chain_breaking_closed_rings(self):
+        """#824 W4a: the blocking chain receive, plus the ring-cut.
+
+        ``PpChainRecvStalled`` does not mean "give up". It means the chain
+        receive has PROVEN the ring is closed -- this rank's CHAN_DICT
+        upstream has entered a send it cannot finish until this rank drains
+        it -- and the receive is still posted and still framed. So the
+        answer is to drain that wire and come back to the same receive,
+        which is what the resumability of ParkedWait exists for.
+
+        The stall is re-raised rather than swallowed if servicing does not
+        clear it, because at that point the ring is closed for a reason this
+        code does not model, and a caller that keeps retrying would turn a
+        diagnosable wedge into an invisible one.
+        """
+        from sglang.srt.managers.pp_chain_receiver import PpChainRecvStalled
+
+        for turn in range(self.MAX_STALL_SERVICE_TURNS + 1):
+            try:
+                return self.chain_receiver.recv()
+            except PpChainRecvStalled:
+                if self.pp_chain_stall_service is None or turn >= self.MAX_STALL_SERVICE_TURNS:
+                    raise
+                logger.warning(
+                    "PP-CHAIN-RECV closed ring detected on the request "
+                    "chain; running drain turn %d to release the upstream's "
+                    "dict send, then resuming the same posted receive.",
+                    turn + 1,
+                )
+                self.pp_chain_stall_service()
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -238,7 +282,7 @@ class SchedulerRequestReceiver:
                     # Routing the blocking path through it as well is
                     # what keeps a half-received message from being
                     # misframed by a second, competing irecv.
-                    recv_reqs = self.chain_receiver.recv()
+                    recv_reqs = self._recv_chain_breaking_closed_rings()
                 else:
                     src = (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset
                     if self.on_blocked_recv is not None:
