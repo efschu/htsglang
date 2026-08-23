@@ -89,7 +89,8 @@ mutant that disabled the recovery edge once survived a whole suite.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+import dataclasses
+from typing import Dict, List, Optional, Sequence, Tuple
 
 #: Head depth the enforcer agrees on. Matches PREFETCH_BALLOT_SLOTS so the
 #: enforcer covers exactly the window the detector already watches; a rid
@@ -304,6 +305,190 @@ def batch_decision(
     return list(order)[: max(0, int(limit))], order_source, limit_source
 
 
+# ---------------------------------------------------------------------------
+# W9b: the decision has to REACH the batch, and its absence has to be LOUD.
+# ---------------------------------------------------------------------------
+#
+# Everything above decides correctly and was proven to, fifteen cases green,
+# while the boot formed rank-locally 105 times out of 105. What failed was
+# the hand-over: the pass destroyed the memo before the consumer read it
+# (scheduler.py:7429 pops `_uniform_prefetch_ballot`, :5314 read it), and
+# the COUNT arm's own hand-over failed SILENTLY through a
+# `getattr(..., None)` that turned a structural defect into a plausible
+# number -- the #606 family.
+#
+# So this block carries two things and no new decision: a VALUE that holds
+# the whole group verdict for one pass (a parameter cannot be absent, which
+# is the only guarantee stronger than a default), and the pure arithmetic of
+# saying so when it is missing.
+
+
+@dataclasses.dataclass(frozen=True)
+class UniformHeadInputs:
+    """One pass's group verdict, as a value rather than as four attributes.
+
+    FOUR ATTRIBUTES WERE THE BUG. They were published at one point in the
+    pass, consumed at another, and one of the four was destroyed in between
+    -- a lifecycle with four independent chances to be wrong, and the boot
+    took one of them on every pass. Bundled, they are taken once and handed
+    down; there is no window in which three of them are live and the fourth
+    is a hole.
+
+    ``digest_agreed`` rides along because it is REPORTED, not because it
+    decides: ``head_decision`` deliberately does not branch on it (see its
+    docstring -- the group order is computable in exactly the pass where the
+    digests disagree, which is the point of the whole ticket). It was
+    nonetheless the field whose direct read raised, so it is carried here
+    where reading it is free rather than left to be fetched from a memo the
+    pass has already consumed.
+    """
+
+    canonical: Tuple[str, ...]
+    group_match_lens: Tuple[int, ...]
+    admit_limit: Optional[int]
+    digest_agreed: bool
+
+
+def build_uniform_head_inputs(
+    canonical: Sequence[str],
+    group_match_lens: Sequence[int],
+    admit_limit: Optional[int],
+    digest_agreed: bool,
+) -> UniformHeadInputs:
+    """Freeze this pass's reduce results into the value the pass hands down."""
+    return UniformHeadInputs(
+        canonical=tuple(canonical or ()),
+        group_match_lens=tuple(int(v) for v in (group_match_lens or ())),
+        admit_limit=None if admit_limit is None else int(admit_limit),
+        digest_agreed=bool(digest_agreed),
+    )
+
+
+#: Why the enforcer is or is not in force this pass. Named strings rather
+#: than a bare bool, because "inert" and "correctly gated off" read
+#: identically in a log that reports neither -- and that ambiguity is what
+#: cost W9 a GPU window: the boot could not say whether the enforcer was
+#: broken or simply out of scope.
+GATE_ON = "on"
+GATE_OFF_KILL_SWITCH = "off:kill-switch"
+GATE_OFF_NO_PARALLEL_STATE = "off:no-parallel-state"
+GATE_OFF_TP_WORLD_OF_ONE = "off:tp-world-of-one"
+
+
+@dataclasses.dataclass(frozen=True)
+class GateVerdict:
+    enabled: bool
+    reason: str
+    #: Human-readable, for the one log line this produces per transition.
+    detail: str
+
+
+def enforcer_gate(
+    kill_switch_on: bool,
+    tp_size: Optional[int],
+    pp_size: Optional[int] = None,
+) -> GateVerdict:
+    """Is the group's batch-formation decision in force, and if not, WHY.
+
+    THE TP WORLD OF ONE IS NOT A WIDENING OPPORTUNITY, and this is the
+    decision W9's window left open. Under ``--tp-size 1 --pp-size 3`` this
+    predicate returns off, 45 of that boot's 51 prefill batches ran in that
+    phase, and the obvious reading was "so widen the gate to cover PP".
+
+    Three reasons in the code say otherwise, and they are why this function
+    reports a REASON instead of growing a `pp_size > 1` branch:
+
+    1. The enforcer's numbers come from a MIN-reduce over ``tp_cpu_group``,
+       and under tp=1 that group has exactly ONE member per rank
+       (parallel_state.py:3166-3188 chunks the world into ``world_size //
+       tp_size`` groups of size 1). A MIN over a singleton is this rank's
+       own vote. Enforcing it would impose a rank-local verdict while
+       calling it the group's -- worse than off, because it would also look
+       right.
+    2. Supplying the missing collective where the decision is consumed is
+       forbidden, with a casualty: #737 (scheduler.py:7402-7419) records
+       that the PP stages sit at different microbatch offsets by design and
+       that the HiCache ack-count reduction deadlocked there on 2026-08-17.
+    3. The PP phase already has this actuator and a stronger one. #791
+       forwards the first rank's committed decision around the ring;
+       downstream ranks may not drop a named request or add an unnamed one
+       (``PPScheduleRefused``, scheduler.py:7903-7941) and are re-ordered
+       into the forwarded order by ``order_batch_by_schedule``. This
+       module's own rule is a transplant of that one (see "THE RULE,
+       transplanted from #791" above).
+
+    ``pp_size`` is therefore taken and REPORTED, never branched on: the
+    reason string distinguishes "no TP group to agree with, and #791 covers
+    this phase" from "no TP group at all", which a bare `False` cannot.
+    """
+    if not kill_switch_on:
+        return GateVerdict(
+            False,
+            GATE_OFF_KILL_SWITCH,
+            "SGLANG_TP_HEAD_CONGRUENCE=0; pre-#823 rank-local formation restored",
+        )
+    if tp_size is None:
+        return GateVerdict(
+            False,
+            GATE_OFF_NO_PARALLEL_STATE,
+            "no ParallelState on this scheduler; nothing to agree with",
+        )
+    if int(tp_size) > 1:
+        return GateVerdict(True, GATE_ON, f"TP world of {int(tp_size)}")
+    covered = (
+        " -- this phase's formation congruence is #791's forwarded PP "
+        "admission decision, not this enforcer"
+        if pp_size is not None and int(pp_size) > 1
+        else ""
+    )
+    return GateVerdict(
+        False,
+        GATE_OFF_TP_WORLD_OF_ONE,
+        f"TP world of 1 (pp_size={pp_size}): the reduce group has one member, "
+        f"so its MIN is this rank's own vote{covered}",
+    )
+
+
+def advance_gate_report(previous_reason: Optional[str], verdict: GateVerdict):
+    """Report the TRANSITION, not the first sighting.
+
+    Same rule and same reason as #824's ``uniform_floor_scope.report_scope``
+    (scheduler.py:4877-4901): under ``--enable-phase-flip`` this gate is not
+    a boot constant -- ``phase_flip_runtime`` rebuilds the TP group per phase
+    (``want_tp_size = n if tp_phase else 1``), so the enforcer is ON through
+    the TP decode phase and OFF through the PP prefill phase and switches at
+    every cutover. A once-per-process latch made "off for the whole run" and
+    "off for the prefill half of every cutover" read identically, and
+    coverage coming BACK was never reported at all.
+
+    Returns ``(reason, message_or_None)``.
+    """
+    if previous_reason == verdict.reason:
+        return verdict.reason, None
+    return verdict.reason, verdict.detail
+
+
+#: Which half of the batch decision fell back. Named so the counter and the
+#: log can say WHICH, instead of leaving a reader to guess -- the count arm
+#: had no name and no line at all, which is why its inertness was invisible.
+ARM_ORDER = "order"
+ARM_COUNT = "count"
+
+
+def degradation_is_a_defect(gate_enabled: bool, source: str) -> bool:
+    """With the enforcer in force, a rank-local outcome is a DEFECT.
+
+    Not a tuning knob and not a soft fallback: the enforcer being enabled is
+    the operator saying the ranks must agree, so a pass that forms
+    rank-locally anyway has silently reverted to the behaviour the 0516
+    wedge came out of. It is counted and logged on that basis.
+
+    With the gate off, rank-local IS the contract, and reporting it would be
+    noise on every pass of every single-rank boot.
+    """
+    return bool(gate_enabled) and source != SOURCE_GROUP
+
+
 def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
     """Did every rank end up with the same decision?"""
     if not orders:
@@ -316,6 +501,18 @@ __all__ = [
     "TP_HEAD_SLOTS",
     "SOURCE_GROUP",
     "SOURCE_RANK_LOCAL",
+    "ARM_ORDER",
+    "ARM_COUNT",
+    "GATE_ON",
+    "GATE_OFF_KILL_SWITCH",
+    "GATE_OFF_NO_PARALLEL_STATE",
+    "GATE_OFF_TP_WORLD_OF_ONE",
+    "GateVerdict",
+    "UniformHeadInputs",
+    "advance_gate_report",
+    "build_uniform_head_inputs",
+    "degradation_is_a_defect",
+    "enforcer_gate",
     "head_decision",
     "build_admit_limit_payload",
     "admit_limit_decision",
