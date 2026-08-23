@@ -225,9 +225,22 @@ Environment:
 ```
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<disk L3, sized ~100 GB>
   SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES=<non-zero>   # ENOSPC floor (#558)
-  SGLANG_HICACHE_READ_BUFFERS=<small, e.g. 8>          # #720 ring, off by default
   SGLANG_HICACHE_PIN_BUDGET_BYTES=<if #410 checkpoints are exercised>
 ```
+
+The #720 read-buffer ring is NO LONGER SET HERE. `SGLANG_HICACHE_READ_BUFFERS`
+was promoted to `--hicache-read-buffers` by #837 and the env spelling is a
+deprecated bridge that warns. Use the flag:
+
+```
+  --hicache-read-buffers 8      # #720 ring, 0 (off) by default
+```
+
+This is not cosmetic. The #539 boot gate refuses any governed `SGLANG_*` key
+the ship capture does not carry, and it does not carry this one -- so the env
+form was already refused on the `route_a_631_prod_boot.sh` path at the moment
+this recipe was written. The flag travels in argv, which that gate does not
+police, and the planner can emit it.
 
 Deliberately NOT set: `--phase-flip-rebind-hicache` (#719). It would refuse at
 every cutover for want of the second pool; leaving it off keeps the log honest.
@@ -291,7 +304,7 @@ despite real hits (known separate defect) -- count hits from log lines.
 
 ### 3.3 ReadBufferPool fallback counter
 
-With `SGLANG_HICACHE_READ_BUFFERS=8`, the ring's `overflow_allocations` must be
+With `--hicache-read-buffers 8`, the ring's `overflow_allocations` must be
 **zero** under steady load. Non-zero means concurrent reads exceed the ring and
 the path is falling back to per-read allocation -- correct, but it is the #720
 spike returning, so either raise the ring or accept it knowingly.
@@ -447,8 +460,13 @@ on 2026-08-17.
 ```
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<disk L3, ~100 GB>
   SGLANG_HICACHE_CANONICAL_MIN_FREE_BYTES=8589934592
-  SGLANG_HICACHE_READ_BUFFERS=8
   SGLANG_HICACHE_DEMOTE_ON_EVICT=<cap>
+```
+
+plus, in argv rather than the environment (#837):
+
+```
+  --hicache-read-buffers 8
 ```
 
 NOT set, deliberately: `--phase-flip-rebind-hicache`. See 5.4.

@@ -5677,6 +5677,88 @@ class ServerArgs:
             "from SGLANG_FLIP_SEAM_CHUNK_MIB (#781).",
         ),
     ] = None
+    # ------------------------------------------------------------------
+    # #837: the round-4 seam knobs, promoted on the same terms as the block
+    # above. They were introduced as SGLANG_* env vars by #830 and #834 and
+    # never reached a flag, which had a consequence beyond tidiness: the #539
+    # boot gate refuses any governed SGLANG_* key the ship capture does not
+    # carry, and it carries none of these. So the seam shrink was not merely
+    # awkward to set through route_a_631_prod_boot.sh -- it was UNREACHABLE
+    # there, and the W13b window that is supposed to measure it could not have
+    # been run without editing the boot script. argv is not policed by that
+    # gate, which is the point: the flag is how a value reaches the server, and
+    # the planner is what decides it.
+    #
+    # Defaults are None for the same reason as above -- unset means the env
+    # fallback still resolves and the default path is byte-identical.
+    seam_shrink: A[
+        Optional[bool],
+        Arg(
+            help="#834: run the flip's device-tier quiesce at ARM time and "
+            "defer the rank-local KV grow out of the no-return window, "
+            "shrinking the cutover. OFF by default: both halves change WHEN "
+            "work happens relative to a collective, and their failure modes "
+            "are invisible to a hermetic suite. Promoted from "
+            "SGLANG_SEAM_SHRINK (#837); unset falls back to that env var, "
+            "which is deprecated.",
+        ),
+    ] = None
+    seam_shrink_prearm_quiesce: A[
+        Optional[int],
+        Arg(
+            help="Per-half override for the #834 pre-arm quiesce so a window "
+            "can attribute a result to ONE half: -1 follow --seam-shrink, "
+            "0 force off, 1 force on. Promoted from "
+            "SGLANG_SEAM_SHRINK_PREARM_QUIESCE (#837).",
+        ),
+    ] = None
+    seam_shrink_defer_grow: A[
+        Optional[int],
+        Arg(
+            help="Per-half override for the #834 deferred KV grow: -1 follow "
+            "--seam-shrink, 0 force off, 1 force on. Promoted from "
+            "SGLANG_SEAM_SHRINK_DEFER_GROW (#837).",
+        ),
+    ] = None
+    seam_shrink_grow_debt_rounds: A[
+        Optional[int],
+        Arg(
+            help="#834 ratchet guard patience, in flip-runtime rounds: after "
+            "this many rounds with a deferred grow still unpaid the runtime "
+            "shouts GROW-DEBT-UNPAID and names #814. A patience, not a "
+            "measurement. 0 DISABLES THE ALARM ENTIRELY -- it does not mean "
+            "'shout immediately', which is the natural reading and the wrong "
+            "one: the consumer returns early on patience <= 0 "
+            "(phase_flip_runtime.py:4753). Disabling it silences the guard on "
+            "the one failure mode in this family that costs capacity silently "
+            "and permanently (W13b criterion 13), so 0 is a deliberate act, "
+            "not a tuning value. Promoted from "
+            "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS (#837).",
+        ),
+    ] = None
+    flip_seam_drain_budget_ms: A[
+        Optional[int],
+        Arg(
+            help="#830: the longest #760 device-tier quiesce the flip will "
+            "enter the no-return window carrying, in milliseconds. Above it "
+            "the arm is refused by name instead of the seam silently holding "
+            "the ring. 0 disables the guard (the projection is still logged). "
+            "The in-code default 1094 is DERIVED, not pinned: it is the "
+            "largest cutover observed across the 1014-flip HiCache-off corpus "
+            "in ANALYSE_830 section 2.1. Promoted from "
+            "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS (#837).",
+        ),
+    ] = None
+    hicache_read_buffers: A[
+        Optional[int],
+        Arg(
+            help="#720: size of the reusable, budget-registered read-buffer "
+            "ring per HiCache pool. 0 (the default) disables the ring and "
+            "allocates per read. Promoted from SGLANG_HICACHE_READ_BUFFERS "
+            "(#837), which docs/dev/DESIGN_706_BOOT.md still documents as a "
+            "boot-env line -- exactly the pattern #781 exists to end.",
+        ),
+    ] = None
     collective_census_interval: A[
         Optional[int],
         Arg(
@@ -6856,6 +6938,13 @@ class ServerArgs:
         # #410 session checkpoints: HiCache dependency and age ladder.
         self._handle_hicache_host_role()
         self._handle_session_checkpoints()
+
+        # #837: the promoted round-4 seam knobs. Validated here, before any
+        # value is published to the environment, so a bad tri-state fails the
+        # boot at argv instead of being read back mid-flip by a runtime whose
+        # rule is "override >= 1 means force ON" -- under which a typo'd 2
+        # arms the half the window believed it had pinned.
+        self._handle_seam_shrink_flags_837()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -17676,6 +17765,56 @@ class ServerArgs:
         if self.barlink is not None:
             os.environ["SGLANG_BARLINK"] = "1" if self.barlink else "0"
 
+    def _handle_seam_shrink_flags_837(self):
+        """Validate the #837 promoted seam knobs, early and by name.
+
+        WHY EARLY MATTERS HERE MORE THAN USUAL. The consumer of the two
+        per-half overrides is ``_seam_shrink_half`` in phase_flip_runtime,
+        which resolves the value like this (phase_flip_runtime.py:1320-1330)::
+
+            if override == 0:   return False
+            if override >= 1:   return True
+            return _seam_shrink_master()
+
+        So an out-of-range value is NOT swallowed into follow-the-master, and
+        saying so would understate the hazard in the direction that makes it
+        sound harmless. A typo'd ``2`` is FORCE ON. ``EnvInt.parse`` accepts
+        "2" cleanly, so the surrounding try/except -- whose contract is that
+        "a gate lookup must never break a flip" -- never fires for a numeric
+        typo; only ``<= -2`` reaches the master.
+
+        That is the real failure: a window that believed it had pinned one
+        half to a master that was off would have run that half ON, and would
+        have attributed the resulting number to the other move. This family
+        has already paid twice for reading adjacency as attribution. The
+        refusal belongs at argv, where a typo is still a typo and not yet a
+        measurement.
+        """
+        for field, value in (
+            ("seam_shrink_prearm_quiesce", self.seam_shrink_prearm_quiesce),
+            ("seam_shrink_defer_grow", self.seam_shrink_defer_grow),
+        ):
+            if value is not None and value not in (-1, 0, 1):
+                raise ValueError(
+                    f"--{field.replace('_', '-')} must be -1 (follow "
+                    f"--seam-shrink), 0 (force off) or 1 (force on), got "
+                    f"{value}. It is a per-half attribution override, not a "
+                    f"count."
+                )
+        for field, value in (
+            ("seam_shrink_grow_debt_rounds", self.seam_shrink_grow_debt_rounds),
+            ("flip_seam_drain_budget_ms", self.flip_seam_drain_budget_ms),
+            ("hicache_read_buffers", self.hicache_read_buffers),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(
+                    f"--{field.replace('_', '-')} must be >= 0, got {value}."
+                )
+        # A per-half override without the master is not an error -- -1 follows
+        # a master that is off, and 1 is exactly how a window turns ONE half on
+        # without the other. Refusing it would forbid the attribution run the
+        # overrides exist for.
+
     def _publish_promoted_781_flags(self):
         """Publish the #781 promoted flags to the consumers that read env.
 
@@ -17800,6 +17939,33 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = _b(
                 self.enable_health_endpoint_generation
             )
+        # #837. The seam-shrink readers in phase_flip_runtime resolve two of
+        # these by NAME STRING (getattr(envs, name).get() at :1336), so the
+        # published key is the only surface that reaches both halves without
+        # rewriting a dynamic lookup into a static one.
+        if self.seam_shrink is not None:
+            os.environ["SGLANG_SEAM_SHRINK"] = _b(self.seam_shrink)
+        # TRI-STATE, NOT A BOOLEAN. -1/0/1 must survive the round trip; _b()
+        # would collapse -1 and 1 onto the same "1" and silently turn "force
+        # off" into "follow master" for the -1 case.
+        if self.seam_shrink_prearm_quiesce is not None:
+            os.environ["SGLANG_SEAM_SHRINK_PREARM_QUIESCE"] = str(
+                self.seam_shrink_prearm_quiesce
+            )
+        if self.seam_shrink_defer_grow is not None:
+            os.environ["SGLANG_SEAM_SHRINK_DEFER_GROW"] = str(
+                self.seam_shrink_defer_grow
+            )
+        if self.seam_shrink_grow_debt_rounds is not None:
+            os.environ["SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS"] = str(
+                self.seam_shrink_grow_debt_rounds
+            )
+        if self.flip_seam_drain_budget_ms is not None:
+            os.environ["SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS"] = str(
+                self.flip_seam_drain_budget_ms
+            )
+        if self.hicache_read_buffers is not None:
+            os.environ["SGLANG_HICACHE_READ_BUFFERS"] = str(self.hicache_read_buffers)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
