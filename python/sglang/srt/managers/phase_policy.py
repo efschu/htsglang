@@ -1449,6 +1449,31 @@ class PhasePolicyDecision:
     direction: Optional[str]
     reason: str
 
+    #: #817 THE HOLD ALLOWLIST, CARRIED INSTEAD OF SNIFFED.
+    #:
+    #: The #677 hold may veto exactly one kind of arm: the plain timer /
+    #: economics exit, the one whose premise the hold contradicts ("prefill is
+    #: unserved here, so do not let a clock take the layout away"). Every other
+    #: arm is chosen by a RULE for a reason the hold cannot see, and vetoing
+    #: those is how a legitimate exit becomes a wedge.
+    #:
+    #: That membership used to be decided by reading the reason STRING -- a
+    #: denylist of three substrings, with everything unrecognised silently
+    #: swallowed. The blocked-admission exit was unrecognised, so the exit
+    #: built to end a live wedge (403779 tok frozen, every slot held by a
+    #: carried decode) was itself converted into a hold that printed "the timer
+    #: does not get to take it away" about an exit that is not a timer. The
+    #: wrapper's own comment prescribed the remedy: "If a fourth exemption ever
+    #: appears, invert this into an allowlist rather than adding it."
+    #:
+    #: So eligibility is now a PROPERTY OF THE ARM, set where the arm is built
+    #: and by the code that knows what it means. The default is False, which
+    #: makes the safe direction the structural one: an arm nobody marked is an
+    #: EXIT. A future arm added without reading this comment cannot be
+    #: swallowed by forgetting to name it -- only by explicitly claiming to be
+    #: a timer.
+    hold_eligible: bool = False
+
     @property
     def wants_flip(self) -> bool:
         return self.direction is not None
@@ -1488,6 +1513,21 @@ def decide(
     # exit. If a fourth exemption ever appears, invert this into an allowlist
     # rather than adding it.
     #
+    # #817 DID THE INVERSION, and the fourth case that forced it was not
+    # hypothetical: the blocked-admission exit (#677's own, one day older than
+    # this wrapper) was never in the denylist, so it was swallowed. It is not a
+    # timer -- its commit spends a paragraph on exactly that distinction,
+    # because the wedge it ends is the one no clock was watching -- yet the
+    # hold it became announced "the timer does not get to take it away" over
+    # the live specimen's own 403779 frozen tokens. A denylist of substrings
+    # cannot tell an unrecognised arm from an exempt one, and it fails toward
+    # swallowing.
+    #
+    # The membership test is now `d.hold_eligible`, set at the arm. This
+    # paragraph is kept because it states the RULE the allowlist encodes, and
+    # the rule outlives its implementation: the lever may veto the plain timer
+    # exit and nothing else.
+    #
     # THE DRAINED EXIT ALSO OUTRANKS THIS, on #669's economics. A residual
     # ABOVE one chunk stays in PP -- which is what this hold wants anyway --
     # but a SUB-CHUNK residual is finishing regardless, and holding the layout
@@ -1502,13 +1542,7 @@ def decide(
     # not recognise it would suppress all of them. The C2 defect is
     # specifically "pp_to_tp took the layout while prefill was unserved", so
     # that is the only arm this converts into a wait. It can never create one.
-    _r = d.reason or ""
-    if (
-        d.direction == PP_TO_TP
-        and not _r.startswith(IDLE_LOCKED)
-        and "DRAINED" not in _r
-        and "decode starvation cap" not in _r
-    ):
+    if d.direction == PP_TO_TP and d.hold_eligible:
         # #688 OUTRANKS #677 EXACTLY AS IT OUTRANKS #689, and for the same
         # reason spelled out below for formation: the idle-locked arm fires
         # only when the current layout can build NOTHING. Holding that layout
@@ -2205,7 +2239,18 @@ def _decide_from_load(
             )
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
+                # #817: THE ONE ARM THE #677 HOLD MAY VETO. This is the plain
+                # timer -- a hand-set stopwatch on the pp window, with no claim
+                # that the layout has stopped making progress. The hold's
+                # premise ("prefill pulled into this layout is still unserved,
+                # so a clock does not get to take it away") is a direct answer
+                # to THIS arm and to no other. Every sibling arm reports a
+                # STATE the hold cannot see -- drained, starved, blocked,
+                # idle -- and is therefore not eligible; see
+                # PhasePolicyDecision.hold_eligible for why that default is
+                # what makes the swallow structurally impossible.
+                hold_eligible=True,
+                reason=f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
                 f"{inp.running_bs} req waiting to decode "
                 f"({inp.pending_prefill_tokens} tok prefill deferred to the "
                 f"next pp window) -- HAND-SET STOPWATCH; drain-based policy "
