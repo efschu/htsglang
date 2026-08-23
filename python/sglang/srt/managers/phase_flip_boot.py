@@ -908,12 +908,22 @@ class PhaseFlipStacks:
         # editing a threshold" described a repricing that does not reach the
         # policy. `observe_flip_cost` now says so on the first flip that proves
         # it; repricing N itself is the planner's call.
-        try:
-            from sglang.srt.managers.phase_policy import observe_flip_cost
-
-            observe_flip_cost(elapsed)
-        except Exception:  # noqa: BLE001 - economics may never break a flip
-            pass
+        # #819: THE FEED MOVED, and the reason is that this timer measures a
+        # STEP. phase_flip_runtime's header calls the weights-arena refill and
+        # the KV seam "separate steps of the flip", so what is bracketed here
+        # is a component of a leg, not a leg. Priced as if it were the whole,
+        # it understated the flip by more than half: this timer reported
+        # 3.60287/3.66144/4.62869 s on boot_window3_0823_1733.log while that
+        # boot's own PHASE-FLIP DONE lines put a leg at 5681-12023 ms.
+        # It also could not see the cutover at all, which is the term
+        # SGLANG_SEAM_SHRINK moves -- so the seam shrink could never have
+        # reached the threshold through this path.
+        # The estimator is now fed the completed leg's own `total_ms`, once,
+        # by `observe_flip_leg` at the completion site in scheduler.py. Feeding
+        # both a component and its container into one EMA would converge to
+        # neither, so this feed is retired rather than kept alongside.
+        # The measurement itself is NOT lost: `refill_report` below still logs
+        # this leg, which is what the #690 high-water marks bracket.
         try:
             logger.info(
                 "%s %s",

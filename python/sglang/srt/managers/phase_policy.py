@@ -820,6 +820,44 @@ def observe_flip_cost(seconds) -> None:
     )
 
 
+def observe_flip_leg(stats) -> None:
+    """Feed the estimator THE WHOLE LEG, not one step of it (#819).
+
+    WHAT WAS BEING PRICED. The only feeder was ``_timed_arena_refill``, which
+    brackets the weights-arena copy and says so ("the number is the refill leg
+    proper and nothing else"). The arena refill is ONE STEP of a flip --
+    phase_flip_runtime's own header calls the weights-arena refill and the KV
+    seam "separate steps of the flip" -- so the estimator was pricing a
+    component and the policy was spending it as if it were the whole.
+
+    MEASURED, on boot_window3_0823_1733.log. The estimator reported the seam
+    at 3.60287 / 3.66144 / 4.62869 s, while the same boot's own PHASE-FLIP
+    DONE lines put a leg at 5681-12023 ms, and a round trip at
+    tp_to_pp 11490 + pp_to_tp 5681 = 17171 ms. The refill leg is roughly half
+    of one leg, so the flip was priced at well under half of what it cost.
+
+    WHY THIS MATTERS BEYOND ACCURACY, and why #834 needs it: ``total_ms``
+    CONTAINS ``movers_ms`` and ``cutover_ms``, and the refill leg contains
+    neither. ``SGLANG_SEAM_SHRINK`` shrinks the cutover -- so with only the
+    refill fed, the seam shrink could not move the price by construction, no
+    matter how much it saved. The coupling was not mistuned, it was absent.
+
+    ONE SAMPLE PER LEG. The refill feed is retired rather than added to, because
+    a component and its container are different quantities and an EMA fed both
+    alternately converges to neither.
+    """
+    if not isinstance(stats, dict):
+        return
+    total_ms = stats.get("total_ms")
+    if total_ms is None:
+        return
+    try:
+        seconds = float(total_ms) / 1000.0
+    except (TypeError, ValueError):
+        return
+    observe_flip_cost(seconds)
+
+
 def flip_cost_estimator() -> Optional[FlipCostEstimator]:
     return _FLIP_COST_ESTIMATOR
 
@@ -859,6 +897,87 @@ def break_even_tokens(
     return int(round(flip_cost_s / (1.0 / tp_tok_s - 1.0 / pp_tok_s)))
 
 
+def live_flip_tokens(cfg: "PhasePolicyConfig") -> int:
+    """N, PRICED FROM THE MEASURED SEAM instead of frozen at the boot seed (#819).
+
+    THE ACTUATOR #777 DECLINED TO BUILD. ``repriced_flip_tokens`` already
+    computed this number and said so in a WARNING -- "N IS STALE AND STAYS
+    STALE ... nothing reprices it" -- explicitly leaving the decision to the
+    planner because repricing moves when the server flips at all. This is that
+    decision, taken: the threshold follows the measurement.
+
+    THE SEED IS A COLD-START PRIOR, NOT A PIN (#770 family). ``flip_tokens``
+    is priced once in ``config_from_env`` off ``DEFAULT_FLIP_COST_S = 3.2``, a
+    PINNED-IMAGE-ERA constant that no longer describes this seam; on the
+    window-3 boot it produced N=7004 while the same process measured the seam
+    at 3.60287 / 3.66144 / 4.62869 s on its three ranks, pricing the same
+    break-even at 7886 / 8014 / 10131. The seed does not decay on a timer --
+    it is SUPERSEDED, on the estimator's own rule that a measurement beats a
+    belief outright on the first sample.
+
+    RANK SAFETY, since the three prices above differ and a per-rank bar would
+    be a #616g divergence: the policy is NOT evaluated independently per rank.
+    ``recv_requests`` runs the hook only on the request-origin rank and
+    BROADCASTS the arm (request_receiver.py:169-193; its comment records the
+    measured alternative -- "1/2/3 arms on PP0/PP1/PP2, a 12765-line
+    capture-census flood, and a self-kill"). One rank prices, one rank decides,
+    every rank obeys the same broadcast arm. No new collective is taken here,
+    and none is available: the one reduce that runs per iteration is a
+    one-element MIN over pool availability.
+
+    THE LIMITATION IS NAMED, NOT ASSUMED AWAY. The deciding rank prices off
+    ITS OWN leg, while ``phase_flip_boot`` states "the flip's cost is the
+    SLOWEST rank's copy". When the decider is the fast rank the bar is priced
+    low. This is strictly better than an unmeasured constant -- the error goes
+    from seed-vs-reality to fast-rank-vs-slowest-rank -- but it is an error,
+    and closing it needs a group MAX that no existing collective carries.
+
+    Returns the frozen ``cfg.flip_tokens`` unchanged for every reason the
+    repricing would be meaningless (no measurement yet, no config recorded, an
+    operator-pinned N, or a pricing the break-even formula refuses), so an
+    un-instrumented deployment is byte-identical to before.
+    """
+    repriced = repriced_flip_tokens()
+    if repriced is None:
+        return int(cfg.flip_tokens)
+    return int(repriced[1])
+
+
+def flip_cost_measured() -> bool:
+    """Whether the live bar rests on a measurement or still on the seed (#819).
+
+    PROVENANCE, IN THE DECISION LINE ITSELF. A repriced threshold that does not
+    say what repriced it is the counter-without-an-actuator shape from the
+    other end: a reader seeing N move has no way to tell a measured seam from
+    an edited constant. Cheap to print, and it is the first thing anyone
+    debugging a surprising bar will want.
+    """
+    return repriced_flip_tokens() is not None
+
+
+def live_flip_cost_s(cfg: "PhasePolicyConfig") -> float:
+    """The seam cost C the ladder is priced with, MEASURED where possible (#819).
+
+    Repricing N alone is not enough, and the reason is in
+    ``_differential_flip_threshold``: that solve derives the ladder from ``C``,
+    ``X`` and ``P`` DIRECTLY -- "`base` survives only as the floor it should
+    always have been" -- so a repriced N left the whole surcharge ladder still
+    priced off the boot seed. Measured on the window-3 numbers: N moved
+    7004 -> 10131 while the 4-decode ceiling stayed at 12608, i.e. the bar
+    moved and the band above it did not.
+
+    GATED ON THE SAME CONDITION AS ``live_flip_tokens``, deliberately. Either
+    the seam has been measured and BOTH the break-even and the ladder follow
+    it, or nothing is repriced and the path is byte-identical to before. A
+    build that repriced one and not the other is the state this function
+    exists to make unreachable.
+    """
+    if repriced_flip_tokens() is None:
+        return float(cfg.flip_cost_s)
+    est = _FLIP_COST_ESTIMATOR
+    return float(cfg.flip_cost_s) if est is None else float(est.value())
+
+
 def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     """Pending-prefill tokens required to justify `tp_to_pp` RIGHT NOW.
 
@@ -887,15 +1006,19 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     """
     if not cfg.prefill_runs_in_tp:
         return 0
-    base = int(cfg.flip_tokens)
-    if cfg.flip_cost_s <= 0 or running_bs <= 0:
+    # #819: the whole ladder is derived from N, so N is taken LIVE here. Were
+    # the base frozen while the surcharge scaled, the lower bar and the upper
+    # band would be priced off two different seams.
+    base = live_flip_tokens(cfg)
+    flip_cost_s = live_flip_cost_s(cfg)
+    if flip_cost_s <= 0 or running_bs <= 0:
         return base
     if cfg.decode_contention > 0.0:
         return _differential_flip_threshold(cfg, running_bs, base)
     if cfg.decode_strand_weight <= 0:
         return base
     stranded_s = cfg.decode_strand_weight * float(running_bs) * cfg.pp_window_s
-    return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
+    return int(round(base * (flip_cost_s + stranded_s) / flip_cost_s))
 
 
 #: How many chunk-cadences of silence make a stall a WEDGE rather than a slow
@@ -1207,7 +1330,10 @@ def _differential_flip_threshold(
         return base
     b = float(running_bs)
     sigma = float(cfg.decode_contention)
-    cost = cfg.flip_cost_s * (1.0 + 2.0 * b)
+    # #819: MEASURED where the seam has reported, seed otherwise. This is the
+    # term that made a repriced N inert -- the ladder is solved from C here,
+    # not from `base`.
+    cost = live_flip_cost_s(cfg) * (1.0 + 2.0 * b)
 
     # Solved from C, X and P DIRECTLY rather than by substituting
     # N0 = C / (1/X - 1/P) and cancelling. The substitution is only valid
@@ -2046,7 +2172,12 @@ def _decide_from_load(
         # "nothing pending means nothing to serve" rule would refuse a genuine
         # deadlock escape. The qualifier below is PERSISTENCE, not a work
         # count.
-        floor = int(cfg.flip_tokens or 0)
+        # #819: the MEASURED break-even, not the boot seed. The estimator's own
+        # docstring names this floor as collateral damage of the stale price --
+        # "#759's IDLE-LOCK floor -- itself `flip_tokens` -- 7x too
+        # permissive". Repricing the bar without repricing this floor would
+        # leave the two disagreeing about what a flip costs.
+        floor = int(live_flip_tokens(cfg) or 0)
         if pending < floor or (floor <= 0 and pending <= 0):
             # Below the MEASURED break-even, so this flip cannot repay itself
             # on the backlog it would carry. It is still a real escape route,
@@ -2143,10 +2274,17 @@ def _decide_from_load(
         # Under purity the break-even is meaningless (see
         # prefill_runs_in_tp): the only threshold that terminates is zero.
         tp_threshold = effective_flip_threshold(cfg, inp.running_bs)
+        # #819: ONE READING. Taken once here and used for both the comparison
+        # and every message below it, so the bar the policy APPLIED and the bar
+        # the log REPORTS can never be two different numbers -- which is what a
+        # repriced threshold printed against `cfg.flip_tokens` would have been.
+        n_live = live_flip_tokens(cfg)
+        seam_s = live_flip_cost_s(cfg)
+        priced = "measured" if flip_cost_measured() else "seed"
         if (
             cfg.prefill_runs_in_tp
             and inp.running_bs > 0
-            and cfg.flip_tokens < inp.pending_prefill_tokens <= tp_threshold
+            and n_live < inp.pending_prefill_tokens <= tp_threshold
         ):
             # Repays the seam, but not the seam PLUS the generations this
             # cutover would pause for a whole PP window. Named explicitly so
@@ -2158,15 +2296,17 @@ def _decide_from_load(
                 # the stall". Say which, or the log invites the wrong fix.
                 return _no(
                     f"pending prefill {inp.pending_prefill_tokens} tok > N="
-                    f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                    f"{n_live} but <= {tp_threshold} with "
                     f"{inp.running_bs} req decoding: too short for the round "
-                    f"trip to beat prefilling it in tp"
+                    f"trip to beat prefilling it in tp "
+                    f"(seam {seam_s:.2f}s {priced})"
                 )
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok > N="
-                f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                f"{n_live} but <= {tp_threshold} with "
                 f"{inp.running_bs} req decoding: flipping would strand them "
-                f"in pp for a {cfg.pp_window_s:g}s window"
+                f"in pp for a {cfg.pp_window_s:g}s window "
+                f"(seam {seam_s:.2f}s {priced})"
             )
         if cfg.drain_mode and inp.pending_prefill_tokens > cfg.pp_exit_tokens:
             # #677 HOT FIX 2: THE BUNDLE IS FINISHED BEFORE THE LAYOUT MOVES.
@@ -2343,7 +2483,7 @@ def _decide_from_load(
             return PhasePolicyDecision(
                 TP_TO_PP,
                 f"pending prefill {inp.pending_prefill_tokens} tok > "
-                f"{'N=' + str(cfg.flip_tokens) if cfg.prefill_runs_in_tp else '0 (purity: prefill cannot run in tp)'}",
+                f"{'N=' + str(n_live) + f' (seam {seam_s:.2f}s {priced})' if cfg.prefill_runs_in_tp else '0 (purity: prefill cannot run in tp)'}",
             )
         # Nothing to do, and the resting layout is PP -> return to rest.
         if idle and cfg.rest_phase == PHASE_PP:
@@ -2363,7 +2503,7 @@ def _decide_from_load(
             # the deadlock of 21:39:50Z had returned.
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok <= "
-                f"N={cfg.flip_tokens}, running it in tp"
+                f"N={n_live}, running it in tp (seam {seam_s:.2f}s {priced})"
             )
         return _no("decoding in tp")
 
@@ -2466,7 +2606,13 @@ def _decide_from_load(
             and in_pp >= cfg.pp_window_s
         ):
             rung = effective_flip_threshold(cfg, inp.running_bs)
-            would_drain = inp.pending_prefill_tokens <= cfg.flip_tokens
+            # #819: the drain target is the same bar as everywhere else, so it
+            # is read the same way. Left frozen, this line would report a
+            # drain-based counterfactual against a target the policy itself no
+            # longer uses.
+            n_live = live_flip_tokens(cfg)
+            seam_s = live_flip_cost_s(cfg)
+            would_drain = inp.pending_prefill_tokens <= n_live
             drain_s = (
                 inp.pending_prefill_tokens / cfg.pp_prefill_tok_s
                 if cfg.pp_prefill_tok_s > 0
@@ -2493,9 +2639,9 @@ def _decide_from_load(
                 f"next pp window) -- HAND-SET STOPWATCH; drain-based policy "
                 f"would {'also leave' if would_drain else 'STAY'} "
                 f"(pending {inp.pending_prefill_tokens} vs drain target "
-                f"{cfg.flip_tokens}, active rung {rung}, ~{drain_s:.1f}s more "
+                f"{n_live}, active rung {rung}, ~{drain_s:.1f}s more "
                 f"in pp to drain at {cfg.pp_prefill_tok_s:g} tok/s vs "
-                f"{2 * cfg.flip_cost_s:.1f}s of seam to leave and return); "
+                f"{2 * seam_s:.1f}s of seam to leave and return); "
                 f"declare {ENV_DECODE_STALL_SLO} to solve this instead",
             )
         if idle and cfg.rest_phase == PHASE_TP:
