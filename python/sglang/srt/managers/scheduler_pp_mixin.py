@@ -699,6 +699,50 @@ def pp_flip_epoch_of(holder) -> Optional[int]:
     return fn() if fn is not None else None
 
 
+def pp_flip_forget_ring_scoped_slots(holder) -> None:
+    """Drop every slot number recorded against a ring that no longer exists.
+
+    #829. A microbatch slot index is an index into a ring of
+    ``pp_loop_size`` slots that a cutover REBUILDS FROM ZERO. It is
+    therefore meaningful only together with the ring it indexes -- the
+    same argument ``_pp_proxy_stamp`` makes for proxies (#795), applied to
+    the only other places a slot number outlives the iteration that
+    produced it:
+
+      ``_pp_flip_arm_mb_id``   the slot an armed window began on
+      ``_pp_flip_arm_epoch``   the ring generation that slot belongs to
+      ``_pp_flip_resume_slot`` a slot the pass loop has been asked to
+                               jump to but has not consumed yet
+
+    ``pp_loop_size`` is re-derived on every rebuild and CHANGES across a
+    cutover (the TP phase gets ``pp_size=1``, and a gapped wire pins the
+    ring to a single slot), so a carried index can be not merely wrong but
+    out of range.
+
+    WHAT THIS COST WHEN IT WAS MISSING, boot_window2_0823_1554 @
+    f9d7637f04: a committed cutover carried ``_pp_flip_arm_mb_id = 2``
+    across the rebuild, #824 W4b's restore applied it to the fresh ring,
+    and PP0 re-entered epoch 6 on slot 2 while its downstream was on slot
+    0. One second later PP1 raised ``#631 PROXY LEFTOVER REFUSED`` on a
+    proxy stamped ``mb_id=2`` in that same epoch, and the group died.
+
+    ``_pp_flip_armed_passes`` IS DELIBERATELY NOT CLEARED HERE, and that
+    omission is the point rather than an oversight. It is what makes the
+    next tick take the falling edge, and the falling edge is the only
+    place every disarm passes through -- #757's
+    ``pp_flip_drain_leftover_dicts`` lives there. Clearing it would take
+    that drain off the commit path silently. #829 removes the SLOT
+    decision from that path and nothing else.
+
+    Written with plain assignment rather than ``delattr`` so a holder that
+    never had the attributes gains them as None, which is what every
+    reader in this file already treats as "nothing recorded".
+    """
+    holder._pp_flip_arm_mb_id = None
+    holder._pp_flip_arm_epoch = None
+    holder._pp_flip_resume_slot = None
+
+
 def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
     """Does ``stamp`` name the pass ``(epoch, mb_id)`` this rank is running?
 
@@ -2560,6 +2604,16 @@ class SchedulerPPMixin:
             if passes is None:
                 self._pp_flip_armed_passes = 0
                 self._pp_flip_arm_mb_id = mb_id
+                # #829: WHICH RING THAT SLOT NUMBER BELONGS TO, recorded at
+                # the same instant as the slot itself. A slot index is an
+                # index into a ring of `pp_loop_size` slots that a cutover
+                # rebuilds from zero, so on its own it is not a name -- the
+                # same argument `_pp_proxy_stamp` makes for proxies (#795),
+                # applied to the one other place a slot number outlives the
+                # iteration that produced it. Read through
+                # `pp_flip_epoch_of` so a holder with no accessor keeps its
+                # pre-#795 behaviour.
+                self._pp_flip_arm_epoch = pp_flip_epoch_of(self)
             else:
                 self._pp_flip_armed_passes = passes + 1
             if counters is not None:
@@ -2609,7 +2663,90 @@ class SchedulerPPMixin:
         # (get_next_batch_to_run returns None while a flip is pending) and
         # made no drain progress, so the slot it is sent back to is the one
         # it was parked on. Longer windows keep going through the hold.
-        if passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id):
+        #
+        # #829: BUT ONLY IF THE RING IT NAMES STILL EXISTS. W4b's argument
+        # holds for an ABANDON, which returns to the same loop with the
+        # same ring -- and the falling edge does not distinguish an abandon
+        # from a COMMIT, which does not. A commit raises PhaseFlipLoopExit
+        # from `_phase_flip_on_round` (the round hook at the bottom of
+        # `_event_loop_pp_body`) while `_pp_flip_armed_passes` is still 0;
+        # the loop unwinds, the cutover swaps the topology,
+        # `init_pp_loop_state` builds a NEW ring, the body restarts at
+        # `mb_id = 0`, and the first tick of that new ring takes THIS
+        # branch with an `arm_mb` recorded against the ring that was just
+        # retired. Nothing cleared it: `_pp_flip_arm_mb_id` was written on
+        # the rising edge and read here, and the rebuild does not touch it.
+        #
+        # This tree already states the law (see the note above this method,
+        # "WHY A COMMIT IS SAFE AND AN ABANDON IS NOT"), and the #631
+        # guard's own message names the hazard: "a pass from before a
+        # cutover that rebuilt this rank's whole slot ring, whose slot
+        # number therefore names nothing here however well it matches".
+        #
+        # MEASURED, boot_window2_0823_1554 @ f9d7637f04. One second after
+        # the sixth cutover COMPLETED, PP0 logged this very restore --
+        #   "ran 0 slot iteration(s) (armed at mb_id=2, disarmed at
+        #    mb_id=0) [...] group RESUME SLOTS [2, 1, 1] -- DIVERGED"
+        # -- where mb_id=0 is not one slot later but the first slot of the
+        # new ring. PP1 then refused a proxy stamped mb_id=2 while sitting
+        # on mb_id=0 OF THE SAME EPOCH (#631 PROXY LEFTOVER REFUSED) and
+        # the group died. The epoch-4 cutover took the identical path 21 s
+        # earlier and survived only because all three ranks happened to
+        # carry the same retired slot ([1, 1, 1] -- AGREED). Agreement
+        # there was luck; this term is the guarantee.
+        #
+        # Refused POSITIVELY and by name rather than by omission, because
+        # the absence of a log line is what made the epoch-4 crossing look
+        # healthy. The rank simply stays where the rebuilt ring started it,
+        # which is the ring's own defined entry slot rather than a number
+        # inherited from a ring that no longer exists.
+        #
+        # WHAT IS NOT CLAIMED HERE, because #737 makes the loose version
+        # false: this is NOT "all ranks must sit on the same mb_id". PP
+        # stages legitimately run at different microbatch offsets, and the
+        # ring arithmetic says so itself -- `next_first_rank_mb_id` and
+        # `next_mb_id` are deliberately different slots. The claim is
+        # narrower and does not depend on any offset: a slot index recorded
+        # against ring generation N must not be applied to generation N+1,
+        # where it indexes a different array that a different cutover built
+        # and whose `pp_loop_size` may not even contain it.
+        now_epoch = pp_flip_epoch_of(self)
+        arm_epoch = getattr(self, "_pp_flip_arm_epoch", None)
+        ring_rebuilt = (
+            arm_epoch is not None
+            and now_epoch is not None
+            and int(arm_epoch) != int(now_epoch)
+        )
+        # Consumed once, like the slot it qualifies: a stale epoch must not
+        # be able to answer for a later window.
+        self._pp_flip_arm_epoch = None
+        would_restore = (
+            passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id)
+        )
+        # Reported only when a jump was actually averted. A commit whose
+        # retired arm slot happens to equal the new ring's first slot
+        # changes nothing and should say nothing -- which is every commit
+        # at pp_loop_size 1, where the TP phase and the gapped wire both
+        # put the ring, and where the only slot there has ever been is 0.
+        if would_restore and ring_rebuilt:
+            logger.warning(
+                "%s SLOT RESTORE REFUSED: the armed window ran 0 slot "
+                "iterations and ended in a COMMIT, not an abandon -- it "
+                "armed at mb_id=%s in flip epoch %s and this tick is the "
+                "first of the ring epoch %s rebuilt. That slot number "
+                "names nothing in this ring, so it is not restored; this "
+                "rank stays on mb_id=%d, the slot the rebuilt ring itself "
+                "started it on. Restoring it is what put PP0 "
+                "on slot 2 of a fresh ring on boot_window2_0823_1554 and "
+                "killed the group one second later (#829, #824 W4b, "
+                "#631 defect Q).",
+                "PHASE-FLIP",
+                arm_mb,
+                arm_epoch,
+                now_epoch,
+                mb_id,
+            )
+        elif would_restore:
             self._pp_flip_resume_slot = int(arm_mb)
             logger.warning(
                 "%s SLOT RESTORE: the armed window ran 0 slot iterations and "
@@ -3733,6 +3870,12 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
         )
+        # #829: the ring is being rebuilt, so every slot number recorded
+        # against the old one dies here. See the function's docstring for
+        # the argument and for why `_pp_flip_armed_passes` is deliberately
+        # left alone.
+        pp_flip_forget_ring_scoped_slots(self)
+
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
