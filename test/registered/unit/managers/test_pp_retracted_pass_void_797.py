@@ -642,6 +642,13 @@ class PPVoidForwardRule797(unittest.TestCase):
 
     Pure: the rule is a property of the decision the void already carries, so
     it needs no processes.
+
+    #801 NARROWED WHAT "STOPS" MEANS HERE. The stop above is unchanged and is
+    still #796's law. What changed is the case this class could not name: a
+    void whose carried decision names NO retracting rank, or that carries no
+    decision at all. #797 stopped on those too, and stopping on them is the
+    intermediate-hop wedge -- see `test_a_void_with_no_decision_on_it_is_
+    relayed_not_swallowed` below and `pp_void_relay_stop_rank`.
     """
 
     def _holder(self, pp_rank, is_last):
@@ -660,15 +667,17 @@ class PPVoidForwardRule797(unittest.TestCase):
         )
 
         entries = tuple(
-            replace(
-                e,
-                admitted=False,
-                retracted=True,
-                retracted_by_rank=retracted_by,
-                observed_local=0,
+            (
+                replace(
+                    e,
+                    admitted=False,
+                    retracted=True,
+                    retracted_by_rank=retracted_by,
+                    observed_local=0,
+                )
+                if e.rid == RID_UNHONOURABLE
+                else replace(e, admitted=False)
             )
-            if e.rid == RID_UNHONOURABLE
-            else replace(e, admitted=False)
             for e in _pp0_decision().entries
         )
         payload = {_PP_VOID_OUTPUT_KEY: True}
@@ -718,20 +727,43 @@ class PPVoidForwardRule797(unittest.TestCase):
         # Verbatim, decision included, so the next hop applies the same rule.
         self.assertIsNone(pp_void_forward_payload(self._holder(1, False), fwd))
 
-    def test_the_last_rank_never_forwards_and_an_ordinary_output_never_does(self):
+    def test_the_last_rank_never_forwards(self):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_void_forward_payload
+
+        self.assertIsNone(
+            pp_void_forward_payload(self._holder(WORLD - 1, True), self._void(2))
+        )
+
+    def test_a_void_with_no_decision_on_it_is_relayed_not_swallowed(self):
+        """#801 CORRECTION, and the mislabel is the whole story.
+
+        This assertion used to read `assertIsNone` and to justify itself with
+        "a message with no decision on it -- an ordinary output -- is not a
+        void". The payload it passes is `{_PP_VOID_OUTPUT_KEY: True}`, which
+        is not an ordinary output and cannot be one: `_pp_absorb_void_output`
+        reaches `pp_void_forward_payload` only AFTER popping that key, so
+        this function is never called for an ordinary output at all. What the
+        old assertion actually pinned was the pre-#801 DEFAULT -- a void whose
+        stop position cannot be derived is swallowed -- and swallowing it
+        parks every rank between here and the void's source in an
+        unconditional output receive (specimen wedge_802f_1712).
+
+        See `pp_void_relay_stop_rank` and
+        test_pp_void_send_contract_801.py for the contract that replaces it.
+        """
         from sglang.srt.managers.scheduler_pp_mixin import (
             _PP_VOID_OUTPUT_KEY,
             pp_void_forward_payload,
         )
 
-        self.assertIsNone(
-            pp_void_forward_payload(self._holder(WORLD - 1, True), self._void(2))
+        fwd = pp_void_forward_payload(
+            self._holder(0, False), {_PP_VOID_OUTPUT_KEY: True}
         )
-        # A message with no decision on it -- an ordinary output -- is not a
-        # void and must never be forwarded as one.
-        self.assertIsNone(
-            pp_void_forward_payload(self._holder(0, False), {_PP_VOID_OUTPUT_KEY: True})
-        )
+        self.assertIsNotNone(fwd)
+        self.assertTrue(fwd[_PP_VOID_OUTPUT_KEY])
+        # Still one hop short of the source, which is the rank that has no
+        # slot for this generation and issues no receive.
+        self.assertIsNone(pp_void_forward_payload(self._holder(WORLD - 2, False), fwd))
 
 
 CHUNK_SIZE = 512
