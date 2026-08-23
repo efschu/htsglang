@@ -13,6 +13,30 @@ backing handed ``masked_set_kv_buffer_kernel`` a ``loc`` its buffer could not
 address and the device assert at memory_pool.py:4978 killed the rank. Four
 boots died this way on 2026-08-22/23; a CUDA coredump named the kernel.
 
+THE FIX PROVEN ON METAL, 2026-08-23, two independent boots under load. The
+clamp fired 12 times as COMMIT events, every one of them at the ``after
+recovery`` site -- the site of the root defect -- and every one at full crash
+magnitude::
+
+    boot 0516  PP2 exposed 449306  committed 126976  withdrew 322330
+               PP1 exposed 449306  committed 120832  withdrew 328474
+               PP0 exposed 449306  committed 204800  withdrew 244506
+    boot 0608  PP2 exposed 466994  committed 133120  withdrew 333874
+               PP1 exposed 466994  committed 124928  withdrew 342066
+               PP0 exposed 466994  committed 212992  withdrew 254002
+
+Against the crash above (417850 exposed over 105413 committed) that is the same
+condition at the same scale. Zero device asserts followed, on either boot, and
+both instances stayed alive; boot 0608 served for 40+ minutes through 12 clamp
+events, roughly 6x the 6:19/6:41 corridor in which the unfixed tree died.
+
+COUNTING WARNING for anyone auditing these logs: ``grep -c "device-side
+assert"`` returns a NON-ZERO count on a HEALTHY boot, because the clamp's own
+warning quotes the crash it prevents. Match ``Assertion .* failed`` or
+``index >= [0-9]+ \\(out of range\\)`` instead, or exclude the clamp lines.
+Grepping the fix's success message and reading it as failure is the exact trap
+this note exists to prevent.
+
 THE INVARIANT, and it is the MIRROR of one this module already enforces::
 
     highest live row  <=  committed backing  >=  exposed id space

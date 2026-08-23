@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     floor_to_interval,
     is_on_interval,
     is_resume_candidate,
+    retention_shrinks_protected,
 )
 from sglang.srt.runtime_context import get_server_args
 
@@ -108,6 +109,10 @@ class MambaComponent(TreeComponent):
         # which leaves the tree anchor-free -- a state that is otherwise
         # indistinguishable from idle traffic in the logs.
         self._off_grid_retention_declines = 0
+        #: #824 declines, counted separately from the off-grid ones above: a
+        #: structurally non-monotone tracked position must announce itself
+        #: rather than look like ordinary grid misses.
+        self._protected_retention_declines = 0
 
     def _raw_token_pos(self, key_units: int) -> int:
         """Absolute RAW-token position of a node measured in KEY units.
@@ -757,6 +762,37 @@ class MambaComponent(TreeComponent):
                     )
                 insert_params.mamba_value = None
                 return _decline_retention(is_finished)
+
+        # #824: BOTH branches above converge here, and either can hand back a
+        # position BELOW what this request has already published as
+        # `cache_protected_len` -- the tracked position is not monotone
+        # (`mamba_branching_seqlen`, schedule_batch.py:2660, can sit under an
+        # earlier track). Capping the shared `effective_cache_len` there would
+        # retain FEWER indices than the tree already owns, and
+        # `cache_unfinished_req`'s assert catches it by killing the rank:
+        # measured 2026-08-23 06:07:06, protected 16384 against 8192 retained.
+        #
+        # Declining, not flooring, for the reason stated two branches up: the
+        # donated state sits at the tracked position, so correcting the LENGTH
+        # would pair state and key at different positions. `_decline_retention`
+        # gives the per-caller answer (#783) -- 0 for an unfinished step, None
+        # for a finished one -- which is why the decision is routed through it
+        # rather than returned from here.
+        if retention_shrinks_protected(cache_len, req.cache_protected_len):
+            self._protected_retention_declines += 1
+            count = self._protected_retention_declines
+            if count <= 3 or count % 1000 == 0:
+                logger.warning(
+                    "mamba retention would truncate a protected prefix: "
+                    "tracked position %s under cache_protected_len %d, "
+                    "caching without a mamba anchor, occurrence=%d, rid=%s",
+                    cache_len,
+                    int(req.cache_protected_len or 0),
+                    count,
+                    getattr(req, "rid", None),
+                )
+            insert_params.mamba_value = None
+            return _decline_retention(is_finished)
 
         if is_finished:
             if cache_len is None:
