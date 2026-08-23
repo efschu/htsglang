@@ -63,6 +63,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
+from sglang.srt.managers import tree_congruence
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -2755,6 +2756,18 @@ class PhaseFlipRuntime:
         #: #631 J: read-only handle for the pool census. Set by the
         #: builder; absent in unit stubs, where the census is a no-op.
         self._census_scheduler = None
+        # #825 tree-congruence state. Counters are attributes rather than a
+        # latch: #823's whole lesson is that a divergence reported once can
+        # say THAT the trees parted and never for how long, whether it got
+        # worse, or whether it healed. Onsets and recoveries are the two
+        # edges; `rounds` is the duration.
+        self._tree_congruence = None
+        self._tree_divergence_open = False
+        self.tree_divergence_onsets = 0
+        self.tree_divergence_rounds = 0
+        self.tree_congruence_recoveries = 0
+        self.tree_reconciles = 0
+        self._tree_reconcile_suppressed_logged = False
         #: #760: True from the seam's no-return point until the cutover has
         #: installed the new phase. Read by the HiCache phase guard through
         #: the authority registration below: while True, device-tier HiCache
@@ -3529,8 +3542,37 @@ class PhaseFlipRuntime:
         if not require_armed_and_parked and self._round % self._interval != 0:
             return None
         dir_id = _DIR_ID[self._pending] if self._pending is not None else 0
+        # #825: THE PREFIX-TREE DIGEST RIDES THIS REDUCE.
+        #
+        # NOT a new collective. `_update_uniform_pool_budget` names this as
+        # the right close for its own gaps ("ONE MORE INT ON A REDUCE THAT
+        # ALREADY RUNS, which is what the gap note itself named as the right
+        # close"), and here it matters more than economy: a second collective
+        # at the seam would need its own proof of group-atomicity, its own
+        # timeout behaviour and its own place in the group FIFO -- the three
+        # things that killed the census all_gather_object (step 4c, "mispairs
+        # with the request broadcasts on the same group FIFO") and the
+        # HiCache ack-count reduction (scheduler.py:7121, 2026-08-17). As a
+        # field of THIS payload it inherits all three from a reduction that
+        # is already proven, and it is reached only after the early returns
+        # above -- never on the ~8 kHz free-running loop body.
+        #
+        # Computed here, one line above the reduce it rides, so a future
+        # reader cannot mistake it for an independent synchronisation point.
+        local_tree_digest = tree_congruence.tree_digest_of(
+            getattr(getattr(self, "_census_scheduler", None), "tree_cache", None)
+        )
         payload = _encode(
-            [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
+            [
+                armed,
+                ready,
+                expired,
+                self._epoch,
+                dir_id,
+                self._fp,
+                *self._vec,
+                local_tree_digest,
+            ]
         )
         self.desync_checks += 1
         # #631(c) WITHDRAWN -- measured fatal, kept as a warning.
@@ -3569,6 +3611,10 @@ class PhaseFlipRuntime:
             "direction",
             "config_fp",
         ] + [f"vector[{i}]" for i in range(self._n)]
+        # #825: appended LAST, matching the payload order above. The vector is
+        # variable-length, so anything added must go after it or every index
+        # below shifts.
+        fields = fields + ["tree_digest"]
         lo = {f: reduced[2 * i] for i, f in enumerate(fields)}
         hi = {f: -reduced[2 * i + 1] for i, f in enumerate(fields)}
 
@@ -3589,6 +3635,54 @@ class PhaseFlipRuntime:
                 f"disagrees across ranks must fail loudly HERE, before any "
                 f"rank moves a byte under the wrong layout."
             )
+        # #825: THE TREE DIGEST IS DELIBERATELY NOT IN `eq_checked`.
+        #
+        # That family RAISES ("must fail loudly HERE, before any rank moves a
+        # byte under the wrong layout"), which is right for epoch, config
+        # fingerprint and vector: those disagreeing is a bug in the flip
+        # itself. A tree digest disagreeing is NOT a bug in the flip -- it is
+        # the expected, measured consequence of the PP phase running with the
+        # uniformity floors switched off (scheduler.py:4770), and it is what
+        # this field exists to observe. Putting it in `eq_checked` would take
+        # the instance down at the first cutover of every boot.
+        #
+        # So it gets a verdict instead of an exception: group-decided (both
+        # ranks read the same lo/hi, so both take the same branch), counted,
+        # and carried to the cutover, which is the only place that can act on
+        # it. Losing prefix cache is a capacity cost; entering the TP phase
+        # with divergent trees is a correctness one -- the same trade #824
+        # makes in this family.
+        self._tree_congruence = tree_congruence.congruence_verdict(
+            local_digest=local_tree_digest,
+            group_min=lo["tree_digest"],
+            group_neg_min=-hi["tree_digest"],
+        )
+        if not self._tree_congruence.congruent:
+            self.tree_divergence_rounds += 1
+            if not self._tree_divergence_open:
+                self._tree_divergence_open = True
+                self.tree_divergence_onsets += 1
+                logger.warning(
+                    "%s #825 TREE DIVERGENCE ONSET at round %d: %s",
+                    LOG_PREFIX,
+                    self._round,
+                    self._tree_congruence.reason,
+                )
+        elif self._tree_divergence_open:
+            # Recovery edge. #823's lesson, applied at build time rather than
+            # after the fact: a divergence that is only ever reported at onset
+            # can say THAT the trees parted and never that they healed.
+            self._tree_divergence_open = False
+            self.tree_congruence_recoveries += 1
+            logger.warning(
+                "%s #825 TREE DIVERGENCE RECOVERED at round %d after %d "
+                "divergent rounds (onsets=%d)",
+                LOG_PREFIX,
+                self._round,
+                self.tree_divergence_rounds,
+                self.tree_divergence_onsets,
+            )
+
         # Park deadline, decided on the MAX: one rank out of time is enough
         # to abandon the flip, and every rank in this reduction reads the
         # same max, so the abandonment is unanimous by construction.
@@ -3616,6 +3710,114 @@ class PhaseFlipRuntime:
             # device tier for the life of the process, the #742 inert-state
             # class. On the ordinary path the cutover already cleared it.
             self.hicache_seam_active = False
+
+    def _reconcile_trees_if_diverged(self, direction: str) -> None:
+        """#825: repair the prefix trees before the TP phase demands identity.
+
+        DECIDED FROM THE GROUP VERDICT, NEVER LOCALLY. `self._tree_congruence`
+        was computed from `lo`/`hi` of the consensus reduction, which is the
+        literal output of a collective, so every rank reads the same verdict
+        and takes the same branch. A reconcile that some ranks skipped would
+        be a new divergence, i.e. the defect this repairs.
+
+        ONLY ON pp_to_tp, and that asymmetry is the point. The TP-decode phase
+        requires rank-identical trees: admission is rank-local
+        (`scheduler.py:7073`), `#cached-token` is literally
+        `len(req.prefix_indices)` per rank, and the per-layer TP collectives
+        are entered with whatever token count that produced -- the measured
+        0516 divergence (`#cached-token 0 vs 16384`). The PP-prefill phase
+        does NOT require it (#791: "Each PP rank is an independent scheduler
+        that re-derives its own admission verdict from its own local
+        radix-cache state"), so reconciling into PP would pay the capacity
+        cost for nothing.
+
+        THE ACTION IS A RESET, and it is chosen for being uniform BY
+        CONSTRUCTION rather than for being clever. Intersecting the trees
+        would keep more cache, but it needs the ranks to exchange key sets --
+        a second, much larger collective at the seam, i.e. exactly the thing
+        this design avoids. An empty tree is a state all ranks reach without
+        talking. Correctness over capacity is the trade `#824` already makes
+        in this family, and the cost is counted (`tree_reconciles`) so it can
+        be argued with evidence rather than assumed small.
+
+        NEVER RAISES. This sits between the pre-cutover movers and the
+        cutover, with requests parked; a raise here takes the instance down
+        for a cache-capacity repair. The same reasoning `_quiesce_hicache`
+        below documents.
+        """
+        verdict = self._tree_congruence
+        if verdict is None or verdict.must_reconcile is False:
+            return
+        if direction != PP_TO_TP:
+            return
+        # #825 FALSIFIED ON METAL, 2026-08-23 08:55:45, boot_826_review_0912.
+        #
+        # The reset is OFF by default because it took the instance down on its
+        # first real cutover, on all three ranks at once:
+        #
+        #   cache_finished_req -> dec_lock_ref
+        #   -> full_component.py:239  `if cur.id in skip_lock_node_ids`
+        #   AttributeError: 'NoneType' object has no attribute 'id'
+        #
+        # My premise was "requests are parked between the movers and the
+        # cutover, so dropping the tree is safe". PARKED IS NOT UNREFERENCED.
+        # The cutover carries RESIDENT requests across, and each holds a
+        # `last_node` with a lock ref. `reset()` rebuilds the root, orphaning
+        # those nodes, so the parent walk in `dec_lock_ref` no longer
+        # terminates at the live root and runs off the top into None.
+        #
+        # The DETECTION half of #825 is unaffected and stays on: the digest
+        # rides the consensus reduce, the verdict is group-decided, and the
+        # onset/recovery counters are what proved the divergence is real (3
+        # onsets inside 35 s of load on this very boot). What is withdrawn is
+        # the ACTION, because a reconcile that must not run while any node is
+        # locked needs to be built against the lock refs -- evicting only the
+        # unlocked portion, or reconciling at a point with no resident reqs --
+        # and that is a design, not a flag flip.
+        if os.environ.get("SGLANG_TREE_RECONCILE", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            if not self._tree_reconcile_suppressed_logged:
+                self._tree_reconcile_suppressed_logged = True
+                logger.warning(
+                    "%s #825 tree divergence detected but the reconcile is "
+                    "OFF (SGLANG_TREE_RECONCILE unset): resetting the tree "
+                    "under resident lock refs crashed dec_lock_ref on "
+                    "2026-08-23. Detection only. %s",
+                    LOG_PREFIX,
+                    verdict.reason,
+                )
+            return
+        scheduler = getattr(self, "_census_scheduler", None)
+        tree = getattr(scheduler, "tree_cache", None)
+        reset = getattr(tree, "reset", None)
+        if reset is None:
+            logger.warning(
+                "%s #825 tree reconcile requested but this scheduler exposes "
+                "no resettable tree_cache; the TP phase is entering with "
+                "divergent prefix trees. %s",
+                LOG_PREFIX,
+                verdict.reason,
+            )
+            return
+        try:
+            reset()
+        except Exception as e:  # noqa: BLE001 - the seam must not die here
+            logger.error("%s #825 tree reconcile failed: %s", LOG_PREFIX, e)
+            return
+        self.tree_reconciles += 1
+        logger.warning(
+            "%s #825 TREE RECONCILE at cutover %s: prefix cache dropped on "
+            "every rank so the TP phase starts from a rank-identical tree "
+            "(reconcile #%d). %s",
+            LOG_PREFIX,
+            direction,
+            self.tree_reconciles,
+            verdict.reason,
+        )
 
     def _quiesce_hicache(self, direction: str) -> None:
         """#760: drain the cache controller's device-tier streams at the seam.
@@ -8140,6 +8342,7 @@ class PhaseFlipRuntime:
             seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
         movers_ms = (self._clock() - t_movers0) * 1000.0
         t_cutover0 = self._clock()
+        self._reconcile_trees_if_diverged(direction)
         self._cutover_fn(direction)
         # #822: THE commit instant, so THE retirement instant. Placed here and
         # not beside `self._epoch += 1` below on purpose: the post-cutover

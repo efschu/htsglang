@@ -4310,6 +4310,24 @@ taxonomy and the global importance ladder.
   GATE `_ctl_defer` — false restores the pre-#517 blocking read verbatim
   (`:4690`), which is the falsifier for the optimization.
   Reuse the PATTERN, not the module, for any other device status word.
+- **tree congruence (#825)** — prove the ranks' prefix trees are congruent at
+  the ONE point where the flip needs them to be replicas, using a MIN-reduce
+  as an equality test: a digest is sent as the pair `(d, -d)`, and the group
+  agrees iff `group_min == -group_neg_min`. That trick is the reusable part —
+  it turns "are all ranks equal?" into two MIN-reduces over any collective
+  that only offers min, with no all-gather and no per-rank table.
+  ENTRY `managers/tree_congruence.py:159` (`congruence_verdict`), `:184`
+  (`tree_digest_of`), `:81` (`node_fingerprint`), `:105` (`fold_digest`),
+  `:119` (`digest_pair`), `:131` (`reduce_pair_result`), `:143`
+  (`agreement`), verdict type `:153` (`CongruenceVerdict`).
+  GATE: the DETECTION is ungated and always runs. The RECOVERY is gated —
+  `SGLANG_TREE_RECONCILE` at `managers/phase_flip_runtime.py:3777`, unset
+  meaning OFF, because the reset it performs is what crashed on resident lock
+  references (#827) and it was withdrawn rather than repaired in place.
+  CONSUMERS `managers/phase_flip_runtime.py:3562` (`tree_digest_of`), `:3655`
+  (`congruence_verdict`), `:3748` (the verdict read). The verdict is decided
+  FROM THE GROUP, never locally — a rank that decided on its own digest would
+  be the divergence it is trying to detect.
 
 ### 18.6 Observability and triage
 

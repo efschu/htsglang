@@ -53,9 +53,8 @@ class FullComponent(TreeComponent):
         # `depth` (#747) is unused: full KV validity does not depend on the
         # node's absolute position.
         if match_device_only:
-            return (
-                lambda node, depth: node.component_data[self.component_type].value
-                is not None
+            return lambda node, depth: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -203,9 +202,9 @@ class FullComponent(TreeComponent):
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            assert cd.value is not None, (
+                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.cache.component_evictable_size_[ct] -= key_len
@@ -235,7 +234,31 @@ class FullComponent(TreeComponent):
         root = self.cache.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
+        hops = 0
         while cur != root:
+            # #827: THE WALK'S ONLY EXIT IS REACHING ROOT.
+            #
+            # A node whose ancestor chain is broken -- detached, evicted, or
+            # left behind by a rebuilt root -- walks PAST the top, `cur`
+            # becomes None, and the next line dereferences it. Measured
+            # 2026-08-23 08:55:45 on all three ranks:
+            #   AttributeError: 'NoneType' object has no attribute 'id'
+            # which names the wrong thing: the fault is a broken parent chain
+            # several frames earlier, not this attribute.
+            #
+            # NAMED, NOT SWALLOWED. A `break` here would leave
+            # `component_protected_size_` overcounted for the life of the
+            # process -- a loud fault traded for a slow leak. This raises with
+            # the node, the component and the distance walked, so the next
+            # occurrence is diagnosable from the message alone.
+            if cur is None:
+                raise RuntimeError(
+                    f"release_component_lock: parent chain broke after {hops} "
+                    f"hops from node {node.id} (component {ct.name}) without "
+                    f"reaching root {getattr(root, 'id', None)}. An ancestor "
+                    f"was detached or evicted while this lock was held."
+                )
+            hops += 1
             if cur.id in skip_lock_node_ids:
                 cur = cur.parent
                 continue
