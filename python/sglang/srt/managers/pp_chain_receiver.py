@@ -59,17 +59,68 @@ mid-flip, which is exactly what the flip's quiescence requirement wants.
 from __future__ import annotations
 
 import logging
+import os
 import pickle
+import time
 from collections import deque
-from typing import Any, Deque, List, Optional
+from typing import Any, Callable, Deque, List, Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.mem_cache.hicache_collective import ParkedWait
+
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PP-CHAIN-RECV"
+
+#: #824 W4: hard abort deadline for a single blocking chain receive, in
+#: seconds. DEFAULT 0 = never abort, which is the pre-#824 behaviour and
+#: is deliberate: an idle PP rank legitimately waits on this channel for
+#: as long as no request arrives, so a wall-clock abort that is on by
+#: default would fire on a perfectly healthy idle server. Set it only where
+#: something else establishes that a stall here is a WEDGE and not an idle
+#: wait -- or, better, inject ``abort_check`` and decide from real state.
+STALL_ENV = "SGLANG_PP_CHAIN_RECV_STALL_S"
+
+#: How often a blocking receive surfaces to stamp the blocked-recv marker
+#: and consult ``abort_check``. This is a YIELD interval, not a bound: the
+#: underlying wait is never interrupted (see ParkedWait), so a short value
+#: costs one Event wakeup and buys watchdog resolution.
+YIELD_INTERVAL_S = 1.0
+
+
+class PpChainRecvStalled(RuntimeError):
+    """#824 W4: a blocking chain receive gave up by a NAMED branch.
+
+    Raised INSTEAD of parking for ever when the upstream cannot feed this
+    channel -- the boot_827 wedge, where PP0 sat in an admission send on
+    the typed-dict channel while PP1 and PP2 sat in this receive on the
+    request-relay channel and the ring went silent for 31 s.
+
+    THE STREAM IS STILL FRAMED when this is raised. The posted receive was
+    never cancelled and the parked wait is still running, so calling
+    ``recv()`` again resumes the SAME receive and a late message still
+    arrives intact. Handle this by servicing whatever the peer is actually
+    waiting on, then come back -- do NOT rebuild the receiver, and do not
+    post another receive on this stream.
+    """
+
+
+def _default_stall_timeout_s() -> float:
+    raw = os.environ.get(STALL_ENV, "0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s ignoring unparsable %s=%r; blocking receives stay unbounded",
+            LOG_PREFIX,
+            STALL_ENV,
+            raw,
+        )
+        return 0.0
+
 
 #: State machine positions. IDLE means no message is half-received and the
 #: stream may be abandoned safely; the other two mean it may NOT be.
@@ -88,10 +139,41 @@ class PpChainReceiver:
     the phase flip enabled.
     """
 
-    def __init__(self, group, src: int, dst: int, on_consumed=None):
+    def __init__(
+        self,
+        group,
+        src: int,
+        dst: int,
+        on_consumed=None,
+        stall_timeout_s: Optional[float] = None,
+        abort_check: Optional[Callable[[str, float], Optional[str]]] = None,
+        on_blocked: Optional[Callable[[Optional[str], Optional[float]], None]] = None,
+    ):
         self._group = group
         self._src = int(src)
         self._dst = int(dst)
+        #: #824 W4. See STALL_ENV: 0 keeps the pre-#824 unbounded block.
+        self._stall_timeout_s = (
+            _default_stall_timeout_s()
+            if stall_timeout_s is None
+            else float(stall_timeout_s)
+        )
+        #: #824 W4: called as ``abort_check(arm, waited_s)`` every yield
+        #: while a blocking receive is stalled. Return a reason string to
+        #: abort by the named branch, or None to keep waiting. This is the
+        #: seam for deciding from REAL state (is a peer owed a message on
+        #: another channel?) rather than from a wall clock.
+        self._abort_check = abort_check
+        #: #824 W5: called as ``on_blocked(arm, since_monotonic)`` when a
+        #: receive first goes overdue and as ``on_blocked(None, None)``
+        #: when it clears. This is the funnel #821's
+        #: ``_pp_blocked_recv_since`` marker never had on this path -- the
+        #: very path two of three ranks wedged in on boot_827.
+        self._on_blocked = on_blocked
+        #: Diagnostics mirror of the marker, readable without the hook.
+        self.blocked_recv_arm: Optional[str] = None
+        self.blocked_recv_since: Optional[float] = None
+        self.stall_aborts = 0
         #: #631 G: called with the new consumed count each time a whole
         #: message leaves the wire, so the upstream can learn that its
         #: send is gone and stop treating its own commit as speculative.
@@ -110,8 +192,10 @@ class PpChainReceiver:
         self._state = _IDLE
         self._size_tensor: Optional[torch.Tensor] = None
         self._size_work = None
+        self._size_park: Optional[ParkedWait] = None
         self._data_tensor: Optional[torch.Tensor] = None
         self._data_work = None
+        self._data_park: Optional[ParkedWait] = None
         #: Fully received, not yet handed to the scheduler.
         self.inbox: Deque[List[Any]] = deque()
         #: Diagnostics: how many messages were absorbed by a non-blocking
@@ -151,6 +235,7 @@ class PpChainReceiver:
         self._size_work = dist.irecv(
             self._size_tensor, src=self._src, group=self._group
         )
+        self._size_park = None
         self._state = _AWAITING_SIZE
 
     def _post_data_recv(self, size: int) -> None:
@@ -158,7 +243,103 @@ class PpChainReceiver:
         self._data_work = dist.irecv(
             self._data_tensor, src=self._src, group=self._group
         )
+        self._data_park = None
         self._state = _AWAITING_DATA
+
+    # -- #824 W4/W5: the bounded, named, instrumented block -------------
+
+    def _mark_blocked(self, arm: str, since: float) -> None:
+        """#824 W5: publish that THIS arm is overdue, by name.
+
+        The watchdog's job on boot_827 was to say which wait had stopped
+        the ring; it could not, because #821's marker only covers
+        ``_pp_recv_typed_dict`` and both wedged ranks were in here.
+        """
+        if self.blocked_recv_arm == arm:
+            return
+        self.blocked_recv_arm = arm
+        self.blocked_recv_since = since
+        if self._on_blocked is not None:
+            try:
+                self._on_blocked(arm, since)
+            except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+                logger.error("%s blocked-recv marker hook failed: %s", LOG_PREFIX, exc)
+
+    def _clear_blocked(self) -> None:
+        if self.blocked_recv_arm is None:
+            return
+        self.blocked_recv_arm = None
+        self.blocked_recv_since = None
+        if self._on_blocked is not None:
+            try:
+                self._on_blocked(None, None)
+            except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+                logger.error("%s blocked-recv marker hook failed: %s", LOG_PREFIX, exc)
+
+    def _ensure_park(self, arm: str) -> ParkedWait:
+        """Park the blocking wait for ``arm``, creating it on FIRST BLOCK.
+
+        Deliberately lazy. Parking at post time would call ``wait()`` on
+        every receive this class posts, including the ones ``poll()``
+        posts -- and ``poll()``'s whole contract is that it never waits on
+        a peer. Creating the waiter only when a caller actually asks to
+        block keeps that contract exact (and costs no thread on the
+        non-blocking path).
+        """
+        if arm == "size":
+            if self._size_park is None:
+                self._size_park = ParkedWait(
+                    self._size_work, f"pp-chain-size<-{self._src}"
+                )
+            return self._size_park
+        if self._data_park is None:
+            self._data_park = ParkedWait(self._data_work, f"pp-chain-data<-{self._src}")
+        return self._data_park
+
+    def _block_on(self, park: ParkedWait, arm: str) -> None:
+        """Block until ``park`` completes, an abort_check fires, or the
+        stall deadline expires.
+
+        Every exit that is not completion raises ``PpChainRecvStalled`` and
+        leaves the receive POSTED and the state machine untouched, so the
+        caller may service the peer and come back.
+        """
+        since = time.monotonic()
+        deadline = self._stall_timeout_s
+        yield_s = YIELD_INTERVAL_S
+        if deadline and deadline > 0:
+            yield_s = min(yield_s, max(deadline / 3.0, 0.01))
+        while True:
+            if park.join(yield_s):
+                self._clear_blocked()
+                return
+            waited = park.waited_s
+            self._mark_blocked(arm, since)
+            if self._abort_check is not None:
+                try:
+                    reason = self._abort_check(arm, waited)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("%s abort_check failed: %s", LOG_PREFIX, exc)
+                    reason = None
+                if reason:
+                    self.stall_aborts += 1
+                    raise PpChainRecvStalled(
+                        f"{LOG_PREFIX} arm={arm} src={self._src} dst={self._dst} "
+                        f"waited={waited:.1f}s state={self._state} "
+                        f"consumed={self.consumed}: {reason}. The receive is "
+                        f"still posted; service the peer, then receive again."
+                    )
+            if deadline and deadline > 0 and waited >= deadline:
+                self.stall_aborts += 1
+                raise PpChainRecvStalled(
+                    f"{LOG_PREFIX} arm={arm} src={self._src} dst={self._dst} "
+                    f"waited={waited:.1f}s state={self._state} "
+                    f"consumed={self.consumed}: exceeded the {deadline:g}s stall "
+                    f"bound ({STALL_ENV}). The upstream is not feeding this "
+                    f"channel -- on boot_827 it was blocked in an admission "
+                    f"send on the typed-dict channel. The receive is still "
+                    f"posted; service the peer, then receive again."
+                )
 
     def _note_consumed(self) -> None:
         """One whole message has left the wire. The single accounting point.
@@ -198,6 +379,7 @@ class PpChainReceiver:
         serialized = bytes(self._data_tensor.cpu().numpy())
         self._data_tensor = None
         self._data_work = None
+        self._data_park = None
         self._state = _IDLE
         self.inbox.append(pickle.loads(serialized))
         self._note_consumed()
@@ -215,12 +397,19 @@ class PpChainReceiver:
 
         if self._state == _AWAITING_SIZE:
             if block:
-                self._size_work.wait()
+                # #824 W4: THE wedge site. py-spy caught PP1 and PP2 both
+                # here (this file:218 pre-fix) on boot_827, parked for ever
+                # on a size that PP0 could not send because PP0 was itself
+                # blocked in a send on the admission channel. Bounded and
+                # named now -- and still resumable, which is the property
+                # that lets the caller break the ring and come back.
+                self._block_on(self._ensure_park("size"), "size")
             elif not self._size_work.is_completed():
                 return False
             size = int(self._size_tensor.item())
             self._size_tensor = None
             self._size_work = None
+            self._size_park = None
             if size == 0:
                 # An empty forward. It still carries the pass, so it is a
                 # message like any other and must be queued rather than
@@ -238,7 +427,12 @@ class PpChainReceiver:
             # cooperation from the peer -- blocking here cannot deadlock,
             # and not blocking here cannot lose the message.
             if block:
-                self._data_work.wait()
+                # Bounded too, but for INSTRUMENTATION rather than for
+                # recovery: this wait is bounded by transfer time (the
+                # payload is already on the wire behind a received size),
+                # so it should never go overdue. If it ever does, the
+                # marker names it instead of leaving another silent arm.
+                self._block_on(self._ensure_park("data"), "data")
             elif not self._data_work.is_completed():
                 return False
             self._complete_data()
@@ -330,4 +524,4 @@ class PpChainReceiver:
         return self.inbox.popleft()
 
 
-__all__ = ["PpChainReceiver", "LOG_PREFIX"]
+__all__ = ["PpChainReceiver", "PpChainRecvStalled", "LOG_PREFIX", "STALL_ENV"]
