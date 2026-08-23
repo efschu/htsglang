@@ -26,7 +26,6 @@ work and kept raw blocking calls on the same collectives.
 
 from __future__ import annotations
 
-import datetime
 import threading
 import time
 from typing import Any, Optional
@@ -152,9 +151,48 @@ def bounded_wait(
     # itself. ``Work.wait`` takes a timeout and raises on expiry, which gives
     # both properties at once: the transfer progresses, and a dead peer still
     # cannot park this rank for the group's two-hour timeout.
+    # #829: THE BOUND MUST NOT DESTROY THE PAIR EITHER.
+    #
+    # The line above used to be, verbatim:
+    #
+    #     completed = work.wait(timeout=datetime.timedelta(seconds=timeout_s))
+    #
+    # It was the ONLY timed ``Work.wait`` on a gloo ``Work`` anywhere in
+    # ``sglang/srt`` (every other ``.wait(timeout=`` in the tree is a
+    # ``threading.Event`` or a ``Popen``), and #630 introduced it. It fixed the
+    # livelock and bought a second defect at group scope, measured hermetically
+    # on 2-process gloo by #824 W4 and written up on :class:`ParkedWait`:
+    # an expired ``wait(timeout=...)`` CLOSES THE GLOO PAIR. The waiter then
+    # gets "Application timeout caused pair closure" from every later call, and
+    # the PEER gets "Connection closed by peer" from its next send.
+    #
+    # THE CONTRACT THAT BROKE IS NOT THIS FUNCTION'S. ``bounded_recv``'s
+    # docstring calls the raise terminal -- "the process is on its way down" --
+    # and that is a RANK-LOCAL promise. It is not containable: the pair is
+    # shared, so this rank's deadline kills collectives on peers that are
+    # healthy and are not waiting on anything of ours. 34 of 262 boot logs
+    # carry the peer's half of it, always at a BARE ``work.wait()`` in the PP
+    # tensor-dict transport (``parallel_state.recv_object`` :2130-2132,
+    # ``scheduler_pp_mixin._pp_commit_comm_work``), and those victims run on
+    # the SAME gloo context this function does: ``kv_cache_builder.py:230``
+    # passes ``pp_cache_group=pp_group.cpu_group``, which is the very group
+    # ``recv_object`` posts its ``irecv`` on. Same ranks, same context, same
+    # TCP pairs.
+    #
+    # So the deadline moves off the ``Work`` and onto the CALLER, which is
+    # exactly what :class:`ParkedWait` is for: the unbounded ``wait()`` -- the
+    # one call with positive evidence that it DRIVES the transfer, which is
+    # #630's whole finding -- runs on its own thread, and we join that thread
+    # with the deadline. Expiry returns control without touching the ``Work``,
+    # so the pair is never poisoned.
+    #
+    # ALL THREE CONTRACTS OF THIS FUNCTION ARE UNCHANGED: the terminal raise,
+    # the ``_timeout_message`` wording, and the #734 numeric discriminator
+    # below. What changes is only that a peer no longer dies for our deadline.
     started = time.monotonic()
+    parked = ParkedWait(work, label)
     try:
-        completed = work.wait(timeout=datetime.timedelta(seconds=timeout_s))
+        completed = parked.join(timeout_s)
     except RuntimeError as exc:
         waited = time.monotonic() - started
         # #734: A DEAD PEER IS NOT A SLOW PEER, and the log must not say it is.
@@ -186,8 +224,11 @@ def bounded_wait(
         raise HiCacheCollectiveTimeoutError(
             _timeout_message(label, timeout_s, waited, rank_desc)
         ) from exc
-    # Some backends report expiry by returning False rather than raising.
-    if completed is False:
+    # Expiry. ``ParkedWait.join`` returns False with the wait STILL PARKED and
+    # the pair intact; the raise below keeps this function's terminal contract,
+    # so callers are unaffected. (Before #829 this branch also caught backends
+    # that reported expiry by returning False rather than raising.)
+    if not completed:
         raise HiCacheCollectiveTimeoutError(
             _timeout_message(label, timeout_s, time.monotonic() - started, rank_desc)
         )
