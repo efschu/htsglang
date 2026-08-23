@@ -64,8 +64,64 @@ class _Event:
         pass
 
 
+def assert_faithful_pp_roles(group, pp_size):
+    """A rank of a pp_size>1 ring is not both the first and the last stage.
+
+    #791, and the reason this check exists instead of two more attributes.
+    The stub below used to carry ``is_last_rank = True`` and nothing else,
+    so the loop's ``not self.pp_group.is_first_rank`` raised AttributeError
+    the moment it asked -- the drift this suite was failing on.
+
+    The cheap repair is to add ``is_first_rank = True`` beside it. That
+    would make this rank the FIRST and the LAST stage of a three-stage
+    pipeline simultaneously, which no rank of a pp_size=3 ring can be, and
+    it would make every branch keyed on either role take the wrong arm
+    while the suite stayed green. That is the #630 lesson exactly: an
+    unfaithful stub does not merely fail to catch the defect, it ENCODES
+    the defect's assumption and then certifies it.
+
+    So the roles are derived from a real position in a real ring, and this
+    guard makes the forbidden combination a loud failure rather than a
+    silent one.
+    """
+    first = bool(group.is_first_rank)
+    last = bool(group.is_last_rank)
+    if pp_size > 1 and first and last:
+        raise AssertionError(
+            f"unfaithful PP group stub: is_first_rank and is_last_rank are "
+            f"both True at pp_size={pp_size}. Only a degenerate one-stage "
+            f"ring can be both. A stub in this shape silently takes the "
+            f"wrong arm of every role-keyed branch in the loop under test."
+        )
+    return group
+
+
 class _Group:
-    is_last_rank = True  # skips the proxy-send block; not what is under test
+    """The PP group as ONE rank of a real pp_size=3 ring sees it.
+
+    Rank 2 is the default because that is what the previous stub was
+    reaching for with its lone ``is_last_rank = True``: the last stage,
+    which skips the proxy-send block that is not under test here. The
+    difference is that it is now last WITHOUT also claiming to be first,
+    so ``_event_loop_pp_body``'s admission-decision branch takes the arm a
+    real last rank takes.
+    """
+
+    def __init__(self, rank: int = 2, pp_size: int = 3):
+        self.rank = int(rank)
+        self.pp_size = int(pp_size)
+        if not 0 <= self.rank < self.pp_size:
+            raise AssertionError(
+                f"rank {self.rank} is not a position in a {self.pp_size}-stage ring"
+            )
+
+    @property
+    def is_first_rank(self):
+        return self.rank == 0
+
+    @property
+    def is_last_rank(self):
+        return self.rank == self.pp_size - 1
 
 
 class _ServerArgs:
@@ -106,10 +162,15 @@ class _Rank:
         honour_hold=True,
         tail=4,
         pp_loop_size=3,
+        pp_group=None,
     ):
         self.pp_loop_size = pp_loop_size
         self.ps = _PS()
-        self.pp_group = _Group()
+        # #791: a REAL position in the ring, checked. ``pp_group`` is an
+        # injection point so the can-fail test can plant an unfaithful one
+        # and prove this suite rejects it.
+        self.pp_group = _Group(rank=2, pp_size=_PS.pp_size) if pp_group is None else pp_group
+        assert_faithful_pp_roles(self.pp_group, self.ps.pp_size)
         self.server_args = _ServerArgs(enable_phase_flip)
         self.request_receiver = _Receiver()
         self.mbs = [None] * pp_loop_size
@@ -135,6 +196,7 @@ class _Rank:
         self._hard_stop = 400
 
         self.armed = False
+        self.admission_recvs = 0
         self.iterations = 0
         self.spins = 0
         self.slots_seen = []
@@ -163,6 +225,69 @@ class _Rank:
         if self.armed:
             return _Plan(None, running_batch)
         return _Plan(_Batch(), running_batch)
+
+    # -- the admission-decision arm a non-first rank really takes ---------
+    #
+    # #791: reached only now that this rank reports a faithful position in
+    # the ring. These are collaborators, not the subject: the loop CONTROL
+    # is what this suite pins, so each is the cheapest thing that keeps the
+    # control flow real and records nothing.
+
+    def _pp_recv_admission_decision(self):
+        # Counted, so the suite can prove the faithful role is LOAD-BEARING
+        # and not decorative: a rank that reports "not first" must actually
+        # take this arm.
+        self.admission_recvs += 1
+        return None
+
+    def _pp_reconcile_incoming_admission(self, incoming):
+        return None, None
+
+    def _pp_void_retracted_pass(self, effective, amended):
+        return effective, amended
+
+    def _pp_forwarded_schedule_from(self, amended):
+        return None
+
+    def _pp_note_output_expectation(self, mb_id, expected, amended):
+        pass
+
+    _pp_output_expected_incoming = None
+    #: #753's per-iteration lockstep barrier is for the GAPPED layout. This
+    #: rank is an ordinary contiguous stage, so the barrier is correctly
+    #: skipped -- and skipping it is what keeps this suite free of a real
+    #: process group.
+    _pp_gapped_wire = False
+
+    def _pp_note_chunked_req_before_admission(self, mb_id):
+        pass
+
+    def _pp_void_pass_without_upstream_launch(self, mb_id):
+        return False
+
+    def _pp_void_own_batch(self, mb_id):
+        pass
+
+    def _pp_send_admission_decision(self, *args, **kwargs):
+        pass
+
+    def _pp_try_recv_admission_decision(self, *args, **kwargs):
+        return None
+
+    def _pp_commit_admission_send_work(self, *args, **kwargs):
+        pass
+
+    def _pp_commit_pending_req_work(self, *args, **kwargs):
+        pass
+
+    def _pp_drain_voided_proxy(self, *args, **kwargs):
+        return None
+
+    def _pp_proxy_stamp(self, *args, **kwargs):
+        return None
+
+    def _pp_send_dict_to_next_stage(self, *args, **kwargs):
+        return None
 
     def _pp_recv_proxy_tensors(self, mb_id):
         return None
@@ -350,3 +475,71 @@ def test_the_hold_is_released_the_moment_the_flip_disarms():
     r = _Rank(arm_at_iteration=1, armed_spins=20).run()
     tail = r.slots_after_disarm[:4]
     assert len(set(tail)) > 1, f"the loop never resumed walking: {tail}"
+
+
+# ---------------------------------------------------------------------------
+# #791: the stub's FAITHFULNESS is itself under test.
+# ---------------------------------------------------------------------------
+#
+# The red-first logic is inverted here, and deliberately. The seven tests
+# above were RED for months with an AttributeError -- the loop asked this
+# rank whether it was the first stage and the stub had no answer. So the
+# repair is proven by those tests going GREEN with a faithful stub, and the
+# CAN-FAIL is the other direction: the convenient repair must be REJECTED.
+
+
+class _FirstAndLast:
+    """The tempting stub: answer both questions with True and move on."""
+
+    is_first_rank = True
+    is_last_rank = True
+
+
+def test_can_fail_a_stub_that_is_both_first_and_last_is_rejected():
+    """THE #630 LESSON, enforced.
+
+    Adding ``is_first_rank = True`` beside the existing
+    ``is_last_rank = True`` makes every test above pass. It also makes this
+    rank the first AND the last stage of a three-stage pipeline, which no
+    rank of a pp_size=3 ring can be -- so every branch keyed on either role
+    takes the wrong arm while the suite reports green. An unfaithful stub
+    does not merely miss the defect; it encodes the defect's assumption and
+    then certifies it.
+    """
+    with pytest.raises(AssertionError) as exc:
+        _Rank(arm_at_iteration=2, armed_spins=3, pp_group=_FirstAndLast())
+
+    assert "both True at pp_size=3" in str(exc.value)
+
+
+def test_the_faithful_stub_carries_real_ring_positions():
+    ring = [_Group(rank=r, pp_size=3) for r in range(3)]
+
+    assert [g.is_first_rank for g in ring] == [True, False, False]
+    assert [g.is_last_rank for g in ring] == [False, False, True]
+    for g in ring:
+        assert_faithful_pp_roles(g, 3)
+
+
+def test_a_position_outside_the_ring_is_rejected():
+    with pytest.raises(AssertionError):
+        _Group(rank=3, pp_size=3)
+
+
+def test_the_faithful_role_is_load_bearing_not_decorative():
+    """A rank that reports "not the first stage" must actually take the
+    admission-decision arm.
+
+    Without this, the stubs added for that arm could be dead code and the
+    word "faithful" would be doing no work: the suite would be green
+    because the branch was never entered, which is the state it was in
+    before -- only quieter.
+    """
+    rank = _Rank(arm_at_iteration=2, armed_spins=3).run()
+
+    assert not rank.pp_group.is_first_rank
+    assert rank.pp_group.is_last_rank
+    assert rank.admission_recvs > 0, (
+        "the non-first admission arm was never entered, so the faithful "
+        "role changed nothing and this suite still does not exercise it"
+    )
