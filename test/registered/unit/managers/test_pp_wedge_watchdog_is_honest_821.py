@@ -193,7 +193,14 @@ class TheDumpMustSurviveTheNewFiringCase(unittest.TestCase):
             blocked_since=time.monotonic() - (WATCHDOG_TIMEOUT_S + 5.0),
         )
         info = _watchdog_for(s)["dump_info"]()
-        self.assertIn("parked in a blocking PP dict receive", info)
+        # #824 W5(b) CHANGED THIS WORDING ON PURPOSE. It used to read
+        # "parked in a blocking PP dict receive" unconditionally, because
+        # _pp_recv_typed_dict was the only site that set the marker. On
+        # boot_827 the two ranks that actually wedged were in the
+        # request-relay chain receive, so this line named the wrong channel
+        # in the one report an operator reads first. The dump now carries
+        # the arm the marker recorded instead of asserting a channel.
+        self.assertIn("parked in a blocking PP receive on arm=", info)
 
     def test_the_dump_names_how_long_the_receive_has_been_blocked(self):
         s = _scheduler(

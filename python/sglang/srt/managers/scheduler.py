@@ -2862,7 +2862,29 @@ class Scheduler(
                 if counters is not None
                 else None
             ),
+            # #824 W5(b): give THIS funnel the blocked-recv marker #821
+            # only ever gave _pp_recv_typed_dict. Two of three ranks wedged
+            # in here on boot_827 and the watchdog could not say so,
+            # because nothing on this path recorded that it was blocked.
+            on_blocked=self._note_pp_chain_blocked,
         )
+
+    def _note_pp_chain_blocked(self, arm, since):
+        """Publish the chain receive's blocked state on the scheduler.
+
+        Writes the SAME pair the #821 arm reads
+        (``invariant_checker.pp_receive_is_overdue``), so the existing
+        watchdog backstop covers this path with no second mechanism. The
+        threshold semantics are unchanged: it records since WHEN, and the
+        reader decides what is too long -- a healthy idle rank blocks here
+        continuously, so a flag would SIGQUIT an idle server.
+        """
+        if arm is None:
+            self._pp_blocked_recv_since = None
+            self._pp_blocked_recv_arm = None
+            return
+        self._pp_blocked_recv_since = since
+        self._pp_blocked_recv_arm = f"chain-recv/{arm}"
 
     def _build_pp_flip_counters(self):
         """#631 G: the pollable message-count channel, or None.
@@ -2961,6 +2983,10 @@ class Scheduler(
             phase_flip_service_hook=(
                 self.pp_flip_service if self.server_args.enable_phase_flip else None
             ),
+            # #824 W5(b): mark the DIRECT chain receive too. That branch
+            # runs on every boot without the flip, and it was the last
+            # blocking PP receive with no marker at all.
+            on_blocked_recv=self._note_pp_chain_blocked,
         )
 
     def init_dp_attn_adapter(self) -> None:

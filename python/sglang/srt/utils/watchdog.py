@@ -100,6 +100,28 @@ class _WatchdogNoop(Watchdog):
     pass
 
 
+def compose_timeout_line(
+    debug_name: str, watchdog_timeout: float, soft: bool, arm: str = ""
+) -> str:
+    """The line an operator reads first when a rank dies of a wedge.
+
+    #824 W5(a). It used to carry only the name, the budget and the soft
+    flag; on boot_827 that meant the one honest wedge report on the whole
+    boot said nothing about WHICH wait had stopped the ring, and the answer
+    had to be dug out of a py-spy dump taken minutes later. ``arm`` is
+    appended only when the caller could actually name it, so a watchdog
+    with no describer is worded exactly as before.
+
+    Kept a plain function so the wording can be tested without arming a
+    real watchdog thread and its SIGQUIT.
+    """
+    line = (
+        f"{debug_name} watchdog timeout "
+        f"(self.watchdog_timeout={watchdog_timeout!r}, self.soft={soft!r})"
+    )
+    return line + (f" tripped_by={arm}" if arm else "")
+
+
 class WatchdogRaw:
     def __init__(
         self,
@@ -109,6 +131,7 @@ class WatchdogRaw:
         watchdog_timeout: float,
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
+        describe_arm: Optional[Callable[[], str]] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -116,6 +139,12 @@ class WatchdogRaw:
         self.watchdog_timeout = watchdog_timeout
         self.soft = soft
         self.dump_info = dump_info
+        #: #824 W5(a): name the arm that tripped, in the trigger line
+        #: itself. On boot_827 the watchdog fired correctly and the line
+        #: said only "Scheduler watchdog timeout (...)" -- which arm had
+        #: gone overdue was left to be reconstructed from a py-spy dump
+        #: taken minutes later. Returning "" keeps the old wording.
+        self.describe_arm = describe_arm
 
         self.parent_process = psutil.Process().parent()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -150,9 +179,18 @@ class WatchdogRaw:
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 
         pyspy_dump_schedulers()
+        arm = ""
+        if self.describe_arm is not None:
+            try:
+                arm = self.describe_arm() or ""
+            except Exception as e:  # noqa: BLE001 - diagnostics must not raise
+                # This runs microseconds before SIGQUIT. A broken describer
+                # must cost the arm name, never the death notice itself.
+                arm = f"<arm describer failed: {e}>"
         logger.error(
-            f"{self.debug_name} watchdog timeout "
-            f"({self.watchdog_timeout=}, {self.soft=})"
+            compose_timeout_line(
+                self.debug_name, self.watchdog_timeout, self.soft, arm
+            )
         )
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)

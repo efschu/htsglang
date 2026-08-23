@@ -4354,6 +4354,11 @@ class SchedulerPPMixin:
         # test_pp_dead_peer_is_not_the_wedge_801.py -- does not leave a stale
         # timestamp behind that would later read as a wedge.
         self._pp_blocked_recv_since = time.monotonic()
+        # #824 W5(b): stamp WHICH arm, not merely that some arm is blocked.
+        # Three channels ride this one call (proxy / output / admission) and
+        # a fourth blocking receive lives in the request-relay chain; the
+        # watchdog line named none of them on boot_827.
+        self._pp_blocked_recv_arm = f"typed-dict/{expected_kind}"
         try:
             tensor_dict = recv_typed_tensor_dict(
                 self.pp_group,
@@ -4364,6 +4369,7 @@ class SchedulerPPMixin:
             )
         finally:
             self._pp_blocked_recv_since = None
+            self._pp_blocked_recv_arm = None
         if expected_kind == "default":
             logger.warning_once(
                 f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"

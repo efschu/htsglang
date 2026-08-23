@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -81,6 +82,13 @@ class SchedulerRequestReceiver:
     # downstream's counter proves consumed. Replaces the poll-based drain,
     # which absorbed nothing (corpse F).
     phase_flip_service_hook: Optional[Callable[[], None]] = None
+    # #824 W5(b): called as on_blocked_recv(arm, since) around the DIRECT
+    # chain receive below, and with (None, None) when it returns. Without
+    # it that call is a blocking PP receive that records nothing, so the
+    # watchdog cannot name it -- the same blind spot #821 left on the
+    # chain_receiver path, which is where two of three ranks wedged on
+    # boot_827. The PpChainReceiver path stamps its own marker instead.
+    on_blocked_recv: Optional[Callable[[Optional[str], Optional[float]], None]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -232,13 +240,25 @@ class SchedulerRequestReceiver:
                     # misframed by a second, competing irecv.
                     recv_reqs = self.chain_receiver.recv()
                 else:
-                    recv_reqs = point_to_point_pyobj(
-                        [],
-                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                        self.world_group.cpu_group,
-                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    )
+                    src = (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset
+                    if self.on_blocked_recv is not None:
+                        self.on_blocked_recv(
+                            f"request-chain/point_to_point<-{src}", time.monotonic()
+                        )
+                    try:
+                        recv_reqs = point_to_point_pyobj(
+                            [],
+                            self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            src,
+                            self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        )
+                    finally:
+                        # Cleared even when the receive RAISES, so a dead
+                        # peer's "Connection closed by peer" cannot leave a
+                        # stale timestamp that later reads as a wedge.
+                        if self.on_blocked_recv is not None:
+                            self.on_blocked_recv(None, None)
             else:
                 recv_reqs = None
         return recv_reqs
