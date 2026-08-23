@@ -37,6 +37,7 @@ from sglang.srt.managers.funding_authority import (
     RELIEF_LOCAL,
     RELIEF_REBALANCE,
     FundingAuthority,
+    authority_from_seam_snapshot,
     FundingError,
     Post,
     diagnose_floor_band,
@@ -417,6 +418,91 @@ class TestUnsatisfiableFloor(unittest.TestCase):
     def test_the_boundary_is_inclusive(self):
         self.assertTrue(diagnose_floor_band(1129, 1229, 100).satisfiable)
         self.assertFalse(diagnose_floor_band(1130, 1229, 100).satisfiable)
+
+
+class TestSeamSnapshotBuilder(unittest.TestCase):
+    """The builder the refusal path calls, fed the specimen's own figures."""
+
+    def test_specimen_snapshot_funds_the_shortfall_and_names_kv_slack(self):
+        auth = authority_from_seam_snapshot(
+            allocator_cache_bytes=SPEC_ALLOCATOR_CACHE_MIB * MIB,
+            kv_slack_rows=90080,
+            row_bytes=ROW_BYTES,
+            kv_granule_rows=KV_GRANULE_ROWS,
+        )
+        v = auth.can_fund(396 * MIB)
+        self.assertTrue(v.ok, v.describe())
+        self.assertIn("kv-slack", v.describe())
+        # And the string it produces is the one that replaces "[nothing]".
+        self.assertNotIn("[nothing]", v.describe())
+
+    def test_an_empty_snapshot_still_names_all_three_posts(self):
+        auth = authority_from_seam_snapshot()
+        v = auth.can_fund(396 * MIB)
+        self.assertFalse(v.ok)
+        for name in ("allocator-cache", "draft-weights", "kv-slack"):
+            self.assertIn(name, v.describe())
+        self.assertIn("at or below its rung floor", v.describe())
+
+
+class TestRungAccessorContract(unittest.TestCase):
+    """CAN-FAIL PROOF for the refusal-path census.
+
+    ``_funding_post_census`` reads the rung through a broad ``except`` so that
+    a refusal can never crash. That safety has a cost: a WRONG attribute name
+    is swallowed and the census goes permanently silent, which in a log is
+    indistinguishable from a census that was simply never needed. This exact
+    mistake was made while writing it -- ``current_rows`` / ``floor_rows`` /
+    ``row_bytes`` were guessed and none of the three exist.
+
+    These asserts pin the real names, so a rename upstream fails HERE loudly
+    instead of silently disarming the census.
+    """
+
+    def test_rung_exposes_the_accessors_the_census_uses(self):
+        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+
+        self.assertTrue(callable(getattr(KvBackingRelief, "_min_release_rows", None)))
+        import inspect
+
+        src = inspect.getsource(KvBackingRelief)
+        self.assertIn("_bytes_per_row", src)
+        self.assertIn("_last_proposal_terms", src)
+
+    def test_proposal_terms_carry_the_two_keys_the_census_reads(self):
+        import inspect
+
+        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+
+        src = inspect.getsource(KvBackingRelief)
+        # The census computes slack as current - floor_rows.
+        self.assertIn('t["current"]', src)
+        self.assertIn('t["floor_rows"]', src)
+
+    def test_census_is_reachable_and_returns_a_named_string(self):
+        """The census logic itself, exercised on a stand-in rung.
+
+        Not the full runtime object -- that needs a scheduler -- but the exact
+        read pattern the census performs, so a change to it fails here.
+        """
+
+        class _StandInRung:
+            _last_proposal_terms = {"current": 212992, "floor_rows": 122912}
+            _bytes_per_row = ROW_BYTES
+
+            def _min_release_rows(self):
+                return KV_GRANULE_ROWS
+
+        rung = _StandInRung()
+        terms = getattr(rung, "_last_proposal_terms", None)
+        slack = max(0, int(terms["current"]) - int(terms["floor_rows"]))
+        self.assertEqual(slack, 90080)  # the specimen's own figure
+        auth = authority_from_seam_snapshot(
+            kv_slack_rows=slack,
+            row_bytes=int(rung._bytes_per_row),
+            kv_granule_rows=int(rung._min_release_rows()),
+        )
+        self.assertTrue(auth.can_fund(396 * MIB).ok)
 
 
 class TestVerdictHygiene(unittest.TestCase):

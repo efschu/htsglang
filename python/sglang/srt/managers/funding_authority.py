@@ -500,6 +500,73 @@ def uniform_absolute_floor(
     return max(int(f) for f in per_rank_floors)
 
 
+def authority_from_seam_snapshot(
+    *,
+    allocator_cache_bytes: int = 0,
+    kv_slack_rows: int = 0,
+    row_bytes: int = 0,
+    kv_granule_rows: int = 0,
+    draft_available_bytes: int = 0,
+    draft_reason: str = "",
+    rank: int = 0,
+) -> FundingAuthority:
+    """Build an authority from the numbers a seam refusal ALREADY has in hand.
+
+    Every argument is a plain integer the caller has already computed for its
+    own census, so this introspects nothing and can be called from a refusal
+    path without reaching into a scheduler. That is deliberate: the census at
+    ``phase_flip_runtime._staging_budget_census`` gathers exactly these figures
+    and then formats them into a log string, and the whole defect this module
+    addresses is that no decision ever receives them.
+
+    A post with nothing to give is still DECLARED, with its reason, because law
+    1 requires a refusal to name what it considered.
+    """
+    auth = FundingAuthority(rank=rank)
+    auth.declare_post(
+        Post(
+            "allocator-cache",
+            max(0, int(allocator_cache_bytes)),
+            tier=RELIEF_LOCAL,
+            cost=10,
+            unavailable_reason=(
+                "" if allocator_cache_bytes > 0 else "torch cache already returned"
+            ),
+        )
+    )
+    auth.declare_post(
+        Post(
+            "draft-weights",
+            max(0, int(draft_available_bytes)),
+            tier=RELIEF_REBALANCE,
+            cost=20,
+            unavailable_reason=(
+                draft_reason
+                if draft_reason
+                else ("" if draft_available_bytes > 0 else "no draft payload resident")
+            ),
+        )
+    )
+    # THE POST THE GUARD LADDER CANNOT SEE. It is declared here precisely
+    # because it is absent there: the rung pays before the gate, so its bytes
+    # never enter the ladder's provider list and a refusal has never once been
+    # able to name it. See the module docstring's specimen.
+    auth.declare_post(
+        Post(
+            "kv-slack",
+            max(0, int(kv_slack_rows)) * max(0, int(row_bytes)),
+            tier=RELIEF_REBALANCE,
+            cost=30,
+            granule_bytes=max(0, int(kv_granule_rows)) * max(0, int(row_bytes)),
+            group_scope=GROUP_UNIFORM_CAP,
+            unavailable_reason=(
+                "" if kv_slack_rows > 0 else "pool is at or below its rung floor"
+            ),
+        )
+    )
+    return auth
+
+
 @dataclasses.dataclass(frozen=True)
 class FloorBandDiagnosis:
     """Whether the gate's watermark is reachable inside the corridor band."""

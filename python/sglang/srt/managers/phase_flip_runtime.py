@@ -6894,7 +6894,81 @@ class PhaseFlipRuntime:
                 )
         else:
             self._corridor_pp_refusals = 0
-        return f"corridor gate refused the seam staging: {verdict.detail}"
+        return (
+            f"corridor gate refused the seam staging: {verdict.detail}"
+            f"{self._funding_post_census(int(ask_bytes))}"
+        )
+
+    def _funding_post_census(self, want_bytes: int) -> str:
+        """#770: name the posts a refusal considered, or say nothing at all.
+
+        STRICTLY OBSERVATIONAL. It takes no decision, spends nothing and
+        returns a suffix for the refusal line. The gate's verdict above is
+        already final by the time this runs.
+
+        It exists because ``reclaimed 0 MiB from [nothing]`` is three different
+        worlds in one string -- no providers, providers that paid zero, and a
+        funder that was never in the ladder's list -- and the specimen is the
+        third: the same second that printed ``[nothing]`` also printed
+        ``KV capacity is the funder`` with an exact draw. A reader could not
+        tell those apart, and on 2026-08-16 that cost a morning.
+
+        Like ``_staging_budget_census`` above, it must never raise: a refusal
+        that cannot explain itself is bad, and a refusal that CRASHES while
+        trying to is worse.
+        """
+        try:
+            from sglang.srt.managers.funding_authority import (
+                authority_from_seam_snapshot,
+            )
+            from sglang.srt.managers.phase_flip_spill import (
+                KV_BACKING_RELIEF_ATTR as _RUNG_ATTR,
+            )
+
+            cached = 0
+            try:
+                if torch.cuda.is_available():
+                    cached = int(
+                        torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+            sched = getattr(self, "_census_scheduler", None)
+            rung = getattr(sched, _RUNG_ATTR, None) if sched is not None else None
+            slack_rows = 0
+            row_bytes = 0
+            granule_rows = 0
+            if rung is not None:
+                # THE REAL ACCESSORS, verified against kv_backing_relief.py --
+                # `_last_proposal_terms` (:1036, keys `current`/`floor_rows`),
+                # `_bytes_per_row` and `_min_release_rows()` (:1375). Guessed
+                # attribute names would have been swallowed by the except below
+                # and left this census permanently silent, which is the exact
+                # failure shape the draft-weights provider comment warns about:
+                # inert, and indistinguishable in a log from never being needed.
+                terms = getattr(rung, "_last_proposal_terms", None)
+                if terms:
+                    slack_rows = max(
+                        0, int(terms["current"]) - int(terms["floor_rows"])
+                    )
+                row_bytes = int(getattr(rung, "_bytes_per_row", 0) or 0)
+                try:
+                    granule_rows = int(rung._min_release_rows())
+                except Exception:  # noqa: BLE001
+                    granule_rows = 0
+
+            auth = authority_from_seam_snapshot(
+                allocator_cache_bytes=cached,
+                kv_slack_rows=slack_rows,
+                row_bytes=row_bytes,
+                kv_granule_rows=granule_rows,
+                rank=int(getattr(self, "_rank", 0) or 0),
+            )
+            v = auth.can_fund(int(want_bytes))
+            return f". #770 FUNDING POSTS: {v.describe()}"
+        except Exception:  # noqa: BLE001 - a census must not raise
+            return ""
 
     def _seam_funding_verdict(self, staging_bytes: int, direction: str, **kw) -> str:
         """The gate's verdict, with #662-F4's per-direction injection on top.
