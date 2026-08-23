@@ -515,6 +515,40 @@ class BudgetHarness:
     # cannot price.
     chunked_prefill_size = 4096
     _local_corridor_width_ceiling = Scheduler._local_corridor_width_ceiling
+    # #823: the reduce grew the HEAD-CONGRUENCE block -- a TP_HEAD_SLOTS-wide
+    # prefix-match vote and a one-slot admission-count vote. Seventh drift of
+    # this harness after #616g, #639, #639b, #791b, #794 and #701, and the
+    # first one the guard caught in the SAME change that caused it rather
+    # than a quarter later.
+    #
+    # Both are bound from Scheduler rather than stubbed, so this harness keeps
+    # modelling the real contract, and both ride NEUTRALLY here for reasons
+    # the harness already has: `waiting_queue` is empty, so the head vote is
+    # an empty canonical set and every slot carries the absent sentinel; and
+    # this harness has no `get_num_allocatable_reqs`, so the limit vote takes
+    # its own "no opinion" path and rides the unpriced sentinel. That is the
+    # same shape as the host and mamba tiers above -- the sentinel rides and
+    # nothing is published.
+    _local_head_prefix_matches = Scheduler._local_head_prefix_matches
+    _local_admit_limit = Scheduler._local_admit_limit
+
+    def get_num_allocatable_reqs(self, running_bs):
+        """A STAND-IN, which is what the guard's own message offers as the
+        alternative to binding -- and the right choice here.
+
+        The shipped method is bounded by `admission_limiter.current` and
+        carries the #677 decode-parking branch; binding it would oblige this
+        harness to model a limiter and a phase policy to answer a question it
+        is not asking. The budget reduce is what this file is about, and the
+        count vote occupies its own slot, so a constant priced vote exercises
+        the priced path without touching any assertion here.
+
+        Constant and equal on both ranks deliberately: a DIVERGENT count is
+        the subject of test_tp_head_congruence_823, not of this harness, and
+        making it diverge here would put a second unrelated variable into the
+        budget cases.
+        """
+        return 8
     uniform_corridor_width = Scheduler.uniform_corridor_width
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
@@ -564,23 +598,45 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     #: the predicate raised AttributeError on both ranks -- the same drift
     #: shape, this time introduced by the fix rather than by a reduce.
     adder.fundable_extend_floor = None
-    #: #815: the same drift shape a third time, from 97ceea2f19 [#701], which
-    #: gave ``rem_total_tokens`` a cross-pass reservation term. The guard test
-    #: below caught it and named both fields; this is that guard being obeyed.
+    #: #701 added the CROSS-PASS COMMITMENT LEDGER to the tail of
+    #: ``rem_total_tokens``. #815 and #823/#610's e11e4d46be repaired that
+    #: drift INDEPENDENTLY, on two branches that never saw each other, and
+    #: this block is the hand-merge of the two. Both counted the incident,
+    #: and both counts are kept because they count different things: it is
+    #: the sixth drift of this stub overall (after #616g, #639, #639b, #791b
+    #: and #794) and the third appearance of this particular shape, where the
+    #: guard below names the missing field instead of letting an
+    #: AttributeError surface inside an unrelated admission assertion.
     #:
-    #: `True` is the production default and the documented one ("DEFAULT ON: a
-    #: wedge is strictly worse than a refusal"); nothing in the tree overrides
-    #: it except the dedicated A/B in test_chunked_commitment_701.py.
+    #: BOTH names are bound, not just the one the failure reported. Binding
+    #: only the reported name is what reshipped this incident twice already
+    #: (see the #639b note above): ``chunked_admission_enabled`` was the
+    #: reported miss and ``commitment_ledger`` was the next one queued
+    #: behind it.
+    #:
+    #: `True` is the production default and the documented one ("DEFAULT ON:
+    #: a wedge is strictly worse than a refusal"); nothing in the tree
+    #: overrides it except the dedicated A/B in test_chunked_commitment_701.py.
+    #: Setting it False would also make the guard green, and would quietly
+    #: take the #701 tail out of the tested path -- the weaker binding of the
+    #: two.
     adder.chunked_admission_enabled = True
-    #: A REAL, EMPTY LEDGER RATHER THAN None, and the difference is not
-    #: cosmetic. `None` is the __init__ default, so it is the convenient value
-    #: -- but no real Scheduler ever passes it: `chunked_commitment_ledger` is a
-    #: lazy property that always constructs one, and the adder is always built
-    #: with `commitment_ledger=self.chunked_commitment_ledger`. The two happen
-    #: to agree numerically here only because `effective_rem_total_tokens`
-    #: special-cases `ledger is None` into the same no-op an empty ledger gives.
-    #: Modelling the object the system really hands over keeps this stub honest
-    #: if that special case is ever removed.
+    #: A REAL, EMPTY LEDGER RATHER THAN None, and this is the one value the
+    #: two repairs disagreed on: #815 constructed a ledger, e11e4d46be passed
+    #: None. The merge takes the ledger, on the strength of e11e4d46be's OWN
+    #: argument -- it observes that ``effective_rem_total_tokens`` returns its
+    #: input unchanged when the ledger is ``None``
+    #: (planner/chunked_admission.py), i.e. the two choices are numerically
+    #: indistinguishable here, so the stronger binding costs nothing.
+    #:
+    #: What None costs is stated by the other side: it is the ``__init__``
+    #: default, so it is the convenient value -- but no real Scheduler ever
+    #: passes it. ``chunked_commitment_ledger`` is a lazy property that always
+    #: constructs one, and the adder is always built with
+    #: ``commitment_ledger=self.chunked_commitment_ledger``. The agreement
+    #: holds only while the ``ledger is None`` special case survives, so a
+    #: stub carrying None is a stub that depends on a special case rather than
+    #: on the object the system really hands over.
     adder.commitment_ledger = ChunkedCommitmentLedger()
     adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
     adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
