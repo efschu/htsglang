@@ -261,6 +261,27 @@ class Envs:
     # the same pool, is the cold-read anchor; #690 measured the pinned DMA
     # refill at 9,614.9 MiB/rank). Requires SGLANG_PHASE_FLIP_IMAGE_DIR on a
     # persistent filesystem; refuses (never silently pins) otherwise.
+    # #830 F4: the seam's DRAIN BUDGET, in milliseconds -- the longest #760
+    # device-tier quiesce the flip will enter the no-return window carrying.
+    # Above it the arm is REFUSED BY NAME (bounded defer, then escalate and
+    # proceed, exactly as #721's host-RAM guard does) instead of the seam
+    # silently holding the ring for as long as the drain happens to take.
+    #
+    # THE DEFAULT IS DERIVED, NOT PINNED, and 1094 is odd on purpose so it
+    # stays traceable. It is the largest cutover step observed anywhere in the
+    # pre-integration corpus ANALYSE_830 section 2.1 measures: 1014 flips with
+    # HiCache off, across boot_knowngood_r15 (503 flips), the 303-flip
+    # 2026-08-17 bundle, boot_735_nohc and boot_735_w2 -- max cutover 1094 ms,
+    # max total 4155 ms, zero faults. So the claim behind the number is
+    # narrow and checkable: the seam has demonstrably held the ring this long,
+    # a thousand times, without producing a single fault. A projected drain
+    # that would push past a duration with that much clean evidence behind it
+    # is worth refusing an arm over.
+    #
+    # 0 disables the guard (no refusal, projection still logged). Raise it if
+    # a boot shows the refusal firing on drains that complete harmlessly --
+    # that is data, and this number should move on data.
+    SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS = EnvInt(1094)
     SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
     SGLANG_PHASE_FLIP_IMAGE_DIR = EnvStr("")
     # #802: refill a FILE-BACKED image by READING the file into a pinned

@@ -1188,6 +1188,107 @@ def flip_host_headroom_verdict(
     )
 
 
+#: #830 F4: how many consecutive seam-budget refusals before the guard stands
+#: aside. Same bound and same reasoning as #721's FLIP_HOST_RAM_MAX_DEFERS: the
+#: flip is how this instance alternates prefill and decode, so a PERMANENT
+#: refusal converts a latency hazard into a certain half-service outage. This
+#: guard exists to make a long seam NAMED, not to make the flip optional.
+FLIP_SEAM_BUDGET_MAX_DEFERS: int = 3
+
+#: The refusal reason, spelled once, so a boot log greps for one token.
+SEAM_BUDGET_REFUSED = "SEAM-BUDGET-REFUSED"
+
+
+def flip_seam_drain_budget_ms() -> int:
+    """#830 F4: the seam drain budget in ms, from the environment.
+
+    Read through ``envs`` so the default and its derivation live in one place
+    (see ``SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS`` in environ.py: the 1094 ms
+    maximum cutover observed across 1014 fault-free pre-integration flips).
+    """
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS.get()))
+    except Exception:  # noqa: BLE001 - a budget lookup must not break a flip
+        return 0
+
+
+def flip_seam_budget_verdict(
+    projected_drain_ms,
+    defers_so_far: int,
+    budget_ms: Optional[int] = None,
+    max_defers: int = FLIP_SEAM_BUDGET_MAX_DEFERS,
+):
+    """``(allow, escalated, detail)`` for one flip's seam-window budget (#830 F4).
+
+    THE POINT IS THE NAME, NOT THE REFUSAL. ANALYSE_830 F4: "Nothing in the
+    tree caps how long the seam may hold the ring. A named ceiling converts a
+    silent 24-second exposure into a refusal that names itself." The measured
+    exposure this answers is real -- single flips reaching 24892 ms and single
+    cutovers 13742 ms, against a HiCache-off corpus where 1014 flips never
+    exceeded 4155 ms total or 1094 ms of cutover.
+
+    THE PROJECTION IS THE LAST MEASURED DRAIN, deliberately. It is the only
+    honest projector available before the seam: the drain's duration is a
+    property of the backlog on the controller's private streams, which nothing
+    at arm time can enumerate. Using last-measured means the FIRST slow drain
+    is never refused -- it is what teaches the guard -- and a persistently slow
+    one is. That is a real limitation and it is stated rather than dressed up:
+    this guard cannot catch a one-off spike, only a standing condition.
+
+    ``projected_drain_ms`` None, or a budget of 0, means NO GUARD -- allow and
+    say so. This mirrors #721's rule that a flip must never be refused on a
+    fabricated number: a refusal is the thing with a service cost, so an
+    unknown must not produce one.
+    """
+    if budget_ms is None:
+        budget_ms = flip_seam_drain_budget_ms()
+    budget_ms = max(0, int(budget_ms))
+    if budget_ms == 0:
+        return True, False, "seam drain budget disabled (0) -- guard stood down"
+    if projected_drain_ms is None:
+        return (
+            True,
+            False,
+            "seam drain unmeasured -- guard stood down (no honest projection)",
+        )
+    projected = float(projected_drain_ms)
+    if projected <= budget_ms:
+        return (
+            True,
+            False,
+            (
+                f"seam drain OK: projected {projected:.1f} ms <= budget "
+                f"{budget_ms} ms"
+            ),
+        )
+    if int(defers_so_far) >= int(max_defers):
+        return (
+            True,
+            True,
+            (
+                f"{SEAM_BUDGET_REFUSED} ESCALATED after {defers_so_far} "
+                f"refusals: projected drain {projected:.1f} ms > budget "
+                f"{budget_ms} ms. PROCEEDING WITH EYES OPEN -- a permanent "
+                f"refusal would stop the instance alternating prefill and "
+                f"decode, which is a certain outage, while a long seam is a "
+                f"latency hazard. The exposure is now NAMED, which is the "
+                f"whole difference from before this guard existed."
+            ),
+        )
+    return (
+        False,
+        False,
+        (
+            f"{SEAM_BUDGET_REFUSED}: projected drain {projected:.1f} ms > "
+            f"budget {budget_ms} ms; refusal {int(defers_so_far) + 1} of "
+            f"{max_defers}, the flip is retried next round. The seam would "
+            f"hold the ring for the drain on top of its own work."
+        ),
+    )
+
+
 _DISK_TIER_ARM_WARNED = False
 
 
@@ -1285,6 +1386,76 @@ def flip_blocking_guards(scheduler) -> List[str]:
     #
     # If this configuration ever wedges again, restore the clause and do NOT
     # accept a green mock suite as grounds to lift it a third time.
+    #
+    # ------------------------------------------------------------------
+    # #830 F3 -- THE TRIGGER ABOVE HAS FIRED. THIS IS THE ANSWER TO IT.
+    # 2026-08-23. See /spinning/evidence-665-f1/ANALYSE_830_flip_regression_
+    # attribution.md, sections 6.1 and 8 (candidate F3).
+    #
+    # The author of d4e71e64cf (2026-08-17 13:56) wrote the sentence directly
+    # above as this clause's own exit condition:
+    #
+    #     "If it wedges again: restore the clause, and do not accept a green
+    #      mock suite as grounds to lift it a third time."
+    #
+    # It wedged again: #767, #771, #787, #796, #798, #801, #802, and W12. The
+    # antecedent is not in dispute, and an author-set trigger that fires and
+    # goes unanswered is worse than no trigger. So it is answered here, in the
+    # tree, at the clause it governs.
+    #
+    # DECISION: THE REFUSAL IS NOT RESTORED. Recorded with its reasons so a
+    # later reader can overturn it on evidence rather than re-litigate it.
+    #
+    # 1. THE CLAUSE IS NO LONGER AVAILABLE AS A REMEDY. Three standing user
+    #    laws now require this exact combination to run: default serving always
+    #    carries the full feature set; sglang never boots on anything but the
+    #    newest tree; and HiCache must be phase-uniform, with a per-phase cache
+    #    geometry named as a defect rather than an endpoint. Restoring the
+    #    clause would not make the instance safe -- it would make it refuse to
+    #    boot in its required configuration, converting a latency defect into a
+    #    total outage. That is the same trade #721's own bounded defer already
+    #    rejected: "a permanent hold is WORSE than the hazard".
+    #
+    # 2. THE MEASUREMENT SAYS THE CLAUSE WOULD NOT HAVE FIXED THE RIGHT THING.
+    #    ANALYSE_830's verdict is exposure-window inflation, not a new hole:
+    #    the timing-coupled cutover edges predate the integration, and with
+    #    HiCache off, 1014 instrumented flips never exceeded 4155 ms total.
+    #    What the integration changed is how long the seam holds the ring --
+    #    32-50 ms of cutover became 2209-3773 ms (max 13742 ms). A gate that
+    #    refuses the configuration hides that window; it does not shrink it.
+    #
+    # 3. WHAT IS BEING DONE INSTEAD -- the three postings that shrink the
+    #    window the trigger was really complaining about:
+    #      F2  take the KV-pool recovery out of the cutover. Measured, not
+    #          assumed: the cutover term is `recover_kv_backing`, at 99% of it
+    #          across 63 rank-flips in two independent boots. NOTE, because it
+    #          corrects ANALYSE_830 section 8 itself: F2 was filed against
+    #          #719's pool rebind, and that is WRONG -- the rebind's own step
+    #          measures 0.25-0.7 ms mean (max 2.4 ms) on both sides of the
+    #          flag, and `rebind_for_cutover` returns None by default anyway
+    #          (hicache_phase_binding.py, `phase_flip_rebind_hicache`).
+    #      F1  get the HiCache stream drain off the seam's critical path.
+    #      F4  a NAMED seam budget: refuse to arm when the projected drain
+    #          exceeds it, instead of silently exposing a 24-second window.
+    #
+    # 4. WHAT WOULD OVERTURN THIS. Not a green mock suite -- the author's
+    #    second sentence stands and is honoured. Restore the clause if, after
+    #    F1/F2/F4 are on metal, a boot still shows the seam holding the ring
+    #    beyond the F4 budget, or the `PROXY LEFTOVER REFUSED` form recurs with
+    #    the seam measured back inside its pre-integration band. Either would
+    #    mean the window was not the mechanism, and then the configuration
+    #    itself is what has to go.
+    #
+    # HONEST RESIDUE, so this is not read as a clean acquittal: `recover_kv_
+    # backing` is not HiCache code, yet it costs 8.8 ms per cutover with
+    # HiCache off and ~5000 ms with it on. HiCache is therefore implicated in
+    # the inflation, but the MECHANISM by which its presence slows the pool
+    # grow (cached-segment competition, pinned-host pressure, allocator
+    # serialization) is NOT established here. That is an open question, not a
+    # closed one, and it is the reason item 4 above keeps the clause a live
+    # option rather than deleting it.
+    # ------------------------------------------------------------------
+    #
     # WARNING-NOT-BLOCKER (corridor canon): a disk tier WITHOUT a pipeline is
     # still allowed, and the first such arm says so exactly once, so a
     # regression there has an attribution line.
@@ -1436,6 +1607,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # only the total, so the spread cannot be attributed from it; the 43.5
         # ms minimum is the honest target. These marks cost one perf_counter
         # call per step and change no control flow.
+        #
+        # #830 F5: the marks below used to end the whole 7b..8 span in ONE
+        # bucket named ``draft_state``, and that bucket carried 99.98% of the
+        # cutover term in every boot measured (PP0, mean ms):
+        #
+        #   boot_735_nohc2  HiCache off  cutover  50.2  draft_state  18.9
+        #   boot_735_hc1    HiCache on   cutover 3448.9 draft_state 3417.3
+        #   boot_735_acc767 HiCache on   cutover 3773.0 draft_state 3741.2
+        #
+        # while ``verify+publish+trace`` -- which contains #719's pool rebind,
+        # the term ANALYSE_830 F2 named as the leading suspect -- measured
+        # 0.25-0.7 ms mean, max 2.4 ms, on BOTH sides of the flag. So the
+        # single-bucket shape was actively misleading: it hid the only step
+        # that moves behind a label naming a step that does not. The span is
+        # now split at its own call boundaries, so the next boot attributes
+        # the term by measurement instead of by reconstruction.
+        #
+        # The label ``draft_state`` therefore no longer appears on its own;
+        # it is the SUM of retune + spill_rung2 + rung4_cold_stack +
+        # draft_bootstrap + kv_recover + spec_clear + relay_reseed +
+        # abort_drain, which is how historical logs stay comparable.
         _marks = [("enter", time.perf_counter())]
 
         def _mark(label: str) -> None:
@@ -1794,6 +1986,8 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 want_spec_algo,
             )
 
+        _mark("retune")
+
         # 7b-i. SPILL RUNG 2 (#656 spec item 6): the draft weights.
         #
         # WHY HERE AND NOT AT THE PRE-WAVE SITE. The design note proposed
@@ -1825,6 +2019,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             if _ladder is not None:
                 _ladder.on_enter_tp(stacks.draft_worker)
 
+            _mark("spill_rung2")
             # 7b-ii. SPILL RUNG 4: the posts the BOOT deferred.
             #
             # BETWEEN the weight restore above and the bootstrap below, and
@@ -1849,7 +2044,9 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     LOG_PREFIX,
                 )
 
+            _mark("rung4_cold_stack")
             arm_draft_bootstrap_all_reachable(scheduler, want_draft)
+            _mark("draft_bootstrap")
 
             # #662-F4: AND THE MIRROR OF THE RECOVERY BELOW. Since the rung
             # funds the seam from whichever layout is RESIDENT, the tp_to_pp
@@ -1866,12 +2063,15 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             from sglang.srt.managers.phase_flip_spill import recover_kv_backing
 
             recover_kv_backing(scheduler, reduce_fn=reduce_fn)
+            _mark("kv_recover")
         else:
             # ``stacks.draft_worker``, not ``want_draft``: want_draft is None
             # on this leg by design (that is the point of the leg), while the
             # carrier is parked on the worker object the stacks still hold.
             if _ladder is not None:
                 _ladder.on_enter_pp(stacks.draft_worker)
+
+            _mark("spill_rung2")
 
             # The scheduler's KV pool is the PP layout's, so entering PP makes
             # it the ACTIVE pool again and any residency relief taken against
@@ -1882,7 +2082,87 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
 
             # #656 C22-e: the grow is rank-local by necessity, the ID SPACE it
             # produces may not be. See recover_kv_backing.
+            # ==============================================================
+            # #830 F2 -- THIS CALL IS THE CUTOVER TERM. Measured, not guessed.
+            #
+            # ANALYSE_830 section 8 filed F2 against #719's pool rebind. That
+            # was wrong, and the correction matters more than the original
+            # claim: the rebind's own sub-step measures 0.25-0.7 ms mean (max
+            # 2.4 ms) on both sides of the HiCache flag, and rebind_for_cutover
+            # returns None by default anyway. The cost is HERE.
+            #
+            # THE MEASUREMENT (from the #690 marks, which were emitting in
+            # every boot all along -- see the F5 note at the top of _cutover):
+            #   cutover term, PP0 mean:  50.2 ms HiCache off, 3448.9 / 3773.0
+            #   ms HiCache on. The whole of it lands in the 7b..8 span, and
+            #   inside that span the gap between "rung 2 SPILLED the draft
+            #   weights" and the next emitted line -- which contains ONLY this
+            #   call -- tracks the cutover total at 99-101% across 63
+            #   rank-flips in two independent boots (boot_735_acc767,
+            #   boot_735_hc1), and falls to 0 s exactly when the cutover falls
+            #   to ~9 ms. The indicator moves in BOTH directions.
+            #
+            # WHY IT IS STILL HERE, i.e. why this is a note and not a patch.
+            # The obvious cut -- defer the recovery to the first post-flip
+            # round -- was analysed against the code and NOT taken:
+            #
+            #   * recover_kv_backing is TWO halves. The expensive one,
+            #     relief.recover() -> runtime_set_backing_rows -> cuMemCreate /
+            #     cuMemMap (kv_backing_relief.py:2682, memory_pool.py:2972-3081,
+            #     kv_vmm_backing.py:1297-1347), is 100% RANK-LOCAL: there is not
+            #     one collective anywhere in kv_backing_relief.py. The cheap one
+            #     -- the cap agreement at phase_flip_spill.py:1250-1320 -- is a
+            #     collective through reduce_fn (production passes
+            #     flip_collective_min, this file's cutover build site).
+            #   * So the grow could move out safely. THE LEVELLING CANNOT MOVE
+            #     WITH IT, and it cannot be dropped either: recover() ends by
+            #     re-exposing ids against its OWN backing, and a corridor-bounded
+            #     grow leaves ranks unequal (measured on this rig: 210944 /
+            #     124928 / 131072 backed rows). An id one rank exposes and a peer
+            #     cannot map aborts ALL THREE inside store_kvcache's bounds
+            #     assert. The levelling is what prevents that, and it must
+            #     therefore run before the pool is used again.
+            #   * Running that collective at a post-cutover round cadence is
+            #     precisely the shape on_round's own docstring was written
+            #     against (the 2026-08-08 boots 9/10 PP wedge): a blocking
+            #     reduction entered at a LOCAL cadence can pair with a peer
+            #     blocked in a pipeline recv. "Just after a cutover" is
+            #     approximately synchronized, and approximately is what that
+            #     wedge punished.
+            #   * And skipping a recovery has its own catastrophic mode, already
+            #     paid for once: recover_kv_backing_on_abandon's docstring
+            #     records the ratchet -- cap never lifted, pool at 26.8% of its
+            #     id space for the life of the process, a user served an
+            #     overloaded_error against a pool sized 3.7x larger.
+            #
+            # WHAT THE NEXT STRAND SHOULD DO, in order:
+            #   1. Split recover_kv_backing into grow (rank-local) and level
+            #      (collective) as separate callables. The seam then runs
+            #      grow-then-level as today, with no behaviour change, and the
+            #      split is provable by test before anything moves.
+            #   2. Defer ONLY the grow, and keep the pool's exposure clamped to
+            #      the pre-grow group level until the levelling runs, so no rank
+            #      can expose an id a peer has not backed. That is the invariant
+            #      to write the red arm against FIRST.
+            #   3. Level on the seam's existing OFF-SEAM funding-verdict cadence
+            #      (collective_kv_backing_relief -> apply_cap_agreement, already
+            #      collective and already outside the no-return window), not on
+            #      a fresh round hook. cap_proposal is documented as strictly
+            #      non-allocating and self-healing in exactly this direction:
+            #      "a rank that recovers raises its own proposal, and its peers
+            #      follow by RELEASING a cap over pages they never gave up."
+            #   4. Guard the ratchet explicitly: a deferred grow that has not
+            #      drained after N rounds is a loud error naming #814's trap,
+            #      the way the abort window's "drain missed" check does.
+            #
+            # This needs a GPU window to validate: the failure modes are a
+            # three-rank abort and a silent permanent pool shrink, neither of
+            # which a hermetic suite can observe. Shipping it on desk evidence
+            # alone would be the "green mock suite" this file already refuses
+            # to accept once, seventy lines up.
+            # ==============================================================
             recover_kv_backing(scheduler, reduce_fn=reduce_fn)
+            _mark("kv_recover")
 
             # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
             # the relay re-seed, so that nothing between the stack swap and
@@ -1900,6 +2180,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     ", ".join(spec_rids) or "-",
                 )
 
+            _mark("spec_clear")
             # THE TP->PP LEG'S OWN HANDOVER. The PP phase's first decode
             # gathers its input token out of the future-map relay, and the
             # speculative phase it is leaving never wrote that relay (the
@@ -1919,6 +2200,8 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     reseeded,
                 )
 
+            _mark("relay_reseed")
+
         # 8. Deferred aborts drain in the first post-flip round.
         window = getattr(scheduler, "phase_flip_abort_window", None)
         if window is not None and window.active:
@@ -1930,7 +2213,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     drained,
                 )
 
-        _mark("draft_state")
+        _mark("abort_drain")
         # 9. Completeness self-check: every snapshot the rebuild list names
         # is verified against the routed source of truth, HERE, before the
         # first post-flip round can touch a stale handle. A missed rebuild
@@ -1979,6 +2262,16 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # ATTRIBUTED instead of guessed at. Emitted after the completeness
         # check so a cutover that failed verification never reports timings as
         # if it had succeeded.
+        #
+        # #830 F5: the literal token "#690" is part of the EMITTED text, not
+        # only of this comment. ANALYSE_830 section 6.3 ran `grep -c '#690'`
+        # over six boot logs, got 0, and concluded the marks "are not present
+        # in these boots" -- so the cutover term was reported as UNMEASURABLE
+        # (open item O4) and F2 was aimed at the rebind on that basis. The
+        # marks were in fact emitting in every one of those logs, three per
+        # flip; the grep was searching for a string that only ever existed in
+        # the source. An instrument whose documented grep does not match its
+        # own output is not an instrument. Keep the ticket token in the line.
         try:
             steps = [
                 (_marks[i + 1][0], (_marks[i + 1][1] - _marks[i][1]) * 1000.0)
@@ -1987,7 +2280,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             total_ms = (_marks[-1][1] - _marks[0][1]) * 1000.0
             worst = sorted(steps, key=lambda kv: kv[1], reverse=True)
             logger.warning(
-                "%s CUTOVER SUB-STEPS %s total=%.1f ms | %s",
+                "%s [#690] CUTOVER SUB-STEPS %s total=%.1f ms | %s",
                 LOG_PREFIX,
                 direction,
                 total_ms,
@@ -3868,7 +4161,7 @@ class PhaseFlipRuntime:
             verdict.reason,
         )
 
-    def _quiesce_hicache(self, direction: str) -> None:
+    def _quiesce_hicache(self, direction: str) -> float:
         """#760: drain the cache controller's device-tier streams at the seam.
 
         Reaches the controller through the census scheduler handle (absent in
@@ -3877,6 +4170,32 @@ class PhaseFlipRuntime:
         instance down, and the seam guard above still refuses NEW I/O -- only
         already-in-flight copies remain exposed, which is the pre-fix state,
         not a new hazard.
+
+        #830 F1: RETURNS THE DRAIN IN MILLISECONDS, and the caller records it.
+        ``quiesce_device_io``'s own docstring already promised this -- "Returns
+        the wait in seconds; the caller logs it into the seam record so a slow
+        drain is attributable instead of vanishing into the flip's residual
+        (#690)" -- but this method DISCARDED the return value, so the drain
+        vanished into exactly the residual that sentence names.
+
+        That mattered, because the drain was filed (ANALYSE_830 F1) as the
+        leading cause of the movers inflation (mean movers 2715-2898 ms with
+        HiCache off vs 8113-18083 ms with it on) purely on the strength of its
+        own docstring saying the copies "outlive their Python call by seconds".
+        The one boot where the drain's line survives says otherwise:
+        ``boot_window2_0823_1554.log``, current tree, 18 emissions, mean AND
+        max 0.0 ms -- against movers of 5915.9 ms in that same boot. So in this
+        tree the drain is not the movers cost. It is left in place (removing it
+        re-opens the two #760 SIGSEGVs, which is a correctness trade nobody
+        should take for latency), and it is now MEASURED at the seam instead of
+        being argued about from a docstring.
+
+        The caveat is stated rather than buried: the 08-19 boots carrying the
+        big movers numbers predate this drain's log line entirely, so this is a
+        measurement on the current tree, not a retro-acquittal of the 08-19
+        ones. What it does establish is that today the movers term needs a
+        different explanation, and F4's budget is what will catch the drain if
+        it ever does become the cost.
         """
         scheduler = getattr(self, "_census_scheduler", None)
         controller = getattr(
@@ -3884,9 +4203,21 @@ class PhaseFlipRuntime:
         )
         quiesce = getattr(controller, "quiesce_device_io", None)
         if quiesce is None:
-            return
+            return 0.0
         try:
-            quiesce(f"phase flip {direction}")
+            elapsed_s = quiesce(f"phase flip {direction}")
+            drain_ms = float(elapsed_s or 0.0) * 1000.0
+            # Carries LOG_PREFIX deliberately: the controller's own line has no
+            # prefix and no direction, so it cannot be correlated with the flip
+            # it belongs to in a three-rank log.
+            logger.warning(
+                "%s [#760] SEAM DRAIN %s: device-tier streams quiesced in "
+                "%.1f ms at the no-return point.",
+                LOG_PREFIX,
+                direction,
+                drain_ms,
+            )
+            return drain_ms
         except Exception as e:  # noqa: BLE001 - the seam must not die here
             logger.error(
                 "%s #760 HiCache stream quiesce failed (%s); in-flight "
@@ -3896,6 +4227,7 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
                 e,
             )
+            return 0.0
 
     def _pool_census(self, when: str, direction: str) -> None:
         """#631 defect J: the allocator's own view, straddling the cutover.
@@ -7686,6 +8018,65 @@ class PhaseFlipRuntime:
         )
         return union, ""
 
+    def record_host_ram_defer(self, direction: str, host_detail: str) -> int:
+        """#830 F6: COUNT THE #721 DEFER, AT WARNING, WITH A STABLE TOKEN.
+
+        ANALYSE_830 open item O1 is "#721 defer frequency: UNMEASURED. No log
+        line counted." That is not because the path is silent -- it is because
+        what it emitted could not be COUNTED. The ``HOST HEADROOM`` line at the
+        call site fires on every flip whether the verdict allows or defers, so
+        its count is the flip count and says nothing; the defer's own text was
+        folded into that same info-level line and carried no running total. A
+        strand reading a boot log could not answer "how often did this fire"
+        without parsing prose out of a per-flip line.
+
+        WHY THIS ONE DESERVES A COUNTER. A defer appends to ``too_small``, so
+        the rank votes the flip unfit and its ARMED WINDOW ENDS EARLY AND
+        RANK-LOCALLY. That is the shape that diverges resume slots between
+        peers -- one rank abandoning for a reason its peers never observed,
+        because host RAM is measured per rank. The lifetime total is what turns
+        "it happened" into a rate, and the rate is what decides whether #721's
+        own author was right to call this floor unfitted ("I have NO measured
+        projected host transient for the flip").
+
+        Returns the new lifetime total, so a caller or test can assert on the
+        count rather than on the string.
+        """
+        self._host_ram_defer_total = int(getattr(self, "_host_ram_defer_total", 0)) + 1
+        logger.warning(
+            "%s [#721] HOST-RAM DEFER %s: consecutive=%d of %d, lifetime=%d. "
+            "This rank votes the flip unfit, so its armed window ends early "
+            "and RANK-LOCALLY -- peers that saw ample host RAM do not abandon "
+            "for this reason. %s",
+            LOG_PREFIX,
+            direction,
+            int(getattr(self, "_host_ram_defers", 0)),
+            FLIP_HOST_RAM_MAX_DEFERS,
+            self._host_ram_defer_total,
+            host_detail,
+        )
+        return self._host_ram_defer_total
+
+    def record_host_ram_escalation(self, direction: str, host_detail: str) -> int:
+        """#830 F6: the defer path's OTHER exit, counted SEPARATELY.
+
+        A defer retries; an escalation PROCEEDS ANYWAY under a floor the guard
+        just failed. Those are opposite outcomes -- one costs a flip, the other
+        accepts the hazard #721 exists to avoid -- and a single merged counter
+        would hide which one a boot actually took.
+        """
+        self._host_ram_escalation_total = (
+            int(getattr(self, "_host_ram_escalation_total", 0)) + 1
+        )
+        logger.warning(
+            "%s [#721] HOST-RAM ESCALATION %s: lifetime=%d. %s",
+            LOG_PREFIX,
+            direction,
+            self._host_ram_escalation_total,
+            host_detail,
+        )
+        return self._host_ram_escalation_total
+
     def _execute(self) -> Optional[dict]:
         direction = self._pending
         assert direction is not None
@@ -7853,14 +8244,76 @@ class PhaseFlipRuntime:
             logger.info("%s HOST HEADROOM %s: %s", LOG_PREFIX, direction, host_detail)
             if not allow_host:
                 self._host_ram_defers = int(getattr(self, "_host_ram_defers", 0)) + 1
+                # #830 F6: counted, at warning, with a stable token -- O1.
+                self.record_host_ram_defer(direction, host_detail)
                 too_small.append(host_detail)
             else:
                 if escalated:
-                    logger.warning("%s %s", LOG_PREFIX, host_detail)
+                    self.record_host_ram_escalation(direction, host_detail)
                 self._host_ram_defers = 0
         except Exception as exc:  # noqa: BLE001 - a guard must not break a flip
             logger.warning(
                 "%s host-headroom guard could not run (%r); the flip proceeds "
+                "unguarded rather than being refused on an unknown.",
+                LOG_PREFIX,
+                exc,
+            )
+
+        # #830 F4: THE SEAM WINDOW GETS A NAMED CEILING.
+        #
+        # Placed beside #721's host-RAM guard because it is the same kind of
+        # object -- an arm-time verdict that votes through ``too_small``,
+        # bounded, escalating rather than holding forever -- and because both
+        # answer "should this flip enter its no-return window right now".
+        #
+        # It projects from the LAST measured drain (see flip_seam_budget_verdict
+        # for why that is the only honest projector, and for what it therefore
+        # cannot catch). Before any flip has measured one, the projection is
+        # None and the guard stands down: an unknown must never produce a
+        # refusal, which is #721's rule and it applies unchanged here.
+        try:
+            projected_drain = getattr(self, "_seam_drain_ms", None)
+            allow_seam, seam_escalated, seam_detail = flip_seam_budget_verdict(
+                projected_drain, int(getattr(self, "_seam_budget_defers", 0))
+            )
+            logger.info(
+                "%s SEAM BUDGET %s: %s", LOG_PREFIX, direction, seam_detail
+            )
+            if not allow_seam:
+                self._seam_budget_defers = (
+                    int(getattr(self, "_seam_budget_defers", 0)) + 1
+                )
+                self._seam_budget_refusals = (
+                    int(getattr(self, "_seam_budget_refusals", 0)) + 1
+                )
+                logger.warning(
+                    "%s [#830] %s %s: consecutive=%d of %d, lifetime=%d. %s",
+                    LOG_PREFIX,
+                    SEAM_BUDGET_REFUSED,
+                    direction,
+                    self._seam_budget_defers,
+                    FLIP_SEAM_BUDGET_MAX_DEFERS,
+                    self._seam_budget_refusals,
+                    seam_detail,
+                )
+                too_small.append(seam_detail)
+            else:
+                if seam_escalated:
+                    self._seam_budget_escalations = (
+                        int(getattr(self, "_seam_budget_escalations", 0)) + 1
+                    )
+                    logger.warning(
+                        "%s [#830] %s ESCALATION %s: lifetime=%d. %s",
+                        LOG_PREFIX,
+                        SEAM_BUDGET_REFUSED,
+                        direction,
+                        self._seam_budget_escalations,
+                        seam_detail,
+                    )
+                self._seam_budget_defers = 0
+        except Exception as exc:  # noqa: BLE001 - a guard must not break a flip
+            logger.warning(
+                "%s seam-budget guard could not run (%r); the flip proceeds "
                 "unguarded rather than being refused on an unknown.",
                 LOG_PREFIX,
                 exc,
@@ -8148,7 +8601,10 @@ class PhaseFlipRuntime:
         # phase is the one its bindings belong to), so the seam must arm
         # after it and the drain must cover it.
         self.hicache_seam_active = True
-        self._quiesce_hicache(direction)
+        # #830 F1: the drain's cost is RECORDED, not discarded. It lands in
+        # last_stats["drain_ms"] and in its own prefixed line, so "is the drain
+        # the seam's cost?" is answered by a grep instead of by argument.
+        self._seam_drain_ms = self._quiesce_hicache(direction)
         seam_census.mark("hicache_quiesce")
 
         # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
@@ -8478,6 +8934,12 @@ class PhaseFlipRuntime:
             "movers_ms": movers_ms,
             "cutover_ms": cutover_ms,
             "total_ms": total_ms,
+            # #830 F1: the #760 device-tier drain, which is INSIDE movers_ms.
+            # Kept out of the DONE line's parenthesised list on purpose --
+            # ANALYSE_830 section 10's reproduction regex pins that list ending
+            # at "cutover N ms)", and silently breaking the analysis's own
+            # documented grep is the exact failure this ticket is repairing.
+            "drain_ms": float(getattr(self, "_seam_drain_ms", 0.0)),
         }
         self.last_stats = stats
         logger.warning(
