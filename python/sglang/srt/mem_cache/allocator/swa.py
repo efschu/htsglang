@@ -503,6 +503,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(free_index[free_index > 0])
 
     def free_group_begin(self):
+        # #827 W10 / #832 O-8: RECOVER, DO NOT DISCARD. This override re-opened
+        # the hole the base class was fixed for (allocator/base.py:273-283) by
+        # assigning `self.free_group = []` unconditionally, so rows staged by a
+        # window that was never closed were dropped at the next window's open --
+        # released from the radix tree, never returned to a free list, and
+        # unreachable from then on. Worse than a missing recovery: it is a
+        # permanent leak of exactly the rows W10 exists to recover, and under
+        # the default SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE the idle
+        # invariant then raises on them with no recovery path at all.
+        self.reclaim_abandoned_free_group()
         self.is_not_in_free_group = False
         self.free_group = []
 

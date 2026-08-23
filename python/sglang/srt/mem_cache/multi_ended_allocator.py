@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_row_ownership import FREE_WATERMARK
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
@@ -98,6 +99,15 @@ def _install_signal_handlers_once() -> None:
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
+
+    #: #832. Watermark accounting: this class never fills the base
+    #: `free_pages` / `release_pages` (they stay None) and tracks capacity as a
+    #: watermark plus `_free_phys_pages` holes. Declared even though the
+    #: scheduler holds a composite rather than this class directly, so that any
+    #: consumer reaching a sub-allocator gets the same answer the composite
+    #: gives -- the whole point of the declaration is that no reader has to
+    #: infer the shape.
+    census_free_accounting = FREE_WATERMARK
 
     def __init__(
         self,
@@ -1651,6 +1661,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     # -- free-group --
 
     def free_group_begin(self) -> None:
+        # #827 W10 / #832 O-8: RECOVER, DO NOT DISCARD. This override used to
+        # assign `self.free_group = []` unconditionally, which is the exact
+        # defect the base class was fixed for (allocator/base.py:273-283): rows
+        # staged by a window nobody closed are out of the radix tree, in no
+        # free list, and held by no request, so dropping the list here makes
+        # them unreachable for the life of the process and the idle invariant
+        # reports them as a fatal leak. Inheriting the base fix was not enough
+        # -- an override silently opts out of it.
+        self.reclaim_abandoned_free_group()
         self.is_not_in_free_group = False
         self.free_group = []
 
@@ -1670,6 +1689,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     separately by `UnifiedHybridReqToTokenPool`. Both sub-allocators are id-owners
     of their own (independent) virtual-id spaces.
     """
+
+    #: #832. This allocator's free capacity is a WATERMARK, not a page list:
+    #: `free_pages` / `release_pages` below are empty tensors kept only for the
+    #: leak checker, and space above the watermark has never been minted as ids
+    #: at all, so there is no set of free ids to hand out. Consumers must read
+    #: `available_size()` instead. Without this declaration the phase-flip pool
+    #: census read the empty page lists as "nothing is free" and reported every
+    #: free row as unaccounted -- and the #822 ownership audit, which consumes
+    #: the same reading, turned that into one false violation per free row.
+    census_free_accounting = FREE_WATERMARK
 
     def __init__(
         self,
@@ -1732,6 +1761,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
         # Base init left these None; we use watermark math, not free-lists.
+        # EMPTY HERE MEANS "NOT APPLICABLE", NEVER "NOTHING IS FREE" -- see the
+        # `census_free_accounting` declaration on this class.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
@@ -1895,6 +1926,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.clear_inverse_history()
 
     def free_group_begin(self) -> None:
+        # #827 W10 / #832 O-8: RECOVER, DO NOT DISCARD. This override used to
+        # assign `self.free_group = []` unconditionally, which is the exact
+        # defect the base class was fixed for (allocator/base.py:273-283): rows
+        # staged by a window nobody closed are out of the radix tree, in no
+        # free list, and held by no request, so dropping the list here makes
+        # them unreachable for the life of the process and the idle invariant
+        # reports them as a fatal leak. Inheriting the base fix was not enough
+        # -- an override silently opts out of it.
+        self.reclaim_abandoned_free_group()
         self.is_not_in_free_group = False
         self.free_group = []
 
@@ -1982,6 +2022,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
       = min(conserve, schedulable).
     """
 
+    #: #832, same reason as the mamba composite: watermark accounting, and the
+    #: `free_pages` / `release_pages` below are empty by construction.
+    census_free_accounting = FREE_WATERMARK
+
     # Parent's `size` property has no setter but base init does `self.size = size`;
     # override with a no-op setter. Reading returns `min(_size_full, _size_swa)`.
     @property
@@ -2067,7 +2111,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
-        # Empty (not None) for the leak checker.
+        # Empty (not None) for the leak checker. NOT a statement that nothing
+        # is free -- see the `census_free_accounting` declaration on this class.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
@@ -2424,6 +2469,15 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- free-group --
 
     def free_group_begin(self) -> None:
+        # #827 W10 / #832 O-8: RECOVER, DO NOT DISCARD. This override used to
+        # assign `self.free_group = []` unconditionally, which is the exact
+        # defect the base class was fixed for (allocator/base.py:273-283): rows
+        # staged by a window nobody closed are out of the radix tree, in no
+        # free list, and held by no request, so dropping the list here makes
+        # them unreachable for the life of the process and the idle invariant
+        # reports them as a fatal leak. Inheriting the base fix was not enough
+        # -- an override silently opts out of it.
+        self.reclaim_abandoned_free_group()
         self.is_not_in_free_group = False
         self.free_group = []
 
