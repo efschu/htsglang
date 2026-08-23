@@ -216,6 +216,94 @@ def head_decision(
     )
 
 
+#: "This rank cannot price its own limit." Rides as a large sentinel so a
+#: rank with nothing to say cannot pull the group's MIN down to zero.
+_UNPRICED_LIMIT = 1 << 30
+
+
+def build_admit_limit_payload(local_limit: Optional[int]) -> List[int]:
+    """This rank's vote for HOW MANY of the group head may be admitted.
+
+    One slot, MIN-reduced beside the order slots. ``None`` means this rank
+    has no opinion (no allocator to ask) and rides as the sentinel, exactly
+    as the host and mamba tiers do in the existing reduce.
+    """
+    if local_limit is None:
+        return [_UNPRICED_LIMIT]
+    return [max(0, int(local_limit))]
+
+
+def admit_limit_decision(
+    local_limit: Optional[int],
+    group_limit: Optional[int],
+    enforcer_enabled: bool,
+):
+    """THE SECOND VARIABLE. Same defect, same rule, different quantity.
+
+    Returns ``(limit, source)``.
+
+    Making the ORDER uniform is not sufficient: the candidate loop stops on
+    a RANK-LOCAL count (scheduler.py:7542 ``get_num_allocatable_reqs`` and
+    :7547 ``req_to_token_pool.available_size()``), and neither rides the
+    #610/#616g uniform floor that already covers ``PrefillAdder``'s token
+    budget. Equal order with unequal count is still unequal batches -- it is
+    what puts "#new-seq 1 vs 3" in the 0516 specimen alongside the
+    "#cached-token 0 vs 16384" that the order arm explains.
+
+    MIN, and for the third time in this file it is the safe direction: the
+    group limit is <= every rank's own, so no rank is ever asked to admit
+    more than it can seat. It can only ADMIT FEWER than it would have --
+    delay, never force. The rank-local capacities stay the INPUTS; only the
+    decision built from them becomes uniform, which is the
+    kein-bindender-rang line: a binding rank shortens this pass, it does not
+    own a permanent share.
+
+    An unpriced group reading (every rank sentinel) leaves the local limit
+    untouched, so a configuration with no allocator behaves exactly as it
+    does today.
+    """
+    if not enforcer_enabled or group_limit is None:
+        return local_limit, SOURCE_RANK_LOCAL
+    group_limit = int(group_limit)
+    if group_limit >= _UNPRICED_LIMIT:
+        return local_limit, SOURCE_RANK_LOCAL
+    return group_limit, SOURCE_GROUP
+
+
+def batch_decision(
+    canonical: Sequence[str],
+    group_match_lens: Sequence[int],
+    local_rids: Sequence[str],
+    local_match_lens: Dict[str, int],
+    local_limit: Optional[int],
+    group_limit: Optional[int],
+    digest_agreed: bool,
+    enforcer_enabled: bool,
+    slots: int = TP_HEAD_SLOTS,
+):
+    """The whole decision: WHICH requests, in WHICH order, HOW MANY.
+
+    Returns ``(admitted, order_source, limit_source)``. Both halves must be
+    uniform for the batch to be uniform, which is why they are decided in
+    one place rather than in two call sites that could drift apart.
+    """
+    order, order_source = head_decision(
+        canonical,
+        group_match_lens,
+        local_rids,
+        local_match_lens,
+        digest_agreed=digest_agreed,
+        enforcer_enabled=enforcer_enabled,
+        slots=slots,
+    )
+    limit, limit_source = admit_limit_decision(
+        local_limit, group_limit, enforcer_enabled
+    )
+    if limit is None:
+        return list(order), order_source, limit_source
+    return list(order)[: max(0, int(limit))], order_source, limit_source
+
+
 def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
     """Did every rank end up with the same decision?"""
     if not orders:
@@ -229,6 +317,9 @@ __all__ = [
     "SOURCE_GROUP",
     "SOURCE_RANK_LOCAL",
     "head_decision",
+    "build_admit_limit_payload",
+    "admit_limit_decision",
+    "batch_decision",
     "canonical_head_rids",
     "build_head_order_payload",
     "uniform_head_order",

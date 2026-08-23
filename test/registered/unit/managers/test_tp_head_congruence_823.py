@@ -332,3 +332,136 @@ def test_real_gloo_ranks_form_the_same_head(world):
     assert thc.head_order_is_uniform(orders), (
         f"{world} real gloo ranks formed different heads: {orders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part 4: the COUNT arm -- the same defect in the second variable.
+# ---------------------------------------------------------------------------
+#
+# Making the ORDER uniform is not sufficient. The candidate loop stops on a
+# RANK-LOCAL count (scheduler.py:7542 get_num_allocatable_reqs, :7547
+# req_to_token_pool.available_size()), and neither rides the #610/#616g
+# uniform floor that already covers PrefillAdder's token budget. Equal order
+# with unequal count is still unequal batches -- it is what puts
+# "#new-seq 1 vs 3" in the 0516 specimen next to the "#cached-token 0 vs
+# 16384" the order arm explains.
+
+#: Same order on both ranks (identical matches), different free pool. Rank 0
+#: can seat three requests, rank 1 only one. These are the specimen's numbers.
+SAME_MATCHES = {"r-alpha": 16, "r-bravo": 16, "r-charlie": 16, "r-delta": 16}
+LOCAL_LIMITS = {0: 3, 1: 1}
+
+
+def _count_decide(rank, enforcer_enabled, limits=None):
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    limits = LOCAL_LIMITS if limits is None else limits
+    canonical = thc.canonical_head_rids(RIDS)
+    reduced = _group_min(
+        [thc.build_head_order_payload(canonical, SAME_MATCHES) for _ in limits]
+    )
+    group_limit = _group_min(
+        [thc.build_admit_limit_payload(limits[r]) for r in sorted(limits)]
+    )[0]
+    return thc.batch_decision(
+        canonical,
+        reduced,
+        thc.local_head_order(RIDS, SAME_MATCHES),
+        SAME_MATCHES,
+        local_limit=limits[rank],
+        group_limit=group_limit,
+        digest_agreed=True,
+        enforcer_enabled=enforcer_enabled,
+    )
+
+
+def test_todays_local_count_really_does_diverge():
+    """THE PREMISE for this arm: same ORDER, different COUNT, so the batches
+    still differ -- the case an order-only fix would leave wedged."""
+    admitted = [_count_decide(r, enforcer_enabled=False)[0] for r in (0, 1)]
+
+    assert len(admitted[0]) == 3 and len(admitted[1]) == 1, admitted
+    assert admitted[0] != admitted[1], (
+        "the count fixture no longer models divergent pool pressure"
+    )
+
+
+def test_the_group_count_is_uniform_across_ranks():
+    """After the fix both ranks admit the SAME requests, MIN many."""
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    results = [_count_decide(r, enforcer_enabled=True) for r in (0, 1)]
+    admitted = [a for a, _, _ in results]
+    limit_sources = {ls for _, _, ls in results}
+
+    assert limit_sources == {thc.SOURCE_GROUP}, limit_sources
+    assert admitted[0] == admitted[1], admitted
+    assert len(admitted[0]) == 1, (
+        f"the group admitted more than the binding rank can seat: {admitted}"
+    )
+
+
+def test_the_group_never_asks_a_rank_to_seat_more_than_it_can():
+    """MIN, delay never force: the agreed count is <= every rank's own."""
+    for rank in (0, 1):
+        admitted, _, _ = _count_decide(rank, enforcer_enabled=True)
+        assert len(admitted) <= LOCAL_LIMITS[rank], (
+            f"rank {rank} was told to admit {len(admitted)} with room for "
+            f"{LOCAL_LIMITS[rank]}"
+        )
+
+
+def test_can_fail_with_the_count_enforcer_off_the_divergence_goes_silent():
+    """THE MUTANT LEVER for this arm, as a test."""
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    results = [_count_decide(r, enforcer_enabled=False) for r in (0, 1)]
+    admitted = [a for a, _, _ in results]
+    limit_sources = {ls for _, _, ls in results}
+
+    assert limit_sources == {thc.SOURCE_RANK_LOCAL}
+    assert admitted[0] != admitted[1], (
+        "with the count enforcer off the ranks agreed anyway, so this suite "
+        "could not tell an enforced pass from an unenforced one"
+    )
+
+
+def test_an_unpriced_group_leaves_the_local_limit_untouched():
+    """A configuration with no allocator to ask must behave exactly as it
+    does today, not collapse to a zero-sized batch."""
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    limit, source = thc.admit_limit_decision(
+        local_limit=5,
+        group_limit=thc.build_admit_limit_payload(None)[0],
+        enforcer_enabled=True,
+    )
+    assert limit == 5 and source == thc.SOURCE_RANK_LOCAL
+
+
+def test_both_arms_are_required_for_a_uniform_batch():
+    """ORDER alone and COUNT alone each leave a divergent batch, which is why
+    W9 is only green when both are enforced."""
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    canonical = thc.canonical_head_rids(RIDS)
+    reduced = _group_min(
+        [thc.build_head_order_payload(canonical, SAME_MATCHES) for _ in (0, 1)]
+    )
+    order_only = [
+        thc.batch_decision(
+            canonical,
+            reduced,
+            thc.local_head_order(RIDS, SAME_MATCHES),
+            SAME_MATCHES,
+            local_limit=LOCAL_LIMITS[r],
+            group_limit=None,
+            digest_agreed=True,
+            enforcer_enabled=True,
+        )[0]
+        for r in (0, 1)
+    ]
+    assert order_only[0] != order_only[1], (
+        "an order-only fix looked sufficient; the count arm would then be "
+        "untestable and #new-seq 1 vs 3 would survive it"
+    )
