@@ -6897,9 +6897,65 @@ class Scheduler(
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
+            # #838 CLASS 1: STAMP THE LAYOUT THIS BATCH WAS ADMITTED IN.
+            #
+            # THE SINGLE FUNNEL. This is the only return of this method that
+            # carries a batch, and every event loop (normal, overlap, and the
+            # PP body at scheduler_pp_mixin.py:1534) reaches `run_batch`
+            # through it, so one stamp here covers all of them. The decoupled
+            # spill batch does NOT come through here and therefore carries no
+            # stamp, which `admit_vs_exec_verdict` reads as "nothing to
+            # compare" rather than as a violation.
+            #
+            # STAMPED ON THE BATCH, not on the scheduler, and that is required
+            # rather than tidier. Under PP the batch does not run in the
+            # iteration that built it: `_event_loop_pp_body` parks it in the
+            # `mbs` slot ring and several other microbatches reach `run_batch`
+            # in between. A scheduler-side "last admission" would therefore be
+            # compared against the wrong microbatch on every PP boot -- which
+            # is the rig's own configuration. Riding on the batch, the stamp
+            # arrives at `run_batch` with the batch it belongs to, whatever
+            # the ring did in between.
+            #
+            # A batch that never came through here (the decoupled spill batch)
+            # simply carries no attribute, which the verdict reads as
+            # "nothing to compare" rather than as a violation.
+            # getattr / try: same STAND-IN discipline as the two call sites
+            # below, and a batch object that refuses the attribute simply
+            # goes unstamped, which the verdict reads as "nothing to compare".
+            try:
+                ret._layout_admitted_phase = getattr(
+                    self, "_layout_routing_phase", lambda: None
+                )()
+            except Exception:  # noqa: BLE001 - a detector may never break serving
+                pass
 
         self._note_round_build_outcome(ret, running_batch)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _layout_routing_phase(self) -> Optional[str]:
+        """#838: the layout the FORWARD will route in, read rank-locally.
+
+        The same authority the batch line's ``phase=`` field uses (#758,
+        metrics_reporter._active_phase_field) and the same one the model code
+        branches on -- ``phase_flip_tp_routing_active()``. A second source of
+        truth here would just be a new way to lie, which is the sentence #758
+        already wrote about this exact field.
+
+        None when the phase flip is off: there is only one layout, the
+        question is meaningless, and every #838 verdict declines on None.
+        """
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            return None
+        try:
+            from sglang.srt.distributed.parallel_state import (
+                phase_flip_tp_routing_active,
+            )
+            from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP
+
+            return PHASE_TP if phase_flip_tp_routing_active() else PHASE_PP
+        except Exception:  # noqa: BLE001 - a detector may never break serving
+            return None
 
     def get_num_allocatable_reqs(self, running_bs):
         # #287: the floating admission limit joins the existing bounds as one
@@ -8817,6 +8873,50 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    def _check_layout_conformance(self, batch: ScheduleBatch) -> None:
+        """#838 class 1, at the execution site: did this batch run where it
+        was admitted?
+
+        Called from the top of ``run_batch``, i.e. after the point at which a
+        cutover could still have committed since the scheduling pass, and
+        before the forward that would consume the wrong groups.
+
+        #713: ONE READING OF THE ROUTING FLAG, used by the comparison AND by
+        the message that reports it. Calling the accessor a second time to
+        build the alarm text is how a violation could name a phase the
+        comparison never saw -- and on this path the second read could even
+        disagree with the first, which would make the line self-refuting.
+
+        A detector may never break serving: everything here is guarded, and a
+        failure to READ is silence, never an alarm.
+        """
+        try:
+            executing = self._layout_routing_phase()
+            if executing is None:
+                return
+            # Local, like every other manager import reached from this class:
+            # `sys.modules` is a dict lookup against a millisecond-scale
+            # forward, and a module-level import here would be the only new
+            # E402 in a file where all ~90 of them are already the same
+            # finding.
+            from sglang.srt.managers import layout_conformance
+            admitted = getattr(batch, "_layout_admitted_phase", None)
+            reqs = getattr(batch, "reqs", None) or ()
+            rid = getattr(reqs[0], "rid", "-") if reqs else "-"
+            alarm, detail = layout_conformance.admit_vs_exec_verdict(
+                admitted,
+                executing,
+                rid,
+                int(getattr(self, "_pp_live_mb_id", -1) or -1),
+                getattr(self.phase_policy_state, "last_reason", None),
+            )
+            if alarm:
+                layout_conformance.note_conformance_violation(
+                    detail, time.perf_counter()
+                )
+        except Exception:  # noqa: BLE001 - a detector may never break serving
+            pass
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -8825,6 +8925,9 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        # getattr: same STAND-IN discipline as the policy gate -- a holder
+        # that binds `run_batch` unbound must not acquire a new requirement.
+        getattr(self, "_check_layout_conformance", lambda *_: None)(batch)
 
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
@@ -10740,6 +10843,18 @@ class Scheduler(
                     inp.pending_prefill_tokens,
                     inp.running_bs,
                 )
+            # #838: the two detectors that can only be evaluated HERE, where
+            # the verdict, the config, the state and the inputs are all in
+            # scope at once. Placed after the hold line so the alarm reads
+            # directly beneath the hold it contradicts.
+            # getattr, for the same reason the three call sites below and
+            # above it use it: this gate is driven in tests by scheduler
+            # STAND-INS that carry only the fields the policy reads. A
+            # stand-in without the detector must behave exactly as before,
+            # not raise AttributeError inside the arming path.
+            getattr(self, "_check_layout_policy_conformance", lambda *_: None)(
+                cfg, state, inp, decision
+            )
             # getattr, for the third time in this file and for the same
             # reason: the policy gate is driven in tests by scheduler
             # STAND-INS carrying only the fields the policy reads. A stand-in
@@ -10792,6 +10907,84 @@ class Scheduler(
         return PhaseFlipReqInput(
             direction=decision.direction, source="policy", internal=True
         )
+
+    def _check_layout_policy_conformance(self, cfg, state, inp, decision) -> None:
+        """#838 classes 1 and 2, at the policy site.
+
+        Runs on every round the policy HOLDS. It never influences the
+        decision -- it is read-only over cfg/state/inp/decision and returns
+        nothing -- so a defect in here can cost a spurious log line and
+        nothing else.
+
+        #713: ONE READING of the routing flag and ONE READING of
+        ``decision.reason``, both taken into locals here and passed down. The
+        verdict functions build their own messages from those same values and
+        never reach back for either. A second read is what would let the
+        alarm quote a verdict the comparison did not make.
+
+        #699 COVERAGE, and the reason this is not folded into that detector:
+        the admission-wedge verdict short-circuits to "not wedged" the moment
+        ``running > 0`` (invariant_checker.py:598), because a box that is
+        serving is by its definition not wedged. The window-3 shape has 5 to
+        7 requests decoding throughout, so it is invisible there by
+        construction. Class 2 is keyed to the ECONOMICS of the hold rather
+        than to the absence of service, and therefore has no such guard: it
+        fires at any ``running_bs``.
+        """
+        try:
+            from sglang.srt.managers import layout_conformance
+            from sglang.srt.managers.phase_policy import (
+                drain_stall_deadline_s,
+                flip_cost_measured,
+                live_flip_cost_s,
+                live_flip_tokens,
+            )
+
+            reason = decision.reason
+            mb_id = int(getattr(self, "_pp_live_mb_id", -1) or -1)
+            now = inp.now
+
+            routing = self._layout_routing_phase()
+            if routing is not None:
+                alarm, detail = layout_conformance.verdict_vs_routing_verdict(
+                    inp.phase, routing, mb_id, reason
+                )
+                if alarm:
+                    layout_conformance.note_conformance_violation(detail, now)
+
+            window_s = layout_conformance.economy_window_s(
+                drain_stall_deadline_s(cfg)
+            )
+            held_s = 0.0 if state.phase_since is None else now - state.phase_since
+            # Never observed shrinking -> the whole occupancy has passed with
+            # no recorded progress, which is exactly what that reads as.
+            bundle_stall_s = (
+                held_s
+                if state.last_bundle_progress_at is None
+                else now - state.last_bundle_progress_at
+            )
+            alarm, detail = layout_conformance.economy_divergence_verdict(
+                phase=inp.phase,
+                held_s=held_s,
+                window_s=window_s,
+                pending_prefill_tokens=int(inp.pending_prefill_tokens),
+                live_flip_tokens=int(live_flip_tokens(cfg)),
+                live_flip_cost_s=float(live_flip_cost_s(cfg)),
+                price_measured=bool(flip_cost_measured()),
+                hold_reason=reason,
+                since_flip_s=now - state.last_flip_at,
+                min_dwell_s=float(cfg.min_dwell_s),
+                staging_active=bool(
+                    getattr(self, "phase_flip_is_armed", lambda: False)()
+                ),
+                running_bs=int(inp.running_bs),
+                bundle_at_phase_entry=int(state.bundle_at_phase_entry or 0),
+                bundle_stall_s=bundle_stall_s,
+            )
+            if alarm:
+                layout_conformance.note_economy_anomaly(detail, now)
+        except Exception:  # noqa: BLE001 - a detector may never break serving
+            pass
 
     def arm_phase_flip(self, direction: str, source: str):
         """#631: replicated arming entry (RPC / regime gate). Activates the
