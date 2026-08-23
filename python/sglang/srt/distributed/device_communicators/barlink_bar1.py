@@ -262,6 +262,115 @@ class Bar1CollectiveStalled(Bar1KernelAborted):
         )
 
 
+class Bar1PeerLost(Bar1KernelAborted):
+    """A peer process is GONE, and this rank was waiting on its contribution.
+
+    A THIRD fact, distinct from both siblings, and the distinction is the
+    whole point of #818:
+
+      ``Bar1CollectiveAborted``  a kernel took its abort path -- something
+                                 tripped, and there is a partial buffer.
+      ``Bar1CollectiveStalled``  nothing tripped and nobody could be proven
+                                 dead; a peer is merely not arriving.
+      ``Bar1PeerLost``           nobody tripped either, but a peer's PROCESS
+                                 no longer exists, so the contribution this
+                                 rank is waiting for can never arrive.
+
+    Reporting the third case as the second is what cost the instance on
+    2026-08-22/23: the survivors' only escalation was ``Bar1CollectiveStalled``
+    after N CONSECUTIVE expiries, and the message they actually emitted said
+    "the compute stream has not retired the copy" -- true, and useless, because
+    the reason it had not was that PP1 was dead. A stall says "wait longer"; a
+    lost peer says "stop now". They must not share a name.
+
+    Derived from ``Bar1KernelAborted`` (hence from ``PeerLivenessError``) so
+    that every existing handler of the family -- ``barlink.py``'s
+    ``except barlink_liveness.PeerLivenessError``, and the phase-flip runtime's
+    ``except (CollectiveTimeoutError, PeerLostError)`` -- keeps working without
+    a new except clause anywhere.
+
+    It carries the peer IDENTITY, which neither sibling does. ``waited_s`` is
+    how long this rank had made no progress when the peer was proven gone, not
+    how long the peer had been dead: nothing here can know the latter.
+    """
+
+    def __init__(self, group, rank, op: str, nbytes: int, waited_s: float,
+                 peers: str):
+        self.group = group
+        self.rank = rank
+        self.op = op
+        self.nbytes = int(nbytes)
+        self.waited_s = float(waited_s)
+        self.peers = peers
+        super().__init__(
+            f"barlink-BAR1 group {group} rank {rank}: peer lost. {peers} no "
+            f"longer exists, and this rank has been waiting {waited_s:.1f} s "
+            f"for a staged status word that the dead peer's contribution will "
+            f"never let the compute stream retire. Last launch: op={op} "
+            f"nbytes={nbytes}. This rank aborts NOW instead of waiting for "
+            f"the consecutive-expiry ceiling, which a dead peer need never "
+            f"reach: every resolved read in between clears the run. Set "
+            f"SGLANG_BARLINK_PEER_LIVENESS=0 to restore the previous "
+            f"wait-forever behaviour."
+        )
+
+
+def raise_if_peer_lost(transport, waited_s: float) -> None:
+    """Abort this wait if a peer's process is provably gone (#818).
+
+    MODULE-LEVEL and taking the transport, for the same load-bearing reason
+    ``defer_stall_for_building_peer`` is: the guard's methods are invoked
+    UNBOUND against stubs by their tests, so a method call from inside
+    ``_wait_ctl_event`` would resolve against the stub and raise
+    ``AttributeError`` on the very path the stub exists to exercise.
+
+    Costs ``world_size`` ``os.kill(pid, 0)`` syscalls, and only at the cadence
+    the liveness module already defines for its own bounded waits. No device
+    read, no sync, no allocation -- deliberately, for the reason
+    ``defer_stall_for_building_peer`` records: on this path the only
+    fatal-capable events found by the wedge census were the unbounded host
+    syncs, so a guard against a wedge must not introduce one.
+
+    Silent no-op when liveness is disabled or no peer table was installed, so
+    the pre-#818 behaviour is recoverable by one env var and this returns
+    control to the existing stall ladder untouched.
+    """
+    table = getattr(transport, "_peer_table", None)
+    if table is None:
+        return
+    try:
+        if not barlink_liveness.liveness_enabled():
+            return
+        dead = table.dead_peers()
+    except Exception:  # noqa: BLE001 - a diagnostic must not hold a wedge open
+        return
+    if not dead:
+        return
+    who = ", ".join(e.describe() for e in dead)
+    message = (
+        f"barlink-BAR1 group {getattr(transport, 'group', '?')} rank "
+        f"{getattr(transport, 'rank', '?')}: peer lost -- {who}"
+    )
+    # Trip the device-mapped abort words FIRST, exactly as
+    # ``barlink_liveness.check_peers`` does. The OTHER survivor may be spinning
+    # inside a device kernel where no Python exception can reach it; the abort
+    # word is the only channel that does. Raising without tripping would fail
+    # this rank fast and leave the third one hanging -- which is the bug, moved
+    # rather than fixed.
+    try:
+        barlink_liveness.trip_all_abort_windows(message)
+    except Exception:  # noqa: BLE001 - never let the notify path eat the raise
+        pass
+    raise Bar1PeerLost(
+        getattr(transport, "group", "?"),
+        getattr(transport, "rank", "?"),
+        getattr(transport, "_last_op", None) or "unknown",
+        int(getattr(transport, "_last_nbytes", 0) or 0),
+        waited_s,
+        who,
+    )
+
+
 def defer_stall_for_building_peer(transport, run: int, deadline_s: float) -> bool:
     """Forgive one stall run because a PEER published a build window (#615).
 
@@ -4860,9 +4969,18 @@ class BarlinkBar1Transport:
         """
         deadline_s = barlink_abort_gate.sync_deadline_s()
         if deadline_s <= 0.0:
+            # #818: this branch is genuinely unbounded -- it blocks in the CUDA
+            # driver with no timeout at all. That is exactly the shape
+            # ``check_peers`` exists for, so ask ONCE before entering it. It
+            # cannot help a peer that dies after this point, and it does not
+            # pretend to: the deadline-0 mode is a bisecting aid, not a
+            # supported serving configuration.
+            raise_if_peer_lost(self, 0.0)
             self._ctl_event.synchronize()
             return True
-        end = time.monotonic() + deadline_s
+        start = time.monotonic()
+        end = start + deadline_s
+        next_probe = start + barlink_liveness.probe_interval_s()
         while True:
             if self._ctl_event.query():
                 self._ctl_stall_run = 0
@@ -4871,8 +4989,19 @@ class BarlinkBar1Transport:
                 # from a full cap. This is the ONLY thing that clears it.
                 self._ctl_build_deferred_s = 0.0
                 return True
-            if time.monotonic() >= end:
+            now = time.monotonic()
+            if now >= end:
                 break
+            # #818: probe peer liveness at the cadence the liveness module
+            # already defines for its own bounded waits -- NOT once per 0.5 ms
+            # iteration, which would be world_size syscalls at 2 kHz. With the
+            # shipped defaults (2 s deadline, 1 s probe) this fires about twice
+            # per wait; with an operator-raised deadline it is what keeps the
+            # gate's response time bounded by the probe interval instead of by
+            # the deadline.
+            if now >= next_probe:
+                next_probe = now + barlink_liveness.probe_interval_s()
+                raise_if_peer_lost(self, now - start)
             time.sleep(0.0005)
         self._ctl_sync_timeouts += 1
         self._ctl_stall_run += 1
@@ -4915,6 +5044,25 @@ class BarlinkBar1Transport:
                     )
             except Exception:  # noqa: BLE001 - never mask the path below
                 pass
+        # #818: THE fix. Before consulting the consecutive-expiry ceiling and
+        # before letting a build window forgive the run, ask whether a peer is
+        # simply GONE.
+        #
+        # Both of the gates below are unreachable for a dead peer, and that is
+        # what cost the instance:
+        #   * the ceiling counts CONSECUTIVE expiries (``_ctl_stall_run`` is
+        #     reset to 0 by every resolved read above), and a dead peer
+        #     produces INTERMITTENT expiries -- the 2026-08-23 specimen logged
+        #     20 CUMULATIVE expiries in ~36 s while PP1 was already dead, and
+        #     never escalated;
+        #   * ``defer_stall_for_building_peer`` can extend the wait to
+        #     ``SGLANG_BARLINK_BUILD_WINDOW_CAP_S`` (900 s default) off a
+        #     marker a dead peer may have left behind -- a process that no
+        #     longer exists is not building anything, and must never be
+        #     forgiven for it.
+        # A stall says "wait longer". A lost peer says "stop now". This is the
+        # line that tells them apart.
+        raise_if_peer_lost(self, self._ctl_stall_run * deadline_s)
         limit = barlink_abort_gate.stall_raise_after()
         if limit and self._ctl_stall_run >= limit:
             # #615: ...unless a PEER is legitimately inside a lazy JIT build
