@@ -55,6 +55,7 @@ import unittest
 
 from sglang.srt.managers import phase_policy
 from sglang.srt.managers.phase_policy import (
+    IDLE_LOCKED,
     PHASE_PP,
     PHASE_TP,
     PP_TO_TP,
@@ -104,26 +105,43 @@ class TestEveryHoldableArmIsAPpPhaseArm(CustomTestCase):
         _cfg(pp_window_s=15.0, prefill_runs_in_tp=True, flip_tokens=100),
     )
 
+    #: (nothing_can_run, target_can_admit). THE THIRD ARM SITE LIVES BEHIND
+    #: THESE, and the first draft of this sweep left them at their defaults --
+    #: so the #759 deadlock escape, the one PP_TO_TP site that derives its
+    #: direction FROM the phase, was never exercised at all. A mutant that made
+    #: that site arm PP_TO_TP unconditionally survived the sweep. An indicator
+    #: has to be shown to measure what it claims before it is evidence.
+    ADMISSION = ((False, False), (True, True), (True, False))
+
+    _CACHE = None
+
     def _sweep(self):
-        """Every (config, layout, load, clock) decision the rules produce."""
+        """Every (config, layout, load, clock, admission) decision the rules
+        produce. Cached: the same sweep answers three questions."""
+        if type(self)._CACHE is not None:
+            return type(self)._CACHE
         seen = []
         for cfg in self.CONFIGS:
             for phase in (PHASE_PP, PHASE_TP):
                 for pending in (0, 22, 7003, 302757):
                     for bs in (0, 1, 4):
                         for carriers in (0, 3):
-                            state = PhasePolicyState()
-                            for now in (0.0, 3.0, 9.0, 15.0, 46.0, 200.0):
-                                inp, d = _drive(
-                                    cfg,
-                                    state,
-                                    phase,
-                                    pending,
-                                    bs,
-                                    now,
-                                    ready_carriers=carriers,
-                                )
-                                seen.append((inp, d))
+                            for nothing_can_run, target_can_admit in self.ADMISSION:
+                                state = PhasePolicyState()
+                                for now in (0.0, 3.0, 9.0, 15.0, 46.0, 200.0):
+                                    inp, d = _drive(
+                                        cfg,
+                                        state,
+                                        phase,
+                                        pending,
+                                        bs,
+                                        now,
+                                        ready_carriers=carriers,
+                                        nothing_can_run=nothing_can_run,
+                                        target_can_admit=target_can_admit,
+                                    )
+                                    seen.append((inp, d))
+        type(self)._CACHE = seen
         return seen
 
     def test_every_pp_to_tp_arm_the_rules_build_was_built_in_the_pp_layout(self):
@@ -143,9 +161,22 @@ class TestEveryHoldableArmIsAPpPhaseArm(CustomTestCase):
         """CAN-FAIL GUARD. The implication above is trivially true over an
         empty set, so the sweep has to be shown to produce both directions --
         otherwise a broken harness reads as a proof."""
-        dirs = {d.direction for _, d in self._sweep()}
+        sweep = self._sweep()
+        dirs = {d.direction for _, d in sweep}
         self.assertIn(PP_TO_TP, dirs, "the sweep must actually build pp_to_tp arms")
         self.assertIn(TP_TO_PP, dirs, "the sweep must actually build tp_to_pp arms")
+        # AND IT MUST REACH ALL THREE ARM SITES, not just the two easy ones.
+        # The #759 escape is the only site that derives the direction from the
+        # phase, so it is precisely the site a reachability claim must cover; it
+        # fires only behind nothing_can_run/target_can_admit.
+        escapes = [
+            d for _, d in sweep if d.direction is not None and IDLE_LOCKED in d.reason
+        ]
+        self.assertTrue(escapes, "the sweep must reach the #759 deadlock escape")
+        window = [
+            d for _, d in sweep if d.direction == PP_TO_TP and "pp window" in d.reason
+        ]
+        self.assertTrue(window, "the sweep must reach the pp-window arm")
 
     def test_every_tp_to_pp_arm_was_built_in_the_tp_layout(self):
         """The mirror image, and it is the reason the gate can stay one-sided:
