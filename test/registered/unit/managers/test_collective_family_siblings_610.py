@@ -563,6 +563,27 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     #: the predicate raised AttributeError on both ranks -- the same drift
     #: shape, this time introduced by the fix rather than by a reduce.
     adder.fundable_extend_floor = None
+    #: #701 added the CROSS-PASS COMMITMENT LEDGER to the tail of
+    #: ``rem_total_tokens``, the sixth time this stub has drifted behind the
+    #: production predicate after #616g, #639, #639b, #791b and #794 -- and
+    #: the sixth time the guard below named it instead of an AttributeError
+    #: surfacing inside an unrelated admission assertion.
+    #:
+    #: BOTH names are bound, not just the one the failure reported. Binding
+    #: only the reported name is what reshipped this incident twice already
+    #: (see the #639b note above): ``chunked_admission_enabled`` was the
+    #: reported miss and ``commitment_ledger`` was the next one queued
+    #: behind it.
+    #:
+    #: The pair is chosen to EXERCISE the shipped chokepoint rather than to
+    #: step around it. ``effective_rem_total_tokens`` returns its input
+    #: unchanged when the ledger is ``None`` (planner/chunked_admission.py
+    #: :233-235), so enabling the flag runs the real tail and provably
+    #: cannot move the budget this harness is about. Setting the flag False
+    #: would also make the guard green, and would quietly take the tail out
+    #: of the tested path -- the weaker binding of the two.
+    adder.chunked_admission_enabled = True
+    adder.commitment_ledger = None
     adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
     adder.tree_cache = SimpleNamespace(evictable_size=lambda: evictable)
     adder.dcp_avail_deficit = deficit
