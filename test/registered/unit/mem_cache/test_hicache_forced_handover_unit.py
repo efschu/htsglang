@@ -76,6 +76,14 @@ def _build_cache(write_policy: str) -> HiRadixCache:
     cache.kv_cache = None
     cache.eviction_strategy = get_eviction_strategy("lru")
     cache.cache_controller = _FakeCacheController(write_policy)
+    # #810: HiRadixCache.__init__ builds this unconditionally, and the whole
+    # insert path guards on `is not None`. None is the shipped state under
+    # `--hicache-host-role retention` -- the default, and the regime these
+    # handover cases are written against -- so it is what a bare instance
+    # must carry. UnifiedRadixCache spells the same default out at
+    # unified_radix_cache.py:757; HiRadixCache reaches it through __init__,
+    # which this helper deliberately skips.
+    cache.staging_write_ring = None
     # Same derivation as HiRadixCache.__init__.
     cache.write_through_threshold = 1 if write_policy == "write_through" else 2
 
