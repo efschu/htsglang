@@ -274,3 +274,76 @@ class TestTheBuilderKeepsAnExemptBatchToTransportOnly(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheExemptionOutranksDrainModeSuppression(CustomTestCase):
+    """W31 arm 1: THE FIX WAS INSTALLED AND UNREACHABLE.
+
+    The exemption first sat after `prefill_allowed_in_tp`, which is BELOW the
+    #677 drain-mode suppression. The W31 recipe runs
+    `--phase-policy-drain-mode`, so `prefill_suppressed_in_tp` returned True
+    and `prefill_blocked_here` returned before the exemption was ever
+    evaluated. Measured (SPECIMEN_w31_a1_exemption_below_drain_gate.log): the
+    seam retracted 87 requests across 39 pp_to_tp flips and logged
+    `SEAM TRANSPORT ADMITTED` **0** times and `Prefill batch phase=tp` **0**
+    times -- the W30 livelock reproduced exactly, with its own fix in the
+    tree.
+
+    Same defect shape this very function already carries a note about: "What
+    broke was ORDER -- suppression was checked FIRST and returned True, so the
+    valve never ran."
+
+    AND THE ORDER IS SUBSTANTIVE, not cosmetic. Drain mode forbids TP prefill
+    because "a TP window entered to finish a bundle must not admit the work it
+    was entered to escape". A request the cutover itself retracted is not that
+    work -- it IS the bundle this window was entered to finish. Suppressing it
+    makes the drain contract unsatisfiable rather than defending it.
+    """
+
+    def _drain_sched(self, queue):
+        from sglang.srt.managers.phase_policy import PhasePolicyConfig
+
+        sched = _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), queue)
+        sched.phase_policy_cfg = PhasePolicyConfig(
+            enabled=True, drain_mode=True, flip_tokens=7000
+        )
+        return sched
+
+    def test_a_stamped_request_is_admitted_even_under_drain_mode(self):
+        sched = self._drain_sched([_req("readmit", seam_epoch=5)])
+        self.assertFalse(
+            prefill_blocked_here(sched, running_bs=1),
+            "the seam's own re-admission IS the bundle drain mode is finishing",
+        )
+
+    def test_drain_mode_still_suppresses_ordinary_prefill(self):
+        # CAN-FAIL: the exemption must not become a way around drain mode for
+        # work the seam did not retract. If this stops blocking, #677's
+        # contract has been dissolved rather than qualified.
+        sched = self._drain_sched([_req("fresh")])
+        self.assertTrue(prefill_blocked_here(sched, running_bs=1))
+
+    def test_the_exemption_is_checked_before_the_drain_gate(self):
+        # Keyed on ORDER in the source, because that is precisely what W31
+        # arm 1 got wrong and no behavioural test on a passing path can see.
+        import inspect
+
+        from sglang.srt.managers import phase_purity
+
+        src = inspect.getsource(phase_purity.prefill_blocked_here)
+        exempt_at = src.find("seam_transport_exempt(scheduler)")
+        drain_at = src.find("prefill_suppressed_in_tp(")
+        self.assertGreater(exempt_at, -1, "the exemption must be in this function")
+        self.assertGreater(drain_at, -1)
+        self.assertLess(
+            exempt_at, drain_at, "seam transport must outrank drain suppression"
+        )
+
+    def test_the_exemption_is_single_sited(self):
+        # It was moved, not copied. Two call sites would drift.
+        import inspect
+
+        from sglang.srt.managers import phase_purity
+
+        src = inspect.getsource(phase_purity.prefill_blocked_here)
+        self.assertEqual(src.count("seam_transport_exempt(scheduler)"), 1)

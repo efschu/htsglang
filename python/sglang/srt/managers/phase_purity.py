@@ -676,6 +676,29 @@ def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
 
     if _active_phase(scheduler) != PHASE_TP:
         return False
+    # W31: SEAM TRANSPORT OUTRANKS EVERYTHING BELOW, AND ORDER IS THE WHOLE
+    # POINT OF PUTTING IT HERE.
+    #
+    # This check first sat after `prefill_allowed_in_tp`, which is BELOW the
+    # drain-mode suppression. W31 arm 1 measured what that costs: with
+    # `--phase-policy-drain-mode` in the recipe, `prefill_suppressed_in_tp`
+    # returned True and this function returned before the exemption was ever
+    # evaluated. The seam retracted 87 requests across 39 pp_to_tp flips, and
+    # `SEAM TRANSPORT ADMITTED` was logged 0 times, `Prefill batch phase=tp` 0
+    # times -- the W30 livelock reproduced exactly, with the fix for it
+    # installed and unreachable. Same defect shape as the ORDER bug recorded
+    # in this very function ("What broke was ORDER -- suppression was checked
+    # FIRST and returned True, so the valve never ran").
+    #
+    # AND IT IS NOT MERELY A PLACEMENT CONVENIENCE. Drain mode's own stated
+    # reason for forbidding TP prefill is that "a TP window entered to finish
+    # a bundle must not admit the work it was entered to escape". A request
+    # the cutover ITSELF retracted is not that work: it IS the bundle this
+    # window was entered to finish, sent back to the queue by the seam a
+    # moment earlier. Suppressing it does not defend the drain contract, it
+    # makes the contract unsatisfiable -- the bundle can never complete.
+    if seam_transport_exempt(scheduler):
+        return False
     # #677 HOT FIX 2: DRAIN MODE OUTRANKS THE PURITY MODE ON THIS ONE AXIS.
     #
     # Checked BEFORE `prefill_allowed_in_tp` on purpose. The deployed purity
@@ -744,18 +767,9 @@ def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
         )
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
-    # W30: FLIP TRANSPORT IS NOT WORKLOAD, and this is the one carve-out.
-    #
-    # See `seam_transport_exempt` for the full argument and the W30 specimen.
-    # In one line: the #856 cutover RETRACTS its residents, so the only way a
-    # decode-ready request can exist in the layout it was flipped into is to
-    # be re-admitted there by a read-through that recomputes nothing. Strict
-    # purity forbade that read-through, so the request could never cross the
-    # seam and the instance ping-ponged 150 times executing zero decode
-    # batches. Exempting a cache restore of already-computed tokens keeps
-    # "never any WORK in the wrong layout" exactly as true as it was.
-    if seam_transport_exempt(scheduler):
-        return False
+    # (The seam-transport exemption is checked at the TOP of this function --
+    # see the W31 note there. It must outrank the drain-mode suppression, so
+    # it cannot live down here.)
     return not _relaxed(scheduler, "prefill")
 
 
