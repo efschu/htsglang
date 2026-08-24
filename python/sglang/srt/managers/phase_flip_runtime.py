@@ -3420,6 +3420,9 @@ class PhaseFlipRuntime:
         self.presence_futile_abandons = 0
         #: #850: monotonic time this futile withhold began, or None.
         self._presence_futile_since: Optional[float] = None
+        #: #850: the (epoch, round) `_presence_futile_since` belongs to, so a
+        #: later arm never inherits an earlier one's age.
+        self._presence_futile_key: Optional[Tuple[int, int]] = None
         #: #850: the shortened bound. Read once here so a test can override it
         #: on the instance without touching the process environment. Imported
         #: locally, the convention this module already uses for every other
@@ -5782,7 +5785,21 @@ class PhaseFlipRuntime:
                     self.presence_futile_rounds = (
                         getattr(self, "presence_futile_rounds", 0) + 1
                     )
-                    if getattr(self, "_presence_futile_since", None) is None:
+                    # THE CLOCK IS PER EPISODE, never inherited. #800 states
+                    # the same rule for its escape clock ("reset when the key
+                    # empties, so a kind that is consumed and stashed again
+                    # starts fresh rather than inheriting a stranger's age").
+                    # Without this, a futile withhold that ended in an abandon
+                    # leaves `_presence_futile_since` set, and the NEXT arm
+                    # measures its bound from the previous episode -- expiring
+                    # in its first round, before the service turn has had one
+                    # chance to work.
+                    episode = (epoch, entry_round)
+                    if (
+                        getattr(self, "_presence_futile_key", None) != episode
+                        or getattr(self, "_presence_futile_since", None) is None
+                    ):
+                        self._presence_futile_key = episode
                         self._presence_futile_since = self._clock()
                     # ONCE PER OCCURRENCE, not once per round. #800's specimen
                     # was 57922 silent rounds; the answer to silence is one
