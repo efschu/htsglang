@@ -2787,6 +2787,22 @@ class KvBackingRelief:
             claimed / (1024 * 1024),
             self._cap.withheld,
         )
+        # #851 F1: SEAM EVENT TWO OF TWO -- the shrink restatement.
+        #
+        # A shrink that SUCCEEDS withholds rows at the free-list bookkeeper and
+        # leaves the EXPOSED id span where it was. The failed path two branches
+        # up already clamps ("undoing the cap must not hand out ids the failed
+        # shrink never backed"); the successful path had no such step, so a
+        # working shrink was the one way to WIDEN the gap between exposed and
+        # committed without anything saying so.
+        #
+        # That is W22's state exactly: withheld=343779 constant while free and
+        # cached swung wildly, exposed 470755 against committed 126976, and
+        # every id-space-derived quantity downstream still priced unbacked ids.
+        # The accounting was self-consistent; the law was broken.
+        #
+        # Same actuator as the failed path, so the two branches cannot drift.
+        self.clamp_exposure_to_backing("after a successful shrink")
         return measured
 
     def recover(self) -> int:

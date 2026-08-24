@@ -5281,6 +5281,65 @@ class PhaseFlipRuntime:
         except Exception:  # noqa: BLE001 -- an instrument, never a gate
             logger.debug("%s census ownership audit skipped", LOG_PREFIX, exc_info=True)
 
+    def _enforce_exposure_at_seam(self, when: str) -> int:
+        """#851 F1: hold the allocator to the EXPOSURE law at a seam event.
+
+        THE HALF #822 NAMED AND DID NOT BUILD. `fe43b09e52` states it as its
+        own open item -- `_retire_row_id_space` "does not yet REFUSE such an id
+        at the allocator -- that is enforcement" -- and O-2 recorded the
+        audit-only status as an owner decision on hot-path grounds. The
+        reversal is scoped to answer exactly that objection: this runs at the
+        TWO SEAM EVENTS where the id space changes regime (cutover retirement,
+        shrink restatement), never per allocation. The hot path is untouched.
+
+        WHY W22 NEEDED IT. The authority observed `exposed 470755 > committed
+        126976` and said so 48 times in one boot while the instance livelocked
+        on that exact gap; the #816 clamp fired twice. An instrument that names
+        the root once per arm and binds nobody is not a gate.
+
+        THE ACTUATOR IS NOT NEW. This calls `clamp_exposure_to_backing`, whose
+        own contract makes it safe here: it "only ever LOWERS exposure toward
+        `_current_rows()` -- a MEASURED committed count, never a remembered one
+        -- and it never lowers the BACKING". So it cannot cap below a live set
+        (the #722 direction, and the reverted floor-clamp remedy); an
+        under-backed pool is REPORTED by that actuator, not papered over.
+
+        Returns rows withdrawn, so a caller or a test can assert on the ACTION
+        rather than on the absence of a symptom. Never raises: a seam is
+        mid-flight and enforcement that kills the cutover is worse than the
+        exposure it corrects -- it refuses, it does not explode.
+        """
+        try:
+            from sglang.srt.managers.phase_flip_spill import (
+                KV_BACKING_RELIEF_ATTR as _rung_attr,
+            )
+        except Exception:  # noqa: BLE001 - never break a seam on an import
+            return 0
+        sched = getattr(self, "_census_scheduler", None)
+        rung = getattr(sched, _rung_attr, None) if sched is not None else None
+        if rung is None:
+            return 0
+        try:
+            withdrawn = int(rung.clamp_exposure_to_backing(when) or 0)
+        except Exception:  # noqa: BLE001 - a seam may refuse, never explode
+            logger.debug(
+                "%s #851 exposure enforcement skipped at %s",
+                LOG_PREFIX,
+                when,
+                exc_info=True,
+            )
+            return 0
+        if withdrawn > 0:
+            logger.warning(
+                "%s #851 EXPOSURE ENFORCED at %s: withdrew %d over-exposed row "
+                "id(s) so the allocator can no longer hand out an id with no "
+                "page behind it. The id space, not the backing, was corrected.",
+                LOG_PREFIX,
+                when,
+                withdrawn,
+            )
+        return withdrawn
+
     def _retire_row_id_space(self, direction) -> None:
         """The cutover retires the whole old id space in ONE step (#822).
 
@@ -9921,6 +9980,13 @@ class PhaseFlipRuntime:
                 retire(direction)
         except Exception:  # noqa: BLE001 -- an instrument, never a gate
             logger.debug("%s id-space retirement skipped", LOG_PREFIX, exc_info=True)
+        # #851 F1: SEAM EVENT ONE OF TWO -- the cutover. `retire(direction)`
+        # above is the AUDIT half: it stamps a new epoch and reports. This is
+        # the enforcement half that #822 named as its own open item ("does not
+        # yet REFUSE such an id at the allocator"). Deliberately OUTSIDE the
+        # try above -- a swallowed audit must not also swallow the gate, or
+        # enforcement inherits the exact silence it exists to end.
+        self._enforce_exposure_at_seam(f"{direction} cutover")
         seam_census.mark("cutover")
         self._pool_census("post-cutover", direction)
         cutover_ms = (self._clock() - t_cutover0) * 1000.0
