@@ -927,6 +927,20 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
+        # W30: the PHASE-FLIP SEAM's own retraction stamp -- the epoch of the
+        # #856 no-carry cutover that retracted this request, or None.
+        #
+        # DELIBERATELY SEPARATE FROM `is_retracted`, which is set by four
+        # unrelated paths (this seam, decode-OOM preemption in
+        # `retract_decode`, the PD prefill path, the PP void path). Only the
+        # seam's retraction makes a request's re-admission flip TRANSPORT --
+        # a read-through of tokens already computed and already fenced to the
+        # canonical store. An OOM-preempted request's re-prefill is real work
+        # and must stay subject to the purity rule, so the two populations
+        # need two different marks. Set only in
+        # `phase_flip_runtime.build_cutover_release._retract`; spent (cleared)
+        # on the one re-admission it licenses.
+        self.seam_readmit_epoch = None
 
         # kv-session-offload Prefill-Spill (born-spilled, PS1-V1a): set at
         # admission when the prompt's lifetime KV would not fit VRAM but its

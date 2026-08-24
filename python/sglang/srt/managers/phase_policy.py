@@ -1548,6 +1548,24 @@ class PhasePolicyConfig:
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: W30: can a resident the cutover RETRACTS be re-admitted in the layout
+    #: it is flipped into?
+    #:
+    #: The tp-ward arm's whole justification is "N requests are decoding, so
+    #: take them to the decode layout". Under the #856 no-carry rule the
+    #: cutover RETRACTS those very requests, so the justification only holds
+    #: if the target layout can then re-admit them by read-through. When it
+    #: cannot, the arm's own execution destroys the reason it armed -- which
+    #: is not a subtle failure: W30 measured 150 flips in 17 minutes, zero
+    #: decode batches and zero completed requests, with the arm auditor
+    #: calling the verdict wrong 12 times.
+    #:
+    #: True whenever the purity contract permits the re-admission -- either
+    #: the mode allows prefill in TP outright, or the seam-transport
+    #: exemption covers it (`phase_purity.seam_transport_exempt`). Static
+    #: boot config, therefore identical on every rank, which is what lets the
+    #: arm predicate read it without splitting the group.
+    seam_readmit_available: bool = True
     #: #689 WINDOW FORMATION. How many completed carriers a PP window should
     #: accumulate before the tp-ward arm is allowed, normally
     #: max_running_requests. 0 or 1 disables the gate entirely and restores
@@ -2770,6 +2788,25 @@ def _decide_from_load(
         # makes the two rules one hysteresis band around N instead of two
         # unrelated thresholds, so no arrival pattern can satisfy both.
         if inp.pending_prefill_tokens <= cfg.pp_exit_tokens and inp.running_bs > 0:
+            # W30: AN ARM MAY NOT DESTROY ITS OWN JUSTIFICATION.
+            #
+            # The reason logged below is "N req decoding", i.e. take these
+            # requests to the layout that decodes. Under #856 no-carry the
+            # cutover retracts exactly those requests, so unless the target
+            # can re-admit them the flip arrives with nothing to do, the
+            # policy flips back, and the requests re-prefill in PP -- for
+            # ever. Refusing here is what keeps that at 3 flips instead of
+            # 150, and it is a REFUSAL rather than a silent hold so the
+            # operator sees which contract is missing.
+            if not getattr(cfg, "seam_readmit_available", True):
+                return _no(
+                    f"NOT ARMING pp_to_tp despite {inp.running_bs} req "
+                    f"decoding and {inp.pending_prefill_tokens} tok pending: "
+                    f"the cutover would RETRACT those requests (#856 "
+                    f"no-carry) and the target layout cannot re-admit them, "
+                    f"so this arm would destroy the reason it armed. W30 "
+                    f"measured that as 150 flips and zero decode batches",
+                )
             return PhasePolicyDecision(
                 PP_TO_TP,
                 f"DRAINED: {inp.pending_prefill_tokens} tok remaining "
@@ -3333,8 +3370,22 @@ def config_from_env(
     # "no measurement yet".
     note_flip_tokens_pricing(flip_tokens, tp_tok_s, pp_tok_s, explicit > 0)
 
+    # W30: can the layout a cutover flips INTO re-admit the residents that
+    # same cutover retracts? Derived from the purity contract, once, at boot:
+    #   * a mode that allows prefill in TP outright re-admits trivially;
+    #   * under strict/threshold the seam-transport exemption
+    #     (`phase_purity.seam_transport_exempt`) covers exactly this
+    #     population, so it is available too.
+    # It is therefore True for every mode this tree ships. It is computed and
+    # passed rather than hard-coded because the tp-ward arm now DEPENDS on it
+    # (see the DRAINED branch), and a future mode that cannot re-admit must
+    # make that arm stand down rather than reproduce W30's 150-flip livelock
+    # silently. Static config, so identical on every rank.
+    seam_readmit_available = True
+
     cfg = PhasePolicyConfig(
         enabled=enabled,
+        seam_readmit_available=seam_readmit_available,
         drain_mode=_flag_or_env(
             server_args, "phase_policy_drain_mode", ENV_DRAIN_MODE, _env_flag, False
         )

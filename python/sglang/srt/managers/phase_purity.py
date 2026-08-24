@@ -550,6 +550,48 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
             f"{bound}); the layout {work} needs is not reachable"
             f"{_last_abandon_detail(state, direction)}"
         )
+    # W30, THE FOURTH CAUSE: THE FLIP WORKS AND STILL SERVES NOTHING.
+    #
+    # The three causes above all describe a flip that does not HAPPEN --
+    # guarded, abandoned, or refused. W30 found the state none of them can
+    # see: every flip COMMITTED (150 of them in 17 minutes, 72 pp_to_tp
+    # against 69 tp_to_pp) and the layout they committed into built no batch,
+    # so the instance executed ZERO decode batches for ten minutes, timed out
+    # every client request, and stood purity down exactly 0 times. A valve
+    # keyed only on flips that fail is a valve blind to a flip that succeeds
+    # pointlessly.
+    #
+    # The signal is the arm auditor's own, which was already computing this
+    # and writing it to a log nobody consumed: `ARM-VERDICT-WRONG` fires when
+    # a COMMITTED cutover builds nothing for `ARM_VERDICT_ROUNDS` rounds.
+    #
+    # RANK-UNIFORMITY -- THE WEAKEST OF THE FOUR, SAID PLAINLY. The three
+    # causes above read group-REDUCED books. This one reads a per-rank round
+    # counter, so a one-round skew between ranks is possible in principle.
+    # It is bounded away rather than assumed away: the streak must reach
+    # `stand_down_after()` SEPARATE fruitless arms, each of which is already
+    # `ARM_VERDICT_ROUNDS` rounds deep, so the trigger sits ~32 batchless
+    # rounds in. Nothing transient survives that depth; what does survive is
+    # a config-determined livelock, and a config-determined state is by
+    # construction the same on every rank. One built batch anywhere resets it.
+    #
+    # LOUD AND SCORED, NOT A QUIET PATH. Standing purity down here runs work
+    # in the wrong layout, which w29_score.py counts as a violation and this
+    # module's own log marks as a hazard. That is deliberate: this valve
+    # firing means the PRIMARY fix (the seam-transport exemption) did not
+    # work, and an acceptance run must fail loudly rather than pass on the
+    # net. Serving degraded still beats serving nothing (#656 C22's rule),
+    # but it must never be mistaken for the target mode.
+    livelock = int(getattr(scheduler, "_arm_verdict_wrong_streak", 0) or 0)
+    if livelock >= bound:
+        return (
+            f"LIVELOCK: {livelock} consecutive arms COMMITTED into the target "
+            f"layout and built no batch there (bound {bound}, each arm "
+            f"already watched for several rounds). The flip is not broken -- "
+            f"it works and serves nothing, which no abandon or refusal "
+            f"counter can see. {work} is starved by a seam that keeps "
+            f"succeeding"
+        )
     return None
 
 
@@ -702,7 +744,122 @@ def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
         )
     if purity_of(scheduler).prefill_allowed_in_tp():
         return False
+    # W30: FLIP TRANSPORT IS NOT WORKLOAD, and this is the one carve-out.
+    #
+    # See `seam_transport_exempt` for the full argument and the W30 specimen.
+    # In one line: the #856 cutover RETRACTS its residents, so the only way a
+    # decode-ready request can exist in the layout it was flipped into is to
+    # be re-admitted there by a read-through that recomputes nothing. Strict
+    # purity forbade that read-through, so the request could never cross the
+    # seam and the instance ping-ponged 150 times executing zero decode
+    # batches. Exempting a cache restore of already-computed tokens keeps
+    # "never any WORK in the wrong layout" exactly as true as it was.
+    if seam_transport_exempt(scheduler):
+        return False
     return not _relaxed(scheduler, "prefill")
+
+
+#: W30: attribute the seam stamps on every request it retracts under the #856
+#: no-carry rule. Set ONLY in `build_cutover_release._retract`; deliberately
+#: NOT `Req.is_retracted`, which decode-OOM preemption sets too.
+SEAM_READMIT_ATTR = "seam_readmit_epoch"
+
+#: Scheduler flag naming the round in which the seam-transport exemption is
+#: open, read by the prefill builder to keep the batch to transport only.
+SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
+
+
+def seam_readmit_candidates(scheduler) -> list:
+    """Queued requests the #856 cutover retracted and must re-admit.
+
+    Read off ``waiting_queue``, which is replicated across the ranks
+    (scheduler.py's own note: "``self.waiting_queue``, which is replicated
+    across the TP ranks"), so this list is the same on every rank in the same
+    round -- the property the purity branch is required to have.
+    """
+    out = []
+    for req in getattr(scheduler, "waiting_queue", ()) or ():
+        if getattr(req, SEAM_READMIT_ATTR, None) is not None:
+            out.append(req)
+    return out
+
+
+def seam_transport_exempt(scheduler) -> bool:
+    """Is this round's TP prefill a SEAM RE-ADMISSION, i.e. flip transport?
+
+    THE W30 LIVELOCK, and why this exists rather than a purity stand-down.
+    Measured 2026-08-24 (SPECIMEN_w30_a1_purity_nocarry_livelock.log): 150
+    flips in 17 minutes, 129 prefill batches, **zero decode batches**, every
+    client request timing out at 600 s. The scheduler's own arm auditor named
+    it 12 times -- "armed pp_to_tp (... 1 req decoding ...), the cutover
+    COMMITTED into the target layout, and it still built no batch in 8
+    rounds ... target_can_admit=False".
+
+    The chain is short and every link is a shipped design decision:
+      1. the policy arms pp_to_tp BECAUSE a request has drained prefill and
+         is ready to decode;
+      2. the #856 seam then RETRACTS that very request -- no-carry, "their KV
+         is in the canonical store from the fence; the new layout re-admits
+         them and serves the prefix by read-through";
+      3. re-admitting it in TP therefore needs a read-through PREFILL batch;
+      4. strict purity forbids prefill in TP absolutely -- the W30 arm logged
+         `Prefill batch phase=tp` exactly 0 times;
+      5. so TP builds nothing, the policy flips back, the request re-prefills
+         in PP, drains, and arms the same flip again. For ever.
+    The arm's own justification is destroyed by the arm's own execution.
+
+    WHY THIS IS AN EXEMPTION AND NOT A RELAXATION. A purity stand-down would
+    let ORDINARY prefill run in TP, which both the #838 detector and
+    w29_score.py count as wrong-layout work -- so it would make the very
+    acceptance this is meant to pass unpassable by our own scorers, and it
+    would be dishonest about the user's rule. What crosses here is different
+    in kind: the tokens were already prefilled in the PP window, their KV is
+    in the canonical store, and the re-admission recomputes nothing -- it is
+    a cache restore, i.e. SEAM MECHANICS, the same category as the KV the
+    flip moves. "Never any work in the wrong layout" is untouched, because
+    this is not work.
+
+    THE DANGEROUS DIRECTION IS PINNED. A genuine, never-retracted request
+    must still be refused in TP. That is why the stamp is seam-specific
+    (`SEAM_READMIT_ATTR`, set only by the cutover's own retract closure) and
+    not `Req.is_retracted`, which decode-OOM preemption sets identically --
+    keying on the latter would silently exempt every preempted request's
+    re-prefill, which IS work. The builder additionally keeps the batch to
+    stamped requests only, so a new arrival cannot ride along inside an
+    exempt batch.
+
+    RANK-UNIFORM: the stamp comes from a group-unanimous cutover and is read
+    off the replicated ``waiting_queue``, so every rank takes this branch in
+    the same round. A rank-local input here would split the group across
+    branches with mismatched collectives.
+    """
+    if not seam_readmit_candidates(scheduler):
+        # RE-DERIVED EVERY ROUND, NEVER LATCHED. If the flag stayed set after
+        # the debt was paid, a later round would filter the prefill builder
+        # down to stamped requests that no longer exist and build nothing --
+        # trading the W30 livelock for a quieter one.
+        try:
+            setattr(scheduler, SEAM_TRANSPORT_ROUND_ATTR, False)
+        except Exception:  # noqa: BLE001 - a flag may never break the gate
+            pass
+        return False
+    try:
+        setattr(scheduler, SEAM_TRANSPORT_ROUND_ATTR, True)
+    except Exception:  # noqa: BLE001 - the flag is an optimisation, not a gate
+        return False
+    if not getattr(scheduler, "_seam_transport_announced", False):
+        scheduler._seam_transport_announced = True
+        logger.warning(
+            "%s SEAM TRANSPORT ADMITTED in the TP layout: the #856 cutover "
+            "retracted its residents, so their re-admission is a read-through "
+            "that recomputes nothing -- flip transport, not workload, and the "
+            "purity rule on WORK is untouched. Only requests the cutover "
+            "itself stamped are admitted; a genuine new request is still "
+            "refused here. Without this the instance ping-pongs for ever "
+            "executing zero decode batches (W30).",
+            LOG_PREFIX,
+        )
+    return True
 
 
 def decode_blocked_here(scheduler, running_bs: int) -> bool:

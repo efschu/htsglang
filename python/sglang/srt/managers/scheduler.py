@@ -3484,6 +3484,11 @@ class Scheduler(
             if ret is not None:
                 # The target ran. The verdict is vindicated; stop watching.
                 self._arm_watch = None
+                # W30 SAFETY NET: a target that runs also ends the livelock
+                # streak. Reset here (not only on a fresh arm) so the streak
+                # measures CONSECUTIVE fruitless arms and one good round
+                # clears it, exactly like `_seam_abandons_in_a_row`.
+                self._arm_verdict_wrong_streak = 0
             else:
                 watch["rounds"] += 1
                 if watch["rounds"] == self.ARM_VERDICT_ROUNDS:
@@ -3534,6 +3539,20 @@ class Scheduler(
                             watch["nothing_can_run"],
                             watch["target_can_admit"],
                             watch["ready_carriers"],
+                        )
+                        # W30 SAFETY NET, and the reason it exists: on
+                        # 2026-08-24 this exact line was emitted 12 times over
+                        # ten minutes while the instance flipped 150 times and
+                        # served nothing, and NOTHING consumed it. The purity
+                        # valve could not see the state at all -- it arms on
+                        # ABANDONED or REFUSED flips, and here every flip
+                        # COMMITTED. A log line is not a consumer (#800).
+                        #
+                        # Booked as a streak so one fruitless arm is not a
+                        # verdict; `flip_unavailable_reason` reads it as its
+                        # fourth cause.
+                        self._arm_verdict_wrong_streak = (
+                            int(getattr(self, "_arm_verdict_wrong_streak", 0) or 0) + 1
                         )
         if ret is not None:
             self._round_built_nothing = False
@@ -8037,8 +8056,33 @@ class Scheduler(
             _skips[kind] = _skips.get(kind, 0) + 1
             _skip_first_rid.setdefault(kind, str(rid))
 
+        # W30: AN EXEMPT BATCH CARRIES TRANSPORT ONLY.
+        #
+        # `seam_transport_exempt` opened the purity gate for this round
+        # because the #856 cutover retracted residents that must be
+        # re-admitted by read-through. That exemption is about SEAM MECHANICS,
+        # so the batch it permits may contain nothing else: a genuine,
+        # never-retracted request riding along inside it would be real prefill
+        # work executing in the TP layout, which is exactly what the user's
+        # rule and both scorers forbid. Filtering here (rather than trusting
+        # the queue to hold only stamped requests) is what makes the
+        # can-fail test in the dangerous direction actually pass.
+        #
+        # Rank-uniform: the flag is set from the replicated queue's contents
+        # in `seam_transport_exempt`, and the stamp comes from a
+        # group-unanimous cutover, so every rank filters identically.
+        from sglang.srt.managers.phase_purity import (
+            SEAM_READMIT_ATTR,
+            SEAM_TRANSPORT_ROUND_ATTR,
+        )
+
+        transport_only = bool(getattr(self, SEAM_TRANSPORT_ROUND_ATTR, False))
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if transport_only and getattr(req, SEAM_READMIT_ATTR, None) is None:
+                _note_skip("seam_transport_only", req.rid)
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 _note_skip("lora", req.rid)
                 continue
@@ -8285,6 +8329,22 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+
+        # W30: THE SEAM STAMP IS ONE-SHOT AND IS SPENT HERE.
+        #
+        # It licenses exactly one re-admission -- the one this cutover owes.
+        # Left on the request it would travel with it for the rest of its
+        # life and exempt every later prefill it ever needs, which would turn
+        # a narrow seam carve-out into a permanent hole in the purity rule.
+        # Cleared on admission, so a request that is retracted by the NEXT
+        # cutover is stamped again by that cutover and by nothing else.
+        # The round flag is cleared with it: the exemption is re-derived from
+        # the queue every round rather than latching.
+        if transport_only:
+            for req in can_run_list:
+                if getattr(req, SEAM_READMIT_ATTR, None) is not None:
+                    setattr(req, SEAM_READMIT_ATTR, None)
+            setattr(self, SEAM_TRANSPORT_ROUND_ATTR, False)
 
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
         # decision here; scheduler_pp_mixin.py's _event_loop_pp_body drains

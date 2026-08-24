@@ -981,6 +981,30 @@ def _live_reqs(scheduler) -> List:
 
     for mb in getattr(scheduler, "running_mbs", []) or []:
         _take(mb)
+    # W30: `last_mbs` IS A RESIDENCY ROUTE AND WAS THE ONE ROUTE MISSING HERE.
+    #
+    # `last_batch` above is the NON-PP handle. Under `event_loop_pp` the
+    # per-slot equivalent is `last_mbs[mb_id]`, and a request that has just
+    # finished a prefill iteration sits THERE and nowhere else until the next
+    # `get_next_batch_to_run` merges it into the running batch. The cutover
+    # guard `orphan_resident_reqs` (phase_flip_resident_carry.py) has always
+    # checked `last_mbs`; this authority did not, so the two disagreed about
+    # what "resident" means and the retraction could not see a request the
+    # guard would then refuse to flip past.
+    #
+    # W30 arm 2 measured it, all three ranks, 21 s into load:
+    #   ResidentCarryError: PHASE-FLIP-CARRY 1 request(s) are reachable only
+    #   through last_mbs/last_batch at the cutover: ['56fddcc3c0ef...']
+    #
+    # THE GUARD IS RIGHT AND STAYS AS STRICT AS IT IS. Its docstring names the
+    # correct remedy and forbids the tempting one: "a bug to raise, not a
+    # carry to widen. Silently widening the harvest here would hide a broken
+    # predicate behind a carry that appears to work." So the route is added to
+    # the AUTHORITY -- the same "fix it at the one authority, not at the
+    # consumers" rule the W27 fix above was built on, which simply stopped one
+    # route short.
+    for mb in getattr(scheduler, "last_mbs", []) or []:
+        _take(mb)
     for name in ("running_batch", "last_batch"):
         _take(getattr(scheduler, name, None))
     # THE CHUNKED PREFILL IS RESIDENT AND IS IN NO BATCH (#631 defect O).
@@ -1348,6 +1372,13 @@ def consume_retracted_from_live_universe(scheduler, reqs) -> int:
 
     for mb in getattr(scheduler, "running_mbs", []) or []:
         _consume(mb)
+    # W30: and it must be CLEARED from `last_mbs` too, not merely enumerated
+    # there. Retracting a request the guard can still reach through
+    # `last_mbs[slot]` leaves exactly the orphan the cutover refuses on --
+    # freeing the resource and retiring the reference are two jobs, and this
+    # route needs both.
+    for mb in getattr(scheduler, "last_mbs", []) or []:
+        _consume(mb)
     for name in ("running_batch", "last_batch"):
         _consume(getattr(scheduler, name, None))
     # The chunked prefill is resident and in NO batch (#631 defect O), which is
@@ -1387,7 +1418,7 @@ def build_cutover_release(scheduler):
             return []
         from sglang.srt.managers.schedule_batch import retract_all
 
-        return retract_all(
+        out = retract_all(
             reqs=list(reqs),
             server_args=scheduler.server_args,
             req_to_token_pool=scheduler.req_to_token_pool,
@@ -1396,6 +1427,31 @@ def build_cutover_release(scheduler):
             hisparse_coordinator=getattr(scheduler, "hisparse_coordinator", None),
             offload_kv=False,
         )
+        # W30 SEAM STAMP. `Req.reset_for_retract` sets `is_retracted` /
+        # `retracted_stain`, but those are NOT seam-specific: ordinary
+        # decode-OOM preemption (`Req.retract_decode`), the PD prefill path
+        # and the PP void path all set the identical two booleans through the
+        # same shared helper. An exemption keyed on `is_retracted` would
+        # therefore also exempt every OOM-preempted request's re-prefill,
+        # which is real workload and must NOT be exempt.
+        #
+        # So the seam stamps its own retractions, here and nowhere else. This
+        # closure is reached only from `build_cutover_release`, i.e. only from
+        # the #856 no-carry cutover, which is exactly the population whose
+        # re-admission is flip TRANSPORT rather than work.
+        #
+        # RANK-UNIFORM BY CONSTRUCTION: the cutover is a group-unanimous
+        # event and every rank retracts the same resident set, so the stamp
+        # appears on the same rids on every rank in the same round. That is
+        # the property the purity gate's branch requires (see the
+        # rank-uniformity note at its call site in scheduler.py).
+        epoch = getattr(getattr(scheduler, "phase_flip_runtime", None), "epoch", None)
+        for r in reqs or ():
+            try:
+                r.seam_readmit_epoch = epoch
+            except Exception:  # noqa: BLE001 - a stamp may never break a seam
+                pass
+        return out
 
     # #856 W27-retry: the drop must RETURN the tree's rows, not orphan them.
     # A bare `tree_cache.reset` is a bookkeeping reset and leaked 152 rows per

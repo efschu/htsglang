@@ -80,9 +80,17 @@ class _Batch:
         self.reqs = [self.reqs[i] for i in self.filtered_with]
 
 
-def _sched(*, mbs=None, running=None, last=None, chunked=None):
+def _sched(*, mbs=None, running=None, last=None, chunked=None, last_mbs=None):
     return types.SimpleNamespace(
-        running_mbs=mbs, running_batch=running, last_batch=last, chunked_req=chunked
+        running_mbs=mbs,
+        running_batch=running,
+        last_batch=last,
+        chunked_req=chunked,
+        # W30: the PP loop's PER-SLOT `last_batch` array. `last_batch` alone is
+        # the NON-PP handle; under event_loop_pp the per-slot entry is where a
+        # just-prefilled request actually sits.
+        last_mbs=last_mbs,
+        max_running_requests=8,
     )
 
 
@@ -258,3 +266,100 @@ class TestTheGdnMoverRetiresByConstruction(CustomTestCase):
 
         sched = _sched(running=_Batch([_Req("healthy", mamba=7)]))
         self.assertEqual(list(resident_mamba_slots(sched)), [7])
+
+
+class TestTheW30SpecimenLastMbs(CustomTestCase):
+    """W30 arm 2: the SAME defect, one route short.
+
+    THE SPECIMEN. /spinning/evidence-665-f1/SPECIMEN_w30_a2_resident_carry_
+    last_mbs.log -- all three ranks, 21 s into load, pin 9b9b6d1f81 with
+    `--phase-flip-purity prefill_in_tp`:
+
+        ResidentCarryError: PHASE-FLIP-CARRY 1 request(s) are reachable only
+        through last_mbs/last_batch at the cutover: ['56fddcc3c0ef...']
+
+    THE ASYMMETRY THAT PRODUCED IT. Two functions disagreed about what
+    "resident" means:
+
+      * `_live_reqs` -- the authority the RETRACTION uses -- read
+        `running_mbs`, `running_batch`, `last_batch`, `chunked_req`. It did
+        NOT read `last_mbs`.
+      * `orphan_resident_reqs` -- the cutover guard -- checks `last_mbs` AND
+        `last_batch`.
+
+    So `last_mbs` was a residency route the retraction could not see and the
+    guard did check. A request freshly prefilled under `event_loop_pp` sits in
+    `last_mbs[slot]`, was invisible to `_live_reqs`, was therefore never
+    retracted, and the guard correctly refused at the cutover.
+
+    THE GUARD IS NOT WEAKENED, and its own docstring forbids that: "reaching a
+    cutover with an orphan means the predicate did not hold -- a bug to raise,
+    not a carry to widen. Silently widening the harvest here would hide a
+    broken predicate behind a carry that appears to work." So the fix is in
+    the AUTHORITY, exactly as the W27 fix above was, and the guard below is
+    still the real one.
+    """
+
+    def test_a_request_only_in_last_mbs_is_live(self):
+        # RED before the fix: `_live_reqs` could not see this request at all.
+        req = _Req("only-in-last-mbs")
+        sched = _sched(last_mbs=[None, _Batch([req]), None])
+        self.assertEqual([r.rid for r in _live_reqs(sched)], ["only-in-last-mbs"])
+
+    def test_every_last_mbs_slot_is_consumed(self):
+        # The #631 defect-J shape again: cleaning only ONE slot leaves the
+        # request live in the others, silently.
+        req, keep = _Req("gone"), _Req("stays")
+        sched = _sched(
+            last_mbs=[_Batch([keep]), _Batch([req]), _Batch([req, keep])],
+        )
+        consume_retracted_from_live_universe(sched, [req])
+        self.assertEqual(sorted(r.rid for r in _live_reqs(sched)), ["stays"])
+
+    def test_the_w30_cutover_guard_has_nothing_left_to_refuse(self):
+        # END TO END against the REAL guard, not a restatement of it.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            assert_no_orphan_resident_reqs,
+        )
+
+        req = _Req("56fddcc3c0ef4f94a497b333b82bdf2f")
+        sched = _sched(last_mbs=[_Batch([req])], mbs=[_Batch([])])
+        consume_retracted_from_live_universe(sched, [req])
+        assert_no_orphan_resident_reqs(sched)  # must not raise
+
+    def test_the_real_guard_STILL_refuses_without_the_consume(self):
+        # CAN-FAIL, the dangerous direction. If this stops raising, the guard
+        # has been widened instead of satisfied -- the trade its docstring
+        # explicitly forbids.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            ResidentCarryError,
+            assert_no_orphan_resident_reqs,
+        )
+
+        req = _Req("56fddcc3c0ef4f94a497b333b82bdf2f")
+        sched = _sched(last_mbs=[_Batch([req])], mbs=[_Batch([])])
+        with self.assertRaises(ResidentCarryError) as caught:
+            assert_no_orphan_resident_reqs(sched)
+        self.assertIn("last_mbs/last_batch", str(caught.exception))
+
+    def test_the_authority_covers_every_route_the_guard_checks(self):
+        # THE DRIFT-DETECTOR, and it is the whole lesson of W30: the guard may
+        # never check a residency route the retraction authority cannot see.
+        import inspect
+
+        from sglang.srt.managers import phase_flip_resident_carry as carry
+        from sglang.srt.managers.phase_flip_runtime import (
+            _live_reqs as live,
+        )
+
+        guard_src = inspect.getsource(carry.orphan_resident_reqs)
+        authority_src = inspect.getsource(live)
+        consume_src = inspect.getsource(consume_retracted_from_live_universe)
+        for route in ("last_mbs", "last_batch"):
+            self.assertIn(route, guard_src, f"guard is expected to check {route}")
+            self.assertIn(
+                route, authority_src, f"_live_reqs must also see {route}"
+            )
+            self.assertIn(
+                route, consume_src, f"the consume path must also clear {route}"
+            )
