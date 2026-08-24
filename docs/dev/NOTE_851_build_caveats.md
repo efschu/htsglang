@@ -110,6 +110,58 @@ pre-#851 wall.
 So no term is unknown at boot, and the constant no longer decides anything on a
 correctly configured boot.
 
+## #852 prices the cache post; it does not PROVE why the draw was empty
+
+The W24 root (43 of 45 binding refusals, `cause=phantom_capacity`, every
+60-75 s for 21.6 min on PP0) was narrowed against the log to one surviving
+hypothesis, and the two it killed are worth recording so nobody re-opens them:
+
+* **Stale pricing — KILLED.** The derate denominator takes **21 distinct
+  values**, drifting 320,464,384 -> 325,639,168 B across the window. The
+  promise is genuinely re-measured every pass.
+* **Missing release — KILLED.** `empty_cache()` runs on every entry
+  (`_reclaim_cached_blocks` has no production hook), and 43/43 phantom lines
+  are tagged `[reclaim figures measured this pass]`, against the single
+  `scarcity` line tagged `[reclaim figures never measured]`.
+* **Wrong-rank read — no positive evidence.** All PP0; under `--rank-gpu-id`
+  each worker sees one device.
+* **Fragmentation — the only survivor, and NOT PROVEN.** The log carries no
+  allocator-segment telemetry at all: `inactive_split`, `fragment` and
+  `segment` appear **zero times in 14,490 lines**. It is the last hypothesis
+  standing, which is not the same as a confirmed root.
+
+**So #852 must not be cited as proving fragmentation.** What it ships is an
+estimator that DECIDES the question at runtime instead of assuming it, and the
+fix is correct under every one of the four hypotheses: a cache that really is
+releasable measures nonzero, draws, and pays exactly as before; only a cache
+that is provably unreleasable is priced at zero. Law 2 stays underneath as the
+backstop, so an estimator that over-promises is still corrected by the measured
+draw.
+
+The discriminator W24 lacked is now emitted every pass — the predicted
+releasable figure printed next to what the draw actually returned. Agreement
+confirms the fragmentation account; a nonzero prediction against a zero
+delivery falsifies it and indicts the estimator rather than the allocator.
+**Reading that pair is a W25 acceptance item.**
+
+### The abstention is load-bearing, not politeness
+
+Under `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` the arithmetic is
+void: `reserved` counts a VIRTUAL extent, measured in this tree at 36910 MiB on
+a 32607 MiB card (`phase_flip_spill.py` :369-377), and
+`adaptive_graph_memory.py` :354 already refuses a feature outright on that env.
+Subtracting there UNDER-reports, and an under-report suppresses a draw that
+would have paid — making the flip **stickier**, which is the precise defect
+#852 exists to remove. The estimator abstains instead, returning the seam to
+#828 behaviour byte for byte. Same for a backend without the counter
+(cudaMallocAsync) and for an empty reservation.
+
+All three abstentions live in `releasable_cache_bytes_from_stats`, a pure
+function over a stats mapping, so each is falsifiable without a GPU — with
+`test_the_arithmetic_holds_on_a_normal_allocator` as the can-fail direction
+that stops the abstention tests from passing against a function that only ever
+returns `None`.
+
 ## Metal criteria are NOT substituted by any of this
 
 "0 over-cap floor vetoes under load" stays in the window ticket unchanged. The

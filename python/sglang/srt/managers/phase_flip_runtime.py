@@ -1039,6 +1039,51 @@ def seam_probe_age_phrase(age: Optional[int]) -> str:
     return f"measured {int(age)} passes ago"
 
 
+def releasable_cache_bytes_from_stats(stats, alloc_conf: str = "") -> Optional[int]:
+    """Bytes an ``empty_cache()`` draw CAN hand the driver, or None (#852).
+
+    Pure arithmetic over a ``torch.cuda.memory_stats()`` mapping, kept out of
+    the device call so both directions are testable without a GPU -- the figure
+    AND every abstention.
+
+    ``reserved - allocated`` counts every free block, including blocks
+    fragmented inside segments that still carry live allocations.
+    ``empty_cache()`` releases only whole free segments, and
+    ``inactive_split_bytes`` is exactly the trapped remainder, so the
+    difference is what a draw can deliver.
+
+    IT ABSTAINS RATHER THAN GUESSES, in three cases:
+
+    * ``expandable_segments:True`` -- ``reserved`` then describes a VIRTUAL
+      extent, not physical bytes. This tree measured it at 36910 MiB on a
+      32607 MiB card (``phase_flip_spill``, "it cannot be compared to a
+      physical budget at all") and refuses another feature outright on the
+      same env (``adaptive_graph_memory`` :354). Subtracting under that config
+      UNDER-reports, and an under-report here suppresses a draw that would
+      have paid -- which would make the flip stickier, the exact defect #852
+      exists to remove.
+    * no ``inactive_split_bytes`` counter (cudaMallocAsync) -- without the
+      trapped figure the only available number is the phantom promise itself.
+    * nothing reserved -- there is no cache to price.
+
+    Every abstention returns the caller to its pre-#852 behaviour exactly.
+    """
+    try:
+        if "expandable_segments:True" in (alloc_conf or ""):
+            return None
+        reserved = int(stats.get("reserved_bytes.all.current", 0))
+        allocated = int(stats.get("allocated_bytes.all.current", 0))
+        inactive_split = int(stats.get("inactive_split_bytes.all.current", -1))
+        if reserved <= 0 or inactive_split < 0:
+            return None
+        # Counters sampled without a lock can disagree by a block; floor at
+        # zero so a transient over-subtraction reads as "nothing to collect"
+        # rather than as a corrupt census.
+        return max(0, reserved - allocated - inactive_split)
+    except Exception:  # noqa: BLE001 - a measurement may abstain, never break
+        return None
+
+
 def _resident_rows(scheduler) -> Optional[set]:
     """KV rows held by RESIDENT REQUESTS -- the census's missing owner (#822).
 
@@ -7573,6 +7618,39 @@ class PhaseFlipRuntime:
         if torch.cuda.is_available():  # pragma: no cover - needs a device
             torch.cuda.empty_cache()
 
+    @staticmethod
+    def _torch_releasable_cache_bytes():
+        """#852: bytes ``empty_cache()`` CAN hand the driver, or None.
+
+        THE DEVICE HALF ONLY. Every judgement -- the arithmetic and all three
+        abstentions -- lives in ``releasable_cache_bytes_from_stats``, which
+        needs no GPU and is therefore falsifiable in both directions. What is
+        left here is the sampling: the counters, and the allocator config the
+        expandable-segments abstention keys on. A rule that can only be
+        exercised on metal is a rule this corpus has repeatedly shipped inert.
+        """
+        try:
+            if not torch.cuda.is_available():
+                return None
+            return releasable_cache_bytes_from_stats(
+                torch.cuda.memory_stats(),
+                alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+            )
+        except Exception:  # noqa: BLE001 - a measurement may abstain, never break
+            return None
+
+    def _releasable_cache_bytes(self):
+        """#852: injectable like ``_mem_probe`` / ``_mem_reclaim``, so the
+        unit tests can model a fragmented cache, a whole one, and a backend
+        that cannot say."""
+        hook = getattr(self, "_mem_releasable", None)
+        if hook is not None:
+            try:
+                return hook()
+            except Exception:  # noqa: BLE001 - an abstaining probe, not a crash
+                return None
+        return PhaseFlipRuntime._torch_releasable_cache_bytes()
+
     def _record_seam_peak(
         self,
         direction: str,
@@ -7724,9 +7802,31 @@ class PhaseFlipRuntime:
         if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
             before = driver_free
             cache_promised = int(cached_free)
-            self._reclaim_cached_blocks()
-            driver_free, cached_free = probe()
-            from_driver = max(0, driver_free - reserve)
+            # #852: ask what a draw CAN return before paying for one. W24
+            # paid an empty_cache() device sync every 60-75 s for 23 straight
+            # minutes, each one measuring the 0 the allocator's own counters
+            # already knew (~309-324 MiB cached, all of it fragmented inside
+            # in-use segments). A measured 0 skips the draw and the census
+            # prices the post honestly from the recorded figure; a nonzero
+            # or abstaining (None) measurement keeps the draw AND the law-2
+            # delivery measurement exactly as #828 wired them.
+            releasable = self._releasable_cache_bytes()
+            self._last_cache_releasable_bytes = releasable
+            self._last_cache_releasable_seq = self._seam_probe_seq
+            if releasable == 0:
+                logger.info(
+                    "%s staging reclaim skipped: %.0f MiB cached but 0 MiB "
+                    "releasable (free blocks fragmented inside in-use "
+                    "segments) -- an empty_cache() draw would return nothing "
+                    "to the driver, so the seam keeps the sync and prices "
+                    "the post honestly at zero",
+                    LOG_PREFIX,
+                    cache_promised / (1024 * 1024),
+                )
+            else:
+                self._reclaim_cached_blocks()
+                driver_free, cached_free = probe()
+                from_driver = max(0, driver_free - reserve)
             # #828 LAW 2, MEASURED HERE AND SPENT BY THE CENSUS BELOW. This is
             # the only place in the refusal path that observes what the torch
             # cache ACTUALLY handed the driver. Without it the census prices
@@ -7738,18 +7838,38 @@ class PhaseFlipRuntime:
             # written ONLY here, inside the reclaim branch, and cleared
             # nowhere -- which is why the census below could not tell a
             # figure from this pass from one several passes old.
+            #
+            # #852: on the SKIPPED path this records a delivery of zero, and
+            # that is a fact rather than a fabricated measurement -- zero bytes
+            # reached the driver in this pass, and the skip is exactly why. It
+            # never reaches the refusal line as "derated to zero" either: a
+            # priced-zero promise carries the fragmentation reason instead, and
+            # `creditable` returns that reason before the derate text is built.
             self._last_cache_bytes_seq = self._seam_probe_seq
             self._last_cache_promised_bytes = cache_promised
             self._last_cache_delivered_bytes = max(0, int(driver_free - before))
             mib = 1024 * 1024
+            # #852 TELEMETRY, AND IT IS THE POINT. W24 could not settle WHY the
+            # draw delivered nothing, because 14490 lines carry no allocator
+            # -segment figure at all -- `inactive_split`, `fragment` and
+            # `segment` appear zero times. The estimate is printed NEXT TO what
+            # the draw actually returned, on every pass, so the next window
+            # reads the discriminator directly: agreement confirms the
+            # fragmentation account, and a nonzero prediction against a zero
+            # delivery falsifies it and indicts this estimator instead. An
+            # abstaining backend says so rather than printing a fabricated 0.
+            predicted = (
+                "unmeasurable" if releasable is None else f"{releasable / mib:.0f} MiB"
+            )
             logger.info(
                 "%s staging reclaim: driver free %.0f -> %.0f MiB "
-                "(+%.0f returned), %.0f MiB still cached, reserve %.0f MiB, "
-                "staging needs %.0f MiB",
+                "(+%.0f returned, predicted releasable %s), %.0f MiB still "
+                "cached, reserve %.0f MiB, staging needs %.0f MiB",
                 LOG_PREFIX,
                 before / mib,
                 driver_free / mib,
                 (driver_free - before) / mib,
+                predicted,
                 cached_free / mib,
                 reserve / mib,
                 staging_bytes / mib,
@@ -8748,6 +8868,18 @@ class PhaseFlipRuntime:
             # census ASSERTS is #828's law-2 question and not this ticket's.
             delivered = getattr(self, "_last_cache_delivered_bytes", None)
             promised = getattr(self, "_last_cache_promised_bytes", None)
+            # #852: the figure that makes the PROMISE honest rather than the
+            # verdict, written by the same probe pass as the two above and
+            # therefore quoted under the same age. A law connected to nothing
+            # is this corpus's signature failure mode, and this is the wire.
+            # A value that will not coerce ABSTAINS (None -> #828 pricing)
+            # instead of raising into the census's blanket except, which would
+            # silence the whole line and lose the funder list too.
+            try:
+                releasable = getattr(self, "_last_cache_releasable_bytes", None)
+                releasable = None if releasable is None else int(releasable)
+            except Exception:  # noqa: BLE001 - a measurement may abstain
+                releasable = None
             cache_age = seam_probe_reading_age(
                 getattr(self, "_seam_probe_seq", None),
                 getattr(self, "_last_cache_bytes_seq", None),
@@ -8786,6 +8918,7 @@ class PhaseFlipRuntime:
             auth = authority_from_seam_snapshot(
                 allocator_cache_bytes=cached,
                 allocator_cache_delivered_bytes=delivered,
+                allocator_cache_releasable_bytes=releasable,
                 kv_slack_rows=slack_rows,
                 row_bytes=row_bytes,
                 kv_granule_rows=granule_rows,

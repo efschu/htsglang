@@ -526,6 +526,7 @@ def authority_from_seam_snapshot(
     *,
     allocator_cache_bytes: int = 0,
     allocator_cache_delivered_bytes: Optional[int] = None,
+    allocator_cache_releasable_bytes: Optional[int] = None,
     kv_slack_rows: int = 0,
     row_bytes: int = 0,
     kv_granule_rows: int = 0,
@@ -566,9 +567,43 @@ def authority_from_seam_snapshot(
     ``None`` -- the default, and what every pre-#828 caller passes -- means NO
     draw has been observed, which law 2 defines as "trust it once". So this is
     additive: an unmeasured post keeps exactly its old credit.
+
+    #852: ``allocator_cache_releasable_bytes`` MAKES THE PROMISE ITSELF
+    HONEST. #828 corrected the verdict after a wasted draw; W24
+    (``boot_w24_0824_0852.log``, 43 of 45 binding refusals) then showed the
+    loop that leaves standing: every pass re-promised ~309-324 MiB of
+    ``reserved - allocated``, paid an ``empty_cache()`` sync, measured 0
+    delivered, derated, and repeated 60 s later. The torch allocator
+    publishes the discriminating figure -- ``inactive_split_bytes`` is the
+    free bytes trapped inside segments still in use -- so the caller can
+    price the post at what a draw CAN return. A raw-nonzero,
+    releasable-zero cache becomes an honest zero with the fragmentation
+    NAMED (cause reads ``scarcity``, not ``phantom_capacity``: nothing was
+    promised, so nothing is phantom). ``None`` abstains and keeps #828's
+    pricing exactly.
     """
     auth = FundingAuthority(rank=rank)
-    cache_promised = max(0, int(allocator_cache_bytes))
+    raw_cache = max(0, int(allocator_cache_bytes))
+    # #852: the honest promise. `raw_cache` counts free blocks fragmented
+    # inside segments that still carry live allocations -- bytes
+    # `empty_cache()` structurally cannot return. When the releasable figure
+    # is measured, IT is the promise; a reading above the raw cache means the
+    # measurement is wrong, not the post (clamp, law 2's own philosophy).
+    if allocator_cache_releasable_bytes is None:
+        cache_promised = raw_cache
+        cache_reason = "" if raw_cache > 0 else "torch cache already returned"
+    else:
+        cache_promised = max(0, min(raw_cache, int(allocator_cache_releasable_bytes)))
+        if cache_promised > 0:
+            cache_reason = ""
+        elif raw_cache > 0:
+            cache_reason = (
+                f"{raw_cache / MIB:.0f} MiB cached but 0 MiB releasable: the "
+                "free blocks sit fragmented inside segments still in use, "
+                "and empty_cache() returns only whole free segments"
+            )
+        else:
+            cache_reason = "torch cache already returned"
     cache_derate_num, cache_derate_den = 1, 1
     if allocator_cache_delivered_bytes is not None:
         cache_derate_den = cache_promised
@@ -586,9 +621,7 @@ def authority_from_seam_snapshot(
             cost=10,
             derate_num=cache_derate_num,
             derate_den=cache_derate_den,
-            unavailable_reason=(
-                "" if allocator_cache_bytes > 0 else "torch cache already returned"
-            ),
+            unavailable_reason=cache_reason,
         )
     )
     auth.declare_post(
