@@ -56,6 +56,7 @@ from sglang.srt.model_executor.weights_arena import (
     bind_arena_views,
     host_image_mode,
     image_from_tensors,
+    release_host_image,
     pack_into_arena,
     plan_arena_layout,
 )
@@ -1762,6 +1763,11 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # and it lives in `rotation_image`. Releasing it is what turns the boot's
     # two-image peak into a one-image steady state -- keeping it would be the
     # dual pin W26 OOM-killed, merely renamed.
+    # UNREGISTER BEFORE FREEING. The pages are cudaHostRegister'd; returning
+    # them to the allocator while CUDA still maps them makes the next big host
+    # allocation fail with rc=712 (W28 attempt 1 died exactly there, in
+    # HiCache's 5.6 GB KV buffer).
+    release_host_image(image_pp)
     del image_pp
 
     # The mode qualifier keeps this line honest for the host ledger: a

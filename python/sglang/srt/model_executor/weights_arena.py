@@ -887,6 +887,10 @@ def _torch_pinned_empty(total: int) -> torch.Tensor:
 #: replace the first and the ledger would under-report by a whole image.
 _image_post_seq = 0
 
+#: #809/W28: data_ptr -> pinned-registry post name, for images that may be
+#: freed before process exit. See `release_host_image`.
+_LIVE_IMAGE_POSTS: Dict[int, str] = {}
+
 
 def _register_image_post(nbytes: int) -> Optional[str]:
     """Record a pinned host image in the shared post registry. Never raises.
@@ -1035,10 +1039,48 @@ def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
     # exception is re-raised untouched -- cleanup must never substitute the
     # diagnosis (#386), so the operator still sees cudaHostRegister's own words.
     try:
-        return _alloc_host_image_inner(total, zero, envs)
+        image = _alloc_host_image_inner(total, zero, envs)
     except BaseException:
         _unregister_image_post(_image_post)
         raise
+    # #809/W28: remember the post for images that may be FREED before exit.
+    # Every image used to live for the process lifetime, so nothing ever had to
+    # be given back. The chunk rotation frees the PP boot image once the arena
+    # carries it, and an image that is dropped must return BOTH its registry
+    # post and its cudaHostRegister mapping -- see `release_host_image`.
+    if _image_post:
+        _LIVE_IMAGE_POSTS[int(image.data_ptr())] = _image_post
+    return image
+
+
+def release_host_image(image: torch.Tensor) -> None:
+    """Undo :func:`_alloc_host_image` for an image about to be dropped.
+
+    THE DEFECT THIS CLOSES, measured on metal (W28 attempt 1,
+    boot_w28_0824_1934.log). `_alloc_host_image` pins through
+    `cudaHostRegister`. Dropping the last Python reference returns the pages to
+    the process allocator while CUDA still has them REGISTERED, so the next
+    large host allocation -- HiCache's 5.6 GB KV buffer, in the specimen --
+    lands on that range and its own `cudaHostRegister` fails with
+
+        rc=712, part or all of the requested memory range is already mapped
+
+    and takes the boot down with it. The registration is a process-wide fact
+    about an ADDRESS RANGE, not a property of the tensor, so freeing without
+    unregistering leaves a landmine at an address nobody owns any more.
+
+    Ordering is the whole content of this function: UNREGISTER FIRST, then let
+    the caller drop the reference. The reverse order is the bug.
+    """
+    ptr = int(image.data_ptr())
+    try:
+        from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+        _cuda_host_unregister(image)
+    except Exception as exc:  # noqa: BLE001 -- cleanup never kills a boot
+        logger.warning("#809 could not cudaHostUnregister a boot image: %s", exc)
+    _unregister_image_post(_LIVE_IMAGE_POSTS.pop(ptr, None))
+    _FILE_BACKED_IMAGES.pop(ptr, None)
 
 
 def _alloc_host_image_inner(total: int, zero: bool, envs) -> torch.Tensor:
