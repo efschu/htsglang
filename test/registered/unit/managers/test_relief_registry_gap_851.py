@@ -32,10 +32,15 @@ registry. W22 cost a window partly to that distinction: the same log shows the
 registry DELIVERING elsewhere (``reclaimed 1210 MiB from [allocator-cache]``
 x12, 1124 x7, 1398 x4), which reads as a healthy registry and hid the gap.
 
-FIX-SHAPE-INDEPENDENT. The red assertion below is satisfied by registering
-kv-slack with the ladder, by having the rung report through the ladder, or by
-making the refusal name declared-but-unreachable posts. It does not prescribe
-which. It only forbids a refusal that says "nothing" while a post is declared.
+ONE REMEDY IS FORBIDDEN, and this file originally asserted it. Registering
+kv-slack with the ladder is WRONG: ``phase_flip_runtime.py:8290-8294`` states
+"No KV provider is registered with the guard at all, BY DESIGN (the cap is a
+group decision and the ladder is rank-local)". A rank-local ladder must not
+spend a group-decided cap, and it would spend it a SECOND time after the rung
+already paid. The corrected red assertion below therefore pins the property
+rather than a mechanism: a refusal must not describe its sources as "nothing"
+while a declared post holds credit. That is satisfied by naming the funder in
+the refusal, and NOT satisfiable by making the ladder spend it.
 
 Hermetic: pure registry inspection, no scheduler, no CUDA.
 """
@@ -45,7 +50,7 @@ import inspect
 import unittest
 
 from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.funding_authority import authority_from_seam_snapshot
+from sglang.srt.managers.funding_authority import MIB, authority_from_seam_snapshot
 
 
 def _declared_post_names():
@@ -106,23 +111,73 @@ class TestTheRegistryAsymmetry(unittest.TestCase):
         self.assertTrue(declared - registered)
         self.assertEqual(declared - registered, {"kv-slack"})
 
-    @unittest.expectedFailure
-    def test_every_declared_post_is_reachable_by_the_ladder(self):
-        """RED TODAY, BY DESIGN. UNEXPECTED SUCCESS when #851 closes the gap.
+    def test_kv_slack_must_NOT_be_registered_with_the_ladder(self):
+        """THE ASSERTION THIS FILE ORIGINALLY GOT BACKWARDS -- corrected, and
+        kept as a guard so nobody "fixes" #813 the dangerous way.
 
-        A post the authority declares but the ladder cannot spend is a post
-        that can never appear in a refusal's provider list -- so the refusal
-        says "nothing" and blames the rig. Either the ladder learns to reach
-        it, or the refusal learns to name it; this assertion does not care
-        which, only that "[nothing]" stops being printed while a post exists.
+        The first version of this file asserted ``declared - registered ==
+        set()``, i.e. that the ladder must register every declared post. That
+        is WRONG, and the tree says so at
+        ``phase_flip_runtime.py:8290-8294``:
+
+            No KV provider is registered with the guard at all, BY DESIGN (the
+            cap is a group decision and the ladder is rank-local), so the
+            rung's bytes arrive as `kv_freed` BEFORE the probe and can never
+            appear in that list.
+
+        Registering kv-slack with the ladder would let a RANK-LOCAL ladder
+        spend a GROUP-DECIDED cap, and would spend it a second time after the
+        rung already paid it. The gap is real; that remedy is not. #813 closes
+        by making the refusal NAME what it could not reach -- which is what
+        the plan's F4 says ("a refusal prices ALL declared posts") and what
+        the corrected red test below pins.
         """
-        declared = _declared_post_names()
-        registered = _ladder_registered_names()
-        self.assertEqual(
-            declared - registered,
-            set(),
-            "declared but unreachable posts: a refusal will report [nothing] "
-            "while these sit beside it",
+        self.assertNotIn("kv-slack", _ladder_registered_names())
+
+    def test_a_refusal_names_the_funder_it_cannot_spend(self):
+        """GREEN SINCE F4. Was the red acceptance assertion for it.
+
+        The defect is not that the ladder cannot spend kv-slack -- it must
+        not. The defect is that the refusal REPORTS "[nothing]" while a
+        declared post holds credit, which reads as "this rig had no memory to
+        give" and sends the next reader to capacity planning instead of to the
+        registry. W22 printed that 39 times while kv-slack held 2776 MiB.
+
+        The property, and it is fix-shape-independent: a guard whose ladder
+        delivered nothing, but which can see a declared post holding credit,
+        must not describe its sources as "nothing".
+        """
+        from sglang.srt.managers import corridor_guard as cg
+
+        # W22's numbers: the gate wanted 3248 MiB against 2420 MiB free, with
+        # an empty ladder (no provider registered), while kv-slack held credit.
+        guard = cg.CorridorGuard(
+            0,
+            floor_mib=1255,
+            probe=lambda: 2420 * MIB,
+            law_floor_mib=1024,
+        )
+        guard.declare_offledger_funder(
+            lambda want: (("kv-slack", 2560 * MIB, ""),)
+        )
+        res = guard.ensure_headroom(3248 * MIB, reason="seam staging tp_to_pp")
+        self.assertFalse(res.ok)
+        # The funder must be NAMED, with its figure.
+        self.assertIn("kv-slack", res.detail)
+        self.assertIn("2560", res.detail)
+        # "[nothing]" LEGITIMATELY REMAINS, and this is deliberate rather than
+        # a weakened assertion. That token is the LADDER's record of what it
+        # actually spent, and it is true: the ladder spent nothing. The defect
+        # was never the word, it was that the word stood ALONE and therefore
+        # read as "this rig had no memory to give". So the property pinned
+        # here is that the two facts appear TOGETHER -- a future change that
+        # drops the suffix and leaves the bare list fails this, which is the
+        # regression that matters.
+        self.assertIn("[nothing]", res.detail)
+        self.assertLess(
+            res.detail.index("[nothing]"),
+            res.detail.index("kv-slack"),
+            "the ladder record must still come first; the funder clause explains it",
         )
 
     def test_an_unavailable_post_still_carries_a_reason(self):

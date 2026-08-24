@@ -2562,6 +2562,34 @@ def get_corridor_guard(scheduler: Any):
             LOG_PREFIX,
             int(device_index),
         )
+        # #851 F4: NOT A PROVIDER -- A WITNESS. Everything above stays true:
+        # this rung is deliberately not registered, because its cap is a GROUP
+        # decision and this ladder is rank-local. What was missing is that a
+        # refusal could not SAY so, and printed "reclaimed 0 MiB from
+        # [nothing]" instead -- 39 times on W22 while this rung held 2776 MiB.
+        # The view below is consulted only on a refusal and only for text; it
+        # frees nothing and cannot change a verdict.
+        def _kv_rung_witness(want_bytes: int):
+            rung = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+            if rung is None:
+                return ()
+            try:
+                # THE SAME DERIVATION THE #770 CENSUS USES
+                # (phase_flip_runtime.py:8716-8721), deliberately: a witness
+                # that computed slack its own way would be a fifth bookkeeper,
+                # which is the defect class this whole build is closing.
+                terms = getattr(rung, "_last_proposal_terms", None)
+                rows = 0
+                if terms:
+                    rows = max(0, int(terms["current"]) - int(terms["floor_rows"]))
+                row_bytes = int(getattr(rung, "_bytes_per_row", 0) or 0)
+            except Exception:  # noqa: BLE001 - a witness may never raise
+                return ()
+            if rows <= 0 or row_bytes <= 0:
+                return (("kv-slack", 0, "pool is at or below its rung floor"),)
+            return (("kv-slack", rows * row_bytes, ""),)
+
+        guard.declare_offledger_funder(_kv_rung_witness)
 
     setattr(scheduler, CORRIDOR_GUARD_ATTR, guard)
     logger.info(

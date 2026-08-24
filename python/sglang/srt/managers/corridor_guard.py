@@ -885,6 +885,19 @@ class CorridorGuard:
         self.floor_bytes = int(floor_mib) * _MIB
         self.delta_bytes = int(delta_mib) * _MIB
         self._probe = probe
+        # #851 F4: THE FUNDER THIS LADDER MAY NOT SPEND, so that a refusal can
+        # still NAME it. Optional and None by default -- an unset view leaves
+        # every existing refusal line byte-identical.
+        #
+        # A post can be declared to the FundingAuthority and be unreachable
+        # from here on purpose: the KV rung pays BEFORE this gate, and its cap
+        # is a GROUP decision while this ladder is rank-local
+        # (phase_flip_runtime.py:8290-8294). Registering it as a provider would
+        # spend a group quantity from a rank-local ladder, twice. So the fix is
+        # not to reach it -- it is to stop reporting "[nothing]" when the true
+        # answer is "there was money, one bookkeeper earlier, and this gate
+        # could not draw it".
+        self._offledger_funder: Optional[Callable[[int], Sequence]] = None
         # Item 16's fleet predicate. Deliberately a per-card NVML read rather
         # than a collective: this gate runs inside the flip's no-return
         # region, and a collective there is a deadlock waiting for the one
@@ -983,6 +996,54 @@ class CorridorGuard:
 
     def _host_tier_permitted(self, column: Sequence[int]) -> bool:
         return fleet_is_level(column, self.floor_mib, self.delta_mib)
+
+    def declare_offledger_funder(self, view: Optional[Callable[[int], Sequence]]) -> None:
+        """Name a funder this ladder may NOT spend, so refusals can cite it.
+
+        ``view(want_bytes)`` returns an iterable of ``(name, credit_bytes,
+        reason)``. It is consulted ONLY on a refusal and ONLY for text: it
+        never frees a byte, never changes the verdict, and is wrapped so a
+        broken view cannot turn a refusal into a crash. A diagnostic that can
+        alter the thing it reports is worse than none -- the same rule
+        ``explain_kv_target`` states for the group verdict.
+
+        Unset by default, which keeps every existing refusal line unchanged.
+        """
+        self._offledger_funder = view
+
+    def _offledger_detail(self, want: int) -> str:
+        """One clause naming declared funders this gate could not draw on."""
+        view = getattr(self, "_offledger_funder", None)
+        if view is None:
+            return ""
+        try:
+            posts = list(view(int(want)))
+        except Exception as exc:  # noqa: BLE001 - a diagnostic may never raise
+            logger.debug("%s off-ledger funder view failed: %s", LOG_PREFIX, exc)
+            return ""
+        held, empty = [], []
+        for entry in posts:
+            try:
+                name, credit, why = entry
+            except Exception:  # noqa: BLE001 - tolerate a malformed row
+                continue
+            if int(credit) > 0:
+                held.append(f"{name} holds {int(credit) / _MIB:.0f} MiB")
+            elif why:
+                empty.append(f"{name}: {why}")
+        if not held and not empty:
+            return ""
+        parts = []
+        if held:
+            parts.append(
+                "this gate may not draw on "
+                + ", ".join(held)
+                + " -- that funder pays before the gate and its cap is a group "
+                "decision, so it can never appear in the list above (#813)"
+            )
+        if empty:
+            parts.append("declared but empty: " + "; ".join(empty))
+        return "; ".join(parts)
 
     def ensure_headroom(
         self,
@@ -1099,6 +1160,24 @@ class CorridorGuard:
             f"{self.floor_bytes / _MIB:.0f} MiB, corridor law "
             f"{self.law_floor_mib} MiB" + (f" ({reason})" if reason else "")
         )
+        # #851 F4: SAY WHAT THIS GATE COULD NOT DRAW, instead of leaving
+        # "[nothing]" to mean two different things.
+        #
+        # W22 printed "reclaimed 0 MiB from [nothing]" 39 times while the
+        # kv-slack post held 2776 MiB. "[nothing]" is the LADDER's provider
+        # list, and it is honest about the ladder -- but read as a sentence it
+        # says "this rig had no memory to give", which sends the next reader to
+        # capacity planning. The true statement is "this rig had a funder this
+        # gate may not spend". One window was partly spent on that difference.
+        #
+        # Appended, never substituted: the ladder's own list stays exactly as
+        # it was, because it is the truthful record of what the gate actually
+        # spent. Only failures carry the suffix -- a successful ask does not
+        # need to explain money it did not need.
+        if not ok:
+            named = self._offledger_detail(want)
+            if named:
+                detail = f"{detail}; {named}"
         # #689 A RECLAIM ASK IS JUDGED BY WHAT MOVED.
         #
         # ``free_now >= want`` asks "is want allocatable", which is exactly
