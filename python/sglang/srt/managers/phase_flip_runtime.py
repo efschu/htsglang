@@ -1136,6 +1136,72 @@ def release_residents_for_cutover(reqs, *, retract, reset_tree):
     return retracted
 
 
+def drop_prefix_tree_returning_rows(tree) -> int:
+    """Empty the prefix tree AND return its rows, then reset it (#856).
+
+    THE W27-RETRY DEFECT, derived from the tree code rather than guessed.
+    `MambaRadixCache.reset` (mamba_radix_cache.py:555) installs a NEW
+    `TreeNode()` as root and zeroes `full_evictable_size_` /
+    `full_protected_size_`. It never frees a device row: the old tree is
+    simply dereferenced, and the rows its nodes held are orphaned. It is a
+    BOOKKEEPING reset, not a deallocation -- correct for a teardown where the
+    pool is reset too, wrong for a seam that keeps serving.
+
+    Measured on metal (boot_w27r_0824_1551.log, third retract+drop cycle):
+
+        pool memory leak detected! [full] total=472864, available=126802,
+          evictable=22, protected=0, session_held=0, uncached=0,
+          withheld=345888
+
+    126802 + 22 + 345888 = 472712 against 472864 -> 152 rows belonging to
+    nobody, accumulating once per cycle. `evictable=22` is the NEW tree; the
+    old tree's rows are gone from every owner's books, which is why the
+    detector can see them only as a total mismatch.
+
+    THE CALL THAT ACTUALLY RETURNS ROWS is `evict` -> `evict_full`, whose leaf
+    path frees through `token_to_kv_pool_allocator.free`. So the drop is
+    evict-then-reset: empty the tree by the route that pays the allocator
+    back, and only then rebuild the root.
+
+    NOT A FLUSH-BY-ANOTHER-NAME. Eviction here is legitimate precisely because
+    the #703 fence has already persisted these prefixes to the canonical
+    store; the new layout re-reads them. Without that fence this would be data
+    loss, which is why the seam order is fence -> retract -> DROP and not any
+    permutation of it.
+
+    Returns the number of rows the tree reported evicting, for the seam's log
+    line -- a drop that returns zero on a non-empty tree is exactly the defect
+    this function exists to remove, and it has to be visible.
+
+    Never raises: it runs at the seam with requests already retracted, and
+    aborting here would strand a flip that has already released its state.
+    """
+    returned = 0
+    try:
+        evictable = int(getattr(tree, "full_evictable_size_", 0) or 0)
+    except (TypeError, ValueError):
+        evictable = 0
+    if evictable > 0:
+        try:
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            result = tree.evict(EvictParams(num_tokens=evictable))
+            returned = int(getattr(result, "num_tokens_evicted", 0) or 0)
+        except Exception:  # noqa: BLE001 - never abort a flip mid-drop
+            logger.error(
+                "%s #856: the prefix tree refused to evict %d row(s) before "
+                "the drop; they will be orphaned and the pool census will "
+                "report them missing",
+                LOG_PREFIX,
+                evictable,
+            )
+    try:
+        tree.reset()
+    except Exception:  # noqa: BLE001
+        logger.error("%s #856: prefix tree reset failed after eviction", LOG_PREFIX)
+    return returned
+
+
 def consume_retracted_from_live_universe(scheduler, reqs) -> int:
     """A retracted request must LEAVE the live universe, not merely be freed.
 
@@ -1253,7 +1319,13 @@ def build_cutover_release(scheduler):
             offload_kv=False,
         )
 
-    return _retract, tree_cache.reset
+    # #856 W27-retry: the drop must RETURN the tree's rows, not orphan them.
+    # A bare `tree_cache.reset` is a bookkeeping reset and leaked 152 rows per
+    # cycle on metal; see `drop_prefix_tree_returning_rows`.
+    def _drop_tree():
+        return drop_prefix_tree_returning_rows(tree_cache)
+
+    return _retract, _drop_tree
 
 
 def _writeback_fence_ms(report) -> Optional[float]:

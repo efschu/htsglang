@@ -105,6 +105,40 @@ KNOWN VACUOUS: `TestMoverLiveSetIsBounded` now passes trivially (peak 0 is
 below any bound) and can no longer fail. It is subsumed by
 `test_the_seam_moves_no_kv_at_all` and must not be cited as evidence.
 
+## The 152-row leak, ROOTED AND FIXED (desk, post-W27-retry)
+
+DERIVED FROM THE TREE CODE, not from an API guess. `MambaRadixCache.reset`
+(`mamba_radix_cache.py:555`) installs a NEW `TreeNode()` as root and zeroes
+`full_evictable_size_` / `full_protected_size_`. It frees no device row: the
+old tree is simply dereferenced. It is a BOOKKEEPING reset -- right for a
+teardown where the pool is reset too, wrong for a seam that keeps serving.
+The call that actually returns rows is `evict` -> `evict_full`, whose leaf
+path frees through `token_to_kv_pool_allocator.free`.
+
+So the drop is EVICT-THEN-RESET (`drop_prefix_tree_returning_rows`), and the
+eviction is legitimate ONLY because the #703 fence has already persisted these
+prefixes. Without the fence this would be data loss -- which is why the seam
+order is fence -> retract -> drop and not any permutation of it.
+
+Both danger directions are pinned: orphaning (the metal defect) AND
+double-return, which is silent where the leak was loud -- the test's allocator
+raises on a second free, so an evict-and-also-free implementation fails.
+
+## The empty wave loop: DEFERRED, with the invariant named
+
+W27-retry measured the seam still walking 16 EMPTY waves for ~314 ms, plus
+753.6 ms for the retract+consume+drop. Skipping the loop when the plan is
+empty by construction looks like free seam time, and it is NOT yet safe:
+
+**`finalize_wave` calls `dst.restore_backing(layers)`** -- it marks the
+destination layers RESIDENT, and that has nothing to do with whether KV moved.
+Skipping the loop would leave the destination pool answering NO to
+`backing_is_resident`.
+
+The cheap successor is a single `restore_backing(all layers)` outside the
+loop, replacing 16 iterations. That changes backing semantics and needs its
+own test, so it is a named follow-up rather than a line in this slice.
+
 ## W27-RETRY (pin b6c38dfe17) — root fix HOLDS, and a NEW defect of mine
 
 9 flips, BOTH directions, no GDN refusal, no #825 shape. Then a leak.

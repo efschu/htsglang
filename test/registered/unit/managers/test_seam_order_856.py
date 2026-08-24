@@ -204,7 +204,12 @@ class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
         self.assertIsNotNone(built)
         retract, reset_tree = built
         self.assertTrue(callable(retract))
-        self.assertIs(reset_tree, tree.reset)
+        # #856 W27-retry: the drop is NO LONGER the bare `tree.reset`. A bare
+        # reset is a bookkeeping reset that orphans the tree's rows -- it
+        # leaked 152 rows per cycle on metal. The binding must hand back the
+        # row-RETURNING drop instead.
+        self.assertTrue(callable(reset_tree))
+        self.assertIsNot(reset_tree, tree.reset)
 
     def test_retracting_nothing_needs_no_scheduler_state(self):
         # The empty case must not reach into pools that an idle instance may
