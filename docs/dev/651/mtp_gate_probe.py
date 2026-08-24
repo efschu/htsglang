@@ -71,6 +71,17 @@ def main() -> int:
     from sglang.srt.model_loader.gguf_registry import create_gguf_adapter
 
     adapter = create_gguf_adapter(draft_cfg, gguf_file)
+    if adapter is None:
+        # Returning None means "no bespoke family, use the generic GGUF path" --
+        # which for this checkpoint would silently gate the wrong thing, since
+        # the MTP name map lives only in the bespoke adapter.
+        print(
+            f"FAIL  no bespoke GGUF adapter for model_type="
+            f"{getattr(draft_cfg, 'model_type', None)!r}; the MTP name map "
+            "this probe exists to check would not be used."
+        )
+        print("VERDICT: DEFECT")
+        return 1
     print(f"adapter: {type(adapter).__name__} arch={adapter.arch} is_draft={getattr(adapter, 'is_draft', None)}")
 
     name_map = adapter.build_name_map()
