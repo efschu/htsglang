@@ -622,6 +622,39 @@ FLOOR_NEED_COMMIT_CLAMPED = "COMMIT-CLAMPED"
 #: has moved past its own boot reservation can never grow again, and the reason
 #: is the RESERVATION, not the commit.
 FLOOR_NEED_RESERVATION_CAPPED = "RESERVATION-CAPPED"
+
+
+def lawful_reservation_rows(
+    size_rows: int, admission_reserve_rows: int = 0, margin_rows: int = 0
+) -> int:
+    """#851 F2: the VA reservation a pool of ``size_rows`` may lawfully need.
+
+    THE ARITHMETIC THE BOOT RESERVATION MISSED. The KV rung's floor is
+    ``max_live + 1 + margin + admission_reserve`` (``_floor_rows``), and
+    ``max_live`` may legitimately sit at the pool's own cap. So the largest
+    backing the dial may lawfully be asked to reach is::
+
+        size + 1 + margin + admission_reserve
+
+    Reserving only ``size`` -- ``reserved_num_tokens=self.size``,
+    memory_pool.py -- therefore under-reserves by exactly the floor's headroom,
+    and a rank whose dial has moved past its boot reservation can never grow
+    again. W22 measured it: "size=126976, reservation=125052, target=126977 ...
+    no grow can ever be accepted here", exit=RESERVATION-CAPPED, on the very
+    rank holding the group floor.
+
+    WHY OVER-RESERVING IS THE SAFE DIRECTION and not a memory cost: this is a
+    VIRTUAL ADDRESS reservation, not committed pages -- that is the whole point
+    of ``swappable_backing``. Address space is nearly free; an under-reservation
+    is a permanent, unfixable-at-runtime wall. The two errors are not
+    symmetric, so the rounding goes up.
+
+    Pure, so the law can be tested without a pool, a driver or a boot.
+    """
+    size = max(0, int(size_rows))
+    if size <= 0:
+        return 0
+    return size + 1 + max(0, int(margin_rows)) + max(0, int(admission_reserve_rows))
 FLOOR_NEED_GROWN = "GROWN"
 
 FLOOR_NEED_EXITS = (

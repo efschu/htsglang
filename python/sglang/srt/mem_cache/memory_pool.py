@@ -2646,6 +2646,35 @@ class MHATokenToKVPool(KVCache):
         self.k_buffer = tensors[: self.layer_num]
         self.v_buffer = tensors[self.layer_num :]
 
+    def _lawful_reserved_tokens(self) -> int:
+        """#851 F2: rows to RESERVE, covering the floor's lawful headroom.
+
+        `reserved_num_tokens=self.size` reserves for the size at THIS INSTANT,
+        and the reservation is never reassigned while `size` stays mutable and
+        the #330 dial writes it. So the pool is walled at its boot size: W22
+        measured "size=126976, reservation=125052, target=126977 ... no grow can
+        ever be accepted here" (exit=RESERVATION-CAPPED) on the rank holding the
+        group floor, and the #839-METAL actuator built for that gap ran 49 times
+        without being able to pay.
+
+        Falls back to `self.size` -- the pre-#851 value -- if the law cannot be
+        read. An under-reservation is bad; failing to construct the pool is
+        worse.
+        """
+        try:
+            from sglang.srt.managers.kv_backing_relief import (
+                _admission_reserve_rows,
+                lawful_reservation_rows,
+            )
+
+            try:
+                reserve = int(_admission_reserve_rows(None))
+            except Exception:  # noqa: BLE001 - the derived value is best-effort
+                reserve = 0
+            return int(lawful_reservation_rows(int(self.size), reserve, 0))
+        except Exception:  # noqa: BLE001 - never fail construction on a knob
+            return int(self.size)
+
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
         device_id = dev.index if dev.index is not None else torch.cuda.current_device()
@@ -2687,7 +2716,12 @@ class MHATokenToKVPool(KVCache):
             device_id=device_id,
             store_dtype=self.store_dtype,
             page_size=self.page_size,
-            reserved_num_tokens=self.size,
+            # #851 F2: reserve for every backing the dial may LAWFULLY reach,
+            # not for the size at this instant. A VA reservation is address
+            # space, not committed pages (the point of swappable_backing), so
+            # over-reserving costs nothing that matters while under-reserving
+            # is a permanent wall no runtime actuator can lift.
+            reserved_num_tokens=self._lawful_reserved_tokens(),
             buffer_descs=self._build_kv_buffer_descs(),
             commit_chunk_bytes=self._vmm_commit_chunk_bytes or seam_chunk,
             retain_handles=retain,
