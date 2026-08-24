@@ -283,6 +283,42 @@ REFERENCE_SHAPES = [
 ]
 
 
+#: #855 shape set, taken from ANALYSE_854 rather than re-derived: the worked
+#: 12:10:10 example (ANALYSE_854 4.1, docs/dev/ANALYSE_854_w8a16_vs_w8a8.md:
+#: 372-386) and the un-sharded projections its 9 step 0 names. The W8A16
+#: lane coarsens shards to 128 (not the INT8 lane's 16), which is why every
+#: K below is 128-aligned -- the two schemes do not share a shard table, so
+#: deriving these from the INT8 unit family would have priced the wrong
+#: shapes.
+SHAPES_855 = [
+    # ratio 12:10:10, intermediate 17408 = 136 units of 128 -> 51/43/42
+    ("m855_gate_up_r0", 13056, 5120, "12:10:10 rank0 gate_up (2 x 6528)"),
+    ("m855_down_r0", 5120, 6528, "12:10:10 rank0 down_proj (K-shard)"),
+    ("m855_down_r1", 5120, 5504, "12:10:10 rank1 down_proj (K-shard)"),
+    # o_proj / GDN out_proj, K=6144 = 48 units -> 18/15/15
+    ("m855_out_proj_r0", 5120, 2304, "12:10:10 rank0 o_proj / GDN out_proj"),
+    ("m855_out_proj_r1", 5120, 1920, "12:10:10 rank1 o_proj / GDN out_proj"),
+    # un-sharded (TP=1) projections listed in ANALYSE_854 9 step 0
+    ("m855_full_gate_up_out", 17408, 5120, "ANALYSE_854 9.0 un-sharded"),
+    ("m855_full_down", 5120, 17408, "ANALYSE_854 9.0 un-sharded"),
+    ("m855_full_qkv", 12288, 5120, "ANALYSE_854 9.0 un-sharded"),
+    ("m855_full_gdn_out", 5120, 6144, "ANALYSE_854 9.0 un-sharded"),
+    ("m855_full_10240", 10240, 5120, "ANALYSE_854 9.0 un-sharded"),
+]
+
+#: The minimum decision set: one large sharded GEMM, one mid, one small.
+#: Deliberately not a ladder -- the verdict question (does Marlin lose enough
+#: at the deployed operating points to veto W8A16) is coarse, and three
+#: shapes that separate cleanly from the A-vs-A floor answer it.
+SHAPES_855_MIN = ["m855_gate_up_r0", "m855_down_r0", "m855_out_proj_r0"]
+
+SHAPE_PRESETS = {
+    "none": [],
+    "855": [s[0] for s in SHAPES_855],
+    "855min": SHAPES_855_MIN,
+}
+
+
 def derive_shapes(
     cfg: dict,
     tp_size: int,
@@ -463,6 +499,18 @@ class Kernels:
     fp8_dtype: torch.dtype
     stub: bool
     missing: list = field(default_factory=list)
+    # --- #855 Marlin wNa16 arm (weight-only int8, group 128) ---------------
+    # Resolved through the SERVING path's own helpers, not a private copy:
+    # CompressedTensorsWNA16.apply_weights calls apply_gptq_marlin_linear
+    # (schemes/compressed_tensors_wNa16.py:327), and the repack that produces
+    # the kernel's weight layout is the same gptq_marlin_repack the scheme
+    # runs in process_weights_after_loading (wNa16.py:250).
+    apply_gptq_marlin_linear: Optional[Callable] = None
+    gptq_marlin_repack: Optional[Callable] = None
+    marlin_make_workspace: Optional[Callable] = None
+    marlin_permute_scales: Optional[Callable] = None
+    marlin_make_empty_g_idx: Optional[Callable] = None
+    marlin_wtype: object = None
 
 
 def _stub_per_token_quant_int8(x: torch.Tensor):
@@ -580,6 +628,38 @@ def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
         block_fp8_linear = None
         missing.append(f"dispatch_w8a8_block_fp8_linear: {type(ex).__name__}: {ex}")
 
+    # #855: the Marlin wNa16 arm. In-tree JIT (sglang.jit_kernel.gptq_marlin),
+    # NOT an sgl_kernel symbol -- so unlike the INT8 arm it cannot be lost to
+    # the #384 wheel swap. Missing here means the JIT could not build.
+    marlin: dict = {}
+    try:
+        from sglang.jit_kernel.gptq_marlin_repack import (  # noqa: PLC0415
+            gptq_marlin_repack,
+        )
+        from sglang.srt.layers.quantization.marlin_utils import (  # noqa: PLC0415
+            apply_gptq_marlin_linear,
+            marlin_make_empty_g_idx,
+            marlin_make_workspace,
+            marlin_permute_scales,
+        )
+        from sglang.srt.layers.quantization.utils import (  # noqa: PLC0415
+            get_scalar_types,
+        )
+
+        _, _scalar_types = get_scalar_types()
+        marlin = dict(
+            apply_gptq_marlin_linear=apply_gptq_marlin_linear,
+            gptq_marlin_repack=gptq_marlin_repack,
+            marlin_make_workspace=marlin_make_workspace,
+            marlin_permute_scales=marlin_permute_scales,
+            marlin_make_empty_g_idx=marlin_make_empty_g_idx,
+            # WNA16_SUPPORTED_TYPES_MAP[8] (wNa16.py:56): 8-bit symmetric,
+            # the type a W8A16 compressed-tensors checkpoint resolves to.
+            marlin_wtype=_scalar_types.uint8b128,
+        )
+    except Exception as ex:
+        missing.append(f"marlin_wna16: {type(ex).__name__}: {ex}")
+
     return Kernels(
         per_token_quant_int8=per_token_quant_int8,
         int8_scaled_mm=int8_scaled_mm,
@@ -590,6 +670,7 @@ def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
         fp8_dtype=fp8_dtype,
         stub=False,
         missing=missing,
+        **marlin,
     )
 
 
@@ -607,11 +688,19 @@ ALL_LANES = [
     "fp8_ct_fused",
     "fp8_block_fused",
 ]
-OPTIONAL_LANES: list = []
+#: #855. Opt-in only (`--lanes ...,+marlin_wna16`), so every #368 default
+#: invocation keeps its exact lane set and remains comparable to the recorded
+#: #368 results.
+OPTIONAL_LANES: list = ["marlin_wna16"]
 
 #: Qwen3.6-27B-FP8's ``weight_block_size``. Also the block the #255/#370
 #: idle-tuner queue tunes for (``--block-n 128 --block-k 128``).
 FP8_BLOCK = (128, 128)
+
+#: #855: the W8A16 candidates surveyed in ANALYSE_854 3 are group-128
+#: pack-quantized, and 128 is also what the wNa16 lane coarsens uneven-TP
+#: shards to (ANALYSE_854 4.1).
+MARLIN_GROUP = 128
 
 
 @dataclass
@@ -630,6 +719,12 @@ class Weights:
     ws_f8_chan: Optional[torch.Tensor]
     w_f8_blk: Optional[torch.Tensor]  # (n, k), NOT transposed
     ws_f8_blk: Optional[torch.Tensor]  # (ceil(n/128), ceil(k/128)) float32
+    # --- #855 Marlin wNa16 (weight-only int8, group 128) ------------------
+    w_marlin: Optional[torch.Tensor] = None  # gptq_marlin_repack output
+    ws_marlin: Optional[torch.Tensor] = None  # marlin_permute_scales output
+    marlin_workspace: Optional[torch.Tensor] = None
+    marlin_empty: Optional[torch.Tensor] = None  # g_idx / sort_indices / zp
+    marlin_note: str = ""
 
 
 @dataclass
@@ -678,7 +773,67 @@ def build_weights(shape: Shape, dev: torch.device, kn: Kernels, seed: int) -> We
             .to(dev)
             .add_(0.01)
         )
-    return Weights(w_bf16, w_i8.t(), ws_i8, w_f8_t, ws_f8_chan, w_f8_blk, ws_f8_blk)
+    w_marlin = ws_marlin = marlin_ws = marlin_empty = None
+    marlin_note = ""
+    if kn.apply_gptq_marlin_linear is not None:
+        # Marlin's own shape rules, checked here rather than crashed in CUDA:
+        # GPTQ_MARLIN_MIN_THREAD_K = 128 / MIN_THREAD_N = 64 (marlin_utils.py:
+        # 57, verify_marlin_supports_shape at :191-208), and a group of 128
+        # must divide K. Under uneven TP the W8A16 lane coarsens every shard
+        # to 128 for exactly this reason (linear.py:361-362, ANALYSE_854 4.1),
+        # so a real deployed shard always passes; a shard that does not is a
+        # finding, not a harness limit.
+        if k % MARLIN_GROUP or n % 64:
+            marlin_note = (
+                f"skipped: K={k} must be %{MARLIN_GROUP} and N={n} must be %64"
+            )
+        else:
+            pack_factor = 32 // 8
+            # GPTQ-serialized layout the scheme hands to gptq_marlin_repack:
+            # (K // pack_factor, N) int32, K-packed. Random bits are a valid
+            # weight -- Marlin's cost does not depend on the values.
+            w_gptq = torch.randint(
+                -(2**31),
+                2**31 - 1,
+                (k // pack_factor, n),
+                generator=g,
+                dtype=torch.int32,
+            ).to(dev)
+            marlin_empty = kn.marlin_make_empty_g_idx(dev)
+            w_marlin = kn.gptq_marlin_repack(
+                w_gptq.contiguous(),
+                perm=marlin_empty,
+                size_k=k,
+                size_n=n,
+                num_bits=8,
+            )
+            s_raw = (
+                torch.rand(k // MARLIN_GROUP, n, generator=g, dtype=torch.float32)
+                .mul_(0.01)
+                .add_(0.001)
+                .to(dev)
+                .to(torch.bfloat16)
+            )
+            ws_marlin = kn.marlin_permute_scales(
+                s_raw.contiguous(), size_k=k, size_n=n, group_size=MARLIN_GROUP
+            )
+            marlin_ws = kn.marlin_make_workspace(dev)
+            del w_gptq
+
+    return Weights(
+        w_bf16,
+        w_i8.t(),
+        ws_i8,
+        w_f8_t,
+        ws_f8_chan,
+        w_f8_blk,
+        ws_f8_blk,
+        w_marlin=w_marlin,
+        ws_marlin=ws_marlin,
+        marlin_workspace=marlin_ws,
+        marlin_empty=marlin_empty,
+        marlin_note=marlin_note,
+    )
 
 
 def build_operand(
@@ -723,6 +878,34 @@ def build_lanes(op: Operand, kn: Kernels, want: Sequence[str]) -> dict:
             )
 
         out["int8_fused"] = _int8_fused
+
+    if (
+        "marlin_wna16" in want
+        and kn.apply_gptq_marlin_linear is not None
+        and op.w.w_marlin is not None
+    ):
+        # Verbatim CompressedTensorsWNA16.apply_weights body
+        # (schemes/compressed_tensors_wNa16.py:311-341): no activation quant
+        # exists on this path at all -- that is the whole structural claim of
+        # W8A16, and it is why this lane is compared against int8_FUSED (quant
+        # + GEMM), which is the complete serving op on the W8A8 side.
+        # is_k_full=True: marlin_is_k_full(has_g_idx=False, ...) returns True
+        # for an act-order-free checkpoint regardless of row-parallelism
+        # (marlin_utils.py, marlin_is_k_full).
+        out["marlin_wna16"] = lambda: kn.apply_gptq_marlin_linear(
+            input=op.x,
+            weight=op.w.w_marlin,
+            weight_scale=op.w.ws_marlin,
+            weight_zp=op.w.marlin_empty,
+            g_idx=op.w.marlin_empty,
+            g_idx_sort_indices=op.w.marlin_empty,
+            workspace=op.w.marlin_workspace,
+            wtype=kn.marlin_wtype,
+            output_size_per_partition=op.w.w_bf16.shape[0],
+            input_size_per_partition=op.w.w_bf16.shape[1],
+            is_k_full=True,
+            bias=None,
+        )
 
     if kn.per_token_quant_fp8 is not None:
         if "fp8_quant" in want:
@@ -847,11 +1030,43 @@ def capture_graph(fn: Callable, iters: int):
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
+    captured = []
     with torch.cuda.graph(graph):
         for _ in range(iters):
-            fn()
+            captured.append(fn())
     torch.cuda.synchronize()
+
+    # #591 falsifier ("the bench could not tell an empty CUDA graph from a
+    # fast one"): a capture that recorded no work replays in microseconds and
+    # reports as the fastest lane in the table. Prove the replay WRITES:
+    # zero the captured output, replay, require it to come back non-zero.
+    # Inputs are random bf16, so an all-zero result is not a legal outcome.
+    probe = _first_tensor(captured[-1]) if captured else None
+    if probe is None or probe.numel() == 0:
+        raise RuntimeError("graph capture produced no inspectable output tensor")
+    probe.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    if not bool(torch.any(probe != 0).item()):
+        raise RuntimeError(
+            "captured graph replayed without writing its output -- empty or "
+            "no-op capture, refusing to time it (#591)"
+        )
+    del captured
     return graph
+
+
+def _first_tensor(obj):
+    """First tensor in a lane's return value (lanes return a tensor or a
+    (quantized, scale) tuple)."""
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if isinstance(obj, (tuple, list)):
+        for item in obj:
+            t = _first_tensor(item)
+            if t is not None:
+                return t
+    return None
 
 
 def summarize(samples: Sequence[float]) -> dict:
@@ -1011,6 +1226,20 @@ def run_point(
             lanes["int8_fused@graph"]["median_ms"] / f8 if f8 else None
         )
 
+    # #855 verdict inputs. The comparison is marlin_wna16 (a COMPLETE W8A16
+    # op: no activation quant exists on that path) against int8_fused (the
+    # complete W8A8 op: per-token quant + GEMM). Comparing it against
+    # int8_gemm alone would hand W8A16 a cost the deployed lane really pays.
+    for suffix in ("", "@graph"):
+        mk = "marlin_wna16" + suffix
+        if mk not in lanes:
+            continue
+        mv = lanes[mk]["median_ms"]
+        for other in ("int8_fused", "bf16_linear", "int8_gemm"):
+            ok = other + suffix
+            if ok in lanes and lanes[ok]["median_ms"]:
+                derived[f"marlin_over_{other}{suffix}"] = mv / lanes[ok]["median_ms"]
+
     del op_a, op_b, lanes_a, lanes_b, graphs
     out = {"lanes": lanes, "noise_floor": noise, "derived": derived}
     if graph_notes:
@@ -1163,6 +1392,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--shapes-only", action="store_true", help="print the shape table and exit"
     )
     ap.add_argument(
+        "--shape-preset",
+        choices=sorted(SHAPE_PRESETS),
+        default="none",
+        help="#855: add the ANALYSE_854 shape set (855) or its minimum "
+        "decision subset (855min) to the table",
+    )
+    ap.add_argument(
+        "--drop-derived-shapes",
+        action="store_true",
+        help="#855: measure ONLY the --shape-preset shapes. The derived "
+        "table is the INT8 unit family's shard plan; the W8A16 lane coarsens "
+        "to 128 instead, so mixing the two would price shapes neither "
+        "checkpoint runs.",
+    )
+    ap.add_argument(
         "--check-imports",
         action="store_true",
         help="resolve the real kernels and exit; needs no card, so it is the "
@@ -1179,6 +1423,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ("fp8_scaled_mm", kn.fp8_scaled_mm),
             ("apply_fp8_linear", kn.apply_fp8_linear),
             ("w8a8_block_fp8_linear (dispatched)", kn.block_fp8_linear),
+            ("apply_gptq_marlin_linear (#855 wNa16)", kn.apply_gptq_marlin_linear),
+            ("gptq_marlin_repack (#855 wNa16)", kn.gptq_marlin_repack),
         ):
             print(f"{'OK  ' if obj is not None else 'MISS'} {label}")
         for line in kn.missing:
@@ -1211,15 +1457,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"plan {label!r} has {len(v)} entries but --tp-size is {args.tp_size}"
             )
 
-    with open(args.config) as fh:
-        cfg = json.load(fh)
-
     shapes: list = []
     by_shape: dict = {}
     cases: list = []
     facts_by_plan: dict = {}
     plan_layers: dict = {}
-    for label, base, mlp in plans:
+    if args.drop_derived_shapes:
+        # #855 runs a literal shape set from ANALYSE_854 and never derives a
+        # shard plan, so it must not require a checkpoint on disk. The INT8
+        # checkpoint this default points at is not even the same model any
+        # more (the standard model moved 3.6 -> 3.8).
+        plans = [(p[0], p[1], p[2]) for p in plans][:1]
+        facts_by_plan[plans[0][0]] = {
+            "note": "not derived: --drop-derived-shapes",
+            "local_q_heads": "-",
+            "local_kv_heads": "-",
+            "local_gdn_k_heads": "-",
+            "local_intermediate": "-",
+        }
+        cfg = {}
+        plan_layers[plans[0][0]] = 0
+    else:
+        with open(args.config) as fh:
+            cfg = json.load(fh)
+    for label, base, mlp in plans if not args.drop_derived_shapes else []:
         derived_shapes, plan_cases, facts = derive_shapes(
             cfg, args.tp_size, base, mlp, args.rank
         )
@@ -1244,7 +1505,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     facts = facts_by_plan[plans[0][0]]
     provenance = cross_check_partition(cases)
 
-    if not args.no_reference_shapes:
+    if args.drop_derived_shapes:
+        if args.shape_preset == "none":
+            ap.error("--drop-derived-shapes needs a --shape-preset to measure")
+        shapes = []
+        by_shape = {}
+
+    if args.shape_preset != "none":
+        selected = set(SHAPE_PRESETS[args.shape_preset])
+        for name, n, k, why in SHAPES_855:
+            if name not in selected:
+                continue
+            if (n, k) in by_shape:
+                by_shape[(n, k)].plans.append(name)
+                continue
+            s = Shape(name, n, k, why, 0, "#855 ANALYSE_854 shape", [name])
+            by_shape[(n, k)] = s
+            shapes.append(s)
+
+    if not args.no_reference_shapes and not args.drop_derived_shapes:
         for name, n, k, why in REFERENCE_SHAPES:
             if (n, k) in by_shape:
                 by_shape[(n, k)].plans.append(name)
@@ -1322,7 +1601,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"plan {label}: {n_gemms} INT8 linear layers per decoded token on "
             f"this rank ({2 * n_gemms} kernel launches -- quant + GEMM each)"
         )
-    for line in facts["not_quantized_by_ignore_list"]:
+    for line in facts.get("not_quantized_by_ignore_list", []):
         print(f"  not INT8: {line}")
     if illegal:
         print(
