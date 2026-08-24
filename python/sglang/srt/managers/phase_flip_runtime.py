@@ -4098,6 +4098,29 @@ class PhaseFlipRuntime:
         # sides), and a no-flip control boot stayed clean, so the page goes
         # missing somewhere in the ARMED window. This bracket closes it.
         self._pool_census("at-arm", direction)
+        # #853(i): ENFORCE THE EXPOSURE LAW HERE TOO, BECAUSE THE CUTOVER MAY
+        # NEVER COME. W24's stuck phase ran 23.6 minutes with 153 arms and ZERO
+        # cutovers, and enforcement was wired to the cutover alone -- so it went
+        # quiet for precisely the window it was installed to police. A gate
+        # unreachable in the failure mode is not a gate.
+        #
+        # LAWFUL HERE, established against the tree rather than assumed:
+        # `kv_backing_relief` reaches NO COLLECTIVE (the ceiling reads a cached
+        # already-agreed floor, never a live reduction), so ranks may run this
+        # at different instants without divergent participation; `KvRowCap` is
+        # non-destructive by construction -- "only unallocated ids are held
+        # back" -- so it cannot disturb the requests still live at arm; and
+        # `exposed > backed` is never a sanctioned mid-grow state (a grow adds
+        # BACKED rows that stay UNEXPOSED until a collective raises the level),
+        # so this can only ever be correcting the #816/#833 defect, never
+        # racing a legitimate grow. The same actuator already runs from four
+        # other non-quiescent sites.
+        #
+        # Its verdict is DISCARDED for the reason `_prearm_floor_relief` above
+        # states: a rank-local judgement must never decide an arm, or one rank
+        # arms while its peers do not and parks at the entry for ever. This
+        # corrects the id space and reports; it does not vote.
+        self._enforce_exposure_at_seam(f"{direction} arm")
         msg = (
             f"phase flip armed: {direction} (source {source}); commits at "
             f"the next consensus boundary where every rank is quiescent, or "
@@ -5359,21 +5382,53 @@ class PhaseFlipRuntime:
                 KV_BACKING_RELIEF_ATTR as _rung_attr,
             )
         except Exception:  # noqa: BLE001 - never break a seam on an import
+            logger.warning(
+                "%s #851 EXPOSURE ACTUATOR MISSING at %s: the spill module "
+                "would not import, so the exposure law has no actuator to "
+                "reach. This is a build/packaging fault, not a pool state.",
+                LOG_PREFIX,
+                when,
+            )
             return 0
         sched = getattr(self, "_census_scheduler", None)
         rung = getattr(sched, _rung_attr, None) if sched is not None else None
         if rung is None:
+            logger.warning(
+                "%s #851 EXPOSURE NOT ENFORCEABLE at %s: no KV backing rung is "
+                "wired to this runtime, so the law is installed and unable to "
+                "act. A wiring fault -- distinct from a seam that ran and found "
+                "nothing to correct, which reports its own marker.",
+                LOG_PREFIX,
+                when,
+            )
             return 0
         try:
             withdrawn = int(rung.clamp_exposure_to_backing(when) or 0)
         except Exception:  # noqa: BLE001 - a seam may refuse, never explode
-            logger.debug(
-                "%s #851 exposure enforcement skipped at %s",
+            # #853(i): AT WARNING, NOT DEBUG. W24 ran at INFO, so the old DEBUG
+            # line meant a clamp that threw on every single seam would leave the
+            # boot log identical to a clamp that found nothing wrong.
+            logger.warning(
+                "%s #851 EXPOSURE CHECK FAILED at %s: the clamp raised and the "
+                "seam refused rather than exploding. Exposure is UNVERIFIED for "
+                "this event -- not verified-and-clean.",
                 LOG_PREFIX,
                 when,
                 exc_info=True,
             )
             return 0
+        if withdrawn <= 0:
+            # #853(i) THE READING W24 COULD NOT TAKE. A silent zero here made
+            # "EXPOSURE ENFORCED = 0" mean any of five things: healthy, inert,
+            # broken, unreachable, or never built. Each of the other four now
+            # has its own marker above, which leaves this line to mean exactly
+            # one thing -- the law RAN and the id space was already sound.
+            logger.info(
+                "%s #851 EXPOSURE CHECKED at %s: the exposed id space is "
+                "within its backing, nothing withdrawn.",
+                LOG_PREFIX,
+                when,
+            )
         if withdrawn > 0:
             logger.warning(
                 "%s #851 EXPOSURE ENFORCED at %s: withdrew %d over-exposed row "
