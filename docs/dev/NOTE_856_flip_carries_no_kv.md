@@ -62,6 +62,72 @@ cutover must leave the new phase's device tier in a state where a lookup MISSES
 rather than returning stale rows. That last point is the correctness core of
 the whole change and is where a red-first test must bite hardest.
 
+### The correctness core, and why the obvious action is already known to crash
+
+Dropping the tree at cutover -- exactly what "make the lookup miss" needs --
+**has been tried and it took the instance down on all three ranks**
+(2026-08-23, recorded verbatim at `phase_flip_runtime.py:4590-4620`):
+
+    cache_finished_req -> dec_lock_ref
+    -> full_component.py:239  `if cur.id in skip_lock_node_ids`
+    AttributeError: 'NoneType' object has no attribute 'id'
+
+with the cause stated in the same comment:
+
+> "PARKED IS NOT UNREFERENCED. The cutover carries RESIDENT requests across,
+> and each holds a `last_node` with a lock ref. `reset()` rebuilds the root,
+> orphaning those nodes, so the parent walk in `dec_lock_ref` no longer
+> terminates at the live root and runs off the top into None."
+
+#825 withdrew the ACTION and kept only detection (`SGLANG_TREE_RECONCILE`,
+off). Its own note says the fix "needs to be built against the lock refs --
+evicting only the unlocked portion, or reconciling at a point with no resident
+reqs -- and that is a design, not a flag flip."
+
+### RESOLVED: the no-KV design removes the precondition of that crash
+
+Both blockers -- the stale `req_pool_idx` and the orphaned `last_node` -- are
+the SAME fact wearing two hats: **a resident request carried across the
+cutover**. Remove the carry and both disappear, and the user's "no carry" rule
+is what removes it.
+
+The mechanism already exists. `retract_all` (`schedule_batch.py:1812`) walks
+`release_req` (:1783) over every request, and `release_req` performs exactly
+the two releases needed:
+
+    release_kv_cache(req, tree_cache, is_insert=False)   # rows AND lock ref
+    req.reset_for_retract()
+
+It takes precisely the objects the flip already holds (`req_to_token_pool`,
+`token_to_kv_pool_allocator`, `tree_cache`) and returns the retracted list.
+
+**So the seam order is:**
+
+1. FENCE — `maybe_flip_writeback` (persist to the canonical store) with
+   `hicache_demotion` on for the evict-before-persist edge.
+2. RETRACT ALL — every resident request releases its rows and its tree lock
+   ref. No carried `req_pool_idx`; no locked node.
+3. TREE RESET — now safe, because #825's precondition (resident lock refs) is
+   gone. The device tier is invalidated, so a lookup MISSES.
+4. CUTOVER + weights refill.
+5. RE-ADMIT — the retracted requests prefill against their cached prefix,
+   served by HiCache/Radix read-through.
+
+Which is the user's sequence verbatim: *phase over, layout stops, KV in
+HiCache, layers move, KV from HiCache, layout starts.*
+
+**The carry only ever existed to avoid a re-prefill.** With read-through, that
+re-prefill is a cache hit, which is why "no carry" is the correct rule rather
+than a simplification — and it is also precisely the "honest warm-up cost as
+served-request latency" the user named as the validation metric. That cost is
+REAL and must be measured, not assumed small: it is the price this design pays
+in exchange for deleting the mover, the staging reserve and the crash class.
+
+CAVEAT, not yet verified: that `release_kv_cache` releases the lock ref along
+the whole parent chain (read from `release_req`'s body, not from
+`release_kv_cache`'s), and that retraction at the seam is compatible with the
+flip's quiescence predicate. Both must be confirmed before this is built.
+
 ## Fence coverage — what is and is not already persisted
 
 Under `--hicache-write-policy write_through` most live rows are already staged:
