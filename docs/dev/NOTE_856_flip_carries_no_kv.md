@@ -161,6 +161,31 @@ in BOTH directions.** That is a thrash pathway, and it is created by this
 design rather than inherited: today the carry keeps those tokens out of the
 pending count entirely.
 
+**CONFIRMED FROM THE COUNTER, AND IT HAS A MEASURED PRECEDENT.**
+`Scheduler._pending_prefill_tokens` (`scheduler.py:10508`) computes
+
+    pending = sum(len(req.origin_input_ids) for req in queued)
+
+the FULL prompt, not the uncached extend. A retracted request therefore
+contributes its entire context to the figure no matter how much of it is
+cached. There is no prefix-residency term anywhere in that function.
+
+And the identical failure has already been measured once, from a different
+cause, in a comment inside that very function (#731, 2026-08-17): a cutover
+left a request both resident and queued, so one prompt was counted twice --
+
+> "51,369 -> 102,307 tokens across one cutover, within rounding of exactly
+> 2x. The inflated backlog drove the flip policy past its threshold -- six
+> cutovers, nothing served."
+
+So an inflated pending figure across a cutover driving the policy into thrash
+is a PRECEDENTED failure of this exact code path, not a speculative one. #731
+fixed its instance (the carry consumes the queue entry) and deliberately did
+NOT add a blanket dedup, on the stated grounds that hiding a real
+double-booking would make the class silent again. Retraction re-creates the
+same shape by a route #731's fix does not cover, because nothing is
+double-counted here -- the tokens are counted ONCE, at a price that is wrong.
+
 This is unresolved and must not be hand-waved. Candidate directions, none yet
 evidenced:
 
