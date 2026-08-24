@@ -2316,15 +2316,28 @@ The 4.7 recipe at `--pp-size 3`, one card per stage, on
   112 tok/s of §4.1.0. PP is ~3.6x worse at decode, and cannot run spec at
   all. Prefill and decode want opposite topologies; do not run a PP server
   as a general-purpose one.
-- **DO NOT combine PP with hierarchical cache — it wedges, silently.**
-  `--enable-hierarchical-cache` with the file backend under `--pp-size 3`
-  never reaches ready: health stays 503 and the launcher sits in
-  `_wait_and_warmup`. Two identical py-spy samples show the last stage blocked
-  in `isend` (`_pp_send_output_to_next_stage`) while stage 0 spins in
-  `_drain_async_work` -> `check_hicache_events` inside
-  `_get_new_batch_prefill_raw` and never posts the matching recv. There is no
-  refusal and no error line. Drop the hicache flags and the same topology
-  boots in ~2 min.
+- **PP + hierarchical cache: FIXED as of the #718/#719/#720 integration
+  (2026-08-19). The old prohibition below no longer holds.**
+  Measured W22, 2026-08-24, pin `e5a37866d7`
+  (`/spinning/evidence-665-f1/boot_w22_0824_0656.log`): `--pp-size 3` with
+  `--enable-hierarchical-cache`, `--hicache-storage-backend file` and
+  `--hicache-write-policy write_through` reached ready in ~4 min, served
+  123/123 requests at HTTP 200, and completed 33 cutovers in both directions.
+  Use the combination.
+
+  HISTORICAL, and kept because a reader who remembers the old rule needs to
+  know it was retired rather than forgotten. Before that integration this
+  entry read "DO NOT combine PP with hierarchical cache — it wedges,
+  silently": the same flags never reached ready, health stayed 503, the
+  launcher sat in `_wait_and_warmup`, and two identical py-spy samples showed
+  the last stage blocked in `isend` (`_pp_send_output_to_next_stage`) while
+  stage 0 spun in `_drain_async_work` -> `check_hicache_events` inside
+  `_get_new_batch_prefill_raw`, never posting the matching recv.
+
+  THE LESSON THAT OUTLIVES THE ENTRY: this text stayed in the source of truth
+  for five days after it became false, and a false statement here is worse
+  than a missing one, because it is believed. Whoever changes a flag, a
+  default or a boot behaviour updates this file IN THE SAME COMMIT.
 
 ### 4.8 Prefill satellite: rig 2 prefills, rig 1 decodes (#212)
 
