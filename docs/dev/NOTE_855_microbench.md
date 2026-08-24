@@ -5,12 +5,18 @@ else"), executed on metal in GPU window **W25**, 2026-08-24. Kernel
 microbench only: no server, no checkpoint, random weights, ~15 min of card
 time on all three cards.
 
-**VERDICT: the W8A16 path is VETOED.** It loses 2.9-3.3x against a
-GDN-covered W8A8 lane at prefill and 1.8x at decode on the 5090, and it wins
-nothing measurable anywhere. The recommendation of ANALYSE_854 §9 step 3 —
-requant the incumbent ourselves with GDN coverage, staying W8A8 — stands
-unchanged and is now quantified: leaving the GDN dense projections in BF16
-costs **1.39x (sm120) / 1.46x (sm86)** of prefill linear-layer time today.
+**VERDICT (speed axis): the W8A16 path is VETOED ON SPEED.** It loses
+2.9-3.3x against a GDN-covered W8A8 lane at prefill and 1.8x at decode on the
+5090. What this bench settles is the *price*, not the *worth*: W8A16 has a
+real, structural quality advantage that this bench does not measure and does
+not refute (§3.5). The honest form of the result is an exchange rate — the
+quality gain must be worth **2.05-2.27x prefill linear time and 1.8x decode
+on the 5090** — and that trade is a decision, not a measurement.
+
+The recommendation of ANALYSE_854 §9 step 3 — requant the incumbent ourselves
+with GDN coverage, staying W8A8 — stands unchanged and is now quantified:
+leaving the GDN dense projections in BF16 costs **1.39x (sm120) / 1.46x
+(sm86)** of prefill linear-layer time today.
 
 ---
 
@@ -169,6 +175,56 @@ That is the recurring cost of the incumbent producer's `re:.*linear_attn.*`
 exclusion, paid on every cold-context prefill, on top of the 4.87 GiB /
 +156k-token KV win the same exclusion also costs us. Both halves of the case
 for requanting ourselves are now measured rather than modelled.
+
+### 3.5 The quality axis is NOT settled by this bench — and it favours W8A16
+
+A speed bench cannot veto a quality argument, and the quality argument for
+W8A16 is structural, not a Reddit chart:
+
+1. **W8A16 quantizes no activations at all.** The W8A8 lane runs
+   `per_token_quant_int8` on every activation tensor before every linear
+   (`compressed_tensors_w8a8_int8.py:213`) — dynamic per-token INT8, i.e. 8
+   bits for a distribution with outlier channels. In published W8A8-vs-W8A16
+   comparisons the *activation* side, not the weight side, is usually the
+   dominant error term. W8A16 pays zero of it: activations stay BF16 into
+   Marlin's BF16 tensor cores.
+2. **W8A16's weight quantization here is also finer**: group 128 along K
+   (one scale per 128 weights) versus W8A8's per-channel (one scale per
+   output row). More scales, less per-group range to cover.
+
+So "BF16 activations should simply be numerically better than INT8
+activations" is correct as stated, and nothing measured above contradicts it.
+This bench deliberately measured the axis that could be settled cheaply
+(ANALYSE_854 §9 step 0, "cheapest falsifier first"); the quality axis is §9
+step 2 and needs the KLD/quality suite **with a W8A8 arm, measured through
+the Marlin serving path** — precisely the comparison the lued card does not
+contain (it measures W8A16 vs FP8, on the HF decompressed path).
+
+What the measurement does change about that decision:
+
+- The price is **higher than ANALYSE_854 modelled** (2.05-2.27x vs the
+  modelled 1.63x against the active checkpoint), so the quality bar W8A16
+  must clear is correspondingly higher.
+- The penalty is **asymmetric across the rig and across phases**: decode on
+  the two 3080s is a wash (0.96-1.03x), decode on the 5090 is 1.81x, prefill
+  is 2.8-3.6x everywhere. A quality-first profile is therefore not absurd —
+  it is a prefill-throughput trade, mitigated to the extent HiCache/radix
+  prefixes hit and cold context is rare.
+- If quality is the goal, **lued is still not the candidate to buy it with**
+  (ANALYSE_854 §9 step 4): a calibrated per-channel AutoRound W8A16, or our
+  own `scheme: W8A16, strategy: channel` requant, beats data-free RTN on
+  method and drops the scale tax from 362.5 MiB to ~7.4 MiB. Its Marlin cost
+  was not measured here (§4) but its dominant term is the same BF16 compute,
+  so expect the same order of penalty.
+- **The two axes are separable.** GDN coverage (the 4.87 GiB / +156k-token
+  KV win) is a *recipe* property available on the W8A8 lane at no speed cost
+  — in fact at a 1.39-1.46x prefill *gain*. Nothing about wanting better
+  quality requires taking the W8A16 speed penalty to get the VRAM win.
+
+**Restated verdict:** W8A16 is vetoed as a *drop-in performance-neutral
+alternative* and as the *W8A8 fallback candidate* — it is neither. It is not
+vetoed as a deliberate quality-for-throughput trade; that decision needs §9
+step 2, and this note supplies the price side of it.
 
 ---
 
