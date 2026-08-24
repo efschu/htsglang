@@ -3067,7 +3067,58 @@ class MHATokenToKVPool(KVCache):
                     buf[lo:hi].zero_()
         # DECOMMIT last: rows above ``n`` are dead the moment ``size`` is ``n``.
         released = int(owner.shrink(n)) if n < backed else 0
-        self.size = n
+        # #848: THE SIZE AXIS IS BOUNDED BY THE ARENA, ON EVERY BRANCH.
+        #
+        # The reservation is checked only INSIDE the two owner calls -- and
+        # neither runs when ``n == backed``. That branch then assigned ``size``
+        # unvalidated ("``self.size`` is assigned either way", above), and
+        # ``backed`` is the CHUNK-GRANULAR reading: ``uniform_backed_tokens``
+        # is ``min over buffers of (committed // row_bytes) * tokens_per_row``,
+        # so it legitimately sits up to one commit chunk per buffer ABOVE the
+        # reservation's row count. That single unvalidated value is therefore
+        # exactly the one that can exceed the ceiling.
+        #
+        # Window 7 (WINDOW7-RESULT.md) latched on it, on all three ranks:
+        #   uniform_backed_rows=126976 reserved_backing_rows=125052  (PP1)
+        # Once ``size`` is 126976 the allocator hands out ids up to 126976 --
+        # ``exposed_rows`` reads the id-space pool's ``size`` -- which is above
+        # the ceiling AND above ``store_bound_rows``=125053, the bound a CUDA
+        # graph baked at capture (#352). The live set fills them, the seam's
+        # need becomes 126977, and every grow to it is refused because
+        # 126977 > 125052. The gap is uncloseable BY ARITHMETIC: 117 arms,
+        # 114 refusals, ZERO tp_to_pp flips in 30.6 min of load.
+        #
+        # ONLY THE SIZE AXIS IS BOUNDED HERE. The owner calls are left exactly
+        # as they were, so a grow above the ceiling still raises loudly rather
+        # than being silently clamped -- the #848 actuator refuses ahead of it
+        # with RESERVATION-CAPPED, and this is the backstop beneath that.
+        # A pool exposing no reservation (0) has no arena to clamp against and
+        # keeps its previous behaviour exactly.
+        # SCOPED TO THE BRANCH THAT HAS NO OTHER AUTHORITY. On the grow and
+        # shrink branches the owner is consulted and is the sole judge of its
+        # own ceiling -- clamping there would second-guess a call that already
+        # returned, and would silently lower a size the owner had ACCEPTED.
+        # Only ``n == backed`` reaches the assignment with nobody having
+        # checked, so only that branch is bounded here.
+        ceiling = int(getattr(self, "reserved_backing_rows", 0) or 0)
+        exposed = min(n, ceiling) if (n == backed and ceiling > 0) else n
+        if exposed != n:
+            logger.warning(
+                "BACKING-DIAL size CLAMPED to the arena reservation: asked to "
+                "expose %d rows but this pool's immutable VA reservation is "
+                "%d (backed reads %d, chunk-granular and legitimately above "
+                "it). Exposing %d would hand the allocator row ids the arena "
+                "can never commit and a captured CUDA graph never baked "
+                "(store bound %d), which is the #848 latch: the seam's need "
+                "then sits permanently above the ceiling every grow is "
+                "checked against. Capping the exposed size instead (#848).",
+                n,
+                ceiling,
+                backed,
+                n,
+                int(self.store_bound_rows),
+            )
+        self.size = exposed
         logger.info(
             "BACKING-DIAL %s done: prev_size=%d -> size=%d "
             "uniform_backed_rows %d -> %d released_bytes=%d",
