@@ -2854,6 +2854,37 @@ with the faithful stub, and planting `first == last` turns 16 of those 18 red.
 **A stub that cannot express the impossible state is better than a comment
 asking the next author not to write it.**
 
+Unconverging-drain family (#840): a graceful-shutdown drain that has no
+admission gate is not a drain -- it is a loop over a queue somebody else is
+still filling. SIGTERM sets `gracefully_exit`
+(`managers/tokenizer_manager.py`), and that flag gated exactly ONE thing in
+the whole tree: `/health` (`entrypoints/http_server.py`,
+`entrypoints/grpc_bridge.py`). Every request entrypoint kept admitting into
+`rid_to_state` for the entire drain, and the drain loop itself had no
+deadline, so the specimen
+(`/spinning/evidence-665-f1/window4A_teardown_hang_2114/`, 2026-08-23 21:15)
+reads 4 -> 3 -> **4** -> 3 remaining requests with a rid appearing for the
+first time ten seconds after the SIGTERM. The cost is not a slow shutdown but
+a shutdown that never happens: `ShutdownReq` is dispatched only AFTER that
+loop breaks, a scheduler sets its own `gracefully_exit` only when that
+request is dequeued, and the `finally` that runs `release_distributed` (#673,
+armed by `--scheduler-distributed-teardown`) is downstream of that -- so
+SIGTERM to the parent freed no GPU memory at all and the cards came back only
+after an explicit TERM to each rank PID. Fixed as two halves, neither
+sufficient alone: a refill gate in `_init_req_state` (the single funnel every
+route reaches `rid_to_state` through, so no route can be forgotten) raising
+`ServerShuttingDown`, and `--shutdown-drain-timeout-s` (default 120 s, `0`
+restores the unbounded loop for bisecting) as a BACKSTOP rather than the
+mechanism. `managers/shutdown_gate.py`;
+`test/registered/unit/managers/test_sigterm_drain_840.py`. **The filing
+hypothesis was a barlink teardown-signal gap** -- py-spy showed all three
+ranks in `barlink_bar1.py:5005 _wait_ctl_event` -- and it was FALSIFIED: that
+wait is already bounded (#818), line 5005 is the poll's 0.5 ms sleep, and all
+three ranks kept emitting round-cadence lines after the SIGTERM. A stack
+sampler finds a host thread where it spends its time, which during a HEALTHY
+collective is that sleep. General lesson: before reading a py-spy frame as a
+hang, check whether the process is still producing output.
+
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
 matching head section of `STATUS.md` in the private dev-log repo

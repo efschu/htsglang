@@ -89,8 +89,10 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.multimodal.lane_support import image_requests_unsupported_reason
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.managers import shutdown_gate
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
+from sglang.srt.managers.shutdown_gate import ServerShuttingDown
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
@@ -2769,7 +2771,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
-            await asyncio.sleep(5)
+            await asyncio.sleep(shutdown_gate.DRAIN_POLL_INTERVAL_S)
+
+        # #840: the drain is BOUNDED. Its exits used to be "zero requests
+        # left", a failed health check, and an env var -- none of which a
+        # refilled or a genuinely stuck queue ever reaches, so the loop below
+        # could run forever. It is downstream of everything that actually frees
+        # the hardware: ``ShutdownReq`` is dispatched only after this loop
+        # breaks, a scheduler sets its own ``gracefully_exit`` only when that
+        # request is dequeued, and the ``finally`` that runs
+        # ``release_distributed`` (#673) is downstream of THAT. So a drain that
+        # does not end is an instance that does not end, and the measured cost
+        # is SIGTERM to the parent freeing no cards at all.
+        #
+        # The deadline is a BACKSTOP, not the mechanism. With the refill gate in
+        # ``_init_req_state`` an ordinary shutdown converges in seconds and
+        # never comes near it; it is reached only when something in flight will
+        # not complete. Zero disables it and restores the pre-#840 loop
+        # verbatim, for bisecting.
+        drain_budget_s = shutdown_gate.drain_timeout_s(self.server_args)
+        drain_deadline = (
+            time.monotonic() + drain_budget_s if drain_budget_s > 0.0 else None
+        )
 
         # Drain requests
         while True:
@@ -2796,10 +2819,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.info(
                 f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
-            if remain_num_req > 0:
-                await asyncio.sleep(5)
-            else:
+            if remain_num_req <= 0:
                 break
+            # #840: the deadline is consulted AFTER the zero check, so a drain
+            # that empties on the very tick the budget expires still leaves by
+            # the clean path and abandons nobody.
+            if drain_deadline is not None and time.monotonic() >= drain_deadline:
+                logger.warning(
+                    "Drain budget of %.1fs expired with %d request(s) still "
+                    "in flight (%s); abandoning them and shutting down. These "
+                    "requests were admitted before SIGTERM and did not "
+                    "complete -- raise --shutdown-drain-timeout-s if this "
+                    "instance legitimately answers requests that long, or 0 "
+                    "to wait forever as before #840.",
+                    drain_budget_s,
+                    remain_num_req,
+                    remaining_rids,
+                )
+                break
+            await asyncio.sleep(shutdown_gate.DRAIN_POLL_INTERVAL_S)
 
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
@@ -2977,6 +3015,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        # #840: THE REFILL GATE, and it sits here because this is the single
+        # funnel -- every route, native and OpenAI-shaped, generation and
+        # embedding, reaches ``rid_to_state`` through this method and nowhere
+        # else. Before this line ``gracefully_exit`` gated exactly one thing in
+        # the whole tree, ``/health``; the request entrypoints never read it, so
+        # a shutting-down server kept admitting work for the entire drain and
+        # the drain could not converge. The specimen has a rid appearing for the
+        # first time TEN SECONDS after SIGTERM.
+        #
+        # Refusing here rather than at each entrypoint is deliberate: an
+        # entrypoint-by-entrypoint gate is a list that the next route forgets to
+        # join, and the cost of forgetting is an instance that will not die.
+        # ``getattr`` and not attribute access, and the default is the ADMITTING
+        # one on purpose. This is the request hot path: if the attribute is ever
+        # missing, degrading to "admit" restores the pre-#840 behaviour, while
+        # an AttributeError here would turn every request on a healthy server
+        # into a 500. The failure directions are not symmetric, so the safe one
+        # is chosen explicitly rather than by whichever the syntax gave.
+        #
+        # That default could hide a rename and leave this gate inert, so the
+        # wiring is pinned separately: ``test_sigterm_drain_840`` asserts that a
+        # real ``TokenizerManager.__init__`` sets ``gracefully_exit``. A rename
+        # breaks that test instead of silently disabling the gate.
+        if getattr(self, "gracefully_exit", False):
+            raise ServerShuttingDown(
+                "The server is shutting down and is not accepting new requests."
+            )
+
         created_time = obj.received_time
 
         external_trace_header = None
