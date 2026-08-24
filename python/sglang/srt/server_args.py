@@ -6034,6 +6034,25 @@ class ServerArgs:
             "task #722's live machinery.",
         ),
     ] = False
+    shutdown_drain_timeout_s: A[
+        float,
+        Arg(
+            help="#840: hard bound on the SIGTERM drain, in seconds (default "
+            "120). The drain used to have no deadline at all, and its only "
+            "exits were an empty queue, a failed health check and "
+            "SGL_FORCE_SHUTDOWN -- so a queue that kept being refilled kept "
+            "the instance alive indefinitely. That is downstream of everything "
+            "that frees the hardware: ShutdownReq reaches the schedulers only "
+            "after the drain breaks, so SIGTERM to the parent freed no GPU "
+            "memory at all and the cards came back only after an explicit "
+            "TERM to each rank PID. This is a BACKSTOP: new requests are "
+            "refused once the drain starts, so an ordinary shutdown converges "
+            "in seconds and never reaches it. Requests still in flight when "
+            "it expires are abandoned and named in the log. Set 0 to wait "
+            "forever, which is the pre-#840 behaviour and is there for "
+            "bisecting.",
+        ),
+    ] = 120.0
     phase_flip_rebind_hicache: A[
         bool,
         Arg(

@@ -170,6 +170,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.shutdown_gate import ServerShuttingDown
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
@@ -2874,11 +2875,21 @@ def _create_error_response(e):
     # Native (non-/v1) endpoints share the OpenAI envelope: one error shape for
     # the whole server means a client that already handles /v1 errors handles
     # these too, and the four fields are always present rather than message-only.
+    #
+    # #840: a shutdown refusal is 503, not 400. The client sent nothing wrong
+    # and the request is retryable -- against another replica now, against this
+    # one after it restarts. Answering 400 would tell a load balancer to drop
+    # the request instead of re-routing it.
+    status = (
+        HTTPStatus.SERVICE_UNAVAILABLE.value
+        if isinstance(e, ServerShuttingDown)
+        else HTTPStatus.BAD_REQUEST.value
+    )
     return openai_error_response(
         str(e),
-        status_code=HTTPStatus.BAD_REQUEST.value,
-        err_type=error_type_for_status(HTTPStatus.BAD_REQUEST.value),
-        code=HTTPStatus.BAD_REQUEST.value,
+        status_code=status,
+        err_type=error_type_for_status(status),
+        code=status,
     )
 
 

@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.liveness import EndpointClass, guard_generate_stream
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.shutdown_gate import ServerShuttingDown
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.training.activity import note_serving_activity
@@ -196,6 +197,16 @@ class OpenAIServingBase(ABC):
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+        except ServerShuttingDown as e:
+            # #840: ahead of the ValueError arm below, which this subclasses so
+            # that untouched routes still refuse. A shutdown refusal is 503:
+            # the request was valid and is retryable, and a load balancer must
+            # re-route it rather than drop it as a client error.
+            return self.create_error_response(
+                message=str(e),
+                err_type="ServiceUnavailable",
+                status_code=503,
             )
         except ValueError as e:
             return self.create_error_response(
