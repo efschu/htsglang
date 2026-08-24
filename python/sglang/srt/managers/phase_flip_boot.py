@@ -50,7 +50,9 @@ from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.model_executor.weights_arena import (
     ArenaLayout,
     allocate_arena,
+    RefillLegTiming,
     arena_refill,
+    refill_bound_phrase,
     bind_arena_views,
     host_image_mode,
     image_from_tensors,
@@ -889,7 +891,15 @@ class PhaseFlipStacks:
         import time as _time
 
         started = _time.perf_counter()
-        arena_refill(self.arena, layout, image, restore=restore)
+        # #856: this leg is 91% of a tp_to_pp flip (W25 seam census,
+        # `refill_highwater->weights_refill` 9516.2 ms of a 10466.8 ms walk),
+        # and it reported ONE aggregate rate. The read and the H2D are
+        # pipelined, so that rate is min(read, h2d) with no way to say which
+        # bound it hit -- which is why the 2.5x direction gap (tp_to_pp
+        # 1351-1723 MiB/s vs pp_to_tp 3214-3915 for the same rank and within
+        # 2.7% of the same bytes) could not be attributed from the log.
+        leg_timing = RefillLegTiming()
+        arena_refill(self.arena, layout, image, restore=restore, timing=leg_timing)
         elapsed = _time.perf_counter() - started
         # #677: FEED THE ECONOMICS THE MEASURED LEG, NOT A REMEMBERED ONE.
         # The flip policy priced a leg at a 3.2 s pinned-era constant while the
@@ -926,7 +936,7 @@ class PhaseFlipStacks:
         # this leg, which is what the #690 high-water marks bracket.
         try:
             logger.info(
-                "%s %s",
+                "%s %s -- %s",
                 LOG_PREFIX,
                 refill_report(
                     direction,
@@ -934,6 +944,11 @@ class PhaseFlipStacks:
                     int(layout.total_bytes),
                     self._images_are_file_backed(),
                 ),
+                # #856: the bound, named. Appended rather than folded into
+                # `refill_report` because that function's whole contract is
+                # "a rate against a rate is comparable" and this is a
+                # different statement about the same leg.
+                refill_bound_phrase(leg_timing),
             )
         except Exception:  # noqa: BLE001 - an instrument may never break a flip
             pass

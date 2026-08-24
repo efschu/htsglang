@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Set, Tuple
 
@@ -519,7 +520,84 @@ def _refill_staging_pool(chunk_bytes: int, depth: int):
     return _staged_pool
 
 
-def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) -> None:
+@dataclass
+class RefillLegTiming:
+    """WHICH HALF of the refill leg was slow (#856).
+
+    THE DEFECT THIS CLOSES. The refill leg reports ONE aggregate MiB/s, and
+    that leg is 91% of a `tp_to_pp` flip (W25 seam census: 9516.2 ms of a
+    10466.8 ms walk, `refill_highwater->weights_refill`). The pipeline is a
+    synchronous `preadv` overlapped with an async H2D DMA, so the aggregate
+    is `min(read_rate, h2d_rate)` -- and a single number cannot say WHICH
+    bound it hit. W25 measured `tp_to_pp` at 1351-1723 MiB/s against
+    `pp_to_tp` at 3214-3915 MiB/s for the SAME rank and within 2.7% of the
+    same bytes, and that 2.5x gap could not be attributed from the code by
+    two independent readers: not a path fallback (both take this function),
+    not a missing fd (zero `#802` warnings in the capture), not the O_DIRECT
+    alignment cliff (offsets are 32 MiB multiples of a 4096 alignment), and
+    not the pre-#802 fault path (rank rates DIVERGE with the link in both
+    directions, where the fault path made them converge).
+
+    So the instrument, not the mechanism, is what is missing -- one number
+    with several meanings, the #851 class, sitting inside the dominant term
+    of the seam. This splits it:
+
+      * ``read_s``     wall time inside ``preadv`` -- storage/ARC bound.
+      * ``h2d_wait_s`` wall time blocked on a previous chunk's DMA to land
+                       -- PCIe/link bound.
+
+    They are near-exclusive by construction: the ring only waits on a buffer
+    whose copy has not landed, so a leg that is read-bound never blocks there
+    and a leg that is link-bound blocks there almost every turn. Whichever
+    dominates names the bound, and the next window reads it directly instead
+    of inferring it.
+
+    A PURE RECORD, deliberately. Every judgement about it lives in
+    ``refill_bound_phrase``, which needs no GPU and is therefore falsifiable
+    in both directions -- the same split #852 used for the allocator-cache
+    estimator, and for the same reason: a rule that can only be exercised on
+    metal is a rule this corpus has repeatedly shipped inert.
+    """
+
+    read_s: float = 0.0
+    h2d_wait_s: float = 0.0
+    drain_s: float = 0.0
+    chunks: int = 0
+
+
+def refill_bound_phrase(timing: Optional["RefillLegTiming"]) -> str:
+    """Name the bound, or say plainly that it cannot be named (#856).
+
+    NEVER GUESSES A WINNER ON A TIE, and never invents a bound for a leg that
+    was not instrumented. "unattributed" is a real answer here -- it is the
+    state the whole ticket is about -- and collapsing it into one of the two
+    named bounds would rebuild the ambiguity this split exists to remove.
+    """
+    if timing is None or timing.chunks <= 0:
+        return "bound unattributed (leg not instrumented)"
+    read_s = float(timing.read_s)
+    wait_s = float(timing.h2d_wait_s)
+    total = read_s + wait_s
+    if total <= 0.0:
+        return "bound unattributed (no time accounted)"
+    read_share = read_s / total
+    detail = (
+        f"read {read_s:.3f}s / h2d-wait {wait_s:.3f}s "
+        f"over {int(timing.chunks)} chunk(s), drain {timing.drain_s:.3f}s"
+    )
+    if read_share >= 0.65:
+        return f"STORAGE-BOUND ({detail})"
+    if read_share <= 0.35:
+        return f"LINK-BOUND ({detail})"
+    return f"bound MIXED, neither half dominates ({detail})"
+
+
+def _staged_file_refill(
+    dst: torch.Tensor,
+    meta: _FileBackedImage,
+    nbytes: int,
+    timing: Optional["RefillLegTiming"] = None,
+) -> None:
     """Move ``nbytes`` of the image file into ``dst`` as READS, not faults.
 
     WHY THIS EXISTS (#802, measured on this rig 2026-08-22). The previous path
@@ -592,7 +670,13 @@ def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) 
             if inflight[i]:
                 # This buffer's previous H2D must land before it is refilled,
                 # or the read would overwrite bytes still in flight.
+                # #856: time spent HERE is link-bound time -- the reader is
+                # ahead and waiting on the DMA. Time spent in preadv below is
+                # storage-bound time. Splitting them is what names the bound.
+                _t0 = time.monotonic()
                 events[i].synchronize()
+                if timing is not None:
+                    timing.h2d_wait_s += time.monotonic() - _t0
                 inflight[i] = False
             got = 0
             while got < n:
@@ -605,7 +689,10 @@ def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) 
                     fd, want = meta.fd, n - got
                 else:
                     fd = meta.fd_direct
+                _t0 = time.monotonic()
                 r = os.preadv(fd, [memoryview(views[i])[got : got + want]], at)
+                if timing is not None:
+                    timing.read_s += time.monotonic() - _t0
                 if r == 0:
                     raise WeightsArenaError(
                         f"#802 short read on flip image {meta.path!r}: got "
@@ -618,9 +705,17 @@ def _staged_file_refill(dst: torch.Tensor, meta: _FileBackedImage, nbytes: int) 
             inflight[i] = True
             off += n
             i = (i + 1) % depth
+            if timing is not None:
+                timing.chunks += 1
+        # #856: the final drain is neither read nor overlap -- it is the tail
+        # of the pipeline, counted separately so it can never be mistaken for
+        # either bound.
+        _t0 = time.monotonic()
         for j in range(depth):
             if inflight[j]:
                 events[j].synchronize()
+        if timing is not None:
+            timing.drain_s += time.monotonic() - _t0
         # The checksum below reads ``dst`` on the CURRENT stream, which never
         # saw these copies. Without this the verify could race the transfer.
         cur = torch.cuda.current_stream()
@@ -1054,6 +1149,7 @@ def arena_refill(
     layout: ArenaLayout,
     image: torch.Tensor,
     restore: Optional[Tuple[ArenaLayout, torch.Tensor]] = None,
+    timing: Optional["RefillLegTiming"] = None,
 ) -> None:
     """The flip: ONE contiguous copy of the other layout's image into the
     arena, verified AFTER the copy on the ARENA's device.
@@ -1092,7 +1188,7 @@ def arena_refill(
     # it and the original copy_ below runs unchanged, byte for byte.
     meta = _file_backed_meta(image) if _staged_refill_enabled() else None
     if meta is not None and dst.is_cuda:
-        _staged_file_refill(dst, meta, layout.total_bytes)
+        _staged_file_refill(dst, meta, layout.total_bytes, timing=timing)
     else:
         dst.copy_(payload)
     have = uint8_checksum(dst)

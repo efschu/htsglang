@@ -75,13 +75,25 @@ def _stacks(pp_mib, tp_mib, committed_mib, recorder):
 class _Recorder:
     def __init__(self):
         self.copies = []
+        #: #856: the timing record the caller handed in on each copy, so the
+        #: instrument's WIRING is pinned here and not merely tolerated.
+        self.timings = []
 
 
 def _patched_refill(st, carrier, rec, monkey):
     """Run PhaseFlipStacks.refill with arena_refill replaced by a recorder
     that FAULTS exactly as the driver does: writing past the committed span."""
 
-    def fake_arena_refill(arena, layout, image, restore=None):
+    def fake_arena_refill(arena, layout, image, restore=None, timing=None):
+        # #856 CONTRACT CHANGE, TAKEN DELIBERATELY RATHER THAN WIDENED AWAY.
+        # `arena_refill` gained an optional `timing` record so the refill leg
+        # -- 91% of a tp_to_pp flip -- can say whether it was storage-bound or
+        # link-bound instead of reporting one aggregate rate. It is an
+        # INSTRUMENT: default None, no behaviour change, so this stub accepting
+        # the kwarg is the whole of the adaptation. What must NOT be silently
+        # accepted is the instrument coming unwired, so the record is captured
+        # and asserted by `test_the_refill_leg_is_instrumented` below.
+        rec.timings.append(timing)
         need = int(layout.total_bytes)
         if restore is not None:
             need = max(need, int(restore[0].total_bytes))
@@ -163,6 +175,29 @@ class TestArenaHighWater(unittest.TestCase):
         self.assertEqual(st.refill_high_water_bytes(), 7924 * MIB)
         st2, _ = _stacks(9115, 7924, 9115, self.rec)
         self.assertEqual(st2.refill_high_water_bytes(), 9115 * MIB)
+
+    def test_the_refill_leg_is_instrumented(self):
+        # #856: the seam census puts `refill_highwater->weights_refill` at 91%
+        # of a tp_to_pp flip, and it reported ONE aggregate MiB/s -- which
+        # cannot separate a storage-bound leg from a link-bound one. The split
+        # only exists if the caller actually hands the record down, so that
+        # wiring is pinned HERE, at the call site this file already owns.
+        # Without this, updating the stub's signature would have silently
+        # tolerated the instrument being removed again.
+        from sglang.srt.model_executor.weights_arena import RefillLegTiming
+
+        st, carrier = _stacks(6690, 7924, 6690, self.rec)
+        self._install(st, carrier)
+        st.refill(PP_TO_TP)
+        self.assertTrue(self.rec.timings, "no refill was recorded at all")
+        for got in self.rec.timings:
+            self.assertIsInstance(
+                got,
+                RefillLegTiming,
+                "the refill leg must be handed a timing record; a None here "
+                "means the bound attribution is dead and the leg is back to "
+                "one aggregate rate",
+            )
 
     def test_a_carrierless_stack_does_not_raise(self):
         st, _ = _stacks(6690, 7924, 6690, self.rec)
