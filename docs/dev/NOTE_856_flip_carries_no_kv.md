@@ -105,6 +105,44 @@ KNOWN VACUOUS: `TestMoverLiveSetIsBounded` now passes trivially (peak 0 is
 below any bound) and can no longer fail. It is subsumed by
 `test_the_seam_moves_no_kv_at_all` and must not be cited as evidence.
 
+## W27-RETRY (pin b6c38dfe17) — root fix HOLDS, and a NEW defect of mine
+
+9 flips, BOTH directions, no GDN refusal, no #825 shape. Then a leak.
+
+**PROVEN ON METAL: the flip carries no KV.** Every `PHASE-FLIP DONE` line, all
+ranks, both directions: `0 live slots, sent 0 cells / 0.00 MiB, received 0
+cells / 0.00 MiB`. W25's comparison point is 116502 slots and 995.31 MiB.
+
+**The W27 killer is gone**: `resident_mamba_slots` did not fire once across 9
+flips. The live-universe consume removed it and the GDN mover retired by
+construction, exactly as derived.
+
+**Two new costs, measured, both mine** (rank-0 segment walk):
+`hicache_quiesce->resident_release` **753.6 ms** for the retract+consume+drop,
+and **~314 ms** for the wave loop still walking 16 EMPTY waves -- the price of
+retiring the mover by emptying its input rather than deleting it. Quantifying
+it is what makes deleting it decidable.
+
+**THE NEW DEFECT — the tree drop orphans the tree's OWN rows.**
+
+    ValueError: pool memory leak detected! [full] total=472864,
+      available=126802, evictable=22, protected=0, ... withheld=345888
+
+126802 + 22 + 345888 = 472712 vs 472864 -> **152 rows belong to nobody**,
+accumulating per retract+drop cycle (it fired on the third). The retraction
+frees the RESIDENT REQUESTS' rows; the tree additionally holds CACHED PREFIX
+rows, and `tree_cache.reset()` rebuilds the root and orphans them instead of
+returning them to the allocator. Before #856 the tree was never reset at the
+seam -- #825 withdrew that action -- so this is NEW and it is mine. W25 ran 33
+cutovers with no such error.
+
+**GATES THE NEXT WINDOW.** The fix must free the tree's rows at the drop
+(`flush_cache` is a wipe, `reset` is not) and be pinned red-first against this
+leak arithmetic. Guessing a tree API at a live seam turns a loud leak into a
+silent double-free.
+
+Full record: `/spinning/gpu-arb/W27-RESULT.md`.
+
 ## W27 (2026-08-24) — what the metal settled, and what it did not
 
 ONE criterion passed, one failed, five have NO DATA. Recorded that way on
