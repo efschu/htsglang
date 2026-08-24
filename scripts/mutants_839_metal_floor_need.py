@@ -21,11 +21,17 @@ SPILL = ROOT / "python/sglang/srt/managers/phase_flip_spill.py"
 SUITE = "test/registered/unit/managers/test_floor_need_839_metal.py"
 
 MUTANTS = [
+    # M1 SUPERSEDED by #839-METAL v2. Its anchor was the v1 spelling of the
+    # "am I the floor" guard, which v2 rewrote into floor_need_verdict. The
+    # SAME EDGE is still mutated, against the current code, by
+    # scripts/mutants_839_metal_v2_exits.py M5. Retired here rather than left
+    # as a dangling anchor, because a SKIP counts as ALIVE and would overstate
+    # the hole.
     (
-        "M1 a rank that is not the floor also grows (the min moves by zero)",
+        "M1 SUPERSEDED by v2 M5 (not-the-floor guard, rewritten in v2)",
         RELIEF,
-        "        if int(self._current_rows()) > floor:\n            return 0\n        return need - floor",
-        "        return need - floor",
+        None,
+        None,
     ),
     # M2 IS A KNOWN EQUIVALENT MUTANT, kept and labelled rather than deleted.
     #
@@ -55,11 +61,16 @@ MUTANTS = [
         "        self._rebind()\n        arena = self._arena_key()\n        if self._group_floor_arena != arena",
         "        arena = self._arena_key()\n        self._rebind()\n        if self._group_floor_arena != arena",
     ),
+    # M4 SUPERSEDED by #839-METAL v2, same reason: v2 inserted the named-exit
+    # call between the refusal and the return, so the anchor no longer exists.
+    # v2's M1 (a non-raising commit taken as success) and M3 (clamp counted but
+    # not refused) mutate this edge against the current code, and M1 is the
+    # stronger arm because it is the bug that actually shipped.
     (
-        "M4 a grow that cannot reach is silent (window 5's 153 abandons)",
+        "M4 SUPERSEDED by v2 M1/M3 (silent unreachable grow)",
         RELIEF,
-        "            self._record_floor_need_refusal(floor, target, repr(e))\n            return 0",
-        "            return 0",
+        None,
+        None,
     ),
     (
         "M5 a failed grow reports success and clears the refusal",
@@ -94,7 +105,8 @@ def main() -> int:
     for name, path, old, new in MUTANTS:
         if old is None:
             equivalent += 1
-            print(f"  EQUIV {name}")
+            tag = "SUPER" if "SUPERSEDED" in name else "EQUIV"
+            print(f"  {tag} {name}")
             continue
         src = path.read_text()
         if old not in src:
@@ -112,7 +124,7 @@ def main() -> int:
         else:
             alive += 1
             print(f"  ALIVE {name}   <-- the suite would not have caught this")
-    print(f"\n{dead} dead / {alive} alive / {equivalent} known-equivalent")
+    print(f"\n{dead} dead / {alive} alive / {equivalent} retired (equivalent or superseded)")
     if not run_suite():
         print("WARNING: sources were not restored cleanly.")
         return 3
