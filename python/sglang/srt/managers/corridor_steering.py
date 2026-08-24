@@ -64,6 +64,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
+# #856 F7: the group-agreement idiom has ONE owner. `tree_congruence` holds no
+# steering state and imports nothing from here, so this direction cannot cycle.
+from sglang.srt.managers.tree_congruence import agreement, digest_pair
+
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "CORRIDOR-STEER"
@@ -202,16 +206,20 @@ class AllocationSteering:
         if self.nvml_index is not None:
             payload[self.rank] = self.nvml_index
         proposal = self._propose(column)
-        payload[n] = proposal
-        payload[n + 1] = -proposal
+        # #856 F7: the (x, -x) MIN-pair idiom comes from the ONE authority
+        # that owns it (`tree_congruence.digest_pair` / `agreement`), not from
+        # a third hand-rolled copy. The arithmetic is identical -- this is a
+        # reconciliation, not a behaviour change -- and the point is that a
+        # defect in "did the ranks agree?" is now fixable in one place instead
+        # of being re-derived at every collective that needs it.
+        payload[n], payload[n + 1] = digest_pair(proposal)
         checksum = self._free_list_checksum()
-        payload[n + 2] = checksum
-        payload[n + 3] = -checksum
+        payload[n + 2], payload[n + 3] = digest_pair(checksum)
 
         reduced = reduce_fn(payload)
         self.state.decisions += 1
 
-        if reduced[n + 2] != -reduced[n + 3]:
+        if not agreement(reduced[n + 2], reduced[n + 3]):
             # THE PREMISE FAILED. The free lists are not identical, so a
             # partition this rank applies is not the partition its peers
             # apply, and steering could split one token's KV across two rows.
@@ -223,7 +231,7 @@ class AllocationSteering:
             )
             return None
 
-        if reduced[n] != -reduced[n + 1]:
+        if not agreement(reduced[n], reduced[n + 1]):
             # The ranks read the column at slightly different instants and
             # named different cards. MIN still yields one answer everywhere,
             # which is all correctness needs; the count is kept because a

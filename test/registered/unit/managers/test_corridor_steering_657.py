@@ -408,5 +408,36 @@ class TestSteeringCannotMoveResidency(unittest.TestCase):
         self.assertGreaterEqual(biased_max - plain_max, n)
 
 
+class TestTheAgreementIdiomHasOneOwner(unittest.TestCase):
+    """#856 F7: the (x, -x) MIN-pair ballot is not re-derived here.
+
+    `decide` hand-rolled the idiom TWICE -- once for the absorbing-rank
+    proposal, once for the free-list checksum -- while
+    `managers/tree_congruence.py` already owned it as `digest_pair` /
+    `agreement`. Three copies of "did the ranks agree?" is three places a
+    defect in that question has to be found.
+
+    This asserts IDENTITY, not equivalent behaviour, deliberately. A test
+    that only checked the answers would pass against a fourth private copy
+    that happens to agree today, which is exactly the state being retired.
+    """
+
+    def test_the_primitives_are_the_shared_ones(self):
+        from sglang.srt.managers import corridor_steering, tree_congruence
+
+        self.assertIs(corridor_steering.digest_pair, tree_congruence.digest_pair)
+        self.assertIs(corridor_steering.agreement, tree_congruence.agreement)
+
+    def test_the_shared_agreement_still_decides_both_ways(self):
+        # The can-fail direction for the import above: the shared primitive
+        # must actually discriminate, or pointing at it proves nothing.
+        from sglang.srt.managers.tree_congruence import agreement, digest_pair
+
+        lo, neg = digest_pair(7)
+        self.assertTrue(agreement(lo, neg))
+        # Two ranks proposing 7 and 9: MIN gives (7, -9), which is disagreement.
+        self.assertFalse(agreement(min(7, 9), min(-7, -9)))
+
+
 if __name__ == "__main__":
     unittest.main()
