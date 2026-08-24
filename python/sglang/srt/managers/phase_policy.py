@@ -2286,6 +2286,64 @@ def _decide_from_load(
             and inp.running_bs > 0
             and n_live < inp.pending_prefill_tokens <= tp_threshold
         ):
+            # #853(iii): THE BAND'S PREMISE IS A CLAIM ABOUT A RATE, AND IT
+            # CAN BE FALSE.
+            #
+            # Everything below this point holds TP because "prefilling it in
+            # tp beats the round trip". That is not a statement about the
+            # backlog's size alone -- it is priced at `tp_prefill_tok_s`, and
+            # it is only true while the backlog is ACTUALLY BEING PREFILLED
+            # HERE. If no chunk is being computed, the arithmetic is denominated
+            # in a rate that is not happening, and the hold becomes #833's
+            # shape one branch up: a wait for something that has stopped.
+            #
+            # THIS WAS THE ONLY HOLD IN THIS FUNCTION THAT COULD NOT BE WRONG.
+            # Every neighbour already carries a bound on its own premise: the
+            # min dwell yields to `starved` (#768), drain mode yields to the
+            # #833 stall deadline, the idle lock yields to the idle dwell
+            # (#748). The band yielded to nothing, so a backlog parked between
+            # the two bars with a decode resident held the layout for as long
+            # as it stayed there.
+            #
+            # THE AXIS IS PREFILL PROGRESS, NOT THE DECODE BUNDLE, and the
+            # difference is load-bearing. W24's ticket proposed breaking the
+            # band when the decode bundle is not draining. At the measured
+            # `decode_contention` = 1 the scheduler gives prefill absolute
+            # priority per iteration, so while prefill is pending in TP the
+            # bundle CANNOT shrink -- by construction, not by defect. Breaking
+            # on it would collapse the band to the plain break-even for every
+            # load with a request decoding, silently deleting the #665-F1
+            # differential model. So the falsifier is taken on the axis the
+            # claim is actually made on.
+            #
+            # `pending_prefill_tokens` is "admitted but not yet computed",
+            # measured at the chunk fill boundary, so it drops by a chunk every
+            # round a chunk is computed -- even mid-way through one long
+            # prompt. Frozen for a whole decode window therefore means no
+            # chunk was computed for a whole decode window. The clock is
+            # #677(a)'s, already maintained by `observe_idle`; unstamped reads
+            # as no stall, so a caller that never observed cannot flip on it.
+            prefill_stall_s = (
+                0.0
+                if state.last_prefill_progress_at is None
+                else inp.now - state.last_prefill_progress_at
+            )
+            band_deadline_s = drain_stall_deadline_s(cfg)
+            if band_deadline_s > 0 and prefill_stall_s >= band_deadline_s:
+                return PhasePolicyDecision(
+                    TP_TO_PP,
+                    f"prefill progress STALLED in tp: "
+                    f"{inp.pending_prefill_tokens} tok has not gone down for "
+                    f"{prefill_stall_s:.1f}s (deadline {band_deadline_s:.1f}s) "
+                    f"while the backlog sits in the secondary band "
+                    f"(> N={n_live}, <= {tp_threshold}) with "
+                    f"{inp.running_bs} req decoding. That band holds because "
+                    f"prefilling it here is supposed to beat the round trip -- "
+                    f"a claim priced at the tp prefill rate, and no chunk has "
+                    f"been computed for a whole decode window, so the rate it "
+                    f"is priced on is not happening. Flipping is what makes "
+                    f"that backlog runnable (seam {seam_s:.2f}s {priced})",
+                )
             # Repays the seam, but not the seam PLUS the generations this
             # cutover would pause for a whole PP window. Named explicitly so
             # the log says which term refused, not just "below threshold".

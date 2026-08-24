@@ -58,6 +58,9 @@ W3_BUNDLE = 7
 W3_SEAM_S = 3.2
 #: One decode window on that config. `drain_stall_deadline_s` floors at 10.0.
 W3_WINDOW_S = 10.0
+#: #853(iii): the secondary-band bar the policy applied at running_bs=7 and
+#: the measured sigma = 1, i.e. `N0 x (1 + 2B) / (1 + B)` = 7004 x 15/8.
+W3_APPLIED_BAR = 13132
 
 
 def _economy(**over):
@@ -72,6 +75,11 @@ def _economy(**over):
         window_s=W3_WINDOW_S,
         pending_prefill_tokens=W3_MAX_PENDING,
         live_flip_tokens=W3_BAR,
+        # #853(iii): the bar the policy applied. The secondary band's upper
+        # edge is bounded above by 2 x the break-even, and this specimen ran
+        # at 119x it, so the span is above BOTH bars and every assertion in
+        # this file is unaffected by which one the gate reads.
+        applied_bar_tokens=W3_APPLIED_BAR,
         live_flip_cost_s=W3_SEAM_S,
         price_measured=True,
         hold_reason="decode bundle running: 7 of 7 req still decoding",
@@ -90,9 +98,7 @@ class TheEconomyWindowIsDerivedNotPinned(unittest.TestCase):
     """N is the policy's own decode window, not a number chosen here."""
 
     def test_n_is_the_policys_own_drain_stall_deadline(self):
-        cfg = PhasePolicyConfig(
-            enabled=True, flip_tokens=W3_BAR, flip_cost_s=W3_SEAM_S
-        )
+        cfg = PhasePolicyConfig(enabled=True, flip_tokens=W3_BAR, flip_cost_s=W3_SEAM_S)
         self.assertEqual(
             lc.economy_window_s(drain_stall_deadline_s(cfg)),
             drain_stall_deadline_s(cfg),
@@ -183,7 +189,9 @@ class HonestEconomicsMustNotAlarm(unittest.TestCase):
 
     def test_a_genuinely_draining_bundle_is_a_legitimate_hold(self):
         """Net progress AND recent progress -- #833's own two conditions."""
-        alarm, detail = _economy(running_bs=2, bundle_at_phase_entry=7, bundle_stall_s=0.4)
+        alarm, detail = _economy(
+            running_bs=2, bundle_at_phase_entry=7, bundle_stall_s=0.4
+        )
         self.assertFalse(alarm)
         self.assertIn("genuinely draining", detail)
 
@@ -227,9 +235,7 @@ class HardConformanceIsBinary(unittest.TestCase):
         self.assertIn("mb_id=2", detail)
 
     def test_the_inverse_is_equally_a_violation(self):
-        alarm, detail = lc.admit_vs_exec_verdict(
-            PHASE_TP, PHASE_PP, "rid-1", 0, None
-        )
+        alarm, detail = lc.admit_vs_exec_verdict(PHASE_TP, PHASE_PP, "rid-1", 0, None)
         self.assertTrue(alarm)
         self.assertIn("admitted=tp executed=pp", detail)
 
@@ -316,9 +322,7 @@ class CountersAndThrottle(unittest.TestCase):
 
     def test_different_shapes_do_not_throttle_each_other(self):
         self.assertTrue(lc.note_conformance_violation("kind=admit_vs_exec", 100.0))
-        self.assertTrue(
-            lc.note_conformance_violation("kind=stale_ring_restore", 100.1)
-        )
+        self.assertTrue(lc.note_conformance_violation("kind=stale_ring_restore", 100.1))
 
     def test_the_periodic_field_reports_both_levels(self):
         lc.note_conformance_violation("kind=admit_vs_exec", 100.0)
@@ -434,9 +438,7 @@ class MutantsDie(unittest.TestCase):
         def overeager(*, phase, held_s, window_s, **_):
             return (phase == PHASE_TP and held_s >= window_s), "alarm"
 
-        alarm, _ = overeager(
-            phase=PHASE_TP, held_s=41.0, window_s=W3_WINDOW_S
-        )
+        alarm, _ = overeager(phase=PHASE_TP, held_s=41.0, window_s=W3_WINDOW_S)
         with self.assertRaises(AssertionError):
             self.assertFalse(alarm)
 
@@ -451,6 +453,7 @@ class MutantsDie(unittest.TestCase):
             window_s=W3_WINDOW_S,
             pending_prefill_tokens=W3_MAX_PENDING,
             live_flip_tokens=W3_BAR,
+            applied_bar_tokens=W3_APPLIED_BAR,
             live_flip_cost_s=W3_SEAM_S,
             price_measured=False,
             hold_reason="x",
@@ -480,6 +483,7 @@ class MutantsDie(unittest.TestCase):
             window_s=W3_WINDOW_S,
             pending_prefill_tokens=W3_MAX_PENDING,
             live_flip_tokens=W3_BAR,
+            applied_bar_tokens=W3_APPLIED_BAR,
             live_flip_cost_s=W3_SEAM_S,
             price_measured=True,
             hold_reason="x",

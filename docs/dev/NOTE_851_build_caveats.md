@@ -162,6 +162,79 @@ function over a stats mapping, so each is falsifiable without a GPU — with
 that stops the abstention tests from passing against a function that only ever
 returns `None`.
 
+## #853(iii) did NOT implement the remedy its ticket named
+
+W24's residual defect (iii) reads: *"the '>N but <=30086 with 1 req decoding:
+too short for round trip' hold must break when the decode bundle is not
+draining"*. **That remedy is deliberately not built, and a later reader must
+not treat its absence as an oversight.** The arithmetic refuses it.
+
+At the measured `decode_contention` (sigma) = 1, batch selection gives prefill
+absolute priority per iteration — `_differential_flip_threshold`'s own
+docstring records the measurement: *"an iteration with any prefill chunk
+pending runs THAT batch and never reaches the decode branch"*. So while
+prefill is pending in TP, the decode bundle **cannot shrink, by
+construction**. "Bundle not draining" is therefore implied by the very
+condition the band operates under, not evidence about it. A band that broke on
+it would collapse to the plain break-even N0 for every load with a request
+decoding — silently deleting the #665-F1 differential model. That is a policy
+rewrite wearing a bug fix.
+
+The specimen turned out to carry **two** defects, and neither is the one the
+ticket named:
+
+1. **The detector read a bar the policy never applied.** The alarm printed
+   `bar_tok=20057` (the break-even) while the hold it indicted named
+   `> N=20057 but <= 30086` — the secondary-band bar,
+   `effective_flip_threshold(cfg, running_bs=1)`, which at sigma = 1 is
+   `N0 x (1+2B)/(1+B)` = exactly `20057 x 1.5`. The policy compared 22887
+   against 30086 and held **correctly**. So the W24 LAYOUT-ECONOMY ANOMALY
+   count of 1 is a **FALSE POSITIVE**, and the "first metal catch of the
+   detector" line in `WINDOW9-RESULT.md` should be read as the detector's
+   first metal *self-indictment*. This is #819's ONE READING rule holding
+   inside `phase_policy` and breaking at the module boundary, and it is the
+   #851 class root exactly ("the DECIDERS still read their own bookkeepers")
+   occurring in an #851-family detector.
+2. **The band had no falsifier for its own premise.** It was the only hold in
+   `_decide_from_load` that could not be wrong — min dwell yields to `starved`
+   (#768), drain mode to the #833 stall deadline, the idle lock to the idle
+   dwell (#748). The band yielded to nothing.
+
+The falsifier that was built is on the axis the band's claim is actually made
+on: **prefill progress**, via #677(a)'s existing `last_prefill_progress_at`
+clock against `drain_stall_deadline_s`. `pending_prefill_tokens` is measured
+at the chunk fill boundary, so it drops every round a chunk is computed; frozen
+for a whole decode window means no chunk was computed for a whole decode
+window, which is precisely "the rate this band is priced on is not happening".
+
+**The two halves agree on the specimen rather than double-counting it**: W24's
+pending oscillated 0 -> ~22.5k -> 0 on a ~5-min period, so prefill progress was
+live and the new break would have stayed silent there — consistent with (1),
+which says that hold was right. That is what makes them two separable defects
+instead of one defect described twice.
+
+### What (iii) therefore does NOT close
+
+It does not move the flip. W24's stuck phase was **funding**, not economics:
+153 tp_to_pp arms were refused *after* `_decide_from_load` had already said the
+load wanted the flip, 43 of 45 binding refusals reading `cause=phantom_capacity`
+— which is #852's territory, not this one. The band contributed a single
+(false) anomaly to that window. **(iii) must not be cited as a flip-stickiness
+fix**; it removes a false alarm and closes an unbounded hold that W24 did not
+actually exercise.
+
+### Not rebuilt: the staging rate limit already clears on a completion
+
+The ticket pairs (iii) with the 60 s staging rate limit. PRIOR ART CHECK found
+the property already implemented (`note_flip_completed` pops `last_abandon_at`,
+`arm_refusals`, `arm_hold_until`, `arm_degraded` for the direction) and already
+pinned by `test_phase_policy_flip_reachability.py::
+test_a_completion_clears_the_staging_rate_limit_outright`. Nothing was
+rebuilt. A band-break is paced by that limiter like any other arm, which is
+correct: `_decide_rules` applies it after `_decide_from_load`, and
+`_demand_outweighs_a_retry` still overrides it when the backlog is worth more
+than the wait.
+
 ## Metal criteria are NOT substituted by any of this
 
 "0 over-cap floor vetoes under load" stays in the window ticket unchanged. The

@@ -10935,6 +10935,7 @@ class Scheduler(
             from sglang.srt.managers import layout_conformance
             from sglang.srt.managers.phase_policy import (
                 drain_stall_deadline_s,
+                effective_flip_threshold,
                 flip_cost_measured,
                 live_flip_cost_s,
                 live_flip_tokens,
@@ -10969,6 +10970,16 @@ class Scheduler(
                 window_s=window_s,
                 pending_prefill_tokens=int(inp.pending_prefill_tokens),
                 live_flip_tokens=int(live_flip_tokens(cfg)),
+                # #853(iii): THE BAR THE POLICY APPLIED, from the policy's own
+                # authority. `live_flip_tokens` is only the break-even; the
+                # hold this detector contradicts may have been taken against
+                # the higher secondary-band bar, and comparing against the
+                # lower one reported correct differential economics as a
+                # defect (W24 09:01:37). Same reading as `_decide_from_load`
+                # takes, computed from the same two inputs.
+                applied_bar_tokens=int(
+                    effective_flip_threshold(cfg, int(inp.running_bs))
+                ),
                 live_flip_cost_s=float(live_flip_cost_s(cfg)),
                 price_measured=bool(flip_cost_measured()),
                 hold_reason=reason,

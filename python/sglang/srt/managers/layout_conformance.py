@@ -327,6 +327,7 @@ def economy_divergence_verdict(
     window_s: float,
     pending_prefill_tokens: int,
     live_flip_tokens: int,
+    applied_bar_tokens: int,
     live_flip_cost_s: float,
     price_measured: bool,
     hold_reason: Optional[str],
@@ -358,7 +359,8 @@ def economy_divergence_verdict(
     4. THE PRICE IS MEASURED. A seeded price is an assumption, not the
        policy's own claim, and a detector that alarmed on an assumption would
        be reporting the seed's opinion as a defect.
-    5. THE PRICE FAVOURS LEAVING: ``pending > live_flip_tokens``.
+    5. THE PRICE FAVOURS LEAVING: ``pending`` exceeds THE BAR THE POLICY
+       ACTUALLY APPLIED.
 
        THIS IS THE GATE THAT MAKES HONEST ECONOMICS SAFE. ``live_flip_tokens``
        IS the repriced break-even; an expensive measured seam raises it, so a
@@ -367,6 +369,30 @@ def economy_divergence_verdict(
        therefore CANNOT reach the alarm. Only a cheap measured price -- the
        policy having computed that flipping pays, and then not flipping --
        can get past here. Both directions are pinned by test.
+
+       #853(iii): THE BREAK-EVEN IS NOT THE ONLY BAR, and reading it as if it
+       were produced a false positive on metal. Above ``live_flip_tokens``
+       sits the #665-F1 SECONDARY BAND, whose upper edge is
+       ``phase_policy.effective_flip_threshold(cfg, running_bs)`` -- the
+       break-even plus the cost of stranding the requests currently decoding.
+       A hold inside that band is the policy's differential arithmetic
+       working, not a divergence from it. W24 09:01:37: this detector printed
+       ``pending_tok=22887 bar_tok=20057`` and alarmed, while the hold it
+       indicted said in its own text ``> N=20057 but <= 30086``. Two bars for
+       one comparison, which is exactly what #819's ONE READING rule forbids
+       inside ``phase_policy`` -- the rule simply had no reach across this
+       module boundary.
+
+       So the applied bar is PASSED IN from the one authority that computes
+       it, and is REQUIRED rather than defaulted: a default is the mechanism
+       by which a caller silently re-creates the divergence.
+
+       THE GATE TAKES THE HIGHER OF THE TWO, which bounds the blast radius of
+       this change to exactly one direction: it can only ever RAISE the bar,
+       so it can only remove false positives and can never invent a new
+       alarm. That also handles strict purity, where ``effective_flip_
+       threshold`` returns 0 by construction (a sub-N prompt cannot run in TP
+       at all) -- there the break-even stands, unchanged.
 
     Then, and only then, the hold must be for a reason that is not legitimate.
     LEGITIMACY IS DECIDED STRUCTURALLY, NEVER BY READING THE REASON STRING.
@@ -413,12 +439,24 @@ def economy_divergence_verdict(
             "flip price provenance is seed, not measured: an assumption is "
             "not the policy's own claim and is not evidence of divergence"
         )
-    if pending_prefill_tokens <= live_flip_tokens:
+    # The bar the policy APPLIED, never the break-even alone. See gate 5.
+    applied_bar = max(int(live_flip_tokens), int(applied_bar_tokens))
+    if pending_prefill_tokens <= applied_bar:
+        band = (
+            ""
+            if applied_bar == live_flip_tokens
+            else (
+                f" -- inside the secondary band (> N={live_flip_tokens}, "
+                f"<= {applied_bar}), where the bar prices the "
+                f"{running_bs} req this cutover would strand on top of the "
+                f"seam"
+            )
+        )
         return False, (
-            f"pending {pending_prefill_tokens} tok <= bar {live_flip_tokens} "
+            f"pending {pending_prefill_tokens} tok <= bar {applied_bar} "
             f"tok at a measured seam of {live_flip_cost_s:.2f}s: the policy's "
             f"own arithmetic says holding is right, which is correct "
-            f"economics and not an anomaly"
+            f"economics and not an anomaly{band}"
         )
     if since_flip_s < min_dwell_s:
         return False, (
@@ -449,14 +487,15 @@ def economy_divergence_verdict(
     return True, (
         f"{ALARM_ECONOMY} held={phase} held_s={held_s:.1f} "
         f"window_s={window_s:.1f} pending_tok={pending_prefill_tokens} "
-        f"bar_tok={live_flip_tokens} seam_s={live_flip_cost_s:.2f} "
+        f"bar_tok={live_flip_tokens} applied_bar_tok={applied_bar} "
+        f"seam_s={live_flip_cost_s:.2f} "
         f"provenance=measured running_bs={running_bs} "
         f"bundle_entry={bundle_at_phase_entry} "
         f"bundle_stall_s={bundle_stall_s:.1f} illegitimate={illegitimate} "
         f"class2_total={_COUNTERS.economy_anomalies + 1} "
         f'verdict="{_quote(hold_reason)}". The policy has held {phase} for '
         f"{held_s:.1f}s while its OWN measured price ({live_flip_cost_s:.2f}s "
-        f"seam, break-even {live_flip_tokens} tok) says the "
+        f"seam, applied bar {applied_bar} tok) says the "
         f"{pending_prefill_tokens} tok waiting would be served faster in the "
         f"other layout, and the hold is not min-dwell, not active staging, "
         f"and not a draining bundle"
