@@ -181,6 +181,50 @@ def mamba_slot_reorder_active(server_args: "ServerArgs") -> bool:
     return os.getenv(MAMBA_SLOT_REORDER_ENV, "") not in ("", "0", "false", "False")
 
 
+def mamba_anchor_ack_release_active(server_args: "ServerArgs") -> bool:
+    """#811: may a running request's anchor pin be released at the ack?
+
+    Builds strictly on top of the #755/#773 reorder: the reorder makes the
+    donated slot BECOME the pinned checkpoint; this releases that pin the
+    moment the checkpoint's write-through backup is ACKNOWLEDGED, so between
+    checkpoints a running request holds only its active slot.
+
+    The release itself is gated per node by
+    ``MambaComponent.anchor_release_admissible`` -- host copy present AND the
+    ack landed (``node.id not in ongoing_write_through``). #767 is the reason
+    that per-node gate is non-negotiable: releasing on ``host_value`` alone,
+    while the copy is still in flight, resumes requests from a copy that does
+    not exist yet (degenerate output in 9/10 salted probes). This predicate
+    only decides whether the mechanism is ARMED; it never makes a node
+    admissible.
+
+    The exclusions are the dec-site audit (#811): kv-session-offload
+    (kv_session_offload.py release_finished_spilled_req), the spill
+    destination's parked-request cleanup, streaming sessions
+    (streaming_session.py release_session), and the PD-disaggregation decode
+    side all call ``dec_lock_ref(req.last_node)`` without DecLockRefParams,
+    so an early-released mamba ref would be decremented a second time there.
+    Rather than teaching every one of those sites the release marker, the
+    feature refuses to arm alongside them.
+
+    Read directly from server_args by user order: no SGLANG_* environment
+    form exists for this flag.
+    """
+    if not mamba_slot_reorder_active(server_args):
+        return False
+    if not bool(getattr(server_args, "mamba_anchor_ack_release", None)):
+        return False
+    if getattr(server_args, "enable_kv_session_offload", False):
+        return False
+    if getattr(server_args, "enable_streaming_session", False):
+        return False
+    if getattr(server_args, "enable_session_radix_cache", False):
+        return False
+    if getattr(server_args, "disaggregation_mode", "null") not in (None, "null"):
+        return False
+    return True
+
+
 def mamba_slots_per_running_req(server_args: "ServerArgs") -> int:
     """Mamba slots one running request can hold simultaneously."""
     slots = MAMBA_FLOOR_ACTIVE_SLOTS
@@ -189,6 +233,18 @@ def mamba_slots_per_running_req(server_args: "ServerArgs") -> int:
         # only ever owns its active state slot.
         return slots
     slots += mamba_ping_pong_slots(server_args)
+    if mamba_anchor_ack_release_active(server_args):
+        # #811: the merged donation/pin term moves off the per-request floor
+        # and into the retention pin budget. A pin now exists only while the
+        # checkpoint's write-through backup is IN FLIGHT (taken only when the
+        # backup was admitted by the pin budget, released at the ack), so the
+        # number of simultaneously pinned checkpoints is bounded by
+        # `mamba_retention_pin_budget`, not by the number of running
+        # requests. Worst case protected = floor (actives) + budget = pool.
+        # NOT a formula-only edit: unified_radix_cache gates the pin-take and
+        # performs the ack-time release; dropping this term without those
+        # mechanisms is the #581 late assert (see NOTE_755 section 3).
+        return slots
     if mamba_slot_reorder_active(server_args):
         # #755: the donated slot BECOMES the next pinned checkpoint. The
         # double-count existed only because the old pin was held across the
@@ -252,6 +308,13 @@ def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -
     pp = mamba_ping_pong_slots(server_args)
     if server_args.disable_radix_cache:
         terms = f"{MAMBA_FLOOR_ACTIVE_SLOTS} active (radix cache disabled)"
+    elif mamba_anchor_ack_release_active(server_args):
+        terms = (
+            f"{MAMBA_FLOOR_ACTIVE_SLOTS} active"
+            f" + {pp} ping-pong"
+            f" (#811 ack release: the pinned checkpoint is retention-budget"
+            f" funded, released at the write-through ack)"
+        )
     elif mamba_slot_reorder_active(server_args):
         terms = (
             f"{MAMBA_FLOOR_ACTIVE_SLOTS} active"
