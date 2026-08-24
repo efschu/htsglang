@@ -743,6 +743,17 @@ class Envs:
     # abandonment it exists to prevent is decoration, not an actuator. Kinds
     # with a declared disposition are unaffected -- see pp_stash_disposition.
     SGLANG_PP_STASH_ESCAPE_S = EnvFloat(20.0)
+    # PP: how long the presence gate may keep waiting once EVERY clause of its
+    # withhold reason is one no armed service turn can clear (#850). The gate
+    # holds four actuators; a reason outside all four cannot change while the
+    # rank is in the gate, so the outcome after the full 60 s presence deadline
+    # is identical to the outcome available in the first round -- the wait just
+    # costs the whole group 60 s of serving. Shortened, not removed: a small
+    # bound keeps the existing withdrawal protocol (may_withdraw, the race
+    # re-check, _abandon_no_quorum) doing the abandoning, unchanged. Set to 0
+    # to disable and fall back to the full presence deadline -- the off-switch
+    # a guard needs to be provable in both directions.
+    SGLANG_PP_PRESENCE_FUTILE_S = EnvFloat(2.0)
     # #201 slice 3: cache the pickled tensor-dict METADATA at the pipeline
     # stage boundary. At bs=1 the gloo-pickled metadata costs MORE than the
     # hidden-state payload itself (measured slice 2: 249 us vs 142 us

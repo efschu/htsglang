@@ -64,6 +64,10 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.managers import tree_congruence
+from sglang.srt.managers.pp_presence_disposition import (
+    ALARM_PRESENCE_FUTILE,
+    census_withhold_reason,
+)
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -3399,6 +3403,37 @@ class PhaseFlipRuntime:
         #: locally can say which it was instead of sending every reader
         #: upstream.
         self._last_presence_withhold_reason: Optional[str] = None
+        #: #850: rounds withheld on a reason NO armed service turn can clear.
+        #: Unlike `presence_withheld_rounds`, a non-zero count here is never
+        #: healthy: it counts rounds spent waiting for a consumer this rank is
+        #: itself excluding, which is the #800 shape one channel over.
+        self.presence_futile_rounds = 0
+        #: #850: distinct futile withholds DETECTED (one per epoch/round), which
+        #: is a count of the defect and is raised even when the actuator below
+        #: is switched off.
+        self.presence_futile_detected = 0
+        #: #850: flips actually abandoned early BY the shortened bound. Kept
+        #: separate from `presence_futile_detected` on purpose: a detector that
+        #: counts its own alarms as actions reports work it never did, and with
+        #: SGLANG_PP_PRESENCE_FUTILE_S=0 this must stay 0 while detection goes
+        #: on -- which is what makes the off-switch provable in both directions.
+        self.presence_futile_abandons = 0
+        #: #850: monotonic time this futile withhold began, or None.
+        self._presence_futile_since: Optional[float] = None
+        #: #850: the shortened bound. Read once here so a test can override it
+        #: on the instance without touching the process environment. Imported
+        #: locally, the convention this module already uses for every other
+        #: `envs` read; a failure to read it DISABLES the shortening rather
+        #: than guessing a bound, which leaves the pre-#850 behaviour intact.
+        try:
+            from sglang.srt.environ import envs as _envs
+
+            self._presence_futile_s = float(_envs.SGLANG_PP_PRESENCE_FUTILE_S.get())
+        except Exception:  # noqa: BLE001 - a knob may never break construction
+            self._presence_futile_s = 0.0
+        #: #850: (epoch, round) already alarmed, so the DEFECT line is emitted
+        #: once per occurrence rather than once per round.
+        self._presence_futile_alarmed: Optional[Tuple[int, int]] = None
         self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
         self.join_deadline_aborts = 0
         self._exchange = exchange
@@ -5727,6 +5762,57 @@ class PhaseFlipRuntime:
             self._last_presence_withhold_reason = (
                 "still owes a chain send" if owes else str(unclean)
             )
+            # #850: IS THIS WAIT AGAINST ANYTHING? A withhold is a wait, and a
+            # wait is only meaningful against something that can happen. The
+            # armed loop holds exactly four actuators (pp_flip_service); a
+            # reason outside all four cannot change while this rank sits in the
+            # gate, so every further round is spent losing. `owes` is excluded
+            # deliberately -- an owed chain send IS reaped by the service turn,
+            # and it is the single most common healthy withhold there is.
+            # Read through `getattr` with old-behaviour defaults, the
+            # convention this module already uses for `pp_flip_counters` and
+            # `_pp_stash_first_seen`: a duck-typed rank that never ran
+            # `__init__` (every gate test in this tree builds one) must keep
+            # working, and must keep the PRE-#850 behaviour while doing so.
+            futile_now = False
+            if unclean and not owes:
+                census = census_withhold_reason(str(unclean))
+                if census.is_futile:
+                    futile_now = True
+                    self.presence_futile_rounds = (
+                        getattr(self, "presence_futile_rounds", 0) + 1
+                    )
+                    if getattr(self, "_presence_futile_since", None) is None:
+                        self._presence_futile_since = self._clock()
+                    # ONCE PER OCCURRENCE, not once per round. #800's specimen
+                    # was 57922 silent rounds; the answer to silence is one
+                    # loud line, not 57922 of them.
+                    if getattr(self, "_presence_futile_alarmed", None) != (
+                        epoch,
+                        entry_round,
+                    ):
+                        self._presence_futile_alarmed = (epoch, entry_round)
+                        self.presence_futile_detected = (
+                            getattr(self, "presence_futile_detected", 0) + 1
+                        )
+                        logger.error(
+                            "%s %s epoch %d round %d: "
+                            "this rank is withholding presence on a reason no "
+                            "armed service turn can clear -- %s. Waiting cannot "
+                            "change it, so the flip is abandoned after %.1fs "
+                            "instead of holding the group for the full %.1fs "
+                            "presence deadline (#850).",
+                            LOG_PREFIX,
+                            ALARM_PRESENCE_FUTILE,
+                            epoch,
+                            entry_round,
+                            census.futile_reason(),
+                            getattr(self, "_presence_futile_s", 0.0),
+                            self._presence_deadline_s,
+                        )
+            if not futile_now:
+                self._presence_futile_since = None
+                self._presence_futile_alarmed = None
             # SAY WHY, PERIODICALLY. A withholding rank is invisible in the
             # log -- it simply does not announce -- and the only symptom is
             # an abandonment 60 s later naming it as "never reached the
@@ -5755,6 +5841,11 @@ class PhaseFlipRuntime:
         else:
             self._last_withhold_log = None
             self._last_presence_withhold_reason = None
+            # #850: this rank announced, so whatever it was waiting for is
+            # gone. Clear the futility clock so a later withhold is timed from
+            # its own arrival rather than inheriting a predecessor's age.
+            self._presence_futile_since = None
+            self._presence_futile_alarmed = None
             self._presence.announce(
                 epoch, note=f"pending={self._pending}", round_=entry_round
             )
@@ -5854,7 +5945,25 @@ class PhaseFlipRuntime:
             return True
 
         waited = self._clock() - self._presence_wait_started
-        if waited >= self._presence_deadline_s:
+        # #850: THE ONLY BEHAVIOUR CHANGE, and it is a clock, not a new exit.
+        # A futile withhold takes the SAME withdrawal path as any other
+        # expiry -- may_withdraw, the race re-check, _abandon_no_quorum -- so
+        # nothing about how a flip is abandoned changes here. It just stops
+        # waiting 60 s for a consumer this rank is itself excluding. The bound
+        # is measured from when the futility STARTED, not from the arm, so a
+        # withhold that only turns futile late still gets its own full bound.
+        expired = waited >= self._presence_deadline_s
+        futile_since = getattr(self, "_presence_futile_since", None)
+        futile_bound = getattr(self, "_presence_futile_s", 0.0)
+        if not expired and futile_since is not None and futile_bound > 0:
+            expired = (self._clock() - futile_since) >= futile_bound
+            if expired:
+                # Counted HERE, where the shortened bound is what ends the
+                # wait -- not where the defect was merely detected.
+                self.presence_futile_abandons = (
+                    getattr(self, "presence_futile_abandons", 0) + 1
+                )
+        if expired:
             # #631 H, THE WITHDRAWAL SIDE. Leaving is only permitted while
             # no peer has committed on this rank's presence. If one has,
             # this rank is still at the hook and owes it the reduction --
