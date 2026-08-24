@@ -261,16 +261,38 @@ class Post:
         gran = int(self.granule_bytes)
         if gran > 0:
             # Law 3: round UP to a whole granule, because a sub-granule draw
-            # delivers ZERO, not a partial. Only if the post cannot cover the
-            # rounded-up figure is this a refusal.
+            # delivers ZERO, not a partial.
             rounded = ((draw + gran - 1) // gran) * gran
             if rounded > have:
-                return 0, (
-                    f"ask of {draw / MIB:.0f} MiB rounds up to one granule of "
-                    f"{gran / MIB:.0f} MiB, which exceeds the "
-                    f"{have / MIB:.0f} MiB this post holds"
-                )
-            draw = rounded
+                # #851 F3: ROUND DOWN, DO NOT REFUSE. Law 3 says a PARTIAL
+                # granule is undeliverable; it does not say that ten-and-a-bit
+                # granules are. When the rounded-up ask overshoots holdings,
+                # the deliverable figure is the largest whole number of
+                # granules that FITS -- refusing the whole post instead throws
+                # away every granule it does hold.
+                #
+                # MEASURED, W22 boot_w22_0824_0656.log:4864 (07:04:52, PP0 --
+                # the rank under pressure): "kv-slack 0 MiB (ask of 2776 MiB
+                # rounds up to one granule of 256 MiB, which exceeds the 2776
+                # MiB this post holds)", printed beside `slack=88837 rows` and
+                # "KV capacity is the funder". 2776 rounds to 2816, overshoots
+                # by 40 MiB, and 2560 MiB of real slack was refused for it.
+                #
+                # The trigger is exactly the pressed case -- ask >= holdings,
+                # holdings not granule-aligned -- so this fired when the funder
+                # was needed most and never when it was idle.
+                fits = (have // gran) * gran
+                if fits <= 0:
+                    # Genuinely below one granule: the ORIGINAL refusal, kept
+                    # by name. This is the case law 3 was written for.
+                    return 0, (
+                        f"ask of {draw / MIB:.0f} MiB rounds up to one granule "
+                        f"of {gran / MIB:.0f} MiB, which exceeds the "
+                        f"{have / MIB:.0f} MiB this post holds"
+                    )
+                draw = fits
+            else:
+                draw = rounded
         return int(draw), ""
 
 
