@@ -57,8 +57,20 @@ LAW_FLOOR = 1024 * 1024 * 1024
 #: Window 5, from the abandon lines, to the row. PP1 is the floor and the
 #: binding rank; PP0 and PP2 are the ranks carrying deferred-grow debt.
 W5_BACKED = {"PP0": 215040, "PP1": 126976, "PP2": 133120}
-#: "live set needs 131073", on every abandon line of both boots.
+#: "live set needs 131073", on every abandon line of both boots. This is the
+#: SPAN -- the number of rows a union must cover.
 W5_LIVE_NEED = 131073
+#: What the BALLOT actually carries, and therefore what the callsite hands the
+#: rung: the highest live ROW ID, one less than the span
+#: (``span = int(ballot.get("max_live_row", -1)) + 1``,
+#: phase_flip_runtime.py:8754).
+#:
+#: #839-METAL v2 CONTRACT CHANGE, stated rather than quietly absorbed: v1's
+#: ``note_group_live_need`` treated its argument AS the span, which is the
+#: off-by-one v2 fixes -- it asked for one row less than the flip needs. These
+#: tests fed it the span directly and so did not see the defect. They now feed
+#: the row id, like the real callsite does, and assert the span comes out.
+W5_MAX_LIVE_ROW = W5_LIVE_NEED - 1
 #: The two debts, from the GROW-DEBT-UNPAID lines.
 W5_DEBT = {"PP0": 88064, "PP2": 6144}
 #: The gap the group never closed.
@@ -151,7 +163,7 @@ def _ballot(ranks, *, need=W5_LIVE_NEED):
         r.relief.note_group_backing_floor(floor)
         note_need = getattr(r.relief, "note_group_live_need", None)
         if callable(note_need):
-            note_need(int(need))
+            note_need(int(need) - 1)  # ballot carries the ROW ID; the rung adds the +1
         # ORDER MATTERS AND MIRRORS THE CALLSITE: publish first, so this round's
         # exposure follows THIS round's verdict, then commit pages for the next
         # one. Growing before publishing would let the same round both grow and
@@ -175,7 +187,7 @@ def _ballot_level_only(ranks, *, need=W5_LIVE_NEED):
         r.relief.note_group_backing_floor(floor)
         note_need = getattr(r.relief, "note_group_live_need", None)
         if callable(note_need):
-            note_need(int(need))
+            note_need(int(need) - 1)  # ballot carries the ROW ID; the rung adds the +1
         r.relief.publish_group_exposure("seam ballot")
     return floor
 

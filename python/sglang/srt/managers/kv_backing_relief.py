@@ -572,6 +572,60 @@ def exposure_over_backing(exposed_rows: int, backed_rows: int) -> int:
 GROUP_FLOOR_UNKNOWN = -1
 
 
+#: #839-METAL v2: THE NAMED EXITS OF THE FLOOR-NEED PATH.
+#:
+#: WHY THIS EXISTS AT ALL. Window 6 booted a floor-need actuator that did
+#: nothing: 570 flip arms, 0 tp_to_pp, the floor rank's backing never moved,
+#: and NEITHER branch of the fix printed -- no grow and no refusal, though
+#: those two were supposed to be exhaustive. The log could not say which of
+#: five silent ``return 0`` fired, so a whole window was spent proving only
+#: that the callsite was reached.
+#:
+#: THAT IS THE THIRD INSTANCE OF ONE FORM on this tree:
+#:   1. WEDGE-RECOVERY 2026-08-22 -- six exits returned None for six causes
+#:      and the log line asserted ONE of them;
+#:   2. ``publish_group_exposure`` -- five exits, one ``if moved:`` line, which
+#:      made "0 seam-ballot publications" read as "the path is unreachable"
+#:      when it had in fact executed on all 153 arms and declined;
+#:   3. this path, which I built AFTER filing (2) as a defect. Naming the
+#:      exits is therefore not decoration here, it is the fix.
+#:
+#: THE RULE, and it is cheap: every exit carries a name, every name is
+#: COUNTED unconditionally so a desk can assert on it, and each distinct exit
+#: is LOGGED ONCE rather than every round -- window 5's 1368 repeated
+#: GROW-DEBT-UNPAID lines are the reason "log everything" is not the answer.
+FLOOR_NEED_NO_GROUP_VERDICT = "NO-GROUP-VERDICT"
+FLOOR_NEED_STALE_ARENA = "STALE-ARENA"
+FLOOR_NEED_GROUP_FITS = "GROUP-FITS"
+FLOOR_NEED_NOT_THE_FLOOR = "NOT-THE-FLOOR"
+FLOOR_NEED_GAP = "GAP"
+FLOOR_NEED_NO_GAP = "NO-GAP"
+FLOOR_NEED_POOL_CANNOT_GROW = "POOL-CANNOT-GROW"
+FLOOR_NEED_COMMIT_RAISED = "COMMIT-RAISED"
+#: The window-6 root: the setter returned WITHOUT RAISING and the pool did not
+#: reach the target anyway -- it clamped. v1 treated a non-raising call as
+#: success, computed ``grown`` as 0, cleared nothing, logged nothing, and
+#: returned 0. Indistinguishable from "there was no gap".
+FLOOR_NEED_COMMIT_CLAMPED = "COMMIT-CLAMPED"
+FLOOR_NEED_GROWN = "GROWN"
+
+FLOOR_NEED_EXITS = (
+    FLOOR_NEED_NO_GROUP_VERDICT,
+    FLOOR_NEED_STALE_ARENA,
+    FLOOR_NEED_GROUP_FITS,
+    FLOOR_NEED_NOT_THE_FLOOR,
+    FLOOR_NEED_GAP,
+    FLOOR_NEED_NO_GAP,
+    FLOOR_NEED_POOL_CANNOT_GROW,
+    FLOOR_NEED_COMMIT_RAISED,
+    FLOOR_NEED_COMMIT_CLAMPED,
+    FLOOR_NEED_GROWN,
+)
+
+#: Marker every named exit line carries, so one grep finds the whole family.
+FLOOR_NEED_LOG_MARKER = "[#839-METAL] floor-need"
+
+
 def group_exposure_ceiling(local_backed_rows: int, group_backed_floor: int) -> int:
     """The id ceiling that keeps the group's exposure IDENTICAL across ranks.
 
@@ -1028,6 +1082,14 @@ class KvBackingRelief:
         #: refusal, or ``None``. Readable rather than only logged so the
         #: condition can be asserted at a desk instead of grepped off metal.
         self._floor_need_refusal: Optional[dict] = None
+        #: #839-METAL v2: the NAMED EXIT census of the floor-need path.
+        #: Counted unconditionally so a desk can assert which exit fired
+        #: without booting; window 6 had to spend a whole GPU window
+        #: establishing only that the callsite was reached.
+        self._floor_need_exit_counts: Dict[str, int] = {}
+        #: Dedup key set for the once-per-distinct logging. Keyed by arena too,
+        #: because the same reason in the other layout is a different event.
+        self._floor_need_said: set = set()
         #: -1 means "nothing reported yet", so the FIRST proposal always logs
         #: and a run can never be silent about this rung again.
         self._last_deficit_sign = -1
@@ -2961,96 +3023,184 @@ class KvBackingRelief:
         payload, and is discarded for the same reason a negative floor is: a
         peer that failed to report is not a group that needs nothing.
         """
-        need = int(max_live_row)
-        if need < 0:
+        row = int(max_live_row)
+        if row < 0:
+            # The abstain sentinel and a truncated payload both arrive as -1.
+            # Discarding is right; SILENTLY discarding was half of why v1 was
+            # unreadable on metal, so the caller's next verdict names
+            # NO-GROUP-VERDICT rather than returning a bare 0.
             return
-        self._group_live_need = need
+        # SPAN, NOT ROW ID. ``max_live_row`` is the HIGHEST LIVE ROW; the
+        # number of rows the union has to span is that plus one, which is
+        # exactly how the abandon path reads it:
+        # ``span = int(ballot.get("max_live_row", -1)) + 1``
+        # (phase_flip_runtime.py:8754). v1 compared the raw row id against a
+        # ROW COUNT, so it asked for one row less than the flip needs -- on
+        # window 6's numbers 131072 against a floor of 126976 instead of
+        # 131073, which is the difference between a flip that fits and one
+        # that abandons by a single row.
+        self._group_live_need = row + 1
         self._group_need_arena = self._arena_key()
 
-    def floor_need_gap(self) -> int:
-        """Rows THIS rank must commit for the group floor to cover the live set.
+    def _note_floor_need_exit(self, reason: str, **facts) -> None:
+        """Count EVERY exit, log each DISTINCT one once. #839-METAL v2.
 
-        Zero unless all four hold, and each exclusion is load-bearing:
+        Counting is unconditional so a desk can assert on it without a boot;
+        logging is deduplicated on (arena, reason, facts) so the steady-state
+        exit -- ``GROUP-FITS``, which is the healthy answer on most rounds --
+        cannot flood a log the way window 5's 1368 repeated GROW-DEBT-UNPAID
+        lines did. Both halves are needed: a counter nobody prints is invisible
+        on metal, and a line printed every round is noise nobody reads.
+        """
+        self._floor_need_exit_counts[reason] = (
+            self._floor_need_exit_counts.get(reason, 0) + 1
+        )
+        key = (self._arena_key(), reason, tuple(sorted(facts.items())))
+        if key in self._floor_need_said:
+            return
+        self._floor_need_said.add(key)
+        logger.warning(
+            "%s %s exit=%s %s",
+            LOG_PREFIX,
+            FLOOR_NEED_LOG_MARKER,
+            reason,
+            " ".join(f"{k}={v}" for k, v in sorted(facts.items())),
+        )
 
-        1. a floor and a need have both been seen -- otherwise there is no
-           group statement to act on and #833's "no verdict, no bound" applies;
-        2. both were measured in the arena that is active now -- a row count
-           from the other layout is a different quantity, which is the whole
-           #839 A lesson;
-        3. the need exceeds the floor -- otherwise the group already fits;
-        4. THIS rank is the one holding the floor down. A rank backing more
-           than the floor has no gap to close: growing it moves ``min`` by
-           exactly nothing, which is precisely what window 5 measured when the
-           two RICHEST ranks carried all the deferred-grow debt and the level
-           did not move for 30 minutes.
+    def floor_need_exits(self) -> dict:
+        """The exit census, readable without a boot. #839-METAL v2."""
+        return dict(self._floor_need_exit_counts)
+
+    def floor_need_verdict(self) -> tuple:
+        """``(gap, reason)`` -- the gap AND which exit produced it.
+
+        EVERY return here is named. That is the whole point of v2: window 6
+        could not tell "no group verdict yet" from "this rank is not the floor"
+        from "the group already fits", because all three were ``return 0``.
         """
         floor = int(self._group_backed_floor)
         need = int(self._group_live_need)
         if floor < 0 or need < 0:
-            return 0
+            self._note_floor_need_exit(
+                FLOOR_NEED_NO_GROUP_VERDICT, floor=floor, need=need
+            )
+            return 0, FLOOR_NEED_NO_GROUP_VERDICT
         # REBIND BEFORE READING THE ARENA, NOT AFTER. ``_arena_key`` is
         # ``id(self._pool)`` and ``self._pool`` only follows ``pool_fn`` when
         # ``_rebind`` runs, so asking which arena is active before rebinding
-        # answers with the PREVIOUS one -- and a stale answer here compares two
-        # row counts from different layouts, which is the exact defect #839 A
-        # exists to close, rebuilt one method over. Caught by
-        # ``test_a_floor_measured_in_another_arena_licenses_no_grow``; the
-        # first draft of this method had the two lines the other way round.
+        # answers with the PREVIOUS one -- a stale answer compares row counts
+        # from two layouts, the exact defect #839 A closes. The v1 draft had
+        # these two lines the other way round and a guard test caught it.
         self._rebind()
         arena = self._arena_key()
         if self._group_floor_arena != arena or self._group_need_arena != arena:
-            return 0
+            self._note_floor_need_exit(
+                FLOOR_NEED_STALE_ARENA,
+                floor_arena_ok=int(self._group_floor_arena == arena),
+                need_arena_ok=int(self._group_need_arena == arena),
+            )
+            return 0, FLOOR_NEED_STALE_ARENA
         if need <= floor:
-            return 0
-        if int(self._current_rows()) > floor:
-            return 0
-        return need - floor
+            self._note_floor_need_exit(
+                FLOOR_NEED_GROUP_FITS, floor=floor, need=need
+            )
+            return 0, FLOOR_NEED_GROUP_FITS
+        local = int(self._current_rows())
+        if local > floor:
+            self._note_floor_need_exit(
+                FLOOR_NEED_NOT_THE_FLOOR, local=local, floor=floor, need=need
+            )
+            return 0, FLOOR_NEED_NOT_THE_FLOOR
+        gap = need - floor
+        self._note_floor_need_exit(
+            FLOOR_NEED_GAP, floor=floor, need=need, gap=gap
+        )
+        return gap, FLOOR_NEED_GAP
+
+    def floor_need_gap(self) -> int:
+        """Rows THIS rank must commit for the group floor to cover the live set.
+
+        Thin wrapper over :meth:`floor_need_verdict`, kept because callers and
+        tests already read a bare int. The REASON is the thing v2 adds; read it
+        with ``floor_need_verdict()`` or ``floor_need_exits()``.
+        """
+        return self.floor_need_verdict()[0]
 
     def close_floor_need_gap(self) -> int:
         """Commit the pages the group floor is short of the live set. #839-METAL.
 
-        RANK-LOCAL, AND THAT IS WHY IT IS ALLOWED TO RUN HERE. This reaches
+        RANK-LOCAL, AND THAT IS WHY IT MAY RUN HERE. This reaches
         ``runtime_set_backing_rows`` and nothing else; ``kv_backing_relief.py``
-        enters no collective anywhere, which is the same property that lets
-        ``grow_kv_backing_local`` run at a rank-local cadence
-        (phase_flip_spill.py:1252) while the levelling may not.
+        enters no collective anywhere, the same property that lets
+        ``grow_kv_backing_local`` run at a rank-local cadence.
 
-        IT COMMITS PAGES AND ANNOUNCES NOTHING. The exposed id space is not
-        touched here -- it still moves only in :meth:`publish_group_exposure`,
-        only on a group verdict, only in the arena that verdict was measured
-        in. The grow makes the NEXT ballot's floor higher and the raise happens
-        there, one round later, legitimately. Collapsing the two into one round
-        would be the window-4-A defect rebuilt: a rank-local reading licensing
-        a raise.
+        IT COMMITS PAGES AND ANNOUNCES NOTHING. The exposed id space still
+        moves only in :meth:`publish_group_exposure`, only on a group verdict,
+        only in the arena that verdict was measured in.
 
-        A GROW THAT CANNOT REACH IS A REFUSAL WITH A NAME, NOT A RETRY. On this
-        rig the floor rank is on a 20 GB card and the need can simply exceed
-        what it may commit; window 5 answered that case with 153 silent
-        abandons and 1368 GROW-DEBT-UNPAID lines that named the two ranks whose
-        debt could not matter. Recording the refusal here gives the one number
-        a reader needs -- which rank binds, at what backing, against what need.
+        THE WINDOW-6 ROOT, and the reason v2 exists: a setter that returns
+        WITHOUT RAISING is not proof that the pool grew. If it clamps to the
+        rank's budget, v1 computed ``grown`` as 0, recorded no refusal, logged
+        nothing and returned 0 -- byte-identical to "there was no gap". So the
+        one outcome that must reach an operator, "this rank cannot fund the
+        group's live set", was the one outcome that was silent. v2 VERIFIES THE
+        COMMIT against the target and names the clamp.
 
-        Returns rows committed (0 when there is nothing to do or it failed).
+        Returns rows actually committed. Every other outcome is named.
         """
-        gap = self.floor_need_gap()
+        gap, reason = self.floor_need_verdict()
         if gap <= 0:
+            self._note_floor_need_exit(FLOOR_NEED_NO_GAP, because=reason)
             return 0
         floor = int(self._group_backed_floor)
         target = floor + gap
         setter = getattr(self._pool, "runtime_set_backing_rows", None)
         if not callable(setter):
-            self._record_floor_need_refusal(floor, target, "pool cannot grow")
+            self._record_floor_need_refusal(
+                floor, target, "pool has no runtime_set_backing_rows"
+            )
+            self._note_floor_need_exit(
+                FLOOR_NEED_POOL_CANNOT_GROW, floor=floor, target=target
+            )
             return 0
         try:
             setter(target)
         except Exception as e:  # noqa: BLE001 -- MemoryError and driver errors alike
-            # NOTHING IS HALF-DONE HERE that needs undoing: the setter either
+            # NOTHING IS HALF-DONE that needs undoing: the setter either
             # committed the span or it did not, and the exposed id space was
             # never moved, so the group is exactly where it was.
             self._record_floor_need_refusal(floor, target, repr(e))
+            self._note_floor_need_exit(
+                FLOOR_NEED_COMMIT_RAISED, floor=floor, target=target
+            )
             return 0
+        # VERIFY. A non-raising setter is a claim, not evidence.
+        reached = int(self._current_rows())
+        if reached < target:
+            # PARTIAL PROGRESS IS STILL PROGRESS, and it is reported as the
+            # number it is. Returning 0 here would under-report rows that were
+            # genuinely committed -- the defect being fixed is the SILENCE, not
+            # the partiality. The refusal carries the shortfall; the return
+            # carries the work done. A caller that sees a positive return AND a
+            # standing refusal is being told the truth: it grew, and not enough.
+            self._record_floor_need_refusal(
+                floor,
+                target,
+                f"the pool CLAMPED: commit returned without error but the "
+                f"backing reached {reached} of {target} rows",
+            )
+            self._note_floor_need_exit(
+                FLOOR_NEED_COMMIT_CLAMPED,
+                floor=floor,
+                target=target,
+                reached=reached,
+            )
+            return max(0, reached - floor)
         self._floor_need_refusal = None
-        grown = int(self._current_rows()) - floor
+        grown = reached - floor
+        self._note_floor_need_exit(
+            FLOOR_NEED_GROWN, floor=floor, target=target, grown=grown
+        )
         return max(0, grown)
 
     def _record_floor_need_refusal(self, binding: int, target: int, why: str) -> None:
