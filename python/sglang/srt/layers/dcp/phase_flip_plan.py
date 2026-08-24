@@ -63,8 +63,7 @@ def validate_layer_map(
         for f in layers:
             if not (0 <= f < n_layers):
                 raise KvReshardError(
-                    f"layer map stage {s} names ordinal {f}, outside "
-                    f"[0, {n_layers})"
+                    f"layer map stage {s} names ordinal {f}, outside [0, {n_layers})"
                 )
             if f in seen:
                 raise KvReshardError(
@@ -279,9 +278,7 @@ def _optimal_layer_order(
     big = max(range(n_ranks), key=lambda r: (shares[r], -r)) if n_ranks else 0
     binding = [r for r in range(n_ranks) if r != big]
 
-    states = sorted(
-        itertools.product(*[range(s + 1) for s in sizes]), key=sum
-    )
+    states = sorted(itertools.product(*[range(s + 1) for s in sizes]), key=sum)
     start = tuple([0] * n_ranks)
 
     def _passes(score_of):
@@ -309,9 +306,7 @@ def _optimal_layer_order(
                 parent[st] = top[1]
         return best, parent
 
-    best_b, parent_b = _passes(
-        lambda t: max((t[b] for b in binding), default=0.0)
-    )
+    best_b, parent_b = _passes(lambda t: max((t[b] for b in binding), default=0.0))
     full = tuple(sizes)
     optimum = best_b.get(full, 0.0)
 
@@ -336,9 +331,7 @@ def _optimal_layer_order(
             if prev_t not in best2 or prev_t not in best_b:
                 continue
             t = _transient_at(prev_t, st, j, shares, direction)
-            bind_here = max(
-                best_b[prev_t], max((t[b] for b in binding), default=0.0)
-            )
+            bind_here = max(best_b[prev_t], max((t[b] for b in binding), default=0.0))
             if bind_here > optimum + 1e-12:
                 continue
             cand = max(best2[prev_t], _score_big(t))
@@ -477,15 +470,35 @@ class PhaseFlipTransition:
     @property
     def outgoing_cells(self) -> int:
         return sum(
-            len(self.send_layers[p]) * int(r.numel())
-            for p, r in self.send_rows.items()
+            len(self.send_layers[p]) * int(r.numel()) for p, r in self.send_rows.items()
         )
 
     @property
     def incoming_cells(self) -> int:
         return sum(
-            len(self.recv_layers[p]) * int(r.numel())
-            for p, r in self.recv_rows.items()
+            len(self.recv_layers[p]) * int(r.numel()) for p, r in self.recv_rows.items()
+        )
+
+    @property
+    def moves_nothing(self) -> bool:
+        """Does this plan carry any KV at all?
+
+        Under #856 the seam retracts every resident and drops the tree before
+        the wave loop, so the plan is rebuilt EMPTY by construction and the
+        loop walks waves with nothing in them (W27-retry measured 16 of them
+        for ~314 ms). This is the predicate that lets the seam say so.
+
+        ALL THREE LEGS, not just the peer exchange. A plan with no send and no
+        recv can still have a LOCAL move -- my layers crossed with my own
+        dcp-owned slots -- and skipping the loop on a plan that still has one
+        would drop KV silently, which is the one failure mode worse than the
+        314 ms.
+        """
+        return (
+            self.outgoing_cells == 0
+            and self.incoming_cells == 0
+            and int(self.local_pp_rows.numel()) == 0
+            and int(self.local_tp_rows.numel()) == 0
         )
 
     def max_pp_row(self) -> int:
@@ -529,8 +542,7 @@ def build_phase_flip_transition(
     """
     if direction not in _DIRECTIONS:
         raise KvReshardError(
-            f"unknown flip direction {direction!r}; expected one of "
-            f"{_DIRECTIONS}"
+            f"unknown flip direction {direction!r}; expected one of {_DIRECTIONS}"
         )
     vec = tuple(int(x) for x in tp_vector)
     norm_map = validate_layer_map(layer_map, n_layers)

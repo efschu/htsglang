@@ -104,6 +104,18 @@ class ReadBufferPool:
             self.overflow_allocations += 1
         return self._factory()
 
+    @property
+    def available(self) -> int:
+        """Slots currently in the ring, i.e. not borrowed.
+
+        A consumer that must return the ring to full between uses (#809's
+        rotation is one: a slot leaked per flip degrades the ring into
+        unbounded allocation by the third one) needs to be able to ASK,
+        rather than read the free list through the class's back.
+        """
+        with self._lock:
+            return len(self._free)
+
     def release(self, buffer: Any) -> None:
         """Return a buffer. Extras beyond the ring are simply dropped."""
         with self._lock:

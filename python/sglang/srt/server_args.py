@@ -8398,6 +8398,8 @@ class ServerArgs:
         from sglang.srt.managers.phase_purity import parse_purity
 
         parse_purity(self.phase_flip_purity)
+        if self.enable_phase_flip:
+            self._post_phase_flip_rotation_host_ledger()
         if not self.enable_phase_flip:
             if self.phase_flip_purity is not None:
                 raise ValueError(
@@ -8898,6 +8900,53 @@ class ServerArgs:
                 "it, turning a capacity change into a hit-rate collapse."
             )
         self._post_hicache_staging_host_ledger()
+
+    def _post_phase_flip_rotation_host_ledger(self):
+        """#809/W28: put the flip-image rotation ring on the host ledger.
+
+        The chunk rotation keeps ONE layout image in RAM plus an overshoot, and
+        the overshoot has two terms (``rotation_overshoot_bytes``): the per-rank
+        size asymmetry and the in-flight window. Only the second is knowable at
+        parse time -- the asymmetry needs the arena layouts, which need the
+        model -- so this prices the RING, which is exact here: chunk x depth,
+        straight from the two envs that size it.
+
+        PRICED, NOT REGISTERED, and the distinction is load-bearing. The ring is
+        allocated in the WORKER, where ``rotation_ring`` builds it through
+        #720's ``ReadBufferPool`` and that charges the process-local registry
+        before allocating (#729). A ``register_pinned_post`` here would create a
+        launcher post for bytes the launcher never pins, which is exactly the
+        helper commit 272d0d9d8c deleted. ``joint_pinned_host_error`` is a pure
+        function and is the right tool at this layer.
+
+        MULTIPLIED BY THE RANKS: every rank runs its own rotation and its own
+        ring, and they all draw on the one machine's RAM.
+        """
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            PinnedHostPost,
+            joint_pinned_host_error,
+            pinned_host_memory_bytes,
+        )
+        from sglang.srt.model_executor.weights_arena import (
+            _refill_chunk_bytes,
+            _refill_depth,
+        )
+
+        ring_bytes = int(_refill_chunk_bytes()) * int(_refill_depth())
+        if ring_bytes <= 0:
+            return
+        ranks = max(1, int(self.tp_size or 1)) * max(1, int(self.pp_size or 1))
+        posts = [
+            PinnedHostPost(
+                name=f"phase-flip rotation staging ring x{ranks} rank(s)",
+                flag="--enable-phase-flip (SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB x _DEPTH)",
+                nbytes=ring_bytes * ranks,
+            )
+        ]
+        total_bytes, available_bytes = pinned_host_memory_bytes()
+        err = joint_pinned_host_error(posts, total_bytes, available_bytes)
+        if err is not None:
+            raise ValueError(err)
 
     def _post_hicache_staging_host_ledger(self):
         """#810: put the staging tier on the boot preflight's host ledger.

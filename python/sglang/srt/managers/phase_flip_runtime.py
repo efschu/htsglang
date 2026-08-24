@@ -10480,6 +10480,35 @@ class PhaseFlipRuntime:
         # be allowed to differ between two waves of the same seam.
         seam_restore_first = self._seam_restore_first and not self._pools_alias()
 
+        # #856/W28: A PLAN THAT MOVES NOTHING NEEDS NO WAVES.
+        #
+        # The seam retracts every resident and drops the tree before this
+        # point, so under the no-KV design the plan is EMPTY by construction
+        # and every wave below packs nothing, exchanges nothing and writes
+        # nothing. W27-retry measured the residue: 16 empty waves for ~314 ms,
+        # pure backing churn.
+        #
+        # WHAT THE WAVES STILL DID, and why this is not simply deleting the
+        # loop: each one released a slice of the source pool's backing and
+        # restored the matching slice of the destination's, and
+        # ``finalize_wave`` is what marks the destination RESIDENT again.
+        # Skipping the loop without doing that leaves the destination pool
+        # answering NO to ``backing_is_resident`` -- the invariant named when
+        # this successor was deferred.
+        #
+        # So the replacement is the whole-pool swap that already exists on the
+        # same object: release the source, reclaim, restore the destination.
+        # It is not merely equivalent here, it is STRICTLY CHEAPER. Waving
+        # exists to bound the transient of holding a source layer live while
+        # its destination layer is written; with no bytes crossing there is
+        # nothing to bracket, and ``__call__`` releases the source BEFORE
+        # restoring the destination, so its peak is max(src, dst) where the
+        # wave loop's is a wave's worth above the resting layout.
+        if swap is not None and tr.moves_nothing:
+            swap(direction)
+            seam_census.mark("wave_loop_skipped")
+            waves = ()
+
         for wave in waves:
             wave_set = None if wave is None else set(int(f) for f in wave)
 
