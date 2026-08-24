@@ -13,10 +13,26 @@ BUILT AND HERMETICALLY PINNED:
   STRICTLY before reset, refusing if either step is absent. The FATAL order is
   reproduced hermetically against a faithful model of `dec_lock_ref`'s walk,
   so if it ever stops raising the model has drifted from the crash.
-* **The retirement**: residents retracted and the tree dropped after the
+* **The KV retirement**: residents retracted and the tree dropped after the
   fence, then the transfer plan rebuilt EMPTY, so the wave loop iterates over
   nothing. Done by emptying the mover's INPUT rather than deleting a loop
   whose extent bookkeeping still has to run.
+  **INCOMPLETE -- FALSIFIED ON METAL BY W27.** The GDN mover was NOT retired
+  with it, and this note's own inventory lists `GdnFlipMover.move()` as a
+  RETIRE entry. W27 (pin 3111539b3c, boot_w27_0824_1510.log) died on all three
+  ranks one second after the retraction:
+
+      resident_mamba_slots (gdn_flip_mover.py:620)
+      KvReshardError: PHASE-FLIP-GDN live request ... has no mamba slot
+        -- refusing to flip past unmoved linear state
+
+  The retraction frees the mamba slot; the GDN mover still enumerates the
+  request as live and refuses, correctly. See `/spinning/gpu-arb/W27-RESULT.md`.
+  A SECOND finding rides on it: `retract_all` releases rows, mamba slots and
+  the tree lock ref, but the scheduler's batch structures still reference the
+  `Req`, so EVERY seam-side consumer of "live requests" sees a live request
+  with freed resources. The GDN mover is the first to hit it, not necessarily
+  the only one.
 * **`_seam_reserve_bytes`**, with `wave_peak` retired from the ask.
   `_staging_bytes` keeps its meaning and all its measured pins — two
   different questions, two names.
@@ -50,6 +66,25 @@ NOT BUILT:
 KNOWN VACUOUS: `TestMoverLiveSetIsBounded` now passes trivially (peak 0 is
 below any bound) and can no longer fail. It is subsumed by
 `test_the_seam_moves_no_kv_at_all` and must not be cited as evidence.
+
+## W27 (2026-08-24) — what the metal settled, and what it did not
+
+ONE criterion passed, one failed, five have NO DATA. Recorded that way on
+purpose: a window that aborts early proves almost nothing, and reading its
+zero counters as passes is the error it invites.
+
+* **C6 PASS -- the #825 crash shape did not occur.** Zero `NoneType' object
+  has no attribute 'id'`, zero `dec_lock_ref`, with the prefix tree dropped
+  while a request was live. That is the crash the no-carry rule exists to
+  remove, and the retract-before-reset order removed it. The order law is
+  vindicated on metal, not only in the hermetic reproduction.
+* **C5 FAIL** -- the GDN mover, above.
+* C1/C2/C3/C4/C7 **NO DATA**. No `PHASE-FLIP DONE` line was reached, so the
+  zero abandons and zero staging refusals are absence of evidence, NOT the
+  funding claim.
+
+`choom -n 1000` was verified on the launcher and all three rank PIDs before
+the weights load; no OOM occurred, so W26's failure mode did not recur.
 
 
 USER DECISION (2026-08-24, binding, verbatim): *"das kv soll niemals vom layer
