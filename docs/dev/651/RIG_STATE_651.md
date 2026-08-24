@@ -127,7 +127,54 @@ This matters to the mission because NEXTN passes the target `.gguf` as
 `--speculative-draft-model-path`, so this is exactly the branch that arms the
 drafter's quantization on a real boot.
 
-## 6. Open residuals for the rig
+## 6. Things that would each have cost a GPU window
+
+**PP and speculation cannot share a phase.** `server_args.py:19303`, reached
+from `entrypoints/engine.py:889`:
+
+    assert self.speculative_algorithm is None or self.enable_phase_flip
+
+No draft worker exists in a PP phase and the draft constructors take no
+pp_rank, so this is enforced by construction. `boot.sh` STAGE=d asked for PP=3
++ NEXTN and would have died on it. Note that construction alone does NOT
+refuse -- `ServerArgs(pp_size=3, speculative_algorithm="NEXTN")` builds fine and
+only `check_server_args()` rejects it, so a constructor-only test misses this
+entirely. Measured: PP=3+NEXTN REFUSED, PP=3 no-spec ACCEPTED, TP=2+NEXTN
+ACCEPTED, TP=1+NEXTN ACCEPTED.
+
+**`test/registered/quant/test_gguf.py` is not a desk test.** It launches a real
+`sglang::scheduler`, which took 26,464 MiB on the 5090 when run as part of what
+looked like a unit sweep. Outside a GPU window that is an unarbitrated claim.
+The genuine desk-safe kernel tests are the three under
+`test/registered/unit/quantization/`: `test_gguf_moe_stride_width_512.py`,
+`test_gguf_moe_expert_ids_sanitize.py`, `test_gguf_capability_floor.py` --
+24 passed in 9.4 s with the cards left at ~0 MiB. They cover the
+`b97e60b25e` / `1d689439f6` defect families.
+
+**The multimodal wrapper resolves itself, provided nothing else is staged.**
+This checkpoint's `config.json` declares `Qwen3_5MoeForConditionalGeneration`,
+and GGUF here is text-only (llama.cpp keeps the vision tower in a separate
+mmproj). `model_config.py:404-434` detects exactly this, looks for an
+`mmproj*.gguf` beside the backbone, finds none, and forces multimodal OFF. That
+is not cosmetic: an uninitialized vision tower yields NaN image features on the
+server's own VLM warmup, the NaN residue survives in recycled mamba slots, and
+every later prompt crossing the mamba chunk grid is corrupted until
+`/flush_cache` (#52). Consequence for staging: do NOT drop `mmproj-*.gguf` into
+that directory unless vision is actually wanted, because its mere presence
+re-enables multimodal.
+
+**`hasattr(torch.ops.sgl_kernel, name)` is only meaningful after
+`import sgl_kernel`.** Before the import it answers for an unpopulated
+namespace. All eight GGUF ops are present in this venv's build
+(`ggml_moe_a8_vec`, `ggml_moe_a8`, `moe_align_block_size`,
+`ggml_moe_get_block_size`, `ggml_dequantize`, `ggml_mul_mat_vec_a8`,
+`ggml_mul_mat_a8`, `ggml_mxfp4_native`). Two of them cannot be probed by hand:
+`ggml_moe_get_block_size` takes no tensor argument and so has no dispatch key
+(call the module-level wrapper, not `torch.ops`), and `moe_align_block_size`
+takes a bool `pad_sorted_token_ids` in position 7. Use the unit tests above
+rather than hand-rolled calls.
+
+## 7. Open residuals for the rig
 
 1. **PP=3 GGUF has never been executed.** `boot.sh` STAGE=d was written and its
    own commit says "Nothing in this commit has been run on a GPU". No later
@@ -145,7 +192,7 @@ drafter's quantization on a real boot.
 5. The checkpoint's location on this box is unresolved; `boot.sh`'s
    `MODEL_DIR` does not exist here.
 
-## 7. What replaces `boot.sh`
+## 8. What replaces `boot.sh`
 
 `docs/dev/651/rig_boot.sh` in this tree. Same STAGE a/b/c/d ladder and the same
 NVML-UUID device resolution, with the corrections this file records:
