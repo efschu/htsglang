@@ -1,5 +1,57 @@
 # NOTE 856 — the flip carries no KV: design, blockers, retirement inventory
 
+## BUILD STATE (2026-08-24) — what is built, and what is not
+
+BUILT AND HERMETICALLY PINNED:
+
+* **Pending priced by residency** (`scheduler.uncached_prompt_tokens`,
+  `Req.reset_for_retract` stamps the fill boundary before clearing it). The
+  prerequisite: without it a cutover hands the policy the retracted prompts at
+  cold-prefill price, which is #731's "six cutovers, nothing served" by a
+  route #731's own dedup cannot catch.
+* **The seam order as a law** (`release_residents_for_cutover`): retract
+  STRICTLY before reset, refusing if either step is absent. The FATAL order is
+  reproduced hermetically against a faithful model of `dec_lock_ref`'s walk,
+  so if it ever stops raising the model has drifted from the crash.
+* **The retirement**: residents retracted and the tree dropped after the
+  fence, then the transfer plan rebuilt EMPTY, so the wave loop iterates over
+  nothing. Done by emptying the mover's INPUT rather than deleting a loop
+  whose extent bookkeeping still has to run.
+* **`_seam_reserve_bytes`**, with `wave_peak` retired from the ask.
+  `_staging_bytes` keeps its meaning and all its measured pins — two
+  different questions, two names.
+* **Launch refusal**: `--enable-phase-flip` without
+  `--enable-hierarchical-cache` is refused at parse time (#806 pattern), with
+  no mover fallback offered and a test asserting the message says so.
+* **Old-contract tests rewritten**: `TestTheFlipCarriesNoKv` asserts the
+  seam's transient storage is EXACTLY 0 in both directions and that every rank
+  drops its tree once; the wedging request that used to be unaffordable now
+  is; waving no longer changes the price.
+
+BUILT BUT ONLY HALF-WIRED, said plainly:
+
+* **The warm-up ledger** (`managers/warmup_latency.py`). `note_cutover` is
+  wired at the cutover. The REQUEST feed is not: request latency is assembled
+  in `tokenizer_manager`, a different process, so it is a cross-process
+  integration rather than a line. For W27 the warm-up cost must therefore be
+  read from the CLIENT side, and if it is not collected it is UNMEASURED —
+  never "no warm-up cost observed".
+
+NOT BUILT:
+
+* Deletion of the now-dead wave-mover code. It is inert (empty input) but
+  still present; deleting it is a separate cleanup with its own diff.
+* `hicache_demotion` is still off by default; turning it on for flip
+  deployments is the evict-before-persist coverage and is not yet wired.
+* `phase_flip_rebind_hicache` is still `False`. The tree drop makes lookups
+  miss, which is what correctness needs; arming the rebind is the separate
+  #847 refusal-conversion step.
+
+KNOWN VACUOUS: `TestMoverLiveSetIsBounded` now passes trivially (peak 0 is
+below any bound) and can no longer fail. It is subsumed by
+`test_the_seam_moves_no_kv_at_all` and must not be cited as evidence.
+
+
 USER DECISION (2026-08-24, binding, verbatim): *"das kv soll niemals vom layer
 flip her stammen, einfach aus dem hicache laden fertig."* — with the context
 that HiCache/Radix was always the intended cross-layout KV home and the flip
