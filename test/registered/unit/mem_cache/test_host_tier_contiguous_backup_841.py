@@ -227,6 +227,36 @@ class TestPrefetchHostInsertUpholdsTheLaw(CustomTestCase):
         self.assertIn(result.inserted_host_node, cache.evictable_host_leaves)
         cache.sanity_check()
 
+    def test_write_back_policy_still_adopts_the_tail(self):
+        """The gate is armed exactly where the invariant is.
+
+        Condition taken from upstream PR 31902's second commit (f198ebf97f).
+        Under `write_back` the checker suppresses the parent invariant
+        (`sanity_check` :3899-3903) AND the orphan hazard is absent --
+        `_evict_device_leaf` writes an un-backed leaf back instead of deleting
+        it, so no edge is ever popped above a backed child. Declining there
+        would cost retention and buy nothing.
+        """
+        cache = build_cache()
+        insert_device_prefix(cache, range(1, MATCHED_PREFIX_LEN + 1))
+
+        class _WriteBackController:
+            write_policy = "write_back"
+
+        cache.cache_controller = _WriteBackController()
+        try:
+            result = prefetch_host_insert(cache, range(1, MATCHED_PREFIX_LEN + 11))
+            self.assertIsNotNone(result.inserted_host_node)
+            self.assertFalse(result.host_span_unclaimed)
+            self.assertEqual(cache._host_insert_refused_unbacked_parent, 0)
+            # The child is backed and its parent is not -- legal under this
+            # policy, and the checker agrees.
+            self.assertTrue(result.inserted_host_node.backuped)
+            self.assertFalse(result.inserted_host_node.parent.backuped)
+            cache.sanity_check()
+        finally:
+            cache.cache_controller = None
+
     def test_host_insert_extends_a_backed_chain(self):
         """And a second prefetch deepening an already-backed chain lands too,
         because every node on the path to it carries a host copy."""

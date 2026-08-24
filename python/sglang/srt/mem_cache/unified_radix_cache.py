@@ -1677,8 +1677,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # rides on that same uniformization; it does not add a new class of
         # divergence. If a boot ever shows the ranks declining different nodes,
         # that is #645's admission drifting, not this gate.
+        #
+        # UPSTREAM CORROBORATION, found after this fix was written and worth
+        # recording as such: sgl-project PR 31902 (Yiqi Yang, 30043ca7eb
+        # 2026-07-21 and f198ebf97f 2026-07-22, "drop prefetched host refill
+        # under an un-backed-up parent") diagnoses the same defect and installs
+        # the same gate at the same line, with a 150-test regression file. It is
+        # NOT merged: it is absent from `upstream/main` at 95f5ecd3d2
+        # (2026-08-24), so the defect is live upstream today and no OSS sync
+        # could have carried the repair into this tree.
+        #
+        # The write-policy condition below is taken from that PR's second
+        # commit rather than invented here. It is right: `sanity_check` arms
+        # this invariant only when the policy is not `write_back`
+        # (:3899-3903), and under `write_back` the orphan hazard is absent too
+        # -- `_evict_device_leaf` writes an un-backed leaf back and returns
+        # rather than deleting it, so no edge is ever popped above a backed
+        # child. Declining under `write_back` would refuse a harmless insert
+        # and cost retention for nothing.
+        write_back_policy = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
         parent_backed = node is self.root_node or node.backuped
-        if not parent_backed:
+        if not parent_backed and not write_back_policy:
             self._host_insert_refused_unbacked_parent += 1
             logger.debug(
                 "#841 host-only insert declined: parent node %s carries no host "
