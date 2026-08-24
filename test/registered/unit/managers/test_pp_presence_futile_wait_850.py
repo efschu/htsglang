@@ -108,6 +108,7 @@ def _gate(reason, clock, futile_s=2.0, deadline=60.0):
     r.presence_futile_detected = 0
     r.presence_futile_abandons = 0
     r._presence_futile_since = None
+    r._presence_futile_key = None
     r._presence_futile_alarmed = None
     r._presence_futile_s = futile_s
     r.abandoned = []
@@ -206,6 +207,42 @@ class TestFutileWaitIsCutShort(unittest.TestCase):
 
         self.assertIsNone(at, f"a mixed withhold was abandoned early at {at}s")
         self.assertEqual(gate.presence_futile_rounds, 0)
+
+
+class TestTheClockIsPerEpisode(unittest.TestCase):
+    """A later arm must not inherit an earlier arm's futility age.
+
+    THE BUG THIS CAUGHT, found by re-reading #800's own rule rather than by a
+    failure: a futile withhold that ends in an abandon leaves the clock set.
+    The NEXT arm then measures its bound from the PREVIOUS episode and expires
+    in its first round -- before the service turn has had a single chance to
+    clear anything. #800 states the rule for its own escape clock: reset when
+    the key empties, "rather than inheriting a stranger's age".
+    """
+
+    def test_a_second_arm_gets_its_own_full_bound(self):
+        clock = _Clock()
+        gate = _gate(FUTILE, clock, futile_s=2.0, deadline=60.0)
+
+        first = _run(gate, clock, until=30.0)
+        self.assertIsNotNone(first)
+
+        # A new arm: new epoch, and the wait restarts. The stale clock would
+        # make this abandon immediately instead of after its own bound.
+        gate.abandoned.clear()
+        gate._epoch = 2
+        gate._entry_round = 0
+        gate._presence_wait_started = None
+        started = clock.t
+        second = _run(gate, clock, until=started + 30.0)
+
+        self.assertIsNotNone(second, "the second arm never abandoned")
+        self.assertGreaterEqual(
+            second - started,
+            2.0,
+            "the second arm inherited the first arm's futility clock and "
+            "expired before its own bound",
+        )
 
 
 class TestTheShippedConstructorSetsTheState(unittest.TestCase):
