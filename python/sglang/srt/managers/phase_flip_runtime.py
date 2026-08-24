@@ -1084,6 +1084,57 @@ def releasable_cache_bytes_from_stats(stats, alloc_conf: str = "") -> Optional[i
         return None
 
 
+class SeamOrderError(RuntimeError):
+    """A seam step ran before the step it depends on (#856)."""
+
+
+def release_residents_for_cutover(reqs, *, retract, reset_tree):
+    """RETRACT STRICTLY BEFORE RESET. The order is the law (#856).
+
+    Once the flip carries no KV, the new phase's device pool holds no valid
+    rows while the radix tree still maps prefixes to row ids, so the tree must
+    be dropped for a lookup to MISS and fall through to the host tier. That
+    action has been tried and it took the instance down on all three ranks
+    (2026-08-23, recorded at this module's #825 reconcile site):
+
+        cache_finished_req -> dec_lock_ref
+        -> full_component.py:239  `if cur.id in skip_lock_node_ids`
+        AttributeError: 'NoneType' object has no attribute 'id'
+
+    with the cause stated there: "PARKED IS NOT UNREFERENCED. The cutover
+    carries RESIDENT requests across, and each holds a `last_node` with a lock
+    ref. `reset()` rebuilds the root, orphaning those nodes, so the parent walk
+    in `dec_lock_ref` no longer terminates at the live root and runs off the
+    top into None."
+
+    THE NO-CARRY RULE REMOVES THE PRECONDITION rather than working around it.
+    Retraction releases every resident request's rows AND its tree lock ref
+    (`release_req` -> `release_kv_cache` -> `cache_finished_req` ->
+    `dec_lock_ref`, whose loop is `while node != self.root_node: node =
+    node.parent`). Run it FIRST and every walk terminates at a root that is
+    still live; run it after `reset()` and it walks off exactly as #825 did.
+
+    So this function exists to make that ordering a named, testable property
+    instead of a comment two callers have to remember. It is deliberately
+    thin: the value is the order and the refusal, not the work.
+
+    Refuses rather than repairs when either step is missing. A seam that
+    silently skipped the retraction would leave locked nodes for the reset to
+    orphan -- the crash -- and one that silently skipped the reset would leave
+    the tree pointing at rows that no longer hold KV, which is a WRONG-ANSWER
+    failure rather than a loud one and therefore worse.
+    """
+    if not callable(retract) or not callable(reset_tree):
+        raise SeamOrderError(
+            "the cutover needs BOTH a retraction and a tree reset: retracting "
+            "without resetting leaves the tree naming rows that hold no KV, "
+            "and resetting without retracting orphans locked nodes (#825)"
+        )
+    retracted = retract(reqs)
+    reset_tree()
+    return retracted
+
+
 def _writeback_fence_ms(report) -> Optional[float]:
     """The HiCache fence's own elapsed time, in ms, or None (#856).
 
