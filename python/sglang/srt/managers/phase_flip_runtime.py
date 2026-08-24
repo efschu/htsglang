@@ -64,6 +64,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.managers import tree_congruence
+from sglang.srt.managers.warmup_latency import WarmupLatencyLedger
 from sglang.srt.managers.pp_presence_disposition import (
     ALARM_PRESENCE_FUTILE,
     census_withhold_reason,
@@ -3585,6 +3586,13 @@ class PhaseFlipRuntime:
         #: #631 J: read-only handle for the pool census. Set by the
         #: builder; absent in unit stubs, where the census is a no-op.
         self._census_scheduler = None
+        # #856: served-request latency by rounds-since-cutover. The cutover
+        # side is wired here; the request side is an explicit open integration
+        # -- request latency is assembled in `tokenizer_manager`, a DIFFERENT
+        # PROCESS, so feeding it is a cross-process change and not a line.
+        # Recorded as open rather than guessed at: a wrongly-wired instrument
+        # reports a number, which is worse than reporting none.
+        self.warmup_ledger = WarmupLatencyLedger()
         # #825 tree-congruence state. Counters are attributes rather than a
         # latch: #823's whole lesson is that a divergence reported once can
         # say THAT the trees parted and never for how long, whether it got
@@ -10572,6 +10580,15 @@ class PhaseFlipRuntime:
         # enforcement inherits the exact silence it exists to end.
         self._enforce_exposure_at_seam(f"{direction} cutover")
         seam_census.mark("cutover")
+        # #856: the warm-up ledger's clock. Everything served from here until
+        # the next cutover is warming the cache back up, which is the price
+        # this design pays for carrying no KV. Counting the cutovers is the
+        # half that lives in this process; feeding it completed-request
+        # latencies is the half that does not (see `warmup_latency`).
+        try:
+            self.warmup_ledger.note_cutover()
+        except Exception:  # noqa: BLE001 - an instrument, never a gate
+            pass
         self._pool_census("post-cutover", direction)
         cutover_ms = (self._clock() - t_cutover0) * 1000.0
         self._phase = _PHASE_AFTER[direction]
