@@ -146,10 +146,14 @@ class RefillTiming(unittest.TestCase):
     """(3 of 3) per-rank refill timing, and it must name the image mode."""
 
     def _stack(self, monkey_refill):
+        # #809/W28: the shipped copy is now the ROTATION, imported inside
+        # `_timed_arena_refill` at call time, so this is the seam to stub.
+        import sglang.srt.model_executor.rotation_executor as rx
         from sglang.srt.managers import phase_flip_boot
 
-        phase_flip_boot.arena_refill = monkey_refill  # shipped call site, stubbed copy
-        holder = types.SimpleNamespace(arena=None)
+        rx.rotate_arena = monkey_refill  # shipped call site, stubbed copy
+        holder = types.SimpleNamespace(arena=None, rotation_image=None)
+        holder.image_holds = "pp"
         holder._images_are_file_backed = types.MethodType(
             phase_flip_boot.PhaseFlipStacks._images_are_file_backed, holder
         )
@@ -163,7 +167,7 @@ class RefillTiming(unittest.TestCase):
         holder = self._stack(lambda *a, **k: calls.append(1))
         layout = types.SimpleNamespace(total_bytes=1048576 * 64)
         with self.assertLogs(level=logging.INFO) as cm:
-            holder._timed_arena_refill("tp_to_pp", layout, None, restore=None)
+            holder._timed_arena_refill("tp_to_pp", layout, layout, "pp")
         self.assertEqual(len(calls), 1, "the real refill must still be called once")
         line = "\n".join(cm.output)
         self.assertIn("REFILL tp_to_pp", line)
@@ -180,13 +184,17 @@ class RefillTiming(unittest.TestCase):
         prev = os.environ.get("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED")
         try:
             os.environ["SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED"] = "1"
+            # The rotation alternates the marker, so each leg is re-armed.
+            holder.image_holds = "tp"
             with self.assertLogs(level=logging.INFO) as cm:
-                holder._timed_arena_refill("pp_to_tp", layout, None, restore=None)
+                holder._timed_arena_refill("pp_to_tp", layout, layout, "tp")
             self.assertIn("file-backed", "\n".join(cm.output))
 
             os.environ.pop("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED")
+            # The rotation alternates the marker, so each leg is re-armed.
+            holder.image_holds = "tp"
             with self.assertLogs(level=logging.INFO) as cm:
-                holder._timed_arena_refill("pp_to_tp", layout, None, restore=None)
+                holder._timed_arena_refill("pp_to_tp", layout, layout, "tp")
             self.assertIn("pinned", "\n".join(cm.output))
         finally:
             if prev is None:

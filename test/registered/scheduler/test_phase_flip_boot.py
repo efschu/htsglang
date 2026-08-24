@@ -172,9 +172,7 @@ class TestPin2StructuralGraphAsymmetry(CustomTestCase):
         self.assertFalse(_StubRunner(False).is_phase_flip_pp_stack)
         self.assertFalse(_StubRunner(True, is_draft=True).is_phase_flip_pp_stack)
         self.assertFalse(
-            _StubRunner(
-                True, is_draft=True, is_tp_stack=True
-            ).is_phase_flip_pp_stack
+            _StubRunner(True, is_draft=True, is_tp_stack=True).is_phase_flip_pp_stack
         )
 
     def test_decode_capture_poisoned_for_pp_stack(self):
@@ -395,8 +393,9 @@ class TestSnapshotFreeBindRefill(CustomTestCase):
         for n in originals:
             self.assertEqual(named[n].data.stride(), originals[n].stride(), n)
             self.assertTrue(
-                torch.equal(named[n].data.to(torch.float32),
-                            originals[n].to(torch.float32)),
+                torch.equal(
+                    named[n].data.to(torch.float32), originals[n].to(torch.float32)
+                ),
                 n,
             )
             # Parameter object identity survived (GDN capture contract)
@@ -437,19 +436,31 @@ class TestPhaseFlipStacksRefill(CustomTestCase):
         named_b = checkpoint_param_dict(_make_module(29))
         layout_a = plan_arena_layout(named_a)
         layout_b = plan_arena_layout(named_b)
-        arena = allocate_arena(
-            max(layout_a.total_bytes, layout_b.total_bytes), "cpu"
+        arena = allocate_arena(max(layout_a.total_bytes, layout_b.total_bytes), "cpu")
+        # #809/W28: ONE host image, max-sized, holding the RESTING layout --
+        # here TP, because the arena below is primed with PP. The flip rotates
+        # them, so a round trip must return both sides to exactly this state.
+        from sglang.srt.model_executor.rotation_executor import (
+            allocate_rotation_image,
         )
+
+        rotation_image = allocate_rotation_image(
+            layout_a.total_bytes, layout_b.total_bytes, pin=False
+        )
+        image_from_tensors(named_b, layout_b, pin=False, out=rotation_image)
         image_a = image_from_tensors(named_a, layout_a, pin=False)
-        image_b = image_from_tensors(named_b, layout_b, pin=False)
+        # The arena starts on PP. Priming it matters: the first refill copies
+        # the arena's PP bytes BACK into the buffer, and the second streams
+        # them in again, so an unprimed arena would round-trip garbage.
+        arena[: layout_a.total_bytes].copy_(image_a[: layout_a.total_bytes])
         return (
             PhaseFlipStacks(
                 tp_worker=None,
                 arena=arena,
                 layout_pp=layout_a,
                 layout_tp=layout_b,
-                image_pp=image_a,
-                image_tp=image_b,
+                rotation_image=rotation_image,
+                image_holds="tp",
                 vector=(30, 17, 17),
                 token_vector=(30, 17, 17),
             ),
@@ -497,20 +508,19 @@ class TestTpScopeEnvMask(CustomTestCase):
 
         seen = {}
 
-        with mock.patch(
-            "sglang.srt.distributed.parallel_state.get_phase_flip_group",
-            return_value=object(),
-        ), mock.patch(
-            "sglang.srt.distributed.parallel_state.set_phase_flip_tp_active"
+        with (
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_phase_flip_group",
+                return_value=object(),
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.set_phase_flip_tp_active"
+            ),
         ):
-            with mock.patch.dict(
-                os.environ, {"SGLANG_PP_LAYER_PARTITION": "32,16,16"}
-            ):
+            with mock.patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "32,16,16"}):
                 try:
                     with pfb.phase_flip_tp_scope(0, 3):
-                        seen["inside"] = os.environ.get(
-                            "SGLANG_PP_LAYER_PARTITION"
-                        )
+                        seen["inside"] = os.environ.get("SGLANG_PP_LAYER_PARTITION")
                 except Exception:
                     # The parallel-context override may refuse stub groups;
                     # the mask/restore contract is what this pin checks and
@@ -544,9 +554,7 @@ class TestFlipTokenVector(CustomTestCase):
         """Backward compatibility: unset must change nothing at all."""
         os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
         args = _flip_args()
-        self.assertEqual(
-            parse_flip_token_vector(args), parse_flip_vector(args)
-        )
+        self.assertEqual(parse_flip_token_vector(args), parse_flip_vector(args))
 
     def test_env_overrides_only_the_token_split(self):
         os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,39,18"

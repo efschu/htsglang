@@ -58,15 +58,19 @@ class _Carrier:
         return max(0, min(int(active_bytes), self._nbytes) - self.committed)
 
 
-def _stacks(pp_mib, tp_mib, committed_mib, recorder):
-    """A PhaseFlipStacks whose refill is real and whose copy is instrumented."""
+def _stacks(pp_mib, tp_mib, committed_mib, recorder, holds="tp"):
+    """A PhaseFlipStacks whose refill is real and whose copy is instrumented.
+
+    #809/W28: ONE host image. ``holds`` must name the layout the FIRST refill
+    of a test streams in, because the rotation alternates it from there.
+    """
     hi = max(pp_mib, tp_mib)
     carrier = _Carrier(hi * MIB, committed_mib * MIB)
     st = PhaseFlipStacks.__new__(PhaseFlipStacks)
     st.layout_pp = _Layout(pp_mib)
     st.layout_tp = _Layout(tp_mib)
-    st.image_pp = object()
-    st.image_tp = object()
+    st.rotation_image = object()
+    st.image_holds = holds
     st.arena = types.SimpleNamespace(numel=lambda: hi * MIB)
     st.arena_carrier = carrier
     return st, carrier
@@ -84,7 +88,20 @@ def _patched_refill(st, carrier, rec, monkey):
     """Run PhaseFlipStacks.refill with arena_refill replaced by a recorder
     that FAULTS exactly as the driver does: writing past the committed span."""
 
-    def fake_arena_refill(arena, layout, image, restore=None, timing=None):
+    def fake_rotate_arena(
+        *,
+        arena,
+        host_image,
+        incoming_bytes,
+        outgoing_bytes,
+        chunk_bytes,
+        depth,
+        ring,
+        ops=None,
+        timing=None,
+        priming=False,
+        verify_incoming=True,
+    ):
         # #856 CONTRACT CHANGE, TAKEN DELIBERATELY RATHER THAN WIDENED AWAY.
         # `arena_refill` gained an optional `timing` record so the refill leg
         # -- 91% of a tp_to_pp flip -- can say whether it was storage-bound or
@@ -94,9 +111,11 @@ def _patched_refill(st, carrier, rec, monkey):
         # accepted is the instrument coming unwired, so the record is captured
         # and asserted by `test_the_refill_leg_is_instrumented` below.
         rec.timings.append(timing)
-        need = int(layout.total_bytes)
-        if restore is not None:
-            need = max(need, int(restore[0].total_bytes))
+        # #809/W28: the leg streams `incoming` IN and reads `outgoing` OUT of
+        # the same arena, so BOTH layouts must be backed. The high-water is the
+        # max of the two exactly as it was under the old `restore=` arm -- now
+        # structurally rather than as a recovery path.
+        need = max(int(incoming_bytes), int(outgoing_bytes))
         rec.copies.append((need, carrier.committed))
         if need > carrier.committed:
             raise RuntimeError(
@@ -104,26 +123,29 @@ def _patched_refill(st, carrier, rec, monkey):
                 f"arena committed to {carrier.committed}"
             )
 
-    monkey(fake_arena_refill)
+    monkey(fake_rotate_arena)
 
 
 class TestArenaHighWater(unittest.TestCase):
     def setUp(self):
-        import sglang.srt.managers.phase_flip_boot as boot
+        # #809/W28: the copy the leg makes is now the ROTATION, and
+        # `_timed_arena_refill` imports it from this module at call time, so
+        # this is the seam to instrument.
+        import sglang.srt.model_executor.rotation_executor as rx
 
-        self.boot = boot
-        self._orig = boot.arena_refill
+        self.rx = rx
+        self._orig = rx.rotate_arena
         self.rec = _Recorder()
 
     def tearDown(self):
-        self.boot.arena_refill = self._orig
+        self.rx.rotate_arena = self._orig
 
     def _install(self, st, carrier):
         _patched_refill(
             st,
             carrier,
             self.rec,
-            lambda fn: setattr(self.boot, "arena_refill", fn),
+            lambda fn: setattr(self.rx, "rotate_arena", fn),
         )
 
     # -- the rank where TP is the larger layout (the regression) ----------
@@ -139,7 +161,7 @@ class TestArenaHighWater(unittest.TestCase):
 
     def test_the_metal_sequence_that_faulted(self):
         # tp->pp then pp->tp, which is exactly the order the instance died in.
-        st, carrier = _stacks(6690, 7924, 7924, self.rec)
+        st, carrier = _stacks(6690, 7924, 7924, self.rec, holds="pp")
         self._install(st, carrier)
         st.refill(TP_TO_PP)
         st.refill(PP_TO_TP)
@@ -149,7 +171,7 @@ class TestArenaHighWater(unittest.TestCase):
     def test_the_tail_is_still_released_after_the_copy(self):
         # The fix must not buy safety by keeping the arena fully committed --
         # that would give away rung 3's entire purpose.
-        st, carrier = _stacks(6690, 7924, 7924, self.rec)
+        st, carrier = _stacks(6690, 7924, 7924, self.rec, holds="pp")
         self._install(st, carrier)
         st.refill(TP_TO_PP)
         self.assertEqual(carrier.committed, 6690 * MIB)
@@ -163,7 +185,7 @@ class TestArenaHighWater(unittest.TestCase):
         self.assertEqual(carrier.committed, 7924 * MIB)
 
     def test_pp_larger_recommits_on_tp_to_pp(self):
-        st, carrier = _stacks(9115, 7924, 7924, self.rec)
+        st, carrier = _stacks(9115, 7924, 7924, self.rec, holds="pp")
         self._install(st, carrier)
         st.refill(TP_TO_PP)
         need, committed_at_copy = self.rec.copies[0]

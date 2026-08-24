@@ -1070,7 +1070,10 @@ def _alloc_host_image_inner(total: int, zero: bool, envs) -> torch.Tensor:
 
 
 def image_from_tensors(
-    named: Dict[str, torch.Tensor], layout: ArenaLayout, pin: bool = False
+    named: Dict[str, torch.Tensor],
+    layout: ArenaLayout,
+    pin: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Host image of a layout built DIRECTLY from live tensors.
 
@@ -1084,9 +1087,24 @@ def image_from_tensors(
     (14.7 + 12.4 + 14.7 GB > 31.8). Alignment-gap bytes are zeroed, so
     the checksum is deterministic."""
     total = layout.total_bytes + _CHECKSUM_BYTES
-    # #695: exact-size, page-locked. See _alloc_host_image for why this must
-    # not be torch's pin_memory (power-of-two rounding, held for process life).
-    host = _alloc_host_image(total, pin)
+    if out is not None:
+        # #809/W28: write into the caller's ROTATION BUFFER instead of
+        # allocating a second lifetime image. The buffer is sized for the
+        # LARGER layout, so a layout that is not the larger one occupies a
+        # prefix of it and the rest is the headroom the rotation needs. Taking
+        # a prefix view keeps the trailer where the format puts it -- directly
+        # after this layout's payload, not at the end of the buffer.
+        if int(out.numel()) < total:
+            raise ValueError(
+                f"image_from_tensors: out holds {int(out.numel())} B, short of "
+                f"the {total} B this layout needs (payload + trailer)"
+            )
+        host = out[:total]
+    else:
+        # #695: exact-size, page-locked. See _alloc_host_image for why this
+        # must not be torch's pin_memory (power-of-two rounding, held for
+        # process life).
+        host = _alloc_host_image(total, pin)
     for slot in layout.slots:
         t = named[slot.name]
         seg = host[slot.offset : slot.offset + slot.nbytes]
@@ -1097,7 +1115,10 @@ def image_from_tensors(
     host[layout.total_bytes :] = torch.tensor([csum], dtype=torch.int64).view(
         torch.uint8
     )
-    return host
+    # The caller of the `out` form owns the WHOLE buffer, not this layout's
+    # prefix of it: the next rotation places the other layout back into it and
+    # that one may be the larger.
+    return out if out is not None else host
 
 
 def bind_arena_views(

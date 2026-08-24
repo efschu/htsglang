@@ -58,18 +58,22 @@ def _layout(nbytes: int = PAYLOAD):
     return wa.ArenaLayout(slots=(), aliases=(), total_bytes=nbytes)
 
 
-def _stacks():
-    """A PhaseFlipStacks bound to a real arena, real layouts, real images.
+def _stacks(holds="tp", resting=0xCD, resident=0xAB, image=None):
+    """A PhaseFlipStacks bound to a real arena, real layouts, one real image.
 
     ``refill`` is the genuine production method; only the surrounding object
     is a shell, and it carries exactly the attributes that method reads.
+
+    #809/W28: ONE host image, not two. ``resident`` is the layout packed in
+    the arena right now; ``resting`` is the one waiting in RAM and about to be
+    streamed in. The flip swaps them.
     """
     stacks = PhaseFlipStacks.__new__(PhaseFlipStacks)
-    stacks.arena = torch.zeros(PAYLOAD, dtype=torch.uint8)
+    stacks.arena = torch.full((PAYLOAD,), resident, dtype=torch.uint8)
     stacks.layout_pp = _layout()
     stacks.layout_tp = _layout()
-    stacks.image_pp = _image(0xAB)
-    stacks.image_tp = _image(0xCD)
+    stacks.rotation_image = _image(resting) if image is None else image
+    stacks.image_holds = holds
     stacks.arena_carrier = None
     return stacks
 
@@ -158,28 +162,47 @@ class TestTheRealMoverOnlyRestores(unittest.TestCase):
         )
 
     def test_tp_to_pp_refill_builds_nothing(self):
-        stacks = _stacks()
+        stacks = _stacks(holds="pp", resting=0xAB, resident=0xCD)
         with _Fence():
             stacks.refill(TP_TO_PP)
         self.assertEqual(int(stacks.arena[0]), 0xAB)
 
-    def test_the_restore_arm_also_builds_nothing(self):
-        """The checksum-mismatch path rewrites the current layout -- the one
-        branch that touches the arena twice, and the one most likely to reach
-        for a rebuild. It must still only copy."""
+    def test_the_copy_back_places_the_outgoing_layout_and_builds_nothing(self):
+        """#809/W28: the leg now also copies the OUTGOING layout back into the
+        host buffer. That is a second arena-touching direction, so it is the
+        new most-likely place to reach for a rebuild -- and it must still only
+        copy."""
         stacks = _stacks()
+        with _Fence():
+            stacks.refill(PP_TO_TP)
+        self.assertEqual(int(stacks.arena[0]), 0xCD, "TP streamed in")
+        self.assertEqual(int(stacks.rotation_image[0]), 0xAB, "PP placed back by COPY")
+        self.assertEqual(stacks.image_holds, "pp")
+
+    def test_a_corrupt_image_is_REFUSED_because_there_is_nothing_to_restore(self):
+        """THE ARM THIS REPLACES, and the replacement is a refusal.
+
+        The old two-image refill answered a checksum mismatch by rewriting the
+        active layout from its OWN separate image, so the abort left both
+        layouts byte-exact. That arm needed a second lifetime image, which is
+        the dual pin W26 OOM-killed. With one buffer it cannot exist: the
+        rotation declares the arena undefined and refuses. What must NOT
+        happen either way is a rebuild, which is what this file is about.
+        """
+        from sglang.srt.model_executor.rotation_executor import RotationHazard
+
         corrupt = _image(0xCD)
         corrupt[0] = 0x01  # payload no longer matches its trailer
-        stacks.image_tp = corrupt
+        stacks = _stacks(image=corrupt)
 
         with _Fence():
-            with self.assertRaises(wa.WeightsArenaError):
+            with self.assertRaises(RotationHazard):
                 stacks.refill(PP_TO_TP)
 
         self.assertEqual(
-            int(stacks.arena[0]),
-            0xAB,
-            "the restore arm must have rewritten the PP layout by copy",
+            stacks.image_holds,
+            "tp",
+            "a failed rotation must not claim a residency nothing verified",
         )
 
 

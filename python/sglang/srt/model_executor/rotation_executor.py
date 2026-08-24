@@ -242,6 +242,28 @@ def rotation_ring(chunk_bytes: int, depth: int):
         return _rotation_ring
 
 
+def allocate_rotation_image(
+    pp_bytes: int, tp_bytes: int, pin: bool = True
+) -> torch.Tensor:
+    """ONE host buffer, sized for the LARGER layout plus its trailer.
+
+    THIS REPLACES THE TWO LIFETIME IMAGES, and replacing rather than joining
+    them is the point: W26 OOM-killed BOTH arms of the dual pin in the LAUNCH
+    phase, before any flip ever ran. RAM holds one layout image plus the
+    overshoot, and the resting layout rotates through this single buffer.
+
+    Sized from the MAXIMUM and never from the resting layout: the buffer has to
+    receive whichever layout the next flip copies back, and on a rank where the
+    outgoing layout is the larger (PP0: 16362.7 MiB tp against 15925.8 MiB pp)
+    a buffer sized for the resting one is 436.9 MiB short at the worst possible
+    moment -- inside the seam's no-return region.
+    """
+    from sglang.srt.model_executor.weights_arena import _alloc_host_image
+
+    span = max(int(pp_bytes), int(tp_bytes)) + _CHECKSUM_BYTES
+    return _alloc_host_image(span, pin)
+
+
 def rotation_host_bytes(pp_bytes: int, tp_bytes: int, chunk_bytes: int, depth: int):
     """(image buffer bytes, ring bytes) -- the host post this scheme costs.
 

@@ -47,11 +47,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.model_executor.rotation_executor import allocate_rotation_image
 from sglang.srt.model_executor.weights_arena import (
     ArenaLayout,
     allocate_arena,
     RefillLegTiming,
-    arena_refill,
     refill_bound_phrase,
     bind_arena_views,
     host_image_mode,
@@ -495,8 +495,51 @@ def _grade_arena_tail_derivation(primary_runner, world_rank, layout_pp, layout_t
     )
 
 
+def prime_arena_from_image(arena, layout, image):
+    """THE PRIMING FILL: the first H2D of a layout, with nothing to keep.
+
+    Deliberately the SAME call as a warm flip, with ``outgoing_bytes=0``. At
+    boot the arena holds nothing worth placing back, so the copy-back has zero
+    length and the rotation degenerates to the plain contiguous H2D it has
+    always been -- one path, not two, which is what keeps the warm path from
+    growing a boot-shaped special case.
+
+    INSTRUMENTED SEPARATELY (P4). The first flip after boot still primes from
+    disk, and a steady-state figure averaged over a mean that includes it is
+    the measurement error this ticket is most likely to make. The returned
+    stats carry ``priming=True`` so the two can never be summed by accident.
+    """
+    from sglang.srt.model_executor.rotation_executor import (
+        rotate_arena,
+        rotation_report,
+    )
+    from sglang.srt.model_executor.weights_arena import (
+        _refill_chunk_bytes,
+        _refill_depth,
+    )
+
+    stats = rotate_arena(
+        arena=arena,
+        host_image=image,
+        incoming_bytes=int(layout.total_bytes),
+        outgoing_bytes=0,
+        chunk_bytes=_refill_chunk_bytes(),
+        depth=_refill_depth(),
+        ring=None,
+        priming=True,
+    )
+    try:
+        logger.info("%s %s", LOG_PREFIX, rotation_report("boot", stats))
+    except Exception:  # noqa: BLE001 - an instrument may never break a boot
+        pass
+    return stats
+
+
 def snapshot_and_free(
-    named: Dict[str, torch.nn.Parameter], layout: ArenaLayout, pin: bool
+    named: Dict[str, torch.nn.Parameter],
+    layout: ArenaLayout,
+    pin: bool,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Host image of ``named`` under ``layout``, then free every device
     original by rebinding ``param.data`` to an empty placeholder.
@@ -504,7 +547,7 @@ def snapshot_and_free(
     Between this call and the later ``bind_arena_views`` + ``arena_refill``
     the parameters are DEAD -- any forward would fail loudly on the 0-sized
     placeholder, which is the wanted behavior (nothing may run mid-boot)."""
-    image = image_from_tensors(named, layout, pin=pin)
+    image = image_from_tensors(named, layout, pin=pin, out=out)
     freed = set()
     for name, param in named.items():
         key = param.data.untyped_storage().data_ptr()
@@ -744,8 +787,20 @@ class PhaseFlipStacks:
     arena: torch.Tensor
     layout_pp: ArenaLayout
     layout_tp: ArenaLayout
-    image_pp: torch.Tensor
-    image_tp: torch.Tensor
+    #: #809/W28: ONE host image buffer, sized for the LARGER layout plus its
+    #: 8-byte trailer, holding whichever layout is currently RESTING. The two
+    #: lifetime images this replaces were the dual pin, and W26 OOM-killed
+    #: BOTH its arms in the LAUNCH phase, before any flip ran. At each flip
+    #: the resting layout streams out of this buffer while the outgoing one is
+    #: placed back into the pages it frees, so RAM holds one layout image plus
+    #: the overshoot rather than two whole layouts.
+    rotation_image: torch.Tensor
+    #: Which layout ``rotation_image`` currently holds: ``"pp"`` or ``"tp"``.
+    #: The rotation is a swap, so this alternates with every flip. It is an
+    #: INVARIANT, not a hint: a mismatch means the buffer does not contain the
+    #: layout about to be served, and under a single-image budget there is no
+    #: second image to fall back to, so the refill refuses.
+    image_holds: str
     #: The WEIGHT shard vector (--phase-flip-tp-vector): how the TP layout
     #: splits heads/compute across the ranks.
     vector: Tuple[int, ...]
@@ -768,17 +823,29 @@ class PhaseFlipStacks:
     arena_carrier: object = None
 
     def refill(self, direction: str) -> None:
-        """The weights leg of a flip: one contiguous H2D refill of the
-        arena with the TARGET phase's image (pre_cutover seam of
-        PhaseFlipRuntime; direction is phase_flip_plan.PP_TO_TP or
-        TP_TO_PP)."""
+        """The weights leg of a flip: a chunk ROTATION of the arena (#809/W28).
+
+        The target phase's image streams RAM -> VRAM while the outgoing phase's
+        arena bytes are placed back into the pages that image vacates, so RAM
+        ends holding exactly the now-resting layout, primed for the next flip.
+        PCIe is full duplex, so the copy-back rides the idle return direction.
+
+        THE COPY-BACK IS NOT WRITE-BACK. The weights are immutable and nothing
+        is saved; it is residency PLACEMENT for the next flip, which is what a
+        single-layout RAM budget requires.
+
+        WHAT THIS GIVES UP, and it is a real loss rather than an oversight.
+        The old two-image refill passed ``restore=(other_layout, other_image)``
+        so that a checksum mismatch rewrote the ACTIVE layout from its own
+        separate image and the abort left both layouts byte-exact. That arm
+        needs a second lifetime image to read from, which is precisely the
+        dual pin W26 proved impossible here. With one buffer it cannot exist:
+        a mismatch now declares the arena undefined and refuses loudly instead
+        of silently serving it. The single-layout RAM budget is what buys the
+        flip its steady state, and this is its price.
+        """
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
-        # restore = the CURRENT phase's pair: on a checksum mismatch the
-        # refill rewrites the active layout so its views stay byte-exact
-        # and the abort is clean (verify-after-copy contract; the
-        # verify-before-copy host sum was the dominant flip leg, 22-33 s
-        # measured 2026-08-08).
         if direction == PP_TO_TP:
             # COMMIT THE HIGH-WATER FIRST. See _refill_high_water_bytes: the
             # refill writes the TP layout and its restore= arm may rewrite the
@@ -786,12 +853,7 @@ class PhaseFlipStacks:
             # where TP is the larger layout this is the difference between a
             # flip and a cudaErrorInvalidValue into the released tail.
             self._commit_refill_high_water()
-            self._timed_arena_refill(
-                "pp_to_tp",
-                self.layout_tp,
-                self.image_tp,
-                restore=(self.layout_pp, self.image_pp),
-            )
+            self._timed_arena_refill("pp_to_tp", self.layout_tp, self.layout_pp, "tp")
             # RUNG 3, AFTER the refill and not before: the restore= arm above
             # rewrites the PP layout on a checksum mismatch, and the PP layout
             # reaches into the tail wherever PP is the larger layout.
@@ -819,12 +881,7 @@ class PhaseFlipStacks:
             # -- it is priced into the affordability verdict by
             # PhaseFlipRuntime._arena_tail_bytes before the flip commits.
             self._commit_refill_high_water()
-            self._timed_arena_refill(
-                "tp_to_pp",
-                self.layout_pp,
-                self.image_pp,
-                restore=(self.layout_tp, self.image_tp),
-            )
+            self._timed_arena_refill("tp_to_pp", self.layout_pp, self.layout_tp, "pp")
             # AND RELEASE AFTER, symmetrically with the pp->tp leg. Without
             # this the tail stays committed for the whole PP phase on a rank
             # whose TP layout is the larger one, which is rung 3's entire
@@ -868,7 +925,9 @@ class PhaseFlipStacks:
         """
         return max(int(self.layout_pp.total_bytes), int(self.layout_tp.total_bytes))
 
-    def _timed_arena_refill(self, direction: str, layout, image, restore) -> None:
+    def _timed_arena_refill(
+        self, direction: str, incoming, outgoing, wants: str
+    ) -> None:
         """#758 emitter (3 of 3): PER-RANK FLIP REFILL TIME.
 
         WHY THIS DID NOT EXIST AND HAD TO. The comp4 load ladder
@@ -899,7 +958,45 @@ class PhaseFlipStacks:
         # 1351-1723 MiB/s vs pp_to_tp 3214-3915 for the same rank and within
         # 2.7% of the same bytes) could not be attributed from the log.
         leg_timing = RefillLegTiming()
-        arena_refill(self.arena, layout, image, restore=restore, timing=leg_timing)
+        # #809/W28: the leg IS the rotation. `incoming` streams out of the one
+        # host buffer and `outgoing` is placed back into it, so the buffer ends
+        # holding the layout that just left the arena.
+        from sglang.srt.model_executor.rotation_executor import (
+            RotationHazard,
+            rotate_arena,
+            rotation_ring,
+        )
+        from sglang.srt.model_executor.weights_arena import (
+            _refill_chunk_bytes,
+            _refill_depth,
+        )
+
+        if self.image_holds != wants:
+            raise RotationHazard(
+                f"{LOG_PREFIX} refill {direction}: the host image holds "
+                f"{self.image_holds!r} but this leg must stream {wants!r} into "
+                f"the arena. Under a single-image budget there is no second "
+                f"image to read from, so this is an invariant violation rather "
+                f"than a case to fall back on."
+            )
+        chunk = _refill_chunk_bytes()
+        depth = _refill_depth()
+        rotate_arena(
+            arena=self.arena,
+            host_image=self.rotation_image,
+            incoming_bytes=int(incoming.total_bytes),
+            outgoing_bytes=int(outgoing.total_bytes),
+            chunk_bytes=chunk,
+            depth=depth,
+            ring=rotation_ring(chunk, depth),
+            timing=leg_timing,
+        )
+        # The swap happened, so the marker follows it. Set only on the success
+        # path: a rotation that raises has left the arena undefined and said so,
+        # and this instance must not serve either layout again. The marker is
+        # deliberately NOT updated there -- it would assert a residency that
+        # nothing has verified.
+        self.image_holds = "pp" if wants == "tp" else "tp"
         elapsed = _time.perf_counter() - started
         # #677: FEED THE ECONOMICS THE MEASURED LEG, NOT A REMEMBERED ONE.
         # The flip policy priced a leg at a 3.2 s pinned-era constant while the
@@ -941,7 +1038,7 @@ class PhaseFlipStacks:
                 refill_report(
                     direction,
                     elapsed,
-                    int(layout.total_bytes),
+                    int(incoming.total_bytes),
                     self._images_are_file_backed(),
                 ),
                 # #856: the bound, named. Appended rather than folded into
@@ -1338,7 +1435,17 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             _grade_arena_tail_derivation(
                 primary_runner, world_rank, layout_pp, layout_tp
             )
-            image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
+            # #809/W28: THE ONE HOST IMAGE. Both layouts are measured by now,
+            # which is the first moment the max-sized buffer CAN be sized --
+            # the PP snapshot above necessarily predates layout_tp. From here
+            # on there is exactly one lifetime image; `image_pp` is a boot
+            # transient and is released once the arena carries the PP layout.
+            rotation_image = allocate_rotation_image(
+                layout_pp.total_bytes, layout_tp.total_bytes, pin=True
+            )
+            image_tp = snapshot_and_free(
+                tp_named, layout_tp, pin=True, out=rotation_image
+            )
             if device == "cuda":
                 torch.cuda.empty_cache()
             arena_total = max(layout_pp.total_bytes, layout_tp.total_bytes)
@@ -1367,7 +1474,7 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # arena_refill verifies the checksum on the arena's device
             # after the copy.
             bind_arena_views(layout_tp, arena, rebind=list(tp_named.items()))
-            arena_refill(arena, layout_tp, image_tp)
+            prime_arena_from_image(arena, layout_tp, image_tp)
 
             # 4b. The TP-phase draft worker (#631 speculation slice).
             # Constructed AFTER the arena is packed, mirroring the boot
@@ -1649,7 +1756,13 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # 7. PP is the boot phase: rebind its params to arena views and refill
     # the arena with the PP image (one contiguous H2D).
     bind_arena_views(layout_pp, arena, rebind=list(pp_named.items()))
-    arena_refill(arena, layout_pp, image_pp)
+    prime_arena_from_image(arena, layout_pp, image_pp)
+    # #809/W28: THE BOOT TRANSIENT ENDS HERE. The arena now carries the PP
+    # layout, so the PP host image has no reader left: the resting layout is TP
+    # and it lives in `rotation_image`. Releasing it is what turns the boot's
+    # two-image peak into a one-image steady state -- keeping it would be the
+    # dual pin W26 OOM-killed, merely renamed.
+    del image_pp
 
     # The mode qualifier keeps this line honest for the host ledger: a
     # file-backed image (SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED) is reclaimable
@@ -1663,7 +1776,7 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         arena.numel() / 1048576.0,
         layout_pp.total_bytes / 1048576.0,
         layout_tp.total_bytes / 1048576.0,
-        (image_pp.numel() + image_tp.numel()) / 1048576.0,
+        rotation_image.numel() / 1048576.0,
         host_image_mode(),
     )
     # #797: the vector the decode phase actually runs under is the one the TP
@@ -1677,8 +1790,8 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         arena=arena,
         layout_pp=layout_pp,
         layout_tp=layout_tp,
-        image_pp=image_pp,
-        image_tp=image_tp,
+        rotation_image=rotation_image,
+        image_holds="tp",
         vector=tuple(vec),
         token_vector=token_verdict.vector,
         draft_worker=draft_worker,
