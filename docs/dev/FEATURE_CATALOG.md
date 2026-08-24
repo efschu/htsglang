@@ -1434,7 +1434,30 @@ multimodal_gen, each of which logs the gap; it forces
 `fp8_needs_dequant_fallback` on (`fp8_utils.py:361`), costing ~2.5-6x decode
 throughput; e4m3 KV bit-exact on sm86 — a measurement, no sm86 code gate), INT8-W8A8 (default
 recommendation; sm86-native lane; beware the dual-dist wheel trap — pin by
-sha256), NVFP4 — "unpackable" is a pure SHAPE test, not a checkpoint class: Marlin
+sha256), INT8-W8A16 (weight-only int8, i.e. int8 weights with bf16 activations —
+a CHECKPOINT class, distinct from the FP8 `CompressedTensorsW8A16Fp8` lane above
+and from #319's planner-side `LANE_INT8_W8A16` fallback concept. Gate predicates:
+`_is_wNa16_group_channel` (`compressed_tensors.py:670-683`) requires
+`input_activations is None` AND strategy in {channel, group} AND not dynamic;
+`:727-730` additionally requires `format: pack-quantized` and
+`num_bits in WNA16_SUPPORTED_BITS = [4,8]` (`compressed_tensors_wNa16.py:55-60`,
+8 -> `uint8b128`). The test runs BEFORE the activation-quant block at `:743`, so
+a W8A8 checkpoint can never reach it — there is no runtime switch to drop
+activation quant, and no INT8 dequant fallback exists at all
+(`_maybe_dequantize_unpackable` is NVFP4-only, `:1026-1027`). Serves on sm86 AND
+sm120: `get_min_capability() = 80` with no upper bound (`:467-520`), shape check
+only (N%64, K%128, K%group_size — `marlin_utils.py:183`, `:219`), kernel guard
+only `__CUDA_ARCH__ < 800` (`gptq_marlin.cuh:37`), JIT-compiled per arch. Weights
+stay int8-packed in VRAM (`pack_factor = 4`, `wNa16.py:73,131-141`) — disk parity,
+no bf16 ballooning. Uses NO compiled `sgl_kernel` symbol, so the #384 dual-dist
+wheel trap does not reach it — unlike INT8-W8A8, which it takes down. Two traps:
+asymmetric 8-bit passes every Python gate and then panics in CUDA (`kU8` is not
+instantiated, `gptq_marlin.cuh:410-425`; the scheme never calls
+`check_marlin_supported`), and a non-`pack-quantized` serialization dies at config
+parse on a bare assert (`:443-454`). Uneven TP: `group_size` IS read —
+`_group_size_block` folds `lcm(group_size, GPTQ_MARLIN_MIN_THREAD_K=128)`
+(`:184-204`), channel strategy falls to the device-free marlin fold
+(`linear.py:361-362`). `ANALYSE_854_w8a16_vs_w8a8.md`), NVFP4 — "unpackable" is a pure SHAPE test, not a checkpoint class: Marlin
 `output_size % 64` on the UNSHARDED width
 (`compressed_tensors_w4a4_nvfp4.py:152-157`), native FP4 `width % 32` on the
 SHARDED width (`:186-192`), routed per rank by the resolved lane (`:225-234`);
