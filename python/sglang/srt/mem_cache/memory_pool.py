@@ -2663,14 +2663,23 @@ class MHATokenToKVPool(KVCache):
         """
         try:
             from sglang.srt.managers.kv_backing_relief import (
+                CONSERVATIVE_ADMISSION_RESERVE_ROWS,
                 _admission_reserve_rows,
                 lawful_reservation_rows,
             )
 
+            # THE DERIVED RESERVE IS NOT KNOWABLE HERE. It comes from the
+            # prefill chunk size, which does not exist when the pool reserves
+            # its address space -- with no scheduler the derivation falls back
+            # to 512, while W22's live value was 4096. Sizing the reservation
+            # on 512 would rebuild the same wall one layer down, so the boot
+            # assumption takes the LARGER of the two. VA is cheap; the wall is
+            # permanent.
             try:
                 reserve = int(_admission_reserve_rows(None))
             except Exception:  # noqa: BLE001 - the derived value is best-effort
                 reserve = 0
+            reserve = max(reserve, int(CONSERVATIVE_ADMISSION_RESERVE_ROWS))
             return int(lawful_reservation_rows(int(self.size), reserve, 0))
         except Exception:  # noqa: BLE001 - never fail construction on a knob
             return int(self.size)

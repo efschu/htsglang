@@ -54,3 +54,45 @@ guards that direction and must stay green.
 If the verdict side is ever changed, the excluded rank must be excluded from
 APPLYING the shrink in the same step — that is a separate, larger change with
 its own group-protocol proof, not a line in F1.
+
+## The instrument-correction rule (third correction, 2026-08-24)
+
+Three acceptance instruments on this build were corrected after being written.
+The pattern is worth a rule, because two of the three were mine and the third
+nearly shipped as a permanently-red test that measured nothing.
+
+    An acceptance test asserts a property THE FIX LAYER CAN DELIVER.
+    A test that injects state into a DEEPER layer tests that layer's
+    contract, not the fix.
+
+The three:
+
+1. **F4 registry falsifier** — asserted the ladder must REGISTER every declared
+   post. The tree forbids that by design (rank-local ladder, group-decided cap,
+   rung pays before the probe). Re-scoped to the property: a refusal must not
+   report "nothing" while a declared post holds credit. The forbidden remedy is
+   now its own guard test.
+2. **F4 refusal text** — asserted `[nothing]` must disappear. It must not: it is
+   the ladder's truthful record. Re-scoped to "both facts appear, in order".
+3. **F1+F2 exposure/veto falsifier** — injected `floor=131073, cap=126976` into
+   `collective_kv_target` and demanded no veto. At that layer the veto is
+   CORRECT; the only way to remove it caps a rank below its own live set
+   (`cudaErrorIllegalAddress`). The assertion demanded a defect and could never
+   flip. Re-scoped: the reduction test became the forbidden-remedy guard
+   (permanently green), and F1+F2's real property -- REACHABILITY, that
+   `floor > cap` is transient rather than permanent -- is pinned in
+   `test_lawful_reservation_851::TestTheFloorIsREACHABLE`, red-both-ways
+   against the shipped sizer.
+
+Correction (3) immediately earned itself: the red-both-ways requirement exposed
+that F2 as first committed still under-reserved. The pool sizes its reservation
+before a scheduler exists, so the derived admission reserve fell back to 512
+while W22's live value was 4096 -- rebuilding the same wall one layer down. The
+boot assumption now takes `max(derived, CONSERVATIVE_ADMISSION_RESERVE_ROWS)`.
+A test that could only pass would never have found that.
+
+## Metal criteria are NOT substituted by any of this
+
+"0 over-cap floor vetoes under load" stays in the window ticket unchanged. The
+unit property proves the pool CAN reach its floor; only metal proves it DOES,
+under real funding dynamics.

@@ -193,9 +193,32 @@ class TestTheGroupVerdict(unittest.TestCase):
         # the peer's fundable plan never runs.
         self.assertTrue(target is None or target >= self.PEER_CAP)
 
-    @unittest.expectedFailure
-    def test_a_self_declared_under_backed_rank_MUST_NOT_veto(self):
-        """RED TODAY, BY DESIGN. Goes UNEXPECTED SUCCESS when #851 lands.
+    def test_the_reduction_MUST_veto_rather_than_cap_below_a_live_set(self):
+        """THE FORBIDDEN-REMEDY GUARD. Green as-is, permanently.
+
+        THIS TEST USED TO ASSERT THE OPPOSITE, and was wrong. It was written as
+        `test_a_self_declared_under_backed_rank_MUST_NOT_veto`, xfail, as the
+        acceptance for F1+F2 -- on the reasoning that a rank which has already
+        declared itself under-backed is filing a defect report, not casting a
+        capacity verdict for its peers. That reasoning is sound about the
+        BACKING and wrong about the REDUCTION.
+
+        At THIS layer the veto is CORRECT. The reduction is handed a floor and
+        a cap as numbers; the only way to stop the veto here is to drop the
+        rank's floor from the group MAX, and that rank still applies the
+        resulting proportion to its own cap -- landing below its own live set,
+        which is `cudaErrorIllegalAddress` and kills every rank rather than
+        raising (#796). So the original assertion demanded a defect, and could
+        never flip without one.
+
+        What F1+F2 actually deliver is REACHABILITY -- floor > cap stops being
+        PERMANENT because the pool can now grow to its lawful floor. That is
+        pinned in `test_lawful_reservation_851::TestTheFloorIsREACHABLE`, at
+        the layer that can deliver it. The two tests cover the two halves.
+
+        THE RULE THIS COST, worth stating once: an acceptance test asserts a
+        property THE FIX LAYER CAN DELIVER. A test that injects state into a
+        deeper layer tests THAT layer's contract, not the fix.
 
         The law, from ``floor_exceeds_local_cap``'s own docstring: "a floor
         above a rank's own cap is a DEFECT REPORT about that rank's backing,
@@ -217,13 +240,13 @@ class TestTheGroupVerdict(unittest.TestCase):
             _proposal(W22_COMMITTED, W22_FLOOR, W22_COMMITTED),
         )
         target = collective_kv_target(reduced, current_rows=self.PEER_CAP)
-        self.assertIsNotNone(
-            target, "a fundable peer plan was refused by an under-backed rank"
-        )
-        self.assertLess(
-            target,
-            self.PEER_CAP,
-            "the group target did not shrink the peer that could afford to",
+        # The veto IS the correct outcome here: no shrink clears every rank's
+        # live set, so the group declines rather than authorising a cap below
+        # one. Asserted positively so a future "optimisation" that drops the
+        # defective rank's floor from the MAX fails loudly.
+        self.assertTrue(
+            target is None or target >= self.PEER_CAP,
+            "the reduction capped below a rank's live set -- cudaErrorIllegalAddress",
         )
 
     def test_two_healthy_ranks_still_respect_the_highest_real_floor(self):

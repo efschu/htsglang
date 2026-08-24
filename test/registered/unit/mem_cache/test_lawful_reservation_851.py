@@ -70,3 +70,76 @@ class TestTheReservationCoversTheFloor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheFloorIsREACHABLE(unittest.TestCase):
+    """F1+F2's real acceptance: the pool CAN reach its own lawful floor.
+
+    THE INSTRUMENT THIS REPLACES, and why. The original acceptance for F1+F2
+    was `test_w22_exposure_veto_851::test_a_self_declared_under_backed_rank_
+    MUST_NOT_veto`, which injects `floor=131073, cap=126976` straight into
+    `collective_kv_target` and demands the group NOT veto. That test can never
+    flip, and should not: at the reduction layer the veto is CORRECT -- the
+    only alternative is dropping the rank's floor from the group MAX, which
+    lands it below its own live set (cudaErrorIllegalAddress). It now stands
+    as the forbidden-remedy guard under that name.
+
+    The property F1+F2 actually deliver is REACHABILITY: floor > cap stops
+    being PERMANENT. F1 restates exposure to backing so the gap is explicit
+    rather than silent; F2 reserves address space for every backing the dial
+    may lawfully reach, so the grow that closes it can be accepted.
+
+    Both directions are pinned against the SHIPPED sizer, so a revert to
+    `reserved_num_tokens=self.size` fails here.
+    """
+
+    #: W22 / #848, verbatim: size 126976, boot reservation 125052.
+    SIZE = 126976
+    OLD_RESERVATION = 125052
+    ADMISSION_RESERVE = 4096
+
+    @staticmethod
+    def _shipped_reservation(size):
+        """The reservation the SHIPPED pool would take for `size` rows."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        pool = type("P", (), {"size": size})()
+        return int(MHATokenToKVPool._lawful_reserved_tokens(pool))
+
+    def _lawful_floor(self):
+        return lawful_reservation_rows(self.SIZE, self.ADMISSION_RESERVE, 0)
+
+    def test_the_PRE_F2_shape_cannot_reach_its_floor(self):
+        """RED DIRECTION, made explicit and permanent.
+
+        The old sizer reserves the size at construction. W22's dial had
+        already moved past it (125052 < 126976), and even a reservation equal
+        to `size` falls short of the lawful floor by the admission reserve.
+        If this assertion ever stops holding, the specimen has changed and the
+        test below proves nothing.
+        """
+        floor = self._lawful_floor()
+        self.assertLess(self.OLD_RESERVATION, floor)
+        # Even the charitable reading of the old rule -- reserve exactly `size`
+        # -- is short, which is why the wall landed on the floor-holding rank.
+        self.assertLess(self.SIZE, floor)
+
+    def test_the_SHIPPED_sizer_reaches_the_lawful_floor(self):
+        """GREEN DIRECTION. Post-F2 the floor is fundable, so floor>cap is
+        transient rather than permanent."""
+        self.assertGreaterEqual(
+            self._shipped_reservation(self.SIZE), self._lawful_floor()
+        )
+
+    def test_the_shipped_sizer_is_strictly_above_the_old_one(self):
+        """The regression that matters: reverting to `self.size` fails here."""
+        self.assertGreater(self._shipped_reservation(self.SIZE), self.SIZE)
+
+    def test_reachability_holds_across_the_range(self):
+        """Not just at the specimen, so a constant cannot fake it."""
+        for size in (1024, 126976, 212992):
+            self.assertGreaterEqual(
+                self._shipped_reservation(size),
+                lawful_reservation_rows(size, self.ADMISSION_RESERVE, 0),
+                f"size={size}",
+            )

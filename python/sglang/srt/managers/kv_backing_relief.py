@@ -624,6 +624,23 @@ FLOOR_NEED_COMMIT_CLAMPED = "COMMIT-CLAMPED"
 FLOOR_NEED_RESERVATION_CAPPED = "RESERVATION-CAPPED"
 
 
+#: #851 F2: the admission reserve a BOOT-TIME reservation must assume when it
+#: cannot ask the scheduler what the reserve will be.
+#:
+#: `_admission_reserve_rows` derives the real value from the prefill chunk
+#: size, which does not exist yet when the pool reserves its address space --
+#: with no scheduler it falls back to 512, while W22's live value was 4096
+#: (chunked-prefill-size 4096). A reservation sized on 512 under-reserves any
+#: boot with a larger chunk, which is the whole defect one layer down.
+#:
+#: So the boot assumption is deliberately GENEROUS. This buys ADDRESS SPACE,
+#: not pages: over-reserving costs a slightly larger VA span, under-reserving
+#: is a permanent wall no runtime actuator can lift. The two errors are not
+#: comparable, so this is sized for the largest chunk anyone on this rig has
+#: configured, with room above it.
+CONSERVATIVE_ADMISSION_RESERVE_ROWS = 16384
+
+
 def lawful_reservation_rows(
     size_rows: int, admission_reserve_rows: int = 0, margin_rows: int = 0
 ) -> int:
