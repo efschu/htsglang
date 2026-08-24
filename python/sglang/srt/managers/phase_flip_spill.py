@@ -2081,6 +2081,55 @@ def collective_kv_backing_relief(
                         LOG_PREFIX,
                         e,
                     )
+            # #839-METAL: AND THE SAME BALLOT ALREADY SAYS HOW FAR THE FLOOR
+            # MUST RISE.
+            #
+            # ``collective_slot_ballot`` decodes ``max_live_row`` out of the
+            # SAME reduced payload as ``min_backed_rows`` -- reduced[2] and
+            # reduced[3] -- and until this ticket only the floor was consumed.
+            # The need was computed on every rank, put on the wire, decoded,
+            # and dropped.
+            #
+            # WINDOW 5 IS WHAT DROPPING IT COSTS. Both boots, to the row:
+            # the floor sat at 126976 (PP1) while the need climbed 131048 ->
+            # 131051 -> 131073, and all 153 flip arms -- 108 of them forced by
+            # RPC, not by the policy -- abandoned on that 4097-row gap. PP1's
+            # backing never moved in 30 minutes.
+            #
+            # AND THE DEBT COUNTER COULD NOT SEE IT. #834 crit 13 measures
+            # backed-but-unexposed rows, which is 0 on the floor rank BY
+            # CONSTRUCTION -- so GROW-DEBT-UNPAID fired 1368 times naming PP0
+            # (+88064) and PP2 (+6144), the two ranks whose debt moves the
+            # group MIN by exactly zero, and never once named the rank that
+            # was actually holding the group down.
+            #
+            # PAGES ONLY, NEVER AN ANNOUNCEMENT. The grow is rank-local and
+            # commits pages; it does not touch the exposed id space. The raise
+            # happens one round later in ``publish_group_exposure``, off the
+            # next ballot's group verdict, in the arena that verdict was
+            # measured in. That ordering IS #839 A and collapsing it into one
+            # round would rebuild the window-4-A defect.
+            #
+            # NO NEW COLLECTIVE IS ENTERED, which is the same constraint that
+            # kept the levelling inside the seam (HANDOVER-S834).
+            need = verdict.get("max_live_row")
+            note_need = getattr(cap_relief, "note_group_live_need", None)
+            close_gap = getattr(cap_relief, "close_floor_need_gap", None)
+            if need is not None and callable(note_need) and callable(close_gap):
+                try:
+                    note_need(int(need))
+                    close_gap()
+                except Exception as e:
+                    logger.error(
+                        "%s could not close this rank's floor-to-live-set gap "
+                        "(%s). The group keeps the level it already agreed, so "
+                        "nothing is corrupted -- what is lost is the only "
+                        "actuator that raises the floor without a cutover, and "
+                        "every tp_to_pp will abandon on the union bound while "
+                        "that is true (#839-METAL)",
+                        LOG_PREFIX,
+                        e,
+                    )
         elif not _GROUP_FLOOR_UNSUPPORTED_LOGGED:
             _GROUP_FLOOR_UNSUPPORTED_LOGGED = True
             logger.warning(

@@ -1013,6 +1013,21 @@ class KvBackingRelief:
         #: map them. Reported, never hidden: it is the #795 federation debt
         #: made countable rather than a silent capacity loss.
         self._stranded_by_group_floor = 0
+        #: #839-METAL: the group's HIGHEST LIVE ROW, and the arena it was
+        #: measured in. Decoded beside the floor out of the SAME reduction
+        #: (``collective_slot_ballot``) and, until this ticket, dropped.
+        #:
+        #: Without it the group can see that it is stuck and not by how much:
+        #: window 5 held ``min_backed_rows`` at 126976 for two whole boots
+        #: while the need climbed 131048 -> 131051 -> 131073, and the 4097-row
+        #: difference -- the entire defect -- was never a quantity anything
+        #: held.
+        self._group_live_need: int = GROUP_FLOOR_UNKNOWN
+        self._group_need_arena: Optional[int] = None
+        #: #839-METAL: the standing "the floor rank cannot fund the live set"
+        #: refusal, or ``None``. Readable rather than only logged so the
+        #: condition can be asserted at a desk instead of grepped off metal.
+        self._floor_need_refusal: Optional[dict] = None
         #: -1 means "nothing reported yet", so the FIRST proposal always logs
         #: and a run can never be silent about this rung again.
         self._last_deficit_sign = -1
@@ -2923,6 +2938,161 @@ class KvBackingRelief:
         # without recording which arena it counts is what let a wide reading
         # be compared against a narrow backing -- see ``_group_floor_arena``.
         self._group_floor_arena = self._arena_key()
+
+    def note_group_live_need(self, max_live_row: int) -> None:
+        """Record the group's HIGHEST LIVE ROW, from the same ballot payload.
+
+        #839-METAL. ``collective_slot_ballot`` decodes this beside
+        ``min_backed_rows`` out of one reduction (:func:`collective_slot_ballot`,
+        the ``max_live_row`` key) and until now only the floor was consumed. The
+        need is the number that says HOW FAR the floor has to rise; without it
+        the group knows it is stuck and not by how much.
+
+        MEASURED, window 5, integ/round5, BOTH boots to the row::
+
+            live set needs 131073   PP1 backs 126976   <- the floor, and short
+            live set needs 131073   PP2 backs 133120
+            live set needs 131073   PP0 backs 215040
+
+        PP1's backing never moved from 126976 in either boot -- 30 minutes on
+        5b -- and every one of 153 flip arms abandoned on the 4097-row gap.
+
+        Negative arrives from the abstain sentinel and from a truncated
+        payload, and is discarded for the same reason a negative floor is: a
+        peer that failed to report is not a group that needs nothing.
+        """
+        need = int(max_live_row)
+        if need < 0:
+            return
+        self._group_live_need = need
+        self._group_need_arena = self._arena_key()
+
+    def floor_need_gap(self) -> int:
+        """Rows THIS rank must commit for the group floor to cover the live set.
+
+        Zero unless all four hold, and each exclusion is load-bearing:
+
+        1. a floor and a need have both been seen -- otherwise there is no
+           group statement to act on and #833's "no verdict, no bound" applies;
+        2. both were measured in the arena that is active now -- a row count
+           from the other layout is a different quantity, which is the whole
+           #839 A lesson;
+        3. the need exceeds the floor -- otherwise the group already fits;
+        4. THIS rank is the one holding the floor down. A rank backing more
+           than the floor has no gap to close: growing it moves ``min`` by
+           exactly nothing, which is precisely what window 5 measured when the
+           two RICHEST ranks carried all the deferred-grow debt and the level
+           did not move for 30 minutes.
+        """
+        floor = int(self._group_backed_floor)
+        need = int(self._group_live_need)
+        if floor < 0 or need < 0:
+            return 0
+        # REBIND BEFORE READING THE ARENA, NOT AFTER. ``_arena_key`` is
+        # ``id(self._pool)`` and ``self._pool`` only follows ``pool_fn`` when
+        # ``_rebind`` runs, so asking which arena is active before rebinding
+        # answers with the PREVIOUS one -- and a stale answer here compares two
+        # row counts from different layouts, which is the exact defect #839 A
+        # exists to close, rebuilt one method over. Caught by
+        # ``test_a_floor_measured_in_another_arena_licenses_no_grow``; the
+        # first draft of this method had the two lines the other way round.
+        self._rebind()
+        arena = self._arena_key()
+        if self._group_floor_arena != arena or self._group_need_arena != arena:
+            return 0
+        if need <= floor:
+            return 0
+        if int(self._current_rows()) > floor:
+            return 0
+        return need - floor
+
+    def close_floor_need_gap(self) -> int:
+        """Commit the pages the group floor is short of the live set. #839-METAL.
+
+        RANK-LOCAL, AND THAT IS WHY IT IS ALLOWED TO RUN HERE. This reaches
+        ``runtime_set_backing_rows`` and nothing else; ``kv_backing_relief.py``
+        enters no collective anywhere, which is the same property that lets
+        ``grow_kv_backing_local`` run at a rank-local cadence
+        (phase_flip_spill.py:1252) while the levelling may not.
+
+        IT COMMITS PAGES AND ANNOUNCES NOTHING. The exposed id space is not
+        touched here -- it still moves only in :meth:`publish_group_exposure`,
+        only on a group verdict, only in the arena that verdict was measured
+        in. The grow makes the NEXT ballot's floor higher and the raise happens
+        there, one round later, legitimately. Collapsing the two into one round
+        would be the window-4-A defect rebuilt: a rank-local reading licensing
+        a raise.
+
+        A GROW THAT CANNOT REACH IS A REFUSAL WITH A NAME, NOT A RETRY. On this
+        rig the floor rank is on a 20 GB card and the need can simply exceed
+        what it may commit; window 5 answered that case with 153 silent
+        abandons and 1368 GROW-DEBT-UNPAID lines that named the two ranks whose
+        debt could not matter. Recording the refusal here gives the one number
+        a reader needs -- which rank binds, at what backing, against what need.
+
+        Returns rows committed (0 when there is nothing to do or it failed).
+        """
+        gap = self.floor_need_gap()
+        if gap <= 0:
+            return 0
+        floor = int(self._group_backed_floor)
+        target = floor + gap
+        setter = getattr(self._pool, "runtime_set_backing_rows", None)
+        if not callable(setter):
+            self._record_floor_need_refusal(floor, target, "pool cannot grow")
+            return 0
+        try:
+            setter(target)
+        except Exception as e:  # noqa: BLE001 -- MemoryError and driver errors alike
+            # NOTHING IS HALF-DONE HERE that needs undoing: the setter either
+            # committed the span or it did not, and the exposed id space was
+            # never moved, so the group is exactly where it was.
+            self._record_floor_need_refusal(floor, target, repr(e))
+            return 0
+        self._floor_need_refusal = None
+        grown = int(self._current_rows()) - floor
+        return max(0, grown)
+
+    def _record_floor_need_refusal(self, binding: int, target: int, why: str) -> None:
+        """Say it ONCE per (arena, target), and keep it readable.
+
+        Once, because window 5's lesson is that an alarm repeated 1368 times is
+        not more informative than one and does crowd out the log. Readable
+        rather than only logged, because a criterion that can only be checked
+        by grepping a boot log cannot be checked at a desk.
+        """
+        key = (self._arena_key(), int(target))
+        said = self._floor_need_refusal
+        if said is not None and said.get("key") == key:
+            return
+        self._floor_need_refusal = {
+            "key": key,
+            "binding_rows": int(binding),
+            "need": int(target),
+            "short": int(target) - int(binding),
+            "why": str(why),
+        }
+        logger.warning(
+            "%s [#839-METAL] GROUP FLOOR CANNOT FUND THE LIVE SET: this rank "
+            "holds the group floor at %d rows and the group's live set needs "
+            "%d, so the group is short %d rows and EVERY tp_to_pp will abandon "
+            "on the union bound until that changes (%s). This is the binding "
+            "rank -- the backed-but-unexposed surplus on the WIDER ranks is "
+            "not payable against it, because the agreed level is the group MIN "
+            "and growing a rank that is not the floor moves it by zero "
+            "(#834 crit 13's counter is blind to this rank by construction: "
+            "its backed-but-unexposed count is 0 precisely because it IS the "
+            "floor). Size this rank's budget up, or accept single-phase.",
+            LOG_PREFIX,
+            binding,
+            target,
+            int(target) - int(binding),
+            why,
+        )
+
+    def floor_need_refusal(self) -> Optional[dict]:
+        """The standing refusal, or ``None`` when the floor can fund the need."""
+        return self._floor_need_refusal
 
     def _arena_key(self):
         """Identity of the layout the backing calls are currently pointed at.
