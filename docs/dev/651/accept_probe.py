@@ -25,10 +25,20 @@ Three questions, because on this checkpoint they fail independently:
    NOT from spec_ema_accept_len, which is a smoothed internal counter and has
    its own known measurement trap.
 
-    python accept_probe.py [port] [--spec]
+    python accept_probe.py [port] [--spec] [--model-dir DIR]
 
 `--spec` makes a low acceptance a FAILURE rather than a note; without it the
 acceptance section is reported but not judged (stages a and d run no drafter).
+
+Prompts go through the tokenizer's chat template with enable_thinking=False,
+applied CLIENT-side, and the result is POSTed to the native /generate endpoint.
+Both halves of that are deliberate. /generate is the endpoint that returns
+meta_info, which is where spec_verify_ct lives. And the template must be applied
+rather than skipped, because this is an instruct model: handed a bare question
+it continues the text instead of answering it, which would make the
+content-judging meaningless. Thinking must be OFF because this checkpoint's
+template opens a <think> block by default -- 96 new tokens of reasoning would
+never reach the answer, and every probe would read as a failure.
 """
 
 from __future__ import annotations
@@ -39,12 +49,34 @@ import urllib.request
 
 PORT = 30040
 EXPECT_SPEC = False
-for arg in sys.argv[1:]:
-    if arg == "--spec":
+MODEL_DIR = "/spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+_args = sys.argv[1:]
+while _args:
+    a = _args.pop(0)
+    if a == "--spec":
         EXPECT_SPEC = True
+    elif a == "--model-dir":
+        MODEL_DIR = _args.pop(0)
     else:
-        PORT = int(arg)
+        PORT = int(a)
 BASE = f"http://127.0.0.1:{PORT}"
+
+_TOK = None
+
+
+def wrap(prompt: str) -> str:
+    """Chat template with thinking off; fall back to the raw prompt loudly."""
+    global _TOK
+    if _TOK is None:
+        from transformers import AutoTokenizer
+
+        _TOK = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    return _TOK.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
 
 # A drafter proposing noise still yields correct text, so this floor is about
 # the DRAFTER being alive, not about speed. 1.005 was the measured #290 corpse;
@@ -68,7 +100,7 @@ def generate(prompt: str) -> tuple[str, dict]:
     """Native /generate, because meta_info is where spec_verify_ct lives."""
     body = json.dumps(
         {
-            "text": prompt,
+            "text": wrap(prompt),
             "sampling_params": {"temperature": 0.0, "max_new_tokens": 96},
         }
     ).encode()
