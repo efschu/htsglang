@@ -1136,6 +1136,56 @@ def release_residents_for_cutover(reqs, *, retract, reset_tree):
     return retracted
 
 
+def tree_evictable_full_rows(tree) -> Optional[int]:
+    """How many FULL-pool rows the prefix tree can still hand back, or ``None``.
+
+    ONE CLOCK, AND IT IS THE BASE-CLASS CONTRACT. This read used to be
+    ``getattr(tree, "full_evictable_size_", 0)`` -- a trailing-underscore
+    attribute that is an implementation detail of exactly three of the caches
+    in this tree (``MambaRadixCache``, ``SWARadixCache``,
+    ``HiMambaRadixCache``) and does not exist on ``UnifiedRadixCache``, which
+    keeps the same quantity in ``component_evictable_size_[BASE_COMPONENT_
+    TYPE]``. So on the tree this rig actually runs, the read returned the
+    number ZERO, the caller took that as licence to skip its eviction, and
+    ``reset()`` orphaned every row the tree held.
+
+    W29 MEASURED IT (SPECIMEN_w29_a1_pool_leak_1row.log, tree_type=
+    UnifiedRadixCache in every census line). The seam's own #832 census named
+    the orphan by id -- ``unaccounted=1 [1]``, flat from the first flip that
+    crossed a non-empty tree onward -- and the scheduler's idle check killed
+    all three ranks:
+
+        pool memory leak detected! [full] total=469733, available=107041,
+          evictable=1, protected=0, session_held=0, uncached=0,
+          withheld=362690
+
+    ONE row only because the tree held exactly one, a 1-token health check.
+    The orphan is the SIZE OF THE TREE, not a constant, and it was read as a
+    constant unit deficit -- and therefore as a reserved/boundary slot --
+    because the only sample available held one row on both ranks.
+
+    THE INDICATOR WAS THE BUG, which is why the fix is a reader and not a
+    tolerance. ``full_evictable_size()`` is declared on ``BasePrefixCache``
+    and implemented by every cache in this tree, and on the three
+    attribute-keeping caches it returns that very attribute -- so the method
+    is a strict superset of what the old read could see, never less. The
+    suite's own double had the attribute and not the method, exactly backwards
+    from production, which is how ten green tests survived the boot this
+    killed.
+
+    ``None`` means the tree could not answer, and that is NOT zero: zero is a
+    licence to skip the eviction, and skipping it is the defect. The caller
+    reports the abstention out loud instead of proceeding quietly.
+    """
+    reader = getattr(tree, "full_evictable_size", None)
+    if not callable(reader):
+        return None
+    try:
+        return max(0, int(reader()))
+    except Exception:  # noqa: BLE001 - an unreadable count is not zero rows
+        return None
+
+
 def drop_prefix_tree_returning_rows(tree) -> int:
     """Empty the prefix tree AND return its rows, then reset it (#856).
 
@@ -1177,11 +1227,21 @@ def drop_prefix_tree_returning_rows(tree) -> int:
     aborting here would strand a flip that has already released its state.
     """
     returned = 0
-    try:
-        evictable = int(getattr(tree, "full_evictable_size_", 0) or 0)
-    except (TypeError, ValueError):
-        evictable = 0
-    if evictable > 0:
+    evictable = tree_evictable_full_rows(tree)
+    if evictable is None:
+        # NOT DEFAULTED TO ZERO, and that default is the entire W29 defect.
+        # A tree that cannot state its evictable size is a tree whose rows
+        # this function is about to orphan, and it has to say so.
+        logger.error(
+            "%s #856: %s cannot answer full_evictable_size(); the drop below "
+            "does not know what to evict and reset() will orphan whatever the "
+            "tree still holds. Reading a count this code cannot get and "
+            "calling the miss zero is the W29 defect verbatim -- give the "
+            "tree the BasePrefixCache contract, do not default this",
+            LOG_PREFIX,
+            type(tree).__name__,
+        )
+    elif evictable > 0:
         try:
             from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -1195,6 +1255,24 @@ def drop_prefix_tree_returning_rows(tree) -> int:
                 LOG_PREFIX,
                 evictable,
             )
+        else:
+            # RE-READ, DO NOT TRUST THE ASK. `evict` walks leaves and can stop
+            # short (a locked or un-backed node refuses, see #841), and the
+            # difference between "asked for N" and "the tree is now empty" is
+            # precisely the difference W29 could not see. Residue here is the
+            # census's `unaccounted` one pass before it becomes fatal.
+            residue = tree_evictable_full_rows(tree)
+            if residue:
+                logger.error(
+                    "%s #856: the prefix tree still reports %d evictable "
+                    "row(s) after a drop that asked for %d and was told %d "
+                    "were evicted; reset() is about to orphan them and the "
+                    "next idle check will read them as a pool leak",
+                    LOG_PREFIX,
+                    residue,
+                    evictable,
+                    returned,
+                )
     try:
         tree.reset()
     except Exception:  # noqa: BLE001
@@ -8198,22 +8276,38 @@ class PhaseFlipRuntime:
             )
             return out
 
+        # W29: SAY HOW MANY ROWS THE DROP RETURNED. `drop_prefix_tree_
+        # returning_rows` computes exactly that and its own docstring says the
+        # number "has to be visible" -- and then the seam threw it away, so
+        # the drop that silently returned ZERO rows on every flip of the W29
+        # boot looked identical in the log to one that returned all of them.
+        # The only reader left was the pool census, one pass later, and by
+        # then the arithmetic no longer names the owner.
+        tree_rows = {"returned": None}
+
+        def _drop_and_record():
+            tree_rows["returned"] = reset_tree()
+            return tree_rows["returned"]
+
         reqs = list(_live_reqs(scheduler))
         released = release_residents_for_cutover(
-            reqs, retract=_retract_and_consume, reset_tree=reset_tree
+            reqs, retract=_retract_and_consume, reset_tree=_drop_and_record
         )
         n = len(released or ())
         self.residents_released = int(getattr(self, "residents_released", 0)) + n
+        self.tree_rows_returned = tree_rows["returned"]
         logger.info(
             "%s RESIDENTS RELEASED for %s: %d request(s) retracted, %d live "
-            "reference(s) retired, and the prefix tree dropped, in that order "
-            "(#856). Their KV is in the canonical store from the fence; the "
-            "new layout re-admits them and serves the prefix by read-through. "
-            "Nothing is carried across, and nothing retracted is still live.",
+            "reference(s) retired, and the prefix tree dropped returning %s "
+            "row(s) to the allocator, in that order (#856). Their KV is in "
+            "the canonical store from the fence; the new layout re-admits "
+            "them and serves the prefix by read-through. Nothing is carried "
+            "across, and nothing retracted is still live.",
             LOG_PREFIX,
             direction,
             n,
             int(getattr(self, "_retracted_refs_retired", 0)),
+            "UNKNOWN" if tree_rows["returned"] is None else tree_rows["returned"],
         )
         return released
 
