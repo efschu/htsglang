@@ -2867,13 +2867,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             else min_completed_tokens - insert_result.prefix_len
         )
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        # #843: `refused` separates the TWO reasons this line can say loaded=0,
+        # which are not the same finding and were indistinguishable at INFO.
+        #
+        #   refused=0  nothing was there to load -- the storage tier missed, or
+        #              the tree already held the whole fetched span
+        #              (matched == completed_synced). Arithmetic, not a defect.
+        #   refused=1  the tail WAS fetched and the tree declined to adopt it,
+        #              because the walk landed on a node carrying no host copy
+        #              (#841's contiguous-backup law).
+        #
+        # Window 6 needed exactly this and could not get it: 339 prefetches all
+        # reported loaded=0, and the only refusal marker was a logger.debug on
+        # a boot running log_level='info', so it could never appear. That made
+        # W-841's acceptance criterion 2 -- "loaded=0 everywhere AND the decline
+        # line frequent" -- unmeasurable by construction. 315 of those 339 were
+        # arithmetic and 24 were refusals; without this field that split costs
+        # a log-and-code archaeology pass.
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d refused=%d tail_release=%d occupied=%d",
             req_id,
             completed_tokens,
             min_completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
+            int(insert_result.host_span_unclaimed),
             completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
