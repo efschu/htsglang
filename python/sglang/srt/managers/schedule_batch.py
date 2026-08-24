@@ -1144,9 +1144,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        assert not self.kv_committed_freed, (
+            f"Committed KV cache already freed ({self.kv_committed_len=})"
+        )
         self.kv_committed_freed = True
         return self._cache_commit_len()
 
@@ -1156,9 +1156,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        assert not self.kv_overallocated_freed, (
+            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        )
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
@@ -1577,6 +1577,44 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
+        # #856: RECORD WHAT WAS ALREADY COMPUTED, BEFORE THE FIELDS THAT SAY SO
+        # ARE CLEARED THREE LINES DOWN.
+        #
+        # A retracted request goes back to the waiting queue and its FULL
+        # prompt reappears in `Scheduler._pending_prefill_tokens`, which is the
+        # quantity the phase policy compares against the break-even N. But N is
+        # priced from the UNCACHED prefill throughputs, and these tokens are
+        # not uncached: their KV was computed, and under the phase-flip fence
+        # it has been persisted to the canonical store, so re-prefilling them
+        # is a cache read in EITHER layout. Tokens that cost the same in both
+        # layouts cannot make one layout cheaper than the other, so they must
+        # not enter that comparison at all.
+        #
+        # #731 measured what happens when this figure is inflated across a
+        # cutover -- "51,369 -> 102,307 tokens ... six cutovers, nothing
+        # served" -- from a different cause (double-counting). This is the same
+        # shape by a route that dedup cannot catch, because nothing is counted
+        # twice here; it is counted ONCE at a price that is wrong.
+        #
+        # Captured here rather than looked up later because the lookup is
+        # impossible later: `prefix_indices`, `num_matched_prefix_tokens` and
+        # `extend_range` are all cleared below. It is also FREE here, where a
+        # `match_prefix` walk per queued request per policy round would not be.
+        #
+        # `extend_range.end` is the fill boundary, the same notion of
+        # "computed" the pending counter itself uses for a chunked remainder.
+        # A request that has emitted output finished its prefill by
+        # construction, so its whole prompt is covered.
+        if self.output_ids:
+            computed = len(self.origin_input_ids)
+        elif self.extend_range is not None:
+            computed = int(self.extend_range.end)
+        else:
+            computed = 0
+        self.cached_prompt_tokens_at_retract = max(
+            0, min(int(computed), len(self.origin_input_ids))
+        )
+
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
@@ -1766,7 +1804,11 @@ def set_mamba_track_indices_from_reqs(batch):
             # discarded, so column 0 is a harmless placeholder; legitimate reqs
             # always carry a real index, so this default never masks a real bug.
             [
-                (req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0)
+                (
+                    req.mamba_next_track_idx
+                    if req.mamba_next_track_idx is not None
+                    else 0
+                )
                 for req in batch.reqs
             ],
             dtype=torch.int64,
@@ -2202,9 +2244,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []

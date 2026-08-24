@@ -444,6 +444,56 @@ def default_pp_micro_batch_size(
     return max(int(max_running_requests) // max(int(pp_size), 1), 1)
 
 
+def uncached_prompt_tokens(req) -> int:
+    """Prompt tokens of ``req`` that still have to be COMPUTED (#856).
+
+    THE QUANTITY THE BREAK-EVEN IS ACTUALLY ABOUT. The phase policy compares
+    pending prefill against ``N = C / (1/X - 1/P)``, where X and P are the TP
+    and PP prefill THROUGHPUTS -- uncached ones. A token whose KV already
+    exists is not prefilled at either rate; it is read back from the cache,
+    at a cost that does not depend on the layout. Equal cost on both sides of
+    an inequality cancels, so such a token cannot make PP cheaper than TP and
+    has no business in the comparison.
+
+    WHY THIS EXISTS NOW. The phase-flip seam retracts resident requests rather
+    than carrying them (#856: the carry is what made #825's tree reset crash,
+    and read-through makes the carry unnecessary). Retraction puts the full
+    prompt back in the waiting queue, so without this the policy would see a
+    huge backlog immediately after every cutover, in BOTH directions, and
+    price cache reads as if they were cold prefill.
+
+    #731 measured that failure from a different cause -- one prompt counted
+    twice across a cutover, "51,369 -> 102,307 tokens ... six cutovers,
+    nothing served". Its fix (make the carry consume the queue entry) cannot
+    catch this route, because nothing is double-counted here: the tokens are
+    counted ONCE, at the wrong price.
+
+    THE CREDIT IS ONLY EVER WHAT WAS MEASURED AT RETRACTION, never a guess:
+    ``reset_for_retract`` stamps the fill boundary before clearing it. A
+    request that was never retracted carries no stamp and is counted in full,
+    so every pre-#856 path returns the identical number.
+
+    CONSERVATIVE IF THE CACHE MOVES UNDER IT. If those tokens are later
+    evicted, the credit overstates residency and this UNDER-reports pending --
+    which makes the policy less eager to flip, not more. The error direction
+    is the one that cannot cause the thrash this function exists to prevent.
+    """
+    try:
+        total = len(req.origin_input_ids)
+    except (AttributeError, TypeError):
+        return 0
+    if not getattr(req, "is_retracted", False):
+        return int(total)
+    try:
+        credit = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
+    except (TypeError, ValueError):
+        credit = 0
+    # Floor at zero and never let a stale credit exceed the prompt: this
+    # figure is a backlog, and a negative one would silently offset the
+    # remaining requests' real work.
+    return max(0, int(total) - max(0, min(credit, int(total))))
+
+
 def _arriving_prefill_tokens(inflight, _already_queued=None) -> int:
     """#713: prompt tokens that have ARRIVED but are not yet on the queue.
 
@@ -8011,9 +8061,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     _note_skip("batch_full_break", req.rid)
                     break
@@ -8900,6 +8949,7 @@ class Scheduler(
             # E402 in a file where all ~90 of them are already the same
             # finding.
             from sglang.srt.managers import layout_conformance
+
             admitted = getattr(batch, "_layout_admitted_phase", None)
             reqs = getattr(batch, "reqs", None) or ()
             rid = getattr(reqs[0], "rid", "-") if reqs else "-"
@@ -10505,7 +10555,12 @@ class Scheduler(
         maybe_arm_phase_policy), so this needs no cross-rank replication.
         """
         queued = list(self.waiting_queue)
-        pending = sum(len(req.origin_input_ids) for req in queued)
+        # #856: UNCACHED prompt tokens. A token whose KV already exists costs a
+        # cache read in EITHER layout, so it cannot make one layout cheaper
+        # than the other and must not enter the break-even comparison. See
+        # `uncached_prompt_tokens`; for a request that was never retracted the
+        # credit is zero and this is the pre-#856 sum, token for token.
+        pending = sum(uncached_prompt_tokens(req) for req in queued)
         # #731: THE TERMS BELOW MUST NOT RE-BILL WHAT THE QUEUE ALREADY DID.
         #
         # The resident term further down and this one are two different sets,
@@ -10953,9 +11008,7 @@ class Scheduler(
                 if alarm:
                     layout_conformance.note_conformance_violation(detail, now)
 
-            window_s = layout_conformance.economy_window_s(
-                drain_stall_deadline_s(cfg)
-            )
+            window_s = layout_conformance.economy_window_s(drain_stall_deadline_s(cfg))
             held_s = 0.0 if state.phase_since is None else now - state.phase_since
             # Never observed shrinking -> the whole occupancy has passed with
             # no recorded progress, which is exactly what that reads as.
@@ -11449,9 +11502,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert (
-        scheduler.disaggregation_mode == DisaggregationMode.NULL
-    ), "phase flip x PD disaggregation is refused at argument time"
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
