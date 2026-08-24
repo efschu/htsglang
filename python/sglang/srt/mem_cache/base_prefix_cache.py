@@ -112,6 +112,13 @@ class InsertResult:
     mamba_exist: bool = False
     inserted_host_node: Any = None
 
+    #: #841: the host-only insert declined to adopt the fetched tail because
+    #: attaching it would have broken the contiguous-backup law (see
+    #: ``UnifiedRadixCache._insert_helper_host``). The span the caller had
+    #: reserved for it therefore has no owner and must be released by the
+    #: caller -- nothing in the tree will ever free it.
+    host_span_unclaimed: bool = False
+
 
 @dataclasses.dataclass
 class EvictParams:
