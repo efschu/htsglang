@@ -12,10 +12,28 @@
 #   STAGE=a  TP=1, no spec      -> loader / kernels / checkpoint
 #   STAGE=b  TP=1, NEXTN spec   -> the #647 router-gate fix on-card (blk.40)
 #   STAGE=c  TP=2, NEXTN spec   -> tensor parallelism
-#   STAGE=d  PP=3, NEXTN spec   -> pipeline parallelism
+#   STAGE=d  PP=3, NO spec      -> pipeline parallelism, alone
+#   STAGE=e  PP prefill + TP decode + spec, via --enable-phase-flip
+#
+# The d/e split is forced by the tree, not by taste. server_args.py:19303
+# (reached from entrypoints/engine.py:889 via check_server_args) asserts:
+#
+#     assert self.speculative_algorithm is None or self.enable_phase_flip
+#
+# PP and speculation cannot run in the same phase: no draft worker exists in a
+# PP phase, and the draft constructors take no pp_rank, so it is enforced by
+# construction rather than by refusing a flag combination. The predecessor's
+# boot.sh STAGE=d asked for PP=3 + NEXTN together and would have died on this
+# assert -- it was never run, so nobody found out. Verified at desk 2026-08-24:
+# PP=3+NEXTN REFUSED, PP=3 no-spec ACCEPTED, TP=2+NEXTN ACCEPTED.
+#
+# STAGE=e is therefore the configuration that actually delivers "PP and TP and
+# speculation" on this tree: #631 Route A, one instance that runs PP for prefill
+# and flips to TP for decode on the same ranks, with the drafter armed on the TP
+# side at cutover.
 #
 # Env knobs: STAGE, TP, PP, SPEC=0|1, DEVICES=<sel>, PORT, GRAPHS=0|1, MODEL,
-#            CTX, MEMFRAC, BOOT_LOG
+#            CTX, MEMFRAC, BOOT_LOG, FLIP_TP_VECTOR
 set -u
 
 WT=${WT:-/spinning/wt-651-rig}
@@ -27,8 +45,8 @@ VENV=/spinning/htsglang-gpu/.venv
 # GPU window to learn something `test -f` answers for free.
 STAGE=${STAGE:-a}
 case "$STAGE" in
-  a|b|c|d) ;;
-  *) echo "REFUSE: unknown STAGE '$STAGE' (expected a|b|c|d)" >&2; exit 2 ;;
+  a|b|c|d|e) ;;
+  *) echo "REFUSE: unknown STAGE '$STAGE' (expected a|b|c|d|e)" >&2; exit 2 ;;
 esac
 
 MODEL=${MODEL:-}
@@ -69,8 +87,18 @@ case "$STAGE" in
   a) TP=${TP:-1}; PP=${PP:-1}; SPEC=${SPEC:-0}; DEVICES=${DEVICES:-5090} ;;
   b) TP=${TP:-1}; PP=${PP:-1}; SPEC=1;          DEVICES=${DEVICES:-5090} ;;
   c) TP=${TP:-2}; PP=${PP:-1}; SPEC=1;          DEVICES=${DEVICES:-all}  ;;
-  d) TP=${TP:-1}; PP=${PP:-3}; SPEC=1;          DEVICES=${DEVICES:-all}  ;;
+  # d: PP alone. SPEC is forced OFF -- see the assert quoted in the header.
+  d) TP=${TP:-1}; PP=${PP:-3}; SPEC=0;          DEVICES=${DEVICES:-all}  ;;
+  # e: PP prefill -> TP decode, drafter armed on the TP side at cutover.
+  e) TP=${TP:-1}; PP=${PP:-3}; SPEC=1; FLIP=1;  DEVICES=${DEVICES:-all}  ;;
 esac
+FLIP=${FLIP:-0}
+# No default exists for the flip's TP decode layout and the tree refuses without
+# it ("there is no default because pool sizing derives from it"). 32,16,16 is the
+# weighting the 2026-08-24 window-7 boot ran on these same three cards, i.e.
+# roughly 5090 : 3080 : 3080; it is a starting point to be measured, not a
+# derived optimum for this model.
+FLIP_TP_VECTOR=${FLIP_TP_VECTOR:-32,16,16}
 LOG=${BOOT_LOG:-/spinning/651-gguf-q4/stage_${STAGE}.boot.log}
 mkdir -p "$(dirname "$LOG")"
 
@@ -146,6 +174,12 @@ ARGS=(
   --host 127.0.0.1 --port "$PORT"
 )
 [ "$GRAPHS" = "1" ] || ARGS+=(--disable-cuda-graph)
+# PP requires the synchronous scheduler; the tree warns and forces it anyway,
+# but passing it explicitly keeps the recorded cmdline honest about what ran.
+[ "$PP" -gt 1 ] && ARGS+=(--disable-overlap-schedule)
+if [ "$FLIP" = "1" ]; then
+  ARGS+=(--enable-phase-flip --phase-flip-tp-vector "$FLIP_TP_VECTOR")
+fi
 # The two 3080s have no P2P on this rig (all PHB); the custom all-reduce path
 # needs it, so TP collectives fall back to NCCL.
 [ "$TP" -gt 1 ] && ARGS+=(--disable-custom-all-reduce)

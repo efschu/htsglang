@@ -24,6 +24,13 @@ GGUF_REPO=unsloth/Qwen3.6-35B-A3B-MTP-GGUF
 BASE_REPO=Qwen/Qwen3.6-35B-A3B
 GGUF_FILE=Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 
+# Not optional. Without hf_transfer the plain python client sustained 0.3 MiB/s
+# against this CDN and repeatedly stalled outright (11 MiB, then nothing for
+# minutes); parallel curl ranges did not rescue it either, since the CDN reset
+# half the connections. With hf_transfer the same fetch runs at ~11 MiB/s, which
+# turns a ~20 hour transfer into ~30 minutes. Measured 2026-08-24, unauthenticated.
+export HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-1}
+
 mkdir -p "$DEST"
 
 # Refuse early rather than half-way: 21.28 GiB of weights plus headroom.
