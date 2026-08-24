@@ -1595,6 +1595,20 @@ class PhasePolicyConfig:
     #: every rule it gates is byte-identical to the previous behaviour until it
     #: is set, so no existing deployment moves.
     drain_mode: bool = False
+    #: #856 STRICT PHASE BATCHING (user directive 2026-08-24). All pending
+    #: prefill is processed in PP, all decode in TP, and NEVER any work in the
+    #: wrong layout -- "egal wie lang der flip dauert". The trigger is then
+    #: DRAIN-AND-FLIP and nothing else: the break-even band answers "is this
+    #: backlog worth the seam?", which is precisely the question this mode does
+    #: not ask, because the alternative to flipping is running prefill in the
+    #: decode layout and the mode forbids that outright.
+    #:
+    #: AN EXTENSION OF ``drain_mode``, NOT A RIVAL TO IT: the exit it relies on
+    #: lives in the drain block, and ``--phase-flip-policy`` is left alone
+    #: because that enum selects the manual-vs-auto ENGINE, not the arming
+    #: rule. Off by default; the economic mode stays byte-identical for every
+    #: other workload.
+    drain_mode_strict: bool = False
     pp_exit_tokens: int = DEFAULT_PP_EXIT_TOKENS
     #: The scheduler's chunked_prefill_size, filled in at boot. Drives the
     #: seam staging estimate below.
@@ -1641,6 +1655,17 @@ class PhasePolicyConfig:
     prefill_runs_in_tp: bool = True
 
     def __post_init__(self) -> None:
+        # #856: strict batching EXTENDS drain; it does not replace it. The exit
+        # strict relies on lives in the drain block, so running strict with
+        # drain off would gate the economic band away and then fall through to
+        # the very economics the mode exists to remove -- a half-applied mode
+        # that looks configured and behaves like neither.
+        if self.drain_mode_strict and not self.drain_mode:
+            raise PhasePolicyError(
+                "phase policy strict batching requires drain mode: strict is an "
+                "extension of the drain exit, not an alternative to it. Set "
+                "--phase-policy-drain-mode (or drop --phase-policy-drain-mode-strict)."
+            )
         if self.rest_state not in REST_STATES:
             raise PhasePolicyError(
                 f"{ENV_REST_STATE}={self.rest_state!r} is not a known resting "
@@ -2441,6 +2466,12 @@ def _decide_from_load(
         priced = flip_cost_provenance()
         if (
             cfg.prefill_runs_in_tp
+            # #856 STRICT BATCHING: the band cannot apply here. It sits ABOVE
+            # the drain exit and returns `_no`, so a correct drain rule below
+            # is not sufficient -- the band has to stop being consulted at all,
+            # or it holds TP and prefill runs in the decode layout, which is
+            # the one thing this mode forbids.
+            and not cfg.drain_mode_strict
             and inp.running_bs > 0
             and n_live < inp.pending_prefill_tokens <= tp_threshold
         ):
@@ -3180,6 +3211,7 @@ def _env_int(name: str, default: int) -> int:
 #: completion, prefill again". Off unless set, so no deployment moves without
 #: asking for it.
 ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
+ENV_DRAIN_MODE_STRICT = "SGLANG_PHASE_POLICY_DRAIN_MODE_STRICT"
 
 
 def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
@@ -3305,6 +3337,20 @@ def config_from_env(
         enabled=enabled,
         drain_mode=_flag_or_env(
             server_args, "phase_policy_drain_mode", ENV_DRAIN_MODE, _env_flag, False
+        )
+        or _flag_or_env(
+            server_args,
+            "phase_policy_drain_mode_strict",
+            ENV_DRAIN_MODE_STRICT,
+            _env_flag,
+            False,
+        ),
+        drain_mode_strict=_flag_or_env(
+            server_args,
+            "phase_policy_drain_mode_strict",
+            ENV_DRAIN_MODE_STRICT,
+            _env_flag,
+            False,
         ),
         flip_tokens=flip_tokens,
         min_dwell_s=min_dwell,

@@ -5606,6 +5606,20 @@ class ServerArgs:
             "that env var, which is deprecated.",
         ),
     ] = None
+    phase_policy_drain_mode_strict: A[
+        Optional[bool],
+        Arg(
+            help="#856 STRICT PHASE BATCHING. All pending prefill runs in PP, "
+            "all decode runs in TP, and nothing ever runs in the wrong layout "
+            "-- regardless of how long the flip takes. Implies "
+            "--phase-policy-drain-mode (and is refused without it). The "
+            "difference from plain drain mode is that the BREAK-EVEN BAND is "
+            "not consulted at all: it sits above the drain exit and can hold "
+            "TP while prefill waits, which is precisely the wrong-layout work "
+            "this mode forbids. The economic policy is unchanged for every "
+            "other workload.",
+        ),
+    ] = None
     phase_policy_min_dwell_s: A[
         Optional[float],
         Arg(
