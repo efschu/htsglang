@@ -174,6 +174,24 @@ namespace. All eight GGUF ops are present in this venv's build
 takes a bool `pad_sorted_token_ids` in position 7. Use the unit tests above
 rather than hand-rolled calls.
 
+## 6b. Stage d is structurally sound (PP layer ownership)
+
+Worth checking before spending a window on it, because the GGUF adapter has no
+pipeline awareness of its own: `gguf_qwen35.py` and `gguf_adapter_base.py`
+contain no `pp_rank` / `start_layer` handling at all, and the one PP layer
+filter in `model_loader/loader.py:1446-1451` belongs to `QuantizedRLModelLoader`
+— a different loader that the GGUF path does not use.
+
+The filtering happens model-side instead, which is the right place: the GGUF
+stream is fed to the model's own `load_weights`, and `models/qwen3_5.py`
+(load_weights at 2011) skips any tensor whose `layer_id` falls outside
+`[self.start_layer, self.end_layer)` and gates `lm_head` on
+`pp_group.is_last_rank`. The model builds its layers through `make_layers` with
+`pp_rank` / `pp_size` and exposes `start_layer` / `end_layer` (1515-1553).
+
+So each PP stage loads only the layers it owns, and stage d does not need a
+GGUF-side change.
+
 ## 7. Open residuals for the rig
 
 1. **PP=3 GGUF has never been executed.** `boot.sh` STAGE=d was written and its
