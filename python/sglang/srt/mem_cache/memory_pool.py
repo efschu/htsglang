@@ -2668,17 +2668,32 @@ class MHATokenToKVPool(KVCache):
                 lawful_reservation_rows,
             )
 
-            # THE DERIVED RESERVE IS NOT KNOWABLE HERE. It comes from the
-            # prefill chunk size, which does not exist when the pool reserves
-            # its address space -- with no scheduler the derivation falls back
-            # to 512, while W22's live value was 4096. Sizing the reservation
-            # on 512 would rebuild the same wall one layer down, so the boot
-            # assumption takes the LARGER of the two. VA is cheap; the wall is
-            # permanent.
+            # DERIVE FROM THE BOOT-KNOWN INPUT, don't guess. The reserve is
+            # "the largest single admission the scheduler can attempt", which
+            # `_admission_reserve_rows` derives from `chunked_prefill_size` --
+            # and that is a server_arg, fixed before this pool exists. It is
+            # simply not reachable from `self`, which is why the first version
+            # of this passed `None` and silently took the 512 fallback while
+            # W22's live value was 4096.
+            #
+            # Reading the global server args removes both the guess and the
+            # failure mode a constant carries: a boot configured above whatever
+            # number a desk picked would rebuild the wall.
+            reserve = 0
             try:
-                reserve = int(_admission_reserve_rows(None))
-            except Exception:  # noqa: BLE001 - the derived value is best-effort
+                from sglang.srt.server_args import get_global_server_args
+
+                reserve = max(0, int(get_global_server_args().chunked_prefill_size))
+            except Exception:  # noqa: BLE001 - fall through to the derivation
                 reserve = 0
+            if reserve <= 0:
+                try:
+                    reserve = int(_admission_reserve_rows(None))
+                except Exception:  # noqa: BLE001 - best-effort
+                    reserve = 0
+            # BELT AND BRACES, not the primary source any more: a floor under
+            # the derivation, so a missing or zero server_arg cannot produce a
+            # reservation smaller than the pre-#851 wall.
             reserve = max(reserve, int(CONSERVATIVE_ADMISSION_RESERVE_ROWS))
             return int(lawful_reservation_rows(int(self.size), reserve, 0))
         except Exception:  # noqa: BLE001 - never fail construction on a knob

@@ -91,6 +91,25 @@ while W22's live value was 4096 -- rebuilding the same wall one layer down. The
 boot assumption now takes `max(derived, CONSERVATIVE_ADMISSION_RESERVE_ROWS)`.
 A test that could only pass would never have found that.
 
+## The reserve constant, answered rather than left bare
+
+`CONSERVATIVE_ADMISSION_RESERVE_ROWS = 16384` was first written as the PRIMARY
+boot assumption, and that was the #505 shape -- a shipped default with no proof
+behind the number, carrying its own failure mode (a boot configured with a
+prefill chunk above it rebuilds the wall).
+
+It is now BELT AND BRACES only. The reserve is derived from
+`get_global_server_args().chunked_prefill_size`, which is the same input
+`_admission_reserve_rows` uses and is fixed before the pool exists. Nothing in
+the derivation needs a scheduler; the value was simply not reachable from
+`self`, which is why the first version passed `None` and silently took the 512
+fallback. The constant survives only as a floor under a missing or zero
+server_arg, where the alternative would be a reservation smaller than the
+pre-#851 wall.
+
+So no term is unknown at boot, and the constant no longer decides anything on a
+correctly configured boot.
+
 ## Metal criteria are NOT substituted by any of this
 
 "0 over-cap floor vetoes under load" stays in the window ticket unchanged. The
