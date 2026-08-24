@@ -7827,10 +7827,26 @@ class PhaseFlipRuntime:
                 DEFAULT_ARMING_MARGIN_MIB,
             )
 
+            # #851 F5: READ WHAT THE ACTUATOR ADOPTED, not the shipped constant.
+            # This used to pass `cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB` while the
+            # gate arms on `cg.seam_entry_reserve_mib_resolved()`. On a boot
+            # with the #826 solver armed the two differ, and the advice then
+            # diagnoses a contradiction the boot does not have.
+            #
+            # MEASURED, W22: log 396/411/412 recorded "#826 arming floor 1037
+            # MiB, solver-derived, corridor ceiling 1229 MiB" -- it fits, the
+            # gate armed -- and every abandon line still appended "UNSATISFIABLE
+            # ARMING FLOOR: the gate would arm at 1331", the shipped-constant
+            # figure, 14 times. It sent every reader away from the real defect.
+            #
+            # The advice itself stays: on the shipped default the contradiction
+            # is REAL (819 + 512 + 192 = 1523 against a 1229 ceiling), and
+            # withdrawing "wait for occupancy to drop" is the whole point of
+            # #770 Defect A. It just has to be true of THIS boot.
             sol = solve_arming_floor(
                 cg.corridor_band_floor_mib(),
                 cg.corridor_band_ceiling_mib(),
-                cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+                cg.seam_entry_reserve_mib_resolved(),
                 DEFAULT_ARMING_MARGIN_MIB,
             )
             if sol.satisfiable:
