@@ -1084,6 +1084,33 @@ def releasable_cache_bytes_from_stats(stats, alloc_conf: str = "") -> Optional[i
         return None
 
 
+def _writeback_fence_ms(report) -> Optional[float]:
+    """The HiCache fence's own elapsed time, in ms, or None (#856).
+
+    ``None`` means NO FENCE RAN and must never collapse into ``0.0``. The two
+    readings a seam census most needs to separate are "this cost nothing" and
+    "this did not happen" -- the fence is skipped outright without a canonical
+    store, and a defaulted zero there would report a flip as fully fenced when
+    nothing was persisted at all.
+
+    Reads the report defensively rather than by attribute access, because a
+    stand-in or a partially wired object is the ordinary state in tests and an
+    instrument may never be the thing that breaks a flip.
+    """
+    if report is None:
+        return None
+    try:
+        return float(report.elapsed_s) * 1000.0
+    except Exception:  # noqa: BLE001 - an instrument, never a gate
+        # Deliberately broad. A narrow (AttributeError, TypeError, ValueError)
+        # was the first version and its own can-fail test killed it: a report
+        # whose `elapsed_s` is a property that raises anything else would have
+        # climbed out of here into the cutover, with requests already parked.
+        # This runs on the flip path, where the module's standing rule is that
+        # an instrument may cost a missing line and never a flip.
+        return None
+
+
 def _segment_pool_id(seg) -> tuple:
     """The private-pool id of one snapshot segment, ``(0, 0)`` for the general
     pool. Torch names the field ``segment_pool_id`` in the snapshot dict and
@@ -9513,8 +9540,17 @@ class PhaseFlipRuntime:
                 maybe_flip_writeback,
             )
 
-            if maybe_flip_writeback(getattr(self, "_census_scheduler", None)):
+            report = maybe_flip_writeback(getattr(self, "_census_scheduler", None))
+            if report:
                 seam_census.mark("flip_writeback")
+                # #856: THE FENCE IS HALF THE NEW VALIDATION METRIC. Once the
+                # flip carries no KV, cutover-blocking time is fence + weights
+                # refill, and the fence's cost has until now been visible only
+                # as a census SEGMENT (`flip_writeback->hicache_quiesce`, 74.8
+                # ms in W25) -- a delta between two marks, which nothing that
+                # reads `last_stats` can see. The report already carries its
+                # own elapsed time; this only stops throwing it away.
+                self._last_writeback_report = report
         except Exception as e:
             logger.error(
                 "%s #703 flip-time writeback did not run (%s); the flip "
@@ -10385,6 +10421,19 @@ class PhaseFlipRuntime:
             # at "cutover N ms)", and silently breaking the analysis's own
             # documented grep is the exact failure this ticket is repairing.
             "drain_ms": float(getattr(self, "_seam_drain_ms", 0.0)),
+            # #856: the HiCache fence, for the same reason and by the same
+            # rule as `drain_ms` above -- recorded in the stats dict, kept OUT
+            # of the DONE line's parenthesised list, because ANALYSE_830
+            # section 10's reproduction regex pins that list ending at
+            # "cutover N ms)" and silently breaking a documented grep is the
+            # failure #830 was repairing.
+            #
+            # None, never 0.0, when no fence ran: "the fence cost nothing" and
+            # "no fence happened" are different facts, and a defaulted zero is
+            # the #606 shape this build has removed repeatedly.
+            "writeback_fence_ms": _writeback_fence_ms(
+                getattr(self, "_last_writeback_report", None)
+            ),
         }
         self.last_stats = stats
         logger.warning(
