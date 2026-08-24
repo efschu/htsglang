@@ -35,6 +35,7 @@ until then. A tolerance covers the per-layer gather (one layer's rows,
 from __future__ import annotations
 
 import threading
+import types
 import unittest
 import weakref
 
@@ -262,6 +263,25 @@ def _make_layout_pools(layer_map, vec, num_slots, seed=7):
     return (ref_k, ref_v), live, pp_pools, pp_views, tp_pools, tp_views
 
 
+class _SchedStub:
+    """The minimum the #856 seam requires of a scheduler.
+
+    The flip now RETRACTS its residents and DROPS the prefix tree before the
+    cutover (the flip carries no KV; see `release_residents_for_cutover`), so
+    a runtime built by hand -- rather than by `build_phase_flip_runtime`,
+    which binds the real scheduler -- has to supply a resettable tree. There
+    are no resident requests in this harness, so the retraction is a no-op and
+    none of the pools are touched.
+    """
+
+    def __init__(self):
+        self.resets = 0
+        self.tree_cache = types.SimpleNamespace(reset=self._reset)
+
+    def _reset(self):
+        self.resets += 1
+
+
 def _build_runtimes(pp_views, tp_views, live, mailbox=None, channel=None):
     n = len(VEC)
     channel = channel or _BarrierMinChannel(n)
@@ -286,6 +306,7 @@ def _build_runtimes(pp_views, tp_views, live, mailbox=None, channel=None):
                 cutover_fn=lambda d: None,
             )
         )
+        runtimes[-1]._census_scheduler = _SchedStub()
     return runtimes
 
 
@@ -440,162 +461,97 @@ class TestMoverLiveSetIsBounded(CustomTestCase):
         )
 
 
-class TestStagingFormulaMatchesReality(CustomTestCase):
-    """``_staging_bytes`` is what the affordability gate spends. It has to
-    be the quantity the mover actually holds, or every refusal -- including
-    the one that produced the HANDOFF_664 section 9 livelock -- is computed
-    from a number that does not exist."""
+class TestTheFlipCarriesNoKv(CustomTestCase):
+    """#856 -- REPLACES ``TestStagingFormulaMatchesReality``.
 
-    def test_staging_bytes_predicts_the_measured_peak(self):
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+    THE RETIRED CONTRACT was "``_staging_bytes`` must cover the bytes the
+    mover holds", asserted three ways: not under-reserving against the plan's
+    legs, not over-reserving against the measured peak, and counting the local
+    leg when it dominates. All three priced A MOVE.
+
+    The mover no longer runs inside a flip. The residents are retracted and
+    the transfer plan is rebuilt EMPTY before the wave loop
+    (``_release_residents_for_cutover``), so the seam holds nothing, and a
+    reservation sized to a move reserves for something that cannot happen.
+    That reservation is what refused 33 arms in W25 -- 25 on the staging rate
+    limit, 17 FLIP ABANDONED -- against a 2339 MiB ``tp_to_pp`` ask on PP0.
+
+    So the assertions INVERT: a flip that still moves KV must FAIL here. The
+    fixture is unchanged and still builds a real, non-empty live set, which is
+    what makes "it moved nothing" a result rather than a tautology.
+    """
+
+    def _flip_and_probe(self, direction):
+        _ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, NUM_SLOTS
         )
         runtimes = _build_runtimes(pp_views, tp_views, live)
-        rt = runtimes[0]
+        probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
+        errs = _run_ranks_probing(runtimes, [direction] * 3, 0, probe)
+        self.assertEqual([e for e in errs if e], [])
+        return runtimes, probe, pp_views, tp_views, live
+
+    def test_the_seam_moves_no_kv_at_all(self):
+        # THE HEADLINE ASSERTION of the whole ticket. `probe.peak` is the
+        # transient storage the seam allocated outside the persistent pools;
+        # under the old contract it was 3.8-27.7 MiB on this fixture.
+        _rt, probe, _s, _d, _live = self._flip_and_probe(PP_TO_TP)
+        self.assertEqual(
+            probe.peak,
+            0,
+            f"the flip allocated {probe.peak / MIB:.1f} MiB of transient "
+            f"storage; under #856 it carries NO KV and must hold nothing",
+        )
+
+    def test_the_other_direction_moves_no_kv_either(self):
+        _rt, probe, _s, _d, _live = self._flip_and_probe(TP_TO_PP)
+        self.assertEqual(probe.peak, 0)
+
+    def test_the_prefix_tree_is_dropped_once_per_flip_on_every_rank(self):
+        # The other half of the contract: nothing is carried, so every rank
+        # must invalidate its device tier or the next phase reads prefixes
+        # naming rows that hold no KV.
+        runtimes, _p, _s, _d, _l = self._flip_and_probe(PP_TO_TP)
+        for rt in runtimes:
+            self.assertEqual(rt._census_scheduler.resets, 1)
+
+    def test_the_staging_ask_is_independent_of_the_live_set(self):
+        # `wave_peak` is retired from the ask, so the SAME number must come
+        # back for a full plan and an empty one. This is the funding claim in
+        # unit form: the gate can no longer refuse a flip because of KV the
+        # flip will not move.
+        _ref, live, _ppp, pp_views, _tpp, tp_views = _make_layout_pools(
+            MAP_625, VEC, NUM_SLOTS
+        )
+        rt = _build_runtimes(pp_views, tp_views, live)[0]
         src, dst = pp_views[0], tp_views[0]
         tr, outgoing, incoming, local = _plan_legs(live, 0, PP_TO_TP, src, dst)
-        # PRICE THE SEAM THAT IS ABOUT TO RUN, NOT A DIFFERENT ONE. #656
-        # successor 38: this test compared an UNWAVED prediction with a WAVED
-        # measurement and had been red since the seam learned to wave. The
-        # production gate passes ``_flip_waves(direction)`` into the same call
-        # (``phase_flip_runtime._execute``), so a single-wave estimate is a
-        # quantity no caller ever spends -- on this fixture it is 20.2 MiB
-        # against a 3.8 MiB measured peak, and reading that gap as a 5.4x
-        # over-reservation in production is exactly the wrong conclusion.
-        single_wave = rt._staging_bytes(tr, PP_TO_TP, src, dst)
-        predicted = rt._staging_bytes(tr, PP_TO_TP, src, dst, rt._flip_waves(PP_TO_TP))
-
-        probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
-        errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, 0, probe)
-        self.assertEqual([e for e in errs if e], [])
-
-        # The gate must not UNDER-reserve: that is the accounting hole in
-        # HANDOFF_664 section 13a, which omitted the local leg entirely. Stated
-        # on the single-wave estimate, because the provable floor below is
-        # summed over the WHOLE plan and a waved seam never holds it at once.
-        self.assertGreaterEqual(
-            single_wave,
-            peak_floor := max(outgoing + incoming, incoming + local),
-            f"_staging_bytes {single_wave / MIB:.1f} MiB is below the bytes "
-            f"the move provably holds ({peak_floor / MIB:.1f} MiB): "
-            f"outgoing {outgoing / MIB:.1f}, incoming {incoming / MIB:.1f}, "
-            f"local {local / MIB:.1f} -- the gate under-reserves",
+        # The fixture must really have a live set, or this proves nothing.
+        self.assertGreater(outgoing + incoming + local, 0)
+        empty = build_phase_flip_transition(
+            torch.empty(0, dtype=torch.int64), MAP_625, N_LAYERS, VEC, 0, PP_TO_TP
         )
-        # ...and must not GROSSLY over-reserve either: the gate's only
-        # action is to refuse, and a refusal does not drain the condition
-        # it tested (HANDOFF_664 section 13c), so slack here is livelock
-        # brought forward.
-        self.assertLessEqual(
-            predicted,
-            1.25 * probe.peak,
-            f"_staging_bytes {predicted / MIB:.1f} MiB over-reserves "
-            f"against the measured live set {probe.peak / MIB:.1f} MiB; "
-            f"the gate refuses flips that would have fit, and a refusal "
-            f"does not drain the resident set it refused on",
+        waves = rt._flip_waves(PP_TO_TP)
+        self.assertEqual(
+            rt._seam_reserve_bytes(tr, PP_TO_TP, src, dst, waves),
+            rt._seam_reserve_bytes(empty, PP_TO_TP, src, dst, waves),
+            "the staging ask still tracks the live set; wave_peak is not "
+            "retired and the gate can still refuse a flip over KV it will "
+            "not move",
         )
 
-    def test_the_waved_price_is_short_of_the_measured_live_set(self):
-        """REGISTER C21, as a RATCHET rather than an approval.
-
-        Measured by #656 successor 38 while reframing the test above: the
-        price the gate actually spends -- ``_staging_bytes`` with the run's own
-        wave plan -- is **2.398 MiB against a measured live set of 3.769 MiB**
-        on this three-rank fixture, a ratio of 0.64. The formula models the
-        seam's peak as ``incoming + max(outgoing, local)`` on the strength of
-        the send buffers being dead before the retained leg is read; on this
-        fixture the high-water holds an outgoing leg (0.689 + 0.684 MiB)
-        alongside a 1.025 MiB local read and its 1.025 MiB gather window.
-
-        NOT REPRODUCED ON METAL and not fixed here. The s37 acceptance window
-        priced the binding card's pp->tp seams at 1177 MiB p50 while the
-        deepest NVML drawdown across any of its 115 cutovers was 504 MiB, so
-        torch's allocator cache absorbs this transient rather than the driver
-        being asked for it -- which is why 65 minutes and 348 flips saw 0
-        corridor breaches. Widening the reservation on that evidence would buy
-        an earlier wedge (HANDOFF_664 section 13c), so the gap is BOOKED and
-        pinned instead of papered over.
-
-        The assertion is one-sided on purpose: closing the gap passes, and only
-        WIDENING it fails.
-        """
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+    def test_the_retired_term_is_still_reported(self):
+        # A term that vanishes silently cannot be shown to have been retired,
+        # and the proof window's funding claim is exactly the difference
+        # between what this used to reserve and what it now reserves.
+        _ref, live, _ppp, pp_views, _tpp, tp_views = _make_layout_pools(
             MAP_625, VEC, NUM_SLOTS
         )
-        runtimes = _build_runtimes(pp_views, tp_views, live)
-        rt = runtimes[0]
+        rt = _build_runtimes(pp_views, tp_views, live)[0]
         src, dst = pp_views[0], tp_views[0]
-        tr, _outgoing, _incoming, _local = _plan_legs(live, 0, PP_TO_TP, src, dst)
-        predicted = rt._staging_bytes(tr, PP_TO_TP, src, dst, rt._flip_waves(PP_TO_TP))
-        probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
-        errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, 0, probe)
-        self.assertEqual([e for e in errs if e], [])
-        self.assertGreaterEqual(
-            predicted,
-            0.60 * probe.peak,
-            f"the waved staging price is {predicted / probe.peak:.2f}x the "
-            f"measured live set ({predicted / MIB:.2f} vs {probe.peak / MIB:.2f} "
-            f"MiB). C21 recorded 0.64x; a SMALLER ratio means the gate's "
-            f"shortfall grew, and the corridor's only defence against it today "
-            f"is the allocator cache",
-        )
-
-    def test_the_local_leg_is_counted_when_it_dominates(self):
-        """The geometry the old formula was blind to.
-
-        ``2 x outgoing + incoming`` happens to exceed the true peak while
-        the outgoing leg is the big one, which is why the hole survived
-        five successors and a livelock: on the usual token vector the
-        wrong formula looked conservative. Give one rank most of the
-        tokens and the retained leg overtakes twice the outgoing one, and
-        the old expression under-reserves by the whole difference -- the
-        state in which the gate says a flip fits and the allocator
-        disagrees.
-        """
-        global VEC
-        original = VEC
-        # rank 0 owns 5/7 of the slots: it keeps far more than it sends.
-        VEC = (5, 1, 1)
-        try:
-            ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
-                MAP_625, VEC, NUM_SLOTS, seed=13
-            )
-            runtimes = _build_runtimes(pp_views, tp_views, live)
-            src, dst = pp_views[0], tp_views[0]
-            tr, outgoing, incoming, local = _plan_legs(live, 0, PP_TO_TP, src, dst)
-            self.assertGreater(
-                local,
-                2 * outgoing,
-                "geometry does not exercise the hole: the local leg must "
-                "exceed twice the outgoing one for the old formula to "
-                "under-reserve",
-            )
-            superseded = 2 * outgoing + incoming
-            predicted = runtimes[0]._staging_bytes(tr, PP_TO_TP, src, dst)
-            floor = max(outgoing + incoming, incoming + local)
-            self.assertLess(
-                superseded,
-                floor,
-                "the superseded formula is supposed to be short here",
-            )
-            self.assertGreaterEqual(
-                predicted,
-                floor,
-                f"_staging_bytes {predicted / MIB:.1f} MiB still under-"
-                f"reserves against {floor / MIB:.1f} MiB (outgoing "
-                f"{outgoing / MIB:.1f}, incoming {incoming / MIB:.1f}, "
-                f"local {local / MIB:.1f})",
-            )
-            probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
-            errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, 0, probe)
-            self.assertEqual([e for e in errs if e], [])
-            self.assertGreaterEqual(
-                predicted,
-                probe.peak,
-                f"_staging_bytes {predicted / MIB:.1f} MiB is below the "
-                f"MEASURED live set {probe.peak / MIB:.1f} MiB",
-            )
-        finally:
-            VEC = original
+        tr, _o, _i, _l = _plan_legs(live, 0, PP_TO_TP, src, dst)
+        rt._seam_reserve_bytes(tr, PP_TO_TP, src, dst, rt._flip_waves(PP_TO_TP))
+        self.assertGreater(int(rt._retired_wave_peak_bytes), 0)
 
 
 class TestWireFormatUnchanged(CustomTestCase):

@@ -174,5 +174,61 @@ class TestNeitherStepMayBeSkipped(CustomTestCase):
         self.assertIn("hold no KV", msg)
 
 
+class TestTheSchedulerBindingRefusesRatherThanDegrades(CustomTestCase):
+    """`build_cutover_release` must not hand back a half-usable pair."""
+
+    def test_no_tree_cache_is_refused(self):
+        import types
+
+        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+
+        self.assertIsNone(build_cutover_release(types.SimpleNamespace()))
+
+    def test_an_unresettable_tree_is_refused(self):
+        # A ChunkCache has no reset(); a flip that cannot drop its tree would
+        # enter the next phase naming rows that hold no KV.
+        import types
+
+        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+
+        sched = types.SimpleNamespace(tree_cache=types.SimpleNamespace())
+        self.assertIsNone(build_cutover_release(sched))
+
+    def test_a_resettable_tree_yields_both_halves(self):
+        import types
+
+        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+
+        tree = types.SimpleNamespace(reset=lambda: None)
+        built = build_cutover_release(types.SimpleNamespace(tree_cache=tree))
+        self.assertIsNotNone(built)
+        retract, reset_tree = built
+        self.assertTrue(callable(retract))
+        self.assertIs(reset_tree, tree.reset)
+
+    def test_retracting_nothing_needs_no_scheduler_state(self):
+        # The empty case must not reach into pools that an idle instance may
+        # not have wired -- an idle flip still has to drop its tree.
+        import types
+
+        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+
+        tree = types.SimpleNamespace(reset=lambda: None)
+        retract, _ = build_cutover_release(types.SimpleNamespace(tree_cache=tree))
+        self.assertEqual(retract([]), [])
+
+    def test_the_fence_already_paid_so_the_seam_does_not_copy_again(self):
+        # `offload_kv=False` is the deliberate choice: that flag exists for
+        # decode-disaggregation to copy retracted KV device->host, and the
+        # fence has already persisted these prefixes. Copying again would pay
+        # twice at the one instant the instance is blocked.
+        import inspect
+
+        from sglang.srt.managers.phase_flip_runtime import build_cutover_release
+
+        src = inspect.getsource(build_cutover_release)
+        self.assertIn("offload_kv=False", src)
+
+
 if __name__ == "__main__":
     unittest.main()

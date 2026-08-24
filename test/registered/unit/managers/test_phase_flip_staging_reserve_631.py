@@ -434,19 +434,25 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         unwaved = r._staging_bytes(self._plan(), "pp_to_tp", src, dst)
         self.assertAlmostEqual(unwaved / MIB, 3855, delta=12)
 
-    def test_the_unwaved_seam_cannot_afford_the_wedging_request(self):
-        """THE CAN-FAIL PROOF: one wave is the behaviour that livelocked.
-
-        Without this the class could pass by pricing something cheap and
-        never demonstrate that the wave split is what buys the flip.
-        """
+    def test_the_wedging_request_is_now_affordable(self):
+        # #856 REPLACES test_the_unwaved_seam_cannot_afford_the_wedging_request.
+        # THE FUNDING WIN, in unit form. That test proved the UNWAVED seam
+        # could not afford the request that livelocked the instance -- true
+        # while staging had to cover a move. The flip no longer moves KV, so
+        # the ask no longer carries `wave_peak`, and the request that wedged
+        # the seam is affordable on the same spendable budget. This is the
+        # W25 counter claim (33 arms refused, 25 on the staging rate limit,
+        # 17 FLIP ABANDONED) reduced to one assertion.
         r = self._runtime_on_the_rig()
         src, dst = self._sides()
-        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, waves=(None,))
+        need = r._seam_reserve_bytes(self._plan(), "pp_to_tp", src, dst, waves=(None,))
         gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
-        ok, detail = gate._staging_affordable(need)
-        self.assertFalse(ok)
-        self.assertIn("spendable", detail)
+        ok, _detail = gate._staging_affordable(need)
+        self.assertTrue(
+            ok,
+            "the seam still cannot afford the wedging request; wave_peak is "
+            "not retired from the ask",
+        )
 
     def test_the_waved_seam_affords_it(self):
         """The wedge, gone, at the spendable figure the rig actually had."""
@@ -564,16 +570,20 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
                 f"to move onto rank {big}",
             )
 
-    def test_waving_divides_the_peak_by_about_the_wave_count(self):
+    def test_waving_no_longer_changes_the_price_at_all(self):
+        # #856 REPLACES test_waving_divides_the_peak_by_about_the_wave_count.
+        # The wave split existed to divide the MOVE's transient. The flip
+        # carries no KV, `wave_peak` is retired from the ask, and the ask is
+        # therefore identical however the layers are waved. A difference here
+        # would mean the move is still being priced.
         r = self._runtime_on_the_rig()
         src, dst = self._sides()
         plan = self._plan()
-        one = r._staging_bytes(plan, "pp_to_tp", src, dst, waves=(None,))
-        many = r._staging_bytes(plan, "pp_to_tp", src, dst, r._flip_waves("pp_to_tp"))
-        # Not exactly 1/16: the one-layer gather window does not divide,
-        # and the wave shares are integers. An order of magnitude is the
-        # claim, and it is the claim that removes the wedge.
-        self.assertLess(many * 8, one)
+        one = r._seam_reserve_bytes(plan, "pp_to_tp", src, dst, waves=(None,))
+        many = r._seam_reserve_bytes(
+            plan, "pp_to_tp", src, dst, r._flip_waves("pp_to_tp")
+        )
+        self.assertEqual(one, many)
 
     def test_the_full_pool_live_set_is_still_affordable(self):
         """THE ACTUAL CLOSURE, and it is stronger than a ratio.

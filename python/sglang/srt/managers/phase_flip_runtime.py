@@ -1135,6 +1135,45 @@ def release_residents_for_cutover(reqs, *, retract, reset_tree):
     return retracted
 
 
+def build_cutover_release(scheduler):
+    """The two callables `release_residents_for_cutover` needs, or None (#856).
+
+    Bound HERE rather than inline at the seam so the seam reads as the ordered
+    sequence it is, and so both halves can be exercised without a scheduler.
+
+    ``offload_kv=False`` on purpose: that flag exists for decode-disaggregation
+    to copy retracted KV device->host so it can be restored without recompute.
+    Under this design the FENCE has already persisted the prefixes to the
+    canonical store, so a second device->host copy at the seam would pay twice
+    for the same bytes at the one instant the instance is blocked.
+
+    Returns ``None`` when the scheduler cannot supply a tree cache or a
+    resettable one. The caller REFUSES on that -- a flip that cannot drop its
+    tree would enter the next phase with prefixes naming rows that hold no KV,
+    which is a wrong answer rather than a loud failure.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    if tree_cache is None or not callable(getattr(tree_cache, "reset", None)):
+        return None
+
+    def _retract(reqs):
+        if not reqs:
+            return []
+        from sglang.srt.managers.schedule_batch import retract_all
+
+        return retract_all(
+            reqs=list(reqs),
+            server_args=scheduler.server_args,
+            req_to_token_pool=scheduler.req_to_token_pool,
+            token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            hisparse_coordinator=getattr(scheduler, "hisparse_coordinator", None),
+            offload_kv=False,
+        )
+
+    return _retract, tree_cache.reset
+
+
 def _writeback_fence_ms(report) -> Optional[float]:
     """The HiCache fence's own elapsed time, in ms, or None (#856).
 
@@ -7458,6 +7497,41 @@ class PhaseFlipRuntime:
             )
         )
 
+    def _seam_reserve_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
+        """What the seam ACTUALLY reserves, which is no longer what a move
+        would need (#856).
+
+        TWO DIFFERENT QUESTIONS, TWO NAMES. ``_staging_bytes`` answers "what
+        would this move need?" and its formula -- pinned by
+        ``test_phase_flip_staging_reserve_631`` and
+        ``test_seam_arena_tail_additive_656`` against measured corridor events
+        -- is still exactly right for that question. It is simply no longer
+        the question the gate asks, because the flip carries no KV: the
+        residents are retracted and the plan is rebuilt EMPTY before the wave
+        loop (``_release_residents_for_cutover``), so nothing is moved and
+        every ``wave_peak`` term prices a transient that cannot occur.
+
+        Collapsing the two into one name is the defect this whole build keeps
+        removing, so the move's price keeps its name and its tests, and the
+        seam's reserve gets its own.
+
+        WHAT THIS REMOVES, in W25's numbers: a 2339.11 MiB ``tp_to_pp``
+        staging ask on PP0, behind 33 refused arms -- 25 of them on the
+        staging rate limit -- and 17 FLIP ABANDONED.
+
+        The move's price is still COMPUTED and recorded, because the
+        difference between the two IS the funding claim the proof window has
+        to check, and a term that vanishes silently cannot be shown to have
+        been retired.
+        """
+        would_move = int(self._staging_bytes(tr, direction, src, dst, waves))
+        self._retired_wave_peak_bytes = would_move
+        return int(
+            self._arena_tail_bytes(direction)
+            + self._draft_restore_bytes(direction)
+            + self._cold_stack_restore_bytes(direction)
+        )
+
     def _arena_tail_bytes(self, direction: str) -> int:
         """Device bytes the tp->pp leg must commit for the weights-arena tail.
 
@@ -7917,6 +7991,55 @@ class PhaseFlipRuntime:
             except Exception:  # noqa: BLE001 - an abstaining probe, not a crash
                 return None
         return PhaseFlipRuntime._torch_graph_pool_free_bytes()
+
+    def _release_residents_for_cutover(self, direction: str):
+        """#856: the flip carries NO KV. Retract the residents, drop the tree.
+
+        Runs AFTER the fence (#703 writeback) and the HiCache quiesce, so every
+        prefix worth keeping is already in the canonical store, and BEFORE the
+        transfer plan is rebuilt, so the plan it is rebuilt on is empty and the
+        wave loop has nothing to move.
+
+        Order is enforced by ``release_residents_for_cutover``; see its
+        docstring for why reversing it reproduces #825's three-rank crash.
+
+        RAISES rather than continues if the scheduler cannot supply a
+        resettable tree. Entering the next phase with a tree that names rows
+        holding no KV is a wrong answer, and the seam's own rule is that a
+        wrong answer is worse than a loud failure. There is deliberately no
+        fallback to the mover: a flip that cannot honour this contract must
+        not happen at all.
+        """
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:
+            raise SeamOrderError(
+                "#856: no scheduler bound at the seam, so the residents cannot "
+                "be retracted and the prefix tree cannot be dropped"
+            )
+        built = build_cutover_release(scheduler)
+        if built is None:
+            raise SeamOrderError(
+                "#856: this scheduler exposes no resettable tree_cache; the "
+                "flip carries no KV, so without dropping the tree the next "
+                "phase would read prefixes naming rows that hold no KV"
+            )
+        retract, reset_tree = built
+        reqs = list(_live_reqs(scheduler))
+        released = release_residents_for_cutover(
+            reqs, retract=retract, reset_tree=reset_tree
+        )
+        n = len(released or ())
+        self.residents_released = int(getattr(self, "residents_released", 0)) + n
+        logger.info(
+            "%s RESIDENTS RELEASED for %s: %d request(s) retracted and the "
+            "prefix tree dropped, in that order (#856). Their KV is in the "
+            "canonical store from the fence; the new layout re-admits them and "
+            "serves the prefix by read-through. Nothing is carried across.",
+            LOG_PREFIX,
+            direction,
+            n,
+        )
+        return released
 
     def _releasable_cache_bytes(self):
         """#852: injectable like ``_mem_probe`` / ``_mem_reclaim``, so the
@@ -9657,7 +9780,7 @@ class PhaseFlipRuntime:
         # that is not the one about to run.
         self._refresh_seam_tuning()
         waves = self._flip_waves(direction)
-        staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
+        staging_bytes = self._seam_reserve_bytes(tr, direction, src, dst, waves)
         # #656 item 15a/16: spill before the allocation, and level the cards
         # before touching host RAM. Runs first so its reclaim is money the
         # affordability check below can see.
@@ -9697,7 +9820,7 @@ class PhaseFlipRuntime:
             tr = build_phase_flip_transition(
                 slots, self._map, self._n_layers, self._vec, self._rank, direction
             )
-            staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
+            staging_bytes = self._seam_reserve_bytes(tr, direction, src, dst, waves)
         # BOUNDS ON THE FINAL PLAN. Computed after the agreement, so the rows
         # the group actually intends to move are the rows the pools are
         # checked against.
@@ -10126,6 +10249,32 @@ class PhaseFlipRuntime:
         # the seam's cost?" is answered by a grep instead of by argument.
         self._seam_drain_ms = self._quiesce_hicache(direction)
         seam_census.mark("hicache_quiesce")
+
+        # #856: THE FLIP CARRIES NO KV, AND THIS IS WHERE THAT BECOMES TRUE.
+        #
+        # The fence above has persisted the tree's prefixes to the canonical
+        # store and the quiesce has drained the staging copies, so every row
+        # worth keeping is durable. Retracting now releases each resident
+        # request's rows AND its tree lock ref, which is what makes the
+        # following reset safe (#825 crashed doing the reset with those locks
+        # still held). See `release_residents_for_cutover`.
+        self._release_residents_for_cutover(direction)
+        seam_census.mark("resident_release")
+
+        # THE PLAN IS REBUILT ON THE NOW-EMPTY LIVE SET. This is the retirement
+        # of the KV mover, performed by making its input empty rather than by
+        # deleting a wave loop whose extent bookkeeping (finalize_wave, span
+        # release, id-space retirement) still has to run. Every downstream
+        # figure -- total_slots, send/recv rows, the staged bytes -- follows
+        # from `tr`, so an empty `tr` is a flip that provably moves nothing.
+        tr = build_phase_flip_transition(
+            torch.empty(0, dtype=torch.int64),
+            self._map,
+            self._n_layers,
+            self._vec,
+            self._rank,
+            direction,
+        )
 
         # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
         #
