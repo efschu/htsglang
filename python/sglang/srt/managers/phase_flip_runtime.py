@@ -1043,6 +1043,58 @@ def _resident_rows(scheduler) -> Optional[set]:
         return None
 
 
+def resident_census_terms(
+    leaked: set,
+    unaccounted,
+    resident_rows: Optional[set],
+    size: int,
+    enumerable: bool,
+):
+    """#849: the census LINE's fourth-owner terms, derived, never asserted.
+
+    Window 7 (boot_window7_0824_0252) showed why the line needs them: it
+    printed ``unaccounted=40960`` while the ownership AUDIT, fed the very same
+    census through ``_resident_rows``, found exactly ONE unowned row -- the
+    other 40959 were the resident working set, absorbed by the #822 fourth
+    owner. The line never subtracted that owner, and its ``resident_reqs=``
+    field counts only the ``running_mbs`` slot scope (structurally 0 in the
+    TP regime), so the one line simultaneously said "40960 rows unowned" and
+    "no resident requests" -- manufacturing the leak reading #844/#849 were
+    filed on. These two terms put the audit's verdict ON the line.
+
+    Returns ``(resident_rows_n, unowned_after_owners)`` as printable values:
+
+    * ``resident_rows is None`` -> ``("no-verdict", "no-verdict")``. None
+      means the enumeration had no verdict, NOT that requests hold nothing;
+      asserting absorption from an empty set is the #822 defect with an
+      extra step (`_resident_rows` docstring, same contract).
+    * enumerable free -> the id difference ``len(leaked - resident_rows)``:
+      overlap-exact, same arithmetic the audit runs.
+    * counted free -> a COUNT difference, ``unaccounted`` minus the resident
+      ids inside the id space. It can come out NEGATIVE when owners overlap
+      the watermark count; reported as it falls, a finding rather than a
+      display glitch to clamp (same rule as ``unaccounted`` itself).
+    * ``unaccounted="UNKNOWN"`` -> passed through: no free reading, no
+      arithmetic.
+    """
+    if resident_rows is None:
+        return "no-verdict", "no-verdict"
+    n = len(resident_rows)
+    if isinstance(unaccounted, str):
+        return n, unaccounted
+    if enumerable:
+        return n, len(leaked - resident_rows)
+    in_space = sum(1 for r in resident_rows if 1 <= r <= size)
+    return n, unaccounted - in_space
+
+
+#: #849: distinguishes "caller did not pass a resident enumeration" from a
+#: passed ``None`` ("no verdict"). The census line and the ownership audit
+#: must read ONE enumeration -- two reads of a moving working set bracket the
+#: log I/O and can disagree, which is the shape #822 exists to end.
+_RESIDENT_UNSET = object()
+
+
 def _probe_allocated_extent(scheduler, reqs) -> None:
     """#631 defect J: MEASURE the gap between what the allocator owns and
     what this enumeration covers. Does not change what is moved.
@@ -5015,10 +5067,27 @@ class PhaseFlipRuntime:
                 if n:
                     resident += n
                     slots_with_reqs.append(i)
+            # #849: the fourth owner, ON the line. Enumerated ONCE per census
+            # and shared with the ownership audit below -- window 7 had the
+            # audit enumerate separately AFTER the print, so the line said
+            # `unaccounted=40960 resident_reqs=0` while the audit, seconds of
+            # log I/O later, absorbed all but ONE of those rows into
+            # `resident:requests`. Note `resident_reqs=` above stays what it
+            # is (the running_mbs slot scope, 0 by construction outside the
+            # PP event loop); `resident_rows_n=` is the fourth owner's term.
+            resident_rows_set = _resident_rows(scheduler)
+            resident_rows_n, unowned_after = resident_census_terms(
+                leaked,
+                unaccounted,
+                resident_rows_set,
+                size,
+                free_reading.is_enumerable,
+            )
             logger.warning(
                 "%s POOL CENSUS %s %s: size=%d free=%s cached=%d "
                 "withheld=%d available=%s cur_slot_reqs=%d resident_reqs=%d "
-                "resident_slots=%s unaccounted=%s %s alloc=%s free_src=%s",
+                "resident_slots=%s unaccounted=%s %s alloc=%s free_src=%s "
+                "resident_rows_n=%s unowned_after_owners=%s",
                 LOG_PREFIX,
                 when,
                 direction,
@@ -5046,6 +5115,8 @@ class PhaseFlipRuntime:
                 # reading needed a live probe instead of the existing logs.
                 free_reading.allocator,
                 free_reading,
+                resident_rows_n,
+                unowned_after,
             )
             # The reason, verbatim, whenever the reading is anything other than
             # a plain corroborated page list. Kept off the ordinary path so the
@@ -5090,6 +5161,10 @@ class PhaseFlipRuntime:
                         free_reading,
                         cached,
                         withheld,
+                        # #849: the ONE resident enumeration this census took,
+                        # shared so line and audit cannot disagree about a
+                        # moving working set.
+                        resident_rows=resident_rows_set,
                     )
             except Exception:  # noqa: BLE001 -- an instrument, never a gate
                 logger.debug(
@@ -5152,7 +5227,14 @@ class PhaseFlipRuntime:
             return None
 
     def _census_ownership_audit(
-        self, why, alloc, size, free_reading, cached, withheld
+        self,
+        why,
+        alloc,
+        size,
+        free_reading,
+        cached,
+        withheld,
+        resident_rows=_RESIDENT_UNSET,
     ) -> None:
         """Route one census reading through the #822 authority.
 
@@ -5191,7 +5273,15 @@ class PhaseFlipRuntime:
             # request on the first census of boot_window1_0823_1204, before
             # anything had moved. None means the enumeration had no verdict,
             # and is passed through as such rather than as an empty owner.
-            resident = _resident_rows(self._census_scheduler)
+            #
+            # #849: the census line passes ITS enumeration in, so line and
+            # audit read one snapshot of a moving working set. Enumerating
+            # here is the fallback for callers that did not.
+            resident = (
+                _resident_rows(self._census_scheduler)
+                if resident_rows is _RESIDENT_UNSET
+                else resident_rows
+            )
             audit_pool_census(
                 authority,
                 exposed=int(size),
