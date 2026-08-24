@@ -129,6 +129,52 @@ into its two rates before any fix is chosen. Recorded as an OPEN root, not
 guessed at: two independent readers (the strand and an explorer sweep) failed to
 attribute it from code, and the search sets are named above.
 
+### CLOSED on W26 metal (2026-08-24) — STORAGE-BOUND
+
+The split ran. Pin `9effad7f0d`, log
+`/spinning/evidence-665-f1/boot_w26_0824_1354.log`, 11 flip epochs, 39 paired
+`REFILL` + bound samples. Full write-up in `NOTE_856_refill_storage_bound.md`
+and `/spinning/gpu-arb/W26-RESULT-856-refill-root.md`.
+
+    dir       rank    n      MiB   tot_s  read_s   h2d_s  drain   MiB/s  read%
+    pp_to_tp  PP0     7  15925.8   4.452   4.230  0.0073  0.002    3612  99.8%
+    pp_to_tp  PP1     7   8573.8   3.292   3.014  0.0051  0.006    2626  99.8%
+    pp_to_tp  PP2     7   8573.8   3.328   3.052  0.0049  0.003    2596  99.8%
+    tp_to_pp  PP0     6  16362.7   7.601   7.384  0.0043  0.002    2156  99.9%
+    tp_to_pp  PP1     6   8961.3   6.743   6.460  0.0030  0.007    1330 100.0%
+    tp_to_pp  PP2     6   9481.6   6.895   6.604  0.0037  0.002    1376  99.9%
+
+`verdicts observed: {'STORAGE-BOUND'}` — every sample, both directions, all
+three ranks. The read is 99.8-100.0 % of the accounted leg and the H2D wait is
+**3-7 ms**. The link never waits; it idles at ~21-35 % of the rate the same
+card demonstrably reaches in the same window (`nvidia-smi dmon` peak `rxpci`
+6893 / 10599 / 4683 MB/s).
+
+**The 2.5x direction gap is a property of the FILE, not of the code.** A
+standalone O_DIRECT probe (no CUDA, no server, same 32 MiB chunk as the refill
+loop) read both PP0 images back to back in one process:
+PP image **3186.4 MiB/s**, TP image **9985.1 MiB/s** — 3.1x, same flags,
+seconds apart. Compression is ruled out (on-disk ratios 1.09x vs 1.11x); the
+surviving explanation is ARC residency, `c_max` being 5.0 GiB against ~29 GiB
+of weight images. So §4's three eliminations above were all correct — the term
+they were hunting was never in this code path.
+
+**And the read side does not scale**, which forecloses the obvious fix: the
+same probe at 1 / 2 / 4 / 8 concurrent readers returned 3186 / 3659 / 3688 /
+3655 MiB/s on the PP image — **1.15x and flat**. The pool is saturated by a
+single stream, not latency-bound, so parallelising `preadv` buys ~15 %.
+Deeper pipelining buys nothing either (`h2d_wait_s` is already ~0.005 s).
+The only lever that reaches the target is not reading from disk at all, i.e.
+#809 §8's pinned share.
+
+**Its sizing A/B (#809 §9) still has NOT run.** W26 attempted it twice and both
+attempts were OOM-killed in the LAUNCH phase, before any flip (`grep -c REFILL`
+= 0 in both `boot_w26pin_*.log`; cgroup `oom_kill` 3 -> 4). That failure is
+itself informative: whole-image pinning (~68.7 GiB) plus the weights-load
+page-cache spike does not fit this container, so the fix must be a PARTIAL
+share, and a pre-launch `free -g` gate does not protect the box because the
+spike builds during the load. Details in `NOTE_856_refill_storage_bound.md`.
+
 ## 5. Consequence for the chosen design
 
 The user's decision — the flip carries NO KV, it is loaded from HiCache —
