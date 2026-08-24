@@ -123,10 +123,60 @@ served-request latency" the user named as the validation metric. That cost is
 REAL and must be measured, not assumed small: it is the price this design pays
 in exchange for deleting the mover, the staging reserve and the crash class.
 
-CAVEAT, not yet verified: that `release_kv_cache` releases the lock ref along
-the whole parent chain (read from `release_req`'s body, not from
-`release_kv_cache`'s), and that retraction at the seam is compatible with the
-flip's quiescence predicate. Both must be confirmed before this is built.
+### Caveat 1 — DISCHARGED, and it makes the ORDER load-bearing
+
+`release_kv_cache` (`mem_cache/common.py:1749`) routes to
+`tree_cache.cache_finished_req(req, is_insert=False)`, and the live
+`dec_lock_ref` (`mem_cache/hi_mamba_radix_cache.py:1610`) walks the chain:
+
+    while node != self.root_node:
+        ...
+        node = node.parent
+
+So the lock ref IS released along the whole parent chain -- **provided the
+walk still terminates at the live root.** That is precisely the loop #825
+crashed in, once `reset()` had rebuilt the root and orphaned the nodes.
+
+**RETRACT STRICTLY BEFORE RESET.** The order is not stylistic; reversing it
+reproduces the 2026-08-23 three-rank crash exactly. A red-first test must pin
+the order, not merely the outcome.
+
+(Two paths bypass `cache_finished_req` and must be checked by the build, both
+already named in that function: `req_pool_idx is None` under MambaRadixCache,
+and `kv_spill_state == "host"`, which routes to the kv-session-offload
+manager's own release.)
+
+### Caveat 2 — NOT a clean pass: retraction inflates the policy's own input
+
+Retracted requests go back to the waiting queue, so their full context
+reappears as `pending_prefill_tokens` -- the quantity the flip policy compares
+against N. But N is priced from X and P, the UNCACHED prefill throughputs
+(`DEFAULT_TP_PREFILL_TOK_S` / `DEFAULT_PP_PREFILL_TOK_S`). Retracted tokens
+are CACHED by construction: the fence just persisted them, and read-through
+serves them. They re-prefill far faster than the bar assumes.
+
+**So every cutover would hand the policy a large pending-prefill figure whose
+real cost is a small fraction of what the bar prices it at, and it would do so
+in BOTH directions.** That is a thrash pathway, and it is created by this
+design rather than inherited: today the carry keeps those tokens out of the
+pending count entirely.
+
+This is unresolved and must not be hand-waved. Candidate directions, none yet
+evidenced:
+
+* price the pending figure by CACHE RESIDENCY -- count a cached token at its
+  read-through cost, not at uncached prefill cost. This is the honest fix and
+  it is the same class as #856(b): the decision is only as good as the
+  quantity it compares.
+* exclude just-retracted tokens from the pending figure for one dwell window.
+* lean on the existing guards (`min_dwell_s`, drain mode, the staging rate
+  limit) and PROVE by measurement that they bound it -- acceptable only with a
+  window that shows it, never by assertion.
+
+Note the interaction with #856(b): the round-trip correction RAISES N
+(8.50 -> 18.06 s, N 18614 -> ~39500), which makes this thrash pathway harder
+to trigger. That is a mitigating accident, not a fix, and must not be cited as
+one.
 
 ## Fence coverage — what is and is not already persisted
 
