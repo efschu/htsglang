@@ -994,6 +994,47 @@ def _live_reqs(scheduler) -> List:
     return out
 
 
+def seam_probe_reading_age(
+    current_seq: Optional[int], stamped_seq: Optional[int]
+) -> Optional[int]:
+    """How many probe passes ago a remembered seam figure was measured (#846).
+
+    ``_staging_affordable`` remembers figures the census cannot re-measure, and
+    nothing ever clears them: ``_last_cache_promised_bytes`` and
+    ``_last_cache_delivered_bytes`` are written ONLY inside the reclaim branch
+    (:7512-7513) and assigned ``None`` nowhere in this module. So after the
+    first reclaim in a process they are never ``None`` again, and the census's
+    own contract -- "None when no reclaim was attempted in this pass" -- became
+    unreachable. This is the age it could not state.
+
+    ``None`` means NEVER MEASURED and must never collapse into ``0``: "no probe
+    has recorded this" and "recorded in this very pass" are the two readings a
+    census most needs to separate, and a ``getattr(..., 0)`` default is exactly
+    how the first silently reads as the second.
+
+    A stamp AHEAD of the counter also returns ``None`` rather than a negative
+    age. That state means the counter was reset or never incremented (a
+    stand-in, a partially wired object); reporting it as "never measured" is
+    true and readable, while a negative number would read as a corrupt census.
+    """
+    if current_seq is None or stamped_seq is None:
+        return None
+    age = int(current_seq) - int(stamped_seq)
+    return age if age >= 0 else None
+
+
+def seam_probe_age_phrase(age: Optional[int]) -> str:
+    """The age as the census says it. Never empty -- an empty phrase would
+    restore precisely the silence #846 exists to end."""
+    if age is None:
+        return "never measured"
+    if age == 0:
+        return "measured this pass"
+    if age == 1:
+        return "measured 1 pass ago"
+    return f"measured {int(age)} passes ago"
+
+
 def _resident_rows(scheduler) -> Optional[set]:
     """KV rows held by RESIDENT REQUESTS -- the census's missing owner (#822).
 
@@ -1258,10 +1299,7 @@ def flip_seam_budget_verdict(
         return (
             True,
             False,
-            (
-                f"seam drain OK: projected {projected:.1f} ms <= budget "
-                f"{budget_ms} ms"
-            ),
+            (f"seam drain OK: projected {projected:.1f} ms <= budget {budget_ms} ms"),
         )
     if int(defers_so_far) >= int(max_defers):
         return (
@@ -4584,9 +4622,7 @@ class PhaseFlipRuntime:
             return
         self._prearm_hold_direction = None
         self.hicache_seam_active = False
-        logger.info(
-            "%s [#834] prearm device-tier hold released (%s)", LOG_PREFIX, why
-        )
+        logger.info("%s [#834] prearm device-tier hold released (%s)", LOG_PREFIX, why)
 
     # -- #834 B: the deferred KV grow ---------------------------------------
 
@@ -7492,7 +7528,11 @@ class PhaseFlipRuntime:
         reserve = self._staging_reserve_bytes
         # Remembered for the ABANDONED census, which runs later and otherwise
         # has no way to quote the figure the refusal was about.
+        # #846: one monotonic tick per probe pass, so anything remembered
+        # below can say how old it is when the census quotes it later.
+        self._seam_probe_seq = int(getattr(self, "_seam_probe_seq", 0)) + 1
         self._last_staging_bytes = int(staging_bytes)
+        self._last_staging_bytes_seq = self._seam_probe_seq
         driver_free, cached_free = probe()
         self._record_seam_peak(direction, int(staging_bytes), driver_free, cached_free)
         from_driver = max(0, driver_free - reserve)
@@ -7509,6 +7549,11 @@ class PhaseFlipRuntime:
             # figure that counts fragmented segments `empty_cache()` cannot
             # return -- and boot_827 printed `covered 1870 MiB ... cause=funded`
             # in the same second this line printed `(+0 returned)`.
+            # #846: stamped with the pass that measured them. These two are
+            # written ONLY here, inside the reclaim branch, and cleared
+            # nowhere -- which is why the census below could not tell a
+            # figure from this pass from one several passes old.
+            self._last_cache_bytes_seq = self._seam_probe_seq
             self._last_cache_promised_bytes = cache_promised
             self._last_cache_delivered_bytes = max(0, int(driver_free - before))
             mib = 1024 * 1024
@@ -8489,8 +8534,23 @@ class PhaseFlipRuntime:
             # None when no reclaim was attempted in this pass, which law 2
             # reads as "unobserved -- trust it once", so a refusal that never
             # tried the cache is priced exactly as it was before.
+            #
+            # #846 CORRECTION, and the sentence above is kept rather than
+            # edited so a reader who relies on it learns that instead of
+            # finding it silently gone: THE "None" CASE IS UNREACHABLE AFTER
+            # THE FIRST RECLAIM. Both attributes are written only inside the
+            # reclaim branch of `_staging_affordable` and are assigned None
+            # nowhere in this module, so from the first reclaim onward a pass
+            # that attempts no reclaim reads an EARLIER pass's measurement and
+            # prices this post with it. The age is now stated in the line
+            # below; the branch is deliberately unchanged, because what this
+            # census ASSERTS is #828's law-2 question and not this ticket's.
             delivered = getattr(self, "_last_cache_delivered_bytes", None)
             promised = getattr(self, "_last_cache_promised_bytes", None)
+            cache_age = seam_probe_reading_age(
+                getattr(self, "_seam_probe_seq", None),
+                getattr(self, "_last_cache_bytes_seq", None),
+            )
             if delivered is not None and promised is not None:
                 # Price the post at what it PROMISED when the draw was taken,
                 # so the ratio is delivered-over-promised for the SAME probe.
@@ -8531,7 +8591,14 @@ class PhaseFlipRuntime:
                 rank=int(getattr(self, "_rank", 0) or 0),
             )
             v = auth.can_fund(int(want_bytes))
-            return f". #770 FUNDING POSTS: {v.describe()}"
+            # #846: the verdict and the AGE of the reclaim figures it was
+            # priced from, in one line. A funding verdict quoting a cache
+            # measurement from several passes ago is not wrong to print -- it
+            # is wrong to print WITHOUT SAYING SO.
+            return (
+                f". #770 FUNDING POSTS: {v.describe()} "
+                f"[reclaim figures {seam_probe_age_phrase(cache_age)}]"
+            )
         except Exception:  # noqa: BLE001 - a census must not raise
             return ""
 
@@ -9090,9 +9157,7 @@ class PhaseFlipRuntime:
             allow_seam, seam_escalated, seam_detail = flip_seam_budget_verdict(
                 projected_drain, int(getattr(self, "_seam_budget_defers", 0))
             )
-            logger.info(
-                "%s SEAM BUDGET %s: %s", LOG_PREFIX, direction, seam_detail
-            )
+            logger.info("%s SEAM BUDGET %s: %s", LOG_PREFIX, direction, seam_detail)
             if not allow_seam:
                 self._seam_budget_defers = (
                     int(getattr(self, "_seam_budget_defers", 0)) + 1
