@@ -724,9 +724,122 @@ class FlipCostEstimator:
         self.samples += 1
 
 
+class RoundTripFlipCost:
+    """C is a ROUND TRIP, so it is priced as TWO LEGS (#856).
+
+    THE DEFECT THIS CLOSES, in this module's own words. The model at the top
+    of this file defines ``C = round-trip flip cost, seconds``, and
+    ``break_even_tokens`` refuses a bad premise by saying flipping "never
+    repays the {flip_cost_s}s round trip". But ``observe_flip_leg`` feeds ONE
+    LEG per sample -- its own docstring even computes the round trip it is not
+    feeding, "tp_to_pp 11490 + pp_to_tp 5681 = 17171 ms" -- and both
+    directions went into ONE estimator.
+
+    THE TWO LEGS ARE NOT THE SAME QUANTITY. W25 measured, per flip, on the
+    binding rank: ``tp_to_pp`` 10466-13181 ms against ``pp_to_tp`` 5078-6545
+    ms. Feeding both to one EMA converges to neither: the seam figure the
+    policy spent was 8.50 s, while the legs it was built from were 11.6 and
+    6.4 and their SUM -- the actual round trip -- was 18.06 s.
+
+    #819's own closing sentence is the rule it then broke one level up: "a
+    component and its container are different quantities and an EMA fed both
+    alternately converges to neither". Two directions are different
+    quantities too.
+
+    REPRODUCED EXACTLY, which is what makes this a measurement and not a
+    reading of the log. Replaying PP0's eleven ``PHASE-FLIP DONE`` totals from
+    boot_w25_0824_1125.log through one estimator at ALPHA=0.3 yields
+    5.0779 / 6.6944 / 6.2494 / 7.5450 / 7.2426 / 9.0241 / 8.2740 / 9.2457 /
+    8.4356 / 9.3990 / 8.5041 -- and the boot's own decision lines printed
+    N=15853 / 18110 / 18464 / 18614 at exactly the samples that price to
+    7.2426 / 8.2740 / 8.4356 / 8.5041. The bar also OSCILLATED by ~2000 tok
+    with flip-direction parity (8.50 after a pp_to_tp, 9.40 after a
+    tp_to_pp), which is a pure artifact of the blend and nothing about cost.
+
+    SO EACH DIRECTION KEEPS ITS OWN ESTIMATOR and C is their SUM. The leg
+    estimator is REUSED, not rebuilt: every property #677 pinned on it (a
+    measurement beats the seed outright, the outlier band, the two-sample
+    regime confirmation, tracking DOWN as readily as up) holds per leg.
+
+    THE SEED IS SPLIT IN HALF, so an uncalibrated instance values exactly the
+    round-trip seed and the pre-#856 default path is unchanged byte for byte.
+    A half-measured state -- one leg measured, one still on its seed half --
+    is a REAL state with its own name (see ``provenance``), because "measured"
+    covering it would be the silent multi-valued word this build keeps
+    removing.
+    """
+
+    #: The two legs of a round trip. A sample naming anything else is not
+    #: attributable and is refused rather than filed under a guess.
+    LEGS = ("tp_to_pp", "pp_to_tp")
+
+    def __init__(self, seed_s: float, alpha: Optional[float] = None):
+        self.seed_s = float(seed_s)
+        self.alpha = FlipCostEstimator.ALPHA if alpha is None else float(alpha)
+        self._legs = {
+            leg: FlipCostEstimator(seed_s=self.seed_s / 2.0, alpha=self.alpha)
+            for leg in self.LEGS
+        }
+
+    def leg(self, direction: str) -> Optional[FlipCostEstimator]:
+        return self._legs.get(str(direction))
+
+    @property
+    def calibrated(self) -> bool:
+        """Any leg measured -- repricing engages on the FIRST flip, as before.
+
+        Deliberately not ``all``: waiting for both legs would leave the whole
+        bar on the seed through an entire first phase, which is the state
+        #819 exists to end. A one-leg price is already strictly better than
+        an unmeasured constant; ``provenance`` is what stops it being read as
+        more than it is.
+        """
+        return any(est.calibrated for est in self._legs.values())
+
+    @property
+    def fully_calibrated(self) -> bool:
+        return all(est.calibrated for est in self._legs.values())
+
+    def provenance(self) -> str:
+        """What the live C actually rests on. Three states, three words."""
+        measured = [leg for leg in self.LEGS if self._legs[leg].calibrated]
+        if not measured:
+            return "seed"
+        if len(measured) == len(self.LEGS):
+            return "measured"
+        return f"half-measured ({measured[0]} only)"
+
+    def value(self) -> float:
+        """The round trip: both legs, always summed."""
+        return float(sum(est.value() for est in self._legs.values()))
+
+    def observe(self, seconds, direction=None) -> None:
+        """One leg when the direction is known; a whole round trip when not.
+
+        An UNDIRECTED sample is a round-trip reading and is split evenly
+        across the legs, so ``value()`` still returns exactly what was
+        observed. That keeps every caller that measured a round trip honest
+        without inventing a direction for it -- and a direction this class
+        does not know is refused outright, because filing a ``pp_to_dcp`` leg
+        under ``tp_to_pp`` would corrupt both.
+        """
+        if direction is None:
+            try:
+                half = float(seconds) / 2.0
+            except (TypeError, ValueError):
+                return
+            for est in self._legs.values():
+                est.observe(half)
+            return
+        est = self._legs.get(str(direction))
+        if est is None:
+            return
+        est.observe(seconds)
+
+
 #: Process-wide, because the seam that measures a flip and the policy that
 #: prices the next one are different modules on the same rank.
-_FLIP_COST_ESTIMATOR: Optional[FlipCostEstimator] = None
+_FLIP_COST_ESTIMATOR: Optional[RoundTripFlipCost] = None
 
 
 #: What `config_from_env` actually froze into `PhasePolicyConfig.flip_tokens`,
@@ -779,8 +892,13 @@ def repriced_flip_tokens() -> Optional[tuple]:
     return (_FLIP_TOKENS_AT_BOOT, int(n_now), est.seed_s, est.value())
 
 
-def observe_flip_cost(seconds) -> None:
+def observe_flip_cost(seconds, direction=None) -> None:
     """Feed one measured flip-leg duration to the estimator (#677).
+
+    #856: ``direction`` names WHICH LEG this reading prices. Omitting it means
+    the reading is a whole round trip (see ``RoundTripFlipCost.observe``), not
+    "either leg, whichever" -- a leg filed under the wrong direction is worse
+    than one not filed at all.
 
     #777: and SAY IT when that measurement has left the live threshold behind.
     The estimator following the regime while N stays frozen at the seed is the
@@ -790,7 +908,7 @@ def observe_flip_cost(seconds) -> None:
     global _FLIP_TOKENS_STALE_SAID
     if _FLIP_COST_ESTIMATOR is None:
         return
-    _FLIP_COST_ESTIMATOR.observe(seconds)
+    _FLIP_COST_ESTIMATOR.observe(seconds, direction)
     if _FLIP_TOKENS_STALE_SAID:
         return
     repriced = repriced_flip_tokens()
@@ -855,10 +973,14 @@ def observe_flip_leg(stats) -> None:
         seconds = float(total_ms) / 1000.0
     except (TypeError, ValueError):
         return
-    observe_flip_cost(seconds)
+    # #856: the seam stamps every completed flip with its direction
+    # (phase_flip_runtime, `stats["direction"]`), so the leg is attributable
+    # at the only place that knows it. A leg whose direction is missing is
+    # priced as a round trip rather than guessed into one of the two.
+    observe_flip_cost(seconds, stats.get("direction"))
 
 
-def flip_cost_estimator() -> Optional[FlipCostEstimator]:
+def flip_cost_estimator() -> Optional[RoundTripFlipCost]:
     return _FLIP_COST_ESTIMATOR
 
 
@@ -953,6 +1075,42 @@ def flip_cost_measured() -> bool:
     debugging a surprising bar will want.
     """
     return repriced_flip_tokens() is not None
+
+
+def flip_cost_fully_measured() -> bool:
+    """BOTH legs measured -- the only state that is evidence, not assumption.
+
+    #856: `flip_cost_measured` engages repricing as soon as EITHER leg has a
+    measurement, which is right for pricing (one measured leg beats an
+    unmeasured constant). It is NOT right for the #838 detector, whose gate
+    refuses to question a bar priced off the seed on the stated ground that
+    "an assumption is not the policy's own claim". A half-measured round trip
+    is still half assumption, so it is refused on exactly the same ground
+    rather than promoted to evidence by a boolean that cannot see the
+    difference. The blast radius is one-directional: the detector can only
+    DECLINE more often, never alarm more often.
+    """
+    if repriced_flip_tokens() is None:
+        return False
+    est = _FLIP_COST_ESTIMATOR
+    return bool(est is not None and est.fully_calibrated)
+
+
+def flip_cost_provenance() -> str:
+    """The SAME provenance, but able to say "half" (#856).
+
+    ``flip_cost_measured`` is a boolean over a quantity that has three states
+    once C is a round trip of two independently-measured legs: neither leg
+    measured, one measured, both measured. A boolean prints the middle state
+    as "measured", and a reader then has no way to tell a fully-priced round
+    trip from one whose second leg is still the seed half -- the silent
+    multi-valued word this build has removed twice already (#851 class,
+    #853(i) on the exposure gate, #854 on the economy detector).
+    """
+    if repriced_flip_tokens() is None:
+        return "seed"
+    est = _FLIP_COST_ESTIMATOR
+    return "measured" if est is None else est.provenance()
 
 
 def live_flip_cost_s(cfg: "PhasePolicyConfig") -> float:
@@ -2280,7 +2438,7 @@ def _decide_from_load(
         # repriced threshold printed against `cfg.flip_tokens` would have been.
         n_live = live_flip_tokens(cfg)
         seam_s = live_flip_cost_s(cfg)
-        priced = "measured" if flip_cost_measured() else "seed"
+        priced = flip_cost_provenance()
         if (
             cfg.prefill_runs_in_tp
             and inp.running_bs > 0
@@ -3112,7 +3270,7 @@ def config_from_env(
     global _FLIP_COST_ESTIMATOR
     _seed_s = _env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S)
     if _FLIP_COST_ESTIMATOR is None or _FLIP_COST_ESTIMATOR.seed_s != _seed_s:
-        _FLIP_COST_ESTIMATOR = FlipCostEstimator(seed_s=_seed_s)
+        _FLIP_COST_ESTIMATOR = RoundTripFlipCost(seed_s=_seed_s)
     seam_s = _FLIP_COST_ESTIMATOR.value()
     tp_tok_s = _env_float(ENV_TP_TOK_S, DEFAULT_TP_PREFILL_TOK_S)
     pp_tok_s = _env_float(ENV_PP_TOK_S, DEFAULT_PP_PREFILL_TOK_S)

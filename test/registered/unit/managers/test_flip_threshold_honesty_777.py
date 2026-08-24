@@ -69,7 +69,7 @@ class _EstimatorState(CustomTestCase):
         ) = self._saved
 
     def _arm(self, seed_s=_SEED_S, explicit=False):
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=seed_s)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=seed_s)
         n = pp.break_even_tokens(seed_s, _TP_TOK_S, _PP_TOK_S)
         pp.note_flip_tokens_pricing(n, _TP_TOK_S, _PP_TOK_S, explicit)
         return n
@@ -142,7 +142,7 @@ class TestSilenceWhereSilenceIsRight(_EstimatorState):
         self.assertIsNone(pp.repriced_flip_tokens())
 
     def test_nothing_to_say_without_a_config(self):
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=_SEED_S)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=_SEED_S)
         pp._FLIP_TOKENS_AT_BOOT = None
         pp._FLIP_TOKENS_PRICING = None
         pp._FLIP_COST_ESTIMATOR.observe(_MEASURED_S)

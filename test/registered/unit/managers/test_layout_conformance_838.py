@@ -175,7 +175,12 @@ class HonestEconomicsMustNotAlarm(unittest.TestCase):
     def test_a_seeded_price_is_not_evidence(self):
         alarm, detail = _economy(price_measured=False)
         self.assertFalse(alarm)
-        self.assertIn("seed, not measured", detail)
+        # #856: the refused state is now "seed OR half-measured" -- C is a
+        # round trip of two independently measured legs, and one measured leg
+        # still leaves half the price an assumption. The gate is unchanged;
+        # what it declines to call evidence got wider, and the text says so.
+        self.assertIn("not measured", detail)
+        self.assertIn("half-measured", detail)
 
     def test_min_dwell_is_a_legitimate_hold(self):
         alarm, detail = _economy(since_flip_s=1.0, min_dwell_s=3.0)

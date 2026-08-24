@@ -473,8 +473,10 @@ def economy_divergence_verdict(
         )
     if not price_measured:
         return False, (
-            "flip price provenance is seed, not measured: an assumption is "
-            "not the policy's own claim and is not evidence of divergence"
+            "flip price provenance is seed or half-measured, not measured: an "
+            "assumption is not the policy's own claim and is not evidence of "
+            "divergence. #856: C is a ROUND TRIP of two independently measured "
+            "legs, so one measured leg still leaves half the price a seed"
         )
     # The bar the policy APPLIED, never the break-even alone. See gate 5.
     applied_bar = max(int(live_flip_tokens), int(applied_bar_tokens))

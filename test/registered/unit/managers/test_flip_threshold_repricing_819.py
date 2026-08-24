@@ -103,14 +103,24 @@ class _EstimatorFixture(CustomTestCase):
         pp._FLIP_TOKENS_STALE_SAID = self._saved_said
 
     def _measure(self, seconds):
-        """Calibrate the estimator to exactly `seconds`.
+        """Calibrate the estimator to exactly `seconds` of ROUND TRIP.
 
         The first observation REPLACES the seed outright (FlipCostEstimator's
         own documented rule), so one call pins the value with no EMA lag.
+
+        #856: an UNDIRECTED reading is a round trip and is split evenly across
+        the two legs, so `value()` returns what was observed -- except below
+        two leg-minimums, where each leg floors at `MIN_ESTIMATE_S` and the
+        round trip therefore floors at twice it. That floor is the point of
+        the constant (it stops the multiplicative band collapsing to zero),
+        and it applies per leg because each leg carries its own band.
         """
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=SEED_C)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=SEED_C)
         pp.observe_flip_cost(seconds)
-        self.assertAlmostEqual(pp._FLIP_COST_ESTIMATOR.value(), seconds, places=6)
+        floor = 2.0 * pp.FlipCostEstimator.MIN_ESTIMATE_S
+        self.assertAlmostEqual(
+            pp._FLIP_COST_ESTIMATOR.value(), max(seconds, floor), places=6
+        )
 
 
 class TestTheSpecimenIsReproduced(_EstimatorFixture):
@@ -202,9 +212,19 @@ class TestTheWholeLegIsPriced(_EstimatorFixture):
         return base
 
     def test_the_leg_total_becomes_the_price(self):
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=SEED_C)
+        # #819's property, RESTATED PER LEG BY #856 rather than weakened. The
+        # whole leg total (not just the refill step) still becomes the price
+        # of THAT LEG -- which is what this test was always about. What
+        # changed is that C is a round trip, so the OTHER leg is still on its
+        # seed half until it too is measured, and the deliberate arithmetic
+        # is 11.4901 + 3.2/2 = 13.0901. Asserting 11.4901 here would be
+        # asserting that one leg is the whole round trip, which is exactly
+        # the defect #856 removes.
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=SEED_C)
         pp.observe_flip_leg(self._stats(total_ms=11490.1))
-        self.assertAlmostEqual(pp._FLIP_COST_ESTIMATOR.value(), 11.4901, places=4)
+        est = pp._FLIP_COST_ESTIMATOR
+        self.assertAlmostEqual(est.leg("tp_to_pp").value(), 11.4901, places=4)
+        self.assertAlmostEqual(est.value(), 11.4901 + SEED_C / 2.0, places=4)
 
     def test_a_shrinking_cutover_lowers_the_bar(self):
         # THE #834 COUPLING, end to end. Same flip, same movers, only the
@@ -212,10 +232,10 @@ class TestTheWholeLegIsPriced(_EstimatorFixture):
         # that term at 3449 ms with HiCache on and 50 ms with it off, against
         # movers of ~2722 ms, so these are the shape of real numbers.
         cfg = _cfg()
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=SEED_C)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=SEED_C)
         pp.observe_flip_leg(self._stats(cutover_ms=3449.0, total_ms=6171.0))
         wide_seam = live_flip_tokens(cfg)
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=SEED_C)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=SEED_C)
         pp.observe_flip_leg(self._stats(cutover_ms=50.0, total_ms=2772.0))
         shrunk_seam = live_flip_tokens(cfg)
         self.assertLess(
@@ -228,7 +248,7 @@ class TestTheWholeLegIsPriced(_EstimatorFixture):
     def test_a_leg_without_a_total_is_not_a_reading(self):
         # Absent or malformed stats must leave the estimate untouched rather
         # than clamp a zero into it -- the module's rule for a non-reading.
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=SEED_C)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=SEED_C)
         for bad in (None, {}, {"total_ms": None}, {"total_ms": "n/a"}, 17.0):
             with self.subTest(stats=bad):
                 pp.observe_flip_leg(bad)

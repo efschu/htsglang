@@ -168,7 +168,7 @@ class TestTheHookFeedsThePolicy(CustomTestCase):
     def test_observations_move_the_break_even(self):
         from sglang.srt.managers import phase_policy as pp
 
-        pp._FLIP_COST_ESTIMATOR = pp.FlipCostEstimator(seed_s=STALE_COST_S)
+        pp._FLIP_COST_ESTIMATOR = pp.RoundTripFlipCost(seed_s=STALE_COST_S)
         n_before = break_even_tokens(
             pp._FLIP_COST_ESTIMATOR.value(), TP_TOK_S, PP_TOK_S
         )

@@ -10936,7 +10936,7 @@ class Scheduler(
             from sglang.srt.managers.phase_policy import (
                 drain_stall_deadline_s,
                 effective_flip_threshold,
-                flip_cost_measured,
+                flip_cost_fully_measured,
                 live_flip_cost_s,
                 live_flip_tokens,
             )
@@ -10981,7 +10981,10 @@ class Scheduler(
                     effective_flip_threshold(cfg, int(inp.running_bs))
                 ),
                 live_flip_cost_s=float(live_flip_cost_s(cfg)),
-                price_measured=bool(flip_cost_measured()),
+                # #856: BOTH legs, not either. C is a round trip, and a
+                # half-measured one is still half seed -- which this gate
+                # refuses as "an assumption is not the policy's own claim".
+                price_measured=bool(flip_cost_fully_measured()),
                 hold_reason=reason,
                 since_flip_s=now - state.last_flip_at,
                 min_dwell_s=float(cfg.min_dwell_s),
