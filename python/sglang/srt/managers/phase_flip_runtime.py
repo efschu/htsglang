@@ -1084,6 +1084,114 @@ def releasable_cache_bytes_from_stats(stats, alloc_conf: str = "") -> Optional[i
         return None
 
 
+def _segment_pool_id(seg) -> tuple:
+    """The private-pool id of one snapshot segment, ``(0, 0)`` for the general
+    pool. Torch names the field ``segment_pool_id`` in the snapshot dict and
+    ``owner_private_pool_id`` in the C++ ``SegmentInfo``; both spellings are
+    accepted so a torch version bump degrades to "general pool" rather than to
+    a wrong subtraction."""
+    raw = seg.get("segment_pool_id", seg.get("owner_private_pool_id", (0, 0)))
+    try:
+        return tuple(int(x) for x in raw)
+    except (TypeError, ValueError):
+        return (0, 0)
+
+
+def graph_pool_free_bytes_from_segments(segments) -> Optional[int]:
+    """THE FOURTH TERM (#852 R3): free bytes trapped in CUDA-graph pools.
+
+    W25 printed, five times, stable to the MiB:
+
+        staging reclaim: driver free 2896 -> 2896 MiB (+0 returned,
+                         predicted releasable 88 MiB)
+
+    A nonzero prediction against a zero delivery, which #852's own text says
+    "falsifies it and indicts this estimator instead". The phantom was down
+    3.6x from W24's ~309-324 MiB, but 88 MiB of it survived, and it was
+    STABLE while the general cache drifted 310 -> 305 MiB across the same
+    seven passes. A term that does not move while its neighbours do is not
+    fragmentation; it is a fixed structure.
+
+    IT IS THE GRAPH POOLS. ``adaptive_graph_memory`` captures decode graphs
+    into PER-TAG PRIVATE pools (:841 ``torch.cuda.graph_pool_handle()``,
+    :873 ``with torch.cuda.graph(cuda_graph, pool=pool, ...)``), and this
+    boot captured them: decode ``backend='full'``, bs 1..24. Torch's
+    ``release_cached_blocks`` frees whole blocks from the GENERAL
+    ``large_blocks``/``small_blocks`` pools only; a private pool is released
+    solely through ``graph_pools_freeable``, i.e. once nothing references the
+    graph. So while the graphs live, those bytes can NEVER be handed back --
+    and ``reserved``/``allocated``/``inactive_split`` are device-global
+    ``.all`` counters that COUNT THEM. The three-term arithmetic therefore
+    promises bytes the driver will never see, which is exactly the observed
+    88 MiB.
+
+    Returns ``None`` when the snapshot cannot be read as segments, never 0 --
+    "no verdict" and "no trapped bytes" are the two readings this whole
+    ticket family exists to keep apart.
+    """
+    try:
+        total = 0
+        seen = False
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seen = True
+            if _segment_pool_id(seg) == (0, 0):
+                continue
+            size = int(seg.get("total_size", 0))
+            used = int(seg.get("allocated_size", 0))
+            total += max(0, size - used)
+        return total if seen else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def releasable_cache_bytes_from_segments(
+    segments, alloc_conf: str = ""
+) -> Optional[int]:
+    """What ``empty_cache()`` can return, computed SEGMENT BY SEGMENT (#852 R3).
+
+    The three-term arithmetic is a proxy; this is the thing itself. Torch's
+    ``release_blocks`` frees a block only when it is unsplit -- i.e. when its
+    segment carries no live allocation at all -- and only from the general
+    pools. So the exact answer is: sum ``total_size`` over segments that are
+    (a) entirely free, (b) not in a private/graph pool, and (c) not
+    expandable.
+
+    THE ABSTENTIONS ARE UNCHANGED, deliberately. The expandable-segments
+    abstention still keys on the ENV, not on the per-segment
+    ``is_expandable`` flag, because #852's reason for it is that ``reserved``
+    describes a virtual extent under that allocator and the whole comparison
+    is void -- an under-report there suppresses a draw that would have paid
+    and makes the flip STICKIER, the precise defect #852 exists to remove.
+    Narrowing that abstention is a separate decision with its own evidence,
+    not a side effect of naming the fourth term.
+
+    ``None`` when there is nothing to read, so the caller falls back to the
+    stats arithmetic exactly as before rather than treating an unreadable
+    snapshot as an empty cache.
+    """
+    try:
+        if "expandable_segments:True" in (alloc_conf or ""):
+            return None
+        total = 0
+        seen = False
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seen = True
+            if seg.get("is_expandable"):
+                continue
+            if _segment_pool_id(seg) != (0, 0):
+                continue
+            if int(seg.get("allocated_size", 0)) != 0:
+                continue
+            total += int(seg.get("total_size", 0))
+        return total if seen else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _resident_rows(scheduler) -> Optional[set]:
     """KV rows held by RESIDENT REQUESTS -- the census's missing owner (#822).
 
@@ -7687,12 +7795,50 @@ class PhaseFlipRuntime:
         try:
             if not torch.cuda.is_available():
                 return None
+            alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            # #852 R3: the SEGMENT view first, because it is the exact answer
+            # and the three-term arithmetic is only a proxy for it. The proxy
+            # over-promised a stable 88 MiB in W25 -- free blocks sitting in
+            # CUDA-graph PRIVATE pools, which `empty_cache()` provably never
+            # returns while the graphs live, but which the device-global
+            # `.all` counters happily count. Falls back to the proxy when the
+            # snapshot cannot be read, so an unreadable snapshot costs
+            # precision, never behaviour.
+            try:
+                exact = releasable_cache_bytes_from_segments(
+                    torch.cuda.memory_snapshot(), alloc_conf=alloc_conf
+                )
+            except Exception:  # noqa: BLE001 - the proxy is still available
+                exact = None
+            if exact is not None:
+                return exact
             return releasable_cache_bytes_from_stats(
                 torch.cuda.memory_stats(),
-                alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+                alloc_conf=alloc_conf,
             )
         except Exception:  # noqa: BLE001 - a measurement may abstain, never break
             return None
+
+    @staticmethod
+    def _torch_graph_pool_free_bytes():
+        """#852 R3 device half: free bytes trapped in CUDA-graph pools."""
+        try:
+            if not torch.cuda.is_available():
+                return None
+            return graph_pool_free_bytes_from_segments(torch.cuda.memory_snapshot())
+        except Exception:  # noqa: BLE001 - an instrument, never a gate
+            return None
+
+    def _graph_pool_free_bytes(self):
+        """Injectable like the other probes, so the discriminator is
+        falsifiable without a GPU."""
+        hook = getattr(self, "_mem_graph_pool_free", None)
+        if hook is not None:
+            try:
+                return hook()
+            except Exception:  # noqa: BLE001 - an abstaining probe, not a crash
+                return None
+        return PhaseFlipRuntime._torch_graph_pool_free_bytes()
 
     def _releasable_cache_bytes(self):
         """#852: injectable like ``_mem_probe`` / ``_mem_reclaim``, so the
@@ -7916,15 +8062,29 @@ class PhaseFlipRuntime:
             predicted = (
                 "unmeasurable" if releasable is None else f"{releasable / mib:.0f} MiB"
             )
+            # #852 R3: NAME THE FOURTH TERM IN THE SAME LINE. W25's prediction
+            # was a stable 88 MiB against a zero delivery, and the discriminator
+            # that settles it is how much free space sits in CUDA-graph PRIVATE
+            # pools -- bytes `empty_cache()` can never return while the graphs
+            # live, which the device-global `.all` counters nevertheless count.
+            # Printed beside the prediction so the next window reads the
+            # attribution directly instead of inferring it, exactly as #852
+            # printed the prediction beside the delivery.
+            trapped = self._graph_pool_free_bytes()
+            trapped_txt = (
+                "unmeasurable" if trapped is None else f"{trapped / mib:.0f} MiB"
+            )
             logger.info(
                 "%s staging reclaim: driver free %.0f -> %.0f MiB "
-                "(+%.0f returned, predicted releasable %s), %.0f MiB still "
-                "cached, reserve %.0f MiB, staging needs %.0f MiB",
+                "(+%.0f returned, predicted releasable %s, graph-pool trapped "
+                "%s), %.0f MiB still cached, reserve %.0f MiB, staging needs "
+                "%.0f MiB",
                 LOG_PREFIX,
                 before / mib,
                 driver_free / mib,
                 (driver_free - before) / mib,
                 predicted,
+                trapped_txt,
                 cached_free / mib,
                 reserve / mib,
                 staging_bytes / mib,

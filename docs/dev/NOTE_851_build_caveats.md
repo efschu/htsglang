@@ -284,6 +284,49 @@ The phantom is down 3.6x (~320 -> 88 MiB) and the cause split moved from 43/2
 to 8/2 phantom/scarcity, but **#852 must not be recorded as closed** — there is
 a fourth term the arithmetic still misses.
 
+#### R3 ROOTED (2026-08-24): the fourth term is the CUDA-graph PRIVATE pool
+
+The tell was in the specimen all along: 88 MiB was STABLE across all seven
+passes while the general cache drifted 310 -> 308 -> 307 -> 305 MiB. A term
+that does not move while its neighbours do is not fragmentation, it is a fixed
+structure.
+
+`speculative/adaptive_graph_memory.py:841` takes a per-tag
+`torch.cuda.graph_pool_handle()` and `:873` captures into it
+(`torch.cuda.graph(cuda_graph, pool=pool, stream=stream)`); this boot captured
+decode graphs (`backend='full'`, bs 1..24; the PP stack captures none). Torch's
+`release_cached_blocks` frees whole blocks from the GENERAL
+`large_blocks`/`small_blocks` pools only — a private pool is released solely
+via `graph_pools_freeable`, i.e. once nothing references the graph. But
+`reserved_bytes.all` / `allocated_bytes.all` / `inactive_split_bytes.all` are
+device-global and COUNT those segments. So the three-term arithmetic promises
+bytes the driver can never be handed, for as long as the graphs live.
+
+Torch's own structure is the citation: `SegmentInfo.owner_private_pool_id =
+{0,0}` (`c10/core/CachingDeviceAllocator.h:98`), surfaced in the snapshot as
+`segment_pool_id`, which `torch/_inductor/cudagraph_trees.py:1827` uses for
+precisely this purpose.
+
+FIXED by computing the figure SEGMENT BY SEGMENT instead of from the
+device-global counters (`releasable_cache_bytes_from_segments`): sum
+`total_size` over segments that are entirely free, not in a private pool, and
+not expandable — which is exactly what `release_blocks` can free. The stats
+proxy remains as the fallback when a snapshot cannot be read, so precision is
+gained without changing behaviour. `graph_pool_free_bytes_from_segments` names
+the trapped figure, and the reclaim line now prints it beside the prediction,
+the same way #852 printed the prediction beside the delivery.
+
+The expandable-segments abstention is UNCHANGED and keys on the env, not on
+the per-segment `is_expandable` flag: #852's reason for it is that `reserved`
+is a virtual extent under that allocator, and an under-report there suppresses
+a draw that would have paid and makes the flip stickier. Narrowing it is a
+separate decision with its own evidence.
+
+Red-first evidence that this is the right term:
+`test_releasable_graph_pool_852.py::test_the_three_term_proxy_counts_the_graph_pool`
+feeds the shipped arithmetic a segment set of the W25 shape and gets back
+**exactly 88 MiB**.
+
 ## Metal criteria are NOT substituted by any of this
 
 "0 over-cap floor vetoes under load" stays in the window ticket unchanged. The
