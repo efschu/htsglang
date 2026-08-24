@@ -134,6 +134,13 @@ def _hashed_nodes(tree_cache: Any) -> list:
     Parent order is not cosmetic: the backup invariant is that backed-up nodes
     form a contiguous prefix from the root, and a child staged before its
     parent is a gap the normal path would have skipped.
+
+    #841: parent order alone was never enough, and the walk below shows why --
+    a node WITHOUT a ``hash_value`` is skipped from the list while the walk
+    still descends into its children. So an unhashed node's children reach the
+    staging loop with their parent absent from it entirely, and the loop's
+    ``write_back=True`` also disarms ``write_backup``'s own parent gate. Order
+    is preserved here; the law itself is enforced at the call site.
     """
     root = getattr(tree_cache, "root_node", None)
     if root is None:
@@ -176,24 +183,55 @@ def flip_writeback(
     deadline = started + float(deadline_s)
 
     nodes = _hashed_nodes(tree_cache)
+    root = getattr(tree_cache, "root_node", None)
     staged = 0
     already = 0
+    skipped_unbacked_parent = 0
     for node in nodes:
         if getattr(node, "backuped", False):
             already += 1
             continue
+        # #841: THE CONTIGUOUS-BACKUP LAW. This loop used to reason that
+        # "the parent is in this same list, earlier, so the invariant holds
+        # by construction", and staged the child regardless with
+        # write_back=True -- which ALSO disarms write_backup's own parent gate
+        # at unified_radix_cache.py:1943-1948. Both halves of that reasoning
+        # fail: an unhashed parent is never in the list at all (see
+        # _hashed_nodes), and a parent that IS in the list can still have had
+        # its own write_backup refused a moment earlier -- the mamba pin
+        # budget, the rank-uniform host floor and the staging ring each return
+        # 0 without raising.
+        #
+        # A child staged over that gap is not merely a lost page. Under any
+        # write policy other than `write_back` the tree's own idle-path
+        # sanity check enforces the law and ABORTS every rank on it, and an
+        # un-backed parent above a backed child can be deleted by a device
+        # eviction, orphaning the subtree in the host ledger. That is the
+        # window-5 crash. The store being content-addressed per page does not
+        # make the tree's ledger consistent.
+        parent = getattr(node, "parent", None)
+        if (
+            parent is not None
+            and parent is not root
+            and not getattr(parent, "backuped", False)
+        ):
+            skipped_unbacked_parent += 1
+            continue
         try:
-            # write_back=True: stage this node even if its parent is not
-            # staged yet. The parent is in this same list, earlier, so the
-            # contiguous-prefix invariant holds by construction -- and where
-            # it would not, staging the child is still better than dropping
-            # it, because the store is content-addressed per page.
             written = tree_cache.write_backup(node, write_back=True)
         except Exception as e:  # an instrument at a seam, never a gate
             logger.warning("%s staging node failed: %s", LOG_PREFIX, e)
             continue
         if written:
             staged += 1
+    if skipped_unbacked_parent:
+        logger.info(
+            "%s skipped %d node(s) whose parent carries no host copy; staging "
+            "them would break the contiguous-backup law the tree asserts on "
+            "the idle path.",
+            LOG_PREFIX,
+            skipped_unbacked_parent,
+        )
 
     # Complete the device->host copies. This is also what triggers the
     # host->storage stage: the write ack path calls write_backup_storage.

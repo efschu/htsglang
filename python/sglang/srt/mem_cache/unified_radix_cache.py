@@ -747,6 +747,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # place by the first backup, but not necessarily at construction.
         self._mamba_pin_budget_cached: Optional[int] = None
         self._mamba_pin_skipped = 0
+        # #841: host-only inserts declined for breaking the contiguous-backup
+        # law. Counted rather than silent, so a collapsing storage hit rate is
+        # attributable to the law and not to the backend.
+        self._host_insert_refused_unbacked_parent = 0
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1624,6 +1628,71 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
+        # #841: THE CONTIGUOUS-BACKUP LAW, enforced here because this is the
+        # second writer into the host tier and it used to be exempt.
+        #
+        # The law: a node may carry a host copy only if its parent does. It is
+        # not decorative. `_evict_device_leaf`'s write-through branch DELETES
+        # an un-backed device leaf outright, and `_is_device_leaf` qualifies a
+        # node whose children hold host data but no device data. So an
+        # un-backed parent above a backed child is a node that can be deleted
+        # while it still has children -- `_remove_leaf_from_parent` pops the
+        # edge and the backed subtree below it is orphaned: still in
+        # `evictable_host_leaves`, still in the aux host LRUs, no longer
+        # reachable from the root. That is precisely the window-5 idle-path
+        # crash, in both of its shapes:
+        #
+        #   "node 144 backed up but parent 11 not backed up"   (the state)
+        #   "H-leaf extra: [18, 19]" + "stale nodes in host_leaves: [18, 19]"
+        #   + "mamba host LRU: +S3=set(), +lru={18}"           (after the delete)
+        #
+        # `write_backup` has always upheld the law, at :1943-1948, by backing
+        # the parent up first and refusing when that fails. This path had no
+        # such gate: `check_prefetch_progress` walks down from
+        # `last_host_node` -- which `Scheduler._prefetch_kvcache` allows to be
+        # the ROOT (scheduler.py:4420) -- through whatever children match the
+        # fetched key, device-only ones included, and attached the fetched tail
+        # wherever the walk stopped. Window 5's `matched=45` is exactly
+        # root -> node 12 (1 token) -> node 11 (44 tokens), both device-only.
+        #
+        # Refusing costs one storage hit. Attaching costs the scheduler, on the
+        # next idle check, on every rank at once. The same trade `write_backup`
+        # already makes one function up.
+        #
+        # WHY REFUSE RATHER THAN BACK THE PARENT UP HERE. Calling
+        # `write_backup(node)` would satisfy the law and keep the hit -- it
+        # recurses up the chain and is the authority for exactly this. It is
+        # also a rank-LOCAL tree edit (`evict_host` deletes host leaves) issued
+        # immediately after the prefetch's own all_reduce, i.e. at a collective
+        # seam. That is the #639/#645 wedge shape, four specimens deep, and it
+        # is not worth re-opening to recover a prefetch tail.
+        #
+        # RESIDUAL RISK, named rather than assumed away: `backuped` is not
+        # provably rank-uniform (the mamba pin budget at
+        # `_mamba_write_through_pin_admissible` is rank-local), so ranks could
+        # in principle decline on different nodes and diverge. This predicate
+        # already drives rank-divergent tree edits today -- `_evict_device_leaf`
+        # DELETES an un-backed node and DEMOTES a backed one -- and #645
+        # uniformized the host admission behind it for that reason. This gate
+        # rides on that same uniformization; it does not add a new class of
+        # divergence. If a boot ever shows the ranks declining different nodes,
+        # that is #645's admission drifting, not this gate.
+        parent_backed = node is self.root_node or node.backuped
+        if not parent_backed:
+            self._host_insert_refused_unbacked_parent += 1
+            logger.debug(
+                "#841 host-only insert declined: parent node %s carries no host "
+                "copy, so a backed child under it could be orphaned by a "
+                "device eviction. matched=%d declined=%d",
+                node.id,
+                matched_length,
+                total_len - matched_length,
+            )
+            # The caller reserved the tail for a node that will not exist.
+            # Nothing in the tree can free it, so say so.
+            result.host_span_unclaimed = True
+            return result
+
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
@@ -1886,6 +1955,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._evict_to_host(node, tracker)
                 return
             else:
+                # #841: this branch DELETES, and `_is_device_leaf` qualifies a
+                # node whose children hold host data but no device data -- so
+                # without this guard the delete pops the edge above a
+                # host-backed subtree and orphans it in `evictable_host_leaves`
+                # and the aux host LRUs. Under the contiguous-backup law
+                # (upheld by `write_backup` and, since #841, by
+                # `_insert_helper_host`) a backed child implies a backed
+                # parent, so an UN-backed node cannot have backed children and
+                # this state is unreachable. Keep the check anyway: it is the
+                # falsifier for the law. Refusing the eviction leaves the
+                # node's device rows in place, which is what keeps the law
+                # true; dropping a caller's eviction request costs tokens,
+                # while the delete costs every rank's scheduler at the next
+                # idle check.
+                if node.children:
+                    logger.error(
+                        "#841 refusing to delete un-backed node %s: it still "
+                        "has %d child node(s), and deleting it would orphan "
+                        "any host-backed subtree below it. The "
+                        "contiguous-backup law has been broken upstream of "
+                        "this point -- find the writer, do not relax this "
+                        "guard.",
+                        node.id,
+                        len(node.children),
+                    )
+                    return
                 # Write-through: node has no backup, delete entirely.
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
@@ -2724,9 +2819,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
+        # #841: the matched head was never adopted (the tree already had it),
+        # and when the contiguous-backup law declined the insert the fetched
+        # TAIL was not adopted either. Both are this rank's to release: no
+        # tree node references them, so nothing else ever will.
+        unclaimed_to = (
+            min_completed_tokens
+            if insert_result.host_span_unclaimed
+            else insert_result.prefix_len
         )
+        self.cache_controller.mem_pool_host.free(host_indices[:unclaimed_to])
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
@@ -2734,7 +2836,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+        # #841: a declined insert loaded NOTHING into the tree. Reporting the
+        # fetched tail as `loaded` would make the metric measure the transfer
+        # instead of the retention, and a refusal would read as a hit.
+        loaded_from_storage = (
+            0
+            if insert_result.host_span_unclaimed
+            else min_completed_tokens - insert_result.prefix_len
+        )
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
