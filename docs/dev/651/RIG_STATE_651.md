@@ -192,6 +192,47 @@ stream is fed to the model's own `load_weights`, and `models/qwen3_5.py`
 So each PP stage loads only the layers it owns, and stage d does not need a
 GGUF-side change.
 
+## 6c. The checkpoint is staged and the speculation loader path is PROVEN
+
+Fetched 2026-08-24: 22,853,663,008 bytes (21.28 GiB) in 1978 s at 11.0 MiB/s,
+to `.../models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/`, tokenizer alongside.
+Header on the complete file matches the mid-download read exactly: 753 tensors,
+`qwen35moe`, block_count 41, nextn_predict_layers 1, expert_count 256,
+type histogram BF16=2 F32=368 Q4_K=80 Q5_K=40 Q6_K=3 Q8_0=260.
+
+`mtp_gate_probe.py` against the real file, CPU only, through the real registry
+adapter with the draft architecture rewrite:
+
+    adapter: Qwen35GGUFAdapter arch=qwen35moe is_draft=True
+    stream: 63000 tensors
+    ok  mtp.layers.0.mlp.gate.weight                bfloat16 (256, 2048) std 0.0096
+    ok  mtp.layers.0.mlp.shared_expert_gate.weight  bfloat16 (1, 2048)   std 0.0020
+    VERDICT: MTP ROUTER GATES DENSE AND SANE
+
+Both gates arrive dense, finite, correctly shaped, at trained-router scale --
+and the two standard deviations reproduce `0155ff2c00`'s measurements on this
+same checkpoint to four decimals. So the #647 fix on this tree works on the file
+that exposes the defect.
+
+**Falsified in the other direction, which is what makes the PASS mean
+anything.** With the #647 predicate neutralized
+(`weight_utils.is_dense_gguf_target` forced to return False, i.e. the pre-fix
+"rename everything non-F32" behaviour):
+
+    stream: 63002 tensors
+    FAIL  mtp.layers.0.mlp.gate.weight: ABSENT from the stream
+    FAIL  mtp.layers.0.mlp.shared_expert_gate.weight: ABSENT from the stream
+    FAIL  mtp.layers.0.mlp.gate.qweight: dense router gate arrived under a PACKED name
+    FAIL  mtp.layers.0.mlp.shared_expert_gate.qweight: ...
+    VERDICT: DEFECT (exit 1)
+
+The tensor count is the independent confirmation of the mechanism: 63000 ->
+63002, because each dense `.weight` is replaced by a `.qweight` +
+`.qweight_type` pair. The probe detects exactly the defect it was written for
+and is silent about nothing else.
+
+Desk phase is therefore closed. What remains needs a card.
+
 ## 7. Open residuals for the rig
 
 1. **PP=3 GGUF has never been executed.** `boot.sh` STAGE=d was written and its
