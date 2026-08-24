@@ -997,7 +997,9 @@ class CorridorGuard:
     def _host_tier_permitted(self, column: Sequence[int]) -> bool:
         return fleet_is_level(column, self.floor_mib, self.delta_mib)
 
-    def declare_offledger_funder(self, view: Optional[Callable[[int], Sequence]]) -> None:
+    def declare_offledger_funder(
+        self, view: Optional[Callable[[int], Sequence]]
+    ) -> None:
         """Name a funder this ladder may NOT spend, so refusals can cite it.
 
         ``view(want_bytes)`` returns an iterable of ``(name, credit_bytes,
@@ -1174,10 +1176,15 @@ class CorridorGuard:
         # it was, because it is the truthful record of what the gate actually
         # spent. Only failures carry the suffix -- a successful ask does not
         # need to explain money it did not need.
-        if not ok:
-            named = self._offledger_detail(want)
-            if named:
-                detail = f"{detail}; {named}"
+        # #853(ii): THE CLAUSE IS APPLIED BELOW, AFTER EVERY MUTATION OF
+        # `detail`, NOT HERE. Applying it at this point covered only the
+        # refusals that were already decided: the `must_reclaim` branch below
+        # flips `ok` AFTER this line and REBUILDS `detail` from scratch, so a
+        # clause added here was discarded, and the CANNOT-FULLY-HOLD report is
+        # emitted with `ok` still True and never reached this branch at all.
+        # W24 counted the result: 67 unclaused "from [nothing]" lines, 66
+        # REFUSED and 1 CANNOT-FULLY-HOLD, every one of them a standalone
+        # corridor-guard emission.
         # #689 A RECLAIM ASK IS JUDGED BY WHAT MOVED.
         #
         # ``free_now >= want`` asks "is want allocatable", which is exactly
@@ -1240,6 +1247,33 @@ class CorridorGuard:
             clause = describe_water_fill(column)
             if clause:
                 detail += f". {clause}"
+        # #851 F4, COMPLETED BY #853(ii): SAY WHAT THIS GATE COULD NOT DRAW,
+        # instead of leaving "[nothing]" to mean two different things.
+        #
+        # W22 printed "reclaimed 0 MiB from [nothing]" 39 times while the
+        # kv-slack post held 2776 MiB. "[nothing]" is the LADDER's provider
+        # list, and it is honest about the ladder -- but read as a sentence it
+        # says "this rig had no memory to give", which sends the next reader to
+        # capacity planning. The true statement is "this rig had a funder this
+        # gate may not spend". One window was partly spent on that difference.
+        #
+        # HERE, at the last possible point, because every earlier position is
+        # reachable by only some of the emissions -- that was the #853(ii)
+        # defect exactly. Every path that ends in a REFUSED or a
+        # CANNOT-FULLY-HOLD line passes through this statement.
+        #
+        # THE LAW BREACH IS INCLUDED EVEN THOUGH IT SUCCEEDS. It is a report
+        # about memory pressure, which is precisely when a reader needs to know
+        # a funder was in the room and unreachable.
+        #
+        # Appended, never substituted: the ladder's own list stays exactly as
+        # it was, because it is the truthful record of what the gate actually
+        # spent. And a clean success still says nothing -- an ask that needed
+        # no money does not have to explain the money it did not need.
+        if not ok or law_breached:
+            named = self._offledger_detail(want)
+            if named:
+                detail = f"{detail}; {named}"
         if ok and law_breached:
             self.law_dip_count = getattr(self, "law_dip_count", 0) + 1
             logger.warning(
