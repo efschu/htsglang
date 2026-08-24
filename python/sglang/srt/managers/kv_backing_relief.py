@@ -607,6 +607,21 @@ FLOOR_NEED_COMMIT_RAISED = "COMMIT-RAISED"
 #: success, computed ``grown`` as 0, cleared nothing, logged nothing, and
 #: returned 0. Indistinguishable from "there was no gap".
 FLOOR_NEED_COMMIT_CLAMPED = "COMMIT-CLAMPED"
+#: #848: the target exceeds the arena's IMMUTABLE VA reservation, so the commit
+#: is refused before it is attempted. Window 7 reached this state and reported
+#: it as COMMIT-RAISED, which named the driver's complaint instead of the
+#: authority that actually binds:
+#:
+#:     PP1 size=126976, reservation=125052, target=126977
+#:     ValueError('final_num_tokens=126977 must satisfy page_size=1 <= final
+#:                 <= reserved=125052')
+#:
+#: The reservation is fixed at construction from the pool's size AT THAT MOMENT
+#: (``reserved_num_tokens=self.size``, memory_pool.py:2690) and never reassigned,
+#: while ``size`` stays mutable and the #330 dial writes it. So a rank whose dial
+#: has moved past its own boot reservation can never grow again, and the reason
+#: is the RESERVATION, not the commit.
+FLOOR_NEED_RESERVATION_CAPPED = "RESERVATION-CAPPED"
 FLOOR_NEED_GROWN = "GROWN"
 
 FLOOR_NEED_EXITS = (
@@ -619,6 +634,7 @@ FLOOR_NEED_EXITS = (
     FLOOR_NEED_POOL_CANNOT_GROW,
     FLOOR_NEED_COMMIT_RAISED,
     FLOOR_NEED_COMMIT_CLAMPED,
+    FLOOR_NEED_RESERVATION_CAPPED,
     FLOOR_NEED_GROWN,
 )
 
@@ -3154,6 +3170,49 @@ class KvBackingRelief:
             return 0
         floor = int(self._group_backed_floor)
         target = floor + gap
+        # #848: ASK THE ARENA WHAT IT CAN HOLD, BEFORE ASKING IT TO HOLD MORE.
+        #
+        # This is #684's pattern, applied one call site over. That ticket found
+        # recovery aiming above the immutable VA reservation -- "The pool's
+        # reservation is never consulted; `reserved` is not read against a pool
+        # anywhere in the module" -- and fixed `recover()` by reading
+        # `_reserved_rows()` first. This actuator was written afterwards and did
+        # not inherit the lesson: it proposed floor+gap and handed it straight to
+        # the setter.
+        #
+        # WHY REFUSE RATHER THAN CLAMP, which is where this differs from
+        # `recover()`. Recovery wants as much backing as it can get, so clamping
+        # to the ceiling still does useful work. This actuator has ONE job --
+        # raise the group floor past the live set -- and a target clamped BELOW
+        # the need does not do it. Clamping here would commit pages, report
+        # progress, and leave the flip exactly as unfittable as before. So the
+        # honest answer is a named refusal that identifies the binding
+        # authority.
+        #
+        # Window 7 attempted the doomed commit and reported COMMIT-RAISED, which
+        # named the driver's ValueError rather than the reservation. Same
+        # outcome, wrong authority, and a reader chasing the commit path instead
+        # of the sizer.
+        ceiling = self._reserved_rows()
+        if ceiling is not None and target > ceiling:
+            self._record_floor_need_refusal(
+                floor,
+                target,
+                f"the pool's IMMUTABLE VA reservation is {ceiling} rows and the "
+                f"target is {target}: this rank's dial has already moved its "
+                f"size past its own boot reservation, so no grow can ever be "
+                f"accepted here. This is a BOOT-TIME SIZING defect (the "
+                f"reservation is fixed at construction from the pool size at "
+                f"that moment and never reassigned), not a seam defect -- the "
+                f"seam is reporting it, not causing it (#848)",
+            )
+            self._note_floor_need_exit(
+                FLOOR_NEED_RESERVATION_CAPPED,
+                floor=floor,
+                target=target,
+                reserved=ceiling,
+            )
+            return 0
         setter = getattr(self._pool, "runtime_set_backing_rows", None)
         if not callable(setter):
             self._record_floor_need_refusal(

@@ -440,6 +440,15 @@ class TheExitSetIsExhaustive(unittest.TestCase):
             g["PP1"].relief.close_floor_need_gap()
             g["PP0"].relief.close_floor_need_gap()  # NO-GAP via NOT-THE-FLOOR
             seen |= set(_exits(g["PP1"])) | set(_exits(g["PP0"]))
+        # #848 RESERVATION-CAPPED: the arena's VA reservation sits BELOW the
+        # target, so the commit is refused before it is attempted. Added when
+        # #848 declared the eleventh exit -- THIS TEST CAUGHT THAT OMISSION,
+        # which is what it is for.
+        capped = _group()
+        capped["PP1"].pool.reserved_backing_rows = W6_FLOOR - 1
+        _ballot(capped, close=False)
+        capped["PP1"].relief.close_floor_need_gap()
+        seen |= set(_exits(capped["PP1"]))
         # no group verdict
         fresh = _group()["PP1"]
         fresh.relief.floor_need_verdict()
@@ -450,17 +459,22 @@ class TheExitSetIsExhaustive(unittest.TestCase):
         st["PP1"].pool = _Pool(W6_BACKED["PP1"], RESERVATION)
         st["PP1"].relief.floor_need_verdict()
         seen |= set(_exits(st["PP1"]))
-        # pool cannot grow
+        # pool cannot grow.
+        #
+        # INSTANCE-LEVEL, NEVER CLASS-LEVEL. The first draft of this arm did
+        # `del nogrow["PP1"].pool.__class__.runtime_set_backing_rows` and
+        # restored it with a lambda, which silently replaced the REAL method for
+        # every later test in the process: sibling suites then saw a setter that
+        # accepted every call and committed nothing, so they passed standalone
+        # and failed in a full run. That is the exact module-global-patch shape
+        # ANALYSE_843 records. Shadowing the attribute on the INSTANCE leaves
+        # the class untouched -- `getattr(pool, "runtime_set_backing_rows")`
+        # returns None, which is not callable, which is the branch under test.
         nogrow = _group()
         _ballot(nogrow, close=False)
-        del nogrow["PP1"].pool.__class__.runtime_set_backing_rows
-        try:
-            nogrow["PP1"].relief.close_floor_need_gap()
-            seen |= set(_exits(nogrow["PP1"]))
-        finally:
-            _Pool.runtime_set_backing_rows = _Pool.__dict__.get(
-                "runtime_set_backing_rows", None
-            ) or (lambda self, rows: None)
+        nogrow["PP1"].pool.runtime_set_backing_rows = None
+        nogrow["PP1"].relief.close_floor_need_gap()
+        seen |= set(_exits(nogrow["PP1"]))
 
         missing = set(K.FLOOR_NEED_EXITS) - seen
         self.assertEqual(
