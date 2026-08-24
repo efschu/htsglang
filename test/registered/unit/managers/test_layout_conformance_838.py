@@ -328,8 +328,13 @@ class CountersAndThrottle(unittest.TestCase):
         lc.note_conformance_violation("kind=admit_vs_exec", 100.0)
         lc.note_economy_anomaly("x", 100.0)
         lc.note_economy_anomaly("x", 100.1)
+        # W25/#854: the field gained `c2ok`, the count of economy verdicts
+        # that RAN and declined. It is what makes `c2=0` readable -- with
+        # c2ok>0 the detector is alive and healthy, with c2ok=0 it never ran.
+        # Zero here because this case recorded only anomalies.
         self.assertEqual(
-            lc.counters().as_field(), "layout-conformance (#838): c1=1, c2=2"
+            lc.counters().as_field(),
+            "layout-conformance (#838): c1=1, c2=2, c2ok=0",
         )
 
 

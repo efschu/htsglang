@@ -235,6 +235,55 @@ correct: `_decide_rules` applies it after `_decide_from_load`, and
 `_demand_outweighs_a_retry` still overrides it when the backlog is worth more
 than the wait.
 
+## W25 (2026-08-24) proved the four fixes and opened three new roots
+
+Boot `/spinning/evidence-665-f1/boot_w25_0824_1125.log`, pin 63c3c0dd00, 85
+requests all HTTP 200. Full result: `/spinning/gpu-arb/WINDOW10-RESULT.md`.
+
+PASSED: #853(i) (CHECKED 78 / ENFORCED 3, no wiring fault — W24's
+UNDETERMINABLE closed), #853(ii) (21/21 refusals claused; the 5 unclaused are
+`CORRIDOR-GUARD cleared` SUCCESSES, which by design carry no funder prose),
+#853(iii) (0 anomalies, 0 false positives, band held 6x correctly). Stage 0
+moved the right way on every counter: 33 cutovers in 3.4 min under load,
+ABANDONED 17 (was 69), arm refused 33 (was 153), FLOOR UNREACHABLE 5 (was 22).
+
+### R1 — the TP-sticky phase is the PRICE, not the policy
+
+**Do not "fix" the flip policy for this.** W25 went TP-sticky on 16–20k
+prompts and the user caught it by eye. The policy was right:
+
+    N repriced live:  15853 -> 18110 -> 18464 -> 18614
+    measured seam:    5.08 -> ... -> 8.50 s   (design seed: 3.2 s)
+    tp_to_pp DONE:    11647 ms over 16 seam waves, 116502 live slots
+
+#819 reprices the break-even linearly in the measured seam cost, so a 2.66x
+seam gives a 2.66x bar: 7004 -> 18614, with the secondary band ceiling at
+27921. A 16–20k prompt is then AT OR BELOW the live break-even — 19 holds read
+`pending <= N=18614`, 6 sat inside the band — and TP genuinely is the cheaper
+layout for it. **The quantity to attack is the seam cost.** Every second shaved
+lowers the break-even by roughly 2200 tok.
+
+### R2 — the gate is ~210 MiB short beside 2432 MiB it may not touch
+
+    want 3108 MiB, free 2898 -> 2898 MiB, reclaimed 0 MiB from [nothing],
+    ... this gate may not draw on kv-slack holds 2432 MiB -- that funder
+    pays before the gate
+
+ANALYSE_851 axis B (#813 shape), and it is visible ONLY because #853(ii)'s
+clause names the funder on every refusal. The honesty fix paid for itself
+inside one window.
+
+### R3 — #852 still over-promises 88 MiB, and says so
+
+    staging reclaim: driver free 2896 -> 2896 MiB (+0 returned,
+                     predicted releasable 88 MiB)
+
+A nonzero prediction against a zero delivery. #852's own text names that
+reading: it FALSIFIES the fragmentation account and indicts the estimator.
+The phantom is down 3.6x (~320 -> 88 MiB) and the cause split moved from 43/2
+to 8/2 phantom/scarcity, but **#852 must not be recorded as closed** — there is
+a fourth term the arithmetic still misses.
+
 ## Metal criteria are NOT substituted by any of this
 
 "0 over-cap floor vetoes under load" stays in the window ticket unchanged. The

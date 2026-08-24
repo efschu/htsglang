@@ -10994,6 +10994,16 @@ class Scheduler(
             )
             if alarm:
                 layout_conformance.note_economy_anomaly(detail, now)
+            else:
+                # W25/#854: SILENCE MUST BE IMPOSSIBLE. W25 ran a sustained
+                # TP-sticky prefill phase that the user found by eye while the
+                # anomaly count read 0 for the whole boot. The detector was
+                # right to decline -- pending sat below the bar the policy
+                # applied -- but a zero that means "ran and declined" reads
+                # identically to "never ran". The decline is now a fact in the
+                # log, on a 60 s heartbeat, and the pair is mutually exclusive
+                # here by construction.
+                layout_conformance.note_economy_declined(detail, now)
         except Exception:  # noqa: BLE001 - a detector may never break serving
             pass
 

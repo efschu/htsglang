@@ -63,6 +63,25 @@ logger = logging.getLogger(__name__)
 ALARM_CONFORMANCE = "LAYOUT-CONFORMANCE VIOLATION (#838)"
 ALARM_ECONOMY = "LAYOUT-ECONOMY ANOMALY (#838)"
 
+#: W25/#854: the DECLINE marker, and it is a grep key of equal standing.
+#:
+#: WHY IT EXISTS. W25 ran a sustained TP-sticky prefill phase that the USER
+#: found BY EYE, while `grep -c "LAYOUT-ECONOMY ANOMALY" = 0` for the whole
+#: boot. The detector was RIGHT to stay silent -- pending was 16-20k against a
+#: live bar of 18614, so the policy's own economy favoured TP and an alarm
+#: would have been the over-eager mutant this file exists to exclude. But a
+#: zero that means "ran and correctly declined" is indistinguishable from a
+#: zero that means "never ran", "not wired", or "threw", and a reader cannot
+#: tell which without reading the source. That is the #851 defect class -- the
+#: silent multi-valued zero -- occurring inside this detector, one commit after
+#: #853(i) had to remove exactly the same shape from the exposure gate.
+#:
+#: So the detector now says what it decided, every time, at a heartbeat
+#: cadence. Silence becomes impossible: either the box is not running this
+#: code, or a line appears. The count of these is NOT an error count and must
+#: never be read as one -- it is the proof that the instrument is alive.
+CHECKED_ECONOMY = "LAYOUT-ECONOMY CHECKED (#838)"
+
 #: Class-1 arms, named in the line so a grep can split them without parsing.
 KIND_ADMIT_VS_EXEC = "admit_vs_exec"
 KIND_VERDICT_VS_ROUTING = "verdict_vs_routing"
@@ -78,6 +97,13 @@ ILLEGITIMATE_BUNDLE_NOT_DRAINING = "decode-bundle-not-draining"
 #: throttle got right after a 12765-line flood cost this feature a self-kill.
 ALARM_REANNOUNCE_S: float = 10.0
 
+#: Seconds between DECLINE heartbeats. Deliberately much longer than the alarm
+#: cadence: an alarm is urgent and a decline is a liveness proof, so it must be
+#: cheap enough that nobody is ever tempted to switch it off. One line per
+#: minute per rank is the price of never using a human eye as the instrument
+#: again.
+DECLINE_REANNOUNCE_S: float = 60.0
+
 
 @dataclass
 class LayoutConformanceCounters:
@@ -90,12 +116,15 @@ class LayoutConformanceCounters:
 
     conformance_violations: int = 0
     economy_anomalies: int = 0
+    #: W25/#854: economy verdicts that RAN and declined. Not an error count --
+    #: it is what separates "healthy" from "never ran" when c2 reads 0.
+    economy_checks: int = 0
 
     def as_field(self) -> str:
         """The fragment appended to the periodic stats line."""
         return (
             f"layout-conformance (#838): c1={self.conformance_violations}, "
-            f"c2={self.economy_anomalies}"
+            f"c2={self.economy_anomalies}, c2ok={self.economy_checks}"
         )
 
 
@@ -121,9 +150,17 @@ def reset_for_test() -> None:
     _LAST_SAID.clear()
 
 
-def _should_say(key: str, now: float) -> bool:
+def _should_say(key: str, now: float, every_s: Optional[float] = None) -> bool:
+    """Throttle one shape. `every_s` defaults to the ALARM cadence.
+
+    The cadence is a PARAMETER rather than a second copy of this function
+    because the decline heartbeat needs a slower one, and two throttles that
+    could drift apart is the shape this file already spends its length
+    avoiding.
+    """
+    window = ALARM_REANNOUNCE_S if every_s is None else every_s
     last = _LAST_SAID.get(key)
-    if last is not None and now - last < ALARM_REANNOUNCE_S:
+    if last is not None and now - last < window:
         return False
     _LAST_SAID[key] = now
     return True
@@ -508,4 +545,25 @@ def note_economy_anomaly(detail: str, now: float) -> bool:
     if not _should_say("c2", now):
         return False
     logger.error("%s", detail)
+    return True
+
+
+def note_economy_declined(detail: str, now: float) -> bool:
+    """The verdict RAN and declined. Count always, log on a heartbeat.
+
+    W25/#854. The caller must invoke this on EVERY non-alarming verdict, so
+    that the absence of anomalies is a fact in the log rather than an
+    inference. The pair is mutually exclusive by construction at the call
+    site: a verdict either alarms or declines, never both, and the tests pin
+    that -- a detector that emitted both would restore the ambiguity while
+    passing every other assertion.
+
+    Logged at INFO, not DEBUG: W25 ran at INFO and would not have seen a DEBUG
+    line, which is the same mistake #853(i) had to correct on the exposure
+    clamp. A liveness proof nobody's log level shows is not a liveness proof.
+    """
+    _COUNTERS.economy_checks += 1
+    if not _should_say("c2ok", now, every_s=DECLINE_REANNOUNCE_S):
+        return False
+    logger.info("%s %s", CHECKED_ECONOMY, detail)
     return True
