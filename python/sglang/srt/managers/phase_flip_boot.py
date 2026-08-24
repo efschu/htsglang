@@ -964,7 +964,10 @@ class PhaseFlipStacks:
         # holding the layout that just left the arena.
         from sglang.srt.model_executor.rotation_executor import (
             RotationHazard,
+            RotationPhases,
             rotate_arena,
+            rotation_phase_report,
+            rotation_report,
             rotation_ring,
         )
         from sglang.srt.model_executor.weights_arena import (
@@ -982,7 +985,12 @@ class PhaseFlipStacks:
             )
         chunk = _refill_chunk_bytes()
         depth = _refill_depth()
-        rotate_arena(
+        # #809 W28 follow-up: the warm path used to DISCARD the rotation's own
+        # record, so `overlapped_steps` -- the duplex falsifier -- was not
+        # observable on metal at all, and 97.6 % of a measured 4.833 s leg had
+        # nowhere to be attributed. Both are captured here and logged below.
+        rot_phases = RotationPhases()
+        rot_stats = rotate_arena(
             arena=self.arena,
             host_image=self.rotation_image,
             incoming_bytes=int(incoming.total_bytes),
@@ -991,6 +999,7 @@ class PhaseFlipStacks:
             depth=depth,
             ring=rotation_ring(chunk, depth),
             timing=leg_timing,
+            phases=rot_phases,
         )
         # The swap happened, so the marker follows it. Set only on the success
         # path: a rotation that raises has left the arena undefined and said so,
@@ -1047,6 +1056,13 @@ class PhaseFlipStacks:
                 # "a rate against a rate is comparable" and this is a
                 # different statement about the same leg.
                 refill_bound_phrase(leg_timing),
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            pass
+        try:
+            logger.info("%s %s", LOG_PREFIX, rotation_report(direction, rot_stats))
+            logger.info(
+                "%s %s %s", LOG_PREFIX, direction, rotation_phase_report(rot_phases)
             )
         except Exception:  # noqa: BLE001 - an instrument may never break a flip
             pass

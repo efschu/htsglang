@@ -101,6 +101,7 @@ def _patched_refill(st, carrier, rec, monkey):
         timing=None,
         priming=False,
         verify_incoming=True,
+        phases=None,
     ):
         # #856 CONTRACT CHANGE, TAKEN DELIBERATELY RATHER THAN WIDENED AWAY.
         # `arena_refill` gained an optional `timing` record so the refill leg

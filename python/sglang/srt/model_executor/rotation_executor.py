@@ -57,7 +57,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -117,6 +117,117 @@ class RotationStats:
     @property
     def overlap_share(self) -> float:
         return (self.overlapped_steps / self.steps) if self.steps else 0.0
+
+
+@dataclass
+class RotationPhases:
+    """WHERE THE ROTATION'S WALL TIME ACTUALLY WENT (#809/W28 follow-up).
+
+    THE DEFECT THIS CLOSES, measured in the W28 window. The leg reported
+    `LINK-BOUND (read 0.000s / h2d-wait 0.114s ... drain 0.001s)` on a 4.833 s
+    rotation -- read + wait + drain account for 2.4 % of it. The phrase named a
+    bound nobody had observed, which is the #851/indicator class: one number
+    with several meanings sitting inside the dominant term of the seam.
+
+    HOST-SIDE PHASES ARE THE ONES THAT MUST RECONCILE, and that follows from
+    the measurement rather than from taste: `h2d_wait_s` was NEAR ZERO, so the
+    host was not blocked on the device. Whatever consumed the wall clock was
+    work the host thread itself did, so timing the host side of each call is
+    what can add up to the whole. The GPU spans below answer a DIFFERENT
+    question (did the two directions actually overlap on the device) and are
+    deliberately not part of the reconciliation -- adding a device span to a
+    host sum is how a reconciliation is made to "pass" without meaning
+    anything.
+
+    ``residual_s`` exists so the unexplained mass has to land somewhere NAMED.
+    A phase set whose parts do not add up to its whole is the #846 class, so
+    the residual is reported rather than distributed.
+    """
+
+    save_s: float = 0.0
+    d2h_issue_s: float = 0.0
+    h2d_issue_s: float = 0.0
+    wait_s: float = 0.0
+    ring_s: float = 0.0
+    checksum_s: float = 0.0
+    plan_s: float = 0.0
+    total_s: float = 0.0
+    #: Device-side spans, read ONCE after the drain (never synchronised inside
+    #: the loop, per the ms-per-round canon). 0.0 when there is no device.
+    gpu_d2h_s: float = 0.0
+    gpu_h2d_s: float = 0.0
+
+    @property
+    def accounted_s(self) -> float:
+        return (
+            self.save_s
+            + self.d2h_issue_s
+            + self.h2d_issue_s
+            + self.wait_s
+            + self.ring_s
+            + self.checksum_s
+            + self.plan_s
+        )
+
+    @property
+    def residual_s(self) -> float:
+        return max(0.0, float(self.total_s) - self.accounted_s)
+
+    @property
+    def residual_share(self) -> float:
+        return (self.residual_s / self.total_s) if self.total_s > 0 else 0.0
+
+    def dominant(self) -> Tuple[str, float]:
+        """(name, seconds) of the largest term, residual included.
+
+        The residual COMPETES with the named phases on purpose: if the
+        unexplained mass is the biggest term, the honest answer is that the
+        instrument still does not know, and it must say so rather than crown
+        the largest thing it happens to measure.
+        """
+        terms = {
+            "save": self.save_s,
+            "d2h_issue": self.d2h_issue_s,
+            "h2d_issue": self.h2d_issue_s,
+            "wait": self.wait_s,
+            "ring": self.ring_s,
+            "checksum": self.checksum_s,
+            "plan": self.plan_s,
+            "UNACCOUNTED": self.residual_s,
+        }
+        name = max(terms, key=lambda k: terms[k])
+        return name, terms[name]
+
+
+#: The share of a leg the phase set may leave unexplained and still be called
+#: an instrument. Chosen, not derived: W28 left 97.6 % unaccounted, so anything
+#: that still admits a majority-unexplained leg would pass the very case this
+#: was built for.
+PHASE_RECONCILE_TOLERANCE = 0.10
+
+
+def phases_reconcile(
+    phases: RotationPhases, tolerance: float = PHASE_RECONCILE_TOLERANCE
+) -> bool:
+    """Do the parts add up to the whole, within ``tolerance``?"""
+    if phases.total_s <= 0:
+        return False
+    return phases.residual_share <= float(tolerance)
+
+
+def rotation_phase_report(phases: RotationPhases) -> str:
+    """One line naming every term AND the leftover. Never hides the residual."""
+    name, secs = phases.dominant()
+    verdict = "RECONCILED" if phases_reconcile(phases) else "UNRECONCILED"
+    return (
+        f"phases {verdict} total {phases.total_s:.3f}s = "
+        f"save {phases.save_s:.3f} + d2h-issue {phases.d2h_issue_s:.3f} + "
+        f"h2d-issue {phases.h2d_issue_s:.3f} + wait {phases.wait_s:.3f} + "
+        f"ring {phases.ring_s:.3f} + checksum {phases.checksum_s:.3f} + "
+        f"plan {phases.plan_s:.3f} + UNACCOUNTED {phases.residual_s:.3f} "
+        f"({phases.residual_share * 100:.1f} %); dominant={name} {secs:.3f}s; "
+        f"gpu-span d2h {phases.gpu_d2h_s:.3f}s / h2d {phases.gpu_h2d_s:.3f}s"
+    )
 
 
 class TorchRotationOps:
@@ -292,6 +403,7 @@ def rotate_arena(
     timing: Optional[RefillLegTiming] = None,
     priming: bool = False,
     verify_incoming: bool = True,
+    phases: Optional[RotationPhases] = None,
 ) -> RotationStats:
     """Rotate ``host_image`` into ``arena`` while placing ``arena`` back into it.
 
@@ -338,6 +450,7 @@ def rotate_arena(
     overshoot = rotation_overshoot_bytes(
         incoming_bytes, outgoing_bytes, chunk_bytes, depth
     )
+    _t_plan = time.perf_counter()
     steps = plan_rotation(
         incoming_bytes=incoming_bytes,
         outgoing_bytes=outgoing_bytes,
@@ -345,6 +458,9 @@ def rotate_arena(
         overshoot_bytes=overshoot,
     )
 
+    if phases is not None:
+        phases.plan_s += time.perf_counter() - _t_plan
+    _t_ck = time.perf_counter()
     want_in = None
     if verify_incoming and incoming_bytes:
         want_in = int(
@@ -355,6 +471,8 @@ def rotate_arena(
         )
     # From the ARENA, before a byte of it moves. See the docstring.
     out_sum = uint8_checksum(arena[:outgoing_bytes]) if outgoing_bytes else 0
+    if phases is not None:
+        phases.checksum_s += time.perf_counter() - _t_ck
 
     stats = RotationStats(priming=bool(priming))
     inflight: deque = deque()
@@ -363,8 +481,11 @@ def rotate_arena(
         buf, handle, is_h2d = inflight.popleft()
         t_wait = time.perf_counter()
         ops.wait(handle, is_h2d=is_h2d)
+        _w = time.perf_counter() - t_wait
         if timing is not None:
-            timing.h2d_wait_s += time.perf_counter() - t_wait
+            timing.h2d_wait_s += _w
+        if phases is not None:
+            phases.wait_s += _w
         if buf is not None and ring is not None:
             ring.release(buf)
 
@@ -389,11 +510,17 @@ def rotate_arena(
                         f"ranges corrupts the NEXT flip's image, which this "
                         f"flip's checksum would not catch."
                     )
+                _t = time.perf_counter()
                 buf = ring.acquire()
+                if phases is not None:
+                    phases.ring_s += time.perf_counter() - _t
+                _t = time.perf_counter()
                 ops.save(
                     buf,
                     host_image[step.h2d_offset : step.h2d_offset + step.h2d_len],
                 )
+                if phases is not None:
+                    phases.save_s += time.perf_counter() - _t
                 stats.ring_saves += 1
                 src = buf[: step.h2d_len]
             else:
@@ -405,18 +532,24 @@ def rotate_arena(
             # decides whether the two lanes can run together.
             if ops.outstanding_h2d > 0:
                 stats.overlapped_steps += 1
+            _t = time.perf_counter()
             d2h_handle = ops.d2h(
                 arena[step.d2h_offset : step.d2h_offset + step.d2h_len],
                 host_image[step.d2h_offset : step.d2h_offset + step.d2h_len],
             )
+            if phases is not None:
+                phases.d2h_issue_s += time.perf_counter() - _t
             stats.d2h_bytes += step.d2h_len
 
         if step.h2d_len:
+            _t = time.perf_counter()
             handle = ops.h2d(
                 src,
                 arena[step.h2d_offset : step.h2d_offset + step.h2d_len],
                 after=d2h_handle,
             )
+            if phases is not None:
+                phases.h2d_issue_s += time.perf_counter() - _t
             stats.h2d_bytes += step.h2d_len
             inflight.append((buf, handle, True))
             if timing is not None:
@@ -444,6 +577,7 @@ def rotate_arena(
             [out_sum], dtype=torch.int64
         ).view(torch.uint8)
 
+    _t_ck2 = time.perf_counter()
     if want_in is not None:
         have = uint8_checksum(arena[:incoming_bytes])
         if have != want_in:
@@ -453,7 +587,11 @@ def rotate_arena(
                 f"now undefined and the layout must not be served."
             )
 
+    if phases is not None:
+        phases.checksum_s += time.perf_counter() - _t_ck2
     stats.elapsed_s = time.perf_counter() - t0
+    if phases is not None:
+        phases.total_s = stats.elapsed_s
     return stats
 
 

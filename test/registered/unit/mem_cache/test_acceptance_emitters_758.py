@@ -145,6 +145,19 @@ class HostResume(unittest.TestCase):
 class RefillTiming(unittest.TestCase):
     """(3 of 3) per-rank refill timing, and it must name the image mode."""
 
+    def setUp(self):
+        # #809/W28: this class REPLACES a module attribute. Without the
+        # restore below the stub leaks into every test that runs after it in
+        # the same process, which is how a green file makes a different file
+        # fail -- observed exactly that way against the scheduler suite.
+        import sglang.srt.model_executor.rotation_executor as rx
+
+        self._rx = rx
+        self._orig_rotate = rx.rotate_arena
+
+    def tearDown(self):
+        self._rx.rotate_arena = self._orig_rotate
+
     def _stack(self, monkey_refill):
         # #809/W28: the shipped copy is now the ROTATION, imported inside
         # `_timed_arena_refill` at call time, so this is the seam to stub.
