@@ -174,6 +174,38 @@ NOT_APPLICABLE_REASONS = frozenset(
 )
 
 
+def takeable_cache_bytes(cache_bytes, trapped_bytes) -> int:
+    """Cached bytes an ORDINARY forward allocation can take (#856 F6).
+
+    Pure arithmetic, kept out of the device call so BOTH directions are
+    falsifiable without a GPU. The first version of this rule lived inside the
+    probe, behind a `torch.cuda.is_available()` guard -- which under the
+    hermetic `CUDA_VISIBLE_DEVICES=""` test regime is always False, so the
+    subtraction could never be exercised off metal. That is the "shipped
+    inert" failure this corpus keeps recording, and it is why #852's estimator
+    was split the same way.
+
+    ``trapped_bytes`` is ``None`` when the segment view could not be read. That
+    means NO VERDICT, not "nothing trapped", so the unadjusted figure is
+    returned and the caller keeps its pre-existing behaviour exactly.
+
+    Floors at zero: the two figures are sampled from different counters and a
+    transient disagreement must read as "nothing takeable", never as a
+    negative budget that would then be added to a free column.
+    """
+    try:
+        cache = int(cache_bytes)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if trapped_bytes is None:
+        return max(0, cache)
+    try:
+        trapped = int(trapped_bytes)
+    except (TypeError, ValueError, OverflowError):
+        return max(0, cache)
+    return max(0, cache - max(0, trapped))
+
+
 def reason_is_defect(reason: str) -> bool:
     """True when a no-op exit means the MECHANISM is broken or missing.
 
@@ -264,14 +296,14 @@ def _activation_bytes_per_token(scheduler: Any) -> int:
     for name in ("_qkv_act_bytes_per_token", "_ffn_act_bytes_per_token"):
         try:
             total += float(getattr(reporter, name, 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
     layers = 0
     for owner in (getattr(scheduler, "model_config", None), reporter):
         for name in ("num_hidden_layers", "num_layers", "_num_layers"):
             try:
                 layers = int(getattr(owner, name, 0) or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 layers = 0
             if layers > 0:
                 break
@@ -571,7 +603,21 @@ class PrefillAdmissionGate:
         except Exception:  # noqa: BLE001
             return None
         delta = float(getattr(guard, "delta_mib", 0) or 0) * (1024 * 1024)
-        return free + float(self._allocator_cache_bytes()) - delta
+        # #856 F6 / #852 R3: THE CACHE TERM'S SAFETY ARGUMENT INVERTS HERE.
+        # `_allocator_cache_bytes` documents overstating as the safe direction
+        # -- true where it sizes `want`, because an overstated cache
+        # UNDERSTATES want. In THIS expression the cache is ADDED to a budget,
+        # so an overstatement widens the chunk this actuator grants, and the
+        # unsurvivable case the docstring names ("an allocation larger than
+        # what can be served") is exactly what it then permits.
+        #
+        # And the overstatement is no longer hypothetical: free blocks inside
+        # a CUDA-graph PRIVATE pool are counted by `reserved - allocated`
+        # (device-global `.all` counters) and cannot be taken by an ordinary
+        # forward allocation at all -- they are reachable only while capturing
+        # into that pool. W25 measured that term at a stable 88 MiB (#852 R3).
+        # Subtracting it here is strictly conservative and cannot widen a cut.
+        return free + float(self._takeable_cache_bytes()) - delta
 
     def granted_width(self, requested_tokens: int) -> int:
         """The width this rank's corridor can fund, <= ``requested_tokens``.
@@ -670,6 +716,41 @@ class PrefillAdmissionGate:
             )
         except Exception:  # noqa: BLE001
             return 0
+
+    def _takeable_cache_bytes(self) -> int:
+        """The cached bytes an ORDINARY forward allocation can actually take.
+
+        `_allocator_cache_bytes` minus the free space trapped in CUDA-graph
+        private pools. Kept as its own method rather than changing that one,
+        because the two callers want OPPOSITE errors: sizing `want` is safe
+        when the cache is overstated, and sizing a spendable BUDGET is not.
+        Silently changing the shared figure would have fixed one caller by
+        breaking the other's documented argument.
+
+        Falls back to the unadjusted figure when the segment view cannot be
+        read -- that is the pre-existing behaviour, so an unreadable snapshot
+        costs precision and never a refusal.
+        """
+        cache = int(self._allocator_cache_bytes())
+        hook = getattr(self, "_graph_pool_free_probe", None)
+        try:
+            if hook is not None:
+                trapped = hook()
+            else:
+                import torch
+
+                from sglang.srt.managers.phase_flip_runtime import (
+                    graph_pool_free_bytes_from_segments,
+                )
+
+                if not torch.cuda.is_available():
+                    return cache
+                trapped = graph_pool_free_bytes_from_segments(
+                    torch.cuda.memory_snapshot()
+                )
+        except Exception:  # noqa: BLE001 - precision, never a gate
+            return cache
+        return takeable_cache_bytes(cache, trapped)
 
     def before_admission(self, tokens: int) -> Optional[Any]:
         """Make room for a ``tokens``-wide prefill chunk BEFORE it is built.
