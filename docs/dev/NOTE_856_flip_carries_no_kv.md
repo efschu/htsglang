@@ -28,11 +28,49 @@ BUILT AND HERMETICALLY PINNED:
 
   The retraction frees the mamba slot; the GDN mover still enumerates the
   request as live and refuses, correctly. See `/spinning/gpu-arb/W27-RESULT.md`.
-  A SECOND finding rides on it: `retract_all` releases rows, mamba slots and
-  the tree lock ref, but the scheduler's batch structures still reference the
-  `Req`, so EVERY seam-side consumer of "live requests" sees a live request
-  with freed resources. The GDN mover is the first to hit it, not necessarily
-  the only one.
+  A SECOND finding rides on it, and it turned out to be THE ROOT rather than a
+  side note: `retract_all` releases rows, mamba slots and the tree lock ref,
+  but the scheduler's batch structures still reference the `Req`, so EVERY
+  seam-side consumer of "live requests" sees a live request with freed
+  resources.
+
+  **FIXED (post-W27): `consume_retracted_from_live_universe`.** Retraction now
+  also retires the reference, out of all four places `_live_reqs` reads --
+  every `running_mbs` slot, `running_batch`, `last_batch`, and the
+  out-of-batch `chunked_req` -- via `filter_batch(keep_indices=...)` rather
+  than a raw `.reqs` edit, because a batch carries per-request tensors beside
+  the list.
+
+  Same shape as #731's fix: there the carry had to CONSUME the queue entry
+  instead of leaving one request counted twice. Freeing a resource and
+  retiring the reference to it are different jobs, and doing only the first
+  leaves a live object every reader must special-case.
+
+  FIXED AT THE AUTHORITY, NOT THE CONSUMERS, and the sweep says that is
+  sufficient: every seam reader of the live set goes through `_live_reqs` --
+  `resident_mamba_slots` (gdn_flip_mover.py:617), the KV enumeration
+  (phase_flip_runtime.py:835), the #822 census (:1431), :5457, the output
+  trace (phase_flip_output_trace.py:266) and the release itself (:8129). A
+  grep for direct `running_mbs` / `running_batch` / `chunked_req` reads in the
+  seam modules returns comments and docstrings only -- no live code bypasses
+  the authority.
+
+### The GDN mover retires BY CONSTRUCTION, and only downstream of that fix
+
+W27's no-retry refused dropping `GdnFlipMover.move()` from the flip path,
+because doing it while linear state is live trades a LOUD CRASH for SILENT
+LINEAR-STATE LOSS. Downstream of the fix above the trade disappears: after the
+seam consumes the retracted requests AND drops the tree, both halves of
+`flip_mamba_slots` -- resident slots UNION the tree's checkpoints -- are
+empty, so the mover moves nothing. No deletion, exactly as the KV mover was
+retired by emptying its input.
+
+**THE ORDER IS THE SAFETY PROPERTY.** Retiring the mover with requests still
+live is the silent-loss trade; retiring it after the live universe is empty is
+a no-op. `test_retracted_leaves_live_universe_856.py` pins that against the
+REAL `resident_mamba_slots`: it no longer refuses after the consume, it STILL
+refuses without it, and a genuinely resident request still yields its slot --
+so the guard is SATISFIED, never weakened.
 * **`_seam_reserve_bytes`**, with `wave_peak` retired from the ask.
   `_staging_bytes` keeps its meaning and all its measured pins — two
   different questions, two names.

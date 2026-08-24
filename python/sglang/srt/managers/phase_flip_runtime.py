@@ -1136,6 +1136,87 @@ def release_residents_for_cutover(reqs, *, retract, reset_tree):
     return retracted
 
 
+def consume_retracted_from_live_universe(scheduler, reqs) -> int:
+    """A retracted request must LEAVE the live universe, not merely be freed.
+
+    THE W27 DEFECT, and it is the root the crash exposed. `retract_all`
+    releases a request's KV rows, its mamba slot and its tree lock ref -- but
+    the scheduler's batch structures keep REFERENCING the `Req`. `_live_reqs`
+    is the one authority for "who is resident", and it reads exactly four
+    places: every `running_mbs` slot, `running_batch`, `last_batch`, and the
+    out-of-batch `chunked_req`. None of them are touched by retraction, so
+    every seam consumer that asks "who is live" still gets a request whose
+    resources are gone.
+
+    W27 (boot_w27_0824_1510.log) died on all three ranks one second after the
+    retraction, in the first consumer to look:
+
+        resident_mamba_slots (gdn_flip_mover.py:620)
+        KvReshardError: PHASE-FLIP-GDN live request ... has no mamba slot
+          -- refusing to flip past unmoved linear state
+
+    That guard was RIGHT. The request really had no mamba slot, and refusing
+    to flip past unmoved linear state is exactly what it should do. What was
+    wrong is that the request was still being offered to it at all.
+
+    SAME SHAPE AS #731's FIX, deliberately: there the carry had to CONSUME the
+    queue entry rather than leave a request counted in two places. Here the
+    retraction has to consume the request out of the resident set rather than
+    leave it enumerable with freed resources. Freeing a resource and retiring
+    the reference to it are two different jobs, and doing only the first is
+    what produces a live object that every reader must special-case.
+
+    FIXED AT THE ONE AUTHORITY, not at the consumers. `resident_mamba_slots`
+    is the first reader to hit this and is explicitly not expected to be the
+    only one; teaching each reader to skip freed requests would be the same
+    defect once per reader, and the next reader added would reintroduce it.
+
+    Uses `filter_batch(keep_indices=...)` rather than mutating `.reqs`,
+    because a batch carries per-request tensors alongside the list and a raw
+    list edit desynchronises them.
+
+    Returns how many references were retired, for the seam's own log line.
+    Never raises: it runs at the seam with requests already parked, and an
+    exception here would abort a flip that has already released its state.
+    """
+    targets = {id(r) for r in (reqs or ())}
+    if not targets:
+        return 0
+    retired = 0
+
+    def _consume(batch) -> None:
+        nonlocal retired
+        if batch is None:
+            return
+        current = list(getattr(batch, "reqs", []) or [])
+        keep = [i for i, r in enumerate(current) if id(r) not in targets]
+        if len(keep) == len(current):
+            return
+        retired += len(current) - len(keep)
+        try:
+            batch.filter_batch(keep_indices=keep)
+        except Exception:  # noqa: BLE001 - never abort a flip mid-release
+            logger.warning(
+                "%s #856: filter_batch refused a retracted-request removal; "
+                "the seam continues and the stale reference is reported",
+                LOG_PREFIX,
+            )
+
+    for mb in getattr(scheduler, "running_mbs", []) or []:
+        _consume(mb)
+    for name in ("running_batch", "last_batch"):
+        _consume(getattr(scheduler, name, None))
+    # The chunked prefill is resident and in NO batch (#631 defect O), which is
+    # why `_live_reqs` enumerates it separately -- so it has to be cleared
+    # separately too, or a retracted chunked request stays live by that route
+    # alone.
+    chunked = getattr(scheduler, "chunked_req", None)
+    if chunked is not None and id(chunked) in targets:
+        scheduler.chunked_req = None
+        retired += 1
+    return retired
+
+
 def build_cutover_release(scheduler):
     """The two callables `release_residents_for_cutover` needs, or None (#856).
 
@@ -8032,20 +8113,35 @@ class PhaseFlipRuntime:
                 "phase would read prefixes naming rows that hold no KV"
             )
         retract, reset_tree = built
+
+        def _retract_and_consume(rs):
+            out = retract(rs)
+            # #856 W27 ROOT FIX: freeing the resources is only half of it. The
+            # request must also leave the live universe, or every seam
+            # consumer after this point is handed a live request whose rows,
+            # mamba slot and tree lock are already gone -- which is exactly
+            # how W27 died in `resident_mamba_slots`.
+            self._retracted_refs_retired = consume_retracted_from_live_universe(
+                scheduler, rs
+            )
+            return out
+
         reqs = list(_live_reqs(scheduler))
         released = release_residents_for_cutover(
-            reqs, retract=retract, reset_tree=reset_tree
+            reqs, retract=_retract_and_consume, reset_tree=reset_tree
         )
         n = len(released or ())
         self.residents_released = int(getattr(self, "residents_released", 0)) + n
         logger.info(
-            "%s RESIDENTS RELEASED for %s: %d request(s) retracted and the "
-            "prefix tree dropped, in that order (#856). Their KV is in the "
-            "canonical store from the fence; the new layout re-admits them and "
-            "serves the prefix by read-through. Nothing is carried across.",
+            "%s RESIDENTS RELEASED for %s: %d request(s) retracted, %d live "
+            "reference(s) retired, and the prefix tree dropped, in that order "
+            "(#856). Their KV is in the canonical store from the fence; the "
+            "new layout re-admits them and serves the prefix by read-through. "
+            "Nothing is carried across, and nothing retracted is still live.",
             LOG_PREFIX,
             direction,
             n,
+            int(getattr(self, "_retracted_refs_retired", 0)),
         )
         return released
 
