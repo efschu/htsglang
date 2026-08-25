@@ -83,6 +83,15 @@ appears in no `PoolTransfer` handed to an exists check.
   `has_draft` directly.
 * `disarm_draft_kv_pool(reason)` — the tp→pp leg. Pools kept, not torn down.
 
+**THE ORDERING TRAP, caught at the desk.** `rebind_for_cutover` runs AFTER the
+active stack swap (`phase_flip_runtime.py`: `scheduler.draft_worker =
+want_draft` at :2717, the rebind at :3026), so on the pp→tp leg the flip's
+drafter IS reachable through `scheduler.draft_worker`. A resolution that
+derived "is this a flip instance" from "did I have to fall back to the stacks"
+would therefore answer NO on exactly the leg that needs the phase term most,
+arming the draft half for BOTH phases. Ownership is read from the stacks'
+EXISTENCE; the handle is looked up wherever it currently lives.
+
 **Why the generation matters and a boot-time snapshot would not do:** draft
 host indices are 1-to-1 with the TARGET host pool's, and
 `hicache_phase_binding._stamp` re-points `mem_pool_host` at every rebind. A
@@ -166,13 +175,13 @@ draft half is **≈ +6.3 %** of host and disk bytes, not ~1.5 %.
 
 ## Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`)
 
-* New: 41 passed across three files
+* New: 42 passed across three files
   (`test_draft_hicache_binding_861.py`, `test_draft_tier_gate_861.py`,
   `test_draft_cold_admission_861.py`).
 * RED on base `e3469633bd`: all three files error at collection (the symbols do
   not exist), and the behavioural probe above shows `has_draft` False in the TP
   phase.
-* CAN-FAIL by mutation, six mutants, each killing ≥1 test; restoring returns 41:
+* CAN-FAIL by mutation, seven mutants, each killing ≥1 test; restoring returns green:
 
   | mutant | reds |
   |---|---|
@@ -182,10 +191,11 @@ draft half is **≈ +6.3 %** of host and disk bytes, not ~1.5 %.
   | discharge goes back to a clear | 1 |
   | scrub is not bounded to the cached prefix | 2 |
   | drafter identity leaves the key | 1 |
+  | `owner_phase` derived from "did I fall back to the stacks" | 5 |
 
 * Scoped gate (touched modules + consumers: hicache / rebind / binding /
   cache_controller / draft / #703 / #718 / #719 / #760 / #847 / #856 / W35 /
-  black-ratchet): **678 passed, 13 skipped, 69 subtests**.
+  black-ratchet): **679 passed, 13 skipped, 69 subtests**.
 * `ruff`: zero delta on every touched file. `codespell`: one pre-existing hit
   (`retuned`, a deliberate word in `retune_carried_batches_for_phase`).
 

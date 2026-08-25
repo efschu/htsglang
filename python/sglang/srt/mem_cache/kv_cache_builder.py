@@ -185,19 +185,32 @@ def resolve_draft_registration(scheduler, phase: Optional[str]) -> Optional[
     if server_args is None:
         return None
 
-    # WHICH DRAFTER, and the two-source rule. On an ordinary (non-flip) boot the
-    # drafter is the scheduler's own and there is no phase to speak of. On a
-    # flip boot the scheduler's is None by design and the real one hangs off the
-    # stacks -- so the stacks are consulted ONLY as a fallback, which keeps a
-    # non-flip deployment reading exactly the value it reads today.
+    # OWNERSHIP IS A PROPERTY OF THE INSTANCE, NOT OF WHERE THE HANDLE HAPPENS
+    # TO BE. This is the trap the first draft of this function fell into.
+    # ``rebind_for_cutover`` runs AFTER the active stack swap
+    # (``phase_flip_runtime``: `scheduler.draft_worker = want_draft`, then the
+    # rebind), so on the pp->tp leg the flip's drafter IS reachable through
+    # ``scheduler.draft_worker`` -- and deriving "is this a flip instance" from
+    # "did I have to fall back to the stacks" would then answer NO on exactly
+    # the leg that needs the phase term most, arming the draft half for both
+    # phases. So the phase is read from the stacks' EXISTENCE, and the handle
+    # is looked up wherever it currently lives.
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    owner_phase = DRAFT_OWNER_PHASE_FLIP if stacks is not None else None
+
     draft_worker = getattr(scheduler, "draft_worker", None)
     spec_algorithm = getattr(scheduler, "spec_algorithm", None)
-    owner_phase = None
     if draft_worker is None:
-        stacks = getattr(scheduler, "phase_flip_stacks", None)
+        # Before the swap, or on the pp leg: the flip's drafter lives on the
+        # stacks and the algorithm is parked (#631).
         draft_worker = getattr(stacks, "draft_worker", None)
         spec_algorithm = getattr(scheduler, "flip_spec_algorithm", None)
-        owner_phase = DRAFT_OWNER_PHASE_FLIP
+    if spec_algorithm is not None and spec_algorithm.is_none():
+        # The scheduler's own pair can be the nulled boot-phase values while the
+        # parked pair is real. Consult the parked one before giving up.
+        parked = getattr(scheduler, "flip_spec_algorithm", None)
+        if parked is not None and not parked.is_none():
+            spec_algorithm = parked
     if draft_worker is None or spec_algorithm is None or spec_algorithm.is_none():
         return None
 

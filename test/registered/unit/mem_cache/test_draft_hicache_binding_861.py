@@ -146,6 +146,26 @@ def test_flip_boot_resolution_reaches_the_stacks_drafter():
     assert reg.owner_phase == DRAFT_OWNER_PHASE_FLIP
 
 
+def test_owner_phase_survives_the_active_stack_swap():
+    """THE ORDERING TRAP. `rebind_for_cutover` runs AFTER the swap, so on the
+    pp->tp leg the flip's drafter is reachable through `scheduler.draft_worker`
+    -- and a resolution that derived "flip instance" from "I had to fall back
+    to the stacks" would answer NO on exactly the leg that needs the phase term
+    most, arming the draft half for BOTH phases."""
+    sched = FakeScheduler(flip=True)
+    # post-swap state, as phase_flip_runtime leaves it:
+    sched.draft_worker = sched.phase_flip_stacks.draft_worker
+    sched.spec_algorithm = FakeAlgo()
+    reg = resolve_draft_registration(sched, "tp")
+    assert reg is not None
+    assert reg.owner_phase == DRAFT_OWNER_PHASE_FLIP, (
+        "a flip instance's draft half must stay phase-scoped even when the "
+        "swap has already published the drafter on the scheduler"
+    )
+    # ...and the pp leg still refuses, from the same post-swap shape.
+    assert resolve_draft_registration(sched, "pp") is None
+
+
 def test_can_fail_pin1_no_drafter_anywhere_resolves_to_none():
     sched = FakeScheduler(flip=True)
     sched.phase_flip_stacks = None
