@@ -662,6 +662,57 @@ def clear_spec_info_for_unspeculated_phase(scheduler) -> tuple:
     return cleared, rids
 
 
+#: #861c: batch fields that LATCH and whose only clear sites are FINISH paths.
+#:
+#: THE CLASS, named: a persistent flag on a ScheduleBatch that survives the
+#: #856 seam because the seam RETRACTS residents instead of finishing them.
+#: Three members are known, and the first two already have bespoke handlers
+#: (``retune_carried_batches_for_phase`` for ``spec_algorithm``,
+#: ``clear_spec_info_for_unspeculated_phase`` for ``spec_info``) -- which is
+#: exactly why the third went unnoticed for a whole window: two instances had
+#: been fixed and the CLASS had not been named.
+#:
+#: ``batch_is_full`` is documented at scheduler.py as "a PERSISTENT flag
+#: carried on running_batch"; every clear site (scheduler.py:6488/6507/6562) is
+#: a finish path, and ``grep -c batch_is_full phase_flip_runtime.py`` is 0.
+#: W37-C measured the result: ``batch_is_full=1`` with ``running=0``,
+#: ``avail=468981``, ``evictable=0``, admission declining for ever. A batch
+#: that is full with zero running requests can never drain.
+#:
+#: RESET TO THE CONSTRUCTOR DEFAULT, not to a computed value: the seam's job is
+#: to remove a STALE claim, and the next ordinary round recomputes the honest
+#: one from the live pool. Guessing the value here would be a second opinion
+#: about admission, which is the shape that produced the defect.
+STALE_BATCH_FLAGS = {
+    "batch_is_full": False,
+}
+
+
+def reset_stale_batch_flags(scheduler) -> dict:
+    """Clear latched batch flags the #856 retract leaves behind. #861c.
+
+    Runs over ``_reachable_batches`` -- the SAME reach
+    ``clear_spec_info_for_unspeculated_phase`` uses, and deliberately wider
+    than the resident harvest, because ``last_batch`` is a live merge target
+    the next round can still reach (that handle is what killed PP0 at
+    2026-08-09 20:31:48, corpse I).
+
+    BOTH DIRECTIONS. A latched ``batch_is_full`` is equally fatal in either
+    phase: it is an admission refusal, and admission runs in whichever layout
+    is allowed to prefill.
+
+    Returns ``{field: batches_cleared}`` so the seam can log a number rather
+    than an intention -- the #719 lesson, applied where it is cheap.
+    """
+    cleared = {name: 0 for name in STALE_BATCH_FLAGS}
+    for batch in _reachable_batches(scheduler):
+        for name, default in STALE_BATCH_FLAGS.items():
+            if getattr(batch, name, default) != default:
+                setattr(batch, name, default)
+                cleared[name] += 1
+    return cleared
+
+
 def arm_draft_bootstrap_all_reachable(scheduler, draft_worker) -> list:
     """PP->TP leg: seed EVERY reachable non-empty batch, not just one.
 

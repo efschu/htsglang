@@ -1846,6 +1846,55 @@ class PhasePolicyInputs:
     #: into is replicated, so every rank computes the same number.
     seam_transport_tokens: int = 0
 
+    #: #861c: PROMPT TOKENS OWED A PREFILL PASS, CACHED OR NOT.
+    #:
+    #: THE SECOND SEMANTICS, and the field exists because ONE number was being
+    #: asked TWO questions. ``pending_prefill_tokens`` sums
+    #: ``uncached_prompt_tokens`` and is right for the ECONOMICS question --
+    #: the break-even compares PP against TP prefill throughputs, and a cached
+    #: token is read at a layout-independent cost, so it cancels. It is wrong
+    #: for the EXISTENCE question, because a fully cached prompt still needs an
+    #: extend pass to place its KV in the device pool and enter the running
+    #: batch.
+    #:
+    #: W37-C measured the cost of conflating them: six requests queued, every
+    #: token prefetched into HiCache, ``pending_prefill_tokens=0``, so the
+    #: policy read "no prefill work", never demanded the flip to PP, strict
+    #: purity correctly refused the pass in TP -- 18 flips, ZERO completions,
+    #: 0 % GPU, pool `avail=468981`.
+    #:
+    #: THE SPLIT IS BY DECISION CLASS, and the classification is pinned by
+    #: `test_counter_semantics_861c.py` so a future consumer cannot pick the
+    #: wrong one silently:
+    #:   ECONOMICS  (break-even N, price bands, LAYOUT-ECONOMY holds, the #819
+    #:              price line, the #838 economy check) -> pending_prefill_tokens
+    #:   EXISTENCE  (idle determination, drain exits, "is there work at all",
+    #:              admission simulation) -> admissible_prefill_tokens
+    #:
+    #: Replicated by the same argument as every other field: it is a pure
+    #: function of the replicated waiting queue.
+    #:
+    #: DEFAULTED so every stand-in and every older construction site keeps
+    #: working; a caller that does not supply it gets 0, and the consumers
+    #: below take `max(...)` with the economics number, so an unsupplied field
+    #: can only reproduce today's behaviour and never invent new work.
+    admissible_prefill_tokens: int = 0
+
+    def work_exists(self) -> bool:
+        """Is a prefill pass owed SOMEWHERE? The existence question, once.
+
+        One method rather than ``max(a, b) > 0`` at each site: the whole defect
+        was two questions sharing one expression, and the fix is worth nothing
+        if the next consumer re-derives it a third way.
+        """
+        return (
+            max(
+                int(self.pending_prefill_tokens or 0),
+                int(self.admissible_prefill_tokens or 0),
+            )
+            > 0
+        )
+
     #: THE ROUND JUST FAILED TO BUILD A BATCH OF EITHER WORK CLASS.
     #:
     #: Not "the queue is empty" and not "the box looks quiet": both classes
@@ -2290,7 +2339,9 @@ def _decide_from_load(
     if not cfg.enabled:
         return _no("policy disabled")
 
-    idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
+    # #861c EXISTENCE class: a fully cached backlog is still work. Reading
+    # the economics number here called a box with six queued requests IDLE.
+    idle = inp.running_bs == 0 and not inp.work_exists()
 
     # NOTHING CAN RUN HERE -- CHECKED BEFORE THE DWELL, AND THAT IS THE POINT.
     #
@@ -2469,8 +2520,15 @@ def _decide_from_load(
     # ("ADMISSION-WEDGE: 1 queued, 0 running, and NO first token", 41 of them)
     # on the specimen numbers 5813 tok pending / 0 running / "0.0s since last
     # flip < 3s", with health still answering 200 the whole time.
+    # #861c EXISTENCE class: 'can this layout do ANY work at all'. A
+    # prefetched backlog starves the box exactly as an uncached one does,
+    # and the dwell floor must not hold the flip that would release it.
     starved = int(getattr(inp, "running_bs", 0) or 0) == 0 and (
-        int(getattr(inp, "pending_prefill_tokens", 0) or 0) > 0
+        max(
+            int(getattr(inp, "pending_prefill_tokens", 0) or 0),
+            int(getattr(inp, "admissible_prefill_tokens", 0) or 0),
+        )
+        > 0
     )
     if state.last_flip_at > 0 and since_flip < cfg.min_dwell_s and not starved:
         return _no(
@@ -2794,7 +2852,7 @@ def _decide_from_load(
                     f"returning to the {cfg.rest_state} resting layout",
                 )
             return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
-        if inp.pending_prefill_tokens:
+        if inp.work_exists():  # #861c EXISTENCE class
             # Unreachable under purity: tp_threshold is 0 there, so any
             # non-zero pending already armed above. Reaching it would mean
             # the deadlock of 21:39:50Z had returned.
@@ -3006,7 +3064,9 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     )
     state.hold_phase = inp.phase
 
-    idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0
+    # #861c EXISTENCE class: a fully cached backlog is still work. Reading
+    # the economics number here called a box with six queued requests IDLE.
+    idle = inp.running_bs == 0 and not inp.work_exists()
     if idle:
         if state.idle_since is None:
             state.idle_since = inp.now

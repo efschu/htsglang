@@ -3715,8 +3715,15 @@ class Scheduler(
                 return self._layout_admits_decode(rows, running_bs)
             return False
         if phase == "tp":
-            if int(pending_tokens) > 0 and self._purity_allows(
-                "prefill_in_tp", running_bs
+            # #861c: the same admission term the PP arm uses, so the two
+            # phases are simulated with ONE notion of "a prefill pass is
+            # owed". Leaving this arm on the economics number would make the
+            # simulation answer differently for the two phases on a fully
+            # cached backlog -- the asymmetry the docstring's "ONE SIMULATION"
+            # claim exists to forbid.
+            if (
+                max(int(pending_tokens), int(self._admissible_prefill_tokens())) > 0
+                and self._purity_allows("prefill_in_tp", running_bs)
             ):
                 if self._layout_admits_prefill(rows, pending_tokens):
                     return True
@@ -3725,6 +3732,64 @@ class Scheduler(
             return self._layout_admits_decode(rows, running_bs)
         return False
 
+    def _admissible_prefill_tokens(self) -> int:
+        """Prompt tokens still owed a PREFILL PASS -- cached or not (#861c).
+
+        THE SECOND QUESTION, and the whole reason this is a second function
+        rather than a change to ``_pending_prefill_tokens``.
+
+        ``_pending_prefill_tokens`` sums ``uncached_prompt_tokens``, and that
+        is CORRECT for what it is for: the break-even compares PP against TP
+        prefill THROUGHPUTS, and a token whose KV already exists is read from
+        cache at a layout-independent cost, so it cancels on both sides of the
+        inequality and "has no business in the comparison" (its own words).
+        Its docstring also records that moving that number moved a different
+        rule once already -- #363's observer quantity and the break-even
+        denominator are both denominated in it -- so it is left untouched.
+
+        THE ADMISSION QUESTION IS NOT THE ECONOMICS QUESTION. "How much would
+        PP save me?" is legitimately 0 for a fully cached prompt. "Must a
+        prefill pass happen SOMEWHERE before this request can decode?" is not:
+        a queued request needs an extend pass to materialise its KV into the
+        device pool by read-through and to enter the running batch, whether
+        those tokens come from HiCache or from the model. Asking the economics
+        number the admission question is what wedged W37-C.
+
+        MEASURED, W37-C, boot_w37c_0825_0809.log: six requests queued, every
+        prompt token prefetched into HiCache, so ``uncached_prompt_tokens`` was
+        0 for all six. The policy read `pending_tokens=0`, `_layout_admits`
+        answered "no prefill work in either layout", the flip to PP was never
+        demanded, strict purity correctly refused the pass in TP -- and the
+        instance sat at 0 % GPU with 18 flips and ZERO completions while the
+        pool reported `avail=468981`.
+
+        THE COUNT IS THE TRIGGER, THE TOKENS SIZE THE REQUIREMENT. A non-empty
+        waiting queue means a pass is owed; how many ROWS that pass needs is
+        the raw prompt remainder, because a read-through has to place the
+        restored prefix in the device pool exactly as a cold prefill would.
+        ``cache_protected_len`` is "the prefix length that is inserted into the
+        tree cache" (schedule_batch.py:919) -- the DEVICE tree -- so for a
+        request the #856 seam retracted (tree dropped) it is 0 and this reads
+        the full prompt, which is the honest row requirement.
+
+        Same shape as ``phase_purity.seam_transport_pending_tokens``, which
+        already computes exactly this quantity for the purity exemption. Two
+        readers, one arithmetic, deliberately.
+        """
+        total = 0
+        for req in list(getattr(self, "waiting_queue", None) or ()):
+            ids = getattr(req, "origin_input_ids", None)
+            try:
+                n = len(ids) if ids is not None else 0
+            except TypeError:
+                n = 0
+            try:
+                done = int(getattr(req, "cache_protected_len", 0) or 0)
+            except (TypeError, ValueError):
+                done = 0
+            total += max(0, n - done)
+        return total
+
     def _layout_admits_prefill(self, rows: int, pending_tokens: int) -> bool:
         """Rows and a state slot for one chunk of the pending backlog.
 
@@ -3732,9 +3797,20 @@ class Scheduler(
         question with ONE arithmetic, which is the property that docstring's
         "ONE SIMULATION" claim rests on. It was true across the two PHASES and
         false across the two CLASSES: TP had no prefill arm at all.
+
+        #861c: the backlog this asks about is the ADMISSION one, not the
+        economics one. ``pending_tokens`` still enters -- it is never smaller
+        than the admission term for an uncached prompt, and passing it keeps
+        every existing caller's arithmetic identical on that path -- but a
+        queued request whose tokens are ALL cached contributes 0 there and its
+        pass would never be simulated. Taking the MAX is the smallest change
+        that cannot lower any existing verdict: it can only turn a "no prefill
+        possible" into a "yes", never the reverse.
         """
-        if int(pending_tokens) <= 0:
+        want = max(int(pending_tokens), int(self._admissible_prefill_tokens()))
+        if want <= 0:
             return False
+        pending_tokens = want
         chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0) or 512
         need = min(chunk, int(pending_tokens))
         mamba = getattr(
@@ -11023,6 +11099,27 @@ class Scheduler(
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
             pending_prefill_tokens=_pending_now,
+            # #861c: the EXISTENCE number beside the ECONOMICS one. Computed
+            # here, from the same replicated waiting queue, so both fields of
+            # the snapshot are rank-identical by the same argument.
+            #
+            # NOT reduced by `_seam_transport_now` the way the economics number
+            # is: that subtraction exists because seam re-admissions are not PP
+            # WORKLOAD (they are flip transport, W32), which is an economics
+            # judgement. For the existence question a seam re-admission is
+            # exactly the thing that still needs a pass -- subtracting it here
+            # would recreate W37-C's blindness from the other side.
+            # getattr, for the SAME reason the block below states for its own
+            # field and which I broke by not reading it first: this gate is
+            # driven in tests by scheduler STAND-INS carrying only what the
+            # policy reads, and a stand-in without the observation has not
+            # observed anything. "Not observed" must mean 0 -- the pre-change
+            # behaviour, which `work_exists()` then reduces to the economics
+            # number alone -- rather than an AttributeError in the arming path.
+            admissible_prefill_tokens=int(
+                (getattr(self, "_admissible_prefill_tokens", None) or (lambda: 0))()
+                or 0
+            ),
             seam_transport_tokens=_seam_transport_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),

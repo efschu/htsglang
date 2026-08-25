@@ -273,10 +273,20 @@ def test_the_host_pool_is_allocated_once_and_restamped(monkeypatch):
     assert sched.tree_cache.cache_controller.registered[2]["binding_generation"] == 3
 
 
-def test_a_broken_one_to_one_invariant_is_refused_loudly(monkeypatch):
-    """Draft host indices are 1-to-1 with the target's BY CONSTRUCTION. If that
-    ever stops holding, every draft row lands at an address that drifts with
-    the slot id -- the #345 right-token/wrong-slot class, silent."""
+def test_a_smaller_draft_pool_is_refused_loudly(monkeypatch):
+    """ADDRESSABILITY, and #861c corrected this test along with the guard.
+
+    It used to assert that ANY size change refuses. That was wrong, and W37-C
+    paid for it: every host pool is page-aligned UP by one whole page
+    (`pool_host/base.py:146-147`), so at page_size 1 a derived draft pool is
+    SYSTEMATICALLY +1 and the equality check refused every cutover after the
+    first -- 18 flips with the draft half never re-stamped and C1 unable to
+    pass.
+
+    What the shared index space needs is that every host index the TARGET can
+    hand out is addressable in the draft pool. LARGER is fine; only SMALLER is
+    the #345 class.
+    """
     from sglang.srt.mem_cache import kv_cache_builder as kcb
 
     host = type("Host", (), {"size": 4096, "layer_num": 1})()
@@ -285,9 +295,16 @@ def test_a_broken_one_to_one_invariant_is_refused_loudly(monkeypatch):
     binding.binding_state().advance("tp", host_pool=object())
     kcb.rebind_hicache_draft_for_phase(sched, "tp")
 
-    sched.tree_cache.cache_controller.mem_pool_host = type("H2", (), {"size": 8192})()
+    # The W37-C shape: target one slot SMALLER than the draft pool -> fine.
+    sched.tree_cache.cache_controller.mem_pool_host = type("H2", (), {"size": 4095})()
     binding.binding_state().advance("tp", host_pool=object())
-    with pytest.raises(ValueError, match="1-to-1"):
+    kcb.rebind_hicache_draft_for_phase(sched, "tp")
+
+    # Target LARGER than the draft pool -> the top of its index range would
+    # address rows outside the draft pool.
+    sched.tree_cache.cache_controller.mem_pool_host = type("H3", (), {"size": 8192})()
+    binding.binding_state().advance("tp", host_pool=object())
+    with pytest.raises(ValueError, match="FEWER"):
         kcb.rebind_hicache_draft_for_phase(sched, "tp")
 
 

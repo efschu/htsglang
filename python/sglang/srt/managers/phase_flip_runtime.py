@@ -2750,6 +2750,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # says which phase BUILT it, and prepare_for_decode branches on it.
         # Retune before the bootstrap, so the batch and the scheduler agree
         # about the phase before anything reads either.
+        # #861c: THE THIRD MEMBER OF THE SAME CLASS. `spec_algorithm` and
+        # `spec_info` each got a bespoke handler; `batch_is_full` latched
+        # unnoticed for a whole window because the class had never been named.
+        # Reset here, beside its siblings, so the three are handled in one
+        # place and a fourth member has an obvious home.
+        from sglang.srt.managers.phase_flip_draft_bootstrap import (
+            reset_stale_batch_flags,
+        )
+
+        _stale = reset_stale_batch_flags(scheduler)
+        if any(_stale.values()):
+            logger.info(
+                "%s #861c cleared latched batch flag(s) across the seam: %s. "
+                "Every clear site for these is a FINISH path and #856 RETRACTS "
+                "instead of finishing, so a flag set before the cutover would "
+                "otherwise refuse admission for ever (W37-C: batch_is_full=1 "
+                "with running=0 and avail=468981).",
+                LOG_PREFIX,
+                _stale,
+            )
+
         retuned = retune_carried_batches_for_phase(scheduler, want_spec_algo)
         if retuned:
             logger.info(
@@ -8466,12 +8487,57 @@ class PhaseFlipRuntime:
                 getattr(scheduler, "tree_cache", None), "cache_controller", None
             )
             if cc is not None:
+                report = gate_heartbeat(cc)
                 logger.info(
                     "%s #719 STALE-GATE HEARTBEAT for %s: %s",
                     LOG_PREFIX,
                     direction,
-                    gate_heartbeat(cc),
+                    report,
                 )
+                # #861c: THE HEARTBEAT OF THE HEARTBEAT.
+                #
+                # W36 built this line so "clean" and "blind" could never again
+                # be byte-identical. W37-C then logged `checked=0 refused=0` on
+                # ALL EIGHTEEN flips and nobody was woken by it -- the line did
+                # its job and the absence of a reader undid the job. A gate that
+                # can silently disconnect for a third time is not guarded by a
+                # line that merely states the disconnection.
+                #
+                # So a run of consecutive zero-check cutovers is now an ALARM.
+                # Two is the threshold rather than one because a single flip on
+                # a genuinely idle instance legitimately checks nothing; two in
+                # a row means the gate has not been reached across a whole
+                # cutover cycle while the seam was busy enough to flip twice.
+                #
+                # WHAT IT IS NOT: this does not decide WHY. W37-C's cause was
+                # downstream (zero decode -> zero write-back -> empty queues ->
+                # both counter sites unreachable), i.e. the gate was blind
+                # because nothing flowed, not because it was disarmed. The alarm
+                # names the observation and points at both possibilities,
+                # because a guard that guesses its own cause is how the wrong
+                # participant gets accused (#861c's other half).
+                try:
+                    zero = "checked=0" in str(report)
+                    streak = int(getattr(self, "_stale_gate_zero_streak", 0) or 0)
+                    streak = streak + 1 if zero else 0
+                    self._stale_gate_zero_streak = streak
+                    if zero and streak >= 2:
+                        logger.error(
+                            "%s #719 STALE-GATE BLIND: checked=0 on %d "
+                            "consecutive cutovers. The stale-generation gate "
+                            "has not been REACHED across a full flip cycle. "
+                            "Either device-tier HiCache traffic stopped "
+                            "entirely (check Decode batch / write_backup / "
+                            "load_to_device counts -- W37-C's cause) or the "
+                            "gate was disconnected from its consume points "
+                            "(cache_controller.py:301 sits behind `if not "
+                            "queue`, :395 runs per queued operation). A gate "
+                            "that is never reached protects nothing.",
+                            LOG_PREFIX,
+                            streak,
+                        )
+                except Exception:  # noqa: BLE001 - telemetry never breaks a seam
+                    pass
         except Exception:  # noqa: BLE001 - telemetry never breaks a seam
             pass
         return released

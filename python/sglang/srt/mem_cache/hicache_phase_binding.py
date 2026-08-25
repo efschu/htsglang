@@ -460,7 +460,30 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
         rebind_hicache_draft_for_phase,
     )
 
-    rebind_hicache_draft_for_phase(scheduler, incoming_phase)
+    # ITS OWN try/except, AND THE REASON IS A LOG LINE THAT ACCUSED THE WRONG
+    # PARTICIPANT (#861c). In W37-C the draft leg raised on every cutover after
+    # the first, the exception propagated out of this function, and the seam's
+    # handler printed "#719 HiCache rebind refused" six times -- for a TARGET
+    # rebind that had ALREADY succeeded two lines above, generation and
+    # coherence check included. A reader chasing "the rebind was refused" was
+    # chasing a rebind that happened.
+    #
+    # The target rebind is COMMITTED at this point and must be reported as
+    # such. A draft-half refusal is a strictly smaller failure -- the device
+    # tier stays armed for the target, only the draft piggyback is off -- so it
+    # is logged as itself and the committed generation is returned.
+    try:
+        rebind_hicache_draft_for_phase(scheduler, incoming_phase)
+    except Exception as exc:  # noqa: BLE001 - a draft refusal is not a rebind refusal
+        logger.error(
+            "%s the TARGET rebind to '%s' COMMITTED at generation %d; only the "
+            "#861 draft half was refused (%s). Draft-piggyback L2/L3 traffic is "
+            "off until the next cutover; target device-tier I/O is unaffected.",
+            LOG_PREFIX,
+            incoming.phase,
+            generation,
+            exc,
+        )
     return generation
 
 

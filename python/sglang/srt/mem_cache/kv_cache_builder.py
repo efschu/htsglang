@@ -300,19 +300,42 @@ def rebind_hicache_draft_for_phase(scheduler, phase: str) -> bool:
             )
             return False
         scheduler._hicache_draft_host_pool = cached
-    elif int(getattr(cached, "size", 0)) != int(getattr(primary, "size", -1)):
-        # The 1-to-1 host index invariant is the whole reason the draft pool can
-        # ride the target's transfers. If it ever stops holding, every draft row
-        # lands at the wrong address with an offset that grows with the slot id.
+    elif int(getattr(cached, "size", 0)) < int(getattr(primary, "size", -1)):
+        # ADDRESSABILITY, NOT EQUALITY -- and #861c is the correction of my own
+        # guard rather than of the pools it guards.
+        #
+        # W37-C, all three ranks, every cutover after the first:
+        #   "the draft host pool holds 30519 slots but the target host pool now
+        #    bound holds 30518 ... Refusing"
+        # The draft half was therefore never re-stamped, binding_generation
+        # stayed 1 for 18 flips, and C1 could not pass.
+        #
+        # The one-slot excess is not drift. Every host pool goes through
+        # `pool_host/base.py:146-147`:
+        #     self.page_num = self.size // self.page_size + 1
+        #     self.size = self.page_num * self.page_size
+        # which adds a whole page UNCONDITIONALLY, even when the size is
+        # already page-aligned. At `page_size == 1` that is exactly +1, always.
+        # So a draft pool derived from a target host pool is SYSTEMATICALLY one
+        # slot larger, and an equality check could never hold once a second
+        # comparison happened at all.
+        #
+        # What the shared index space actually requires is that every host
+        # index the TARGET can hand out is addressable in the draft pool. A
+        # LARGER draft pool satisfies that completely -- the extra tail row is
+        # simply never named. Only a SMALLER one is unsafe, and that is what is
+        # refused here: it would leave the top of the target's index range
+        # writing outside the draft pool, which is the #345 class this guard
+        # was written for.
         raise ValueError(
             f"#861: the draft host pool holds {getattr(cached, 'size', None)} "
-            f"slots but the target host pool now bound holds "
-            f"{getattr(primary, 'size', None)}. Draft host indices are 1-to-1 "
-            f"with the target's by construction; a size change means that "
-            f"invariant is gone, and arming the draft half over it would write "
-            f"draft rows at addresses that drift with the slot id (#345). "
-            f"Refusing -- the draft tier stays disarmed, which is the state "
-            f"that held before #861."
+            f"slots, FEWER than the {getattr(primary, 'size', None)} the target "
+            f"host pool now bound can hand out. Draft host indices are the "
+            f"target's, so the top of that range would address rows outside the "
+            f"draft pool (#345). Refusing -- the draft tier stays disarmed, "
+            f"which is the state that held before #861. (A LARGER draft pool is "
+            f"fine and expected: pool_host/base.py page-aligns every pool up by "
+            f"one whole page, so at page_size 1 a derived pool is always +1.)"
         )
 
     cc.set_draft_kv_pool(
