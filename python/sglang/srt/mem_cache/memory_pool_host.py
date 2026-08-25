@@ -104,7 +104,9 @@ def _bind_phase_tag(pool) -> None:
         "HICACHE-BINDING-TAG pool=%r armed=%s bound_phase=%s layers=%d%s",
         getattr(pool, "pool_name", "?"),
         pool._bound_tp_phase is not None,
-        "tp" if pool._bound_tp_phase else ("pp" if pool._bound_tp_phase is False else "-"),
+        "tp"
+        if pool._bound_tp_phase
+        else ("pp" if pool._bound_tp_phase is False else "-"),
         getattr(pool, "layer_num", -1),
         "" if pool._bound_tp_phase is not None else f" (not armed: {why})",
     )
@@ -1672,6 +1674,32 @@ class HostPoolGroup:
     @property
     def end_layer(self):
         return self.anchor_entry.host_pool.end_layer
+
+    @property
+    def layer_num(self):
+        """W34: the anchor's layer count, delegated like every neighbour here.
+
+        THIS PROPERTY'S ABSENCE MADE THE #718 REBIND UNARMABLE ON THIS TREE,
+        and it predates the rebind work. `hicache_phase_binding.check_shapes`
+        compares `device_pool.layer_num` against `host_pool.layer_num` and
+        refuses when either is None -- "refusing to rebind onto pools whose
+        shapes cannot be compared". A plain host pool has `layer_num`; this
+        COMPOSITE did not, although it already delegates `dtype`,
+        `start_layer`, `end_layer`, `kv_buffer`, `size_per_token` and
+        `allocator` to the same anchor. So on every boot whose host tier is a
+        `HostPoolGroup` -- which is this fork's live shape -- the shape check
+        could only ever read None and refuse, host pool present or not.
+
+        Measured indirectly across W32/W33/W34: the device tier stayed
+        disarmed for the whole TP phase (6, 6 and 3 `#718 hicache-phase-guard`
+        warnings) and every read-through missed with `#cached-token: 0`.
+
+        Delegating is the correct fix and not a widening: the anchor is what
+        `start_layer`/`end_layer` already describe, so a group whose anchor
+        covers N layers describes N layers. A group is exactly as comparable
+        as its anchor, which is the property `check_shapes` needs.
+        """
+        return self.anchor_entry.host_pool.layer_num
 
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()

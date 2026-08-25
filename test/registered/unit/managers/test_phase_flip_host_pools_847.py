@@ -56,6 +56,8 @@ class _HostPool:
 
 
 class _DevicePool:
+    layer_num = 16
+
     def __init__(self, cell=8192):
         self._cell = cell
 
@@ -94,8 +96,32 @@ class TestTheDefaultBootIsUntouched(CustomTestCase):
 
 
 class TestTheWriterBuildsBothPhases(CustomTestCase):
+    def _patched(self, sched):
+        """Assembly needs real pools; patch the NAMED primitives instead.
+
+        Patching the three builders the writer is required to use is itself
+        the assertion that it uses them -- a writer that went back to cloning
+        `type(pp_host)` would ignore these patches and fail here.
+        """
+        import unittest.mock as mock
+
+        m = mock.patch.multiple(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
+            build_kv_host_pool=mock.DEFAULT,
+            build_pool_entry=mock.DEFAULT,
+        )
+        with (
+            m,
+            mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
+        ):
+            grp.side_effect = lambda entries: types.SimpleNamespace(
+                entries=entries,
+                device_pool=sched.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool,
+            )
+            return build_phase_flip_host_pools(sched)
+
     def test_both_phases_are_registered(self):
-        pools = build_phase_flip_host_pools(_sched())
+        pools = self._patched(_sched())
         self.assertEqual(sorted(pools), ["pp", "tp"])
 
     def test_the_pp_entry_is_the_tier_the_boot_already_built(self):
@@ -108,7 +134,7 @@ class TestTheWriterBuildsBothPhases(CustomTestCase):
         # DESIGN_706 C1: a host pool is allocated FROM its device pool, which
         # is why this cannot be derived after the fact and must run at boot.
         s = _sched()
-        pools = build_phase_flip_host_pools(s)
+        pools = self._patched(s)
         self.assertIs(
             pools["tp"].device_pool,
             s.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool,

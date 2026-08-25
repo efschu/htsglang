@@ -1871,7 +1871,7 @@ def host_tier_of(tree):
     return getattr(controller, "mem_pool_host", None)
 
 
-def _staging_pin_gib(scheduler, device_pool) -> float:
+def _staging_pin_gib(scheduler, device_pool, fallback_pool=None) -> float:
     """Bytes the phase-matched staging pin needs, in GiB, from measured cells.
 
     Derived, never guessed: the pool's own per-token cell size times the tokens
@@ -1885,6 +1885,14 @@ def _staging_pin_gib(scheduler, device_pool) -> float:
     cell = int(getattr(device_pool, "get_kv_size_per_token", lambda: 0)() or 0)
     if cell <= 0:
         cell = int(getattr(device_pool, "cell_size", 0) or 0)
+    if cell <= 0 and fallback_pool is not None:
+        # W34 arm 1 printed "0.000 GiB -> 1 GB": neither probe answered on the
+        # live TP pool, so the derived size collapsed to zero and only the
+        # `max(1, ...)` floor kept it allocatable. A pin sized from nothing is
+        # not a derivation. The pp-side tier reports the same per-token cost
+        # (both phases hold the same token rows), so it is the honest fallback
+        # -- and it is a FALLBACK, named, not the primary reading.
+        cell = int(getattr(fallback_pool, "size_per_token", 0) or 0)
     return (tokens * cell) / float(1 << 30)
 
 
@@ -1955,17 +1963,62 @@ def build_phase_flip_host_pools(scheduler):
         )
         return {"pp": pp_host}
 
-    gib = _staging_pin_gib(scheduler, tp_device_pool)
+    gib = _staging_pin_gib(scheduler, tp_device_pool, pp_host)
     size_gb = max(1, int(gib + 0.999))
     try:
-        tp_host = type(pp_host)(
-            tp_device_pool,
-            0,  # ratio unused: an explicit size overrides it, and a RATIO is
-            # exactly the mirror-shaped answer #810 forbids here.
-            size_gb,
-            int(getattr(sa, "page_size", 1) or 1),
-            getattr(sa, "hicache_mem_layout", "layer_first"),
-            allocator_type=getattr(sa, "hicache_storage_backend", None),
+        # W34: BUILT WITH THE ASSEMBLER'S OWN NAMED PRIMITIVES, not by cloning
+        # `type(pp_host)`. The clone was W34 arm 1's defect: the live host tier
+        # is a `HostPoolGroup` COMPOSITE whose constructor takes
+        # `entries: list[PoolEntry]`, so calling it with the MHA/MLA pool
+        # signature died on `unexpected keyword argument 'allocator_type'`.
+        # A type cloned without its contract is a guess; these three builders
+        # ARE the contract, and reusing them is the one-mover rule (the
+        # assembler has five call sites and this must not become a sixth
+        # hand-rolled one).
+        import copy as _copy
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_kv_host_pool,
+            build_pool_entry,
+        )
+        from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        # The size override rides a COPY of server_args: `build_kv_host_pool`
+        # reads `hicache_ratio`/`hicache_size` off it, and a ratio is the
+        # mirror-shaped answer #810 forbids here. Copying leaves the real
+        # server_args untouched for every other reader.
+        sa_pin = _copy.copy(sa)
+        sa_pin.hicache_ratio = 0
+        sa_pin.hicache_size = size_gb
+
+        layers = int(getattr(tp_device_pool, "layer_num", 0) or 0)
+        if layers <= 0:
+            raise ValueError(
+                "the TP device pool exposes no layer_num, so the host pool "
+                "cannot be shape-matched to it (check_shapes compares exactly "
+                "that number)"
+            )
+        use_mla = "MLA" in type(tp_device_pool).__name__
+        kv_host = build_kv_host_pool(
+            kv_pool=tp_device_pool,
+            page_size=int(getattr(sa, "page_size", 1) or 1),
+            server_args=sa_pin,
+            use_mla=use_mla,
+        )
+        tp_host = HostPoolGroup(
+            [
+                build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=kv_host,
+                    device_pool=tp_device_pool,
+                    # Identity: this pool carries the TP phase's own layers,
+                    # so transfer index i IS device layer i.
+                    layer_mapping={i: i for i in range(layers)},
+                    transfer_layer_num=layers,
+                    is_anchor=True,
+                )
+            ]
         )
     except Exception as exc:  # noqa: BLE001 - a refusal must be legible
         logger.error(
