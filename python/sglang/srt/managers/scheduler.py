@@ -1509,6 +1509,23 @@ class Scheduler(
 
             self.phase_flip_stacks = build_phase_flip_tp_stack(self)
 
+        # #847 (W33): the WRITER for the phase-matched host pools. Placed here
+        # because a host pool is allocated FROM its device pool, so both
+        # stacks' device pools must exist first -- the PP one from
+        # init_memory_pools() above, the TP one from the line just above.
+        # Flag-gated inside: without --phase-flip-rebind-hicache this returns
+        # {} and allocates nothing, so every other boot is byte-identical.
+        # Without it `phase_pools_for` raises RebindRefused, the rebind never
+        # arms, bound_phase() stays "pp", and the #718 guard disarms the device
+        # tier for the whole TP phase -- which is the W32 read-through miss.
+        self.phase_flip_host_pools = {}
+        if self.server_args.enable_phase_flip:
+            from sglang.srt.managers.phase_flip_boot import (
+                build_phase_flip_host_pools,
+            )
+
+            self.phase_flip_host_pools = build_phase_flip_host_pools(self)
+
         # #797: hold a SEED vector to its claim, here and not earlier. Every
         # stack that can size a KV pool is built by this point -- the PP stack
         # from init_memory_pools() above and, under --enable-phase-flip, the TP

@@ -1819,3 +1819,157 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         draft_worker=draft_worker,
         arena_carrier=arena_carrier,
     )
+
+
+#: #847/#810: how much of a phase's KV view the staging pin has to hold.
+#:
+#: A STAGING PIN, NOT A MIRROR. #810 draws the line: a `retention` host tier is
+#: sized as a ratio of the device pool and exists to KEEP prefixes; a `staging`
+#: tier holds only what is in flight and is sized to the work, never to the
+#: pool. The rebind needs the second kind. What it must stage is the seam's own
+#: re-admission -- the requests one cutover retracts, read back through in the
+#: layout it flips into -- so the pin is sized to a re-admission batch and to
+#: nothing else: `max_running_requests` requests of one chunk each.
+#:
+#: A ratio-sized second pool would be the wrong answer twice over: it would
+#: duplicate retention the pp-side tier already provides, and on this box the
+#: pinned host budget is the binding constraint (DESIGN_706 C1), so it would be
+#: charged against the 16 GiB floor for capacity nothing reads.
+PHASE_FLIP_STAGING_CHUNKS = 1
+
+
+def _staging_pin_gib(scheduler, device_pool) -> float:
+    """Bytes the phase-matched staging pin needs, in GiB, from measured cells.
+
+    Derived, never guessed: the pool's own per-token cell size times the tokens
+    a re-admission batch can present. Returns a float so the caller can ledger
+    the real number and round only once, at the allocation boundary.
+    """
+    sa = scheduler.server_args
+    chunk = int(getattr(sa, "chunked_prefill_size", 0) or 0) or 4096
+    conc = int(getattr(sa, "max_running_requests", 0) or 0) or 1
+    tokens = chunk * conc * PHASE_FLIP_STAGING_CHUNKS
+    cell = int(getattr(device_pool, "get_kv_size_per_token", lambda: 0)() or 0)
+    if cell <= 0:
+        cell = int(getattr(device_pool, "cell_size", 0) or 0)
+    return (tokens * cell) / float(1 << 30)
+
+
+def build_phase_flip_host_pools(scheduler):
+    """#847: the WRITER for ``scheduler.phase_flip_host_pools``.
+
+    THE ACTUATOR THAT WAS MISSING, and that is the whole shape of this fix.
+    Every other part of the #718 rebind already existed and was already wired:
+    ``rebind_for_cutover`` is called at the cutover, the #719 generation stamp
+    and ``coherence_check`` are built, and ``phase_pools_for`` knows exactly
+    what it wants. It wanted ``scheduler.phase_flip_host_pools[phase]`` -- and
+    across the whole tree that name appeared ONLY in its own docstring and its
+    own refusal message. Nothing ever wrote it, so the rebind could never arm.
+
+    W32 measured the consequence end to end: no host pool -> ``RebindRefused``
+    -> the rebind never arms -> ``bound_phase()`` stays ``"pp"`` ->
+    ``device_tier_disarmed("load")`` is True for the whole TP phase ->
+    ``HiCacheController.load()`` returns None -> ZERO tokens reach the device.
+    The transport prefill logged ``#cached-token: 0`` on what should have been
+    a perfect disk hit, and the specimen carries 6 ``#718 hicache-phase-guard``
+    warnings beside ``phase_flip_rebind_hicache=False``.
+
+    REFUSAL CONVERSION, NOT GUARD DELETION (#847). ``phase_pools_for`` still
+    raises for a genuinely absent or mis-shaped pool -- that guard is correct
+    and stays exactly as strict as it is. This turns "structurally impossible"
+    into "possible and priced": the pool now exists, and its bytes are a named
+    post in the HOST-LEDGER (#721), where the floor never yields to the post.
+
+    FLAG-GATED, so every boot that does not ask for the rebind is
+    byte-identical: without ``--phase-flip-rebind-hicache`` this returns an
+    empty mapping and allocates nothing.
+
+    The ``pp`` entry is the tier the boot already built -- the rebind needs a
+    handle per phase, not a second pp pool. Only the ``tp`` side is new, and it
+    is a staging pin (see ``PHASE_FLIP_STAGING_CHUNKS``).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    sa = getattr(scheduler, "server_args", None)
+    if not getattr(sa, "phase_flip_rebind_hicache", False):
+        return {}
+
+    tree = getattr(scheduler, "tree_cache", None)
+    pp_host = getattr(tree, "token_to_kv_pool_host", None)
+    if pp_host is None:
+        # The rebind was ASKED for and the instance has no host tier at all.
+        # Returning {} here would hand `phase_pools_for` its own refusal one
+        # layer later with a less useful message, so say it where the cause is.
+        logger.error(
+            "#847 PHASE-FLIP REBIND: --phase-flip-rebind-hicache is set but "
+            "this boot has no HiCache host tier, so there is nothing to build "
+            "a phase-matched pin from. The rebind will refuse at the first "
+            "cutover. Enable hierarchical cache, or drop the flag."
+        )
+        return {}
+
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    tp_worker = getattr(stacks, "tp_worker", None)
+    tp_runner = getattr(tp_worker, "model_runner", None)
+    tp_device_pool = getattr(tp_runner, "token_to_kv_pool", None)
+    if tp_device_pool is None:
+        logger.error(
+            "#847 PHASE-FLIP REBIND: no TP device pool at boot, so the "
+            "phase-matched staging pin cannot be allocated FROM it (a host "
+            "pool is allocated from its device pool -- DESIGN_706 C1). The "
+            "rebind will refuse at the first cutover."
+        )
+        return {"pp": pp_host}
+
+    gib = _staging_pin_gib(scheduler, tp_device_pool)
+    size_gb = max(1, int(gib + 0.999))
+    try:
+        tp_host = type(pp_host)(
+            tp_device_pool,
+            0,  # ratio unused: an explicit size overrides it, and a RATIO is
+            # exactly the mirror-shaped answer #810 forbids here.
+            size_gb,
+            int(getattr(sa, "page_size", 1) or 1),
+            getattr(sa, "hicache_mem_layout", "layer_first"),
+            allocator_type=getattr(sa, "hicache_storage_backend", None),
+        )
+    except Exception as exc:  # noqa: BLE001 - a refusal must be legible
+        logger.error(
+            "#847 PHASE-FLIP REBIND: could not allocate the phase-matched "
+            "staging pin (%.3f GiB -> %d GB requested): %s. The rebind will "
+            "refuse at the first cutover rather than run against a mis-shaped "
+            "pool, which is the guard working as designed.",
+            gib,
+            size_gb,
+            exc,
+        )
+        return {"pp": pp_host}
+
+    # #721 HOST-LEDGER: the pin is a NAMED POST, and the floor never yields to
+    # it. Printed here, at the allocation, so the number in the ledger is the
+    # number that was actually taken rather than an intention.
+    try:
+        import subprocess
+
+        free_g = int(
+            subprocess.run(["free", "-g"], capture_output=True, text=True)
+            .stdout.split("\n")[1]
+            .split()[6]
+        )
+    except Exception:  # noqa: BLE001 - the ledger must not break the boot
+        free_g = -1
+    logger.warning(
+        "HOST-LEDGER POST #847 phase-flip staging pin: %d GB pinned for the "
+        "'tp' phase-matched host view (%.3f GiB derived from %d tok x cell), "
+        "host free after = %s GB against the 16 GB floor. This post exists so "
+        "the #718 device tier stays ARMED across the cutover; without it "
+        "load() returns None for the whole TP phase and every read-through "
+        "misses. The POST shrinks if it does not fit -- the FLOOR never does.",
+        size_gb,
+        gib,
+        int(getattr(sa, "chunked_prefill_size", 4096) or 4096)
+        * int(getattr(sa, "max_running_requests", 1) or 1),
+        free_g if free_g >= 0 else "unknown",
+    )
+    return {"pp": pp_host, "tp": tp_host}
