@@ -1930,34 +1930,9 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    copy_state: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
-
-    # #783 half 1: THE #856 CUTOVER COPIES ITS STATE OUT BEFORE LETTING GO.
-    #
-    # Default False, so every other caller is byte-identical: this is set at
-    # exactly ONE site, `build_cutover_release._retract`
-    # (phase_flip_runtime.py), and `retract_all`'s only other caller --
-    # `ScheduleBatch.retract_all`, the decode-pressure path -- never sets it.
-    # That single-site property is not cosmetic: the host budget (0.585 GiB per
-    # cutover, ~57 MiB/s aggregate) is priced at the FLIP CADENCE. Pressure
-    # retractions have a load-dependent rate, so a copy firing there would not
-    # make the estimate conservative, it would make it wrong.
-    #
-    # "Ungated by design" means NO FLAG -- no server arg, no env var. The
-    # condition is structural: this retraction is the cutover's.
-    #
-    # A COPY, NOT A HANDOVER. W37-H arm B persisted at this same instant by
-    # INSERTING into the tree and died 33 s in with `pool memory leak
-    # detected!`, 22 rows claimed twice, because `readmit_seam_residents`
-    # brings the population back onto rows the tree had taken. `offload_kv_
-    # cache` leaves row ownership untouched, which is what the seam ownership
-    # ledger test pins. Runs BEFORE `release_kv_cache` below, while the rows
-    # still hold live bytes.
-    if copy_state:
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
@@ -1974,36 +1949,6 @@ def release_req(
     req.reset_for_retract()
 
 
-def restore_seam_state(
-    req: Req,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-) -> bool:
-    """#783 half 2: put back what the cutover copied out, or do nothing.
-
-    Returns whether a restore happened, so the caller and the tests can tell
-    "restored" from "there was nothing to restore" without inspecting Req
-    internals.
-
-    THE GUARD IS THE COPY, NOT `is_retracted`. `is_retracted` is also True for
-    decode-PRESSURE retractions, and those never copied anything -- half 1
-    fires at exactly one site, `build_cutover_release._retract`. Keying on the
-    flag would ask for a restore that does not exist and force a soft failure,
-    which is the shape that hides defects. Keying on the PRESENCE OF THE COPY
-    is self-limiting by construction: only the population that copied can
-    restore. That is also why this needs no flag and no epoch check, even
-    though `seam_readmit_epoch` stamps the same population.
-
-    THE COPY IS CONSUMED. `load_kv_cache` drops `kv_cache_cpu` and clears
-    `mamba_state_cpu`, so a second pass over the same request finds nothing and
-    cannot re-apply stale bytes over state the model has since advanced.
-    """
-    if getattr(req, "kv_cache_cpu", None) is None:
-        return False
-    req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    return True
-
-
 def retract_all(
     *,
     reqs: List[Req],
@@ -2013,7 +1958,6 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    copy_state: bool = False,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -2026,7 +1970,6 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
-            copy_state=copy_state,
         )
     return retracted_reqs
 
@@ -2634,20 +2577,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                 req.already_computed = seq_len
 
-            # #783 half 2: THE CUTOVER POPULATION RESTORES INSTEAD OF
-            # RECOMPUTING. Placed HERE and not in `readmit_seam_residents`,
-            # which only re-queues: by then `reset_for_retract()` has cleared
-            # `req_pool_idx` and the rows are gone, so there is nothing to load
-            # into. `alloc_for_extend` above has just given this request rows
-            # back, which is the earliest instant a restore can write -- the
-            # same shape as the proven disagg path, `_pre_alloc(req)` then
-            # `load_kv_cache` (disaggregation/decode.py:730-736).
-            #
-            # BEFORE `is_retracted` is cleared on the next line, so the
-            # ordering is visible rather than incidental.
-            restore_seam_state(
-                req, self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
             req.is_retracted = False
 
             if server_args.enable_mamba_extra_buffer():
