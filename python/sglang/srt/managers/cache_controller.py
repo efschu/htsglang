@@ -335,6 +335,62 @@ def consume_gate(controller, queue_attr: str, direction: str) -> bool:
     return bool(getattr(controller, queue_attr))
 
 
+def operation_is_stale(controller, operation, kind: str) -> bool:
+    """Was ``operation`` opened under a binding that has since moved? (#719/W35)
+
+    THE SIBLING OF ``consume_gate``, and deliberately in the same module: that
+    one answers the question for a QUEUED BATCH at a consume point, this one
+    for a SINGLE operation on a background thread. One authority, two shapes --
+    the alternative is a third copy of the rule, which is what cost W32.
+
+    REFUSAL IS THE ONLY SAFE VERB HERE, unlike the release path. A stale
+    RELEASE can be routed to the pool its generation names, because that pool
+    still owns those slots. A stale BACKUP cannot: it would read
+    ``mem_pool_host.get_data_page(...)`` for host slots whose pool may since
+    have been repurposed, and persist those bytes to a CONTENT-ADDRESSED store
+    under a hash computed from the tokens it was opened with. The hash would
+    not match the payload, every later reader would trust it, and the
+    corruption OUTLIVES THE PROCESS. There is no version of routing that makes
+    that safe, so the operation is declined and nothing is written.
+
+    A DECLINED BACKUP IS A CORRECT NON-PERSIST, not a loss: the prefix simply
+    misses later and is recomputed -- the same cheap failure the #718 disarm
+    and the #760 write refusal already accept.
+
+    THREAD BOUNDARY: both generations are read EXACTLY ONCE, here, at the
+    decision point. The consumers are always-running background threads and
+    the current generation is mutated by the cutover on another thread; a
+    second read mid-persist could straddle a rebind and answer two different
+    questions about one operation. One read, one answer, one operation.
+    """
+    stamped = getattr(operation, "binding_generation", None)
+    if stamped is None:
+        return False
+    from sglang.srt.mem_cache.hicache_phase_binding import current_generation
+
+    now = current_generation()
+    if int(stamped) == int(now):
+        return False
+    attr = f"_{kind}_stale_refusals"
+    setattr(controller, attr, getattr(controller, attr, 0) + 1)
+    n = getattr(controller, attr)
+    if n <= 5 or n % 100 == 0:
+        logger.warning(
+            "#719/W35 STALE %s REFUSED: request %s was opened under binding "
+            "generation %s and the binding is now %s. Declining it -- its host "
+            "slots belong to a pool that may have been repurposed, and "
+            "persisting them would write bytes that do not match the "
+            "content-addressed hash they would be stored under. The prefix "
+            "misses later instead. (%d so far.)",
+            kind.upper(),
+            getattr(operation, "request_id", "?"),
+            stamped,
+            now,
+            n,
+        )
+    return True
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -1733,6 +1789,18 @@ class HiCacheController:
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
+                    continue
+
+                # W35 CLASS 4: the durable-corruption gate. Checked HERE, on
+                # the consumer thread, immediately before the persist and
+                # after the operation has been dequeued -- the one point where
+                # this operation's fate is decided. See `operation_is_stale`
+                # for why a stale backup is REFUSED rather than routed.
+                # Acked either way: an unacked operation stalls the queue, and
+                # a declined backup is a correct non-persist, exactly as
+                # `backup_skip` already is.
+                if operation_is_stale(self, operation, "backup"):
+                    self.ack_backup_queue.put(operation)
                     continue
 
                 if not self.backup_skip:
