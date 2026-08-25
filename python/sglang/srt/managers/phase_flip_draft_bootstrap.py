@@ -703,6 +703,54 @@ def _harvest(scheduler):
 COLD_ARMED_ATTR = "phase_flip_draft_cold_armed"
 
 
+def prefix_len(req) -> int:
+    """How many tokens of this request's context came from cache. Never raises.
+
+    ONE DEFINITION, because two of them is what put the boot on the floor.
+
+    THE CRASH, W37-B, 2026-08-25, on the first real burst after nine clean
+    flips::
+
+        RuntimeError: Boolean value of Tensor with more than one value is
+        ambiguous
+          phase_flip_draft_bootstrap.py:846
+          n = len(getattr(req, "prefix_indices", ()) or ())
+
+    ``x or ()`` is idiomatic and safe for a list and a LANDMINE for a tensor:
+    the ``or`` calls ``bool(x)``, and torch refuses that for anything with more
+    than one element. ``Req.prefix_indices`` is a torch tensor of cached slot
+    ids, so the expression is fine for an empty prefix (``bool`` of a 0-element
+    tensor is False), fine for a ONE-token prefix (``bool`` of a 1-element
+    tensor is defined), and fatal from two tokens up. That is exactly why it
+    survived nine flips of 1-token health checks and died on the first burst of
+    real traffic -- the guard's own reachability was inverted from what a reader
+    would assume.
+
+    ``numel()`` is asked for first and ``len()`` second, deliberately: ``len()``
+    RAISES ``TypeError`` on a 0-d tensor while ``numel()`` answers 1, and a 0-d
+    prefix must read as one token rather than as an exception on the admission
+    path. For a list or tuple there is no ``numel`` and ``len`` is exact.
+
+    Returns 0 for anything whose length cannot be read at all. A request whose
+    prefix cannot be measured is treated as having none, which costs at most an
+    unnecessary non-drafting round -- the safe direction, and the same direction
+    every other term on this path takes.
+    """
+    pi = getattr(req, "prefix_indices", None)
+    if pi is None:
+        return 0
+    numel = getattr(pi, "numel", None)
+    if callable(numel):
+        try:
+            return int(numel())
+        except Exception:  # noqa: BLE001 - a length probe never breaks admission
+            return 0
+    try:
+        return int(len(pi))
+    except TypeError:
+        return 0
+
+
 def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
     """Why this request's cached prefix carries no draft rows, or None.
 
@@ -727,13 +775,11 @@ def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
     A request with NO cached prefix is never cold: its whole context was just
     computed here, so ``_draft_extend_for_prefill`` wrote every draft row.
     """
-    prefix = getattr(req, "prefix_indices", None)
-    n_prefix = 0
-    if prefix is not None:
-        try:
-            n_prefix = int(len(prefix))
-        except TypeError:
-            n_prefix = int(getattr(prefix, "numel", lambda: 0)())
+    # THROUGH THE ONE HELPER. This used to carry its own len()/numel() dance,
+    # which is the second-copy defect: the copy in `arm_draft_cold_for_admission`
+    # was the one written with `or ()`, and it was the one that crashed. Two
+    # spellings of "how long is this prefix" is one spelling too many.
+    n_prefix = prefix_len(req)
     if n_prefix <= 0:
         return None
     from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
@@ -843,7 +889,7 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
         reason = draft_cold_reason(scheduler, req, tier_armed)
         if reason is None:
             continue
-        n = len(getattr(req, "prefix_indices", ()) or ())
+        n = prefix_len(req)
         if n > 0:
             # The PREFIX only. The extend region's draft rows are written by
             # this very batch's `_draft_extend_for_prefill`, and scrubbing them
