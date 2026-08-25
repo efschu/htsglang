@@ -2759,6 +2759,11 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             reset_stale_batch_flags,
         )
 
+        # #861i: the step budget is PER PHASE, so the cutover resets it.
+        # Without the reset the counter would run away and the anti-chop floor
+        # would stop protecting after the first phase.
+        scheduler._decode_steps_this_phase = 0
+
         _stale = reset_stale_batch_flags(scheduler)
         if any(_stale.values()):
             logger.info(

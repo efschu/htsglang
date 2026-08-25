@@ -9309,6 +9309,22 @@ class Scheduler(
         # Two cheap terms guard the default path: no speculation in this phase
         # means `draft_worker` is None and the arming returns immediately, and
         # a decode batch has no cached prefix to be cold about.
+        # #861i: COUNT THE DECODE STEPS THE PHASE HAS SERVED.
+        #
+        # `bundle_is_mid_flight()` reads `decode_steps_this_phase` to decide
+        # whether a flip would chop a live bundle. W37-F proved the guard was
+        # DECLARED AND READ AND NEVER WRITTEN: the field had zero producers, so
+        # it was 0 forever, so the guard could only ever be decided by
+        # `running_bs` -- which the cutover manufactures to 0. 48 flips, 30
+        # decode batches, 0 completions, GPU 0 %.
+        #
+        # Counted HERE because this is the one funnel every batch passes on its
+        # way to a forward, the same argument the draft-cold arming below uses.
+        if batch.forward_mode.is_decode():
+            self._decode_steps_this_phase = (
+                int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
+            )
+
         if self.draft_worker is not None and batch.forward_mode.is_extend():
             from sglang.srt.managers.phase_flip_draft_bootstrap import (
                 arm_draft_cold_for_admission,
@@ -11172,6 +11188,11 @@ class Scheduler(
             # Same getattr discipline as the field above, and 0 on every
             # stand-in and every non-flip deployment -- this field can only
             # ADD decode work that genuinely exists, never invent it.
+            # #861i: the step-gate's input, wired. getattr for the same
+            # stand-in reason as its neighbours.
+            decode_steps_this_phase=int(
+                getattr(self, "_decode_steps_this_phase", 0) or 0
+            ),
             retracted_unfinished_bs=int(
                 (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))()
                 or 0

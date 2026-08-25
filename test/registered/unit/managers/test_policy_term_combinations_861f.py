@@ -177,3 +177,41 @@ def test_no_state_holds_without_something_resident():
                     retracted_unfinished_bs=retracted,
                 )
                 assert inp.bundle_is_mid_flight() is False, (bs, steps, retracted)
+
+
+# ------------------------------------- #861i: EVERY INPUT MUST HAVE A PRODUCER
+
+
+def test_every_policy_input_field_is_written_at_the_build_site():
+    """#861i ZUKUNFTS-CHECK for the desk-written-never-executed class.
+
+    W37-F: `decode_steps_this_phase` was DECLARED on PhasePolicyInputs, READ by
+    `bundle_is_mid_flight()`, and WRITTEN NOWHERE. It defaulted to 0 for ever,
+    so the anti-chop floor could only ever be decided by `running_bs` -- the
+    value the cutover manufactures -- and the d4 thrash returned: 48 flips, 30
+    decode batches, ZERO completions, GPU 0 % on all three cards.
+
+    A guard whose input has no producer is not a weak guard, it is an ABSENT
+    one that reads as present. The sibling sweep at the time found this was the
+    only field of seven without a writer; this test keeps it that way.
+
+    Deliberately checks the BUILD SITE rather than "anywhere in the tree": a
+    field written only in tests is exactly the shape that shipped here.
+    """
+    import dataclasses
+    import inspect
+
+    from sglang.srt.managers import scheduler as sched_mod
+    from sglang.srt.managers.phase_policy import PhasePolicyInputs
+
+    src = inspect.getsource(sched_mod)
+    missing = [
+        f.name
+        for f in dataclasses.fields(PhasePolicyInputs)
+        if f"{f.name}=" not in src
+    ]
+    assert not missing, (
+        f"PhasePolicyInputs field(s) with no producer at the build site: "
+        f"{missing}. They will read their default for ever, and any guard that "
+        f"consults them is absent while looking present (#861i)."
+    )
