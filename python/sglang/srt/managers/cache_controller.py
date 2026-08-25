@@ -1818,6 +1818,13 @@ class HiCacheController:
         except Exception:
             logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
 
+    # UNREACHABLE SINCE #861, and kept rather than deleted: these are the
+    # landing site for task #861 item (a). The v2 route keys a page by POOL
+    # NAME, so it cannot carry the drafter identity the generic route puts in
+    # its component key; `_maybe_register_draft_with_storage` refuses to wire
+    # them until (a) folds the drafter into `compute_model_identity_hash`,
+    # where every backend picks it up. Deleting them would make (a) rebuild
+    # what already works, for the sake of a dead-code count.
     def _draft_page_set_v2(self, hash_values, host_indices) -> None:
         self.storage_backend.batch_set_v2(
             [
