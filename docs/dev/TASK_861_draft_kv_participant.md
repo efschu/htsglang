@@ -113,6 +113,13 @@ a second scheme.
   stamp armed. Called from the ONE funnel every batch passes through
   (`Scheduler.run_batch`), because the #856 seam-transport re-admission is
   built by a purity exemption rather than by the ordinary prefill path.
+* THREE-VALUED tier probe. "No host tier at all" is NOT "disarmed": without a
+  host tier a cached prefix can only be a DEVICE radix hit, whose rows were
+  never freed and reallocated, so the original request's draft-extend wrote
+  their draft half and they are warm BY CONSTRUCTION. Collapsing the two would
+  mark every prefix-cache hit on every non-HiCache speculating deployment
+  draft-cold — a default-path throughput regression introduced by a fix for a
+  flip-only defect.
 * Two triggers: `SEAM_READMIT_ATTR` (stamped only by the #856 cutover's own
   retract closure, never by decode-OOM preemption) and "the draft tier is
   disarmed" — the cheap sound over-approximation, whose false positive costs
@@ -175,13 +182,13 @@ draft half is **≈ +6.3 %** of host and disk bytes, not ~1.5 %.
 
 ## Test results (hermetic, `CUDA_VISIBLE_DEVICES=""`)
 
-* New: 42 passed across three files
+* New: 44 passed across three files
   (`test_draft_hicache_binding_861.py`, `test_draft_tier_gate_861.py`,
   `test_draft_cold_admission_861.py`).
 * RED on base `e3469633bd`: all three files error at collection (the symbols do
   not exist), and the behavioural probe above shows `has_draft` False in the TP
   phase.
-* CAN-FAIL by mutation, seven mutants, each killing ≥1 test; restoring returns green:
+* CAN-FAIL by mutation, eight mutants, each killing ≥1 test; restoring returns green:
 
   | mutant | reds |
   |---|---|
@@ -192,10 +199,11 @@ draft half is **≈ +6.3 %** of host and disk bytes, not ~1.5 %.
   | scrub is not bounded to the cached prefix | 2 |
   | drafter identity leaves the key | 1 |
   | `owner_phase` derived from "did I fall back to the stacks" | 5 |
+  | "no host tier" read as "disarmed" | 1 |
 
 * Scoped gate (touched modules + consumers: hicache / rebind / binding /
   cache_controller / draft / #703 / #718 / #719 / #760 / #847 / #856 / W35 /
-  black-ratchet): **679 passed, 13 skipped, 69 subtests**.
+  black-ratchet): **681 passed, 13 skipped, 69 subtests**.
 * `ruff`: zero delta on every touched file. `codespell`: one pre-existing hit
   (`retuned`, a deliberate word in `retune_carried_batches_for_phase`).
 

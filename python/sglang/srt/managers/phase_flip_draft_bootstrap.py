@@ -754,6 +754,20 @@ def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
 def draft_tier_armed_for(scheduler) -> bool:
     """Is the draft half of the HiCache tier armed right now?
 
+    THREE-VALUED, and the third value is the one that matters:
+    ``True``  -- armed, so a restored prefix brought its draft half with it;
+    ``False`` -- a host tier EXISTS and its draft half is off, so a restored
+                 prefix came back target-only;
+    ``True``  -- there is NO host tier at all, which is NOT the same thing.
+
+    THE REGRESSION THIS AVOIDS. Without a host tier a cached prefix can only be
+    a DEVICE radix hit: those rows were never freed and reallocated, so the
+    original request's ``_draft_extend_for_prefill`` wrote their draft half and
+    they are warm BY CONSTRUCTION. Treating "no controller" as "disarmed" would
+    mark every prefix-cache hit on every non-HiCache speculating deployment
+    draft-cold -- a throughput regression on the default path, introduced by a
+    fix for a flip-only defect.
+
     Read from the controller's ONE gate rather than re-derived, so this cannot
     drift from the gate the transfers themselves consult -- the second-copy
     defect that cost W32 and that #861's own consume-point sweep exists to
@@ -761,6 +775,10 @@ def draft_tier_armed_for(scheduler) -> bool:
     """
     tree_cache = getattr(scheduler, "tree_cache", None)
     cc = getattr(tree_cache, "cache_controller", None)
+    if cc is None:
+        # No host tier: nothing can be restored, so nothing can be restored
+        # without its draft half.
+        return True
     gate = getattr(cc, "draft_tier_armed", None)
     if gate is None:
         return False

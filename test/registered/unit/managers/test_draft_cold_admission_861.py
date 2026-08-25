@@ -163,6 +163,35 @@ def test_a_freshly_computed_context_is_never_cold():
     assert draft_cold_reason(sched, make_req("f", 0, prefix_len=0), False) is None
 
 
+def test_no_host_tier_at_all_is_warm_not_disarmed():
+    """THE DEFAULT-PATH REGRESSION THIS AVOIDS. Without a HiCache host tier a
+    cached prefix can only be a DEVICE radix hit, whose rows were never freed
+    and reallocated -- the original request's `_draft_extend_for_prefill` wrote
+    their draft half. Reading "no controller" as "disarmed" would mark every
+    prefix-cache hit on every non-HiCache speculating deployment draft-cold."""
+    from sglang.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
+
+    sched = make_scheduler(FakeKVPool(), tier_armed=False)
+    sched.tree_cache = types.SimpleNamespace(cache_controller=None)
+    assert draft_tier_armed_for(sched) is True
+    assert arm_draft_cold_for_admission(sched, batch_of(make_req("d", 1, 5)))[
+        "cold"
+    ] == 0
+
+
+def test_a_host_tier_with_its_draft_half_off_is_cold():
+    """CAN-FAIL for the pin above: the SAME shape with a controller present and
+    its gate closed IS cold, so the assertion measures the distinction rather
+    than the default."""
+    from sglang.srt.managers.phase_flip_draft_bootstrap import draft_tier_armed_for
+
+    sched = make_scheduler(FakeKVPool(), tier_armed=False)
+    assert draft_tier_armed_for(sched) is False
+    assert arm_draft_cold_for_admission(sched, batch_of(make_req("d", 1, 5)))[
+        "cold"
+    ] == 1
+
+
 def test_a_warm_tier_and_no_seam_stamp_is_not_cold():
     sched = make_scheduler(FakeKVPool(), tier_armed=True)
     assert draft_cold_reason(sched, make_req("w", 0, prefix_len=10), True) is None
