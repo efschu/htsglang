@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 LOG_PREFIX = "PHASE-FLIP"
 
 
-def chunk_blocks_quiescence(chunked_req) -> bool:
+def chunk_blocks_quiescence(chunked_req, *, strict: bool = False) -> bool:
     """Does this chunked prefill prevent a rank from being quiescent?
 
     ONE definition with TWO callers, and they must never disagree:
@@ -111,10 +111,43 @@ def chunk_blocks_quiescence(chunked_req) -> bool:
 
     True ONLY while the request is mid-admission -- it has been chosen but
     has no pool row yet, so its KV has no home the carry could move.
+
+    #858: AND, UNDER STRICT BATCHING, WHILE THE PREFILL IS INCOMPLETE.
+    The "between chunks is settled" relaxation above was written 2026-08-09
+    (#631 defect O) and its justification is quoted in this very docstring:
+    "exactly the state the carry moves". #856 DELETED THE CARRY on
+    2026-08-24 -- the flip now retracts residents and drops the tree -- so
+    that state is freed, not moved. This predicate was never revisited: a
+    6019-token prompt needs two chunks, the flip commits between them, and
+    the re-admission restarts at prefix_lens=0 (measured, W38-B). W37-H arm
+    A: 51 flips, 132 pp prefills, 57 tp prefills, ZERO decode rounds, zero
+    completions.
+
+    NOT UNCONDITIONAL, and the condition is the whole design. Blocking on
+    every incomplete chunk re-creates defect O, where a flip armed FOR a
+    prefill could not land until that prefill had already finished -- the
+    32768-token prefill that ran in the slow layout and paid two cutovers
+    for nothing. Under STRICT batching the flip is not armed for the pending
+    prefill: it is armed for the DECODE that follows the drain, so waiting
+    for prefill to finish IS drain-and-flip rather than a stall. That is
+    also the user's specification for the target mode -- all prefill in PP,
+    then all decode in TP, never work in the wrong layout.
+
+    RESIDUAL, NAMED RATHER THAN LEFT IMPLICIT (own posten): post-#856 there
+    is no carry in EITHER mode, so a mid-chunk flip discards the prefill in
+    NON-STRICT too. We decline to block there because an unconditional block
+    re-creates #631 defect O. THE CORRECT NON-STRICT ANSWER IS UNKNOWN AND
+    IS FILED, NOT SOLVED. Do not read `if strict` as evidence that the
+    non-strict path was analysed and found sound -- it was not analysed.
     """
-    return (
-        chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None
-    )
+    if chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None:
+        return True
+    if strict and chunked_req is not None:
+        end = getattr(getattr(chunked_req, "extend_range", None), "end", None)
+        full = getattr(chunked_req, "full_untruncated_fill_ids", None)
+        if end is not None and full is not None and int(end) < len(full):
+            return True
+    return False
 
 
 class PhaseFlipJoinTimeout(RuntimeError):
@@ -654,8 +687,22 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         # that the flip would move the layout out from under a request
         # whose KV stayed behind. The two changes are one change.
         chunked = getattr(scheduler, "chunked_req", None)
-        if chunk_blocks_quiescence(chunked):
-            return "a chunked prefill has no pool row yet (mid-admission)"
+        # #858: the strict term travels WITH the shared predicate. Both
+        # callers must ask the same question; passing it here and not at the
+        # park site is exactly the drift this helper exists to prevent.
+        from sglang.srt.managers.phase_purity import purity_of
+
+        try:
+            _strict = bool(purity_of(scheduler).strict)
+        except Exception:  # noqa: BLE001 - a purity read may never break a flip
+            _strict = False
+        if chunk_blocks_quiescence(chunked, strict=_strict):
+            return (
+                "a chunked prefill is incomplete (strict: the flip would "
+                "discard it, #856 removed the carry)"
+                if _strict
+                else "a chunked prefill has no pool row yet (mid-admission)"
+            )
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
         # same way, by a leg that could never commit.
@@ -680,17 +727,15 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         # only in last_batch and are merged into the running batch by the
         # next get_next_batch_to_run: a real reason to wait, self-clearing
         # in one iteration.
-        from sglang.srt.managers.phase_flip_resident_carry import (
-            orphan_resident_reqs,
-        )
-
-        orphans = orphan_resident_reqs(scheduler)
-        if orphans:
-            return (
-                f"{len(orphans)} request(s) are still only in "
-                f"last_batch/last_mbs ({orphans[:4]}) and not yet merged "
-                f"into the resident set the carry harvests"
-            )
+        # #858: THE ORPHAN GATE IS GONE, NOT NARROWED. It blocked on requests
+        # "reachable ONLY through last_mbs/last_batch ... not yet merged into
+        # the resident set THE CARRY HARVESTS" (#631 defect L). There is no
+        # harvest: #856 retracts residents instead of carrying them, and
+        # de4f541b41 made `_live_reqs` enumerate running_mbs, last_mbs,
+        # running_batch AND last_batch -- the identical population. The
+        # retraction already sees them, so this gate only delayed flips for a
+        # mechanism that no longer exists. Narrowing it would have left a
+        # third stale premise behind.
         result_queue = getattr(scheduler, "result_queue", None)
         if result_queue is not None and len(result_queue) > 0:
             return f"result_queue holds {len(result_queue)} result(s)"

@@ -7021,7 +7021,14 @@ class Scheduler(
             self.server_args.enable_phase_flip
             and self.phase_flip_runtime is not None
             and self.phase_flip_runtime.pending is not None
-            and not chunk_blocks_quiescence(self.chunked_req)
+            # #858: the SAME strict term as the ready_fn caller. The helper's
+            # own docstring is explicit that these two must never disagree --
+            # they drifted apart once already (defect O relaxed one side while
+            # this one kept the blanket test, 2026-08-09 20:31:38Z).
+            and not chunk_blocks_quiescence(
+                self.chunked_req,
+                strict=bool(getattr(self._phase_purity, "strict", False)),
+            )
         ):
             # A round withheld for a PENDING FLIP is not a round that could
             # not build a batch -- it is one that deliberately did not try. It
