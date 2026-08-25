@@ -118,11 +118,44 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP-DRAFT"
 
-# Set on every Req carried into a speculating TP phase, cleared by the
-# worker after the bootstrap round has run. Per-REQUEST rather than
-# per-batch because a batch may legitimately mix carried requests with
-# ones admitted after the cutover.
+# Set on every Req that must not speculate yet, decremented by the worker
+# after each bootstrap round has run. Per-REQUEST rather than per-batch
+# because a batch may legitimately mix cold requests with warm ones.
+#
+# #861: THIS IS A COUNTER, NOT A FLAG, and the widening has a cause. It was
+# written for the #631 carry, where exactly one non-drafting round was
+# needed: the carried request's draft prefix had just been SCRUBBED to zero
+# and its bonus token was known, so one trivial verify produced the hidden
+# state that seeds the real chain.
+#
+# #856 retired the carry. Residents are RETRACTED at the seam and re-admitted
+# in the next layout as a read-through prefill, so nothing is carried, the
+# cutover's `arm_draft_bootstrap_all_reachable` finds an empty resident set,
+# and the scrub+seed above never runs. What arrives in the TP phase instead is
+# a request whose TARGET prefix was restored from HiCache and whose DRAFT rows
+# hold whatever the previous occupants of those slots wrote -- the same rows
+# this module was built to refuse to trust, reached by a different road.
+#
+# Truthiness is preserved on purpose: `True` still reads as "one round owed",
+# so every pre-#861 caller keeps working unchanged.
 BOOTSTRAP_ATTR = "phase_flip_needs_draft_bootstrap"
+
+#: Hard ceiling on the rounds a single request may owe. THE LOUD END OF THE
+#: "never silently spec-off forever" direction: a mark is a request that is
+#: not speculating, i.e. paying full price per token, and a mark that never
+#: discharges is a permanent throughput regression that looks exactly like a
+#: slow rig. Anything above this is a bug in the caller, not a long warm-up,
+#: and it is refused where it is SET rather than discovered later.
+MAX_DRAFT_COLD_ROUNDS = 8
+
+#: The default a draft-cold admission owes. ONE, because the round's job is
+#: not to warm the prefix -- it cannot, the prefix needs the target's hidden
+#: states for every position and those are gone -- but to get the request a
+#: REAL seed off a full-capture verify, after its garbage prefix rows have
+#: been scrubbed to zero. From the next round it is an ordinary speculating
+#: request whose acceptance climbs as real rows accumulate behind the
+#: admission point. Tunable only with a measurement.
+DEFAULT_DRAFT_COLD_ROUNDS = 1
 
 
 class DraftBootstrapError(RuntimeError):
@@ -664,23 +697,275 @@ def _harvest(scheduler):
     return harvest_resident_batches(scheduler)
 
 
+#: Set once per request so the admission arming is idempotent: a chunked
+#: prefill reaches ``run_batch`` many times with the same request, and each
+#: visit would otherwise re-scrub rows the drafter has since written.
+COLD_ARMED_ATTR = "phase_flip_draft_cold_armed"
+
+
+def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
+    """Why this request's cached prefix carries no draft rows, or None.
+
+    TWO TRIGGERS, and they are not the same question.
+
+    1. SEAM RE-ADMISSION. ``phase_purity.SEAM_READMIT_ATTR`` is stamped by the
+       #856 cutover's own retract closure and by nothing else (ordinary
+       decode-OOM preemption sets ``is_retracted``, which is deliberately NOT
+       what is read here). Such a request prefilled in the PP phase, which has
+       no drafter at all, so no ``draft_extend`` ever ran over its context --
+       the user's question, and the honest answer is that its draft rows were
+       never written by anyone.
+
+    2. THE DRAFT TIER WAS NOT ARMED. A cached prefix restored while the draft
+       half is disarmed came back TARGET-ONLY: the rows hold the previous
+       occupants' draft KV. This is the cheap sound over-approximation -- it
+       cannot tell WHICH cached prefix came through the host tier, so it treats
+       every one as cold while the tier is off. That is the safe direction: the
+       cost of a false positive is one non-drafting round, the cost of a false
+       negative is a request speculating over rows nothing wrote.
+
+    A request with NO cached prefix is never cold: its whole context was just
+    computed here, so ``_draft_extend_for_prefill`` wrote every draft row.
+    """
+    prefix = getattr(req, "prefix_indices", None)
+    n_prefix = 0
+    if prefix is not None:
+        try:
+            n_prefix = int(len(prefix))
+        except TypeError:
+            n_prefix = int(getattr(prefix, "numel", lambda: 0)())
+    if n_prefix <= 0:
+        return None
+    from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+
+    if getattr(req, SEAM_READMIT_ATTR, None) is not None:
+        return (
+            f"seam re-admission (#856): prefilled in a phase with no drafter, "
+            f"{n_prefix} prefix token(s) whose draft rows nothing wrote"
+        )
+    if not tier_armed:
+        return (
+            f"the draft half of the HiCache tier is disarmed, so this "
+            f"{n_prefix}-token cached prefix was restored target-only (#861)"
+        )
+    return None
+
+
+def draft_tier_armed_for(scheduler) -> bool:
+    """Is the draft half of the HiCache tier armed right now?
+
+    THREE-VALUED, and the third value is the one that matters:
+    ``True``  -- armed, so a restored prefix brought its draft half with it;
+    ``False`` -- a host tier EXISTS and its draft half is off, so a restored
+                 prefix came back target-only;
+    ``True``  -- there is NO host tier at all, which is NOT the same thing.
+
+    THE REGRESSION THIS AVOIDS. Without a host tier a cached prefix can only be
+    a DEVICE radix hit: those rows were never freed and reallocated, so the
+    original request's ``_draft_extend_for_prefill`` wrote their draft half and
+    they are warm BY CONSTRUCTION. Treating "no controller" as "disarmed" would
+    mark every prefix-cache hit on every non-HiCache speculating deployment
+    draft-cold -- a throughput regression on the default path, introduced by a
+    fix for a flip-only defect.
+
+    Read from the controller's ONE gate rather than re-derived, so this cannot
+    drift from the gate the transfers themselves consult -- the second-copy
+    defect that cost W32 and that #861's own consume-point sweep exists to
+    remove.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    cc = getattr(tree_cache, "cache_controller", None)
+    if cc is None:
+        # No host tier: nothing can be restored, so nothing can be restored
+        # without its draft half.
+        return True
+    gate = getattr(cc, "draft_tier_armed", None)
+    if gate is None:
+        return False
+    try:
+        return bool(gate("admission"))
+    except Exception:  # noqa: BLE001 - a probe may never break admission
+        return False
+
+
+def arm_draft_cold_for_admission(scheduler, batch) -> dict:
+    """#861 fix (b): refuse to speculate over draft rows nothing wrote.
+
+    THE HOLE #856 OPENED, closed at the boundary that survived it. The #631
+    cutover leg (``arm_draft_bootstrap``) is still correct and still armed, and
+    since #856 it finds an empty resident set on every flip -- the residents
+    are retracted at the seam and come back as a read-through PREFILL. So the
+    scrub-and-seed moved to where the request now enters: ADMISSION.
+
+    Three steps per cold request, in this order, and the order is the whole
+    safety argument:
+
+      1. SCRUB the cached prefix's draft rows to zero. Zero is chosen over the
+         previous occupant's bytes for the reason this module already gives at
+         its head: it is deterministic, this fork's determinism pins are worth
+         more than arbitrary bytes, and it removes the chance of an fp8
+         NaN/Inf reaching the draft's softmax. It is not a correctness
+         argument -- the target verifies every proposed token either way.
+      2. MARK the request draft-cold, so the next decode round runs the
+         trivial 1-node verify instead of drafting off a chain it does not
+         have, and that round's FULL-captured hidden states seed the real one.
+      3. STAMP it armed, so a chunked prefill's later visits do not re-scrub
+         rows the drafter has since written.
+
+    Scrubbing BEFORE marking matters: a request marked but not scrubbed would
+    stop speculating and still hold garbage; a request scrubbed but not marked
+    would speculate off zeros with no seed. Neither half is useful alone.
+
+    A no-op with no cost on every default path: without speculation, without a
+    draft pool, or with no cached prefix in the batch, this returns before it
+    touches anything.
+    """
+    reqs = _reqs_of(batch)
+    if not reqs:
+        return {"cold": 0, "rows": 0}
+
+    draft_worker = getattr(scheduler, "draft_worker", None)
+    pool = draft_kv_pool(draft_worker)
+    if pool is None:
+        # No drafter in this phase: nothing can speculate, so nothing needs to
+        # be told not to. The PP phase of a flip instance takes this exit on
+        # every prefill batch it builds.
+        return {"cold": 0, "rows": 0}
+
+    tier_armed = draft_tier_armed_for(scheduler)
+    req_to_token = scheduler.req_to_token_pool.req_to_token
+
+    cold = []
+    slot_rows: List[torch.Tensor] = []
+    for req in reqs:
+        if getattr(req, COLD_ARMED_ATTR, False):
+            continue
+        reason = draft_cold_reason(scheduler, req, tier_armed)
+        if reason is None:
+            continue
+        n = len(getattr(req, "prefix_indices", ()) or ())
+        if n > 0:
+            # The PREFIX only. The extend region's draft rows are written by
+            # this very batch's `_draft_extend_for_prefill`, and scrubbing them
+            # would erase the one part that is real.
+            slot_rows.append(req_to_token[req.req_pool_idx, :n])
+        cold.append((req, reason))
+
+    if not cold:
+        return {"cold": 0, "rows": 0}
+
+    rows, layer_ids = 0, []
+    if os.environ.get("SGLANG_PHASE_FLIP_DRAFT_SCRUB", "1") == "0":
+        logger.warning(
+            "%s SCRUB DISABLED by SGLANG_PHASE_FLIP_DRAFT_SCRUB=0 at admission: "
+            "%d draft-cold request(s) keep the previous occupants' draft bytes. "
+            "Acceptance only -- answers are unaffected because the target "
+            "verifies every proposed token.",
+            LOG_PREFIX,
+            len(cold),
+        )
+    else:
+        rows, layer_ids = scrub_draft_kv(pool, slot_rows)
+
+    for req, _reason in cold:
+        mark_draft_cold(req)
+        setattr(req, COLD_ARMED_ATTR, True)
+
+    logger.info(
+        "%s ADMISSION draft-cold: %d request(s) marked, %d prefix draft KV "
+        "row(s) scrubbed across layer(s) %s of %s. First reason: %s. Each runs "
+        "a 1-node verify (no draft) whose hidden states seed the real chain; "
+        "from the next round they speculate normally, with acceptance climbing "
+        "as real draft rows accumulate behind the admission point.",
+        LOG_PREFIX,
+        len(cold),
+        rows,
+        layer_ids,
+        type(pool).__name__,
+        cold[0][1],
+    )
+    return {"cold": len(cold), "rows": rows, "layers": layer_ids}
+
+
+def rounds_owed(req) -> int:
+    """How many non-drafting rounds this request still owes. 0 when warm.
+
+    ONE reader of the attribute's shape, so `True` (the pre-#861 value) and an
+    int cannot be interpreted differently by two call sites.
+    """
+    value = getattr(req, BOOTSTRAP_ATTR, 0)
+    if value is True:
+        return 1
+    if not value:
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        # A mark whose value cannot be read is a mark that can never discharge.
+        raise DraftBootstrapError(
+            f"{LOG_PREFIX} request {getattr(req, 'rid', '?')} carries a "
+            f"draft-cold mark of {value!r}, which is neither a bool nor an "
+            f"int. A mark that cannot be decremented never discharges, and a "
+            f"request that never discharges never speculates again."
+        )
+
+
+def mark_draft_cold(req, rounds: int = DEFAULT_DRAFT_COLD_ROUNDS) -> int:
+    """Owe ``rounds`` non-drafting rounds on this request. Returns the total.
+
+    MONOTONIC, never lowering an existing debt: two independent reasons to
+    distrust a request's draft rows (it was seam-re-admitted AND its prefix
+    came back while the draft tier was disarmed) must not cancel each other by
+    the second caller writing a smaller number.
+
+    Refuses above ``MAX_DRAFT_COLD_ROUNDS`` at the SET site, which is the only
+    place the intent is still visible. Discovering an absurd debt at the
+    discharge site would mean the request had already stopped speculating for
+    an unknown number of rounds.
+    """
+    if rounds <= 0:
+        return rounds_owed(req)
+    if rounds > MAX_DRAFT_COLD_ROUNDS:
+        raise DraftBootstrapError(
+            f"{LOG_PREFIX} refusing to mark request "
+            f"{getattr(req, 'rid', '?')} draft-cold for {rounds} rounds, above "
+            f"the {MAX_DRAFT_COLD_ROUNDS} ceiling. A marked request does not "
+            f"speculate, so an unbounded mark is a permanent throughput "
+            f"regression that reads as a slow rig rather than as a defect."
+        )
+    total = max(rounds_owed(req), int(rounds))
+    setattr(req, BOOTSTRAP_ATTR, total)
+    return total
+
+
 def batch_needs_bootstrap(batch) -> bool:
-    """True while any request in the batch still owes its bootstrap round.
+    """True while any request in the batch still owes a bootstrap round.
 
     Whole-batch by design even though the mark is per-request: the trivial
-    verify is a batch-level shape. A batch that mixes carried and fresh
-    requests therefore spends ONE round not drafting for all of them, which
-    costs the fresh ones a single speculation step and keeps the carried
-    ones from reading a draft chain they do not have.
+    verify is a batch-level shape. A batch that mixes cold and warm requests
+    therefore spends the round not drafting for all of them, which costs the
+    warm ones a single speculation step and keeps the cold ones from reading a
+    draft chain they do not have.
     """
-    return any(getattr(r, BOOTSTRAP_ATTR, False) for r in _reqs_of(batch))
+    return any(rounds_owed(r) > 0 for r in _reqs_of(batch))
 
 
 def clear_bootstrap(batch) -> int:
-    """Clear the marks after the bootstrap round. Returns marks cleared."""
+    """DISCHARGE ONE ROUND from every marked request. Returns marks touched.
+
+    #861: a decrement rather than a clear. With ``DEFAULT_DRAFT_COLD_ROUNDS``
+    this is byte-identical to the pre-#861 clear (1 -> 0), which is why the
+    name and the call site in ``eagle_worker_v2`` are unchanged.
+
+    Called ONLY after the draft_extend that turned this round's hidden states
+    into a real chain actually ran -- clearing any earlier would let an
+    exception between the two leave a request marked as bootstrapped while its
+    draft input is still the seed's zeros.
+    """
     n = 0
     for req in _reqs_of(batch):
-        if getattr(req, BOOTSTRAP_ATTR, False):
-            setattr(req, BOOTSTRAP_ATTR, False)
+        owed = rounds_owed(req)
+        if owed > 0:
+            setattr(req, BOOTSTRAP_ATTR, owed - 1)
             n += 1
     return n

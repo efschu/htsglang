@@ -498,7 +498,7 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
-            if self.has_draft and host_indices.numel() > 0:
+            if self.draft_tier_armed("write") and host_indices.numel() > 0:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
@@ -603,7 +603,7 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=resolved_pool_transfers,
                 )
                 if (
-                    self.has_draft
+                    self.draft_tier_armed("load")
                     and host_indices.numel() > 0
                     and i < self.mem_pool_host_draft.layer_num
                 ):
