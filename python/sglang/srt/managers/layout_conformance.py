@@ -311,6 +311,67 @@ def stale_ring_restore_verdict(
     )
 
 
+def work_layout_verdict(
+    *,
+    batch_class: str,
+    phase: str,
+    strict: bool,
+    transport_verified: bool,
+    n_reqs: int,
+    new_tokens: int,
+    cached_tokens: int,
+    now: float,
+) -> Optional[str]:
+    """#861d: WORK IN THE WRONG LAYOUT. The term this detector did not have.
+
+    THE GAP, measured. W37-D formed 258 prefill batches in the TP layout and
+    this module flagged ZERO of them, because every existing term asks about
+    the ECONOMY of a hold or the provenance of a routing decision -- none asks
+    the user's actual law: *never any work in the wrong layout*. The detector
+    ran through all 258 and stayed quiet, which is worse than not existing,
+    because its silence was read as conformity.
+
+    WHAT COUNTS AS A VIOLATION, and the distinction is the whole point.
+    Prefill in TP is permitted for SEAM TRANSPORT -- a re-admitted request
+    whose KV is restored from the canonical store recomputes nothing, so it is
+    mechanics, not work. That exemption is legitimate ONLY while its premise
+    holds, and W37-D proved the premise can be false: `#new-token: 4096,
+    #cached-token: 0` on every one of the 258, i.e. cold prefill wearing
+    transport's clothes.
+
+    So the verdict keys on the MEASURED bytes, not on the caller's intent:
+    a batch claiming transport while recomputing tokens is a violation, and
+    `cached_tokens == 0 and new_tokens > 0` is exactly that shape.
+
+    Returns the detail string when it is a violation, else None. The caller
+    passes it to ``note_conformance_violation`` so counting and throttling stay
+    in one place.
+    """
+    if not strict:
+        return None
+    wrong_layout = (batch_class == "prefill" and phase == "tp") or (
+        batch_class == "decode" and phase == "pp"
+    )
+    if not wrong_layout:
+        return None
+    # A verified restore that actually restored is mechanics, not work.
+    if transport_verified and int(cached_tokens) > 0 and int(new_tokens) <= 0:
+        return None
+    recomputing = int(new_tokens) > 0
+    return (
+        f"{ALARM_CONFORMANCE} kind=work_in_wrong_layout class={batch_class} "
+        f"phase={phase} reqs={n_reqs} new_tokens={new_tokens} "
+        f"cached_tokens={cached_tokens} transport_claimed={transport_verified} "
+        f"recomputing={recomputing} "
+        f"class1_total={_COUNTERS.conformance_violations + 1} -- the user's "
+        f"strict-batch law forbids work in this layout. A batch that claims "
+        f"SEAM TRANSPORT while recomputing tokens is not transport: W37-D ran "
+        f"258 such batches at #new-token 4096 / #cached-token 0 and this "
+        f"detector flagged none of them, because it had no term for the law "
+        f"itself."
+    )
+
+
 def note_conformance_violation(detail: str, now: float) -> bool:
     """Count it always, log it at most once per ALARM_REANNOUNCE_S per shape.
 

@@ -60,11 +60,21 @@ from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP
 from sglang.test.test_utils import CustomTestCase
 
 
-def _req(rid, *, seam_epoch=None, oom_retracted=False):
-    """A request double carrying only the marks the gate reads."""
+def _req(rid, *, seam_epoch=None, oom_retracted=False, cached_prefix=4096):
+    """A request double carrying only the marks the gate reads.
+
+    #861d: `cached_prefix` is now part of what the gate reads, and it DEFAULTS
+    TO A RESTORED PREFIX because that is what these tests were always about --
+    a re-admission whose KV comes back from the canonical store. W37-D showed
+    the other case exists on metal (258 batches at #cached-token 0), so it gets
+    its own explicit tests below rather than being the silent default here.
+    """
     return types.SimpleNamespace(
         rid=rid,
         seam_readmit_epoch=seam_epoch,
+        # The prefix length inserted into the tree cache: >0 means the
+        # re-admission genuinely restores rather than recomputes.
+        cache_protected_len=cached_prefix,
         # What `Req.reset_for_retract` sets -- from ANY retraction path,
         # including plain decode-OOM preemption. Deliberately set on the
         # non-seam doubles so the can-fail tests are about the right thing.
@@ -447,3 +457,65 @@ class TestOnePredicateBothCallers(CustomTestCase):
         fresh.cache_protected_len = 0
         sched = _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), [fresh])
         self.assertEqual(phase_purity.seam_transport_pending_tokens(sched), 0)
+
+
+class TheExemptionsPremiseIsCheckedNotAsserted(unittest.TestCase):
+    """#861d: W37-D falsified the exemption's factual claim on metal.
+
+    The exemption permits prefill in the TP layout because "the re-admission
+    recomputes nothing -- it is a cache restore". W37-D ran 258 such batches at
+    ``#new-token: 4096, #cached-token: 0`` (and #cached-token was 0 on ALL 1441
+    occurrences in the boot, storage_hit 0), i.e. cold prefill of real work in
+    the decode layout -- the user's strict-batch law broken by the exemption
+    written to respect it.
+
+    CLASS: a guard or exemption that ASSERTS a premise in prose and never
+    verifies it at runtime. Same class as #861c/F1, which assumed two host
+    pools have equal slot counts. Both silent for a whole window; both fixed by
+    checking the premise where it is relied upon.
+    """
+
+    def setUp(self):
+        import inspect as _inspect
+
+        from sglang.srt.managers import phase_purity
+
+        self.pp = phase_purity
+        self.inspect = _inspect
+
+    @staticmethod
+    def _s(queue):
+        return _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), queue)
+
+    def test_a_restored_readmission_still_opens_the_exemption(self):
+        """The legitimate case, unchanged: KV really comes back."""
+        s = self._s([_req("a", seam_epoch=1, cached_prefix=4096)])
+        self.assertTrue(self.pp.seam_transport_premise_holds(s))
+
+    def test_a_cold_readmission_is_REFUSED(self):
+        """THE W37-D SPECIMEN. Stamped, queued, and nothing cached: admitting
+        it in TP would be a 4096-token cold prefill wearing transport's
+        clothes."""
+        s = self._s([_req("a", seam_epoch=1, cached_prefix=0)])
+        self.assertFalse(self.pp.seam_transport_premise_holds(s))
+
+    def test_a_mixed_queue_opens_on_the_restored_one(self):
+        """One genuine restore is enough ground for the round; the builder's
+        own filter still keeps unstamped work out of the batch."""
+        s = self._s(
+            [
+                _req("cold", seam_epoch=1, cached_prefix=0),
+                _req("warm", seam_epoch=1, cached_prefix=2048),
+            ]
+        )
+        self.assertTrue(self.pp.seam_transport_premise_holds(s))
+
+    def test_an_empty_queue_holds(self):
+        self.assertFalse(self.pp.seam_transport_premise_holds(self._s([])))
+
+    def test_the_gate_consults_the_premise(self):
+        """FUTURE-CHECK: the call site must AND the two, or the premise check
+        is installed and unreachable -- the shape that cost W32."""
+        src = self.inspect.getsource(self.pp.prefill_blocked_here)
+        self.assertIn("seam_transport_premise_holds", src)
+        self.assertIn("seam_transport_exempt(scheduler) and", src)

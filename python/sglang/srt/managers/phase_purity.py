@@ -697,7 +697,7 @@ def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
     # window was entered to finish, sent back to the queue by the seam a
     # moment earlier. Suppressing it does not defend the drain contract, it
     # makes the contract unsatisfiable -- the bundle can never complete.
-    if seam_transport_exempt(scheduler):
+    if seam_transport_exempt(scheduler) and seam_transport_premise_holds(scheduler):
         return False
     # #677 HOT FIX 2: DRAIN MODE OUTRANKS THE PURITY MODE ON THIS ONE AXIS.
     #
@@ -841,6 +841,80 @@ def seam_transport_pending_tokens(scheduler) -> int:
         except Exception:  # noqa: BLE001 - an accounting probe, never a gate
             continue
     return total
+
+
+def seam_transport_premise_holds(scheduler) -> bool:
+    """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
+
+    THE EXEMPTION RESTS ON A FACTUAL CLAIM, AND THE CLAIM IS FALSIFIABLE.
+    ``seam_transport_exempt`` permits prefill in the TP layout on the ground
+    that "the tokens were already prefilled in the PP window, their KV is in
+    the canonical store, and the re-admission recomputes nothing -- it is a
+    cache restore". That is what makes it an exemption rather than a breach of
+    the user's law: transport is not work.
+
+    W37-D FALSIFIED IT ON METAL. 258 TP prefill batches, every one
+    ``#new-token: 4096, #cached-token: 0``, mean cached 0.0 % -- and
+    ``#cached-token`` was 0 on ALL 1441 occurrences in the whole boot, PP
+    included. HiCache wrote (write_backup 207, load_to_device 207, fence 573)
+    and served ZERO hits (storage_hit 0). So the re-admission was not restoring
+    anything; it was re-prefilling 4096 cold tokens in the decode layout, 258
+    times. Real work, wrong layout, the user's law broken -- by an exemption
+    whose justification was true only in design.
+
+    SAME CLASS AS #861c/F1, and that is the finding rather than this function:
+    a guard or an exemption that ASSERTS a premise in prose and never verifies
+    it at runtime. F1 assumed two host pools have equal slot counts; this
+    assumed a re-admission hits cache. Both were wrong for a whole window, both
+    were silent, and both are fixed the same way -- check the premise where it
+    is relied upon.
+
+    THE CHECK: a restore has a cached prefix. ``cache_protected_len`` is the
+    prefix length inserted into the tree cache (schedule_batch.py:919), so a
+    genuinely restored request carries a non-zero one and a cold one does not.
+    If NO stamped request in the queue carries a prefix, nothing is being
+    restored and the exemption has no ground to stand on -- the batch is held
+    and the flip demand (which #861c's existence term now raises correctly)
+    sends the work to the layout that owns it.
+
+    WHY THIS IS SAFE AGAINST THE W30 LIVELOCK, and the ordering matters: the
+    exemption exists because W30 ping-ponged with ZERO decode batches, and the
+    ROOT of that ping-pong was the blind counter #861c/F2 fixed -- the policy
+    read 0 pending and never demanded the flip. With the existence term in
+    place a held TP prefill DEMANDS the flip to PP, and PP admits it, so the
+    hold now has somewhere to go. The exemption was a workaround for a defect
+    that is fixed; narrowing it to its own premise is safe only BECAUSE F2
+    landed first.
+
+    LOUD, ONCE. A refused exemption is a state somebody has to be able to see.
+    """
+    reqs = seam_readmit_candidates(scheduler)
+    if not reqs:
+        return False
+    restored = 0
+    for req in reqs:
+        try:
+            if int(getattr(req, "cache_protected_len", 0) or 0) > 0:
+                restored += 1
+        except (TypeError, ValueError):
+            continue
+    if restored:
+        return True
+    if not getattr(scheduler, "_seam_premise_refused_announced", False):
+        scheduler._seam_premise_refused_announced = True
+        logger.error(
+            "%s SEAM TRANSPORT REFUSED: the exemption's premise does not hold. "
+            "%d stamped request(s) are queued and NONE carries a cached prefix "
+            "(cache_protected_len=0 for all), so re-admitting them in the TP "
+            "layout would be a COLD PREFILL of real work, not a cache restore "
+            "-- the user's strict-batch law, broken by the exemption meant to "
+            "respect it. Holding instead; the #861c existence term raises the "
+            "flip demand and the work runs in the layout that owns it. "
+            "Measured W37-D: 258 such batches at #cached-token 0.",
+            LOG_PREFIX,
+            len(reqs),
+        )
+    return False
 
 
 def seam_transport_exempt(scheduler) -> bool:
