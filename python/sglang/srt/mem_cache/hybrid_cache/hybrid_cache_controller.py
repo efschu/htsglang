@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
+from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
 )
@@ -327,7 +328,55 @@ class HybridCacheController(BaseHiCacheController):
         self,
         host_indices: Optional[torch.Tensor] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        generation=None,
     ):
+        """W35: the override must route stale releases too, or the fix is inert.
+
+        THIS SIGNATURE SHADOWS THE BASE ONE, and this is the live path on the
+        mamba/hybrid rig. The base `append_host_mem_release` gained
+        produce-time routing so a release opened under an older binding is
+        freed against the pool it came from; an override that silently dropped
+        the `generation` argument would leave that fix installed and
+        unreachable on the only lane that runs -- the same shape that cost W31
+        (below the drain gate), W32 (a second copy) and W33 (unreachable
+        writer). Caught at the desk this time rather than on metal.
+        """
+        if host_indices is not None and generation is not None:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                host_pool_for_generation,
+                write_back_stamp_is_current,
+            )
+
+            if not write_back_stamp_is_current(generation):
+                owner = host_pool_for_generation(generation)
+                self._stale_release_routed = (
+                    getattr(self, "_stale_release_routed", 0) + 1
+                )
+                if owner is None:
+                    self._stale_release_orphaned = (
+                        getattr(self, "_stale_release_orphaned", 0) + 1
+                    )
+                    logger.error(
+                        "#719/W35 STALE RELEASE ORPHANED (hybrid): %d host "
+                        "slot(s) from binding generation %s name no known "
+                        "pool; neither queued nor freed. (%d so far.)",
+                        int(host_indices.numel()),
+                        generation,
+                        self._stale_release_orphaned,
+                    )
+                else:
+                    n = self._stale_release_routed
+                    if n <= 3 or n % 200 == 0:
+                        logger.warning(
+                            "#719/W35 STALE RELEASE ROUTED (hybrid): %d host "
+                            "slot(s) from binding generation %s freed against "
+                            "THAT generation's pool. (%d so far.)",
+                            int(host_indices.numel()),
+                            generation,
+                            n,
+                        )
+                    owner.free(host_indices)
+                host_indices = None
         if host_indices is not None:
             self._append_host_mem_release_pages(
                 self.host_mem_release_queue,
@@ -405,6 +454,14 @@ class HybridCacheController(BaseHiCacheController):
 
     def start_writing(self) -> None:
         if not self.write_queue:
+            return
+        # #760/W35: THE CONSUME HALF, WHICH THIS SUBCLASS NEVER HAD.
+        # `write()` above carries the ENQUEUE-time checks; the base class also
+        # re-asks them at consume, and this override did not. That made the
+        # mamba/hybrid path -- the live path on this rig -- the one lane where
+        # a write-back queued before a cutover is consumed after it, which is
+        # the shape this file's own #760 note describes.
+        if not consume_gate(self, "write_queue", "write"):
             return
         op = CacheOperation.merge_ops(self.write_queue)
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
@@ -512,6 +569,13 @@ class HybridCacheController(BaseHiCacheController):
 
     def start_loading(self) -> int:
         if not self.load_queue:
+            return -1
+        # #760/W35: same consume half, load side. A stale load fills device
+        # rows from host slots this phase does not own and the tree then marks
+        # the prefix RESIDENT, so attention reads KV nobody wrote -- a silent
+        # wrong answer, with no assertion anywhere to catch it. Checked before
+        # a producer is allocated.
+        if not consume_gate(self, "load_queue", "load"):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)

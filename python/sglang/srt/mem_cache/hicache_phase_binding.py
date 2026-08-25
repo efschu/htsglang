@@ -97,6 +97,12 @@ class BindingState:
         self._lock = threading.Lock()
         self._phase = BOOT_PHASE
         self._generation = 0
+        # W35: generation -> the host pool bound at that generation. Recorded
+        # by the same advance() that mints the generation, so there is exactly
+        # one place where a generation and its pool are associated. A release
+        # produced under an older binding can then be freed against the pool it
+        # actually came from instead of the one that happens to be bound now.
+        self._pools: dict = {}
 
     @property
     def phase(self) -> str:
@@ -111,11 +117,19 @@ class BindingState:
             self._phase = BOOT_PHASE
             self._generation = 0
 
-    def advance(self, phase: str) -> int:
+    def advance(self, phase: str, host_pool=None) -> int:
         with self._lock:
             self._phase = str(phase)
             self._generation += 1
+            if host_pool is not None:
+                self._pools[self._generation] = host_pool
             return self._generation
+
+    def host_pool_at(self, generation):
+        """The host pool bound at ``generation``, or None if unknown."""
+        if generation is None:
+            return None
+        return self._pools.get(int(generation))
 
 
 _STATE = BindingState()
@@ -175,7 +189,7 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
             "than not rebinding at all."
         )
 
-    generation = _STATE.advance(incoming.phase)
+    generation = _STATE.advance(incoming.phase, incoming.host_pool)
     for name, obj in readers.items():
         try:
             _stamp(obj, incoming, generation)
@@ -447,6 +461,25 @@ def current_generation() -> int:
     ranks, zero refusals, SIGSEGV anyway).
     """
     return binding_state().generation
+
+
+def host_pool_for_generation(generation):
+    """The host pool a release stamped at ``generation`` must be freed against.
+
+    W35 DURABLE FIX, replacing a one-shot settle. `settle_pending_releases`
+    drained the queue at the rebind instant, which cannot see entries that do
+    not exist yet -- and three producers keep filling that queue AFTER the
+    rebind: `_drain_revoke` (prefetch revocation), the prefetch transfer thread
+    (`_page_transfer` -> `append_host_mem_release`), and the direct path. Each
+    manufactures a release naming slots from the pool bound when the OPERATION
+    was opened, not the pool bound now.
+
+    So the generation travels with the operation (`StorageOperation` stamps
+    itself at construction) and the release is routed to the pool that
+    generation names. Same #719 authority, one more consumer -- not a second
+    stamp scheme, which is the defect that cost W32.
+    """
+    return _STATE.host_pool_at(generation)
 
 
 def write_back_stamp_is_current(stamped: int) -> bool:

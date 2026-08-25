@@ -77,9 +77,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -98,7 +96,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -168,6 +165,18 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # W35: the binding this operation was OPENED under. Stamped here, at
+        # construction, because that is when its host slots were allocated --
+        # so every consumer downstream (the backup/prefetch threads, the
+        # revoke drain, the release queue) can ask which pool the slots came
+        # from instead of assuming the currently-bound one. One authority: the
+        # value comes from #719's generation and nowhere else.
+        try:
+            from sglang.srt.mem_cache.hicache_phase_binding import current_generation
+
+            self.binding_generation = current_generation()
+        except Exception:  # noqa: BLE001 - a stamp may never break an op
+            self.binding_generation = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -238,8 +247,95 @@ def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
     )
 
 
-class HiCacheController:
+def consume_gate(controller, queue_attr: str, direction: str) -> bool:
+    """May the batch queued in ``queue_attr`` be CONSUMED now? (#760/#719)
 
+    ONE AUTHORITY, FOUR CALLERS. The write path had this logic inline and the
+    load path had none; the hybrid subclass had neither. That is four sites
+    that must agree about one question, which is exactly the shape that cost
+    W32 (a second copy of a rule silently overriding the first) -- so the
+    question is asked in one place and the four consume points call it.
+
+    THE TWO CHECKS ARE NOT REDUNDANT, and #760 records why both are needed:
+
+    * ``device_tier_disarmed(direction)`` -- the phase predicate. ``write()``
+      and ``load()`` ask it at ENQUEUE and get the right answer there: the copy
+      is queued while the model computes in the phase these pools are bound to.
+      Nothing re-asked afterwards, and the cutover lands in between. Both #760
+      crash specimens died three seconds AFTER a pp_to_tp cutover completed.
+    * the binding generation stamp -- which cannot cover it alone: with
+      ``--phase-flip-rebind-hicache`` off the binding never advances, so every
+      stamp matches by construction and the check is dead code.
+
+    WHY THE LOAD SIDE MATTERS AT LEAST AS MUCH AS THE WRITE SIDE, and why its
+    absence was worse: a stale WRITE corrupts the host copy and is caught by
+    the pool's own double-free/ownership assertions or simply persists wrong
+    bytes. A stale LOAD fills device rows from host slots the incoming phase
+    does not own and the tree then marks that prefix RESIDENT -- attention
+    reads KV nobody wrote, with no assertion anywhere. A silent wrong answer,
+    which this codebase ranks worse than a crash.
+
+    ``check_shapes`` cannot substitute for either: under ``layer_first`` a
+    stale binding is shape-IDENTICAL to the live one, which is why #760 records
+    the shape guard armed on three ranks, refusing zero, and a SIGSEGV anyway.
+
+    Refusing costs a cache MISS later -- the same cheap failure the #718 disarm
+    already accepts. Proceeding costs the scheduler.
+
+    Returns True to proceed. Returns False after CLEARING the queue: the batch
+    is refused, loudly and counted by name.
+    """
+    from sglang.srt.mem_cache.hicache_phase_binding import (
+        write_back_stamp_is_current,
+    )
+
+    queue = getattr(controller, queue_attr, None)
+    if not queue:
+        return False
+
+    label = direction.upper()
+    if device_tier_disarmed(direction):
+        attr = f"_{direction}_phase_refusals"
+        setattr(controller, attr, getattr(controller, attr, 0) + len(queue))
+        n = getattr(controller, attr)
+        if n <= 3 or n % 200 == 0:
+            logger.warning(
+                "#760 %s REFUSED AT CONSUME: the phase moved after these %d "
+                "operation(s) were queued, so their device indices name the "
+                "pool of a phase that is no longer computing. Dropping them; "
+                "those prefixes miss later. (%d so far.)",
+                label,
+                len(queue),
+                n,
+            )
+        queue.clear()
+        return False
+
+    fresh = [
+        o
+        for o in queue
+        if write_back_stamp_is_current(getattr(o, "binding_generation", None))
+    ]
+    if len(fresh) != len(queue):
+        dropped = len(queue) - len(fresh)
+        attr = f"_{direction}_stamp_refusals"
+        setattr(controller, attr, getattr(controller, attr, 0) + dropped)
+        n = getattr(controller, attr)
+        if n <= 3 or n % 200 == 0:
+            logger.warning(
+                "#760 %s REFUSED: %d queued operation(s) were stamped against "
+                "an older binding generation and are dropped rather than "
+                "consumed after the rebind. Those prefixes miss later. "
+                "(%d so far.)",
+                label,
+                dropped,
+                n,
+            )
+        setattr(controller, queue_attr, fresh)
+    return bool(getattr(controller, queue_attr))
+
+
+class HiCacheController:
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -666,9 +762,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -882,73 +978,14 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        # #760: CHECK THE STAMP AT CONSUME TIME, THE ONLY TIME THAT MATTERS. A
-        # write-back queued before a cutover carries a pointer table into the
-        # pool it was built from; after the rebind that table describes memory
-        # this phase no longer owns, and the copy walks it below the Python
-        # seam. check_shapes cannot see it -- under layer_first a stale binding
-        # is shape-IDENTICAL to the live one, which is why #760 records the
-        # shape guard armed on three ranks, refusing zero, and a SIGSEGV anyway.
-        #
-        # Refusing costs a cache MISS later, the same cheap failure the #718
-        # disarm already accepts. Proceeding costs the scheduler.
-        from sglang.srt.mem_cache.hicache_phase_binding import (
-            write_back_stamp_is_current,
-        )
-
-        # #760: RE-ASK THE PHASE QUESTION AT CONSUME TIME. write() asks it at
-        # ENQUEUE, and gets the right answer there -- the copy is queued while
-        # the model computes in PP, which IS the phase these pools are bound
-        # to, so the enqueue is legitimate. Nothing re-asked afterwards, and
-        # the cutover lands in between: both crash specimens died three seconds
-        # AFTER a pp_to_tp cutover completed (14:08:14 -> 14:08:17 epoch 27;
-        # 07:12:09 -> 07:12:12 epoch 3, seven hours apart).
-        #
-        # The generation stamp below cannot cover this case on its own: with
-        # --phase-flip-rebind-hicache off the binding never advances, so every
-        # stamp matches by construction and the check is dead code. The phase
-        # predicate is the one that already knows, and it only had to be asked
-        # a second time.
-        if device_tier_disarmed("write"):
-            self._writeback_phase_refusals = (
-                getattr(self, "_writeback_phase_refusals", 0) + len(self.write_queue)
-            )
-            n = self._writeback_phase_refusals
-            if n <= 3 or n % 200 == 0:
-                logger.warning(
-                    "#760 WRITE-BACK REFUSED AT CONSUME: the phase moved after "
-                    "these %d copies were queued, so their device indices name "
-                    "the pool of a phase that is no longer computing. Dropping "
-                    "them; those prefixes miss later. (%d so far.)",
-                    len(self.write_queue),
-                    n,
-                )
-            self.write_queue.clear()
+        # #760/W35: ONE AUTHORITY, FOUR CALLERS. This block used to live here
+        # inline while the load path had no equivalent and the hybrid subclass
+        # had neither -- four consume points that must agree about one
+        # question. The question now lives in `consume_gate` and this is one of
+        # its callers; see that function for the full #760 argument and for why
+        # the phase predicate and the generation stamp are BOTH required.
+        if not consume_gate(self, "write_queue", "write"):
             return
-
-        fresh = [
-            o
-            for o in self.write_queue
-            if write_back_stamp_is_current(getattr(o, "binding_generation", None))
-        ]
-        if len(fresh) != len(self.write_queue):
-            dropped = len(self.write_queue) - len(fresh)
-            self._writeback_stamp_refusals = (
-                getattr(self, "_writeback_stamp_refusals", 0) + dropped
-            )
-            n = self._writeback_stamp_refusals
-            if n <= 3 or n % 200 == 0:
-                logger.warning(
-                    "#760 WRITE-BACK REFUSED: %d queued host write-back(s) were "
-                    "stamped against an older binding generation and are dropped "
-                    "rather than consumed after the rebind. Those prefixes miss "
-                    "later. (%d so far.)",
-                    dropped,
-                    n,
-                )
-            self.write_queue = fresh
-            if not self.write_queue:
-                return
 
         op = CacheOperation.merge_ops(self.write_queue)
         # Kernel write-back keeps host indices on CPU only for page_first AND only
@@ -1098,6 +1135,17 @@ class HiCacheController:
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
+            return -1
+
+        # #760/W35: THE CONSUME-TIME CHECKS THE LOAD PATH NEVER HAD.
+        # `load()` asks the phase question at ENQUEUE and is right there; the
+        # cutover lands between enqueue and here, and `load()` is a SEPARATE
+        # call from this one, so the gap is real rather than theoretical. A
+        # stale load fills device rows from host slots this phase does not own
+        # and the tree marks the prefix RESIDENT -- attention then reads KV
+        # nobody wrote, with no assertion anywhere. Checked before a producer
+        # is allocated, so a refused batch costs nothing downstream.
+        if not consume_gate(self, "load_queue", "load"):
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
@@ -1288,9 +1336,69 @@ class HiCacheController:
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
-    def append_host_mem_release(self, host_indices: torch.Tensor):
+    def append_host_mem_release(self, host_indices: torch.Tensor, generation=None):
+        """Queue host slots for release, ROUTED BY THE BINDING THEY CAME FROM.
+
+        W35. `_drain_release` frees whatever is on this queue against
+        `self.mem_pool_host` -- the pool bound NOW. Three producers can put
+        entries here after a cutover that name slots from the pool bound
+        BEFORE it: `_drain_revoke`, the prefetch transfer thread, and the
+        direct path. Freeing those against the current pool is the measured
+        W35 double-free ("slots not currently allocated"); dropping them leaks
+        slots in a pool that returns on the very next flip, because the flip
+        alternates and nothing tears the outgoing pool down.
+
+        ROUTED AT PRODUCE TIME, which is the only point where the generation is
+        still known without changing what this queue carries. A stale batch is
+        freed immediately against the pool its generation names -- the queue is
+        a batching convenience, not a correctness mechanism, so settling one
+        batch early costs nothing. Only current-generation slots are queued, so
+        by construction nothing on the queue can outlive its binding.
+
+        A stale batch whose pool is UNKNOWN is refused loudly and NOT queued:
+        freeing it here would corrupt and queueing it would corrupt later.
+        """
         if host_indices.numel() == 0:
             return
+        if generation is not None:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                host_pool_for_generation,
+                write_back_stamp_is_current,
+            )
+
+            if not write_back_stamp_is_current(generation):
+                owner = host_pool_for_generation(generation)
+                self._stale_release_routed = (
+                    getattr(self, "_stale_release_routed", 0) + 1
+                )
+                if owner is None:
+                    self._stale_release_orphaned = (
+                        getattr(self, "_stale_release_orphaned", 0) + 1
+                    )
+                    logger.error(
+                        "#719/W35 STALE RELEASE ORPHANED: %d host slot(s) were "
+                        "opened under binding generation %s, which names no "
+                        "known pool. Not queued and not freed -- freeing them "
+                        "against the current pool is the W35 double-free and "
+                        "queueing them defers the same crash. (%d so far.)",
+                        int(host_indices.numel()),
+                        generation,
+                        self._stale_release_orphaned,
+                    )
+                    return
+                n = self._stale_release_routed
+                if n <= 3 or n % 200 == 0:
+                    logger.warning(
+                        "#719/W35 STALE RELEASE ROUTED: %d host slot(s) opened "
+                        "under binding generation %s are freed against THAT "
+                        "generation's pool rather than the one bound now. "
+                        "(%d so far.)",
+                        int(host_indices.numel()),
+                        generation,
+                        n,
+                    )
+                owner.free(host_indices)
+                return
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             self.host_mem_release_queue.put(page)
@@ -1375,8 +1483,11 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
+                # W35: this thread runs across cutovers, so the slots it
+                # releases may have been opened under an older binding.
                 self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
+                    operation.host_indices[operation.completed_tokens :],
+                    generation=getattr(operation, "binding_generation", None),
                 )
             except Empty:
                 continue

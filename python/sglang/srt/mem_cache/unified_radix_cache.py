@@ -2971,8 +2971,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     anchor_lock_params,
                     comp_xfers,
                 ) = info
+                # W35: this revoke may be drained AFTER a cutover, so the
+                # slots it releases can belong to the binding the prefetch was
+                # OPENED under. The operation carries that generation.
                 cc.append_host_mem_release(
-                    extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+                    extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+                    generation=getattr(_operation, "binding_generation", None),
                 )
                 self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 cc.prefetch_tokens_occupied -= len(prefetch_key)
