@@ -869,13 +869,21 @@ def seam_transport_premise_holds(scheduler) -> bool:
     were silent, and both are fixed the same way -- check the premise where it
     is relied upon.
 
-    THE CHECK: a restore has a cached prefix. ``cache_protected_len`` is the
-    prefix length inserted into the tree cache (schedule_batch.py:919), so a
-    genuinely restored request carries a non-zero one and a cold one does not.
-    If NO stamped request in the queue carries a prefix, nothing is being
-    restored and the exemption has no ground to stand on -- the batch is held
-    and the flip demand (which #861c's existence term now raises correctly)
-    sends the work to the layout that owns it.
+    THE CHECK: a restore was COMPUTED AND FENCED, and the evidence must
+    survive the retraction that raises the question. The first cut read
+    ``cache_protected_len`` -- but ``reset_for_retract`` zeroes that field on
+    every request the seam stamps, so the premise was structurally False for
+    the whole population it judges (#861j: three boots, zero decode batches,
+    this refusal never even reached because the policy armed away first).
+    The surviving evidence is ``cached_prompt_tokens_at_retract``, stamped
+    from the measured fill boundary BEFORE the fields are cleared: non-zero
+    means the tokens were computed in the PP window and the fence persisted
+    them. A cold request (retracted before any fill) carries 0 and stays
+    refused -- the can-fail direction. Whether the canonical store then
+    actually SERVES the prefix is measured where it can be:
+    ``layout_conformance.work_in_wrong_layout`` scores the batch's own
+    ``cached_tokens``, so a transport batch that recomputes is loud, not
+    silent (the W37-D falsifier, kept).
 
     WHY THIS IS SAFE AGAINST THE W30 LIVELOCK, and the ordering matters: the
     exemption exists because W30 ping-ponged with ZERO decode batches, and the
@@ -894,7 +902,21 @@ def seam_transport_premise_holds(scheduler) -> bool:
     restored = 0
     for req in reqs:
         try:
-            if int(getattr(req, "cache_protected_len", 0) or 0) > 0:
+            # #861j: EVIDENCE THAT SURVIVES THE RETRACTION. The seam's own
+            # `reset_for_retract` zeroes `cache_protected_len` on every
+            # request it stamps, so keying the premise on that field alone
+            # refused the exact population the exemption exists for -- the
+            # W37-D manufactured-state class, committed by the check meant to
+            # close it (three metal boots, zero `Decode batch phase=`,
+            # SEAM TRANSPORT REFUSED unreachable behind the policy's own
+            # arm). `cached_prompt_tokens_at_retract` is stamped from the
+            # measured fill boundary BEFORE those fields are cleared and is
+            # exactly the claim this premise rests on: the tokens WERE
+            # computed and the fence persisted them.
+            if (
+                int(getattr(req, "cache_protected_len", 0) or 0) > 0
+                or int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0) > 0
+            ):
                 restored += 1
         except (TypeError, ValueError):
             continue
@@ -904,8 +926,10 @@ def seam_transport_premise_holds(scheduler) -> bool:
         scheduler._seam_premise_refused_announced = True
         logger.error(
             "%s SEAM TRANSPORT REFUSED: the exemption's premise does not hold. "
-            "%d stamped request(s) are queued and NONE carries a cached prefix "
-            "(cache_protected_len=0 for all), so re-admitting them in the TP "
+            "%d stamped request(s) are queued and NONE carries restore "
+            "evidence (cache_protected_len=0 AND "
+            "cached_prompt_tokens_at_retract=0 for all), so re-admitting "
+            "them in the TP "
             "layout would be a COLD PREFILL of real work, not a cache restore "
             "-- the user's strict-batch law, broken by the exemption meant to "
             "respect it. Holding instead; the #861c existence term raises the "

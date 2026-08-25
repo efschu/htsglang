@@ -11157,6 +11157,69 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - an input probe never breaks arming
             _seam_transport_now = 0
         _pending_now = max(0, _pending_now - _seam_transport_now)
+        # #861j DOOR 1: the SERVICEABLE-HERE subset of the seam transport.
+        #
+        # W37-F, three boots: the cutover re-admits its retracted residents,
+        # the existence term counts their full prompts, and the strict-purity
+        # demand arms tp_to_pp in THIS hook -- before the TP layout gets one
+        # scheduling round -- so the seam-transport exemption at the batch
+        # builder is never consulted (SEAM TRANSPORT ADMITTED=0, REFUSED=0,
+        # `Decode batch phase=`=0 on all three logs). The demand term must
+        # not claim tokens the purity gate will serve in this layout this
+        # round, and "will serve" is asked of the SAME authorities the gate
+        # itself uses: the stamped candidates (via seam_transport_pending_
+        # tokens above) and `seam_transport_premise_holds` -- one predicate,
+        # one clock, per that function's own contract.
+        #
+        # BOUNDED, because W37-E is the standing proof that a hold without an
+        # exit is a deadlock with better manners: the transport-debt clock
+        # starts when stamped candidates first appear in the TP phase and is
+        # cleared when they are admitted (the stamp is spent) or the phase
+        # leaves TP. Past the drain-stall deadline the credit lapses, the
+        # demand fires, and the work goes to PP exactly as it does today --
+        # one bounded delay, never a wedge.
+        _seam_serviceable_now = 0
+        _in_tp_now = getattr(runtime, "phase", None) == "tp"
+        if _seam_transport_now > 0 and _in_tp_now:
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    seam_transport_premise_holds,
+                )
+
+                if seam_transport_premise_holds(self):
+                    _seam_serviceable_now = _seam_transport_now
+            except Exception:  # noqa: BLE001 - an input probe never breaks arming
+                _seam_serviceable_now = 0
+            _debt_since = getattr(self, "_seam_transport_debt_since", None)
+            if _debt_since is None:
+                self._seam_transport_debt_since = time.perf_counter()
+            else:
+                from sglang.srt.managers.phase_policy import (
+                    drain_stall_deadline_s,
+                )
+
+                if time.perf_counter() - _debt_since > drain_stall_deadline_s(cfg):
+                    # The lapse is loud exactly once per debt episode: a
+                    # transport that cannot land within a decode window is a
+                    # defect worth a line, and the demand that now fires is
+                    # the bounded exit, not the failure.
+                    if not getattr(self, "_seam_debt_lapse_announced", False):
+                        self._seam_debt_lapse_announced = True
+                        logger.warning(
+                            "PHASE-POLICY #861j transport-debt clock LAPSED: "
+                            "%d tok of seam re-admission were not admitted "
+                            "within %.1fs of TP residency; the serviceable "
+                            "credit is withdrawn and the flip demand now "
+                            "sends the work to the PP layout. The transport "
+                            "path did not land -- that is the finding this "
+                            "line records.",
+                            _seam_transport_now,
+                            drain_stall_deadline_s(cfg),
+                        )
+                    _seam_serviceable_now = 0
+        else:
+            self._seam_transport_debt_since = None
+            self._seam_debt_lapse_announced = False
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
@@ -11198,6 +11261,10 @@ class Scheduler(
                 or 0
             ),
             seam_transport_tokens=_seam_transport_now,
+            # #861j: the serviceable-here subset computed above; 0 outside TP
+            # and on every stand-in, so an unsupplied field reproduces the
+            # pre-#861j behaviour exactly.
+            seam_serviceable_tokens=_seam_serviceable_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
             # getattr, because this gate is driven in tests by scheduler

@@ -150,6 +150,37 @@ VETOES_FIXED: Tuple[Veto, ...] = tuple(
 )
 
 
+def _strict_purity_with_transport_exemption(s: RequestState, phase: str) -> bool:
+    """#861j: strict purity WITH the seam-transport exemption modeled.
+
+    Prefill may not run in TP -- except the cutover's own re-admission whose
+    restore evidence survives the retraction (`cached_prompt_tokens_at_
+    retract` > 0, which a retracted-WITH-output request always carries). A
+    cold re-admission (retracted before any fill) stays refused: the W37-D
+    can-fail direction, unchanged.
+    """
+    if s.needs_prefill and phase == TP:
+        return not (s.retracted and s.has_output)
+    if s.resident_decoding and not s.needs_prefill and phase == PP:
+        return True
+    return False
+
+
+#: #861j: the veto set with BOTH W37-F doors fixed -- the policy no longer
+#: claims the seam's own re-admission for PP (Door 1: `seam_serviceable_
+#: tokens` subtraction), and the premise admits the population whose restore
+#: evidence survives the retraction (Door 2). Cold transport stays refused.
+VETOES_861J: Tuple[Veto, ...] = (
+    Veto(
+        "strict-purity+transport-exemption",
+        "#856/#861j",
+        _strict_purity_with_transport_exemption,
+        "prefill only in pp, except the seam's own credited re-admission",
+    ),
+    Veto("no-carry", "#856", _no_carry, "residents retracted at the seam"),
+) + tuple(v for v in VETOES_FIXED if v.name == "bundle-mid-flight")
+
+
 def served_in(state: RequestState, phase: str, vetoes) -> bool:
     """Can this state be served in this phase with ALL gates evaluated?"""
     return not any(v.refuses(state, phase) for v in vetoes)
@@ -185,6 +216,77 @@ def matrix_rows(vetoes) -> List[Tuple[str, bool, bool, bool]]:
         in_tp = served_in(s, TP, vetoes)
         rows.append((s.name, in_pp, in_tp, in_pp or in_tp))
     return rows
+
+
+_DECODING = next(s for s in REQUEST_STATES if s.name == "decoding-resident")
+_RETRACTED_WITH = next(s for s in REQUEST_STATES if s.name == "retracted-with-output")
+_RETRACTED_WITHOUT = next(
+    s for s in REQUEST_STATES if s.name == "retracted-without-output"
+)
+
+
+def seam_retract_map(state: RequestState) -> RequestState:
+    """The #856 no-carry cutover, as a state map: every resident is retracted
+    into the waiting queue; nothing else moves. This is the transition the
+    flat matrix did not model, and it is what re-manufactures the deadlocked
+    state on every flip."""
+    if state.resident_decoding:
+        return _RETRACTED_WITH if state.has_output else _RETRACTED_WITHOUT
+    return state
+
+
+def decode_reachable(state: RequestState, vetoes, max_flips: int = 6) -> bool:
+    """#861j: the RUNNABILITY-IN-DESTINATION-LAYOUT axis the W37-F gap named.
+
+    The flat matrix asks "can this state be served in SOME phase" and W37-F
+    proved that question insufficient: every cell read servable at the desk
+    while three metal boots produced ZERO decode batches. The missing model
+    was the ORBIT -- under strict law decode happens only in TP, a request
+    must be RESIDENT there to decode, and the #856 seam retracts every
+    resident at every cutover. So "servable in PP" only ever buys a prefill
+    whose product the next flip un-makes, unless the destination layout can
+    RE-MATERIALIZE the request (the seam-transport read-through).
+
+    This walks that orbit: serve where the gates allow, flip where they do
+    not, apply the seam's retraction map at each cutover, and ask whether the
+    request EVER decodes in TP. A state for which this returns False is
+    exactly the W37-F specimen: alive, servable somewhere every round, and
+    never once decoded.
+    """
+    cur, phase = state, TP
+    for _ in range(max_flips):
+        if phase == TP:
+            if cur.resident_decoding:
+                return True  # decode service happens in the decode layout
+            if cur.needs_prefill and served_in(cur, TP, vetoes):
+                # the transport/read-through lands: the request becomes
+                # resident here and decodes next round
+                cur = _DECODING
+                continue
+            phase = PP
+            cur = seam_retract_map(cur)
+        else:
+            if cur.needs_prefill and served_in(cur, PP, vetoes):
+                # prefill completes in its own layout; the extend pass emits
+                # the first token, so the request leaves PP with output
+                cur = _DECODING
+            phase = TP
+            cur = seam_retract_map(cur)
+    return False
+
+
+def orbit_deadlocked_cells(vetoes) -> List[Tuple[str, List[str]]]:
+    """Every state that never decodes on the flip orbit, with the TP-side
+    refusers of its terminal retracted form -- the terms holding the door."""
+    out = []
+    for s in REQUEST_STATES:
+        if decode_reachable(s, vetoes):
+            continue
+        blamed = sorted(
+            {v.name for v in vetoes if v.refuses(_RETRACTED_WITH, TP)}
+        )
+        out.append((s.name, blamed))
+    return out
 
 
 def render_table(vetoes) -> str:

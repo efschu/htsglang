@@ -1854,6 +1854,26 @@ class PhasePolicyInputs:
     #: into is replicated, so every rank computes the same number.
     seam_transport_tokens: int = 0
 
+    #: #861j: the SERVICEABLE-HERE subset of ``seam_transport_tokens`` -- the
+    #: tokens of stamped re-admissions that the purity gate's exemption WILL
+    #: admit in the current (TP) layout this round: premise verified on the
+    #: retract credit, phase is TP, and the transport-debt clock has not
+    #: lapsed. Supplied by the build site; 0 on every stand-in and in the PP
+    #: layout, so an unsupplied field reproduces the pre-#861j behaviour
+    #: exactly.
+    #:
+    #: WHY A SECOND FIELD AND NOT A CONSUMER OF THE FIRST: W37-F's Door 1 was
+    #: the W32 exclusion and the #861c existence term CLASSIFYING THE SAME
+    #: SEVEN REQUESTS OPPOSITELY -- transport-serviceable-here vs PP demand --
+    #: and the demand side winning by branch order, so the tp-ward arm undid
+    #: its own flip within one round, forever (21+21 flips, zero decode
+    #: batches, three boots). The demand term below subtracts exactly this
+    #: field, so ONE side claims the population and the other releases it --
+    #: the #861g fix principle, applied to the pair that broke it.
+    #: Replicated: derived from the replicated queue and the group-unanimous
+    #: stamp, same argument as ``seam_transport_tokens``.
+    seam_serviceable_tokens: int = 0
+
     #: #861c: PROMPT TOKENS OWED A PREFILL PASS, CACHED OR NOT.
     #:
     #: THE SECOND SEMANTICS, and the field exists because ONE number was being
@@ -2017,9 +2037,24 @@ class PhasePolicyInputs:
         # treating it as decode work is what deadlocked W37-E.
         if self.bundle_is_mid_flight():
             return 0
+        # #861j DOOR 1: work the CURRENT layout will serve this round is not
+        # demand for the OTHER layout. The admissible term deliberately counts
+        # every stamped re-admission (a seam-retracted request owes a full
+        # pass); but when the purity gate's exemption will admit that pass
+        # HERE (premise verified, debt clock live -- the build site's
+        # ``seam_serviceable_tokens``), demanding a flip for it makes the
+        # tp-ward flip undo itself: the W37-F oscillation, measured three
+        # boots in a row. Subtracted from the ADMISSIBLE term only -- the
+        # economics number was already corrected at the input boundary (W32)
+        # -- and floored at 0, so fresh unstamped work keeps demanding
+        # undiminished.
         return max(
             int(self.pending_prefill_tokens or 0),
-            int(self.admissible_prefill_tokens or 0),
+            max(
+                0,
+                int(self.admissible_prefill_tokens or 0)
+                - int(self.seam_serviceable_tokens or 0),
+            ),
         )
 
     def work_exists(self) -> bool:
@@ -2967,6 +3002,26 @@ def _decide_from_load(
         # decision and its explanation must come from the SAME read.
         demand_tokens = inp.demand_prefill_tokens()
         strict_demands_flip = demand_tokens > 0 and not cfg.prefill_runs_in_tp
+        # #861j: the state the subtraction above produces must be NAMED, not
+        # fall through to a generic hold -- the W37-F specimen's whole cost
+        # was that the closed door was invisible from the log. Reached
+        # exactly when the only outstanding prefill is the cutover's own
+        # re-admission and the exemption will serve it here.
+        if (
+            not cfg.prefill_runs_in_tp
+            and not strict_demands_flip
+            and int(getattr(inp, "seam_serviceable_tokens", 0) or 0) > 0
+            and inp.pending_prefill_tokens <= tp_threshold
+        ):
+            return _no(
+                f"seam transport: {inp.seam_serviceable_tokens} tok of the "
+                f"cutover's own re-admission are serviceable in THIS layout "
+                f"by read-through (premise verified on the retract credit) "
+                f"-- holding for the transport batch instead of flipping "
+                f"away from it. Bounded: the transport-debt clock lapses "
+                f"this credit after the drain-stall deadline, and the "
+                f"demand then fires (#861j)"
+            )
         if inp.pending_prefill_tokens > tp_threshold or strict_demands_flip:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
