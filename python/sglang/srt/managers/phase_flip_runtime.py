@@ -8517,11 +8517,39 @@ class PhaseFlipRuntime:
                 # because a guard that guesses its own cause is how the wrong
                 # participant gets accused (#861c's other half).
                 try:
+                    # #861e FALSE-POSITIVE FIX. The >=2 threshold fired 24
+                    # times on a HEALTHY W37-D boot, which devalues the alarm
+                    # into noise -- and an alarm nobody trusts is an alarm that
+                    # will be scrolled past on the boot that matters.
+                    #
+                    # The CONDITION was wrong, not just the number. A cutover
+                    # legitimately checks nothing whenever no device-tier I/O
+                    # was queued under the outgoing binding, and on this
+                    # workload that is common: W37-D read checked=0 on 24
+                    # pp_to_tp cutovers and checked=2/3/8 on twelve others, all
+                    # in one healthy boot. So a zero is only evidence of
+                    # BLINDNESS if traffic existed that SHOULD have been
+                    # checked.
+                    #
+                    # Gate on that instead: count a zero-streak only while the
+                    # controller reports device-tier work in flight. With no
+                    # traffic, zero is the correct reading and is not counted.
+                    # Threshold raised to 4 as well: two consecutive quiet
+                    # cutovers is an ordinary idle stretch.
                     zero = "checked=0" in str(report)
+                    _busy = False
+                    try:
+                        _busy = bool(
+                            getattr(cc, "write_queue", None)
+                            or getattr(cc, "load_queue", None)
+                            or getattr(cc, "ack_backup_queue", None)
+                        )
+                    except Exception:  # noqa: BLE001 - a probe never breaks a seam
+                        _busy = False
                     streak = int(getattr(self, "_stale_gate_zero_streak", 0) or 0)
-                    streak = streak + 1 if zero else 0
+                    streak = streak + 1 if (zero and _busy) else 0
                     self._stale_gate_zero_streak = streak
-                    if zero and streak >= 2:
+                    if zero and _busy and streak >= 4:
                         logger.error(
                             "%s #719 STALE-GATE BLIND: checked=0 on %d "
                             "consecutive cutovers. The stale-generation gate "

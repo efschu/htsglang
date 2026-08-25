@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
+from typing import Optional
 
 
 class ProgressLivenessError(ValueError):
@@ -459,4 +460,74 @@ def sample_from_scheduler(
         pending_tokens=pending_tokens,
         inhibited=inhibited,
         inhibit_reason=inhibit_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #861e: THE COMPLETION-PROGRESS CLOCK -- thrash is neither wedge nor progress.
+# ---------------------------------------------------------------------------
+
+#: A run of samples in which decode advances and completions do not. Two is too
+#: few (a long generation legitimately spans samples); this is the shortest run
+#: that cannot be one slow request.
+THRASH_MIN_SAMPLES = 4
+
+
+def thrash_verdict(
+    samples: "Sequence[ProgressSample]",
+    *,
+    min_samples: int = THRASH_MIN_SAMPLES,
+) -> Optional[str]:
+    """DECODE ADVANCES, COMPLETIONS DO NOT. The detector W37-D lacked.
+
+    THE GAP, measured. W37-D/d4 ran 102 flips, 69 decode batches, GPU at
+    98/47/57 %, and produced ZERO completions in seven minutes. Every existing
+    detector stayed silent and each was right to:
+
+      * ADMISSION-WEDGE measures FIRST-TOKEN age -- and first tokens kept
+        arriving, one per flip cycle, so there was no wedge;
+      * the #699 liveness assess() measures PROGRESS -- and decode_steps kept
+        advancing, so there was progress;
+      * health returns 200 throughout, as it always does.
+
+    Nothing measured the quantity a user actually has: **completions per unit
+    time**. Per-rid output grew (rid be636087: n=2,3,4,...,13 across epochs) at
+    exactly ONE TOKEN PER FLIP CYCLE, so a 64-token request needed 64 cycles.
+    That is a livelock WITH progress, and it is invisible to every rung above.
+
+    THE SHAPE, stated so it cannot be confused with its neighbours:
+        decode_steps STRICTLY INCREASING  (the box is working -- not a wedge)
+        completions   FLAT                 (nobody is being served)
+        has_work      TRUE                 (there is something to serve)
+        not inhibited                      (no flip/maintenance pause claimed)
+
+    BOTH PINS, because a one-sided detector is how the last three terms
+    shipped blind: it must FIRE on that shape and be SILENT when completions
+    advance, when nothing is decoding, when there is no work, and while
+    progress is legitimately inhibited.
+
+    Returns the alarm detail, or None.
+    """
+    window = [s for s in samples][-min_samples:]
+    if len(window) < min_samples:
+        return None
+    if any(s.inhibited for s in window):
+        return None
+    if not all(s.has_work for s in window):
+        return None
+    decode_delta = window[-1].decode_steps - window[0].decode_steps
+    completion_delta = window[-1].completions - window[0].completions
+    if decode_delta <= 0 or completion_delta > 0:
+        return None
+    span = max(1e-9, window[-1].t_s - window[0].t_s)
+    return (
+        f"COMPLETION-PROGRESS STALL (#861e): {decode_delta} decode step(s) in "
+        f"{span:.1f}s and ZERO completions, with work pending "
+        f"({window[-1].pending_requests} req / {window[-1].pending_tokens} tok). "
+        f"The box IS working -- this is not a wedge and every first-token and "
+        f"liveness rung is correctly silent -- but nobody is being served. "
+        f"W37-D measured this exact shape: 102 flips, 69 decode batches, GPU "
+        f"98%, one output token per flip cycle, 0 completions in 7 minutes. "
+        f"Suspect a policy term reading a state the cutover manufactures "
+        f"(#861e) before suspecting the model."
     )

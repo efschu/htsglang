@@ -3732,6 +3732,37 @@ class Scheduler(
             return self._layout_admits_decode(rows, running_bs)
         return False
 
+    def _retracted_unfinished_bs(self) -> int:
+        """Requests the seam retracted that have ALREADY produced output. #861e.
+
+        The count the policy needs so `running_bs == 0` stops being readable as
+        "nothing is decoding" in the one round where the cutover made it 0.
+
+        THE DISCRIMINATOR IS OUTPUT TOKENS, not the seam stamp alone. A
+        re-admitted request that never produced a token is queued PREFILL work
+        (the d2 wedge: 7 queued, 0 output, the demand must fire). One that has
+        produced tokens is a decode bundle mid-flight, parked for a round (the
+        d4 thrash: 7 retracted at n=2..13, the demand must stay silent). The
+        seam stamp alone cannot tell those apart, and telling them apart is the
+        whole job.
+
+        Reads the replicated waiting queue, so every rank computes the same
+        number -- the property every PhasePolicyInputs field must have.
+        """
+        from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+
+        n = 0
+        for req in list(getattr(self, "waiting_queue", None) or ()):
+            if getattr(req, SEAM_READMIT_ATTR, None) is None:
+                continue
+            out = getattr(req, "output_ids", None)
+            try:
+                if out is not None and len(out) > 0:
+                    n += 1
+            except TypeError:
+                continue
+        return n
+
     def _admissible_prefill_tokens(self) -> int:
         """Prompt tokens still owed a PREFILL PASS -- cached or not (#861c).
 
@@ -11118,6 +11149,14 @@ class Scheduler(
             # number alone -- rather than an AttributeError in the arming path.
             admissible_prefill_tokens=int(
                 (getattr(self, "_admissible_prefill_tokens", None) or (lambda: 0))()
+                or 0
+            ),
+            # #861e: decode work the cutover retracted but did not finish.
+            # Same getattr discipline as the field above, and 0 on every
+            # stand-in and every non-flip deployment -- this field can only
+            # ADD decode work that genuinely exists, never invent it.
+            retracted_unfinished_bs=int(
+                (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))()
                 or 0
             ),
             seam_transport_tokens=_seam_transport_now,

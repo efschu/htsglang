@@ -231,3 +231,48 @@ def test_demand_is_the_single_definition():
     import sglang.srt.managers.phase_policy as pp
 
     assert inspect.getsource(pp).count("def demand_prefill_tokens") == 1
+
+
+# --------------------------------- #861e MANUFACTURED-STATE PINS (all three specimens)
+
+
+def test_d4_thrash_the_demand_is_silent_on_a_manufactured_zero():
+    """THE MANUFACTURED-STATE SPECIMEN. `running_bs == 0` one line after
+    "7 request(s) retracted" -- true because of the transition, not the work.
+    Those 7 carry n=2..13 output tokens: a bundle mid-flight, not a queue."""
+    inp = make_inputs(
+        admissible_prefill_tokens=18586, running_bs=0, retracted_unfinished_bs=7
+    )
+    assert inp.decode_work_bs() == 7
+    assert inp.demand_prefill_tokens() == 0
+
+
+def test_d2_wedge_the_demand_still_fires_when_nothing_ever_started():
+    """The discriminator is OUTPUT TOKENS: 7 queued that never produced one are
+    prefill work, and staying serves nobody."""
+    inp = make_inputs(
+        admissible_prefill_tokens=5988, running_bs=0, retracted_unfinished_bs=0
+    )
+    assert inp.decode_work_bs() == 0
+    assert inp.demand_prefill_tokens() == 5988
+
+
+def test_d3_pingpong_genuine_decoders_still_silence_the_demand():
+    inp = make_inputs(
+        admissible_prefill_tokens=5988, running_bs=2, retracted_unfinished_bs=0
+    )
+    assert inp.decode_work_bs() == 2
+    assert inp.demand_prefill_tokens() == 0
+
+
+def test_idle_is_not_declared_while_a_bundle_is_parked():
+    """The second dangerous site on the same axis: a box holding 7 retracted
+    mid-flight requests is not idle, and the idle-return leg must not arm."""
+    inp = make_inputs(running_bs=0, retracted_unfinished_bs=7)
+    assert inp.decode_work_bs() == 7
+
+
+def test_the_field_defaults_to_zero_for_every_stand_in():
+    """Non-flip deployments and test doubles keep today's behaviour exactly:
+    the field can only ADD decode work that genuinely exists."""
+    assert make_inputs(running_bs=3).decode_work_bs() == 3

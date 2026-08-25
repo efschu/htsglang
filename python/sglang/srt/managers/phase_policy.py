@@ -1880,6 +1880,57 @@ class PhasePolicyInputs:
     #: can only reproduce today's behaviour and never invent new work.
     admissible_prefill_tokens: int = 0
 
+    #: #861e: decode work the cutover RETRACTED but that is not FINISHED --
+    #: requests with output tokens already produced, sitting back in the queue
+    #: waiting to resume. Supplied by the build site; 0 on every stand-in and
+    #: on every non-flip deployment, so this field can only ever ADD decode
+    #: work that genuinely exists.
+    retracted_unfinished_bs: int = 0
+
+    def decode_work_bs(self) -> int:
+        """Decode work that EXISTS, not decode work currently installed. #861e.
+
+        THE MANUFACTURED-STATE CLASS, and this is its one authority.
+
+        ``running_bs`` is the size of the running batch, and the #856 cutover
+        EMPTIES that batch as its second step -- it retracts every resident and
+        puts them back at the front of the queue. So in the round after a
+        cutover ``running_bs == 0`` is true, and it is true BECAUSE of the
+        transition, not because the work is gone. W37-D/d4, verbatim, four
+        consecutive log lines::
+
+            arming pp_to_tp: DRAINED ... 2 req decoding
+            RESIDENTS RELEASED for pp_to_tp: 7 request(s) retracted
+            SEAM RE-ADMISSION: 7 put back at the FRONT of the waiting queue
+            arming tp_to_pp: pending prefill 18586 tok > 0 (... nothing decoding)
+
+        "Nothing decoding" one line after "7 retracted". Every policy term that
+        FIRES BECAUSE ``running_bs == 0`` therefore fires on a state the seam
+        produced: the demand term (mine), the idle determination, the starved
+        dwell-bypass, and both flip-threshold shortcuts. Terms gated
+        ``running_bs > 0`` are unaffected -- a manufactured 0 makes them not
+        fire, which is the safe direction.
+
+        THE COHERENT READ: a retracted request that has already produced output
+        tokens is UNFINISHED DECODE WORK. It is not queued prefill and it is not
+        idle; it is a bundle mid-flight that the seam parked for one round.
+
+        THE DISCRIMINATOR IS "HAS IT PRODUCED OUTPUT", and it is what separates
+        the two metal specimens that any fix here must satisfy at once:
+
+          d2 wedge   7 queued, none ever started, 0 output tokens
+                     -> decode_work_bs 0 -> the demand FIRES (correct: nothing
+                        is served by staying)
+          d4 thrash  7 retracted with n=2..13 output tokens each
+                     -> decode_work_bs 7 -> the demand is SILENT (correct: the
+                        bundle this TP window exists to finish is mid-flight)
+
+        Per-rid evidence that these really are mid-flight and not restarts:
+        rid be636087 across epochs read n=2,3,4,5,...,13 -- strictly
+        increasing, never re-bootstrapped (#775 refuted on this boot).
+        """
+        return int(self.running_bs or 0) + int(self.retracted_unfinished_bs or 0)
+
     def demand_prefill_tokens(self) -> int:
         """Tokens of UNSTARTED queued prefill that justify DEMANDING a flip.
 
@@ -1910,7 +1961,9 @@ class PhasePolicyInputs:
         Returns 0 while decode is in flight, so the caller's verdict and its
         message can both be this single number (#713).
         """
-        if int(self.running_bs or 0) > 0:
+        # #861e: decode work that EXISTS, not what is currently installed.
+        # `running_bs` alone is manufactured by the cutover one line earlier.
+        if self.decode_work_bs() > 0:
             return 0
         return max(
             int(self.pending_prefill_tokens or 0),
@@ -2378,7 +2431,8 @@ def _decide_from_load(
 
     # #861c EXISTENCE class: a fully cached backlog is still work. Reading
     # the economics number here called a box with six queued requests IDLE.
-    idle = inp.running_bs == 0 and not inp.work_exists()
+    # #861e: a box holding 7 retracted mid-flight bundles is not idle.
+    idle = inp.decode_work_bs() == 0 and not inp.work_exists()
 
     # NOTHING CAN RUN HERE -- CHECKED BEFORE THE DWELL, AND THAT IS THE POINT.
     #
@@ -2560,7 +2614,9 @@ def _decide_from_load(
     # #861c EXISTENCE class: 'can this layout do ANY work at all'. A
     # prefetched backlog starves the box exactly as an uncached one does,
     # and the dwell floor must not hold the flip that would release it.
-    starved = int(getattr(inp, "running_bs", 0) or 0) == 0 and (
+    # #861e: reading the manufactured 0 here bypasses the dwell floor in the
+    # one round where the floor matters most -- immediately after a cutover.
+    starved = int(inp.decode_work_bs()) == 0 and (
         max(
             int(getattr(inp, "pending_prefill_tokens", 0) or 0),
             int(getattr(inp, "admissible_prefill_tokens", 0) or 0),
@@ -2578,7 +2634,7 @@ def _decide_from_load(
         # the correct answer for short prompts by construction of N.
         # Under purity the break-even is meaningless (see
         # prefill_runs_in_tp): the only threshold that terminates is zero.
-        tp_threshold = effective_flip_threshold(cfg, inp.running_bs)
+        tp_threshold = effective_flip_threshold(cfg, inp.decode_work_bs())  # #861e
         # #819: ONE READING. Taken once here and used for both the comparison
         # and every message below it, so the bar the policy APPLIED and the bar
         # the log REPORTS can never be two different numbers -- which is what a
@@ -3093,7 +3149,7 @@ def _decide_from_load(
             and inp.running_bs > 0
             and in_pp >= cfg.pp_window_s
         ):
-            rung = effective_flip_threshold(cfg, inp.running_bs)
+            rung = effective_flip_threshold(cfg, inp.decode_work_bs())  # #861e
             # #819: the drain target is the same bar as everywhere else, so it
             # is read the same way. Left frozen, this line would report a
             # drain-based counterfactual against a target the policy itself no
@@ -3180,7 +3236,8 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
 
     # #861c EXISTENCE class: a fully cached backlog is still work. Reading
     # the economics number here called a box with six queued requests IDLE.
-    idle = inp.running_bs == 0 and not inp.work_exists()
+    # #861e: a box holding 7 retracted mid-flight bundles is not idle.
+    idle = inp.decode_work_bs() == 0 and not inp.work_exists()
     if idle:
         if state.idle_since is None:
             state.idle_since = inp.now

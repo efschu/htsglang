@@ -250,3 +250,126 @@ def participants_found_by_boot() -> Tuple[Participant, ...]:
     """The ones a GPU window paid for. The number this returns is the argument
     for the registry: every entry here cost a boot to discover."""
     return tuple(p for p in REGISTRY if p.found_by == "boot")
+
+
+# ---------------------------------------------------------------------------
+# CUT 2 (#859): DISCOVERY-DIFF. Default-inverted.
+# ---------------------------------------------------------------------------
+#
+# Cut 1 above is ENUMERATIVE: it validates the declarations somebody remembered
+# to write. It cannot find a participant nobody thought of, and the root
+# property -- a component can participate in the flip implicitly and
+# undeclared -- survived it untouched. Every blocker of W37-B/C/D was such a
+# component.
+#
+# Cut 2 inverts the default. Instead of asking "are the declared entries
+# well-formed", it DISCOVERS what the cutover actually touches and fails on
+# anything undeclared. Undeclared is the failure; silence is not consent.
+#
+# THE READING-MOMENT AXIS IS PART OF THE DECLARATION (#861e). W37-D's last
+# defect was not an undeclared participant -- `running_bs` is declared and
+# handled -- but a term that read it INSIDE the transition that manufactures
+# it. So a participant now also declares WHEN its state is validly readable,
+# and a reader that consults it in the wrong window is as much a defect as a
+# mover that forgets it.
+
+
+class ReadWindow:
+    """When a participant's state is a fact rather than an artefact."""
+
+    #: Readable at any time; the cutover does not disturb it.
+    ALWAYS = "always"
+    #: Valid only OUTSIDE the retract/re-admit window. `running_bs` is the
+    #: type case: the cutover empties the running batch, so a read inside the
+    #: window reports a state the seam produced (W37-D: "nothing decoding" one
+    #: line after "7 request(s) retracted").
+    OUTSIDE_CUTOVER = "outside_cutover"
+    #: Only meaningful DURING the cutover -- seam bookkeeping.
+    DURING_CUTOVER = "during_cutover"
+
+
+#: State the cutover mutates, with the window in which reading it is honest.
+#: A term that reads any of these must either be evaluated outside the window
+#: or go through a transition-coherent accessor. Named rather than discovered,
+#: for the same reason as REGISTRY: what this list forgets, a boot finds.
+MUTATED_STATE = {
+    "running_batch.reqs": ReadWindow.OUTSIDE_CUTOVER,
+    "running_bs": ReadWindow.OUTSIDE_CUTOVER,
+    "waiting_queue": ReadWindow.OUTSIDE_CUTOVER,
+    "tree_cache": ReadWindow.OUTSIDE_CUTOVER,
+    "token_to_kv_pool_allocator": ReadWindow.OUTSIDE_CUTOVER,
+    "batch_is_full": ReadWindow.OUTSIDE_CUTOVER,
+    "spec_algorithm": ReadWindow.OUTSIDE_CUTOVER,
+    "spec_info": ReadWindow.OUTSIDE_CUTOVER,
+    "mem_pool_host": ReadWindow.OUTSIDE_CUTOVER,
+    "seam_readmit_epoch": ReadWindow.DURING_CUTOVER,
+}
+
+#: Accessors that make an OUTSIDE_CUTOVER quantity honest inside the window.
+#: A reader using one of these is coherent by construction.
+COHERENT_ACCESSORS = frozenset(
+    {
+        "decode_work_bs",
+        "demand_prefill_tokens",
+        "work_exists",
+        "_retracted_unfinished_bs",
+        "_admissible_prefill_tokens",
+    }
+)
+
+
+def discover_cutover_writes(source: str) -> set:
+    """Attributes the cutover ASSIGNS, read out of its own source.
+
+    Deliberately syntactic. A semantic analysis would be better and would also
+    be a second thing to maintain; the point of a discovery-diff is that it
+    costs nothing to keep true.
+    """
+    import ast
+
+    found = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return found
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Attribute):
+                found.add(t.attr)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            found.add(node.args[1].value)
+    return found
+
+
+#: Attributes the cutover writes that are NOT participants in the #859 sense:
+#: seam-local bookkeeping, counters, logging state. Declared so the diff has a
+#: small, reviewable allow-list rather than a threshold.
+NOT_PARTICIPANTS = frozenset(
+    {
+        "_stale_gate_zero_streak",
+        "_seam_readmitted",
+        "_seam_drain_ms",
+        "_retracted_refs_retired",
+        "residents_released",
+        "tree_rows_returned",
+        "hicache_seam_active",
+        "_census_scheduler",
+        "_seam_premise_refused_announced",
+        "_seam_transport_announced",
+        "phase_flip_active_stack",
+        "_phase",
+        "epoch",
+    }
+)
