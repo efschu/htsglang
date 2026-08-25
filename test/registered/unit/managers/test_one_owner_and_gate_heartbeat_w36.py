@@ -190,3 +190,89 @@ class TestTheGateHeartbeat(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheFreeListOverlap(CustomTestCase):
+    """W37-A: the pair that is ACTUALLY violated, found by falsifying my own fix.
+
+    W36's fix enforced `withheld ∩ free-lists = 0`. W37-A booted it and the
+    abort reproduced BYTE-IDENTICALLY while `ONE-OWNER` logged zero times --
+    the invariant already held. The log named the real pair arithmetically:
+
+        census  free=108544      (read_free_rows: a set UNION of both lists)
+        alloc   available=108566 (available_size(): a SUM of both lists)
+
+    A union 22 smaller than the sum is 22 ids present in BOTH lists, and
+    `free + withheld == size` already held exactly. So the violated invariant
+    is `free_pages ∩ release_pages = 0`.
+    """
+
+    def _cap(self, free, release, withheld=()):
+        from sglang.srt.managers.kv_backing_relief import KvRowCap
+
+        alloc = _Alloc(free=free, release=release)
+        cap = KvRowCap.__new__(KvRowCap)
+        cap._alloc = alloc
+        cap._cap = 100
+        cap._withheld = torch.tensor(list(withheld), dtype=torch.int64)
+        return cap, alloc
+
+    def test_the_specimen_arithmetic_red_first(self):
+        # union vs sum, delta == the double-inserted ids. This is the whole
+        # diagnosis in one assertion.
+        free = list(range(0, 500))
+        release = list(range(478, 500))  # 22 ids also in free
+        alloc = _Alloc(free=free, release=release)
+        union = len(set(free) | set(release))
+        self.assertEqual(alloc.available_size() - union, 22)
+
+    def test_the_overlap_is_removed_at_the_publish_point(self):
+        cap, alloc = self._cap(free=[1, 2, 3, 4], release=[3, 4])
+        cap._publish()
+        self.assertEqual(alloc.release_pages.tolist(), [])
+        self.assertEqual(alloc.free_pages.tolist(), [1, 2, 3, 4])
+
+    def test_available_size_then_equals_the_union(self):
+        cap, alloc = self._cap(free=[1, 2, 3, 4], release=[3, 4])
+        cap._publish()
+        union = set(alloc.free_pages.tolist()) | set(alloc.release_pages.tolist())
+        self.assertEqual(alloc.available_size(), len(union), "sum == union")
+
+    def test_the_durable_owner_keeps_the_row(self):
+        # free_pages is durable; release_pages is the deferred-sort buffer that
+        # merge_and_sort_free folds back. Dropping the transient copy loses
+        # nothing.
+        cap, alloc = self._cap(free=[7], release=[7])
+        cap._publish()
+        self.assertIn(7, alloc.free_pages.tolist())
+
+    def test_a_disjoint_pair_is_untouched(self):
+        cap, alloc = self._cap(free=[1, 2], release=[8, 9])
+        cap._publish()
+        self.assertEqual(alloc.free_pages.tolist(), [1, 2])
+        self.assertEqual(alloc.release_pages.tolist(), [8, 9])
+
+    def test_the_drop_is_counted_by_name(self):
+        cap, alloc = self._cap(free=[3], release=[3])
+        cap._publish()
+        self.assertEqual(getattr(cap, "_free_list_overlap_dropped", 0), 1)
+
+    def test_restore_does_not_double_insert(self):
+        # KvRowCap.release() cats the withheld set into the FIRST list only;
+        # an id still present in the OTHER list would then be in both.
+        cap, alloc = self._cap(free=[], release=[101], withheld=[101])
+        cap.release()
+        both = set(alloc.free_pages.tolist()) & set(alloc.release_pages.tolist())
+        self.assertEqual(both, set(), "restore may not create an overlap")
+
+    def test_available_size_is_not_deduped(self):
+        # THE PIN. Fixing this inside available_size() would make the census and
+        # the allocator agree by construction and blind the instrument that has
+        # now caught three defects, including my own wrong fix.
+        import inspect
+
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        src = inspect.getsource(TokenToKVPoolAllocator.available_size)
+        for banned in ("unique", "set(", "frozenset"):
+            self.assertNotIn(banned, src)

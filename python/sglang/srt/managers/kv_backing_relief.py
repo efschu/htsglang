@@ -821,11 +821,87 @@ class KvRowCap:
         # between two `_apply` calls (the "allocator has no free listener"
         # path warns about that case and then proceeds anyway).
         self._settle_free_lists()
+        self._settle_free_list_overlap()
         page = max(1, int(getattr(self._alloc, "page_size", 1) or 1))
         try:
             self._alloc.residency_withheld_slots = self.withheld * page
         except Exception:  # pragma: no cover - exotic allocator objects
             pass
+
+    def _drop_withheld_from_free_lists(self) -> None:
+        """Remove every currently-withheld id from BOTH free lists.
+
+        Called before `release()` restores them, so the restore cannot create
+        the duplicate described there.
+        """
+        if self._withheld is None or self._withheld.numel() == 0:
+            return
+        import torch
+
+        held = self._withheld.to("cpu", torch.int64)
+        for name in ("free_pages", "release_pages"):
+            pages = getattr(self._alloc, name, None)
+            if pages is None or pages.numel() == 0:
+                continue
+            dup = torch.isin(pages.detach().to("cpu", torch.int64), held)
+            if bool(dup.any()):
+                setattr(self._alloc, name, pages[(~dup).to(pages.device)])
+
+    def _settle_free_list_overlap(self) -> int:
+        """An id may live in AT MOST ONE free list. Enforced at the publish point.
+
+        W37-A FALSIFIED MY W36 FIX. `_settle_free_lists` enforces
+        `withheld ∩ free-lists = 0`, which already held -- it logged ONE-OWNER
+        zero times while the abort reproduced byte-identically. The pair that
+        is actually violated is `free_pages ∩ release_pages`, and the log says
+        so arithmetically: `read_free_rows` builds a set UNION and reported
+        `free=108544`, while `available_size()` is `len(free)+len(release)` and
+        reported `108566`. A union 22 smaller than the sum is 22 ids in both
+        lists, and `free + withheld` already equalled `size` exactly.
+
+        THE DUPLICATE IS DROPPED FROM `release_pages`, NOT FROM `free_pages`.
+        `release_pages` is the deferred-sort buffer: `merge_and_sort_free`
+        exists precisely to fold it back into `free_pages`, so `free_pages` is
+        the durable owner and the release buffer is the transient one. Removing
+        the transient copy cannot lose a row.
+
+        NOT FIXED INSIDE `available_size()`, deliberately. Deduping the SUM
+        would make the census and the allocator agree by construction and hide
+        this class from the one instrument that has now caught it three times
+        -- including catching my own wrong fix. The checker stays untouched.
+        """
+        alloc = self._alloc
+        free = getattr(alloc, "free_pages", None)
+        rel = getattr(alloc, "release_pages", None)
+        if free is None or rel is None or free.numel() == 0 or rel.numel() == 0:
+            return 0
+        import torch
+
+        dup = torch.isin(
+            rel.detach().to("cpu", torch.int64), free.detach().to("cpu", torch.int64)
+        )
+        n = int(dup.sum())
+        if not n:
+            return 0
+        alloc.release_pages = rel[(~dup).to(rel.device)]
+        self._free_list_overlap_dropped = (
+            getattr(self, "_free_list_overlap_dropped", 0) + n
+        )
+        total = self._free_list_overlap_dropped
+        if total <= 5 or total % 100 == 0:
+            logger.warning(
+                "%s ONE-OWNER (free lists): %d id(s) were in free_pages AND "
+                "release_pages at once; dropped the release-buffer copy, which "
+                "is the transient owner (merge_and_sort_free folds it into "
+                "free_pages anyway). Left standing these are counted twice by "
+                "available_size() and once by the census, which is the W36/"
+                "W37-A abort (available over total by exactly the overlap). "
+                "(%d so far.)",
+                LOG_PREFIX,
+                n,
+                total,
+            )
+        return n
 
     def _settle_free_lists(self) -> int:
         """Drop from the free lists any id this cap is already withholding.
@@ -915,6 +991,18 @@ class KvRowCap:
         self._cap = None
         n = self.withheld
         if self._withheld is not None and n:
+            # W37-A: RESTORING MUST NOT DOUBLE-INSERT. This loop cats the whole
+            # withheld set into the FIRST list that exists and then breaks -- so
+            # any withheld id that is ALSO still sitting in the OTHER list ends
+            # up in both, and `available_size()` (a SUM over the two lists)
+            # counts it twice while the census (`read_free_rows`, a set UNION)
+            # counts it once. That difference is the W36/W37-A abort exactly:
+            #     census free=108544  vs  available=108566  -> 22 ids in both.
+            # `_apply` scans both lists and its `torch.unique` belt was removed
+            # on purpose, so a pre-existing overlap is banked twice in
+            # `_withheld` and restored twice here. Clearing the other list of
+            # these ids first makes the restore idempotent in the id space.
+            self._drop_withheld_from_free_lists()
             for name in ("free_pages", "release_pages"):
                 pages = getattr(self._alloc, name, None)
                 if pages is not None:
