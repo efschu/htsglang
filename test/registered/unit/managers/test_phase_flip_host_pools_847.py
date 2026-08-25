@@ -186,11 +186,17 @@ class TestTheBootWiresIt(CustomTestCase):
 
         from sglang.srt.managers.scheduler import Scheduler
 
-        # The wiring lives in `init_model_worker`, where BOTH device pools
-        # exist (PP from init_memory_pools, TP from build_phase_flip_tp_stack)
-        # -- a host pool is allocated FROM its device pool, so it cannot be
-        # built before them.
-        src = inspect.getsource(Scheduler.init_model_worker)
+        # W33 arm 1: the wiring must sit AFTER `self.tree_cache` is assigned,
+        # not inside `init_model_worker`. It needs THREE inputs -- both device
+        # pools AND the host tier -- and the host tier hangs off `tree_cache`,
+        # which is assigned after that method returns. Placed too early the
+        # writer runs, finds no host tier, and refuses; measured on metal.
+        src = inspect.getsource(Scheduler.__init__)
+        self.assertNotIn(
+            "build_phase_flip_host_pools",
+            inspect.getsource(Scheduler.init_model_worker),
+            "too early: the host tier does not exist yet there",
+        )
         self.assertIn("build_phase_flip_host_pools", src)
         self.assertIn("phase_flip_host_pools", src)
 

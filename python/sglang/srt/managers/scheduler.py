@@ -865,6 +865,26 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # #847 (W33): the WRITER for the phase-matched host pools. HERE, AND
+        # NOT INSIDE init_model_worker -- W33 arm 1 measured why. It needs
+        # THREE inputs: the PP device pool, the TP device pool (both ready
+        # inside init_model_worker) and the HOST tier, which hangs off
+        # `tree_cache` and is assigned on the line above, AFTER that method has
+        # already returned. Placed there, the writer ran, found
+        # `token_to_kv_pool_host` None, logged its own "no HiCache host tier"
+        # refusal on every rank, and the rebind could not arm -- the mechanism
+        # installed and unreachable, for the third time in this strand.
+        # The #677 note directly below records the identical ordering mistake
+        # made once before in this same constructor; this is its second
+        # instance and the reason both now sit after their inputs.
+        self.phase_flip_host_pools = {}
+        if self.server_args.enable_phase_flip:
+            from sglang.srt.managers.phase_flip_boot import (
+                build_phase_flip_host_pools,
+            )
+
+            self.phase_flip_host_pools = build_phase_flip_host_pools(self)
+
         # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.
         # It reads the GDN slot pool off req_to_token_pool.mamba_allocator,
         # and that attribute is assigned four lines up -- AFTER
@@ -1508,23 +1528,6 @@ class Scheduler(
             )
 
             self.phase_flip_stacks = build_phase_flip_tp_stack(self)
-
-        # #847 (W33): the WRITER for the phase-matched host pools. Placed here
-        # because a host pool is allocated FROM its device pool, so both
-        # stacks' device pools must exist first -- the PP one from
-        # init_memory_pools() above, the TP one from the line just above.
-        # Flag-gated inside: without --phase-flip-rebind-hicache this returns
-        # {} and allocates nothing, so every other boot is byte-identical.
-        # Without it `phase_pools_for` raises RebindRefused, the rebind never
-        # arms, bound_phase() stays "pp", and the #718 guard disarms the device
-        # tier for the whole TP phase -- which is the W32 read-through miss.
-        self.phase_flip_host_pools = {}
-        if self.server_args.enable_phase_flip:
-            from sglang.srt.managers.phase_flip_boot import (
-                build_phase_flip_host_pools,
-            )
-
-            self.phase_flip_host_pools = build_phase_flip_host_pools(self)
 
         # #797: hold a SEED vector to its claim, here and not earlier. Every
         # stack that can size a KV pool is built by this point -- the PP stack
