@@ -136,6 +136,9 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+#: #783 seam state transfer log prefix, so the acceptance lines are greppable.
+SEAM_STATE_PREFIX = "[#783 seam-state]"
+
 # #622: per-finish trace for cross-rank finish-divergence attribution.
 _FINISH_TRACE = os.environ.get("SGLANG_FINISH_TRACE", "0") not in ("0", "", "false")
 
@@ -1705,6 +1708,16 @@ class Req(ReqDllmMixin):
     #: here.
     mamba_state_cpu: Optional[object] = None
 
+    #: #783: how many token rows `kv_cache_cpu` actually covers. None = no copy.
+    #: RECORDED rather than re-derived, because `seqlen` is a LOGICAL length
+    #: (`len(origin_input_ids) + len(output_ids)`) and says nothing about how
+    #: much of `req_to_token` has been written. W38-A crashed on exactly that
+    #: gap: a restore whose extent had grown walked off the end of the saved
+    #: chunk list (memory_pool.py:3295). Every pool-level `load_cpu_copy` just
+    #: forwards the indices it is handed, so there is NO backstop below this
+    #: class -- the guarantee has to be established here.
+    kv_cache_cpu_extent: Optional[int] = None
+
     def _mamba_cpu_copy_is_mine(self, token_to_kv_pool_allocator) -> bool:
         """#783: does THIS caller own the mamba copy, or does the pool?
 
@@ -1740,6 +1753,9 @@ class Req(ReqDllmMixin):
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
+        # #783: say what was covered, so a later restore can tell drift from
+        # agreement instead of discovering it as an IndexError.
+        self.kv_cache_cpu_extent = int(token_indices.numel())
         # #783: and when the pool declares it does NOT move mamba, move it here.
         # Without this the comment above was false on this rig's pool: the KV
         # came back and the GDN state did not.
@@ -1930,9 +1946,21 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    copy_state: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
+
+    # #783 half 1: the #856 cutover copies its state out before letting go.
+    # Default False, set at EXACTLY ONE site (build_cutover_release._retract);
+    # `retract_all`'s only other caller is the decode-pressure path, whose rate
+    # is load-dependent and outside the flip-cadence host budget. Not a flag --
+    # the condition is structural. Routed through `seam_copy_state` so a
+    # mid-chunk request is DECLINED rather than copied at an extent that cannot
+    # be restored. Runs before `release_kv_cache` below, while the rows still
+    # hold live bytes, and transfers no ownership (`is_insert` stays False).
+    if copy_state:
+        seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
@@ -1949,6 +1977,137 @@ def release_req(
     req.reset_for_retract()
 
 
+#: #783: seam state-transfer counters. AFFIRMATIVE REPORTING -- these exist so
+#: "did the restore happen" is a grep and not an inference from #cached-token.
+#: `refused` and `declined` are the numbers that matter most: a contract never
+#: exercised in the failure direction is untested, and `declined` doubles as the
+#: measurement of how often a mid-chunk request meets the seam at all -- i.e. it
+#: MEASURES the PS3 question instead of guessing it.
+_SEAM_STATE_COUNTS = {"copied": 0, "declined": 0, "restored": 0, "refused": 0}
+
+
+def _seam_extent_of(req: Req) -> int:
+    """The number of token rows a copy of this request would cover."""
+    return int(req.seqlen) - 1
+
+
+def _seam_prefill_is_complete(req: Req) -> bool:
+    """#783: is this request's row actually filled to its logical length?
+
+    `Req.seqlen` is LOGICAL (`len(origin_input_ids) + len(output_ids)`); the row
+    is filled only to `kv_allocated_len` (== `extend_range.end`), which is
+    strictly less while the prompt is still being chunk-prefilled. Indexing by
+    `seqlen - 1` is therefore only sound once those agree.
+    """
+    allocated = getattr(req, "kv_allocated_len", None)
+    if allocated is None:
+        return False
+    return int(allocated) >= _seam_extent_of(req)
+
+
+def seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
+    """#783 half 1: copy this request's state out at the cutover, or decline.
+
+    DECLINES a request whose prefill is still chunked. Such a request has no
+    well-defined full extent, and the tree has already settled what to do about
+    that: `kv_session_offload` refuses chunked admission outright rather than
+    restoring into it (":445 return False  # would be CHUNKED -> needs PS3";
+    the assert at :4496 names "PS3 (host-prefix extend read)"). PS3 is
+    unimplemented -- four mentions, all comments. So mid-chunk is declined here
+    too, loudly and counted, rather than half-built in passing.
+
+    Declining costs a recompute of work that was unfinished anyway; a
+    decode-phase resident, which is the population the cutover actually
+    retracts, loses real session state and IS covered.
+    """
+    if not _seam_prefill_is_complete(req):
+        _SEAM_STATE_COUNTS["declined"] += 1
+        n = _SEAM_STATE_COUNTS["declined"]
+        if n <= 3 or n % 100 == 0:
+            logger.info(
+                "%s SEAM COPY DECLINED rid=%s: prefill still chunked "
+                "(allocated=%s, needs=%d), so there is no full extent to copy. "
+                "Its tokens are recomputed after the flip. occurrence=%d",
+                SEAM_STATE_PREFIX,
+                getattr(req, "rid", None),
+                getattr(req, "kv_allocated_len", None),
+                _seam_extent_of(req),
+                n,
+            )
+        return False
+    req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    _SEAM_STATE_COUNTS["copied"] += 1
+    return True
+
+
+def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
+    """#783 half 2: put back what the cutover copied, or REFUSE on extent drift.
+
+    THE CONTRACT: a copy may only be applied to the extent it was taken from.
+    W38-A applied one to a longer extent and the pool walked off the end of its
+    saved chunk list (IndexError, memory_pool.py:3295, three ranks, 14 s into
+    the load). The refusal happens HERE, at the caller that knows both numbers,
+    because every pool-level `load_cpu_copy` merely forwards indices and adds no
+    length check of its own beyond a per-chunk one (:3298) on the wrong axis.
+
+    NOT A CLAMP. The two extents describe different things, so a `min()` would
+    write a prefix's KV into the wrong rows -- a wrong ANSWER rather than a
+    crash. A refusal costs a recompute, which is merely slow.
+
+    A REFUSED COPY IS DROPPED, not kept: it is stale against a request the model
+    has since advanced, and holding it would let a later coincidentally-matching
+    extent restore ancient bytes.
+    """
+    saved = getattr(req, "kv_cache_cpu", None)
+    if saved is None:
+        return False
+
+    covered = getattr(req, "kv_cache_cpu_extent", None)
+    now = _seam_extent_of(req)
+    if (
+        covered is None
+        or int(covered) != int(now)
+        or not _seam_prefill_is_complete(req)
+    ):
+        _SEAM_STATE_COUNTS["refused"] += 1
+        n = _SEAM_STATE_COUNTS["refused"]
+        logger.warning(
+            "%s SEAM RESTORE REFUSED rid=%s: the copy covers %s row(s) but the "
+            "request now needs %d (allocated=%s). Applying it would index past "
+            "the saved chunks (the W38-A crash) or write a prefix into the "
+            "wrong rows. Dropped; these tokens are recomputed. occurrence=%d",
+            SEAM_STATE_PREFIX,
+            getattr(req, "rid", None),
+            covered,
+            now,
+            getattr(req, "kv_allocated_len", None),
+            n,
+        )
+        req.kv_cache_cpu = None
+        req.kv_cache_cpu_extent = None
+        req.mamba_state_cpu = None
+        return False
+
+    req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    req.kv_cache_cpu_extent = None
+    _SEAM_STATE_COUNTS["restored"] += 1
+    n = _SEAM_STATE_COUNTS["restored"]
+    if n <= 5 or n % 50 == 0:
+        logger.info(
+            "%s SEAM RESTORE rid=%s extent=%d restored from the host copy "
+            "instead of recomputing (copied=%d declined=%d restored=%d "
+            "refused=%d)",
+            SEAM_STATE_PREFIX,
+            getattr(req, "rid", None),
+            now,
+            _SEAM_STATE_COUNTS["copied"],
+            _SEAM_STATE_COUNTS["declined"],
+            n,
+            _SEAM_STATE_COUNTS["refused"],
+        )
+    return True
+
+
 def retract_all(
     *,
     reqs: List[Req],
@@ -1958,6 +2117,7 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    copy_state: bool = False,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -1970,6 +2130,7 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
+            copy_state=copy_state,
         )
     return retracted_reqs
 
@@ -2577,6 +2738,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                 req.already_computed = seq_len
 
+            # #783 half 2: restore instead of recomputing, for the cutover
+            # population only. Here and not in `readmit_seam_residents`, which
+            # only re-queues: by then `reset_for_retract()` has cleared
+            # `req_pool_idx` and there is nothing to load into. `alloc_for_extend`
+            # above has just given this request rows back. The extent contract
+            # inside REFUSES on drift rather than indexing, which is what W38-A
+            # needed. Before `is_retracted` is cleared, so the order is visible.
+            restore_seam_state(
+                req, self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
             req.is_retracted = False
 
             if server_args.enable_mamba_extra_buffer():
