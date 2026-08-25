@@ -87,7 +87,31 @@ logger = logging.getLogger(__name__)
 LOG_PREFIX = "PHASE-FLIP"
 
 
-def chunk_blocks_quiescence(chunked_req, *, strict: bool = False) -> bool:
+def prefill_runnable_in_current_layout(direction, purity) -> bool:
+    """#858b: can a pending prefill make progress in the layout we are in NOW?
+
+    The armed DIRECTION names the layout that currently holds:
+      * ``pp_to_tp`` armed  -> we are in PP  -> prefill runs there.
+      * ``tp_to_pp`` armed  -> we are in TP  -> only if purity permits it.
+
+    THIS IS THE TERM #858 WAS MISSING. Its block was direction-blind, and its
+    own justification -- "the flip is armed for the DECODE that follows the
+    drain, so waiting IS drain-and-flip" -- is true ONLY for pp_to_tp. For
+    tp_to_pp the flip is armed FOR the prefill, and under strict that prefill
+    may not run in the TP layout that holds while we wait. Waiting there waits
+    for work the current layout forbids: a deadlock by construction.
+
+    Measured, boot_w40_857strict_0825_1931: 225 of 228 holds were tp_to_pp,
+    258 ADMISSION-WEDGE, 11 queued / 0 running, no first token for 535 s.
+    """
+    if direction == TP_TO_PP:
+        return bool(getattr(purity, "prefill_allowed_in_tp", lambda: True)())
+    return True
+
+
+def chunk_blocks_quiescence(
+    chunked_req, *, strict: bool = False, prefill_runnable_here: bool = True
+) -> bool:
     """Does this chunked prefill prevent a rank from being quiescent?
 
     ONE definition with TWO callers, and they must never disagree:
@@ -142,7 +166,14 @@ def chunk_blocks_quiescence(chunked_req, *, strict: bool = False) -> bool:
     """
     if chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None:
         return True
-    if strict and chunked_req is not None:
+    # #858b: DO NOT WAIT FOR WORK THAT CANNOT RUN WHILE WE WAIT. Blocking is
+    # only drain-and-flip when the drain can actually proceed in the current
+    # layout; otherwise it is a hold with no exit. TP has no bounded window --
+    # `--phase-policy-tp-decode-floor-s` is a MINIMUM dwell, not a bound --
+    # so nothing times this out, which is why it presented as a wedge rather
+    # than as a slow flip. See `validate_purity_policy_pair`, which already
+    # makes exactly this argument for PP.
+    if strict and prefill_runnable_here and chunked_req is not None:
         end = getattr(getattr(chunked_req, "extend_range", None), "end", None)
         full = getattr(chunked_req, "full_untruncated_fill_ids", None)
         if end is not None and full is not None and int(end) < len(full):
@@ -693,10 +724,17 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         from sglang.srt.managers.phase_purity import purity_of
 
         try:
-            _strict = bool(purity_of(scheduler).strict)
+            _purity = purity_of(scheduler)
+            _strict = bool(_purity.strict)
         except Exception:  # noqa: BLE001 - a purity read may never break a flip
-            _strict = False
-        if chunk_blocks_quiescence(chunked, strict=_strict):
+            _purity, _strict = None, False
+        # #858b: the ARMED DIRECTION decides whether waiting can ever end.
+        _rt = getattr(scheduler, "phase_flip_runtime", None)
+        _dir = getattr(_rt, "pending", None) if _rt is not None else None
+        _runnable = prefill_runnable_in_current_layout(_dir, _purity)
+        if chunk_blocks_quiescence(
+            chunked, strict=_strict, prefill_runnable_here=_runnable
+        ):
             return (
                 "a chunked prefill is incomplete (strict: the flip would "
                 "discard it, #856 removed the carry)"

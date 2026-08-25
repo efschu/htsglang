@@ -271,6 +271,48 @@ def purity_from_server_args(server_args) -> PhasePurity:
     return purity
 
 
+def validate_tp_exit_pair(purity: PhasePurity, policy_cfg) -> None:
+    """#858b: the TP mirror of `validate_purity_policy_pair`, and it was missing.
+
+    PP has a bounded window and that guard says why: a phase that may not
+    decode and cannot admit prefill "has NO exit except the bounded window".
+    TP has no such bound -- ``--phase-policy-tp-decode-floor-s`` is a MINIMUM
+    dwell, not a maximum -- and under strict the TP phase may not admit
+    prefill either. So a tp_to_pp arm that waits for a chunked prefill to
+    finish waits for work the TP layout forbids, with nothing to time it out.
+
+    THE ASYMMETRY IS THE MISSING EXIT. Measured on
+    boot_w40_857strict_0825_1931: 225 of 228 quiescence holds were tp_to_pp,
+    258 ADMISSION-WEDGE reports, 11 queued / 0 running, no first token for
+    535 s. The predicate that produced them is fixed at its own site
+    (`prefill_runnable_in_current_layout`); this refuses the deadlocking
+    CONFIGURATION at parse time, where refusing is free -- the same reason
+    the PP guard exists rather than a runtime recovery.
+
+    Checkable triple: strict purity + strict drain mode + no bounded TP
+    residency.
+    """
+    if not purity.strict:
+        return
+    if not bool(getattr(policy_cfg, "drain_mode_strict", False)):
+        return
+    slo = float(getattr(policy_cfg, "decode_stall_slo_s", 0.0) or 0.0)
+    tp_window = float(getattr(policy_cfg, "tp_window_s", 0.0) or 0.0)
+    if slo > 0 or tp_window > 0:
+        return
+    raise PhasePurityError(
+        f"{LOG_PREFIX} purity={purity.describe()} with strict drain mode has "
+        f"no bounded TP residency: tp_window_s={tp_window!r} and "
+        f"decode_stall_slo_s={slo!r}. `tp_decode_floor_s` is a MINIMUM dwell "
+        f"and cannot end a hold. Under strict the TP phase may not admit "
+        f"prefill, so a tp_to_pp arm waiting on a pending prefill waits for "
+        f"work this layout forbids and nothing times it out -- the PP guard "
+        f"above refuses exactly this shape for the other direction. Declare "
+        f"SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S, or set a bounded TP window, "
+        f"or run --phase-flip-purity off."
+    )
+
+
 def validate_purity_policy_pair(purity: PhasePurity, policy_cfg) -> None:
     """Refuse the one combination that deadlocks.
 

@@ -145,3 +145,118 @@ class TestBothCallersAskTheSameQuestion(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# #858b: DIRECTION. The block above was direction-BLIND, and every test in this
+# file passed anyway -- which is exactly why it shipped. A direction-blind
+# predicate satisfies every single-direction test, so the tests are
+# parametrised over BOTH directions from here on.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.managers.phase_flip_runtime import (  # noqa: E402
+    prefill_runnable_in_current_layout,
+)
+from sglang.srt.managers.phase_policy import PP_TO_TP, TP_TO_PP  # noqa: E402
+
+
+class _Purity:
+    def __init__(self, prefill_in_tp: bool):
+        self._p = prefill_in_tp
+        self.strict = not prefill_in_tp
+
+    def prefill_allowed_in_tp(self) -> bool:
+        return self._p
+
+
+class TestTheDirectionTerm(CustomTestCase):
+    """`pp_to_tp` is armed for the DECODE after the drain -- waiting is
+    drain-and-flip. `tp_to_pp` is armed FOR the prefill, and under strict that
+    prefill may not run in the TP layout that holds while we wait."""
+
+    def test_pp_to_tp_prefill_can_progress(self):
+        self.assertTrue(
+            prefill_runnable_in_current_layout(PP_TO_TP, _Purity(prefill_in_tp=False))
+        )
+
+    def test_tp_to_pp_under_strict_cannot(self):
+        self.assertFalse(
+            prefill_runnable_in_current_layout(TP_TO_PP, _Purity(prefill_in_tp=False))
+        )
+
+    def test_tp_to_pp_when_tp_may_prefill_can(self):
+        self.assertTrue(
+            prefill_runnable_in_current_layout(TP_TO_PP, _Purity(prefill_in_tp=True))
+        )
+
+    def test_unknown_direction_does_not_invent_a_hold(self):
+        """No armed direction -> do not manufacture a reason to wait."""
+        self.assertTrue(
+            prefill_runnable_in_current_layout(None, _Purity(prefill_in_tp=False))
+        )
+
+
+class TestBothDirectionsAgainstTheSamePrefill(CustomTestCase):
+    """THE TEST THAT WOULD HAVE CAUGHT #858. One incomplete chunked prefill,
+    asked in both directions: the answers must DIFFER under strict."""
+
+    def _req(self):
+        return _chunked(allocated=4096, total=6045)
+
+    def test_strict_blocks_pp_to_tp(self):
+        runnable = prefill_runnable_in_current_layout(
+            PP_TO_TP, _Purity(prefill_in_tp=False)
+        )
+        self.assertTrue(
+            chunk_blocks_quiescence(
+                self._req(), strict=True, prefill_runnable_here=runnable
+            ),
+            "pp_to_tp must still wait: the prefill CAN finish in PP",
+        )
+
+    def test_strict_does_not_block_tp_to_pp(self):
+        """RED before #858b. This is the 225-of-228 hold from
+        boot_w40_857strict_0825_1931, and it has no exit: TP has only a
+        MINIMUM dwell (`tp_decode_floor_s`), never a bound."""
+        runnable = prefill_runnable_in_current_layout(
+            TP_TO_PP, _Purity(prefill_in_tp=False)
+        )
+        self.assertFalse(
+            chunk_blocks_quiescence(
+                self._req(), strict=True, prefill_runnable_here=runnable
+            ),
+            "tp_to_pp is armed FOR this prefill, which strict forbids in TP: "
+            "waiting deadlocks",
+        )
+
+
+class TestTheTpExitIsValidatedAtBoot(CustomTestCase):
+    """#858b: the configuration that deadlocks is refused at parse time, in
+    the shape `validate_purity_policy_pair` already uses for PP."""
+
+    def _cfg(self, **kw):
+        base = dict(drain_mode_strict=True, decode_stall_slo_s=0.0, tp_window_s=0.0)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_the_deadlocking_triple_is_refused(self):
+        from sglang.srt.managers.phase_purity import (
+            PhasePurityError,
+            parse_purity,
+            validate_tp_exit_pair,
+        )
+
+        with self.assertRaises(PhasePurityError):
+            validate_tp_exit_pair(parse_purity("strict"), self._cfg())
+
+    def test_a_declared_slo_is_an_exit(self):
+        from sglang.srt.managers.phase_purity import parse_purity, validate_tp_exit_pair
+
+        validate_tp_exit_pair(parse_purity("strict"), self._cfg(decode_stall_slo_s=180))
+
+    def test_non_strict_is_not_refused(self):
+        """GREEN BEFORE AND AFTER -- the guard must not fire on the mode that
+        never had this problem."""
+        from sglang.srt.managers.phase_purity import parse_purity, validate_tp_exit_pair
+
+        validate_tp_exit_pair(parse_purity("off"), self._cfg())

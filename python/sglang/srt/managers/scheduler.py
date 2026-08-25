@@ -643,10 +643,15 @@ class Scheduler(
             from sglang.srt.managers.phase_purity import (
                 purity_from_server_args,
                 validate_purity_policy_pair,
+                validate_tp_exit_pair,
             )
 
             self._phase_purity = purity_from_server_args(server_args)
             validate_purity_policy_pair(self._phase_purity, self.phase_policy_cfg)
+            # #858b: the TP mirror. PP has been guarded since #665-F1; TP
+            # never was, and that asymmetry IS the missing exit that turned a
+            # tp_to_pp hold into a 535 s wedge.
+            validate_tp_exit_pair(self._phase_purity, self.phase_policy_cfg)
             # Tell the policy that the TP layout cannot prefill, so its
             # break-even N collapses to 0 in that direction. Without this
             # the two features contradict: purity refuses the prefill and
@@ -7015,6 +7020,7 @@ class Scheduler(
         # again the way they did between defect O and 20:31:48.
         from sglang.srt.managers.phase_flip_runtime import (
             chunk_blocks_quiescence,
+            prefill_runnable_in_current_layout,
         )
 
         if (
@@ -7028,6 +7034,12 @@ class Scheduler(
             and not chunk_blocks_quiescence(
                 self.chunked_req,
                 strict=bool(getattr(self._phase_purity, "strict", False)),
+                # #858b: same direction term as the ready_fn caller. A
+                # direction-blind hold deadlocks tp_to_pp, which is armed FOR
+                # the prefill that strict forbids in the TP layout.
+                prefill_runnable_here=prefill_runnable_in_current_layout(
+                    self.phase_flip_runtime.pending, self._phase_purity
+                ),
             )
         ):
             # A round withheld for a PENDING FLIP is not a round that could
