@@ -10919,12 +10919,38 @@ class Scheduler(
         # reports it. Calling the accessor twice inside one constructor is how
         # a refusal could name a number the simulation never saw.
         _pending_now = self._pending_prefill_tokens(inflight_reqs)
+        # W32: SEAM TRANSPORT IS NOT PENDING PP WORK, AND THE POLICY MUST READ
+        # THE SAME AUTHORITY THE PURITY GATE DOES.
+        #
+        # The tokens of a request the cutover retracted and re-admitted are
+        # destined to be served in the layout the flip just entered, by a
+        # read-through that recomputes nothing. Counted as pending prefill they
+        # make the tp-ward flip undo itself: W32 logged "arming tp_to_pp:
+        # pending prefill 1 tok > 0 (purity: prefill cannot run in tp)" 23
+        # times, and the seam-transport exemption got to run ONCE in 144
+        # pp_to_tp flips because the instance had already flipped away.
+        #
+        # Subtracted HERE, at the one boundary, so the drain exit, the
+        # break-even band and the tp-ward arm all see the same corrected
+        # quantity -- rather than three more copies of the same judgement,
+        # which is exactly the defect this fix exists to end.
+        _seam_transport_now = 0
+        try:
+            from sglang.srt.managers.phase_purity import (
+                seam_transport_pending_tokens,
+            )
+
+            _seam_transport_now = int(seam_transport_pending_tokens(self) or 0)
+        except Exception:  # noqa: BLE001 - an input probe never breaks arming
+            _seam_transport_now = 0
+        _pending_now = max(0, _pending_now - _seam_transport_now)
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
             pending_prefill_tokens=_pending_now,
+            seam_transport_tokens=_seam_transport_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
             # getattr, because this gate is driven in tests by scheduler

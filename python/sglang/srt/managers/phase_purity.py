@@ -798,6 +798,51 @@ def seam_readmit_candidates(scheduler) -> list:
     return out
 
 
+def seam_transport_pending_tokens(scheduler) -> int:
+    """Pending prefill tokens that are SEAM TRANSPORT, not PP workload (W32).
+
+    THE ONE AUTHORITY, WITH TWO CALLERS. `prefill_blocked_here` asks
+    `seam_transport_exempt` whether a TP prefill batch may be built; the phase
+    policy asks THIS whether those same tokens justify flipping back to PP.
+    Both answers are derived from `seam_readmit_candidates` -- one predicate,
+    one clock. That is deliberate and it is the whole lesson of the last two
+    windows: the exemption was implemented as a COPY at one enforcement site
+    while another site kept its own, and a correct mechanism that a second
+    copy overrides is a mechanism that never runs.
+
+    W32 measured the cost, in the policy's own words, 23 times:
+
+        PHASE-POLICY arming tp_to_pp: pending prefill 1 tok > 0
+          (purity: prefill cannot run in tp)
+
+    The seam had just re-admitted its retracted residents, so those tokens
+    appeared as "pending prefill". The policy's copy of the purity rule read
+    that as work requiring the PP layout and armed tp_to_pp -- leaving TP
+    before the exemption at the batch builder could be consulted. The
+    exemption fired ONCE in 144 pp_to_tp flips; the other 143 times the
+    instance had already flipped away.
+
+    THESE TOKENS ARE NOT PP WORK. They are the seam's own re-admission,
+    destined to be served in the layout the flip just entered, by a
+    read-through that recomputes nothing. Counting them as pending PP prefill
+    makes the tp-ward flip undo itself, every time.
+
+    Excluded at the INPUT BOUNDARY rather than at each trigger, so every
+    consumer of `pending_prefill_tokens` in the policy -- the drain exit, the
+    break-even band, the tp-ward arm -- sees the same, correct quantity. A
+    per-trigger subtraction would be a fourth copy of the same judgement.
+    """
+    total = 0
+    for req in seam_readmit_candidates(scheduler):
+        try:
+            n = len(getattr(req, "origin_input_ids", None) or ())
+            done = int(getattr(req, "cache_protected_len", 0) or 0)
+            total += max(0, n - done)
+        except Exception:  # noqa: BLE001 - an accounting probe, never a gate
+            continue
+    return total
+
+
 def seam_transport_exempt(scheduler) -> bool:
     """Is this round's TP prefill a SEAM RE-ADMISSION, i.e. flip transport?
 

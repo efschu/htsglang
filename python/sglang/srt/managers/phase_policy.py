@@ -1837,6 +1837,15 @@ class PhasePolicyInputs:
     running_bs: int
     now: float
 
+    #: W32: tokens of requests the #856 cutover retracted and RE-ADMITTED,
+    #: awaiting a read-through in the layout the flip just entered. They are
+    #: already excluded from `pending_prefill_tokens` (that is PP work, and
+    #: these are not) -- this field exists so the decode-empty rule can tell
+    #: "the bundle never arrived" from "the bundle is one round away".
+    #: Replicated: the cutover is group-unanimous and the queue it re-admits
+    #: into is replicated, so every rank computes the same number.
+    seam_transport_tokens: int = 0
+
     #: THE ROUND JUST FAILED TO BUILD A BATCH OF EITHER WORK CLASS.
     #:
     #: Not "the queue is empty" and not "the box looks quiet": both classes
@@ -2654,6 +2663,29 @@ def _decide_from_load(
             )
             bundle = max(state.bundle_at_phase_entry, 0)
             elapsed = 0.0 if in_phase is None else in_phase
+            if bundle == 0 and inp.seam_transport_tokens > 0:
+                # W32: UNDER NO-CARRY, EMPTY AT ENTRY IS THE NORMAL STATE.
+                #
+                # The rule below was written for a seam that CARRIED its
+                # residents, where "entered TP with 0 decoding" really did mean
+                # the bundle never existed. Under #856 no-carry the cutover
+                # RETRACTS every resident, so the bundle is absent at entry BY
+                # CONSTRUCTION and arrives one round later through the
+                # re-admission. The old rule therefore fired on every single
+                # flip -- 26 times in W32 -- and armed tp_to_pp straight back
+                # out of the layout the bundle was about to be served in.
+                #
+                # The invariant that DOES exist now: an empty decode phase is a
+                # defect only when NO re-admission is in flight. While these
+                # tokens are outstanding the right action is to WAIT for them,
+                # not to flip away from them.
+                return _no(
+                    f"decode phase entered empty, which is normal under "
+                    f"no-carry: {inp.seam_transport_tokens} tok of seam "
+                    f"re-admission are in flight and are served in THIS "
+                    f"layout by read-through. Waiting for the bundle the "
+                    f"cutover just retracted, not flipping away from it"
+                )
             if bundle == 0:
                 # #730: ZERO WORK MUST NOT READ AS ALL WORK.
                 #

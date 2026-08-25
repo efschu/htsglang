@@ -347,3 +347,103 @@ class TestTheExemptionOutranksDrainModeSuppression(CustomTestCase):
 
         src = inspect.getsource(phase_purity.prefill_blocked_here)
         self.assertEqual(src.count("seam_transport_exempt(scheduler)"), 1)
+
+
+class TestOnePredicateBothCallers(CustomTestCase):
+    """W32: THE EXEMPTION MUST NOT EXIST AS TWO COPIES.
+
+    Measured, in the policy's own words, 23 times
+    (SPECIMEN_w32_policy_purity_copy_pulls_back_to_pp.log):
+
+        PHASE-POLICY arming tp_to_pp: pending prefill 1 tok > 0
+          (purity: prefill cannot run in tp)
+
+    `prefill_blocked_here` had been taught the seam-transport exemption. The
+    POLICY kept an independent copy of the same rule, so the moment the seam
+    re-admitted its residents those tokens read as "pending prefill" and the
+    policy armed tp_to_pp -- leaving TP before the exemption at the batch
+    builder could be consulted. The exemption fired ONCE in 144 pp_to_tp
+    flips.
+
+    That is the same shape as W31 arm 1 one level DOWN (the exemption sat
+    below the drain gate and never ran). Twice now a correct mechanism has
+    been overridden by a second site enforcing the same payload. So both
+    callers must derive from ONE function, and this class is what stops them
+    drifting apart again.
+
+    MANDATORY INVENTORY (Ein-Job-ein-Mover), recorded here because the rule
+    says a new canonical authority owes one. Sites enforcing "may prefill run
+    in the TP layout":
+      1. phase_purity.prefill_blocked_here      -- the batch gate
+      2. the phase policy, via pending-token accounting -- fixed here
+      3. w29_score.py                            -- the scorer (fixed at W32)
+      4. scheduler._phase_admits("prefill_in_tp") -- a runtime probe
+    and two that are NOT this payload: scheduler.py's boot-time
+    `prefill_runs_in_tp` config collapse (static, derived from the MODE) and
+    model_runner_kv_cache_mixin's `survivable` (KV sizing).
+    """
+
+    def test_both_answers_come_from_the_same_candidate_function(self):
+        import inspect
+
+        from sglang.srt.managers import phase_purity
+
+        for fn in (
+            phase_purity.seam_transport_exempt,
+            phase_purity.seam_transport_pending_tokens,
+        ):
+            self.assertIn(
+                "seam_readmit_candidates",
+                inspect.getsource(fn),
+                f"{fn.__name__} must derive from the one authority",
+            )
+
+    def test_a_mutation_on_the_shared_function_reds_both_callers(self):
+        # THE DIVERGENCE PROOF. If the two ever stop sharing a source of
+        # truth, this passes while the real system contradicts itself -- which
+        # is precisely what W32 measured.
+        from sglang.srt.managers import phase_purity
+
+        stamped = _req("a", seam_epoch=1)
+        stamped.origin_input_ids = list(range(100))
+        stamped.cache_protected_len = 0
+        sched = _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), [stamped])
+
+        self.assertTrue(phase_purity.seam_transport_exempt(sched))
+        self.assertEqual(phase_purity.seam_transport_pending_tokens(sched), 100)
+
+        original = phase_purity.seam_readmit_candidates
+        try:
+            phase_purity.seam_readmit_candidates = lambda s: []
+            self.assertFalse(
+                phase_purity.seam_transport_exempt(sched),
+                "the gate must follow the shared function",
+            )
+            self.assertEqual(
+                phase_purity.seam_transport_pending_tokens(sched),
+                0,
+                "the policy's accounting must follow the SAME shared function",
+            )
+        finally:
+            phase_purity.seam_readmit_candidates = original
+
+    def test_the_policy_input_boundary_subtracts_transport(self):
+        # Pinned at the boundary, not at each trigger: a per-trigger
+        # subtraction would be a fourth copy of the same judgement.
+        import inspect
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        src = inspect.getsource(Scheduler)
+        self.assertIn("seam_transport_pending_tokens", src)
+
+    def test_unstamped_pending_is_still_pp_work(self):
+        # CAN-FAIL: ordinary queued prefill must still count toward the
+        # tp_to_pp arm, or the policy stops returning to PP at all.
+        from sglang.srt.managers import phase_purity
+
+        fresh = _req("fresh")
+        fresh.origin_input_ids = list(range(500))
+        fresh.cache_protected_len = 0
+        sched = _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), [fresh])
+        self.assertEqual(phase_purity.seam_transport_pending_tokens(sched), 0)
