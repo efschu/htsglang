@@ -293,6 +293,12 @@ def consume_gate(controller, queue_attr: str, direction: str) -> bool:
     if not queue:
         return False
 
+    # W36 rung 3: COUNT EVERY CHECK, not only every refusal. W36 logged zero
+    # refusals across eight flips and the rung was INCONCLUSIVE, because
+    # "nothing crossed a cutover" and "this gate was never reached" produced
+    # byte-identical logs. Counting the checks makes clean and blind
+    # distinguishable; the seam prints the pair once per cutover.
+    controller._gate_checked = getattr(controller, "_gate_checked", 0) + len(queue)
     label = direction.upper()
     if device_tier_disarmed(direction):
         attr = f"_{direction}_phase_refusals"
@@ -308,6 +314,7 @@ def consume_gate(controller, queue_attr: str, direction: str) -> bool:
                 len(queue),
                 n,
             )
+        controller._gate_refused = getattr(controller, "_gate_refused", 0) + len(queue)
         queue.clear()
         return False
 
@@ -331,8 +338,30 @@ def consume_gate(controller, queue_attr: str, direction: str) -> bool:
                 dropped,
                 n,
             )
+        controller._gate_refused = getattr(controller, "_gate_refused", 0) + dropped
         setattr(controller, queue_attr, fresh)
     return bool(getattr(controller, queue_attr))
+
+
+def gate_heartbeat(controller) -> str:
+    """ "checked N, refused M" for this flip epoch, and reset for the next.
+
+    W36 RUNG 3 EXISTS BECAUSE THIS DID NOT. Every stale-generation gate logged
+    only on REFUSAL, so a boot with zero refusals looked exactly like a boot
+    whose gates were never reached -- and W36 produced precisely that log:
+    eight cutovers, zero refusal lines, rung INCONCLUSIVE. The ambiguity was
+    reintroduced by the very lines meant to remove it.
+
+    Emitted from the SEAM, once per cutover, because the seam always runs. A
+    gate that is never reached therefore still produces a line, reading
+    ``checked=0`` -- which is the can-fail: unreachable is now visible instead
+    of silent. Per epoch, not per operation, so it cannot become spam.
+    """
+    checked = int(getattr(controller, "_gate_checked", 0) or 0)
+    refused = int(getattr(controller, "_gate_refused", 0) or 0)
+    controller._gate_checked = 0
+    controller._gate_refused = 0
+    return f"checked={checked} refused={refused}"
 
 
 def operation_is_stale(controller, operation, kind: str) -> bool:
@@ -363,6 +392,7 @@ def operation_is_stale(controller, operation, kind: str) -> bool:
     second read mid-persist could straddle a rebind and answer two different
     questions about one operation. One read, one answer, one operation.
     """
+    controller._gate_checked = getattr(controller, "_gate_checked", 0) + 1
     stamped = getattr(operation, "binding_generation", None)
     if stamped is None:
         return False
@@ -371,6 +401,7 @@ def operation_is_stale(controller, operation, kind: str) -> bool:
     now = current_generation()
     if int(stamped) == int(now):
         return False
+    controller._gate_refused = getattr(controller, "_gate_refused", 0) + 1
     attr = f"_{kind}_stale_refusals"
     setattr(controller, attr, getattr(controller, attr, 0) + 1)
     n = getattr(controller, attr)

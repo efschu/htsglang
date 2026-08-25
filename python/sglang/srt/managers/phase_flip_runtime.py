@@ -8454,6 +8454,26 @@ class PhaseFlipRuntime:
                 readmitted,
             )
         self._seam_readmitted = readmitted
+        # W36 rung 3: the stale-generation gates report per CUTOVER, from here,
+        # because this runs on every flip. A gate that is never reached still
+        # produces a line reading checked=0, so "clean" and "blind" can never
+        # again be byte-identical (W36: eight flips, zero refusal lines, rung
+        # inconclusive).
+        try:
+            from sglang.srt.managers.cache_controller import gate_heartbeat
+
+            cc = getattr(
+                getattr(scheduler, "tree_cache", None), "cache_controller", None
+            )
+            if cc is not None:
+                logger.info(
+                    "%s #719 STALE-GATE HEARTBEAT for %s: %s",
+                    LOG_PREFIX,
+                    direction,
+                    gate_heartbeat(cc),
+                )
+        except Exception:  # noqa: BLE001 - telemetry never breaks a seam
+            pass
         return released
 
     def _releasable_cache_bytes(self):

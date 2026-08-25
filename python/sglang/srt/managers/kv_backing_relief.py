@@ -672,6 +672,8 @@ def lawful_reservation_rows(
     if size <= 0:
         return 0
     return size + 1 + max(0, int(margin_rows)) + max(0, int(admission_reserve_rows))
+
+
 FLOOR_NEED_GROWN = "GROWN"
 
 FLOOR_NEED_EXITS = (
@@ -790,11 +792,84 @@ class KvRowCap:
         ``page_size``, so a raw id count would be wrong by that factor on
         every paged lane.
         """
+        # W36 ONE-OWNER INVARIANT: a withheld id may not also sit in a free
+        # list. Enforced HERE because this is the single point where the
+        # withheld count is published, so the number the checker reads and the
+        # lists `available_size()` reads are reconciled in one place rather
+        # than by two functions that must agree.
+        #
+        # W36 measured what the absence costs, and the checker caught it:
+        #     total=468981 available=108565 evictable=1 withheld=360437
+        #     -> 469003, TWENTY-TWO ROWS OVER.
+        # The census names it exactly one line earlier:
+        #     size=468981 free=108544 withheld=360437 available=108566
+        # `withheld + free == size` EXACTLY -- the id space is fully owned --
+        # while `available` reports `free + 22`, because `available_size()` is
+        # `len(free_pages) + len(release_pages)` and 22 ids had re-entered the
+        # RELEASE buffer while still being counted in `_withheld`. Two owners,
+        # one row. W29 was the same detector firing with the opposite sign
+        # (one row with ZERO owners), which is why it must never be softened:
+        # both signs prove it measures.
+        #
+        # WHICH OWNER WINS, decided by reading rather than by taste. These ids
+        # are ABOVE THE CAP, so handing them out is precisely what the cap
+        # exists to prevent -- `_apply`'s own docstring is "move ids above the
+        # cap out of every free list". The withhold is therefore authoritative
+        # and the free side is the stale one: the id is removed from the free
+        # lists, NOT from `_withheld`. Re-applying is exactly what `_apply`
+        # does on a free event; this closes the window where a free lands
+        # between two `_apply` calls (the "allocator has no free listener"
+        # path warns about that case and then proceeds anyway).
+        self._settle_free_lists()
         page = max(1, int(getattr(self._alloc, "page_size", 1) or 1))
         try:
             self._alloc.residency_withheld_slots = self.withheld * page
         except Exception:  # pragma: no cover - exotic allocator objects
             pass
+
+    def _settle_free_lists(self) -> int:
+        """Drop from the free lists any id this cap is already withholding.
+
+        Returns how many rows were reclaimed, counted and named -- silence
+        here would make "no overlap" and "never checked" identical, which is
+        the ambiguity W36 rung 3 was lost to.
+        """
+        if self._withheld is None or self._withheld.numel() == 0:
+            return 0
+        import torch
+
+        held = self._withheld.to("cpu", torch.int64)
+        reclaimed = 0
+        for name in ("free_pages", "release_pages"):
+            pages = getattr(self._alloc, name, None)
+            if pages is None or pages.numel() == 0:
+                continue
+            dup = torch.isin(pages.detach().to("cpu", torch.int64), held)
+            n = int(dup.sum())
+            if not n:
+                continue
+            keep = (~dup).to(pages.device)
+            setattr(self._alloc, name, pages[keep])
+            reclaimed += n
+        if reclaimed:
+            self._double_owned_reclaimed = (
+                getattr(self, "_double_owned_reclaimed", 0) + reclaimed
+            )
+            total = self._double_owned_reclaimed
+            if total <= 5 or total % 100 == 0:
+                logger.warning(
+                    "%s ONE-OWNER: %d row(s) were in a free list AND withheld "
+                    "at the same time; removed from the free list, which is "
+                    "the stale owner -- they are above the cap and handing "
+                    "them out is what the cap exists to prevent. Left "
+                    "unsettled these are counted twice and the idle check "
+                    "aborts with available over total (W36: 22 rows). "
+                    "(%d so far.)",
+                    LOG_PREFIX,
+                    reclaimed,
+                    total,
+                )
+        return reclaimed
 
     def engage(self, cap: int) -> int:
         """Hold back every free id above ``cap``. Returns the count withheld."""
@@ -3183,9 +3258,7 @@ class KvBackingRelief:
             )
             return 0, FLOOR_NEED_STALE_ARENA
         if need <= floor:
-            self._note_floor_need_exit(
-                FLOOR_NEED_GROUP_FITS, floor=floor, need=need
-            )
+            self._note_floor_need_exit(FLOOR_NEED_GROUP_FITS, floor=floor, need=need)
             return 0, FLOOR_NEED_GROUP_FITS
         local = int(self._current_rows())
         if local > floor:
@@ -3194,9 +3267,7 @@ class KvBackingRelief:
             )
             return 0, FLOOR_NEED_NOT_THE_FLOOR
         gap = need - floor
-        self._note_floor_need_exit(
-            FLOOR_NEED_GAP, floor=floor, need=need, gap=gap
-        )
+        self._note_floor_need_exit(FLOOR_NEED_GAP, floor=floor, need=need, gap=gap)
         return gap, FLOOR_NEED_GAP
 
     def floor_need_gap(self) -> int:
