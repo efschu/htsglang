@@ -11248,6 +11248,20 @@ class Scheduler(
         else:
             self._seam_transport_debt_since = None
             self._seam_debt_lapse_announced = False
+        # #869: may a decode step execute in the layout that is up right now?
+        # Computed before the snapshot so the probe's failure mode is a plain
+        # fallback rather than a half-built dataclass.
+        _decode_runs_here = True
+        try:
+            from sglang.srt.managers.phase_policy import PHASE_PP as _PHASE_PP
+            from sglang.srt.managers.phase_purity import purity_of
+
+            if getattr(runtime, "phase", None) == _PHASE_PP:
+                _decode_runs_here = bool(
+                    purity_of(self).decode_allowed_in_pp(int(running_bs or 0))
+                )
+        except Exception:  # noqa: BLE001 - an input probe never breaks arming
+            _decode_runs_here = True
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
@@ -11284,6 +11298,23 @@ class Scheduler(
             decode_steps_this_phase=int(
                 getattr(self, "_decode_steps_this_phase", 0) or 0
             ),
+            # #869: the PHASE AXIS of the field above, without which the
+            # anti-chop floor is a constant in PP rather than a measurement.
+            # Asked of the purity authority itself (`decode_allowed_in_pp`),
+            # not re-derived from the mode name -- `decode_forbidden_in_pp`'s
+            # own docstring records what re-deriving it cost the spill guard.
+            #
+            # `decode_blocked_here` is NOT used despite being the scheduler-
+            # level phrasing of this question: it advances and clears the
+            # decode-starvation clock as a side effect, and an input probe that
+            # moves a starvation clock would make the snapshot the cause of the
+            # state it reports. Pure read here, side effects left to the gate.
+            #
+            # try/except and a True fallback for the same STAND-IN reason as
+            # its neighbours: a stand-in that cannot answer has not observed a
+            # prohibition, and "not observed" must reproduce the pre-#869
+            # behaviour rather than raise in the arming path.
+            decode_runs_in_this_phase=_decode_runs_here,
             retracted_unfinished_bs=int(
                 (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))()
                 or 0

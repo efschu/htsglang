@@ -1922,6 +1922,24 @@ class PhasePolicyInputs:
     #: 0 on every stand-in, which reproduces the pre-#861f behaviour exactly.
     decode_steps_this_phase: int = 0
 
+    #: #869: MAY A DECODE STEP EXECUTE IN THE CURRENT LAYOUT AT ALL?
+    #:
+    #: The phase axis of ``decode_steps_this_phase``, and the reason the
+    #: counter alone cannot answer the question its consumer asks. Supplied by
+    #: the build site from the purity authority (``decode_allowed_in_pp``),
+    #: which is the one place that knows; see ``bundle_is_mid_flight`` for what
+    #: goes wrong without it.
+    #:
+    #: DEFAULTS TRUE, which reproduces the pre-#869 behaviour exactly on every
+    #: stand-in and on every deployment without phase purity -- where decode
+    #: does run in whatever layout is up, so the default is not merely
+    #: compatible but correct.
+    #:
+    #: Replicated like every other field here: purity is parsed once from the
+    #: server args at boot and the phase is group-unanimous, so every rank
+    #: computes the same boolean.
+    decode_runs_in_this_phase: bool = True
+
     def bundle_is_mid_flight(self) -> bool:
         """Is a decode bundle running that a flip would chop? #861f.
 
@@ -1934,6 +1952,41 @@ class PhasePolicyInputs:
         d4 (thrash): residents decoding, few steps done -> True, hold.
         W37-E (wedge): nothing resident, 7 queued retracted -> False, flip.
         """
+        # #869: A BUNDLE CANNOT BE MID-FLIGHT IN A LAYOUT THAT CANNOT FLY IT.
+        #
+        # THE PHASE AXIS, which none of #861e/f/i checked. `decode_steps_this_
+        # phase` is produced by exactly one site -- the decode forward funnel
+        # in `scheduler.run_batch`, under `batch.forward_mode.is_decode()` --
+        # and is reset to 0 at every cutover (`phase_flip_runtime`, "#861i: the
+        # step budget is PER PHASE"). Under strict purity decode is FORBIDDEN
+        # in the PP layout (`PhasePurity.decode_allowed_in_pp` -> False), so
+        # across the whole PP phase the counter is 0 BY CONSTRUCTION -- never
+        # because a bundle is young, which is the only thing the floor below
+        # can read it as.
+        #
+        # Read in PP, the test therefore degenerates to `running_bs > 0`:
+        # permanently True whenever any resident exists, and unable to become
+        # False through progress, because the progress it waits for is the one
+        # kind of work that layout may not do. `demand_prefill_tokens()` then
+        # short-circuits to 0, and `_strict_holds_pp` -- the #861d-2 guard
+        # whose entire stated job is that "the two directions cannot disagree
+        # about whether work exists" -- is disarmed in the very phase it
+        # guards.
+        #
+        # THE CLASS: a predicate evaluated in both phases whose governing input
+        # can only be produced in one of them is not a measurement in the other
+        # -- it is a constant wearing a measurement's name. The anti-chop floor
+        # is meaningful exactly where decode steps can accrue; where they
+        # cannot there is no bundle in flight to chop, and saying otherwise
+        # suppresses the demand that would send the work to the layout that can
+        # serve it.
+        #
+        # Third generation of this same term (#861e counted retracted requests
+        # and deadlocked W37-E, #861f replaced the measure, #861i wired the
+        # producer after finding it written nowhere). Each fix moved the defect
+        # along one axis; this one closes the axis they shared.
+        if not self.decode_runs_in_this_phase:
+            return False
         if int(self.running_bs or 0) <= 0:
             return False
         return int(self.decode_steps_this_phase or 0) < MIN_DECODE_STEPS_PER_PHASE
