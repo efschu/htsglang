@@ -301,6 +301,113 @@ def phase_pools_for(scheduler: Any, phase: str) -> PhasePools:
     )
 
 
+def settle_pending_releases(scheduler: Any) -> int:
+    """Free every queued host release AGAINST THE BINDING IT WAS ENQUEUED ON.
+
+    THE W35 CRASH, and the reason this is a SETTLE and not a discard.
+    Measured on metal 2026-08-25, all three ranks, seconds after the first
+    rebind this tree has ever armed:
+
+        AssertionError: Double-free detected: slots not currently allocated:
+          [0, 1, 2, ...]
+        check_hicache_events -> drain_storage_control_queues -> _drain_release
+          -> HostPoolGroup.free
+
+    ``cc.host_mem_release_queue`` holds bare index tensors naming host slots
+    allocated from the OUTGOING pool. ``rebind`` re-points ``mem_pool_host``
+    to the incoming one. The next ordinary scheduler round then drains those
+    entries and frees them against a pool that never handed those ids out.
+
+    THE CRITERION, DECIDED BY READING RATHER THAN GUESSED. Dropping stale
+    entries would be correct only if the outgoing pool died with them. It does
+    not: ``_stamp`` only re-points readers, nothing tears the outgoing pool
+    down, and ``scheduler.phase_flip_host_pools`` deliberately holds BOTH
+    phases for process life so the flip can alternate. The outgoing pool
+    therefore survives WITH LIVE ALLOCATIONS and comes back on the next flip --
+    so a dropped release is a real, recurring host-slot LEAK in a pool that is
+    about to be used again. Route, do not drop.
+
+    SETTLING BEATS ROUTING-AT-DRAIN, and it needs no second stamp scheme.
+    Routing later would mean stamping every entry at enqueue and carrying a
+    generation->pool map -- a parallel bookkeeping scheme beside the #719
+    generation, i.e. exactly the second-copy defect that cost W32. Here the
+    invariant is made true BY CONSTRUCTION instead: the binding changes in
+    exactly one place, so at this instant every queued entry belongs to the
+    binding still installed. Drain it now and no entry can ever outlive its
+    binding. The #719 generation stays the single coherence primitive and
+    gains a second consumer rather than a rival.
+
+    LOUD IN BOTH WRONG DIRECTIONS. A queue this cannot settle is REFUSED, not
+    silently skipped: the caller turns that into a refused rebind, which is
+    safe by construction (the binding does not move, so #718 keeps the device
+    tier disarmed -- the state that held before the feature existed). Silently
+    proceeding would trade a loud crash for a silent corruption, and silently
+    discarding would trade it for a silent leak.
+
+    Returns how many index blocks were settled, for the seam's log line.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    cc = getattr(tree_cache, "cache_controller", None)
+    if cc is None:
+        return 0
+    outgoing = getattr(cc, "mem_pool_host", None)
+    queue = getattr(cc, "host_mem_release_queue", None)
+    if outgoing is None or queue is None:
+        return 0
+
+    # The auxiliary per-component queues are NOT settled here, and that is a
+    # refusal rather than an omission: their entries route through per-pool
+    # allocators this function does not resolve, and guessing that routing on
+    # a free path is how a loud crash becomes a silent corruption. Non-empty
+    # means the rebind must not proceed.
+    extras = getattr(cc, "extra_host_mem_release_queues", None) or {}
+    pending_extra = {
+        str(name): q.qsize()
+        for name, q in extras.items()
+        if getattr(q, "qsize", None) and q.qsize() > 0
+    }
+    if pending_extra:
+        raise RebindRefused(
+            f"{LOG_PREFIX} cannot settle auxiliary host release queue(s) "
+            f"{pending_extra} before rebinding. Their entries name slots in "
+            "the OUTGOING pool and route through per-component allocators this "
+            "settle step does not resolve; draining them against the incoming "
+            "binding is the W35 double-free and dropping them leaks host slots "
+            "in a pool that returns on the next flip. Refusing leaves the "
+            "binding where it is, which keeps #718 disarmed -- the state that "
+            "held before this feature existed."
+        )
+
+    settled = 0
+    blocks = []
+    while True:
+        try:
+            blocks.append(queue.get_nowait())
+        except Exception:  # noqa: BLE001 - Empty, and any queue that mimics it
+            break
+    if not blocks:
+        return 0
+    try:
+        import torch
+
+        outgoing.free(torch.cat(blocks, dim=0))
+        settled = len(blocks)
+    except Exception as exc:  # noqa: BLE001 - a failed settle must be loud
+        raise RebindRefused(
+            f"{LOG_PREFIX} failed to settle {len(blocks)} queued host release "
+            f"block(s) against the outgoing pool ({exc}). The rebind is refused "
+            "rather than run over an unsettled queue."
+        ) from exc
+    logger.info(
+        "%s settled %d queued host release block(s) against the OUTGOING pool "
+        "before rebinding, so no release can outlive the binding it was "
+        "enqueued on (W35 double-free).",
+        LOG_PREFIX,
+        settled,
+    )
+    return settled
+
+
 def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
     """Flag-gated rebind at the cutover. Returns the generation, or None.
 
@@ -315,6 +422,10 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
         return None
     readers = readers_of(scheduler)
     incoming = phase_pools_for(scheduler, incoming_phase)
+    # W35: settle BEFORE the swap. Every queued release belongs to the binding
+    # still installed at this instant; after `rebind` it would be freed against
+    # a pool that never allocated it.
+    settle_pending_releases(scheduler)
     generation = rebind(readers, incoming)
     coherence_check(readers)
     return generation
