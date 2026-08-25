@@ -1426,6 +1426,13 @@ def build_cutover_release(scheduler):
             tree_cache=tree_cache,
             hisparse_coordinator=getattr(scheduler, "hisparse_coordinator", None),
             offload_kv=False,
+            # #783 half 1: THE ONE SITE THAT COPIES. `offload_kv=False` above
+            # skips the decode-disaggregation host copy (unreachable here --
+            # this rig runs disaggregation_mode='null'); `copy_state=True` is
+            # the seam's own copy, which leaves row ownership untouched. Set
+            # here and nowhere else, so the host cost stays priced at the flip
+            # cadence rather than at the decode-pressure rate.
+            copy_state=True,
         )
         # W30 SEAM STAMP. `Req.reset_for_retract` sets `is_retracted` /
         # `retracted_stain`, but those are NOT seam-specific: ordinary

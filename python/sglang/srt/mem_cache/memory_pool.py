@@ -2286,6 +2286,36 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def supports_mamba_cpu_copy(self) -> bool:
+        """#783: does THIS pool's `get_cpu_copy` actually move the mamba state?
+
+        DECLARED, NOT INFERRED FROM THE SIGNATURE. `get_cpu_copy` takes
+        `mamba_indices` on every pool in this tree and only `HybridLinearKVPool`
+        reads it -- it is the one that OWNS a `mamba_pool`. The others accept
+        the parameter and drop it, which is not a bug in them: a KV pool with no
+        mamba pool has nothing to copy and nothing to delegate to.
+
+        The damage was that a caller could not tell the two apart.
+        `Req.offload_kv_cache` promised "copies over both the kv cache and mamba
+        state" and, on this rig's pool, silently copied only the KV -- the
+        failure would surface as a phase flip that loses GDN state, with better
+        cache numbers arguing against looking further.
+
+        So the capability is stated by the class instead of implied by its
+        signature, and `Req` dispatches on the statement. This is a STRUCTURAL
+        property, not a query about what a call did at runtime: asking a pool
+        "did you honour that parameter?" is the very mechanism that produced the
+        silent drop, and it is deliberately not rebuilt here.
+
+        Form follows the existing house idiom for exactly this
+        (`BasePrefixCache.supports_mamba` / `supports_swa` /
+        `supports_streaming_session`): a plain predicate, False on the base,
+        overridden True by the class that can deliver. The allocator tree had no
+        such idiom of its own -- checked, see `allocator/base.py` -- so this
+        reuses the cache side's rather than inventing a second one.
+        """
+        return False
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
@@ -4348,6 +4378,13 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def supports_mamba_cpu_copy(self) -> bool:
+        """#783: TRUE, and the body below is the proof. This pool owns
+        `self.mamba_pool`, so the mover lives where the state lives -- `Req`
+        must NOT copy it a second time. Pinned by
+        test_unified_mamba_cpu_copy_783."""
+        return True
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)

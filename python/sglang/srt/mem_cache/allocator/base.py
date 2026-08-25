@@ -340,6 +340,36 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if getattr(self, "_owner_bias", None) is not None:
             self._apply_owner_bias()
 
+    def supports_mamba_cpu_copy(self) -> bool:
+        """#783: does the copy this allocator hands back carry the mamba state?
+
+        FORWARDED, because the allocator forwards the copy itself: every
+        concrete allocator here implements `get_cpu_copy` as
+        `self._kvcache.get_cpu_copy(...)`. If the declaration did not follow the
+        same hop, `Req` would ask the allocator (base default False) while the
+        underlying pool actually copies mamba, and the state would be copied
+        TWICE -- the mirror-image bug of the one this closes.
+
+        THE getattr DEFAULT IS LOAD-BEARING HERE, unlike at the `Req` callsite
+        where it was removed as dead defensive (#606/#608). Checked rather than
+        assumed: `UnifiedKVPool` (unified_memory_pool.py:177) and
+        `DeepSeekV4UnifiedKVPool` (deepseek_v4_memory_pool.py:390) declare NO
+        base class at all, so they do not inherit `KVCache.supports_mamba_cpu_
+        copy` and genuinely cannot answer. (`UnifiedSWAKVPool` DOES answer --
+        it reaches `KVCache` via `SWAKVPool` -> `BaseSWAKVPool`.)
+
+        A pool that cannot answer must read as "does not move mamba": `Req`
+        then copies it, and a redundant copy is a cost while a missing one is a
+        wrong answer.
+        """
+        return bool(
+            getattr(
+                getattr(self, "_kvcache", None),
+                "supports_mamba_cpu_copy",
+                lambda: False,
+            )()
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()

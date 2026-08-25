@@ -64,12 +64,12 @@ import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.distributed.device_communicators import lockstep_sentinel
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.distributed.device_communicators import lockstep_sentinel
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -1158,9 +1158,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert not self.kv_committed_freed, (
-            f"Committed KV cache already freed ({self.kv_committed_len=})"
-        )
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
         return self._cache_commit_len()
 
@@ -1170,9 +1170,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert not self.kv_overallocated_freed, (
-            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
@@ -1690,6 +1690,48 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = array("q")
 
+    #: #783: the mamba half of the copy, when the pool does not do it itself.
+    #:
+    #: SHAPE DECISION, MADE DELIBERATELY. `HybridLinearKVPool.get_cpu_copy`
+    #: returns a TUPLE `(kv_cpu, mamba_cpu)` and `UnifiedSWAKVPool` a DICT
+    #: `{"full", "swa"}` -- two shapes for one role, which is the next naming
+    #: error waiting to happen. This does NOT add a third, and does NOT unify
+    #: them: `Req` never inspects the allocator's payload, it only hands the
+    #: same object back to `load_cpu_copy`. The mamba copy therefore lives in
+    #: its own attribute, which works for every pool regardless of shape and
+    #: keeps `Req` independent of a decision that belongs to the pools.
+    #: Unifying the two payload shapes is a real cleanup and a separate one; it
+    #: touches every caller of both pools and is filed rather than smuggled in
+    #: here.
+    mamba_state_cpu: Optional[object] = None
+
+    def _mamba_cpu_copy_is_mine(self, token_to_kv_pool_allocator) -> bool:
+        """#783: does THIS caller own the mamba copy, or does the pool?
+
+        Exactly one of the two moves it -- Ein-Job-ein-Mover, enforced by a
+        declaration rather than promised by a comment. The pool that owns a
+        mamba pool declares `supports_mamba_cpu_copy()` and keeps its mover;
+        this path covers the pools that have no mamba pool to delegate to.
+
+        NO getattr DEFAULT HERE (#606/#608). Since `BaseTokenToKVPoolAllocator`
+        carries the method, every allocator that can be passed as
+        `token_to_kv_pool_allocator` ANSWERS: TokenToKVPoolAllocator,
+        PagedTokenToKVPoolAllocator, SWATokenToKVPoolAllocator (and its
+        PureSWA subclass), HiSparseTokenToKVPoolAllocator,
+        DeepSeekV4HiSparseTokenToKVPoolAllocator, MultiEndedAllocator,
+        UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator --
+        all of them inherit it. The only allocator classes in this tree that do
+        NOT are `MambaSlotAllocator` and `UnifiedMambaSlotAllocator`, which
+        allocate mamba SLOTS and are never passed here.
+
+        So a missing attribute would be a real defect, and an AttributeError
+        saying so is worth more than a silent False that would quietly make
+        `Req` copy state the pool had already copied.
+        """
+        if self.mamba_pool_idx is None:
+            return False
+        return not bool(token_to_kv_pool_allocator.supports_mamba_cpu_copy())
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1698,6 +1740,19 @@ class Req(ReqDllmMixin):
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
+        # #783: and when the pool declares it does NOT move mamba, move it here.
+        # Without this the comment above was false on this rig's pool: the KV
+        # came back and the GDN state did not.
+        self.mamba_state_cpu = None
+        if self._mamba_cpu_copy_is_mine(token_to_kv_pool_allocator):
+            mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+            if mamba_pool is not None:
+                translate = getattr(
+                    req_to_token_pool, "translate_mamba_indices", lambda ids: ids
+                )
+                self.mamba_state_cpu = mamba_pool.get_cpu_copy(
+                    translate(self.mamba_pool_idx)
+                )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1707,6 +1762,16 @@ class Req(ReqDllmMixin):
         token_to_kv_pool_allocator.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
+        if self.mamba_state_cpu is not None:
+            mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+            if mamba_pool is not None:
+                translate = getattr(
+                    req_to_token_pool, "translate_mamba_indices", lambda ids: ids
+                )
+                mamba_pool.load_cpu_copy(
+                    self.mamba_state_cpu, translate(self.mamba_pool_idx)
+                )
+            self.mamba_state_cpu = None
         del self.kv_cache_cpu
 
     def build_rebootstrap_payload(self) -> dict:
@@ -1865,9 +1930,34 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    copy_state: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
+
+    # #783 half 1: THE #856 CUTOVER COPIES ITS STATE OUT BEFORE LETTING GO.
+    #
+    # Default False, so every other caller is byte-identical: this is set at
+    # exactly ONE site, `build_cutover_release._retract`
+    # (phase_flip_runtime.py), and `retract_all`'s only other caller --
+    # `ScheduleBatch.retract_all`, the decode-pressure path -- never sets it.
+    # That single-site property is not cosmetic: the host budget (0.585 GiB per
+    # cutover, ~57 MiB/s aggregate) is priced at the FLIP CADENCE. Pressure
+    # retractions have a load-dependent rate, so a copy firing there would not
+    # make the estimate conservative, it would make it wrong.
+    #
+    # "Ungated by design" means NO FLAG -- no server arg, no env var. The
+    # condition is structural: this retraction is the cutover's.
+    #
+    # A COPY, NOT A HANDOVER. W37-H arm B persisted at this same instant by
+    # INSERTING into the tree and died 33 s in with `pool memory leak
+    # detected!`, 22 rows claimed twice, because `readmit_seam_residents`
+    # brings the population back onto rows the tree had taken. `offload_kv_
+    # cache` leaves row ownership untouched, which is what the seam ownership
+    # ledger test pins. Runs BEFORE `release_kv_cache` below, while the rows
+    # still hold live bytes.
+    if copy_state:
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
@@ -1884,6 +1974,36 @@ def release_req(
     req.reset_for_retract()
 
 
+def restore_seam_state(
+    req: Req,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """#783 half 2: put back what the cutover copied out, or do nothing.
+
+    Returns whether a restore happened, so the caller and the tests can tell
+    "restored" from "there was nothing to restore" without inspecting Req
+    internals.
+
+    THE GUARD IS THE COPY, NOT `is_retracted`. `is_retracted` is also True for
+    decode-PRESSURE retractions, and those never copied anything -- half 1
+    fires at exactly one site, `build_cutover_release._retract`. Keying on the
+    flag would ask for a restore that does not exist and force a soft failure,
+    which is the shape that hides defects. Keying on the PRESENCE OF THE COPY
+    is self-limiting by construction: only the population that copied can
+    restore. That is also why this needs no flag and no epoch check, even
+    though `seam_readmit_epoch` stamps the same population.
+
+    THE COPY IS CONSUMED. `load_kv_cache` drops `kv_cache_cpu` and clears
+    `mamba_state_cpu`, so a second pass over the same request finds nothing and
+    cannot re-apply stale bytes over state the model has since advanced.
+    """
+    if getattr(req, "kv_cache_cpu", None) is None:
+        return False
+    req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    return True
+
+
 def retract_all(
     *,
     reqs: List[Req],
@@ -1893,6 +2013,7 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    copy_state: bool = False,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -1905,6 +2026,7 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
+            copy_state=copy_state,
         )
     return retracted_reqs
 
@@ -2277,9 +2399,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens, (
-            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
-        )
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []
@@ -2511,6 +2633,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
+
+            # #783 half 2: THE CUTOVER POPULATION RESTORES INSTEAD OF
+            # RECOMPUTING. Placed HERE and not in `readmit_seam_residents`,
+            # which only re-queues: by then `reset_for_retract()` has cleared
+            # `req_pool_idx` and the rows are gone, so there is nothing to load
+            # into. `alloc_for_extend` above has just given this request rows
+            # back, which is the earliest instant a restore can write -- the
+            # same shape as the proven disagg path, `_pre_alloc(req)` then
+            # `load_kv_cache` (disaggregation/decode.py:730-736).
+            #
+            # BEFORE `is_retracted` is cleared on the next line, so the
+            # ordering is visible rather than incidental.
+            restore_seam_state(
+                req, self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
             req.is_retracted = False
 
             if server_args.enable_mamba_extra_buffer():
