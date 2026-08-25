@@ -15,6 +15,24 @@ entirely, a function of what else was running.
 
 ---
 
+## RESULT IN ONE BLOCK
+
+    partition          270 wide | 36 narrow | 0 serial | 3 excluded (need a card)
+    equivalence        PROVED, both directions, twice: serial and partitioned
+                       both 0 failures over the same 306 modules
+    speedup            2.22x   (766.62 s serial mean -> 345.78 s partitioned mean,
+                                quiet box, A-vs-A floor 0.07 % / 0.65 %)
+    planted mutant     CAUGHT, 3 named tests, in the wide lane
+    #860 divergence 1  NOT a test dependency -- it is `--dist loadscope`
+    standing 15        entirely the desk gate's own non-hermeticity, 0 real defects
+
+The limiter is named rather than smoothed: 35 rank-spawning modules, 11 % of
+the suite, carry 62 % of the gate's wall time. That is why this is 2.22x and
+not #860's 3.39x, and the 1.2x between them is the price of not shipping that
+family crowded (§4.4).
+
+---
+
 ## 0. TWO CORRECTIONS TO #860, NEITHER OF THEM SILENT
 
 `NOTE_860_xdist.md` is not edited. Both corrections are recorded here with the
@@ -237,9 +255,13 @@ structural — see §2.4.
 | verdict | count | meaning |
 |---|---|---|
 | `PARALLEL` | 270 | proof holds; wide lane, `-n 8 --dist loadfile` |
-| `RANKS` | 35 | proof holds, but the module spawns real ranks; narrow lane with a bounded worker count |
-| `SERIAL` | 1 | proof did not hold; one process, one order |
+| `RANKS` | 36 | proof holds, but the module spawns real ranks; narrow lane with a bounded worker count |
+| `SERIAL` | 0 | proof did not hold; one process, one order |
 | `EXCLUDED` | 3 | needs a real card, cannot run at the desk at all |
+
+The `SERIAL` column is empty on this tree — not by assumption, by 309
+measurements. It is kept in the schema because it is where the runner puts
+anything unproven, and because the next tree may need it.
 
 The lane split for `RANKS` is a CROWDING decision, not a correctness one, and
 it is read from the source (`multiprocessing`, `torch.distributed`,
@@ -273,9 +295,15 @@ solo measurements of this module were taken while my own sweeps were loading
 the box — so the instrument, not the module, produced the divergence.
 
 **Stated as a defect in my own measurement rather than repaired into a
-result.** The module is a rank spawner and its natural lane is `RANKS`; it sits
-in `SERIAL` until its solo probe is re-taken on a quiet box. That is the
-conservative direction: the slow lane, never the fast one.
+result.** The module is a rank spawner and its natural lane is `RANKS`; it was
+parked in `SERIAL` — the slow lane, never the fast one — until its solo probe
+could be re-taken on a quiet box.
+
+**RESOLVED, §7 ARM 0.** Re-probed alone on a confirmed-quiet box: **3 passed in
+31.02 s**, which equals its serial reference set. The proof holds; the earlier
+divergence was the instrument. It is now `RANKS`, and with it the table has
+**no `SERIAL` rows at all** — every module in the gate path either proved
+independent or needs a card.
 
 **Independently confirmed, from the other side, by a different runner.** R7's
 managers landing run on a separate tree returned 17 instead of the standing 15,
@@ -287,6 +315,36 @@ so the table row's reason is stated precisely: *a load-sensitive multi-rank
 deadline assert, observed independently twice, re-probe on a quiet box
 outstanding* — not *fails solo, cause unknown*. A reader can tell from that
 whether to trust the row.
+
+### 2.4b Three runners, three failure sets, one shared member
+
+Three independent runs of this suite, in three trees, under three different
+kinds of load, produced three non-baseline failure sets on top of the standing
+15:
+
+| runner | form | non-baseline failures |
+|---|---|---|
+| R7 | serial, live serving instance on the box, 1097 s vs 716 s baseline | 2: `pp_admission_wraparound_never_blocks`, `pp_output_ring_retraction_wedge_791b` |
+| R9 | `-n 8 --dist loadfile`, whole suite, no partition, 290 s | 3: `pp_void_send_contract_801`, `pp_flip_leftover_proxy_757`, `pp_admission_wraparound_never_blocks` |
+| this note | solo sweep at `-P 6` | 1: `pp_admission_wraparound_never_blocks` |
+
+**Every name in all three sets is a rank spawner, and every one is in the
+narrow lane of this table.** R9's three and R7's two all pass serially in
+isolation on a quiet box; so does the shared member (§7 ARM 0, 3 passed /
+31.02 s).
+
+The intersection of the three sets is exactly one module — the one that also
+happens to be the most load-sensitive of them. That is what a crowding class
+looks like when it is sampled three times: the membership varies with the
+pressure, the FAMILY does not. It is `NOTE_860 §1`'s divergence 2 observed a
+third and fourth time, and it is why the family gets a bounded lane instead of
+a full-width one.
+
+**R9's run is also the counterfactual for the partition.** Same engine, same
+`loadfile`, same suite, no partition table: 3 spurious reds in 290 s. With the
+partition: 0 spurious reds in ~345 s. The 55 s is the price, and it buys the
+difference between a gate that must be re-run serially to interpret its red and
+one that does not.
 
 ### 2.5 The crowding reason has a NAME, and it is narrower than "spawns ranks"
 
@@ -477,6 +535,80 @@ at it from module names would be exactly the unchecked-indicator move.
 
 ---
 
+---
+
+## 4.4 THE TIMED ARMS — quiet box, A-vs-A first
+
+Taken only after a MEASURED quiet condition, not an assurance: no pytest
+process outside this tree (checked by `/proc/<pid>/cwd`, not by command-line
+pattern), load below 3, a 60 s settle, and the condition RE-checked after the
+settle because a foreign run can start during it — which it twice did.
+Overrun was wired as a finding with a 40-minute deadline, not as an unbounded
+wait. The gate opened at 22:59:04Z at load 1.02. All four arms hermetic, back
+to back, same takt, nothing else of mine running.
+
+    ARM 0  solo re-probe, test_pp_admission_wraparound_never_blocks   3 passed / 31.02 s
+
+| arm | form | wall | failures | `--prove` |
+|---|---|---|---|---|
+| S1 | serial, one process, 306 modules | **766.88 s** | 0 | EQUAL |
+| S2 | serial, repeat | **766.36 s** | 0 | EQUAL |
+| P1 | partitioned, `-n 8` / narrow `-n 4` | **344.66 s** | 0 | EQUAL |
+| P2 | partitioned, repeat | **346.90 s** | 0 | EQUAL |
+
+**A-vs-A noise floor first, per the benchmark discipline:** serial 0.52 s
+apart (0.07 %), partitioned 2.24 s apart (0.65 %). The floor is small enough
+that the difference between the forms is a measurement and not a hope.
+
+**Speedup 2.22x** (766.62 s mean serial ÷ 345.78 s mean partitioned).
+
+Stated against the right denominator: **this tree's own serial arm on this
+quiet box**, not `NOTE_860 §1`'s 717.49 s, which was measured in a different
+quiet window against a different module-count reading. Both numbers are real
+and they answer different questions.
+
+**2.22x, not 3.4x, and the reason is arithmetic rather than disappointing.**
+The lane breakdown of P1:
+
+    wide   lane    98.58 s   270 modules  (-n 8)
+    narrow lane   213.82 s    35 modules  (-n 4)     <- 62 % of the gate
+    serial lane    32.26 s     1 module
+
+**The rank-spawning family is the gate.** 35 of 306 modules — 11 % of the
+modules — carry 62 % of the wall time, because they spawn real ranks and wait
+out real timeouts, and their bounded lane is what keeps them honest. #860's
+3.39x was measured with that family crowded at full width, which is exactly
+what produced its flaky divergence 2. The 1.2x that separates the two numbers
+is the price of the correctness, and it is visible rather than argued: it is
+the difference between running that family at `-n 8` and at `-n 4`.
+
+**AND THE EQUIVALENCE IS PROVED.** Four arms, both forms, both directions,
+zero failures each, `EQUAL` reported by the runner's own two-sided check
+against the serial reference. §4.1's NOT EQUAL was, as the serial lane's own
+failure indicated at the time, the box and not the partition.
+
+The one caveat on the numbers, stated because it changes them slightly: ARM 0
+resolved §2.4 AFTER P1/P2 ran, so those arms had that module in the serial
+lane (32.26 s). Promoting it to the narrow lane moves that work; the gate total
+above is therefore a very slight over-estimate of the shipped table's cost, not
+an under-estimate.
+
+### 4.5 An observation that is NOT a result, filed rather than concluded
+
+The wide lane took **98.58 s at `-n 8`** here, and an earlier arm measured
+**48.60 s at `-n 4`** for the identical 270 modules and 3798 tests — under
+FOREIGN LOAD, which should have made it slower, not twice as fast. Two
+variables differ between those runs, so this is a hint and not a finding.
+
+If it holds, the wide lane is startup-bound rather than compute-bound: each
+xdist worker imports the whole of `sglang`, and 270 fast modules do not give
+eight workers enough work to amortise eight imports. Halving the wide lane
+would take the gate from ~345 s to under 300 s. **It needs one clean A/B at
+`-n 4` vs `-n 8` on a quiet box and it was not run** — the measurement quota
+was four arms and it was spent on the question that had to be answered.
+
+---
+
 ## 5. ROOT BEFORE EFFECT — the three questions, answered
 
 **1. What is the CLASS of the defect, not the instance?**
@@ -527,25 +659,36 @@ by not running it.
 Recorded as owed rather than quietly dropped, in the same form #860 used for
 its own unrun arm.
 
-* **The equivalence proof.** §4.1 ran and returned NOT EQUAL, with the cause
-  attributed to §2.5's simultaneity class on a loaded box — including a lane
-  that has no parallelism in it at all and failed anyway. It needs ONE arm on a
-  quiet box to settle, and until that arm exists this note claims no
-  equivalence.
-* **The solo re-probe of `test_pp_admission_wraparound_never_blocks.py`**
-  (§2.4), same reason, same one quiet arm. Until then its row stays `SERIAL`.
-* **Timings — deliberately NOT taken.** The box carried a foreign gate, then a
-  window boot, then a serving instance, throughout. Per `NOTE_860 §0.6b`, "no
-  foreign pytest" is not "quiet", and a speedup measured against a contaminated
-  denominator is flattering in exactly the direction that must never be taken
-  on trust. Two arms were started at 22:08:32Z on a briefly quiet box and
-  killed 21 s later when a boot was scheduled; no number from them is reported.
-  The denominator will be this tree's own serial arm on a quiet box, not #860's
-  717.49 s, which was measured in a different quiet window against a different
-  module-count reading. The wall times printed by the arms in §4 are on a box
-  under foreign load and are recorded in the logs, not quoted as a result.
+DONE and no longer owed: the equivalence proof and the solo re-probe (§4.4),
+and the mutant arm (§4.2). §4.1's NOT EQUAL stands in this note as the record
+of a measurement taken under conditions that could not answer the question, and
+of how the cause was separated from the coincidence — not as the verdict.
+
+Still owed:
+
+* **The `-n 4` vs `-n 8` A/B for the wide lane** (§4.5). One arm, worth
+  possibly 50 s off the gate; the measurement quota was spent on equivalence,
+  which was the question that had to be answered first.
 * **A tighter marker for the simultaneity class** (§0.3): the lane heuristic
   reads rank spawning, which is sufficient but not necessary. A source probe
   for wall-clock margins would also catch
   `test_pp_wedge_watchdog_is_honest_821.py`.
 * **The #864 question** (§4.3), which needs its own suite and its own run.
+
+### 6.1 One caution, because the finding is already in use
+
+Within an hour of §0.2 being measured, an `-n 8 --dist loadfile` run of this
+same suite was observed in a different tree. That is the finding working, and
+the two halves of it travel at different speeds — so the distinction matters:
+
+* **`loadscope` → `loadfile` is proved on its own**, by three arms over ONE
+  module with nothing else in the run (§0.2). It does not depend on anything
+  else in this note, and it is safe to adopt today.
+* **Running the whole suite in parallel is NOT proved yet.** That rests on the
+  partition (§1), and its equivalence arm is still owed (§4.1). A full-suite
+  `-n 8` run without the partition table has no admission proof behind it, no
+  recorded-failure check under it, and no exclusion report on top of it.
+
+Adopting the first while the second is outstanding is fine. Reading a green
+from the second because the first is proved would be the error, and it is the
+kind that looks like progress.

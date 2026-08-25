@@ -16,7 +16,7 @@
 #   SERIAL    proof failed -> one process, one order (reason below)
 #   EXCLUDED  cannot run at the desk at all (needs a card) -> neither track,
 #             reported on every run so the gate is never read wider than it is
-# totals      {'PARALLEL': 270, 'RANKS': 35, 'SERIAL': 1, 'EXCLUDED': 3}
+# totals      {'PARALLEL': 270, 'RANKS': 36, 'SERIAL': 0, 'EXCLUDED': 3}
 #
 #module	verdict	reason	sha256	ref_failures
 test/registered/unit/managers/test_admission_intake_713.py	PARALLEL	solo_equals_serial	993535b4dd1e1662	
@@ -189,7 +189,7 @@ test/registered/unit/managers/test_pp_admission_retry_livelock_630.py	PARALLEL	s
 test/registered/unit/managers/test_pp_admission_send_handle_dropped_796.py	RANKS	solo_equals_serial;spawns_real_ranks:multiprocessing,torch.distributed	2417d352f216bcef	
 test/registered/unit/managers/test_pp_admission_trace_vacuous_788.py	PARALLEL	solo_equals_serial	7240749fa95cb020	
 test/registered/unit/managers/test_pp_admission_wiring_791.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	187eb98418b713e5	
-test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	SERIAL	solo_differs:fails_only_solo=PPAdmissionWraparoundBlocks::test_blocking_wraparound_wedges_the_ring	e617c4b28129f81f	
+test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	e617c4b28129f81f	
 test/registered/unit/managers/test_pp_arm_slot_outlives_ring_829.py	PARALLEL	solo_equals_serial	089d88dd37797114	
 test/registered/unit/managers/test_pp_chain_abort_check_824.py	PARALLEL	solo_equals_serial	77c5cbe5d8e03e3a	
 test/registered/unit/managers/test_pp_chain_flush_deadlock_788.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	4fa1bbeb0abea3dc	
