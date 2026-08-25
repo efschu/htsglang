@@ -4566,6 +4566,89 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
+    def readmit_seam_residents(self, reqs: List[Req]) -> int:
+        """W31: put the residents the #856 cutover retracted BACK ON THE QUEUE.
+
+        THE MISSING HALF OF #856. The seam's own log line has always promised
+        "their KV is in the canonical store from the fence; the new layout
+        RE-ADMITS them and serves the prefix by read-through" -- and nothing
+        did the re-admitting. `retract_all` returns the list it retracted,
+        `_release_residents_for_cutover` returned it upward, and its caller
+        discarded it. The requests were prefilled once, retracted at the next
+        cutover, and never seen again.
+
+        W31 arm 2 measured exactly that (SPECIMEN_w31_a2_residents_never_
+        readmitted.log): 28 distinct rids, each admitted EXACTLY ONCE ever
+        (three log lines apiece, one per rank), 14 requests prefilled once,
+        78 requests retracted by the seam, and ZERO completions -- every
+        client waited out its 600 s timeout. Two windows (W30, W31) read as a
+        flip "livelock" were in truth the flip ping-ponging over an instance
+        whose work it had already dropped on the floor.
+
+        FRONT OF THE QUEUE, AS A BLOCK, IN ARRIVAL ORDER. These are the OLDEST
+        work in the instance and they are the flip's own justification -- the
+        tp-ward arm fires *because* they are ready to decode, and under strict
+        batching the target phase exists to serve precisely them. Appending
+        them behind newly arrived prefill would let a busy instance starve the
+        bundle it just flipped for, which is the same starvation the phase
+        policy's fairness window exists to prevent. Original arrival order is
+        preserved by `kv_arrival_seq`, which `_add_request_to_queue` already
+        keeps across a retracted re-queue.
+
+        REUSES THE ONE QUEUE AUTHORITY rather than hand-rolling a second
+        mover: `_add_request_to_queue(req, is_retracted=True)` carries the
+        priority validation, the queued-limit abort, the retract timestamp
+        and -- load-bearing here -- `_prefetch_kvcache`, which is what makes
+        the promised read-through actually hit. This method then moves the
+        block it just queued to the front; it does not re-implement queueing.
+
+        ORDERING AGAINST THE LIVE UNIVERSE IS THE CALLER'S, AND IT IS STRICT:
+        `consume_retracted_from_live_universe` runs FIRST (inside the retract
+        closure), this runs SECOND. A request that were both live-referenced
+        and queued would be counted twice by every consumer that sums the two
+        -- the #731 double-billing shape this tree has already paid for once.
+
+        Returns how many were re-admitted, so the seam can assert
+        retracted == readmitted rather than hope.
+        """
+        if not reqs:
+            return 0
+        before = len(self.waiting_queue)
+        block: List[Req] = []
+        for req in reqs:
+            if getattr(req, "finished", None) is not None and req.finished():
+                # A request whose client gave up between retraction and here
+                # must not be re-admitted into a queue nobody is waiting on.
+                continue
+            self._add_request_to_queue(req, is_retracted=True)
+            block.append(req)
+        if not block:
+            return 0
+        # Move exactly the block just queued to the FRONT, in arrival order.
+        # Identity-keyed: `_add_request_to_queue` may legitimately refuse a
+        # request (priority validation, queued-limit abort), and one that never
+        # landed must not be conjured into the queue here.
+        landed = {id(r) for r in block}
+        queued_block = [r for r in self.waiting_queue if id(r) in landed]
+        rest = [r for r in self.waiting_queue if id(r) not in landed]
+        queued_block.sort(
+            key=lambda r: r.kv_arrival_seq if r.kv_arrival_seq is not None else 0
+        )
+        self.waiting_queue = queued_block + rest
+        n = len(queued_block)
+        logger.info(
+            "PHASE-FLIP SEAM RE-ADMISSION: %d retracted resident(s) put back "
+            "at the FRONT of the waiting queue in arrival order (queue %d -> "
+            "%d). They are the oldest work and the flip's own justification; "
+            "their prefixes are served by read-through from the canonical "
+            "store. Without this the seam retracts and DROPS them, which is "
+            "what produced zero completions in W30 and W31.",
+            n,
+            before,
+            len(self.waiting_queue),
+        )
+        return n
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:

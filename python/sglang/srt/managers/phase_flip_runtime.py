@@ -8365,6 +8365,95 @@ class PhaseFlipRuntime:
             int(getattr(self, "_retracted_refs_retired", 0)),
             "UNKNOWN" if tree_rows["returned"] is None else tree_rows["returned"],
         )
+        # W31: RE-ADMIT THEM. THIS IS THE HALF #856 NEVER SHIPPED.
+        #
+        # The line just logged has promised, on every flip of every boot, that
+        # "the new layout re-admits them and serves the prefix by
+        # read-through". Nothing did. `released` was computed here and thrown
+        # away by the caller, so W30 and W31 both dropped every request the
+        # seam retracted -- 78 of them in W31 arm 2, with zero completions and
+        # every client timing out at 600 s.
+        #
+        # THE ABORT PATH IS CORRECT BY CONSTRUCTION BECAUSE IT HAPPENS HERE.
+        # Requeuing at the release site means there is NO window in which the
+        # list exists and is not owned by someone: if the cutover raises after
+        # this point the flip abandons, the layout is unchanged, and the
+        # requests are already back on the queue of the SOURCE layout, which
+        # is exactly where an abandoned flip should leave them. Deferring the
+        # requeue to the end of the cutover would recreate the current defect
+        # for precisely the abort case.
+        #
+        # ORDER (#731 shape): `_retract_and_consume` has already removed every
+        # one of these from the live universe. Consume FIRST, requeue SECOND,
+        # never both at once -- a request that is simultaneously
+        # live-referenced and queued is double-billed by every consumer that
+        # sums the two.
+        #
+        # RANK-UNIFORM: the cutover is group-unanimous and retracts the same
+        # resident set on every rank, `kv_arrival_seq` is assigned identically
+        # on every rank (its own comment: "the admission order is identical on
+        # every TP rank, so the counter is rank-uniform"), and the ordering
+        # below is a pure function of it. So every rank rebuilds the same
+        # queue in the same order -- the property `waiting_queue` consumers
+        # already depend on.
+        # #703 FENCE COVERAGE, ASSERTED RATHER THAN ASSUMED.
+        #
+        # The re-admission's whole premise is that these prefixes are already
+        # in the canonical store, so the read-through hits and nothing is
+        # recomputed. That premise is the FENCE's output, and
+        # `_writeback_fence_ms` returns None for "NO FENCE RAN" -- a state
+        # that is real (the fence is skipped outright without a canonical
+        # store) and that must never be silently read as "fenced, cost 0 ms".
+        # Re-admitting into an unfenced instance is not a wrong answer -- the
+        # prefix simply misses and is recomputed -- but it is a silent
+        # performance cliff on the exact path this design is built to avoid,
+        # so it is named here.
+        if (
+            released
+            and _writeback_fence_ms(getattr(self, "_last_writeback_report", None))
+            is None
+        ):
+            logger.warning(
+                "%s #856/W31: re-admitting %d resident(s) for %s with NO "
+                "WRITEBACK FENCE RECORDED. Their prefixes may not be in the "
+                "canonical store, so the read-through this design promises "
+                "can only MISS and the tokens are recomputed. Not a wrong "
+                "answer, but the cliff this whole no-carry seam exists to "
+                "avoid -- and it is named rather than inferred from a slow "
+                "boot later.",
+                LOG_PREFIX,
+                n,
+                direction,
+            )
+        readmitted = 0
+        try:
+            readmitted = scheduler.readmit_seam_residents(list(released or ()))
+        except Exception:  # noqa: BLE001 - never strand a flip mid-release
+            logger.error(
+                "%s #856/W31: RE-ADMISSION FAILED for %s after %d request(s) "
+                "were already retracted. Those requests are now owned by "
+                "nobody -- this is the W31 defect happening live, and it is "
+                "logged rather than raised only because the residents are "
+                "already released and raising here would strand the flip.",
+                LOG_PREFIX,
+                direction,
+                n,
+                exc_info=True,
+            )
+        if readmitted != n:
+            # RETRACTED MUST EQUAL READMITTED. Anything else means requests
+            # were dropped, and dropping them silently is the whole W31
+            # defect. Loud and greppable so the next boot's first check is
+            # arithmetic rather than inference.
+            logger.error(
+                "%s #856/W31 RE-ADMISSION MISMATCH for %s: retracted %d but "
+                "re-admitted %d. The difference is requests owned by nobody.",
+                LOG_PREFIX,
+                direction,
+                n,
+                readmitted,
+            )
+        self._seam_readmitted = readmitted
         return released
 
     def _releasable_cache_bytes(self):
