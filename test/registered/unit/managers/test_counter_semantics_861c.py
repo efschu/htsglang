@@ -174,3 +174,60 @@ def test_can_fail_the_future_check_sees_a_reverted_site():
     seg = "idle = inp.running_bs == 0 and inp.pending_prefill_tokens == 0"
     assert "work_exists" not in seg and "admissible_prefill_tokens" not in seg
     assert isinstance(node, ast.Assign)
+
+
+# ----------------------------------------------- #861d-2 SYMMETRY PINS
+#
+# CLASS RULE, added after the THIRD instance in 24h of "a term answers a
+# different question than the decision needs" (F2 blind, demand blind, demand
+# inverted): every existence/demand term needs BOTH pins -- it must FIRE when
+# work exists and be SILENT when none does. One pin alone is how a blind term
+# and an inverted term both pass their own tests.
+
+
+def test_demand_fires_on_the_d2_wedge_specimen():
+    """7 queued, 0 running, GPU 0%, no first token for 589s. Nothing is served
+    by staying, so the flip must be demanded."""
+    inp = make_inputs(
+        pending_prefill_tokens=0, admissible_prefill_tokens=5988, running_bs=0
+    )
+    assert inp.demand_prefill_tokens() == 5988
+
+
+def test_demand_is_SILENT_on_the_d3_pingpong_specimen():
+    """THE INVERSE DEFECT. Same queue, but two requests DECODING: 18 armings
+    chopped the bundle mid-flight, epochs 13/14 in six minutes, COMPLETIONS 0.
+    Drain, THEN flip -- an arm may not destroy its own justification (W30)."""
+    inp = make_inputs(
+        pending_prefill_tokens=0, admissible_prefill_tokens=5988, running_bs=2
+    )
+    assert inp.demand_prefill_tokens() == 0
+
+
+def test_demand_is_silent_when_there_is_genuinely_nothing():
+    assert make_inputs(running_bs=0).demand_prefill_tokens() == 0
+
+
+def test_demand_still_fires_for_an_ordinary_uncached_backlog():
+    inp = make_inputs(pending_prefill_tokens=32768, running_bs=0)
+    assert inp.demand_prefill_tokens() == 32768
+
+
+def test_verdict_and_message_come_from_one_read():
+    """#713, violated by d3: 18 lines reading "pending prefill 0 tok > 0" --
+    a verdict of >0 printed beside a 0. The arm must show the number it used."""
+    import inspect
+
+    import sglang.srt.managers.phase_policy as pp
+
+    src = inspect.getsource(pp)
+    assert "demand_tokens = inp.demand_prefill_tokens()" in src
+    assert "_shown" in src, "the message must print the read the verdict used"
+
+
+def test_demand_is_the_single_definition():
+    import inspect
+
+    import sglang.srt.managers.phase_policy as pp
+
+    assert inspect.getsource(pp).count("def demand_prefill_tokens") == 1

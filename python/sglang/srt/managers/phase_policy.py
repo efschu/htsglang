@@ -1880,6 +1880,43 @@ class PhasePolicyInputs:
     #: can only reproduce today's behaviour and never invent new work.
     admissible_prefill_tokens: int = 0
 
+    def demand_prefill_tokens(self) -> int:
+        """Tokens of UNSTARTED queued prefill that justify DEMANDING a flip.
+
+        #861d-2, and it is a narrower question than ``work_exists()``.
+
+        THE TWO SPECIMENS THIS MUST SATISFY AT ONCE, both from tonight:
+
+          d2  7 queued, **0 running**, GPU 0 %, no first token for 589 s.
+              The demand MUST fire: nothing is decoding, so nothing is served
+              by staying, and the queued work can only run in the other layout.
+          d3  queued seam-transport re-admissions and **2 decoding**. The
+              demand must NOT fire: 18 armings chopped decode mid-bundle,
+              epochs 13/14 in six minutes, COMPLETIONS 0. The bundle this TP
+              window exists to finish was destroyed by the arm meant to help
+              the queue.
+
+        The discriminator is therefore ``running_bs``, not the token count:
+        DRAIN, THEN FLIP. While decode is in flight the queue waits -- that is
+        the user's law, not a compromise with it ("aller Decode in TP, dann
+        aller Prefill in PP"). With nothing decoding, any queued prefill work
+        demands the layout that can run it, whatever its cached status.
+
+        This is also W30's own rule read forward: AN ARM MAY NOT DESTROY ITS
+        OWN JUSTIFICATION. An arm justified by "the queue is starving" that
+        interrupts the decode which would empty the running set destroys
+        exactly the progress it claims to want.
+
+        Returns 0 while decode is in flight, so the caller's verdict and its
+        message can both be this single number (#713).
+        """
+        if int(self.running_bs or 0) > 0:
+            return 0
+        return max(
+            int(self.pending_prefill_tokens or 0),
+            int(self.admissible_prefill_tokens or 0),
+        )
+
     def work_exists(self) -> bool:
         """Is a prefill pass owed SOMEWHERE? The existence question, once.
 
@@ -2813,7 +2850,15 @@ def _decide_from_load(
         # the QUESTION a site asks depends on the purity mode, not on the site
         # alone. Recorded as a sweep-completeness failure rather than a new
         # class -- the class ("one number, two questions") was already named.
-        strict_demands_flip = bool(inp.work_exists()) and not cfg.prefill_runs_in_tp
+        # #861d-2: ONE READ FEEDS THE VERDICT AND THE MESSAGE (#713).
+        #
+        # The first cut computed the verdict from `work_exists()` and printed
+        # `pending_prefill_tokens`, so all 18 armings of boot d3 read
+        # "pending prefill 0 tok > 0" -- a verdict of >0 beside a printed 0.
+        # That is unreadable, and it is the exact rule #713 exists for: a
+        # decision and its explanation must come from the SAME read.
+        demand_tokens = inp.demand_prefill_tokens()
+        strict_demands_flip = demand_tokens > 0 and not cfg.prefill_runs_in_tp
         if inp.pending_prefill_tokens > tp_threshold or strict_demands_flip:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
@@ -2861,10 +2906,18 @@ def _decide_from_load(
                     f"decoding ({inp.pending_prefill_tokens} tok prefill "
                     f"waiting for the next pp window)"
                 )
+            # #713 / #861d-2: the number printed is the number the verdict
+            # used. d3 printed `pending_prefill_tokens` beside a verdict taken
+            # from a different read and produced 18 lines of "0 tok > 0".
+            _shown = (
+                inp.pending_prefill_tokens
+                if inp.pending_prefill_tokens > tp_threshold
+                else demand_tokens
+            )
             return PhasePolicyDecision(
                 TP_TO_PP,
-                f"pending prefill {inp.pending_prefill_tokens} tok > "
-                f"{'N=' + str(n_live) + f' (seam {seam_s:.2f}s {priced})' if cfg.prefill_runs_in_tp else '0 (purity: prefill cannot run in tp)'}",
+                f"pending prefill {_shown} tok > "
+                f"{'N=' + str(n_live) + f' (seam {seam_s:.2f}s {priced})' if cfg.prefill_runs_in_tp else '0 (purity: prefill cannot run in tp, nothing decoding)'}",
             )
         # Nothing to do, and the resting layout is PP -> return to rest.
         if idle and cfg.rest_phase == PHASE_PP:
@@ -2929,7 +2982,11 @@ def _decide_from_load(
         # prefill work exists, whatever that work costs. Under relaxed purity
         # the economics stand: TP can prefill there, so leaving is a price
         # question and `pending <= N` is the right one to ask.
-        _strict_holds_pp = bool(inp.work_exists()) and not cfg.prefill_runs_in_tp
+        # #861d-2: the SAME single read as the tp->pp arm, so the two
+        # directions cannot disagree about whether work exists.
+        _strict_holds_pp = (
+            inp.demand_prefill_tokens() > 0 and not cfg.prefill_runs_in_tp
+        )
         if (
             inp.pending_prefill_tokens <= cfg.pp_exit_tokens
             and inp.running_bs > 0
