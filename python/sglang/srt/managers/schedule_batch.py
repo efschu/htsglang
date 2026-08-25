@@ -1628,6 +1628,25 @@ class Req(ReqDllmMixin):
         self.cached_prompt_tokens_at_retract = max(
             0, min(int(computed), len(self.origin_input_ids))
         )
+        # #861f: THE EXISTENCE STAMP, beside the economics credit above.
+        #
+        # `cached_prompt_tokens_at_retract` answers "how much of this prompt
+        # will be cheap to redo" -- an ECONOMICS question, and it credits the
+        # ENTIRE prompt to any request that produced even one output token
+        # (see the branch above). W37-E showed why that cannot double as an
+        # existence signal: seven retracted requests each carried n>=1 output
+        # tokens, were credited their whole prompt, and every backlog counter
+        # therefore read 0 while they sat unservable in the queue for 198 s.
+        #
+        # This field answers the different question: does this request still
+        # need a PREFILL PASS before it can decode again? After a retraction
+        # the answer is always yes -- the seam drops the prefix tree, so the
+        # KV must be re-materialised whatever the credit says. Cleared by the
+        # admission path when the pass has actually run.
+        #
+        # Declared in cutover_participants.MUTATED_STATE as DURING_CUTOVER:
+        # it is written BY the retraction and is only meaningful afterwards.
+        self.needs_prefill_pass = True
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None

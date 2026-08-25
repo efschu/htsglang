@@ -3814,6 +3814,23 @@ class Scheduler(
                 n = len(ids) if ids is not None else 0
             except TypeError:
                 n = 0
+            if n <= 0:
+                continue
+            # #861f: A RETRACTED REQUEST OWES A FULL PASS, WHATEVER THE CREDIT.
+            #
+            # This used to subtract `cache_protected_len`, and W37-E showed
+            # both that field and the retract credit read the request as fully
+            # computed: seven requests with n>=1 output tokens were credited
+            # their entire prompt, both backlog counters read 0, and nothing
+            # flipped for 198 s while they starved.
+            #
+            # The subtraction was an ECONOMICS habit in an EXISTENCE term. For
+            # "must a pass happen", a request the seam retracted needs the
+            # whole pass -- the prefix tree it was credited against was dropped
+            # by that same seam. `needs_prefill_pass` says so explicitly.
+            if getattr(req, "needs_prefill_pass", False):
+                total += n
+                continue
             try:
                 done = int(getattr(req, "cache_protected_len", 0) or 0)
             except (TypeError, ValueError):

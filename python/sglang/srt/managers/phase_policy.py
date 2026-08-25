@@ -1827,6 +1827,14 @@ class PhasePolicyState:
     hold_phase: str = ""
 
 
+#: #861f: decode steps a TP phase owes a live bundle before a flip may pull the
+#: layout away. Measured in COMPLETED STEPS, not seconds: a seconds floor
+#: cannot distinguish a fast bundle from a stalled one, and W37-D/d4 produced
+#: exactly one token per flip cycle while every seconds-based guard was happy.
+#: Small on purpose -- this is an anti-chop floor, not a scheduling quantum.
+MIN_DECODE_STEPS_PER_PHASE = 8
+
+
 @dataclass(frozen=True)
 class PhasePolicyInputs:
     """A replicated snapshot of the load. Every field MUST be identical on
@@ -1887,6 +1895,29 @@ class PhasePolicyInputs:
     #: work that genuinely exists.
     retracted_unfinished_bs: int = 0
 
+    #: #861f: decode steps COMPLETED since this TP phase began. The d4-thrash
+    #: protection, measured in work actually done rather than in wall seconds
+    #: (a seconds floor cannot tell a fast bundle from a stalled one) and
+    #: rather than in "requests that exist" (which is what deadlocked W37-E).
+    #: 0 on every stand-in, which reproduces the pre-#861f behaviour exactly.
+    decode_steps_this_phase: int = 0
+
+    def bundle_is_mid_flight(self) -> bool:
+        """Is a decode bundle running that a flip would chop? #861f.
+
+        REPLACES the #861e formulation that deadlocked. The question is not
+        "does decode work exist somewhere" -- a retracted request in the queue
+        is not decoding and answering yes for it is what wedged W37-E. The
+        question is whether THIS TP phase has a live bundle that has not yet
+        had a fair share of steps.
+
+        d4 (thrash): residents decoding, few steps done -> True, hold.
+        W37-E (wedge): nothing resident, 7 queued retracted -> False, flip.
+        """
+        if int(self.running_bs or 0) <= 0:
+            return False
+        return int(self.decode_steps_this_phase or 0) < MIN_DECODE_STEPS_PER_PHASE
+
     def decode_work_bs(self) -> int:
         """Decode work that EXISTS, not decode work currently installed. #861e.
 
@@ -1929,7 +1960,27 @@ class PhasePolicyInputs:
         rid be636087 across epochs read n=2,3,4,5,...,13 -- strictly
         increasing, never re-bootstrapped (#775 refuted on this boot).
         """
-        return int(self.running_bs or 0) + int(self.retracted_unfinished_bs or 0)
+        # #861f ROOT FIX: GENUINELY RESIDENT DECODING ONLY.
+        #
+        # W37-E proved the #861e formulation wrong by deadlock. Adding
+        # `retracted_unfinished_bs` here made a RETRACTED request count as
+        # decode work, so the demand term stayed silent for requests that were
+        # not decoding at all -- they were sitting in the waiting queue needing
+        # a prefill pass, which TP may not run. Nothing flipped, nothing
+        # prefilled, GPU 0 % for 198 s with 7 queued.
+        #
+        # THE CLEAN ROOT: a retracted-unfinished request IS NOT DECODE WORK.
+        # It is PREFILL work waiting for the pp layout -- it needs a pass to be
+        # re-materialised before it can decode again. So it belongs on the
+        # DEMAND side, and counting it here was the category error.
+        #
+        # `retracted_unfinished_bs` is KEPT on the input (the seam still
+        # reports it, and the d4 thrash pin still reads it) but it no longer
+        # suppresses the flip. What protects a live bundle from being chopped
+        # is `decode_steps_this_phase` below -- a floor measured in COMPLETED
+        # DECODE STEPS rather than in "requests that exist somewhere", which is
+        # what d4 actually needed and what this field was standing in for.
+        return int(self.running_bs or 0)
 
     def demand_prefill_tokens(self) -> int:
         """Tokens of UNSTARTED queued prefill that justify DEMANDING a flip.
@@ -1961,9 +2012,10 @@ class PhasePolicyInputs:
         Returns 0 while decode is in flight, so the caller's verdict and its
         message can both be this single number (#713).
         """
-        # #861e: decode work that EXISTS, not what is currently installed.
-        # `running_bs` alone is manufactured by the cutover one line earlier.
-        if self.decode_work_bs() > 0:
+        # #861f: hold only for a bundle that is genuinely MID-FLIGHT. A
+        # retracted request in the queue is prefill work, not decode work, and
+        # treating it as decode work is what deadlocked W37-E.
+        if self.bundle_is_mid_flight():
             return 0
         return max(
             int(self.pending_prefill_tokens or 0),

@@ -134,17 +134,78 @@ class ScriptedHttpServer:
             )
 
     def _await_handshake(self) -> None:
-        if not self._socket.poll(int(LISTENER_ACCEPT_TIMEOUT_S * 1000)):
-            raise TimeoutError(
-                f"ScriptedHttpServer: HTTP server did not connect within "
-                f"{LISTENER_ACCEPT_TIMEOUT_S}s"
-            )
+        # #861h: POLL IN SLICES AND CHECK THE CHILD EVERY SLICE.
+        #
+        # THE HANG, py-spy'd on 2026-08-25: test_dirty_session_refuses_to_run
+        # sat in this call at 0 % CPU while its spawned server child
+        # (pid 2502190) was already <defunct> -- dead at startup, never reaped.
+        # A single blocking `poll(LISTENER_ACCEPT_TIMEOUT_S)` cannot notice
+        # that: it waits out the whole deadline for a handshake that can never
+        # arrive, and on a long deadline that reads as a wedged test run rather
+        # than as a failed server. "Aktiv aber tot" (#369 family), in the test
+        # infrastructure itself.
+        #
+        # A deadline alone is not the fix -- it was already here. The missing
+        # half is LIVENESS: a peer that has exited will never speak, so the
+        # wait must end the moment the child does, and it must say WHY.
+        deadline = time.monotonic() + LISTENER_ACCEPT_TIMEOUT_S
+        slice_ms = 250
+        while True:
+            if self._socket.poll(slice_ms):
+                break
+            # multiprocessing.Process, NOT subprocess.Popen -- `.poll()` would
+            # AttributeError here. `execute_script` at :95 already uses the
+            # right accessor; matching it is what keeps ONE liveness idiom in
+            # this file instead of two.
+            if not self._server_process.is_alive():
+                rc = self._server_process.exitcode
+                raise RuntimeError(
+                    f"ScriptedHttpServer: the spawned server child (pid "
+                    f"{self._server_process.pid}) EXITED with code {rc} before "
+                    f"the handshake. Waiting for a handshake from a dead peer "
+                    f"is the hang this check exists to prevent.\n"
+                    f"--- child stderr ---\n{self._drain_child_stderr()}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"ScriptedHttpServer: HTTP server did not connect within "
+                    f"{LISTENER_ACCEPT_TIMEOUT_S}s (child pid "
+                    f"{self._server_process.pid} still alive)"
+                )
 
         ready = sock_recv(self._socket)
         if not isinstance(ready, HookReady):
             raise RuntimeError(
                 f"ScriptedHttpServer: expected HookReady handshake, got {ready!r}"
             )
+
+    def _drain_child_stderr(self) -> str:
+        """Whatever the child managed to say before dying. #861h.
+
+        CAPTURED, because "the child died" without WHY moves the hang one
+        question later. Best-effort and never raises: this runs on a failure
+        path and must not replace the failure it is explaining.
+        """
+        for attr in ("stderr", "stdout"):
+            stream = getattr(self._server_process, attr, None)
+            if stream is None:
+                continue
+            try:
+                data = stream.read()
+            except Exception:  # noqa: BLE001 - a diagnostic never raises
+                continue
+            if not data:
+                continue
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", "replace")
+            return data[-4000:]
+        try:
+            err = self._read_out_of_band_error()
+        except Exception:  # noqa: BLE001
+            err = None
+        if err is not None:
+            return str(getattr(err, "traceback", err))[-4000:]
+        return "(no child output captured)"
 
     def _await_http_ready(self) -> None:
         # HookReady only means the scheduler dispatch loop started; the uvicorn

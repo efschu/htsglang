@@ -314,6 +314,11 @@ COHERENT_ACCESSORS = frozenset(
         "work_exists",
         "_retracted_unfinished_bs",
         "_admissible_prefill_tokens",
+        # #861f: asks whether a GENUINELY RESIDENT bundle is owed decode steps.
+        # It reads `running_bs` raw ON PURPOSE -- residency is exactly what it
+        # must measure, and it fires on >0 (the fail-safe direction) rather
+        # than on the manufactured 0.
+        "bundle_is_mid_flight",
     }
 )
 

@@ -236,15 +236,27 @@ def test_demand_is_the_single_definition():
 # --------------------------------- #861e MANUFACTURED-STATE PINS (all three specimens)
 
 
-def test_d4_thrash_the_demand_is_silent_on_a_manufactured_zero():
-    """THE MANUFACTURED-STATE SPECIMEN. `running_bs == 0` one line after
-    "7 request(s) retracted" -- true because of the transition, not the work.
-    Those 7 carry n=2..13 output tokens: a bundle mid-flight, not a queue."""
+def test_d4_thrash_a_retracted_request_is_PREFILL_work_not_decode_work():
+    """#861f CORRECTS THIS PIN, and the correction is the finding.
+
+    It used to assert `decode_work_bs() == 7` and `demand == 0` for seven
+    retracted-with-output requests -- i.e. that a retracted request counts as
+    decode work in flight. W37-E falsified that BY DEADLOCK: those seven were
+    not decoding, they were queued needing a prefill pass TP may not run, and
+    counting them as decode work silenced the only term that could have flipped
+    to the layout that serves them. 198 s at GPU 0 %.
+
+    A retracted request is PREFILL work. The d4 thrash it was protecting
+    against is now handled by `bundle_is_mid_flight()`, which asks whether a
+    GENUINELY RESIDENT bundle is owed steps -- see
+    `test_policy_term_combinations_861f.py`.
+    """
     inp = make_inputs(
         admissible_prefill_tokens=18586, running_bs=0, retracted_unfinished_bs=7
     )
-    assert inp.decode_work_bs() == 7
-    assert inp.demand_prefill_tokens() == 0
+    assert inp.decode_work_bs() == 0, "retracted is not resident decoding"
+    assert inp.bundle_is_mid_flight() is False, "nothing resident to chop"
+    assert inp.demand_prefill_tokens() == 18586, "and the flip must be demanded"
 
 
 def test_d2_wedge_the_demand_still_fires_when_nothing_ever_started():
@@ -265,11 +277,14 @@ def test_d3_pingpong_genuine_decoders_still_silence_the_demand():
     assert inp.demand_prefill_tokens() == 0
 
 
-def test_idle_is_not_declared_while_a_bundle_is_parked():
-    """The second dangerous site on the same axis: a box holding 7 retracted
-    mid-flight requests is not idle, and the idle-return leg must not arm."""
-    inp = make_inputs(running_bs=0, retracted_unfinished_bs=7)
-    assert inp.decode_work_bs() == 7
+def test_a_parked_bundle_is_not_counted_as_resident_decoding():
+    """#861f: same correction. `decode_work_bs` reports GENUINELY RESIDENT
+    decoding only. A parked (retracted) request is prefill demand, and the idle
+    determination is kept honest by `work_exists()` seeing that demand -- not
+    by pretending the request is still decoding."""
+    inp = make_inputs(running_bs=0, retracted_unfinished_bs=7, admissible_prefill_tokens=99)
+    assert inp.decode_work_bs() == 0
+    assert inp.work_exists() is True, "the box is not idle: there is prefill demand"
 
 
 def test_the_field_defaults_to_zero_for_every_stand_in():

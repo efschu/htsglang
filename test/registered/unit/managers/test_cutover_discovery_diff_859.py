@@ -97,21 +97,29 @@ def test_policy_terms_that_fire_on_zero_use_a_coherent_accessor():
     src = inspect.getsource(pp)
     tree = ast.parse(src)
     offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
+    # FUNCTION-AWARE, and #861f is why. A coherent accessor is precisely the
+    # place that MAY read the raw field -- `bundle_is_mid_flight` measures
+    # residency, so `running_bs` is exactly its subject. Matching on the
+    # expression text could never see that: the offending segment is
+    # `int(self.running_bs or 0) <= 0`, which contains no accessor name. The
+    # allow-list has to be keyed on the ENCLOSING FUNCTION.
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        seg = ast.get_source_segment(src, node) or ""
-        if "running_bs" not in seg:
+        if fn.name in COHERENT_ACCESSORS:
             continue
-        # `x == 0` / `x <= 0` on the RAW field is the dangerous shape.
-        if not any(
-            isinstance(op, (ast.Eq, ast.LtE)) for op in node.ops
-        ):
-            continue
-        if any(acc in seg for acc in COHERENT_ACCESSORS):
-            continue
-        if "self.running_bs" in seg or "inp.running_bs" in seg:
-            offenders.append(f"line {node.lineno}: {seg}")
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Compare):
+                continue
+            seg = ast.get_source_segment(src, node) or ""
+            if "running_bs" not in seg:
+                continue
+            if not any(isinstance(op, (ast.Eq, ast.LtE)) for op in node.ops):
+                continue
+            if any(acc in seg for acc in COHERENT_ACCESSORS):
+                continue
+            if "self.running_bs" in seg or "inp.running_bs" in seg:
+                offenders.append(f"{fn.name} line {node.lineno}: {seg}")
     assert not offenders, (
         "policy term(s) firing on a raw running_bs zero -- the value the "
         "cutover manufactures:\n" + "\n".join(offenders)
