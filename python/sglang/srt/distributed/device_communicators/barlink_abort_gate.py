@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Any, List, Optional
 
 from sglang.srt.distributed.device_communicators import lockstep_sentinel
@@ -306,6 +307,87 @@ class _PausePolling:
         return None
 
 
+# --- #867: a device fault the watchdog cannot survive ------------------------
+# `poll_status_words` swallows every exception so the watchdog thread cannot
+# die. That is right for a poll that hiccups and WRONG for a CUDA illegal
+# memory access: once a context takes one, it is unusable, and EVERY later CUDA
+# call in the process raises the same error at whatever site happens to run
+# next. Swallowing it therefore does not keep serving alive -- it only decides
+# that the crash will be reported somewhere innocent.
+#
+# W40 (2026-08-25 21:17:13) is the specimen. The first fault in the whole log is
+# this poll, logged as "barlink-BAR1 status poll failed" and continued past; the
+# scheduler then died in `get_cpu_copy` inside the seam capture, and the boot
+# before it died in `load_cpu_copy` inside the seam RESTORE. Three sites, one
+# fault, and two of them innocent -- which cost this shift two wrong roots.
+#
+# THIS MODULE ALREADY OWNS THIS CLASS. Its own docstring opens on #431: a run
+# that tripped the cap on every collective produced a file with ZERO matching
+# lines, so "nothing tripped" and "everything tripped" were indistinguishable.
+# The handler below had made "a poll hiccuped" and "the CUDA context is dead"
+# indistinguishable in exactly the same way.
+_poison_lock = threading.Lock()
+_poison: Optional[dict] = None
+
+#: Substrings of CUDA errors that leave the context UNUSABLE. Matched on the
+#: message because the driver's class does not distinguish them: torch raises
+#: `AcceleratorError` for a recoverable OOM and for an illegal access alike.
+_POISON_MARKERS = (
+    "illegal memory access",
+    "an illegal instruction",
+    "misaligned address",
+    "unspecified launch failure",
+    "device-side assert",
+)
+
+
+def is_poison_error(exc: BaseException) -> bool:
+    """Does this exception mean the CUDA context is gone?
+
+    Deliberately NOT `isinstance(exc, AcceleratorError)`: torch raises that for
+    an out-of-memory too, which is recoverable and must keep being swallowed.
+    The message is what carries the distinction the driver makes.
+    """
+    return any(m in str(exc) for m in _POISON_MARKERS)
+
+
+def record_poison(source: str, exc: BaseException) -> bool:
+    """Record the FIRST poison-class fault. Returns True if this call recorded it.
+
+    First wins, not last: the point of the record is the ORIGIN, and every
+    later CUDA call in a poisoned process reports the same error. A record that
+    tracked the newest would name the innocent site, which is the defect.
+    """
+    global _poison
+    with _poison_lock:
+        if _poison is not None:
+            return False
+        _poison = {
+            "source": source,
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "monotonic": time.monotonic(),
+        }
+        return True
+
+
+def poison_record() -> Optional[dict]:
+    """The first poison-class fault seen in this process, or None.
+
+    The serving path reads this to attribute its own failure: a CUDA error
+    raised while this is set did not originate where it was raised.
+    """
+    with _poison_lock:
+        return dict(_poison) if _poison is not None else None
+
+
+def clear_poison_record() -> None:
+    """Test-only. A real process does not recover from a poisoned context."""
+    global _poison
+    with _poison_lock:
+        _poison = None
+
+
 def pause_polling() -> _PausePolling:
     """Exclude the watchdog's device reads for the duration of a capture.
 
@@ -350,7 +432,27 @@ def poll_status_words() -> int:
         try:
             if poll():
                 tripped += 1
-        except Exception:  # pragma: no cover - a watchdog must not die
+        except Exception as exc:  # a watchdog must not die
+            source = f"barlink poll_status_word({type(transport).__name__})"
+            if is_poison_error(exc):
+                # #867: NOT survivable, so do not pretend it was. The watchdog
+                # still does not raise -- raising here kills the thread and
+                # loses the record -- but it stops reading devices for the rest
+                # of this round (every further read returns this same error and
+                # multiplies the misattribution) and it names itself as the
+                # origin so the crash that lands later can point back here.
+                if record_poison(source, exc):
+                    logger.error(
+                        "#867 barlink-BAR1 status poll hit an UNSURVIVABLE CUDA "
+                        "fault: %s. The context is now unusable and every later "
+                        "CUDA call in this process will raise this same error at "
+                        "an unrelated site -- so treat THIS as the origin, not "
+                        "the traceback that lands next. Device polling stops "
+                        "here. (source=%s)",
+                        exc,
+                        source,
+                    )
+                break
             logger.exception("barlink-BAR1 status poll failed")
     return tripped
 
@@ -717,7 +819,11 @@ __all__ = [
     "max_lag",
     "sync_deadline_s",
     "stall_raise_after",
+    "clear_poison_record",
+    "is_poison_error",
     "pause_polling",
+    "poison_record",
+    "record_poison",
     "poll_interval_s",
     "poll_status_words",
     "polling_paused",
