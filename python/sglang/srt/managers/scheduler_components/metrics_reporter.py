@@ -114,6 +114,59 @@ def _layout_conformance_field() -> str:
         return ""
 
 
+def _note_work_layout(scheduler, batch, prefill_stats) -> None:
+    """#861k: run the W37-D wrong-layout detector on the batch line's numbers.
+
+    `layout_conformance.work_layout_verdict` was built after W37-D's 258 cold
+    transport batches and then NEVER CALLED -- zero callers in the tree, so
+    W37-G's 27 recompute transports (#cached-token 0 under a transport claim)
+    passed with conformance count 0. Desk-written-never-executed, in the
+    instrument meant to falsify exactly that shape.
+
+    Wired HERE because this is the one place that holds, at once: the batch's
+    measured new/cached tokens (prefill_stats), the transport claim
+    (`batch.is_seam_transport`, stamped by the admission that rode the
+    exemption), and the phase from the same authority the phase label uses.
+    Runs BEFORE the stats-logging-rank gate so every rank's counter is
+    maintained -- the counters are rank-local by design.
+
+    DECODE SIDE DELIBERATELY NOT WIRED HERE: decode-in-pp is prevented
+    upstream by `decode_blocked_here` and has no measured specimen; wiring it
+    into the per-iteration decode path would put an import and two getattrs
+    on the hot loop for a direction nothing has ever violated. Named rather
+    than silent, so the next sweep sees a decision and not an omission.
+
+    An instrument may never break the stats line: everything is inside one
+    try/except, exactly like `_active_phase_field`.
+    """
+    try:
+        if not getattr(
+            getattr(scheduler, "server_args", None), "enable_phase_flip", False
+        ):
+            return
+        from sglang.srt.distributed.parallel_state import (
+            phase_flip_tp_routing_active,
+        )
+        from sglang.srt.managers import layout_conformance
+        from sglang.srt.managers.phase_purity import purity_of
+
+        now = time.perf_counter()
+        detail = layout_conformance.work_layout_verdict(
+            batch_class="prefill",
+            phase="tp" if phase_flip_tp_routing_active() else "pp",
+            strict=bool(purity_of(scheduler).strict),
+            transport_verified=bool(getattr(batch, "is_seam_transport", False)),
+            n_reqs=int(getattr(prefill_stats, "num_new_seqs", 0) or 0),
+            new_tokens=int(getattr(prefill_stats, "log_input_tokens", 0) or 0),
+            cached_tokens=int(getattr(prefill_stats, "log_hit_tokens", 0) or 0),
+            now=now,
+        )
+        if detail:
+            layout_conformance.note_conformance_violation(detail, now)
+    except Exception:  # noqa: BLE001 - an instrument may never break the stats line
+        pass
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -945,6 +998,17 @@ class SchedulerMetricsReporter:
         # Before the logging-rank gate: the online estimator runs on the rank
         # that carries the lanes, which is not necessarily the logging rank.
         self.prefill_tokens_total += int(prefill_stats.log_input_tokens or 0)
+        # #861k: the wrong-layout detector, also before the gate -- the
+        # conformance counters are rank-local and every rank runs the same
+        # batch, so every rank keeps its own honest count.
+        #
+        # getattr, NOT self.scheduler: the argument expression evaluates in
+        # THIS frame, outside the helper's try/except, and this method is
+        # driven in tests by reporter STAND-INS that carry only the fields
+        # the pre-gate region reads (test_rank_prefill_log's silent-rank
+        # fixture). The first cut broke exactly that test -- the one-token
+        # hole in "an instrument may never break the stats line".
+        _note_work_layout(getattr(self, "scheduler", None), batch, prefill_stats)
 
         if (
             not self.is_stats_logging_rank

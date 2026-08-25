@@ -462,5 +462,143 @@ class TestTheHoldHasABoundedExit(CustomTestCase):
         )
 
 
+class TestDarkRadixTransportIsLoud(CustomTestCase):
+    """#861k, the W37-G specimen: 27 TP transport batches recomputed cold
+    (#cached-token: 0 under the transport claim, the #783 dark-radix shape)
+    and the conformance count stayed 0 -- because
+    `layout_conformance.work_layout_verdict`, built after W37-D for exactly
+    this, had ZERO callers. The premise (#861j door 2) can be defeated by the
+    store at runtime; the batch-level detector is its falsifier and MUST be
+    reachable from the real emit path."""
+
+    def _reporter(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            SchedulerMetricsReporter,
+        )
+
+        sched = SimpleNamespace()
+        sched.server_args = SimpleNamespace(
+            enable_phase_flip=True,
+            phase_flip_purity="strict",
+            enable_metrics=False,
+            enable_metrics_for_all_schedulers=False,
+            kv_events_config=None,
+            enable_mfu_metrics=False,
+            enable_forward_pass_metrics=False,
+            language_only=False,
+            encoder_transfer_backend=None,
+            decode_log_interval=40,
+            enable_priority_scheduling=False,
+        )
+        sched.ps = SimpleNamespace(attn_tp_rank=0, attn_cp_rank=0)
+        sched.kv_events_publisher = SimpleNamespace(
+            init_kv_events=lambda *a, **k: None,
+            publish_kv_events=lambda *a, **k: None,
+        )
+        sched.tp_workers = []
+        sched.tp_worker = SimpleNamespace(model_runner=SimpleNamespace())
+        sched.draft_worker = None
+        sched.waiting_queue = []
+        sched.disaggregation_mode = DisaggregationMode.NULL
+        sched.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                get_prefill_usage_msg_parts=lambda: ["full token usage: 0.50"],
+                update_scheduler_stats=lambda stats: None,
+            )
+        )
+        sched.enable_priority_scheduling = False
+        sched.forward_ct = 0
+        sched._phase_purity = parse_purity("strict")
+        reporter = SchedulerMetricsReporter(
+            scheduler=sched,
+            tp_rank=0,
+            pp_rank=0,
+            dp_rank=0,
+            metrics_collector_context=SimpleNamespace(
+                enable_metrics=False,
+                is_stats_logging_rank=True,
+                current_scheduler_metrics_enabled=False,
+                enable_kv_cache_events=False,
+                collector=None,
+            ),
+            metrics_collector=None,
+        )
+        return reporter
+
+    def _emit(self, *, new_tokens, cached_tokens, transport, in_tp=True):
+        from unittest.mock import patch as _patch
+
+        from sglang.srt.managers import layout_conformance
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        layout_conformance.reset_for_test()
+        reporter = self._reporter()
+        batch = SimpleNamespace(
+            forward_mode=None,
+            forward_iter=None,
+            is_seam_transport=transport,
+            reqs=[],
+        )
+        stats = PrefillStats(
+            log_input_tokens=new_tokens,
+            log_hit_tokens=cached_tokens,
+            new_token_ratio=1.0,
+            num_running_reqs=SimpleNamespace(total=0),
+            num_new_seqs=3,
+        )
+        with _patch(
+            "sglang.srt.distributed.parallel_state.phase_flip_tp_routing_active",
+            return_value=in_tp,
+        ):
+            reporter.report_prefill_stats(batch, stats, can_run_cuda_graph=False)
+        return layout_conformance.counters().conformance_violations
+
+    def test_a_cold_transport_batch_is_flagged_from_the_real_emit_path(self):
+        """RED before the wiring: the W37-G shape -- transport claimed,
+        #new-token 4096, #cached-token 0 -- must count a conformance
+        violation through the REAL report_prefill_stats, not through a direct
+        call to a function nothing invokes."""
+        n = self._emit(new_tokens=4096, cached_tokens=0, transport=True)
+        self.assertEqual(
+            n,
+            1,
+            "27 cold transport batches ran on metal and the conformance "
+            "count stayed 0: the detector for exactly this shape has no "
+            "caller. Silence read as conformity -- worse than no detector",
+        )
+
+    def test_a_genuine_partial_restore_is_not_flagged(self):
+        """CAN-FAIL, the false-positive direction: a real read-through still
+        computes >=1 token per request. cached 3046 / new 47 under the
+        transport claim is the HEALTHY shape and must stay silent -- a wired
+        instrument that flags every legitimate restore is a broken
+        instrument."""
+        n = self._emit(new_tokens=47, cached_tokens=3046, transport=True)
+        self.assertEqual(n, 0)
+
+    def test_ordinary_prefill_in_tp_is_still_flagged(self):
+        """CAN-FAIL, the dangerous direction: a prefill batch in TP WITHOUT
+        the transport claim is wrong-layout work whatever its cache ratio."""
+        n = self._emit(new_tokens=100, cached_tokens=900, transport=False)
+        self.assertEqual(n, 1)
+
+    def test_prefill_in_pp_is_never_flagged(self):
+        n = self._emit(new_tokens=4096, cached_tokens=0, transport=False, in_tp=False)
+        self.assertEqual(n, 0)
+
+    def test_the_transport_claim_is_stamped_at_the_build_site(self):
+        """Wiring pin for the batch flag: the admission path that spends the
+        seam stamps must also record the claim on the batch it builds --
+        otherwise the detector's `transport_verified` is permanently False
+        and the healthy-restore excuse can never engage (every restore would
+        flag). Source-level, same spirit as the policy build-site pin."""
+        import inspect
+
+        src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+        self.assertIn("is_seam_transport = transport_only", src)
+
+
 if __name__ == "__main__":
     unittest.main()

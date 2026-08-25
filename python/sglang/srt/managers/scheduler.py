@@ -8661,6 +8661,15 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
+        # #861k: CARRY THE TRANSPORT CLAIM TO THE BATCH, so the conformance
+        # detector can judge the MEASURED bytes against it at emit time. The
+        # seam stamp itself is one-shot and was spent above; this flag is the
+        # batch-level record that this admission rode the exemption.
+        # `transport_only` is this pass's own gate reading (same local the
+        # spend block used), so the claim cannot drift from the admission
+        # that made it. W37-G measured the cost of the unwired detector: 27
+        # cold transport batches, conformance count 0.
+        new_batch.is_seam_transport = transport_only
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:

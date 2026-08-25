@@ -355,7 +355,18 @@ def work_layout_verdict(
     if not wrong_layout:
         return None
     # A verified restore that actually restored is mechanics, not work.
-    if transport_verified and int(cached_tokens) > 0 and int(new_tokens) <= 0:
+    #
+    # #861k: THE EXCUSE IS `cached_tokens > 0`, NOT `new_tokens <= 0`. A
+    # genuine read-through still COMPUTES at least one token per request (the
+    # extend pass needs a last position), so the original `new_tokens <= 0`
+    # clause would have flagged every legitimate restore the moment this
+    # detector was wired -- a false-positive instrument, which the Indikator
+    # law forbids more strictly than a missing one. The defect signature this
+    # exists for -- W37-D's 258 batches and W37-G's 27 -- is cached_tokens
+    # EXACTLY 0: the store served nothing and the whole prompt recomputed.
+    # Partial-restore accounting (cached>0 with large new) is deferred and
+    # named here rather than silently folded into either side.
+    if transport_verified and int(cached_tokens) > 0:
         return None
     recomputing = int(new_tokens) > 0
     return (
