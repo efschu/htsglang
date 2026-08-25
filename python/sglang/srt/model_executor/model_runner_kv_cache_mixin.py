@@ -7052,6 +7052,15 @@ class ModelRunnerKVCacheMixin:
         )
         from sglang.srt.managers.phase_purity import purity_from_server_args
 
+        # W33 INVENTORY PIN -- NOT THE RUNTIME PURITY PAYLOAD. This asks a
+        # SIZING question ("must a TP-phase prefill be survivable in this
+        # pool"), answered once from static config, not the per-round question
+        # "may a prefill batch run in TP right now" (one authority:
+        # phase_purity.seam_readmit_candidates). Note the seam-transport
+        # exemption makes a TP-phase prefill possible even under strict, so if
+        # anything this should read MORE permissively, never less -- but it is
+        # a different payload and is left alone deliberately. Named so the next
+        # Ein-Job-ein-Mover sweep does not re-litigate it.
         try:
             survivable = bool(
                 purity_from_server_args(self.server_args).prefill_allowed_in_tp()

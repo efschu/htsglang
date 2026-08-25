@@ -653,6 +653,17 @@ class Scheduler(
             # the policy refuses to leave TP for anything below N, so a
             # prompt smaller than N never runs at all (metal, 21:39:50Z --
             # a one-token health check wedged an otherwise idle server).
+            # W33 INVENTORY PIN -- NOT THE RUNTIME PURITY PAYLOAD.
+            # This is BOOT-TIME config derived from the purity MODE, not the
+            # per-round question "may a prefill batch run in TP right now".
+            # It collapses the policy's break-even N and nothing else. The
+            # runtime question has ONE authority
+            # (`phase_purity.seam_readmit_candidates`, via
+            # `seam_transport_exempt` / `seam_transport_pending_tokens` /
+            # `_phase_admits`); this line is deliberately NOT a fifth caller of
+            # it, because the seam-transport exemption is a per-round state and
+            # must never be baked into static config. Named here so the next
+            # Ein-Job-ein-Mover sweep does not re-litigate it.
             if not self._phase_purity.prefill_allowed_in_tp():
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg, prefill_runs_in_tp=False
@@ -3735,6 +3746,31 @@ class Scheduler(
             return False
         try:
             if what == "prefill_in_tp":
+                # W33 -- THE FOURTH COPY, UNIFIED. This is the hypothetical
+                # `target_can_admit` term: "could the TP layout admit prefill",
+                # asked while some other layout is active, so it cannot simply
+                # call `prefill_blocked_here` (which early-returns on the
+                # ACTIVE phase). It must therefore carry the seam-transport
+                # term itself -- and it carries it BY DERIVING IT FROM THE ONE
+                # AUTHORITY, `seam_readmit_candidates`, exactly as
+                # `seam_transport_exempt` and `seam_transport_pending_tokens`
+                # do. Not a fourth copy of the judgement, a fourth caller of
+                # the same function.
+                #
+                # THE INVENTORY RULE IS WHY THIS IS HERE AT ALL. The same
+                # shape has now cost two windows: W31 arm 1 (the exemption sat
+                # below the drain gate and never ran) and W32 (the policy kept
+                # its own copy and armed away from the layout the exemption was
+                # about to serve). This site was the next one waiting, and a
+                # `target_can_admit=False` computed without the exemption is
+                # precisely how the arm auditor concluded the verdict was wrong
+                # while the mechanism to make it right was already installed.
+                from sglang.srt.managers.phase_purity import (
+                    seam_readmit_candidates,
+                )
+
+                if seam_readmit_candidates(self):
+                    return True
                 if not purity.prefill_allowed_in_tp():
                     return False
                 from sglang.srt.managers.phase_policy import (
