@@ -562,6 +562,69 @@ def note_mamba_carry_without_copy(pool: Any, req: Any) -> None:
     )
 
 
+def check_cpu_copy_rows(indices, rows: int, direction: str, axis: str) -> None:
+    """#783b: the rows/slots a CPU copy names must address THIS pool.
+
+    A MODULE FUNCTION, not a method, because the pools that need it do not share
+    a base: `MHATokenToKVPool` and `MLATokenToKVPool` are `KVCache` subclasses
+    and `MambaPool` is not. A guard installed on one ancestor would be silently
+    inert on the other -- and a guard that cannot fire is the exact shape this
+    sweep exists to remove.
+
+    THE HOLE THIS CLOSES. #783's extent contract (25e7849844) compares one
+    scalar -- the row COUNT a copy covers against the count the request now
+    needs -- and then forwards `req_to_token[req_pool_idx, :seqlen-1]` down to
+    the pools as ids that nothing validates. Equal length is not equal validity.
+    The pools index their buffers directly, and the only assert on the path
+    (MHA :3298) compares the saved host chunk's SHAPE against the chunk LENGTH
+    -- a different axis, which the parent commit already names: "per-chunk, on
+    the wrong axis entirely. There is no backstop below." This is that backstop,
+    and it sits BESIDE :3298 rather than replacing it. Neither implies the other.
+
+    THE SILENT HALF IS THE REASON THIS EXISTS. Two failure modes:
+      * id >= rows: on CUDA an ASYNCHRONOUS illegal memory access, surfaced by
+        whatever call synchronizes next -- W40b, 2026-08-25 19:52:52, three PP
+        ranks, instance down 5 s later, traceback naming `synchronize()` and not
+        the store that caused it. That is the LOUD half, and it is only the half
+        that made us look.
+      * id < 0: NOT a fault at all. `-1` is the classic stale-row sentinel AND
+        valid torch indexing, so it silently writes the LAST row/slot -- wrong
+        KV or wrong recurrent state under a prefix the tree reports as restored.
+        No crash, no log, on a shipped path. Refused nowhere before this.
+
+    THE BOUND AND THE AXIS ARE PASSED IN because they genuinely differ: MHA/MLA
+    are bounded by their KV buffer rows on dim 0, `MambaPool` by its slot count
+    on dim 1 (`conv[:, indices]`, layout [num_layers, num_slots, ...]). Reading
+    a fixed attribute here would guess one and be inert on the other.
+
+    REFUSAL, NEVER A CLAMP -- the parent commit's rule, for its reason: the ids
+    and the pool describe different things, so dropping or wrapping the
+    offending id writes state into rows belonging to someone else. A refusal
+    costs a recompute, which is merely slow.
+
+    Called BEFORE the first store, so a refused copy leaves the pool
+    byte-identical. A guard that fires halfway through is a louder corruption.
+    """
+    if indices is None:
+        return
+    n = int(indices.numel())
+    if n == 0:
+        return
+    lo = int(indices.min())
+    hi = int(indices.max())
+    if lo < 0 or hi >= int(rows):
+        bad = lo if lo < 0 else hi
+        raise ValueError(
+            f"HiCache CPU copy ({direction}): {axis} {bad} does not address this "
+            f"pool, which has {int(rows)} {axis}s. The #783 extent contract "
+            f"checked the COUNT ({n}) and never the VALUES, so these ids arrived "
+            f"unvalidated. Refusing: a negative id silently writes the LAST "
+            f"{axis} (a wrong answer, no crash) and an out-of-range id is an "
+            f"asynchronous illegal memory access (W40b). These tokens are "
+            f"recomputed instead."
+        )
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -1178,6 +1241,9 @@ class MambaPool:
         return names
 
     def get_cpu_copy(self, indices):
+        check_cpu_copy_rows(
+            indices, int(self.mamba_cache.conv[0].shape[1]), "offload", "slot"
+        )
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1191,6 +1257,9 @@ class MambaPool:
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         conv_cpu, temporal_cpu = mamba_cache_cpu
+        check_cpu_copy_rows(
+            indices, int(self.mamba_cache.conv[0].shape[1]), "restore", "slot"
+        )
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
@@ -3264,6 +3333,9 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
+        check_cpu_copy_rows(
+            indices, int(self.k_buffer[0].shape[0]), "offload", "row"
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -3285,6 +3357,9 @@ class MHATokenToKVPool(KVCache):
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
+        check_cpu_copy_rows(
+            indices, int(self.k_buffer[0].shape[0]), "restore", "row"
         )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

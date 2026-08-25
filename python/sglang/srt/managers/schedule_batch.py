@@ -2088,6 +2088,22 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         req.mamba_state_cpu = None
         return False
 
+    # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
+    # AFTER `load_kv_cache`, so the one event it exists to explain -- a
+    # restore that does not return -- was the one it structurally could not
+    # witness. W40a logged 18 seam lines; W40b crashed INSIDE this call and
+    # logged ZERO, leaving the traceback to name `synchronize()` rather than
+    # the restore. Rate-limited on the same cadence as the success line
+    # below, so the pair costs one extra line per restore at the head and
+    # nothing in steady state.
+    n_try = _SEAM_STATE_COUNTS["restored"] + 1
+    if n_try <= 5 or n_try % 50 == 0:
+        logger.info(
+            "%s SEAM RESTORE ATTEMPT rid=%s extent=%s rows -- entering load_kv_cache",
+            SEAM_STATE_PREFIX,
+            getattr(req, "rid", None),
+            covered,
+        )
     req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     req.kv_cache_cpu_extent = None
     _SEAM_STATE_COUNTS["restored"] += 1
