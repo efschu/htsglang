@@ -307,3 +307,85 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
         src = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
         self.assertIn("host_tier_of(tree)", src)
         self.assertNotIn('getattr(tree, "token_to_kv_pool_host"', src)
+
+
+class TestTheDevicePoolIsUnwrappedLikeTheConsumerDoes(CustomTestCase):
+    """W34 arm 2: `the TP device pool exposes no layer_num`.
+
+    `phase_pools_for` does `inner = getattr(device_pool, "full_kv_pool",
+    device_pool)` before building the PhasePools that `check_shapes` reads, so
+    the pool whose `layer_num` must match is the INNER one. The writer read
+    the wrapper and refused itself; the pool that had the attribute was one
+    dereference away.
+
+    Building from the wrapper would ALSO have been a latent mismatch even if
+    the attribute had existed, because the shape check compares the inner
+    pool. So the writer must unwrap exactly as its consumer does -- pinned
+    here, and in the source, so the two cannot drift.
+    """
+
+    def test_a_wrapped_pool_is_unwrapped(self):
+        import unittest.mock as mock
+
+        inner = _DevicePool()
+        inner.layer_num = 24
+        wrapper = types.SimpleNamespace(full_kv_pool=inner)
+        s = _sched()
+        s.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool = wrapper
+
+        with (
+            mock.patch.multiple(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
+                build_kv_host_pool=mock.DEFAULT,
+                build_pool_entry=mock.DEFAULT,
+            ) as patched,
+            mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
+        ):
+            grp.side_effect = lambda entries: types.SimpleNamespace(entries=entries)
+            pools = build_phase_flip_host_pools(s)
+            self.assertIn("tp", pools, "the inner pool has layer_num=24")
+            # and the host pool must be built FROM the inner pool, not the
+            # wrapper -- otherwise check_shapes compares two different things
+            self.assertIs(
+                patched["build_kv_host_pool"].call_args.kwargs["kv_pool"], inner
+            )
+
+    def test_the_writer_unwraps_the_same_field_the_consumer_does(self):
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+        from sglang.srt.mem_cache import hicache_phase_binding
+
+        writer = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
+        consumer = inspect.getsource(hicache_phase_binding.phase_pools_for)
+        self.assertIn("full_kv_pool", writer)
+        self.assertIn(
+            "full_kv_pool",
+            consumer,
+            "if the consumer stops unwrapping, the writer must stop too",
+        )
+
+
+class TestTheCompositeCanStateItsLayerCount(CustomTestCase):
+    """The defect that predates this work: `check_shapes` compares
+    `host_pool.layer_num`, and `HostPoolGroup` delegated six properties to its
+    anchor but not that one -- so on every boot whose host tier is a composite
+    (this fork's live shape) the check could only read None and refuse."""
+
+    def test_the_group_delegates_layer_num_to_its_anchor(self):
+        from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+        self.assertTrue(
+            isinstance(getattr(HostPoolGroup, "layer_num", None), property),
+            "check_shapes reads host_pool.layer_num and refuses on None",
+        )
+
+    def test_it_sits_with_its_neighbours(self):
+        # start_layer/end_layer/dtype already delegate; layer_num is the same
+        # kind of question and must not be answered differently.
+        import inspect
+
+        from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+        src = inspect.getsource(HostPoolGroup)
+        self.assertIn("self.anchor_entry.host_pool.layer_num", src)

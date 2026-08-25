@@ -1992,7 +1992,17 @@ def build_phase_flip_host_pools(scheduler):
         sa_pin.hicache_ratio = 0
         sa_pin.hicache_size = size_gb
 
-        layers = int(getattr(tp_device_pool, "layer_num", 0) or 0)
+        # W34 arm 2: UNWRAP THE WAY THE CONSUMER UNWRAPS. `phase_pools_for`
+        # does `inner = getattr(device_pool, "full_kv_pool", device_pool)`
+        # before it builds the PhasePools that `check_shapes` reads, so the
+        # pool whose `layer_num` must match is the INNER one. Reading the
+        # wrapper directly is how arm 2 refused itself with "the TP device
+        # pool exposes no layer_num" -- the wrapper has no such attribute and
+        # the pool that does was one dereference away. Building the host pool
+        # from the wrapper while the shape check reads the inner pool would
+        # also be a latent mismatch even if the attribute had existed.
+        inner_pool = getattr(tp_device_pool, "full_kv_pool", tp_device_pool)
+        layers = int(getattr(inner_pool, "layer_num", 0) or 0)
         if layers <= 0:
             raise ValueError(
                 "the TP device pool exposes no layer_num, so the host pool "
@@ -2001,7 +2011,7 @@ def build_phase_flip_host_pools(scheduler):
             )
         use_mla = "MLA" in type(tp_device_pool).__name__
         kv_host = build_kv_host_pool(
-            kv_pool=tp_device_pool,
+            kv_pool=inner_pool,
             page_size=int(getattr(sa, "page_size", 1) or 1),
             server_args=sa_pin,
             use_mla=use_mla,
@@ -2011,7 +2021,7 @@ def build_phase_flip_host_pools(scheduler):
                 build_pool_entry(
                     name=PoolName.KV,
                     host_pool=kv_host,
-                    device_pool=tp_device_pool,
+                    device_pool=inner_pool,
                     # Identity: this pool carries the TP phase's own layers,
                     # so transfer index i IS device layer i.
                     layer_mapping={i: i for i in range(layers)},
