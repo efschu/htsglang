@@ -309,12 +309,36 @@ class HybridCacheController(BaseHiCacheController):
 
     def _init_extra_host_mem_release_queues(self) -> None:
         self.extra_host_mem_release_queues = {}
+        # #718/#847: the OWNING entry, captured next to its queue.
+        # `extra_host_mem_release_queues` outlives a phase rebind (it is built
+        # once, at storage-thread start), but the lookup that used to resolve a
+        # release went through the CURRENTLY bound `entry_map` -- so after a
+        # rebind onto a narrower tier every extra-pool release fell through an
+        # `entry is None -> continue` and those host slots were neither queued
+        # nor freed. Silent leak, one per load-back, for the whole phase.
+        # Keeping the entry beside the queue makes the pair inseparable, which
+        # is what the anchor path achieves with its generation lookup.
+        self.extra_host_mem_release_entries = {}
         entries = getattr(self.mem_pool_host, "entries", None) or []
         anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
         for entry in entries:
             if entry is anchor_entry or entry.is_primary_index_anchor:
                 continue
             self.extra_host_mem_release_queues[entry.name] = Queue()
+            self.extra_host_mem_release_entries[entry.name] = entry
+
+    def entry_for_extra_release(self, pool_name):
+        """The entry that OWNS an extra pool's host slots, rebind or not.
+
+        Prefers the currently bound tier and falls back to the entry captured
+        when the release queue was created. Returns None only when neither
+        knows the pool, which is the caller's cue to say so rather than to drop
+        the slots.
+        """
+        entry = self.mem_pool_host.entry_map.get(pool_name)
+        if entry is not None:
+            return entry
+        return getattr(self, "extra_host_mem_release_entries", {}).get(pool_name)
 
     def _append_host_mem_release_pages(
         self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
@@ -386,12 +410,30 @@ class HybridCacheController(BaseHiCacheController):
         for transfer in extra_pools or []:
             if transfer.host_indices is None or transfer.host_indices.numel() == 0:
                 continue
-            entry = self.mem_pool_host.entry_map.get(transfer.name)
-            if (
-                entry is None
-                or entry.is_primary_index_anchor
-                or transfer.indices_from_pool is not None
-            ):
+            if transfer.indices_from_pool is not None:
+                # A derived transfer borrows another pool's indices; the owner
+                # releases them, and releasing them twice is the real bug.
+                continue
+            entry = self.entry_for_extra_release(transfer.name)
+            if entry is None:
+                n = getattr(self, "_orphaned_extra_release", 0) + 1
+                self._orphaned_extra_release = n
+                # Rate-limited on the same cadence as the stale-release routing
+                # above: this fires per release, so an unbounded emitter here is
+                # the log-flood class. The COUNT is the finding, not the line.
+                if n <= 3 or n % 200 == 0:
+                    logger.error(
+                        "#718/#847 EXTRA RELEASE ORPHANED: %d host slot(s) of "
+                        "pool '%s' name no known entry in the bound tier (%s) "
+                        "nor in the queue registry; neither queued nor freed. "
+                        "(%d so far.)",
+                        int(transfer.host_indices.numel()),
+                        transfer.name,
+                        sorted(str(name) for name in self.mem_pool_host.entry_map),
+                        n,
+                    )
+                continue
+            if entry.is_primary_index_anchor:
                 continue
             release_queue = self.extra_host_mem_release_queues.get(transfer.name)
             if release_queue is None:
@@ -846,17 +888,42 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
-                continue
+                # #718/#847: THE BOUND TIER CANNOT DESCRIBE THIS POOL. Both
+                # other answers are wrong. Returning the transfer unresolved
+                # hands a None index set to `move_indices` (the W38-B crash at
+                # cache_controller.py:1217, and its write-side twin one line
+                # below); dropping it silently moves the KV while this pool's
+                # state stays behind and the tree calls the prefix RESIDENT --
+                # a wrong ANSWER, which is worse than a crash. Refusing costs
+                # one recompute, which is merely slow.
+                #
+                # This is reachable because a phase rebind REPLACES
+                # `mem_pool_host` (hicache_phase_binding._stamp), and the TP
+                # tier built at phase_flip_boot.py:2019-2032 carries KV alone.
+                # `check_pool_coverage` refuses that rebind now; this stays as
+                # the class guard for every other way a tier can be narrower
+                # than the transfers built against it.
+                self._refuse_unresolvable_transfer(pool)
+                rollback_allocated()
+                return None
             if alloc_host:
-                if pool.host_indices is not None or pool.device_indices is None:
+                if pool.host_indices is not None:
                     continue
+                if pool.device_indices is None:
+                    self._refuse_unresolvable_transfer(pool)
+                    rollback_allocated()
+                    return None
                 alloc_fn = entry.host_pool.alloc
                 free_fn = entry.host_pool.free
                 evict_fn = entry.host_evict_fn
                 size = len(pool.device_indices)
             else:
-                if pool.device_indices is not None or pool.host_indices is None:
+                if pool.device_indices is not None:
                     continue
+                if pool.host_indices is None:
+                    self._refuse_unresolvable_transfer(pool)
+                    rollback_allocated()
+                    return None
                 # device_alloc_fn / device_free_fn override entry.device_pool's
                 # methods for pools whose device_pool is a raw KV pool (layout)
                 # rather than an allocator (e.g. SWA).
@@ -899,4 +966,42 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             pool.host_indices = source.host_indices
             pool.device_indices = source.device_indices
+
+        # THE POST-CONDITION IS THE POINT OF THIS FUNCTION, so it is stated
+        # here rather than discovered at cache_controller.py:1217 on boot
+        # second 20. Contract: a returned list contains no unresolved index
+        # set. Anything else is refused, and the callers (write():439,
+        # load():554) already know how to give back what they took.
+        for pool in extra_pools:
+            if pool.host_indices is None or pool.device_indices is None:
+                self._refuse_unresolvable_transfer(pool)
+                rollback_allocated()
+                return None
         return extra_pools
+
+    def _refuse_unresolvable_transfer(self, pool: PoolTransfer) -> None:
+        """Log one refusal, rate-limited.
+
+        `match_prefix` re-derives the host hit every scheduler tick, so a
+        refused load-back is RETRIED every tick for as long as the state stays
+        on the host. The request still makes progress (it re-prefills the
+        segment); what must not happen is one line per tick -- that is the
+        449 MB/20 min flood class. First three, then every 200th, which is the
+        cadence the stale-release routing above already uses.
+        """
+        n = getattr(self, "_unresolvable_transfer_refusals", 0) + 1
+        self._unresolvable_transfer_refusals = n
+        if n <= 3 or n % 200 == 0:
+            logger.error(
+                "#718/#847 POOL-SET MISMATCH: cannot resolve the '%s' transfer "
+                "against the bound host tier (it describes %s; host=%s "
+                "device=%s). Refusing the whole transfer set: moving the KV "
+                "while this pool's state stays behind would leave the tree "
+                "reporting a prefix as resident that is not, which is a wrong "
+                "answer. These tokens are recomputed. (%d refusal(s) so far.)",
+                pool.name,
+                sorted(str(name) for name in self.mem_pool_host.entry_map),
+                "set" if pool.host_indices is not None else "None",
+                "set" if pool.device_indices is not None else "None",
+                n,
+            )

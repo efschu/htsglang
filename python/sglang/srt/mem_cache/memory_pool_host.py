@@ -1732,6 +1732,51 @@ class HostPoolGroup:
     def set_from_flat_data_page(self, index: int, data_page) -> None:
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
 
+    def _entry_for_transfer(self, transfer, direction: str):
+        """The entry this transfer names, or a refusal.
+
+        #718/#847: THIS USED TO SKIP SILENTLY. `entry is None or
+        transfer.host_indices is None -> continue` meant that after a phase
+        rebind onto a narrower tier the anchor KV moved and the extra pool's
+        state did NOT, while the radix tree went on reporting the prefix as
+        RESIDENT. Attention (or, for MAMBA, the recurrent step) then reads
+        state nobody wrote: a wrong ANSWER, with no assertion anywhere.
+
+        A crash is the cheaper failure and it is the honest one -- by the time
+        execution reaches this loop the copy is already in flight, so there is
+        no correct way to continue. The refusal that costs nothing lives one
+        tier up, at `_resolve_pool_transfers_allocation`, which now returns
+        None instead of a half-resolved list; this raise exists so that a
+        future producer that bypasses the resolver is LOUD rather than wrong.
+
+        Note the reachability: the `kernel`/`page_first`/write-back-JIT path
+        hands `op.pool_transfers` here RAW (hybrid_cache_controller.py:468-475),
+        bypassing `move_hybrid_indices` entirely -- so on that configuration
+        this skip was the LIVE failure and no crash would ever have exposed it.
+        """
+        entry = self.entry_map.get(transfer.name)
+        if entry is None:
+            raise ValueError(
+                f"HiCache {direction}: the bound host tier describes "
+                f"{sorted(str(n) for n in self.entry_map)} and cannot describe "
+                f"pool '{transfer.name}'. Skipping this transfer would move the "
+                "KV while this pool's state stayed behind, with the tree still "
+                "reporting the prefix resident -- a wrong answer. This is a "
+                "phase-binding defect (see check_pool_coverage), not a "
+                "transient."
+            )
+        if transfer.host_indices is None or transfer.device_indices is None:
+            raise ValueError(
+                f"HiCache {direction}: pool '{transfer.name}' reached the "
+                f"executor unresolved (host="
+                f"{'set' if transfer.host_indices is not None else 'None'}, "
+                f"device="
+                f"{'set' if transfer.device_indices is not None else 'None'}). "
+                "_resolve_pool_transfers_allocation must refuse such a set "
+                "before it is enqueued."
+            )
+        return entry
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1755,11 +1800,11 @@ class HostPoolGroup:
 
         # 2. Extra pool transfers
         for transfer in pool_transfers or []:
-            entry = self.entry_map.get(transfer.name)
-            if entry is None or transfer.host_indices is None:
-                continue
+            entry = self._entry_for_transfer(transfer, "load")
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
+                # A layer this pool does not cover. The ONLY legitimate skip
+                # here, and it is per-layer, not per-pool.
                 continue
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
@@ -1786,9 +1831,7 @@ class HostPoolGroup:
         )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
-            entry = self.entry_map.get(transfer.name)
-            if entry is None or transfer.host_indices is None:
-                continue
+            entry = self._entry_for_transfer(transfer, "backup")
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,
                 transfer.host_indices,

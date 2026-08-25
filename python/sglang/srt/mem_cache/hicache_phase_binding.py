@@ -171,6 +171,50 @@ def check_shapes(incoming: PhasePools) -> None:
         )
 
 
+def check_pool_coverage(readers: dict, incoming: PhasePools) -> None:
+    """Refuse a rebind whose host tier describes FEWER pools than the bound one.
+
+    #718/#847. ``check_shapes`` above compares ONE SCALAR -- the anchor entry's
+    layer count -- where the invariant is STRUCTURAL: the incoming tier must be
+    able to describe every pool the outgoing one did. A KV-only ``HostPoolGroup``
+    passes the scalar check while dropping MAMBA entirely, and the consumers then
+    split in two: ``move_indices`` dereferences the index set the resolver could
+    not fill (the W38-B crash), and ``HostPoolGroup.load_to_device_per_layer``
+    skips the pool it does not know -- moving the KV while the recurrent state
+    stays behind, with the tree marking the prefix resident. The second is a
+    wrong ANSWER and it is the one a crash-only fix would have hidden.
+
+    A refusal here is the cheap outcome and the designed one: ``rebind`` raises,
+    the #718 device tier stays DISARMED for that phase, and every read-through
+    misses. A miss is recomputed; a narrowed tier is not.
+
+    Only pools the reader ALREADY names are required -- a WIDER incoming tier is
+    fine, and a reader that names no host tier at all (the scheduler names the
+    allocator only) is not turned into a coverage claim.
+    """
+    incoming_names = set(getattr(incoming.host_pool, "entry_map", None) or ())
+    for name, obj in readers.items():
+        current = getattr(obj, "mem_pool_host", None)
+        bound_names = set(getattr(current, "entry_map", None) or ())
+        missing = bound_names - incoming_names
+        if missing:
+            raise RebindRefused(
+                f"{LOG_PREFIX} the '{incoming.phase}' host tier describes "
+                f"{sorted(str(n) for n in incoming_names)} but reader '{name}' "
+                f"is bound to a tier describing "
+                f"{sorted(str(n) for n in bound_names)}: "
+                f"{sorted(str(n) for n in missing)} would lose its host "
+                "backing. Every transfer built for those pools would then be "
+                "either unresolvable (a None index set reaching move_indices) "
+                "or silently skipped (the KV moves, the state does not, and "
+                "the tree still calls the prefix resident) -- a crash or a "
+                "wrong answer. A phase host tier has to be built with the full "
+                "pool set before this rebind can arm; until then the #718 "
+                "disarm is the correct state and a read-through miss is the "
+                "correct cost."
+            )
+
+
 def rebind(readers: dict, incoming: PhasePools) -> int:
     """Point every reader at ``incoming``. ALL THREE OR NONE.
 
@@ -180,6 +224,7 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
     and is therefore detectable, which a "looks right" inspection is not.
     """
     check_shapes(incoming)
+    check_pool_coverage(readers, incoming)
     missing = [name for name, obj in readers.items() if obj is None]
     if missing:
         raise RebindRefused(

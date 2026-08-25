@@ -3032,9 +3032,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     host_indices_list.append(host_indices)
                     released_tokens += len(host_indices)
                 if host_indices_list:
-                    entry = cc.mem_pool_host.entry_map.get(pool_name)
+                    # #718/#847: resolve through the queue's OWNING entry, not
+                    # only through the currently bound tier. A phase rebind onto
+                    # a narrower tier used to make this lookup return None, and
+                    # the slots -- already dequeued -- were then dropped on the
+                    # floor instead of freed. The drain is the last holder, so a
+                    # miss here is a permanent host-slot leak, not a retry.
+                    entry = cc.entry_for_extra_release(pool_name)
                     if entry is not None:
                         entry.host_pool.free(torch.cat(host_indices_list, dim=0))
+                    else:
+                        # Rate-limited: the drain runs every iteration, so an
+                        # unbounded emitter here is the log-flood class.
+                        n = getattr(self, "_drain_orphaned_releases", 0) + 1
+                        self._drain_orphaned_releases = n
+                        if n <= 3 or n % 200 == 0:
+                            logger.error(
+                                "#718/#847 DRAIN ORPHANED: %d host slot(s) of "
+                                "pool '%s' were dequeued but name no known "
+                                "entry; they cannot be freed and are leaked. "
+                                "(%d so far.)",
+                                released_tokens,
+                                pool_name,
+                                n,
+                            )
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
