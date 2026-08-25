@@ -64,11 +64,6 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.managers import tree_congruence
-from sglang.srt.managers.warmup_latency import WarmupLatencyLedger
-from sglang.srt.managers.pp_presence_disposition import (
-    ALARM_PRESENCE_FUTILE,
-    census_withhold_reason,
-)
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -76,6 +71,11 @@ from sglang.srt.managers.kv_reshard import (
     _encode,
     _gather_block_rows,
 )
+from sglang.srt.managers.pp_presence_disposition import (
+    ALARM_PRESENCE_FUTILE,
+    census_withhold_reason,
+)
+from sglang.srt.managers.warmup_latency import WarmupLatencyLedger
 from sglang.srt.model_executor.weights_arena import (
     checksum_is_representable,
     uint8_checksum,
@@ -2740,12 +2740,6 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # FALSIFIED and cost the instance. spec_info is read on the TP->PP
         # side by ScheduleBatch.merge_batch, which has no drafter in it at
         # all. See corpse I in phase_flip_draft_bootstrap.
-        from sglang.srt.managers.phase_flip_draft_bootstrap import (
-            arm_draft_bootstrap_all_reachable,
-            clear_spec_info_for_unspeculated_phase,
-            retune_carried_batches_for_phase,
-        )
-
         # Both directions: a carried batch's OWN spec_algorithm field still
         # says which phase BUILT it, and prepare_for_decode branches on it.
         # Retune before the bootstrap, so the batch and the scheduler agree
@@ -2756,7 +2750,10 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # Reset here, beside its siblings, so the three are handled in one
         # place and a fourth member has an obvious home.
         from sglang.srt.managers.phase_flip_draft_bootstrap import (
+            arm_draft_bootstrap_all_reachable,
+            clear_spec_info_for_unspeculated_phase,
             reset_stale_batch_flags,
+            retune_carried_batches_for_phase,
         )
 
         # #861i: the step budget is PER PHASE, so the cutover resets it.
@@ -8450,6 +8447,42 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
                 n,
                 direction,
+            )
+        # #783: AND THE FENCE THAT RAN AND PERSISTED NOTHING.
+        #
+        # The check above asks "did a fence run". W37-G proved that is the wrong
+        # question: a fence over an empty tree returns `elapsed_s=0.0`, not
+        # None, so the check above stayed silent on 33 of 39 cutovers while
+        # `acked=0` held for every fence of the entire boot. `report.complete`
+        # called those same 33 complete, because `outstanding == 0` is trivially
+        # true when there was nothing to send. Two instruments, both correct,
+        # both blind to the one state that matters -- and `#cached-token: 0` on
+        # all 209 prefill batch lines is what it cost.
+        #
+        # Read defensively: a stand-in report is the ordinary state in tests and
+        # an instrument may never be the thing that breaks a flip.
+        if released and getattr(
+            getattr(self, "_last_writeback_report", None), "persisted_nothing", False
+        ):
+            logger.warning(
+                "%s #783: re-admitting %d resident(s) for %s after a fence that "
+                "RAN AND PERSISTED NOTHING (%s). No storage ack and no host "
+                "copy, so neither tier can serve the read-through: the device "
+                "tree is dropped by law at this seam and the canonical store "
+                "was never written. Every re-admitted prefix MISSES and is "
+                "recomputed in full. If this repeats across cutovers the "
+                "instance cannot make progress -- requests are retracted before "
+                "they finish, retention is finish-only, so nothing is ever "
+                "inserted for the next fence to persist (W37-G: 12 flips, zero "
+                "completions).",
+                LOG_PREFIX,
+                n,
+                direction,
+                (
+                    getattr(self, "_last_writeback_report").as_log()
+                    if hasattr(getattr(self, "_last_writeback_report", None), "as_log")
+                    else "no report"
+                ),
             )
         readmitted = 0
         try:

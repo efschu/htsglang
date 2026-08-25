@@ -86,6 +86,34 @@ class FlipWritebackReport:
     def complete(self) -> bool:
         return self.outstanding == 0
 
+    @property
+    def persisted_nothing(self) -> bool:
+        """#783: nothing of this fence is retrievable after the tree is dropped.
+
+        NOT the same question as `complete`, which is `outstanding == 0` and is
+        therefore TRUE for a fence that had nothing to do. In W37-G 33 of 39
+        cutovers fenced `eligible=0 staged=0 already_staged=0 acked=0
+        outstanding=0 elapsed=0.000s` -- complete, cheap, and empty -- and every
+        instrument in the tree read them as healthy. `#cached-token: 0` on all
+        209 prefill batch lines is the consequence.
+
+        The seam's own guard could not see it either: it warns when
+        `_writeback_fence_ms(...) is None`, and an empty fence returns 0.0. A
+        cheap fence and a healthy fence are indistinguishable BY COST, because
+        the healthy case is also cheap. So this asks about retrievability, which
+        is the property the read-through actually depends on, using counts the
+        report already carried and nothing read.
+
+        DELIBERATELY NARROW: true only when NEITHER route survives -- no storage
+        acknowledgement AND no pre-existing host copy. A fence that acked
+        nothing but left `already_staged` nodes behind is NOT claimed here; that
+        host copy may still serve the read-through, and that case already draws
+        the "deadline reached with backups still in flight" warning. Widening
+        this to cover it would double-report one condition and make a
+        crying-wolf gate out of the instrument built to replace one.
+        """
+        return self.acknowledged == 0 and self.already_staged == 0
+
     def as_log(self) -> str:
         return (
             f"eligible={self.eligible} staged={self.staged} "
