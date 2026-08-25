@@ -212,3 +212,72 @@ class TestTheBootWiresIt(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
+    """W33 arm 2 -- the W29 defect, repeated one strand later by me.
+
+    The writer read `getattr(tree, "token_to_kv_pool_host", None)`. That
+    attribute belongs to `HiRadixCache`; the tree this box runs is
+    `UnifiedRadixCache`, which does not have it and reaches the host tier
+    through `cache_controller.mem_pool_host`. The read returned None on the
+    live tree, the writer logged its own "no HiCache host tier" refusal on
+    every rank, and the rebind could not arm -- 6 `#718 hicache-phase-guard`
+    warnings, the W32 read-through miss reproduced with its fix installed.
+
+    Identical in shape to W29's `full_evictable_size_`: an attribute three
+    tree types have and `UnifiedRadixCache` does not, with `getattr(..., 0)`
+    turning the absence into a value that silently disabled the mechanism.
+    Same tree class, same silent default. Hence a NAMED accessor plus this
+    drift-detector, which tests the REAL classes rather than a double.
+    """
+
+    def test_the_direct_attribute_route(self):
+        from sglang.srt.managers.phase_flip_boot import host_tier_of
+
+        pool = object()
+        self.assertIs(
+            host_tier_of(types.SimpleNamespace(token_to_kv_pool_host=pool)), pool
+        )
+
+    def test_the_cache_controller_route_the_live_tree_uses(self):
+        from sglang.srt.managers.phase_flip_boot import host_tier_of
+
+        pool = object()
+        tree = types.SimpleNamespace(
+            token_to_kv_pool_host=None,
+            cache_controller=types.SimpleNamespace(mem_pool_host=pool),
+        )
+        self.assertIs(host_tier_of(tree), pool)
+
+    def test_absent_is_absent_not_a_route_i_forgot_to_look_at(self):
+        from sglang.srt.managers.phase_flip_boot import host_tier_of
+
+        self.assertIsNone(host_tier_of(types.SimpleNamespace()))
+        self.assertIsNone(host_tier_of(None))
+
+    def test_the_live_tree_class_really_lacks_the_direct_attribute(self):
+        # THE DRIFT-DETECTOR, against the REAL class. If UnifiedRadixCache ever
+        # grows `token_to_kv_pool_host`, the first route starts working and
+        # this test says so -- rather than the accessor quietly depending on a
+        # route that only some trees have, which is the whole defect.
+        import inspect
+
+        from sglang.srt.mem_cache import unified_radix_cache
+
+        src = inspect.getsource(unified_radix_cache)
+        self.assertNotIn(
+            "self.token_to_kv_pool_host",
+            src,
+            "UnifiedRadixCache reaches the host tier via cache_controller; if "
+            "that changed, revisit host_tier_of",
+        )
+
+    def test_the_writer_uses_the_named_accessor(self):
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+
+        src = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
+        self.assertIn("host_tier_of(tree)", src)
+        self.assertNotIn('getattr(tree, "token_to_kv_pool_host"', src)

@@ -1838,6 +1838,39 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
 PHASE_FLIP_STAGING_CHUNKS = 1
 
 
+def host_tier_of(tree):
+    """The HiCache host pool behind ``tree``, whichever route it keeps it on.
+
+    W33 arm 2, AND IT IS THE W29 DEFECT REPEATED BY ME. This read used to be a
+    bare ``getattr(tree, "token_to_kv_pool_host", None)``. That attribute is
+    ``HiRadixCache``'s; the tree this box actually runs is
+    ``UnifiedRadixCache``, which does not have it at all -- it reaches the host
+    tier through ``cache_controller.mem_pool_host``. So the read returned
+    ``None`` on the live tree, the writer logged its own "no HiCache host tier"
+    refusal on every rank, and the rebind could not arm: mechanism installed,
+    unreachable.
+
+    That is exactly the shape rooted at W29, when
+    ``drop_prefix_tree_returning_rows`` read ``full_evictable_size_`` -- an
+    attribute three of the tree types have and ``UnifiedRadixCache`` does not
+    -- and ``getattr(..., 0)`` turned the absence into a number that silently
+    disabled the eviction. Same family, same tree class, same silent default,
+    written by me one strand later.
+
+    So the accessor is NAMED and knows BOTH routes, and a drift-detector test
+    asserts every shipped cache is reachable through it. ``None`` here means
+    genuinely no host tier -- a real state, reported loudly by the caller --
+    never "this tree keeps it somewhere I did not look".
+    """
+    if tree is None:
+        return None
+    direct = getattr(tree, "token_to_kv_pool_host", None)
+    if direct is not None:
+        return direct
+    controller = getattr(tree, "cache_controller", None)
+    return getattr(controller, "mem_pool_host", None)
+
+
 def _staging_pin_gib(scheduler, device_pool) -> float:
     """Bytes the phase-matched staging pin needs, in GiB, from measured cells.
 
@@ -1896,7 +1929,7 @@ def build_phase_flip_host_pools(scheduler):
         return {}
 
     tree = getattr(scheduler, "tree_cache", None)
-    pp_host = getattr(tree, "token_to_kv_pool_host", None)
+    pp_host = host_tier_of(tree)
     if pp_host is None:
         # The rebind was ASKED for and the instance has no host tier at all.
         # Returning {} here would hand `phase_pools_for` its own refusal one
