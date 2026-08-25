@@ -340,11 +340,22 @@ pressure, the FAMILY does not. It is `NOTE_860 §1`'s divergence 2 observed a
 third and fourth time, and it is why the family gets a bounded lane instead of
 a full-width one.
 
-**R9's run is also the counterfactual for the partition.** Same engine, same
-`loadfile`, same suite, no partition table: 3 spurious reds in 290 s. With the
-partition: 0 spurious reds in ~345 s. The 55 s is the price, and it buys the
-difference between a gate that must be re-run serially to interpret its red and
-one that does not.
+**R9's run is also the counterfactual for the partition** — and it should be
+read knowing where it came from. **I did not construct it.** R9 ran the whole
+suite at `-n 8 --dist loadfile` in a different tree, for its own reasons, while
+this ticket was still measuring. It happens to be the exact control arm this
+note would otherwise have had to argue for without evidence: same engine, same
+`loadfile`, same suite, **no partition table**.
+
+    no partition:   3 spurious reds in 290 s
+    partition:      0 spurious reds in ~345 s
+
+The 55 s is the price, and it buys the difference between a gate that must be
+re-run serially to interpret its red and one that does not. A control arm that
+falls into your lap is worth more than one you design, precisely because
+nobody chose its conditions to suit the conclusion — but for the same reason
+its conditions were not controlled by anyone either, so it is corroboration
+and not a measurement of this note's making.
 
 ### 2.5 The crowding reason has a NAME, and it is narrower than "spawns ranks"
 
