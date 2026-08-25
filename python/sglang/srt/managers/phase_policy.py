@@ -2788,7 +2788,33 @@ def _decide_from_load(
                 f"({inp.pending_prefill_tokens} tok prefill waiting) -- exit "
                 f"condition: decode drained",
             )
-        if inp.pending_prefill_tokens > tp_threshold:
+        # #861d SECOND HALF: THE DEMAND SIDE, and the question is not the same
+        # question as the price.
+        #
+        # `pending_prefill_tokens > tp_threshold` asks "is the backlog worth a
+        # flip" -- ECONOMICS, and correct where economics decides. Under STRICT
+        # purity economics does NOT decide: the user's law is drain-and-flip,
+        # not break-even ("Break-even ist NICHT der Trigger"). Prefill simply
+        # cannot run here, so ANY queued prefill work must demand the flip
+        # regardless of its price, and a cached prompt is queued work.
+        #
+        # MEASURED, W37-D retry: `holding in tp: pending prefill 0 tok <=
+        # N=28544, running it in tp` while SIX requests sat queued, every token
+        # HiCache-cached so `uncached_prompt_tokens` was 0 -- and
+        # ADMISSION-WEDGE alarmed for 368 s. The #861c existence term had
+        # reached `_layout_admits` (prefill correctly refused in tp, rung 10
+        # green) but NOT this branch, so the requests starved behind a CORRECT
+        # refusal with nothing ever demanding the layout that could serve them.
+        # Half a fix is its own failure mode.
+        #
+        # THE CLASSIFICATION ERROR THIS CORRECTS IS MINE. #861c's sweep put the
+        # threshold arms in the ECONOMICS class and routed only the four
+        # existence sites. That is right in relaxed mode and wrong in strict:
+        # the QUESTION a site asks depends on the purity mode, not on the site
+        # alone. Recorded as a sweep-completeness failure rather than a new
+        # class -- the class ("one number, two questions") was already named.
+        strict_demands_flip = bool(inp.work_exists()) and not cfg.prefill_runs_in_tp
+        if inp.pending_prefill_tokens > tp_threshold or strict_demands_flip:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
             # above N and this rule would otherwise fire the instant
@@ -2853,9 +2879,21 @@ def _decide_from_load(
                 )
             return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
         if inp.work_exists():  # #861c EXISTENCE class
-            # Unreachable under purity: tp_threshold is 0 there, so any
-            # non-zero pending already armed above. Reaching it would mean
-            # the deadlock of 21:39:50Z had returned.
+            # #861d: THE COMMENT THAT USED TO STAND HERE WAS FALSIFIED, and it
+            # is worth keeping the correction visible. It read: "Unreachable
+            # under purity: tp_threshold is 0 there, so any non-zero pending
+            # already armed above." That is true only while "pending" and
+            # "work exists" are the same quantity. They are not: a queue of
+            # fully cached prompts has `pending_prefill_tokens == 0` and real
+            # work, so `0 > 0` is False, the arm above did not fire, and
+            # control reached this supposedly unreachable hold -- for 368 s,
+            # with six requests starving. The arm above now consults the
+            # existence term under strict purity, which restores the comment's
+            # claim by making it TRUE rather than by asserting it.
+            #
+            # Same class as #861c/F1 and #861d: a premise stated in prose and
+            # never checked. Third instance, so it is the SWEEP that was
+            # incomplete, not the class that was unknown.
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok <= "
                 f"N={n_live}, running it in tp (seam {seam_s:.2f}s {priced})"
@@ -2877,7 +2915,26 @@ def _decide_from_load(
         # running in whatever layout we are about to be in anyway. That
         # makes the two rules one hysteresis band around N instead of two
         # unrelated thresholds, so no arrival pattern can satisfy both.
-        if inp.pending_prefill_tokens <= cfg.pp_exit_tokens and inp.running_bs > 0:
+        # #861d THE MIRROR, and without it the other half is a ping-pong.
+        #
+        # This arm means "prefill is done, take the decoders to TP". With a
+        # fully cached backlog `pending_prefill_tokens` is 0, so it reads
+        # "done" while requests are still QUEUED and never computed -- PP
+        # leaves, TP refuses to prefill (strict), the TP arm above demands the
+        # flip straight back, and the instance oscillates without serving.
+        # Fixing only the tp->pp side would have produced exactly that, so the
+        # two directions are one change.
+        #
+        # Under STRICT purity, PP must not hand the layout back while queued
+        # prefill work exists, whatever that work costs. Under relaxed purity
+        # the economics stand: TP can prefill there, so leaving is a price
+        # question and `pending <= N` is the right one to ask.
+        _strict_holds_pp = bool(inp.work_exists()) and not cfg.prefill_runs_in_tp
+        if (
+            inp.pending_prefill_tokens <= cfg.pp_exit_tokens
+            and inp.running_bs > 0
+            and not _strict_holds_pp
+        ):
             # W30: AN ARM MAY NOT DESTROY ITS OWN JUSTIFICATION.
             #
             # The reason logged below is "N req decoding", i.e. take these
