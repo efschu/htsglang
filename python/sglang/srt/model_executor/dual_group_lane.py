@@ -2241,7 +2241,33 @@ class DualGroupLane:
                     try:
                         with torch.cuda.stream(self.stream):
                             self._step_locked_scope()
-                    except Exception:
+                    except Exception as exc:
+                        # #867: THE WORST EXPRESSION OF THE CLASS. Dropping the
+                        # job and continuing is right for a job-local failure
+                        # and catastrophic for a poisoned CUDA context: this is
+                        # a daemon thread, so it would go straight back round
+                        # and launch the NEXT job's kernels into a dead
+                        # context, job after job, burying the origin under one
+                        # identical traceback per job.
+                        from sglang.srt.distributed.device_communicators import (
+                            barlink_abort_gate,
+                        )
+
+                        if barlink_abort_gate.is_poison_error(exc):
+                            source = f"dual-group lane {self.lane_id} step"
+                            if barlink_abort_gate.record_poison(source, exc):
+                                logger.error(
+                                    "#867 dual-group lane %d standing down: the "
+                                    "step hit an UNSURVIVABLE CUDA fault (%s). "
+                                    "The context is unusable, so this thread "
+                                    "stops rather than launching the next job "
+                                    "into it. Treat THIS as the origin, not the "
+                                    "traceback that lands next.",
+                                    self.lane_id,
+                                    exc,
+                                )
+                            self.drop_active()
+                            return
                         logger.exception(
                             "dual-group lane %d step failed; dropping the active job.",
                             self.lane_id,

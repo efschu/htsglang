@@ -689,6 +689,50 @@ class PeerWatchdog:
 
         return barlink_abort_gate.poll_status_words()
 
+    def _stop_on_poison(self, what: str, exc: BaseException) -> bool:
+        """#867: the OUTER swallow layer, and the trap it was leaving behind.
+
+        This thread wrapped `probe_once()` and `poll_abort_words()` in
+        `except Exception: logger.exception(...)` with the same "a watchdog must
+        not die" comment as the inner handler #867 fixed -- and
+        `poll_abort_words` calls straight into that inner one. So the moment
+        anyone made the inner layer re-raise on a poisoned context, THIS layer
+        would have swallowed it again and quietly restored the original defect.
+        It did not mask the fix on the day it landed; it was a trap set for the
+        next editor, which is the shape this tree lost to three times in one
+        night.
+
+        A poisoned CUDA context cannot be polled out of. Every further tick
+        re-reads a dead device, logs the same error and buries the origin
+        deeper, at ~10 ms per tick. So: record it as the origin (first wins),
+        say once that the thread is standing down, and return True so the
+        caller LEAVES THE LOOP. The thread still does not raise -- raising here
+        kills it and loses the record, which is what the original comment was
+        right about.
+        """
+        from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
+        if not barlink_abort_gate.is_poison_error(exc):
+            return False
+        source = f"barlink liveness {what}"
+        if barlink_abort_gate.record_poison(source, exc):
+            logger.error(
+                "#867 barlink liveness thread standing down: %s hit an "
+                "UNSURVIVABLE CUDA fault (%s). The context is unusable, so "
+                "every further tick would re-read a dead device and bury the "
+                "origin. Treat THIS as the origin, not the traceback that "
+                "lands next.",
+                what,
+                exc,
+            )
+        else:
+            logger.error(
+                "#867 barlink liveness thread standing down after a poisoned "
+                "context (origin already recorded elsewhere): %s",
+                what,
+            )
+        return True
+
     def _run(self) -> None:
         # Two duties, two cadences. The loop ticks at the FASTER one (the
         # abort poll, ~10 ms) and runs the peer probe every Nth tick, so the
@@ -707,11 +751,15 @@ class PeerWatchdog:
                         # so a window registered later still gets tripped, but
                         # stop re-logging: trip() is idempotent.
                         pass
-            except Exception:  # pragma: no cover - a watchdog must not die
+            except Exception as exc:  # a watchdog must not die
+                if self._stop_on_poison("peer watchdog probe", exc):
+                    break
                 logger.exception("barlink peer watchdog probe failed")
             try:
                 self.poll_abort_words()
-            except Exception:  # pragma: no cover - a watchdog must not die
+            except Exception as exc:  # a watchdog must not die
+                if self._stop_on_poison("abort-word poll", exc):
+                    break
                 logger.exception("barlink abort-word poll failed")
             tick = barlink_abort_gate.poll_interval_s()
             self._stop.wait(max(min(tick, max(self._interval, 0.05)), 0.001))
