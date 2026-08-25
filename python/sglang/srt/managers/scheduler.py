@@ -9174,6 +9174,23 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+
+        # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
+        # nothing wrote must not speculate over them. Here, and not in the
+        # prefill builder, because this is the one funnel every batch passes
+        # through on its way to a forward -- including the seam-transport
+        # re-admission the #856 cutover queues, which is built by a purity
+        # exemption rather than by the ordinary path.
+        #
+        # Two cheap terms guard the default path: no speculation in this phase
+        # means `draft_worker` is None and the arming returns immediately, and
+        # a decode batch has no cached prefix to be cold about.
+        if self.draft_worker is not None and batch.forward_mode.is_extend():
+            from sglang.srt.managers.phase_flip_draft_bootstrap import (
+                arm_draft_cold_for_admission,
+            )
+
+            arm_draft_cold_for_admission(self, batch)
         # getattr: same STAND-IN discipline as the policy gate -- a holder
         # that binds `run_batch` unbound must not acquire a new requirement.
         getattr(self, "_check_layout_conformance", lambda *_: None)(batch)

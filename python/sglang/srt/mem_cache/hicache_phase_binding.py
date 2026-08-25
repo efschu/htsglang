@@ -442,6 +442,25 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
     settle_pending_releases(scheduler)
     generation = rebind(readers, incoming)
     coherence_check(readers)
+    # #861: THE FOURTH PARTICIPANT. The draft half is registered here and
+    # nowhere else, for the same reason the other three are rebound here: its
+    # host indices are 1-to-1 with the target host pool's, and that pool has
+    # just moved. Registering it at boot -- which is what Scheduler.__init__
+    # tried to do, against the deliberately-nulled boot-phase drafter -- names
+    # generation 0's slot space for a consumer that runs at generation n.
+    #
+    # AFTER coherence_check, deliberately: a draft half armed against a target
+    # binding that itself failed to move is the partial-rebind hazard this
+    # module's own docstring calls "strictly worse than the #718 state".
+    #
+    # A refusal here RAISES (the caller treats it as a refused rebind); a
+    # phase that simply owns no drafter DISARMS quietly, which is the ordinary
+    # tp->pp leg.
+    from sglang.srt.mem_cache.kv_cache_builder import (
+        rebind_hicache_draft_for_phase,
+    )
+
+    rebind_hicache_draft_for_phase(scheduler, incoming_phase)
     return generation
 
 

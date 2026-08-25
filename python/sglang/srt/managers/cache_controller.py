@@ -442,6 +442,14 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        # #861: the phase that owns the drafter (None on a single-phase
+        # instance), the #719 binding generation the registration was minted
+        # at, and the drafter-identity suffix its persisted pages carry. All
+        # three are read by ``draft_tier_armed`` and nowhere else.
+        self.draft_owner_phase = None
+        self.draft_binding_generation = None
+        self.draft_identity = None
+        self._draft_disarm_warned = set()
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -1084,7 +1092,7 @@ class HiCacheController:
                 kv_device_indices,
                 self.io_backend,
             )
-            if self.has_draft:
+            if self.draft_tier_armed("write"):
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
@@ -1230,7 +1238,10 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                if (
+                    self.draft_tier_armed("load")
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
@@ -1319,20 +1330,140 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+    def draft_tier_armed(self, direction: str) -> bool:
+        """THE ONE GATE for draft-half I/O. Six consume points, one answer.
+
+        #861, and the shape is 2bf0f53498's ("give all four consume points one
+        gate") applied to the participant that never had one. Before this, six
+        sites each read ``self.has_draft`` directly -- four here and two in
+        ``HybridCacheController``'s overrides, which is the lane this rig
+        actually runs (the W31/W32/W33 shape: a correct mechanism a second copy
+        overrides is a mechanism that never runs).
+
+        Three conditions, and each one is a corruption if it is skipped:
+
+        1. REGISTERED AT ALL. The pre-#861 state on a flip boot, and the
+           acceptance collapse this fixes.
+        2. THE ACTIVE PHASE OWNS THE DRAFTER. There is one drafter in a
+           phase-flip process and it lives on the TP stack; the PP prefill
+           phase has none. A draft backup taken in PP would persist rows no
+           drafter ever wrote under a content-addressed key, for the TP phase
+           to load as valid -- strictly worse than the missing registration.
+           ``None`` means "single-phase instance", which skips this term and
+           keeps every non-flip deployment byte-identical.
+        3. THE BINDING HAS NOT MOVED UNDER US. Draft host indices are 1-to-1
+           with the TARGET host pool's, and ``hicache_phase_binding._stamp``
+           re-points ``mem_pool_host`` at every rebind. A registration minted
+           at generation g indexes generation g's slot space; consumed at g+1
+           it addresses a different pool. Same authority as the releases and
+           the write-backs (``write_back_stamp_is_current``), one more
+           consumer -- not a second stamp scheme.
+
+        The TARGET tier's own ``device_tier_disarmed`` is NOT re-asked here:
+        every device-side consume point already sits behind it, and asking
+        twice would let the two answers drift. The L3 points are storage-side
+        and correctly outside it.
+        """
+        if not self.has_draft:
+            return False
+        if self.draft_owner_phase is not None:
+            from sglang.srt.mem_cache.hicache_phase_guard import active_phase
+
+            if active_phase() != self.draft_owner_phase:
+                self._warn_draft_disarmed(
+                    direction,
+                    f"the active phase is not '{self.draft_owner_phase}', which "
+                    f"is the only phase that owns a drafter",
+                )
+                return False
+        if self.draft_binding_generation is not None:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                current_generation,
+            )
+
+            if int(self.draft_binding_generation) != int(current_generation()):
+                self._warn_draft_disarmed(
+                    direction,
+                    f"registered at binding generation "
+                    f"{self.draft_binding_generation}, current is "
+                    f"{current_generation()}",
+                )
+                return False
+        return True
+
+    def _warn_draft_disarmed(self, direction: str, reason: str) -> None:
+        """One line per (direction, reason) per process; the state is phase-long."""
+        key = f"{direction}:{reason}"
+        if key in self._draft_disarm_warned:
+            return
+        self._draft_disarm_warned.add(key)
+        logger.warning(
+            "#861 draft-half HiCache %s DISARMED: %s. Target-tier I/O is "
+            "unaffected; a prefix restored while this holds carries NO draft "
+            "rows, so requests admitted on it must be marked draft-cold "
+            "(phase_flip_draft_bootstrap.mark_draft_cold) rather than allowed "
+            "to speculate over rows nothing wrote.",
+            direction,
+            reason,
+        )
+
+    def set_draft_kv_pool(
+        self,
+        draft_device_pool,
+        draft_host_pool,
+        *,
+        owner_phase=None,
+        binding_generation=None,
+        drafter_identity=None,
+    ) -> None:
+        """Register draft KV pools so L2/L3 ops piggyback draft transfers.
+
+        Idempotent by design: ``rebind_hicache_draft_for_phase`` calls this on
+        every pp->tp cutover with the same pools and a fresh generation, so
+        re-registration is the normal case rather than an error.
+        """
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        self.draft_owner_phase = owner_phase
+        self.draft_binding_generation = binding_generation
+        self.draft_identity = drafter_identity
         logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
+            "HiCache draft KV registered: %s (host %d slots), owner_phase=%s, "
+            "binding_generation=%s, drafter=%s",
             type(draft_device_pool).__name__,
             draft_host_pool.size,
+            owner_phase,
+            binding_generation,
+            drafter_identity,
         )
 
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+
+    def disarm_draft_kv_pool(self, reason: str) -> None:
+        """#861: leave the draft half unarmed for the phase being entered.
+
+        Not a teardown: the pools stay referenced so the next cutover into the
+        drafter's own phase re-arms by re-stamping rather than re-allocating
+        (a pinned host pool per flip would charge the host budget every time,
+        and on this box that budget binds -- DESIGN_706 C1).
+
+        Called unconditionally on the leg into a phase without a drafter, so
+        "armed" is never a latch. The gate would refuse anyway on the phase
+        term, and that redundancy is deliberate: a latched True that only the
+        gate contradicts is one refactor away from being trusted.
+        """
+        if self.has_draft:
+            logger.info(
+                "#861 draft-half HiCache DISARMED: %s. The pools are kept for "
+                "the next cutover into the drafter's phase.",
+                reason,
+            )
+        self.has_draft = False
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
@@ -1345,17 +1476,24 @@ class HiCacheController:
 
         # Multi-pool zero-copy backends.
         if backend == "mooncake":
-            if self.storage_config.should_split_heads:
-                logger.warning(
-                    "HiCache draft L3 disabled: should_split_heads not yet "
-                    "supported on the mooncake v2 path."
-                )
-                return
-            self.storage_backend.register_mem_host_pool_v2(
-                self.mem_pool_host_draft, PoolName.DRAFT
+            # #861 GUARD. The v2 route keys a page by the POOL NAME
+            # (`register_mem_host_pool_v2(pool, PoolName.DRAFT)` ->
+            # `_get_component_key`), so the drafter-identity suffix the generic
+            # route carries cannot ride along without changing the registered
+            # pool identity itself. Until task #861 item (a) puts the drafter
+            # into `compute_model_identity_hash` -- where every backend and both
+            # key routes pick it up -- a v2 draft page would be readable by a
+            # different drafter as valid. Refused by name rather than left
+            # write-only: a page nobody may read is still a page the NEXT boot
+            # may read.
+            logger.warning(
+                "HiCache draft L3 disabled on the mooncake v2 route (#861): a "
+                "v2 page is keyed by pool name, so it cannot carry the drafter "
+                "identity the generic route puts in its component key, and a "
+                "draft page readable across a drafter change is a silently "
+                "wrong draft KV. The L2 host tier is unaffected. Lift this "
+                "once #861 (a) folds the drafter into the model identity hash."
             )
-            self.draft_page_get_func = self._draft_page_get_v2
-            self.draft_page_set_func = self._draft_page_set_v2
             return
 
         # TODO: support "hf3fs", "eic", "nixl", "simm"
@@ -1510,7 +1648,7 @@ class HiCacheController:
             # Best-effort draft L3 read before publishing target completion.
             # Otherwise wait_complete can race and load back target KV before
             # draft KV reaches host memory.
-            if self.has_draft:
+            if self.draft_tier_armed("l3-load"):
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
@@ -1702,10 +1840,40 @@ class HiCacheController:
             ]
         )
 
+    def _draft_component_name(self) -> str:
+        """The component name a persisted draft page is keyed under.
+
+        #861 GUARD, and it is the cheapest correct form rather than the full
+        fix. Fix (0) newly makes these pages READABLE, and every HiCache key
+        suffix is built from ``compute_model_identity_hash``, which covers the
+        TARGET (model_path, revision, dtype, quantization, kv_cache_dtype) and
+        carries nothing about the drafter. Two boots agreeing on the target and
+        differing in drafter -- another NEXTN checkpoint, MTP<->EAGLE, the #156
+        cross-algorithm switch -- would read each other's draft KV as valid,
+        with blob length the only accidental guard and equal geometry the
+        common case.
+
+        Folding the drafter into the component name makes such a page simply
+        NOT EXIST for the other drafter: a clean miss, which is the same
+        argument ``HiCacheFile`` already makes for the identity hash it does
+        carry. Task #861 item (a) -- drafter identity inside
+        ``compute_model_identity_hash`` itself, so EVERY backend and both key
+        routes carry it -- is filed and deliberately not built here.
+
+        Falls back to the bare pool name when no identity was supplied, which
+        keeps a caller that predates this parameter writing exactly the keys it
+        wrote before.
+        """
+        if not self.draft_identity:
+            return str(PoolName.DRAFT)
+        return f"{PoolName.DRAFT}-{self.draft_identity}"
+
     def _draft_page_set_generic(self, hash_values, host_indices) -> None:
-        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
-        # `{key}.{pool_name}` convention so target/draft pages never collide.
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        # `{hash}.draft-{drafter}` mirrors HiCacheStorage._get_component_key's
+        # `{key}.{pool_name}` convention so target/draft pages never collide,
+        # and never collide across drafters either (#861).
+        component = self._draft_component_name()
+        draft_keys = [f"{h}.{component}" for h in hash_values]
         draft_data = [
             self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
             for i in range(len(draft_keys))
@@ -1713,7 +1881,8 @@ class HiCacheController:
         self.storage_backend.batch_set(draft_keys, draft_data)
 
     def _draft_page_get_generic(self, hash_values, host_indices) -> None:
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        component = self._draft_component_name()
+        draft_keys = [f"{h}.{component}" for h in hash_values]
         draft_dummy = [
             self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
         ]
@@ -1774,7 +1943,7 @@ class HiCacheController:
                 break
 
             # Best-effort draft L3 write alongside target.
-            if self.has_draft:
+            if self.draft_tier_armed("l3-write"):
                 self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
