@@ -1106,6 +1106,16 @@ SEAM_READMIT_ATTR = "seam_readmit_epoch"
 #: open, read by the prefill builder to keep the batch to transport only.
 SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
 
+#: #890: attribute stamped on a request whose seam restore was REFUSED where it
+#: is executed, i.e. whose tokens the refusal sends back to be RECOMPUTED.
+#: Written only by `schedule_batch.restore_seam_state`'s two refusal branches
+#: and cleared there by a restore that actually happens, so it is a statement
+#: about the last attempt rather than a life sentence. Read by
+#: `seam_transport_premise_holds`, which is the whole point: the exemption is
+#: granted on the claim that a re-admission recomputes nothing, and this is the
+#: one signal that says the claim was false for this request.
+SEAM_RESTORE_REFUSED_ATTR = "seam_restore_refused"
+
 
 def seam_readmit_candidates(scheduler) -> list:
     """Queued requests the #856 cutover retracted and must re-admit.
@@ -1224,8 +1234,31 @@ def seam_transport_premise_holds(scheduler) -> bool:
     if not reqs:
         return False
     restored = 0
+    revoked = 0
     for req in reqs:
         try:
+            # #890: THE GRANT IS WITHDRAWN BY THE EXECUTION THAT DISPROVED IT.
+            #
+            # Everything below this line is EVIDENCE -- what was true when the
+            # request was retracted. This is OUTCOME: `restore_seam_state`
+            # refused the copy and said so in its own words, "Dropped; these
+            # tokens are recomputed" (W38: 90 and 21 occurrences). A recompute
+            # is the one thing the exemption promised would not happen, so the
+            # request stops counting as restore evidence until a restore
+            # actually succeeds for it again.
+            #
+            # IT CANNOT BE FOLDED INTO THE EVIDENCE TERM, which is why it is a
+            # field of its own: the recompute the refusal forces re-fills the
+            # prefix, so the NEXT retraction re-stamps
+            # `cached_prompt_tokens_at_retract` from the measured boundary and
+            # the evidence reads "computed and fenced" at exactly the moment
+            # the copy has proven unusable. The premise would then be issued
+            # again on a claim this request has already falsified on metal --
+            # the #501 shape (a grant checked at issue, never revoked at
+            # execution).
+            if getattr(req, SEAM_RESTORE_REFUSED_ATTR, False):
+                revoked += 1
+                continue
             # #861j: EVIDENCE THAT SURVIVES THE RETRACTION. The seam's own
             # `reset_for_retract` zeroes `cache_protected_len` on every
             # request it stamps, so keying the premise on that field alone
@@ -1245,6 +1278,14 @@ def seam_transport_premise_holds(scheduler) -> bool:
         except (TypeError, ValueError):
             continue
     if restored:
+        # #890 EDGE-TRIGGERED, on this module's own rule for exactly this shape:
+        # "Cleared on recovery, so a flapping rig logs each engagement rather
+        # than only the first in the process's life" (`_drain_yield_announced`).
+        # The refusal below latched instead -- which would have made the
+        # revocation this fix installs observable exactly once per process, and
+        # a revocation nobody can see recur is a revocation nobody can measure.
+        if getattr(scheduler, "_seam_premise_refused_announced", False):
+            scheduler._seam_premise_refused_announced = False
         return True
     if not getattr(scheduler, "_seam_premise_refused_announced", False):
         scheduler._seam_premise_refused_announced = True
@@ -1252,15 +1293,19 @@ def seam_transport_premise_holds(scheduler) -> bool:
             "%s SEAM TRANSPORT REFUSED: the exemption's premise does not hold. "
             "%d stamped request(s) are queued and NONE carries restore "
             "evidence (cache_protected_len=0 AND "
-            "cached_prompt_tokens_at_retract=0 for all), so re-admitting "
+            "cached_prompt_tokens_at_retract=0 for all), or %d of them had "
+            "their restore REFUSED at execution (#890 -- the copy was dropped "
+            "and the tokens go back to be recomputed), so re-admitting "
             "them in the TP "
             "layout would be a COLD PREFILL of real work, not a cache restore "
             "-- the user's strict-batch law, broken by the exemption meant to "
             "respect it. Holding instead; the #861c existence term raises the "
             "flip demand and the work runs in the layout that owns it. "
-            "Measured W37-D: 258 such batches at #cached-token 0.",
+            "Measured W37-D: 258 such batches at #cached-token 0; W38: 90 and "
+            "21 SEAM RESTORE REFUSED (LAYOUT).",
             LOG_PREFIX,
             len(reqs),
+            revoked,
         )
     return False
 

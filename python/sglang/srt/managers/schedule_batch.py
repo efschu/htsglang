@@ -945,6 +945,20 @@ class Req(ReqDllmMixin):
         # on the one re-admission it licenses.
         self.seam_readmit_epoch = None
 
+        # #890: DID THE LAST SEAM RESTORE ACTUALLY RESTORE?
+        #
+        # The exemption above is granted on the claim that a re-admission
+        # "recomputes nothing -- it is a cache restore". `restore_seam_state`
+        # has two branches that refuse the copy and send the tokens back to be
+        # RECOMPUTED, which falsifies that claim for this request; W38 counted
+        # 90 and 21 of them in two boots. Set there and only there, and cleared
+        # there by a restore that actually happens, so this says what the LAST
+        # attempt did rather than passing a life sentence. Read by
+        # `phase_purity.seam_transport_premise_holds`
+        # (`SEAM_RESTORE_REFUSED_ATTR`), which is where the permission is
+        # issued and therefore where it has to be withdrawn.
+        self.seam_restore_refused = False
+
         # kv-session-offload Prefill-Spill (born-spilled, PS1-V1a): set at
         # admission when the prompt's lifetime KV would not fit VRAM but its
         # prefill input transiently fits. The prompt is admitted (instead of
@@ -2103,6 +2117,25 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
     A REFUSED COPY IS DROPPED, not kept: it is stale against a request the model
     has since advanced, and holding it would let a later coincidentally-matching
     extent restore ancient bytes.
+
+    #890: A REFUSAL ALSO REVOKES THE PERMISSION THAT BROUGHT THE REQUEST HERE.
+    Dropping the copy is only half of it. The request was admitted into the TP
+    layout under `phase_purity.seam_transport_exempt`, whose premise -- verified
+    at the GRANT by `seam_transport_premise_holds` -- is that the re-admission
+    "recomputes nothing". Each refusal below says in its own log line that the
+    tokens ARE recomputed, so the premise is false for this request and the
+    permission must not be issued to it again on the same evidence. The
+    evidence field (`cached_prompt_tokens_at_retract`) cannot carry that: the
+    recompute the refusal forces re-stamps it at the next retraction, so it
+    reads "computed and fenced" precisely when the copy has just proven
+    unusable. Hence a separate mark, set here and cleared on the success path
+    below, where the claim becomes true again.
+
+    NOTHING IS MARKED WHEN THERE WAS NO COPY. This function runs for every
+    request in an extend batch and `kv_cache_cpu` is None for almost all of
+    them -- a request that never went through the seam, or one whose copy the
+    cutover DECLINED. Marking that path would revoke the exemption for the
+    whole world and put the W30 livelock back.
     """
     saved = getattr(req, "kv_cache_cpu", None)
     if saved is None:
@@ -2134,6 +2167,12 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         req.kv_cache_cpu_layout = None
         req.mamba_state_cpu = None
         req.mamba_state_cpu_layout = None
+        # #890: the tokens this line just sent back to be recomputed are the
+        # ones the exemption promised would not be. Rank-uniform: both sides of
+        # the comparison above are the LOGICAL extent (`kv_cache_cpu_extent` is
+        # stamped in `offload_kv_cache` from `[: seqlen - 1]`), which is
+        # replicated across the group.
+        req.seam_restore_refused = True
         return False
 
     # #861c: the SECOND axis, and the one W40 died on. The extent check above
@@ -2191,6 +2230,15 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         req.kv_cache_cpu_layout = None
         req.mamba_state_cpu = None
         req.mamba_state_cpu_layout = None
+        # #890: THE AXIS THE MEASUREMENT ACTUALLY LANDED ON -- W38 logged 90 and
+        # 21 of exactly this line, each one an exempt admission whose tokens
+        # were then recomputed in the decode layout. Rank-uniform: a flip that
+        # repartitions layers changes `layer_num` on EVERY rank (a stage's slice
+        # against the whole), so this verdict is a property of the flip and not
+        # of the rank; a flip that repartitions nothing leaves the two equal on
+        # every rank. Whether a pool can state a layout at all is a property of
+        # the pool CLASS, which is likewise the same on every rank.
+        req.seam_restore_refused = True
         return False
 
     # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
@@ -2211,6 +2259,12 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         )
     req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     req.kv_cache_cpu_extent = None
+    # #890: THE REVOCATION IS NOT A LIFE SENTENCE. A restore that actually
+    # happens is the premise coming true again for this request, so the mark
+    # clears here. Without this one flip whose geometry did not match would
+    # exile the request from an exemption that exists to keep the instance out
+    # of the W30 livelock, for the rest of its life.
+    req.seam_restore_refused = False
     _SEAM_STATE_COUNTS["restored"] += 1
     n = _SEAM_STATE_COUNTS["restored"]
     if n <= 5 or n % 50 == 0:

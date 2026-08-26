@@ -3949,9 +3949,28 @@ class Scheduler(
                 # while the mechanism to make it right was already installed.
                 from sglang.srt.managers.phase_purity import (
                     seam_readmit_candidates,
+                    seam_transport_premise_holds,
                 )
 
-                if seam_readmit_candidates(self):
+                # #890 SIBLING: THE PROBE MUST ASK THE SAME TWO QUESTIONS THE
+                # GATE ASKS, and it was asking only the first.
+                #
+                # `prefill_blocked_here` opens on `seam_transport_exempt(...)
+                # AND seam_transport_premise_holds(...)`. This probe answered
+                # the hypothetical on the STAMP ALONE, so a stamped population
+                # whose premise does not hold made it say "the TP layout could
+                # admit prefill" while the real gate refused to build anything
+                # -- `target_can_admit=True`, batch built in 0 rounds, which is
+                # the arm auditor's own wedge signature and the exact W33 defect
+                # this site's comment above says it exists to prevent. The
+                # divergence widens with the #890 revocation, which makes a
+                # false premise a routine outcome rather than a rare one.
+                #
+                # Callable directly, unlike `prefill_blocked_here`: the premise
+                # reads the replicated queue and has no active-phase early
+                # return, so it answers the hypothetical honestly. Pure -- it
+                # books nothing, so a probe still cannot empty the valve.
+                if seam_readmit_candidates(self) and seam_transport_premise_holds(self):
                     return True
                 # #887: THE HYPOTHETICAL ASKS THE BUDGETED FORM, AND SPENDS
                 # NOTHING. With a chunk still owed this phase, the TP layout
