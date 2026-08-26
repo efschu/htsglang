@@ -2911,9 +2911,33 @@ combination rather than silently degrading). Measured on this rig: an
 MT-shaped probe took 19.7 s to first token behind one 46k-token prefill and
 112.9 s behind four, against 154-186 ms idle; tagged `lane: "fast"` under the
 identical four-prefill load measured 23.6 s — a 4.8x win, not immunity,
-because `preempt_to_schedule` (`schedule_policy.py:1368`, `:1382`) iterates
-`running_batch.reqs` and a request still being chunk-prefilled is not in that
-set; chunk-preemptive admission is a separate, unbuilt cut. Two DIFFERENT
+because `preempt_to_schedule` (`schedule_policy.py:1614`, reserved-heavy floor
+`:1650`) iterates `running_batch.reqs` and a request still being chunk-prefilled
+is not in that set; chunk-preemptive admission is a separate, unbuilt cut.
+**#536 DETERMINATION (`ANALYSE_536_fastlane_starvation_determination.md`),
+re-verified on `train/0817-control`:** the 34.5 s specimen is that same
+mechanism — a whole prefill DRAIN, not a chunk boundary. Ordering is already
+correct and is not the cause (`schedule_policy.py:382` `_sort_by_priority_and_fcfs` sorts fast first; #552
+aging promotes an aged heavy request only to `fast_lane_priority - 1`, and its
+docstring records that promoting one ABOVE fast "would only wedge the admission
+loop and starve the fast lane"). So chunk-boundary preemption / priority
+admission is the WRONG remedy and is falsified by that docstring: priority
+orders the queue, it cannot release memory another request holds. The decided
+remedy is a KV-HEADROOM RESERVE and it is BUILT WITH TESTS but DARK and
+unreferenced on `fix/536-fast-lane-reserve` (`98125f1436`,
+`managers/fast_lane_reserve.py`), gated on a lane-ON/OFF observation under real
+session load that does not exist yet (`WINDOW_TICKET_536.md`) — so the specimen
+still reproduces here as a DEFECT, not a misconfiguration. The reverse
+direction is already protected in-tree: `--fast-lane-reserved-heavy-slots`
+floors heavy preemption at `schedule_policy.py:1650`. INTERACTION, and the
+brief's premise is stale: #699's admission-wedge detector IS wired on this
+lineage (`2753c764ba`) and structurally CANNOT see #536 —
+`invariant_checker.py:568` returns "not wedged" whenever `running > 0`, and the
+#536 shape always has a co-tenant running. The classes are disjoint (#699 =
+queued>0/running==0/no first token >= 20 s), which is safe for any bounded
+fast-lane wait and is also a COVERAGE GAP: nothing alarms on #536-class
+starvation today, though 34.5 s sits inside the 11.87-62.65 s band the 20 s
+threshold was drawn from. Two DIFFERENT
 mechanisms decide who yields under pressure and only one reads the lane by
 default: SLOT pressure (`--max-running-requests` full) already goes through
 `batch_is_full` -> `preempt_to_schedule` (`scheduler.py:3797-3809`), armed by
