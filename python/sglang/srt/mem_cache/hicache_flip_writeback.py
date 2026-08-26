@@ -281,6 +281,7 @@ def flip_writeback(
         elapsed_s=now() - started,
         deadline_s=float(deadline_s),
     )
+    _observe_store_delivery(report)
     if report.complete:
         logger.info("%s %s", LOG_PREFIX, report.as_log())
     else:
@@ -293,6 +294,81 @@ def flip_writeback(
             report.as_log(),
         )
     return report
+
+
+#: #871a: fences run in this process, and storage acks confirmed across ALL of
+#: them. Two ints, process-lifetime, deliberately NOT per-fence -- the per-fence
+#: numbers already exist on the report and are not the question being asked.
+_LIFETIME_FENCES: int = 0
+_LIFETIME_ACKED: int = 0
+
+#: Fences allowed to pass with a lifetime ack count of zero before this is
+#: reported as a delivery failure. Not 1: the first fences of a boot legitimately
+#: run over an empty tree, and an alarm that fires on an idle instance is the
+#: crying-wolf gate that gets muted. By the fourth work-carrying fence a store
+#: that has never taken a byte is not waiting for traffic, it is not connected.
+STORE_NEVER_DELIVERED_AFTER: int = 4
+
+
+def store_delivery_counters() -> tuple:
+    """``(fences, acknowledged)`` since process start. For tests and probes."""
+    return _LIFETIME_FENCES, _LIFETIME_ACKED
+
+
+def reset_store_delivery_counters() -> None:
+    global _LIFETIME_FENCES, _LIFETIME_ACKED
+    _LIFETIME_FENCES = 0
+    _LIFETIME_ACKED = 0
+
+
+def _observe_store_delivery(report: FlipWritebackReport) -> None:
+    """#871a: HAS EVER A BYTE REACHED THE STORE?
+
+    THE QUESTION NO EXISTING INSTRUMENT COULD ANSWER, and the reason this is a
+    lifetime counter rather than another per-fence field. Every number the fence
+    already reports is per-cutover, and each of them is legitimately zero on an
+    idle instance: `eligible=0` because the tree is empty, `acked=0` because
+    there was nothing to acknowledge, `complete` true because `outstanding == 0`
+    is trivially true when nothing was sent. So a store that has NEVER taken a
+    byte -- misconfigured, unreachable, or fed by a writer that never fires --
+    is byte-for-byte indistinguishable in the log from a healthy store on a
+    quiet instance. That is the INDICATOR shape: an instrument that cannot fail
+    to look healthy is not measuring the thing it is named after.
+
+    A LIFETIME count separates them, because the two states differ over TIME
+    even though they agree at every single sample. "No fence has ever acked a
+    byte, and fences have been running" is a statement about the store's
+    existence; "this fence acked nothing" is a statement about this cutover.
+
+    DELIBERATELY A LOWER BOUND. It counts acks the FENCE drained, not every
+    byte the normal write policy ever pushed, so a nonzero value is proof of
+    delivery while a zero is only evidence -- reported as such. Proving the
+    negative exactly would need a counter inside the backend, which is a second
+    source of truth about the same fact and the thing #838 acquired a silent
+    multi-valued zero from.
+    """
+    global _LIFETIME_FENCES, _LIFETIME_ACKED
+    _LIFETIME_FENCES += 1
+    _LIFETIME_ACKED += max(0, int(report.acknowledged))
+    if _LIFETIME_ACKED > 0 or _LIFETIME_FENCES != STORE_NEVER_DELIVERED_AFTER:
+        # `!=` not `>=`: once, at the crossing, not on every fence afterwards.
+        return
+    logger.error(
+        "%s #871a STORE NEVER DELIVERED: %d writeback fences have completed in "
+        "this process and NOT ONE has confirmed a single storage "
+        "acknowledgement. If this instance has served any request, the "
+        "geometry-neutral store is not being filled at all, and every "
+        "read-through after every cutover can only miss -- which shows up as "
+        "latency and full re-prefills, never as an error. This is the one "
+        "state the per-fence counters cannot report: `eligible=0 acked=0 "
+        "outstanding=0` is also what a healthy store looks like on an idle "
+        "instance, so only the lifetime count separates 'nothing to persist' "
+        "from 'nowhere to persist to'. Check that retention actually inserts "
+        "before the cutover retracts, and that the storage backend is "
+        "reachable.",
+        LOG_PREFIX,
+        _LIFETIME_FENCES,
+    )
 
 
 def _await_storage_acks(

@@ -2024,7 +2024,9 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
         return None
 
     # The pool's OWN mapping, exactly as `_MambaStrategy` reads it.
-    full_map = dict(getattr(tp_device_pool, "full_attention_layer_id_mapping", {}) or {})
+    full_map = dict(
+        getattr(tp_device_pool, "full_attention_layer_id_mapping", {}) or {}
+    )
     mamba_map = dict(mamba_map)
     if not full_map:
         logger.error(
@@ -2179,6 +2181,38 @@ def build_phase_flip_host_pools(scheduler):
                 "that number)"
             )
         use_mla = "MLA" in type(tp_device_pool).__name__
+        # #721/#547: ADMIT THIS PIN THROUGH THE SINGLE OWNER, BEFORE PINNING IT.
+        #
+        # `pinned_host_budget` is the declared owner of "may this PINNED host
+        # buffer be allocated?", and this pin -- the newest and one of the
+        # largest -- was not going through it. That is #547's defect exactly,
+        # reintroduced: "two independently plausible budgets can be jointly
+        # impossible, and because both pools are PINNED the over-commit is not
+        # a swap -- it is the OOM killer picking a victim that need not even be
+        # this process." #721 is that outcome observed on this box.
+        #
+        # The launcher's rank-invariant gate (`server_args`, over CONFIGURED
+        # numbers) cannot price this post: its size is DERIVED from the device
+        # pool's measured per-token cell, which does not exist until the worker
+        # has built the pool. So the admission belongs here, in the worker, as
+        # the module's documented runtime BACKSTOP -- the same place
+        # `weights_arena` registers its images.
+        #
+        # RAISING HERE IS THE POINT. The `except` below turns it into the named
+        # "#847 could not allocate the phase-matched staging pin" refusal, and
+        # the rebind then refuses at the first cutover with a legible reason.
+        # That is the outcome this replaces an OOM kill with.
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            check_and_register_pinned_post,
+        )
+
+        _kv_post_name = "phase-flip staging pin (KV half)"
+        check_and_register_pinned_post(
+            name=_kv_post_name,
+            flag="--phase-flip-* (staging pin, derived from chunked_prefill_size x max_running_requests)",
+            requested_bytes=int(gib * (1 << 30)),
+        )
+        _pinned_posts = [_kv_post_name]
         kv_host = build_kv_host_pool(
             kv_pool=inner_pool,
             page_size=int(getattr(sa, "page_size", 1) or 1),
@@ -2264,6 +2298,23 @@ def build_phase_flip_host_pools(scheduler):
             )
         tp_host = HostPoolGroup(entries)
     except Exception as exc:  # noqa: BLE001 - a refusal must be legible
+        # #721: TAKE THE POSTS BACK. `pinned_host_budget` names this hazard in
+        # its own words: "a post that is registered and then NEVER allocates
+        # ... would be credited back without ever having been resident, and the
+        # next admission would be charged too little -- the registry waving
+        # through the over-commitment it exists to refuse. A future producer
+        # that can leave a post registered with no allocation behind it must do
+        # the same [unregister]." This producer is exactly that: every path out
+        # of this block below the admission can fail.
+        for _name in locals().get("_pinned_posts", ()) or ():
+            try:
+                from sglang.srt.mem_cache.pinned_host_budget import (
+                    unregister_pinned_post,
+                )
+
+                unregister_pinned_post(_name)
+            except Exception:  # noqa: BLE001 - cleanup must not mask `exc`
+                pass
         logger.error(
             "#847 PHASE-FLIP REBIND: could not allocate the phase-matched "
             "staging pin (%.3f GiB -> %d GB requested): %s. The rebind will "
@@ -2278,14 +2329,22 @@ def build_phase_flip_host_pools(scheduler):
     # #721 HOST-LEDGER: the pin is a NAMED POST, and the floor never yields to
     # it. Printed here, at the allocation, so the number in the ledger is the
     # number that was actually taken rather than an intention.
+    # #549/#551: THE NUMBER MUST DENOTE SOMETHING. This read `free -g`, which
+    # inside this LXC container is synthesised by lxcfs -- `MemAvailable` can
+    # exceed `MemTotal` (observed on this rig), and with `memory.max` unlimited
+    # it reports the HOST's figures on a box other containers are also
+    # spending. `pinned_host_budget.pinned_host_memory_bytes` is the #407
+    # declared owner of this question and consults /sys/fs/cgroup, so the
+    # ledger now prints the same figure the admission above decided on. A
+    # ledger and a guard that disagree about how much RAM there is are worse
+    # than either alone.
     try:
-        import subprocess
-
-        free_g = int(
-            subprocess.run(["free", "-g"], capture_output=True, text=True)
-            .stdout.split("\n")[1]
-            .split()[6]
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            pinned_host_memory_bytes,
         )
+
+        _total_b, _avail_b = pinned_host_memory_bytes()
+        free_g = -1 if _avail_b is None else int(_avail_b // (1024**3))
     except Exception:  # noqa: BLE001 - the ledger must not break the boot
         free_g = -1
     # #871: the MAMBA half is a POST OF ITS OWN, priced from what was actually
@@ -2296,19 +2355,53 @@ def build_phase_flip_host_pools(scheduler):
     if mamba_host is not None:
         try:
             mamba_bytes = int(
-                getattr(mamba_host, "size", 0) * getattr(mamba_host, "size_per_token", 0)
+                getattr(mamba_host, "size", 0)
+                * getattr(mamba_host, "size_per_token", 0)
             )
         except Exception:  # noqa: BLE001 - the ledger must not break the boot
             mamba_bytes = -1
+        # #721: the MAMBA half is a POST TOO. Registered AFTER its allocation
+        # rather than before it, and the asymmetry with the KV half above is
+        # deliberate: this pool's byte size is not desk-decidable (it mirrors
+        # the device mamba pool per SLOT, so it depends on `conv_state` /
+        # `temporal_state` shapes that only exist once the pool is built), so
+        # there is no honest figure to admit it on beforehand. Registering it
+        # now still makes it visible to every LATER post in this process, which
+        # is the half of #547 that can be recovered here. `weights_arena`
+        # registers its images the same way.
+        if mamba_bytes > 0:
+            try:
+                check_and_register_pinned_post(
+                    name="phase-flip staging pin (MAMBA half)",
+                    flag="--phase-flip-* (staging pin, per-slot mirror of the device mamba pool)",
+                    requested_bytes=mamba_bytes,
+                )
+            except Exception as _mexc:  # noqa: BLE001 - already allocated
+                # It is ALREADY PINNED; refusing now would be a lie about a
+                # buffer that exists. Report it as the over-commitment it is
+                # and let the operator lower a flag, rather than pretending the
+                # bytes went back.
+                logger.error(
+                    "#721 HOST-LEDGER: the phase-flip MAMBA half (%.3f GiB) is "
+                    "ALLOCATED but does not fit the pinned-host budget: %s. It "
+                    "cannot be given back here, so this is a warning and not a "
+                    "refusal -- lower a host-pinning flag before the next boot.",
+                    mamba_bytes / 2**30,
+                    _mexc,
+                )
     logger.warning(
         "HOST-LEDGER POST #847/#871 phase-flip staging pin: %d GB pinned for "
         "the 'tp' phase-matched host view (%.3f GiB derived from %d tok x "
         "cell) + MAMBA half %s (%s slots mirroring the device pool, ratio 1.0 "
-        "-- per-SLOT not per-GB), pools=%s, host free after = %s GB against "
-        "the 16 GB floor. This post exists so the #718 device tier stays ARMED "
-        "across the cutover; without it load() returns None for the whole TP "
-        "phase and every read-through misses. The POST shrinks if it does not "
-        "fit -- the FLOOR never does.",
+        "-- per-SLOT not per-GB), pools=%s, host available after = %s GB "
+        "(cgroup, #407 owner -- NOT `free -g`). This post exists so the #718 "
+        "device tier stays ARMED across the cutover; without it load() returns "
+        "None for the whole TP phase and every read-through misses. BOTH "
+        "halves are now ADMITTED through `pinned_host_budget`, which sums this "
+        "pin with every other pinned post and REFUSES rather than shrinking "
+        "-- the earlier text here promised a 16 GB floor that no code "
+        "enforced, and an unenforced floor in a ledger line is how #721's OOM "
+        "looked survivable on paper.",
         size_gb,
         gib,
         int(getattr(sa, "chunked_prefill_size", 4096) or 4096)
@@ -2316,7 +2409,9 @@ def build_phase_flip_host_pools(scheduler):
         (
             "not built"
             if mamba_host is None
-            else ("unpriceable" if mamba_bytes < 0 else f"{mamba_bytes / 2**30:.3f} GiB")
+            else (
+                "unpriceable" if mamba_bytes < 0 else f"{mamba_bytes / 2**30:.3f} GiB"
+            )
         ),
         "0" if mamba_host is None else getattr(mamba_host, "size", "?"),
         # getattr, for the SAME STAND-IN reason this module states at its other
@@ -2325,7 +2420,8 @@ def build_phase_flip_host_pools(scheduler):
         # the writer uses, and `HostPoolGroup` itself is patched there. An
         # instrument may never be the thing that breaks a boot -- reporting
         # "unknown" is the honest answer when the shape is not there.
-        sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ())) or "unknown",
+        sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ()))
+        or "unknown",
         free_g if free_g >= 0 else "unknown",
     )
     return {"pp": pp_host, "tp": tp_host}
