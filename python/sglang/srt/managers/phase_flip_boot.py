@@ -971,6 +971,18 @@ class PhaseFlipStacks:
         # bound it hit -- which is why the 2.5x direction gap (tp_to_pp
         # 1351-1723 MiB/s vs pp_to_tp 3214-3915 for the same rank and within
         # 2.7% of the same bytes) could not be attributed from the log.
+        #
+        # #873: AND IT IS NEITHER OF THE TWO THIS SENTENCE OFFERS. "read or
+        # h2d" names the only two candidates a reader is given here, and the
+        # measured answer is a third that is not on the list -- ``ops.save``,
+        # the host-to-host memcpy into the staging ring (4.342 s of a 4.801 s
+        # leg on PP0, with both device spans at 0.000 s). This is not a
+        # hypothetical cost of leaving the sentence: an independent reader
+        # sweeping these segments in 2026-08 classified this leg
+        # "SINGLE-MECHANISM, driver = bytes moved / PCIe bandwidth" and cited
+        # THIS COMMENT as the authority, having never seen the phase lines. A
+        # narrowed candidate set reads as a decomposition. The real one is
+        # registered with the seam census below.
         leg_timing = RefillLegTiming()
         # #809/W28: the leg IS the rotation. `incoming` streams out of the one
         # host buffer and `outgoing` is placed back into it, so the buffer ends
