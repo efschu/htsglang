@@ -96,7 +96,7 @@ from sglang.srt.mem_cache.common import (
     peer_needs_mamba_evict,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import CpuCopyUnmappedRows, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -2052,6 +2052,14 @@ _SEAM_STATE_COUNTS = {
     "refused": 0,
     "refused_layout": 0,
     "carried": 0,
+    # #913: counted apart from `declined` for the reason `refused_layout` is
+    # counted apart from `refused` -- they diagnose different things. A
+    # `declined` says the request was mid-chunk, which is normal traffic; a
+    # `declined_unmapped` says the backing dial released pages under a live
+    # row, which is a defect upstream of this file. Folded into one number the
+    # second would be invisible inside the first at exactly the rate the first
+    # is common.
+    "declined_unmapped": 0,
 }
 
 
@@ -2104,7 +2112,53 @@ def seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
                 n,
             )
         return False
-    req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    # #913: DECLINE A ROW WHOSE PAGE IS GONE, do not read it.
+    #
+    # The backing dial releases pages under ids that live requests still hold
+    # (`runtime_set_backing_tokens` states "rows above n are dead the moment
+    # size is n", which is false while a resident holds one), and this copy is
+    # the consumer that turns that into a CUDA illegal memory access: R7 of the
+    # 0826 window, 18:27:14Z, PP2, live high-water 122898 against a backing of
+    # 114688, the whole instance down with a traceback naming `synchronize()`.
+    #
+    # CAUGHT HERE AND NOT LOWER because this is the frame that owns the
+    # response. `check_cpu_copy_rows` can only refuse; only the seam knows that
+    # a refused copy is survivable -- it is the DECLINE path three lines above,
+    # already built, already counted, whose cost is a recompute. Letting the
+    # refusal propagate would replace an unrecoverable rank death with a
+    # recoverable-in-principle one that still kills the flip, which is not the
+    # improvement it looks like: `release_residents_for_cutover` is past the
+    # no-return point and its caller has no abort left.
+    #
+    # NARROW ON PURPOSE. Only `CpuCopyUnmappedRows` is caught. A plain
+    # ValueError from the same guard means the id addresses NO pool -- the
+    # #783b defect -- and must still surface loudly; swallowing it here would
+    # hide an addressing bug behind a counter that reads as normal traffic.
+    try:
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    except CpuCopyUnmappedRows as refusal:
+        _SEAM_STATE_COUNTS["declined_unmapped"] += 1
+        n = _SEAM_STATE_COUNTS["declined_unmapped"]
+        if n <= 3 or n % 100 == 0:
+            logger.error(
+                "%s SEAM COPY DECLINED (UNMAPPED) rid=%s: %s The rows were "
+                "minted at a larger backing and a dial shrink released their "
+                "pages while this request still held them, so the copy would "
+                "read unmapped device memory. Declined; its tokens are "
+                "recomputed after the flip. occurrence=%d",
+                SEAM_STATE_PREFIX,
+                getattr(req, "rid", None),
+                refusal,
+                n,
+            )
+        # Leave nothing half-taken: a partially populated copy would be applied
+        # at restore against an extent it does not cover.
+        req.kv_cache_cpu = None
+        req.kv_cache_cpu_extent = None
+        req.kv_cache_cpu_layout = None
+        req.mamba_state_cpu = None
+        req.mamba_state_cpu_layout = None
+        return False
     _SEAM_STATE_COUNTS["copied"] += 1
     return True
 

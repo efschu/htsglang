@@ -77,6 +77,16 @@ class _StubPool:
         self.get_cpu_copy = types.MethodType(MHATokenToKVPool.get_cpu_copy, self)
         self.load_cpu_copy = types.MethodType(MHATokenToKVPool.load_cpu_copy, self)
 
+    def _committed_row_bound(self):
+        """#913: an eager stub pool has no VMM arena, so it cannot state a
+        backing -- None, never 0. Production pools answer this from
+        ``KVCache._committed_row_bound`` or the ``MHATokenToKVPool`` override;
+        modelling it here keeps the double from diverging from the real pool,
+        which is the W29 failure ("the suite's own double had the attribute and
+        not the method, exactly backwards from production").
+        """
+        return None
+
 
 SLOTS = 6
 LAYERS = 2

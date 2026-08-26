@@ -562,7 +562,22 @@ def note_mamba_carry_without_copy(pool: Any, req: Any) -> None:
     )
 
 
-def check_cpu_copy_rows(indices, rows: int, direction: str, axis: str) -> None:
+class CpuCopyUnmappedRows(ValueError):
+    """A CPU copy named rows whose pages are not committed (#913).
+
+    ITS OWN TYPE BECAUSE THE SEAM MUST BE ABLE TO CATCH EXACTLY THIS. The
+    cutover's response to "this request cannot be copied" already exists and is
+    to DECLINE it and let its tokens be recomputed (`seam_copy_state`). It must
+    not respond that way to a genuine addressing bug, which is what the plain
+    `ValueError` from `check_cpu_copy_rows` reports -- an id that addresses no
+    pool at all is a defect to surface, not a request to drop. Two conditions,
+    two responses, so two types.
+    """
+
+
+def check_cpu_copy_rows(
+    indices, rows: int, direction: str, axis: str, backed_rows: Optional[int] = None
+) -> None:
     """#783b: the rows/slots a CPU copy names must address THIS pool.
 
     A MODULE FUNCTION, not a method, because the pools that need it do not share
@@ -604,6 +619,42 @@ def check_cpu_copy_rows(indices, rows: int, direction: str, axis: str) -> None:
 
     Called BEFORE the first store, so a refused copy leaves the pool
     byte-identical. A guard that fires halfway through is a louder corruption.
+
+    ``backed_rows``: THE SECOND AXIS, AND #913 IS WHAT IT COSTS TO OMIT IT.
+    ----------------------------------------------------------------------
+    ``rows`` above is the tensor's own row count. On a #330-dial pool that is
+    the IMMUTABLE BOOT VA RESERVATION, not the memory that is mapped right now
+    -- ``store_bound_rows`` says so in as many words ("On the dial lane it is
+    the boot VA reservation"). Physical backing is ``uniform_backed_rows`` and
+    it MOVES: ``runtime_set_backing_tokens`` decommits pages on every shrink.
+
+    So the guard as written passes an id that addresses the reservation and
+    reads unmapped VA, which is a CUDA illegal memory access -- the exact
+    failure this function's own docstring calls "the LOUD half", one level up.
+    Measured, R7 of the 0826 acceptance window, 18:27:14Z: PP2 held live rows
+    to a high-water id of 122898 while its backing had been dialled down to
+    114688, `release_residents_for_cutover` -> `seam_copy_state` ->
+    `offload_kv_cache` -> `get_cpu_copy` read them, and the rank died at the
+    next `synchronize()` with the traceback naming the sync and not the read.
+    The reservation-axis check passed every one of those ids.
+
+    ``None`` means "this pool cannot state a backing" -- an eager pool with no
+    VMM arena -- and is NOT zero. Zero from a pool that HAS an arena would mean
+    nothing is mapped; zero from a pool that has none means the question does
+    not apply, and conflating them would refuse every copy off the dial lane.
+    The same rule ``reserved_backing_rows`` states for its own zero.
+
+    ORDER: the reservation check first. An id outside the reservation addresses
+    no pool at all and is the #783b defect; an id inside it but above the
+    backing addresses THIS pool at a moment when the page is gone, which is a
+    different fact with a different caller response (see `CpuCopyUnmappedRows`).
+    Checking the backing first would report the narrower cause for the broader
+    defect.
+
+    NOT A CLAMP HERE EITHER, for the reason the paragraph above gives: the rows
+    below the backing are a PREFIX of the request's extent only by accident,
+    and copying that prefix under the request's full length writes someone
+    else's KV. A refusal costs a recompute.
     """
     if indices is None:
         return
@@ -612,6 +663,21 @@ def check_cpu_copy_rows(indices, rows: int, direction: str, axis: str) -> None:
         return
     lo = int(indices.min())
     hi = int(indices.max())
+    if (
+        lo >= 0
+        and hi < int(rows)
+        and backed_rows is not None
+        and hi >= int(backed_rows)
+    ):
+        raise CpuCopyUnmappedRows(
+            f"HiCache CPU copy ({direction}): {axis} {hi} is inside this pool's "
+            f"{int(rows)}-{axis} reservation but ABOVE its committed backing of "
+            f"{int(backed_rows)} {axis}s. The pages under it were released by a "
+            f"backing-dial shrink while the row was still held, so reading it is "
+            f"an asynchronous illegal memory access that surfaces at the next "
+            f"synchronize() and takes the rank with it (#913, R7 18:27:14Z). "
+            f"Refusing: these tokens are recomputed instead."
+        )
     if lo < 0 or hi >= int(rows):
         bad = lo if lo < 0 else hi
         raise ValueError(
@@ -2677,6 +2743,28 @@ class KVCache(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
+    def _committed_row_bound(self) -> Optional[int]:
+        """Highest row id + 1 whose page is committed, or None if unanswerable.
+
+        DECLARED ON THE BASE SO NO POOL CAN RAISE AT THE SEAM (#913). The
+        overriding reason is not tidiness: this is read from inside
+        `release_residents_for_cutover`, which is past the cutover's no-return
+        point. An `AttributeError` there kills the rank exactly as dead as the
+        illegal access the caller exists to prevent, and it would do so on the
+        pools that were never in danger.
+
+        None means "this pool cannot state a backing", which for every pool
+        without a VMM arena is the truth: its rows are as mapped as the tensor
+        is. It is NOT zero -- see `MHATokenToKVPool._committed_row_bound`.
+
+        A pool that DOES dial its backing must override this. The default
+        cannot detect that omission, which is why the override lives beside
+        `uniform_backed_rows` on the class that owns the arena: the two are
+        read from the same owner, so a pool that gained one without the other
+        would be visibly half-built.
+        """
+        return None
+
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
@@ -3383,7 +3471,30 @@ class MHATokenToKVPool(KVCache):
     def uniform_backed_rows(self) -> int:
         """Rows backed in EVERY buffer. See KvVmmBufferOwner.uniform_backed_tokens."""
         owner = self._post_capture_owner
-        return int(owner.uniform_backed_tokens) if owner is not None else 0
+        return int(owner.reserved_rows) if owner is not None else 0
+
+    def _committed_row_bound(self) -> Optional[int]:
+        """Highest row id + 1 whose page is committed, or None if unanswerable.
+
+        #913: the ONE reading every consumer that indexes device rows should
+        bound against, as opposed to the tensor's row count, which on this lane
+        is the boot VA reservation and says nothing about what is mapped now.
+
+        None, NEVER ZERO, when there is no VMM arena. ``uniform_backed_rows``
+        returns 0 in that case, and 0 read as a bound would refuse every copy
+        on an eager pool -- the #832 rule ("a claim over an empty set is not
+        the absence of a claim") in its second instance.
+
+        The bound is the backing itself and not ``size``: ``uniform_backed_
+        rows`` is chunk-granular and legitimately sits up to one commit chunk
+        ABOVE the exposed size, so bounding here can never refuse an id the
+        allocator was entitled to hand out. It refuses exactly the ids that
+        were minted at a larger backing and outlived a shrink.
+        """
+        owner = self._post_capture_owner
+        if owner is None:
+            return None
+        return int(owner.uniform_backed_tokens)
 
     @property
     def reserved_backing_rows(self) -> int:
@@ -3621,7 +3732,13 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
-        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "offload", "row")
+        check_cpu_copy_rows(
+            indices,
+            int(self.k_buffer[0].shape[0]),
+            "offload",
+            "row",
+            backed_rows=self._committed_row_bound(),
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -3648,7 +3765,13 @@ class MHATokenToKVPool(KVCache):
         # copy; the loop below is sized by this one. Across a phase flip they are
         # different pools with different layer counts.
         check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
-        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "restore", "row")
+        check_cpu_copy_rows(
+            indices,
+            int(self.k_buffer[0].shape[0]),
+            "restore",
+            "row",
+            backed_rows=self._committed_row_bound(),
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
