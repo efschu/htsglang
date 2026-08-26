@@ -1179,6 +1179,72 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (flip_cost_s + stranded_s) / flip_cost_s))
 
 
+def unpriced_seam_note(cfg: "PhasePolicyConfig", running_bs: int = 0) -> Optional[str]:
+    """The seam costs seconds and NOTHING is required to justify paying it.
+
+    #874. A two-token health-check ping took 15.6-16.6 s on boot w40, three
+    times over four and a half hours, on a server with no other traffic. None
+    of it was compute. The ping is 13 tokens; under ``strict`` purity prefill
+    cannot run in the TP layout, so the 13 tokens armed ``tp_to_pp``, the
+    drain armed ``pp_to_tp`` right back, and the request paid two cutovers of
+    ~6.2 s each plus the 3 s minimum dwell between them.
+
+    EVERY ONE OF THAT BOOT'S CUTOVERS CARRIED ZERO KV (``sent 0 cells /
+    0.00 MiB``, 611 of 611). The seconds are the weights arena: 16.4 GiB per
+    rank, refilled host-to-device on every layout entry because the PP and TP
+    layouts hold disjoint shards and the inactive one is not resident. The
+    seam census names it directly -- ``refill_highwater->weights_refill``,
+    4868 ms of a 6299 ms walk. That term is occupancy-independent, so it does
+    not shrink for a small request: a 13-token ping and a 40k-token prompt pay
+    the same seam.
+
+    NOTHING HERE IS A BUG, AND THAT IS THE POINT. ``effective_flip_threshold``
+    returns 0 under strict purity deliberately -- a sub-N prompt could not run
+    in TP at all, and a threshold that survived would leave short prompts
+    unrunnable, which is the wedge recorded at the scheduler's wiring site ("a
+    one-token health check wedged an otherwise idle server"). The arm then
+    fires on any pending token, deliberately, against the user's law
+    "Break-even ist NICHT der Trigger". Both halves are correct in isolation.
+
+    WHAT IS MISSING IS THAT NOBODY SAYS THE PRODUCT OUT LOUD. A large fixed
+    cost whose price gate has been switched off will fire at whatever rate the
+    arrival pattern dictates, and the instance reports the rate (flip counts)
+    and the unit cost (DONE lines) in two different places while never
+    multiplying them. The state is decidable from config alone, so it is
+    reported at boot rather than discovered by timing a ping:
+
+      * ``live_flip_cost_s > 0``               the seam costs something, and
+      * ``effective_flip_threshold(...) == 0``  nothing is required to buy it.
+
+    THE FIGURE IS THE ROUND TRIP, not one leg, because that is what a single
+    request costs: out to the prefill layout and back to decode. Reporting one
+    leg would halve the number an operator has to act on.
+
+    Returns None whenever there is nothing to report -- a priced seam, or a
+    seam that costs nothing (unmeasured, or a deployment where the layouts
+    share their weights). A note on every config would be a note nobody reads.
+    """
+    cost_s = live_flip_cost_s(cfg)
+    if cost_s <= 0:
+        return None
+    if effective_flip_threshold(cfg, int(running_bs)) > 0:
+        return None
+    return (
+        f"UNPRICED SEAM: the flip threshold is 0, so ANY pending prefill token "
+        f"arms a cutover, and one request pays the round trip -- "
+        f"{2.0 * cost_s:.1f}s at the seam priced RIGHT NOW ({cost_s:.1f}s per "
+        f"leg; the estimator supersedes the boot seed on its first sample), "
+        f"plus {cfg.min_dwell_s:g}s of minimum dwell between the two legs. "
+        f"That cost is occupancy-independent (it is the weights arena, not "
+        f"the KV), so a 1-token health check pays the same as a full backlog. "
+        f"This is the DESIGNED behaviour of purity mode 'strict', not a "
+        f"defect: prefill cannot run in the tp layout there, so every prefill "
+        f"must reach pp regardless of size. Purity mode 'prefill_in_tp' "
+        f"restores the break-even gate (and is this tree's default), at the "
+        f"cost of allowing prefill in the decode layout below it. #874."
+    )
+
+
 #: How many chunk-cadences of silence make a stall a WEDGE rather than a slow
 #: tick. Small on purpose: the rule already refuses to fire while anything is
 #: moving, so its only job is to outlast ordinary jitter between chunks.
