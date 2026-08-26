@@ -126,7 +126,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -3903,7 +3903,36 @@ ENV_DRAIN_MODE = "SGLANG_PHASE_POLICY_DRAIN_MODE"
 ENV_DRAIN_MODE_STRICT = "SGLANG_PHASE_POLICY_DRAIN_MODE_STRICT"
 
 
-def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
+#: How a knob's value was arrived at, in the words the boot log prints.
+#: #896: an EFFECTIVE value with no printed provenance is a silent knob. The
+#: decode-stall SLO booted at 180 s and governed a real cutover while the only
+#: trace of where 180 came from was the 27 KB ``ServerArgs`` repr -- readable in
+#: principle, unfindable in practice, so two follow-up tickets hung their
+#: semantics on a number nobody could source. These three words are the whole
+#: fix: they say FLAG, ENV or DEFAULT at the point the value starts governing.
+PROVENANCE_DEFAULT = "default"
+
+
+def _env_source(env_name: str) -> str:
+    """Provenance for a knob that has no CLI flag yet: the env var, or the default.
+
+    An env var set to the empty string is NOT a source -- ``_env_float`` and
+    friends fall through to the default for it, so reporting "env" there would
+    name a source that did not supply the value.
+    """
+    if os.environ.get(env_name) not in (None, ""):
+        return f"env {env_name}"
+    return PROVENANCE_DEFAULT
+
+
+def _flag_or_env(
+    server_args,
+    field: str,
+    env_name: str,
+    env_reader,
+    default,
+    record: Optional[Dict[str, str]] = None,
+):
     """Resolve one knob: the CLI FLAG wins, the env var is a deprecated bridge.
 
     #781. These knobs used to come from the environment only. The boot env was
@@ -3915,11 +3944,20 @@ def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
     So the flag is authoritative. The env is still read when the flag is unset,
     which keeps every existing deployment byte-identical, and warns so the
     remaining users are visible instead of silent.
+
+    ``record``, when supplied, collects the PROVENANCE of every knob resolved
+    through here, keyed by ``field`` (#896). The resolution order already lives
+    in this function and nowhere else, so this is the only place that can name
+    the winning source without guessing at it afterwards.
     """
     value = getattr(server_args, field, None) if server_args is not None else None
     if value is not None:
+        if record is not None:
+            record[field] = "flag --" + field.replace("_", "-")
         return value
     if os.environ.get(env_name) not in (None, ""):
+        if record is not None:
+            record[field] = f"env {env_name}"
         try:
             from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
 
@@ -3928,6 +3966,8 @@ def _flag_or_env(server_args, field: str, env_name: str, env_reader, default):
             # A missing/renamed helper must never cost a boot: the warning is
             # advisory, the value below is what matters.
             pass
+    elif record is not None:
+        record[field] = PROVENANCE_DEFAULT
     return env_reader(env_name, default)
 
 
@@ -3946,6 +3986,11 @@ def config_from_env(
     ServerArgs keep working unchanged; when it is None every knob resolves
     exactly as it did before.
     """
+    # #896: every knob resolved below records WHERE its value came from, so the
+    # arming block can print it. Filled as a side effect of the resolution
+    # itself -- a provenance re-derived after the fact would be a second
+    # opinion about the first one, and those drift.
+    prov: Dict[str, str] = {}
     rest_state = os.environ.get(ENV_REST_STATE) or REST_DECODE
     min_dwell = _flag_or_env(
         server_args,
@@ -3953,8 +3998,10 @@ def config_from_env(
         ENV_MIN_DWELL,
         _env_float,
         DEFAULT_MIN_DWELL_S,
+        record=prov,
     )
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
+    prov["idle_dwell_s"] = _env_source(ENV_IDLE_DWELL)
 
     # THE THREE MEASUREMENTS THE WHOLE LADDER RESTS ON, resolved from the
     # environment ONCE and then used everywhere -- for the break-even N, for
@@ -3993,8 +4040,26 @@ def config_from_env(
     if _FLIP_COST_ESTIMATOR is None or _FLIP_COST_ESTIMATOR.seed_s != _seed_s:
         _FLIP_COST_ESTIMATOR = RoundTripFlipCost(seed_s=_seed_s)
     seam_s = _FLIP_COST_ESTIMATOR.value()
+    # The seam has TWO provenances and both matter: where the SEED came from,
+    # and whether the estimator is still sitting on that seed or has since
+    # measured a real flip. Printing only the first would read as "measured".
+    prov["flip_cost_s"] = (
+        f"{_env_source(ENV_FLIP_COST_S)} seed, estimator {flip_cost_provenance()}"
+    )
+    prov["decode_strand_weight"] = _env_source(ENV_DECODE_STRAND_WEIGHT)
     tp_tok_s = _env_float(ENV_TP_TOK_S, DEFAULT_TP_PREFILL_TOK_S)
     pp_tok_s = _env_float(ENV_PP_TOK_S, DEFAULT_PP_PREFILL_TOK_S)
+    # The two MEASUREMENTS N is solved from. #665-F1's defect was a solved
+    # number silently replaced by a constant, so "measured or assumed" is the
+    # first thing to know about either of them. Note DEFAULT_TP_PREFILL_TOK_S
+    # itself reads ENV_TP_TOK_S at import time, so the env can reach this value
+    # by two routes -- both of them are "env", which is what gets printed.
+    prov["tp_prefill_tok_s"] = _env_source(ENV_TP_TOK_S)
+    prov["pp_prefill_tok_s"] = _env_source(ENV_PP_TOK_S)
+    prov["pp_exit_tokens"] = _env_source(ENV_PP_EXIT_TOKENS)
+    prov["refusal_backoff_cap_s"] = _env_source(ENV_REFUSAL_BACKOFF_CAP)
+    prov["refusal_degrade_after"] = _env_source(ENV_REFUSAL_DEGRADE_AFTER)
+    prov["rest_state"] = _env_source(ENV_REST_STATE)
 
     explicit = _env_int(ENV_FLIP_TOKENS, 0)
     if explicit > 0:
@@ -4039,7 +4104,12 @@ def config_from_env(
         enabled=enabled,
         seam_readmit_available=seam_readmit_available,
         drain_mode=_flag_or_env(
-            server_args, "phase_policy_drain_mode", ENV_DRAIN_MODE, _env_flag, False
+            server_args,
+            "phase_policy_drain_mode",
+            ENV_DRAIN_MODE,
+            _env_flag,
+            False,
+            record=prov,
         )
         or _flag_or_env(
             server_args,
@@ -4047,6 +4117,7 @@ def config_from_env(
             ENV_DRAIN_MODE_STRICT,
             _env_flag,
             False,
+            record=prov,
         ),
         drain_mode_strict=_flag_or_env(
             server_args,
@@ -4054,6 +4125,7 @@ def config_from_env(
             ENV_DRAIN_MODE_STRICT,
             _env_flag,
             False,
+            record=prov,
         ),
         flip_tokens=flip_tokens,
         min_dwell_s=min_dwell,
@@ -4065,6 +4137,7 @@ def config_from_env(
             ENV_PP_WINDOW,
             _env_float,
             DEFAULT_PP_WINDOW_S,
+            record=prov,
         ),
         tp_decode_floor_s=_flag_or_env(
             server_args,
@@ -4072,6 +4145,7 @@ def config_from_env(
             ENV_TP_FLOOR,
             _env_float,
             DEFAULT_TP_DECODE_FLOOR_S,
+            record=prov,
         ),
         # #689: the caller passes max_running_requests; the env can override
         # it, and 0/1 disables the gate and restores the previous behaviour.
@@ -4093,6 +4167,7 @@ def config_from_env(
             ENV_DECODE_CONTENTION,
             _env_float,
             DEFAULT_DECODE_CONTENTION,
+            record=prov,
         ),
         decode_stall_slo_s=_flag_or_env(
             server_args,
@@ -4100,6 +4175,7 @@ def config_from_env(
             ENV_DECODE_STALL_SLO,
             _env_float,
             DEFAULT_DECODE_STALL_SLO_S,
+            record=prov,
         ),
         pp_exit_tokens=_env_int(ENV_PP_EXIT_TOKENS, DEFAULT_PP_EXIT_TOKENS),
         # Passed in rather than read from env: it is a runtime fact of THIS
@@ -4151,6 +4227,69 @@ def config_from_env(
         superseded = superseded_pp_bound_warning(cfg)
         if superseded:
             logger.warning("%s", superseded)
+        # #896: the SECOND line, and the reason this ticket exists. The line
+        # above prints VALUES; this one prints where each value came from, and
+        # it carries `decode_stall_slo_s` -- which the line above never printed
+        # at all, so a 180 s cap governed a live cutover with no boot-log trace
+        # of either its value or its origin. Kept as its own line rather than
+        # widened into the one above: the armed line is grepped by name in
+        # standing runsheets, and provenance is a different question from
+        # arming. Every knob, not just the SLO -- a per-knob exception is how
+        # the next one goes silent.
+        logger.warning(
+            "%s knob provenance: %s",
+            LOG_PREFIX,
+            # " | " rather than ", ": a source may itself contain a comma
+            # (the seam reports seed AND estimator state), and a separator a
+            # field can also produce is not a separator.
+            " | ".join(
+                f"{name}={value:g} from {prov.get(key, PROVENANCE_DEFAULT)}"
+                for name, key, value in (
+                    ("min_dwell_s", "phase_policy_min_dwell_s", cfg.min_dwell_s),
+                    ("idle_dwell_s", "idle_dwell_s", cfg.idle_dwell_s),
+                    ("pp_window_s", "phase_policy_pp_window_s", cfg.pp_window_s),
+                    (
+                        "tp_decode_floor_s",
+                        "phase_policy_tp_decode_floor_s",
+                        cfg.tp_decode_floor_s,
+                    ),
+                    ("flip_cost_s", "flip_cost_s", cfg.flip_cost_s),
+                    (
+                        "decode_strand_weight",
+                        "decode_strand_weight",
+                        cfg.decode_strand_weight,
+                    ),
+                    (
+                        "decode_contention",
+                        "phase_policy_decode_contention",
+                        cfg.decode_contention,
+                    ),
+                    (
+                        "decode_stall_slo_s",
+                        "phase_policy_decode_stall_slo_s",
+                        cfg.decode_stall_slo_s,
+                    ),
+                    ("tp_prefill_tok_s", "tp_prefill_tok_s", cfg.tp_prefill_tok_s),
+                    ("pp_prefill_tok_s", "pp_prefill_tok_s", cfg.pp_prefill_tok_s),
+                    ("pp_exit_tokens", "pp_exit_tokens", cfg.pp_exit_tokens),
+                    (
+                        "refusal_backoff_cap_s",
+                        "refusal_backoff_cap_s",
+                        cfg.refusal_backoff_cap_s,
+                    ),
+                    (
+                        "refusal_degrade_after",
+                        "refusal_degrade_after",
+                        cfg.refusal_degrade_after,
+                    ),
+                )
+            )
+            # flip_tokens and rest_state are not floats, so they carry their
+            # own formatting rather than being bent into the %g loop above.
+            + f" | flip_tokens={cfg.flip_tokens:d} from {source}"
+            + f" | rest_state={cfg.rest_state} from "
+            + prov.get("rest_state", PROVENANCE_DEFAULT),
+        )
     return cfg
 
 
