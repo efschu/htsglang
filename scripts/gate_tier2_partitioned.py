@@ -48,10 +48,43 @@ WHAT THIS RUNNER REFUSES TO DO SILENTLY
    the one direction repeated parallel runs cannot see, so it is checked
    arithmetically on every run.
 
+4. **Hand an UNRECORDED failure to the reader unclassified** (#895).  Check 3
+   is one-way: it asks only whether a recorded failure came back.  On this tree
+   every recorded failure belongs to an EXCLUDED module, so check 3 can never
+   fire at the desk and EVERY desk failure is unrecorded.  Such a failure has
+   two possible causes, and they are not the same finding:
+
+     * the product is broken -- the ordinary red, and the reason for the gate;
+     * the failure needs company.  In a lane with workers that is crowding --
+       the admission proof is `solo failure set == serial failure set`, taken
+       on a quiet box, and NOTE #868 §2.5 names the class it cannot settle: an
+       assert about where concurrent ranks stand at a deadline, whose
+       independent variable is the load on the box.  In the serial lane it is a
+       neighbour's state, or the same load.
+
+   Guessing between them was the reader's job until #895; now the runner
+   re-runs the affected module ALONE, in a fresh process, in the same gate run,
+   and prints the verdict.  Solo reproduces -> GENUINE, the gate is red as it
+   always was.  Solo does not reproduce -> the failure did not survive
+   isolation; that is its OWN exit code (6), never a green.  A gate that
+   quietly forgave what it could not explain would forgive a real,
+   load-sensitive regression with it.
+
 ``--prove`` adds the OTHER direction for acceptance: the union must EQUAL the
 reference set, not merely contain it.  It is a separate flag because in normal
 gate use an added failure is the gate doing its job, while during acceptance an
 added failure means the partition changed the answer.
+
+EXIT CODES
+----------
+    0  green            1  failing test(s)               2  refused (loadscope)
+    3  inconclusive: an extraction, or a solo re-run, could not answer
+    4  PARTITION VIOLATION -- a recorded failure vanished (false green)
+    5  --prove: the partitioned answer differs from the serial reference
+    6  every failure in the run is unrecorded AND did NOT reproduce when its
+       module was re-run alone (crowding, coupling, or the box).  6 is
+       reserved for the case where that is the ONLY thing wrong: one genuine
+       failure anywhere in the run and the ordinary red code wins instead.
 
 CUDA_VISIBLE_DEVICES is forced empty and not overridable from the environment.
 """
@@ -170,7 +203,18 @@ def main() -> int:
             serial.append(mod)
             demoted.append((mod, "proof stale: module bytes changed since the solo proof"))
             continue
-        (wide if v == "PARALLEL" else narrow if v == "RANKS" else serial).append(mod)
+        if v == "PARALLEL":
+            wide.append(mod)
+        elif v == "RANKS":
+            narrow.append(mod)
+        else:
+            serial.append(mod)
+            # SERIAL is a verdict; anything else in that column is a typo or a
+            # verdict this runner does not know. Both land in the slow lane --
+            # that part was already right -- but silently, which is not.
+            if v != "SERIAL":
+                demoted.append((mod, f"unknown verdict {v!r}: not one of "
+                                     f"PARALLEL/RANKS/SERIAL/EXCLUDED"))
 
     stale_gone = [m for m in table if m not in present]
 
@@ -244,9 +288,23 @@ def main() -> int:
             print(f"  {name:7s}: empty lane, skipped")
             continue
         r = res[name]
-        print(f"  {name:7s}: {'OK' if r.tally_ok else 'BROKEN'}  counts={r.counts} "
-              f"names={len(r.all_names)} {r.tally_note}")
-        broken = broken or not r.tally_ok
+        # A lane that was HANDED modules and collected nothing passes the
+        # name-vs-count tally trivially: zero names, zero counts. "no tests
+        # ran" and "everything passed" are the same log to the arithmetic,
+        # so the emptiness is asked about separately.
+        ran_something = sum(r.counts.get(k, 0) for k in
+                            ("failed", "passed", "skipped", "error", "xfailed",
+                             "xpassed", "subtests")) > 0
+        empty = r.collected_nothing or not ran_something
+        ok = r.tally_ok and not empty
+        note = r.tally_note
+        if empty:
+            note = (f"lane holds {len(mods)} module(s) but the log reports no "
+                    f"test outcome at all -- collected nothing, or the summary "
+                    f"was not understood")
+        print(f"  {name:7s}: {'OK' if ok else 'BROKEN'}  counts={r.counts} "
+              f"names={len(r.all_names)} {note}")
+        broken = broken or not ok
     if broken:
         print("\nVERDICT: INCONCLUSIVE -- the extraction is broken, not the run.")
         return 3
@@ -275,6 +333,119 @@ def main() -> int:
         for name in vanished:
             print(f"  MISSING FAILURE {name}")
 
+    # ---- #895: the other direction of check 3, on every run ----------------
+    # Every unrecorded failure, in every lane, is re-run ALONE and classified.
+    #
+    # The first cut of this only re-ran the lanes that had WORKERS, on the
+    # argument that a serial-lane failure has one reading. The gate's own next
+    # run falsified that: `test_pp_admission_wraparound_never_blocks.py`
+    # failed in the SERIAL lane of two consecutive full runs -- once at load
+    # 150 from foreign gates, once on a quiet box -- and passed 3/3 alone, and
+    # passed again with the whole serial lane run standalone. So the serial
+    # lane hands the reader exactly the same unclassified red, and the reader
+    # had exactly the same guess to make.
+    #
+    # The re-run is a MEASUREMENT in every lane, not a retry, because it always
+    # changes the same independent variable: neighbours. Wide/narrow, the
+    # neighbours are the other workers; serial, they are the other modules in
+    # the one process. Alone in a fresh process is the shape every row's proof
+    # was taken in -- comparing against it is #868's admission criterion, run
+    # on the failure instead of on the table.
+    #
+    # NOT REPRODUCED never means forgiven and never means "not real": a defect
+    # that needs a neighbour's leaked state is a defect, and the serial lane
+    # exists to keep exactly those visible. It means the failure did not
+    # survive isolation, which is a different finding from the product being
+    # broken, and the gate stays non-green for it either way (exit 6).
+    lane_of = {}
+    for lane_name, mods_ in (("wide", wide), ("narrow", narrow), ("serial", serial)):
+        for m in mods_:
+            lane_of[m] = lane_name
+    unrecorded = sorted(union - recorded)
+    not_reproduced: list[str] = []
+    if unrecorded:
+        print("\n=== UNRECORDED FAILURE, CLASSIFIED BY A SOLO RE-RUN (#895) ===")
+        print("  Not recorded in the table. Either the product is broken, or the")
+        print("  failure needs company -- crowding in a lane with workers, a")
+        print("  neighbour's state in the serial lane, or the load on the box.")
+        print("  Separated by measurement, here, now: each affected module is")
+        print("  re-run ALONE in a fresh process, which is the shape its row in")
+        print("  the table was proved in. The whole module is re-run, not the")
+        print("  single test, because the proof's unit is the module.")
+        verdicts: dict[str, str] = {}
+        for mod in sorted({module_of(n) for n in unrecorded}):
+            log = outdir / f"solo_{Path(mod).stem}.log"
+            solo_rc, solo_t = run_lane([mod], log, 0, args.extra)
+            solo = parse_log(log)
+            names = {n for n in unrecorded if module_of(n) == mod}
+            lane = lane_of.get(mod, "?")
+            print(f"\n  MODULE {mod}  (lane {lane})")
+            print(f"    solo re-run: rc={solo_rc} {solo_t:.2f}s counts={solo.counts} "
+                  f"-> {log}")
+            # A re-run only answers the question if it RAN. pytest past 1 means
+            # it did not (2 interrupted, 3 internal, 4 usage, 5 nothing
+            # collected), and a log with no summary or nothing collected means
+            # the same. Without this the absence of the failing name would read
+            # as "passes alone" -- the most expensive possible misreading, and
+            # the one a module that dies during its re-run produces.
+            if solo_rc not in (0, 1) or not solo.tally_ok or solo.collected_nothing:
+                print(f"    RERUN INCONCLUSIVE -- "
+                      f"{solo.tally_note or 'collected nothing'}"
+                      f"{'' if solo_rc in (0, 1) else f' (pytest rc {solo_rc})'}")
+                for n in sorted(names):
+                    verdicts[n] = "INCONCLUSIVE"
+                continue
+            if lane in ("wide", "narrow"):
+                why = ("the table admits this module to a lane with workers, and "
+                       "this run disagrees:")
+                what = "independence proof stale, or a deadline missed under crowding."
+            else:
+                why = ("it needs its neighbours or the box it ran on. That is a "
+                       "finding about")
+                what = ("coupling or load, not about the product -- and not a "
+                        "dismissal either.")
+            for n in sorted(names):
+                if n in solo.all_names:
+                    verdicts[n] = "GENUINE"
+                    print(f"    GENUINE          {n}")
+                    print("                     reproduces alone. This is a real "
+                          "failure and the gate is red for it.")
+                else:
+                    verdicts[n] = "NOT REPRODUCED"
+                    print(f"    NOT REPRODUCED   {n}")
+                    print(f"                     passes alone -- {why}")
+                    print(f"                     {what}")
+                    print("                     NOT forgiven -- see exit code 6.")
+        not_reproduced = sorted(n for n, v in verdicts.items() if v == "NOT REPRODUCED")
+        inconclusive = sorted(n for n, v in verdicts.items() if v == "INCONCLUSIVE")
+        genuine = sorted(n for n, v in verdicts.items() if v == "GENUINE")
+        print(f"\n  summary: {len(genuine)} genuine, {len(not_reproduced)} not "
+              f"reproduced, {len(inconclusive)} inconclusive")
+        if inconclusive and rc == 0:
+            rc = 3
+            print("  VERDICT: INCONCLUSIVE -- a solo re-run could not answer.")
+        # 6 only when non-reproduction is the ONLY thing wrong. One genuine
+        # failure anywhere in the run and the ordinary red code wins, so a real
+        # regression is never filed under a flake's name.
+        #
+        # KNOWN LIMIT, measured 2026-08-26: the re-run happens on this box,
+        # seconds after the lane it is classifying, so it inherits whatever the
+        # lane left behind -- warm CPUs, sockets in TIME_WAIT, ranks still
+        # exiting. `test_pp_admission_wraparound_never_blocks` is 5/5 green
+        # alone on a settled box and failed the gate's own re-run immediately
+        # after the serial lane. That error runs toward GENUINE, i.e. toward
+        # red, which is the safe direction: the re-run can call a load artefact
+        # real, never the reverse. A settling delay or a quarantine re-run is
+        # owed, not built.
+        elif rc == 0 and not_reproduced and not (union - set(not_reproduced)):
+            rc = 6
+            print("  VERDICT: exit 6 -- every failure in this run is unrecorded and")
+            print("  did not reproduce when its module was re-run alone. No failure")
+            print("  in this run survived isolation, so the product is not implicated")
+            print("  by any of them. This is NOT a green: a load-sensitive regression")
+            print("  presents exactly like this, and what separates the two is a")
+            print("  measurement nobody has taken -- the table row, or the box.")
+
     if args.prove:
         ref = parse_log(args.prove)
         if not ref.tally_ok:
@@ -301,6 +472,15 @@ def main() -> int:
             rc = max(rc, 5)
 
     print(f"\n# logs {' '.join(str(v) for v in logs.values())}")
+    # pytest's own exit codes: 0 ok, 1 tests failed, 2 interrupted, 3 internal
+    # error, 4 usage error, 5 nothing collected. Anything past 1 says the RUN
+    # did not happen as asked, which no failure set can express -- so it is
+    # named whatever else the verdict is, not only when the gate is otherwise
+    # green.
+    for lane_name, lane_rc in (("wide", rc_w), ("narrow", rc_n), ("serial", rc_s)):
+        if lane_rc not in (0, 1):
+            print(f"# LANE RC {lane_name} lane exited {lane_rc} -- pytest did not "
+                  f"complete the run it was asked for")
     if rc == 0 and union:
         rc = 1
     if rc == 0 and max(rc_w, rc_n, rc_s) not in (0, 1):
