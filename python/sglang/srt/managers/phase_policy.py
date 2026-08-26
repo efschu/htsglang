@@ -1149,8 +1149,16 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     The seconds go into the same C that produced N, so the threshold simply
     scales:
 
-        C_eff = flip_cost_s + weight x running_bs x pp_window_s
+        C_eff = flip_cost_s + weight x running_bs x stranded_decode_s(cfg)
         N_eff = flip_tokens x C_eff / flip_cost_s
+
+    #893: THE SECONDS ARE THE RESIDENCY THAT GOVERNS, not the requested knob.
+    This term used to read ``cfg.pp_window_s`` directly, which #889 showed is
+    unreachable whenever a decode-stall SLO supersedes it -- on the live line
+    that charged a flip for 15 s of stranding while the decodes waited 173.6 s,
+    understating the ladder ~9.7x, and on the configuration
+    ``validate_purity_policy_pair`` recommends (window cleared, SLO declared)
+    it multiplied by zero and switched the surcharge off entirely.
 
     Degenerate cases return the unchanged threshold, so a deployment that has
     not measured its seam behaves exactly as before:
@@ -1175,7 +1183,10 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
         return _differential_flip_threshold(cfg, running_bs, base)
     if cfg.decode_strand_weight <= 0:
         return base
-    stranded_s = cfg.decode_strand_weight * float(running_bs) * cfg.pp_window_s
+    # #893: `stranded_decode_s`, never `cfg.pp_window_s`. `base` stays OUTSIDE
+    # the surcharge on purpose -- at running_bs 0 there is nothing to strand,
+    # and the reprice may raise the ladder's SLOPE, never its floor.
+    stranded_s = cfg.decode_strand_weight * float(running_bs) * stranded_decode_s(cfg)
     return int(round(base * (flip_cost_s + stranded_s) / flip_cost_s))
 
 
@@ -1417,6 +1428,34 @@ def effective_pp_exit_term(cfg: "PhasePolicyConfig") -> tuple[str, float]:
     return PP_EXIT_BY_DRAIN, 0.0
 
 
+def stranded_decode_s(cfg: "PhasePolicyConfig") -> float:
+    """How long a decode carried into PP is REALLY stranded there (#893).
+
+    THE ONE READER THE ENTRY ECONOMY IS ALLOWED TO HAVE. Every price a flip
+    pays for the generations it pauses -- the one-sided surcharge in
+    ``effective_flip_threshold``, and the regime boundary plus the saturation
+    term inside ``_differential_flip_threshold`` -- is a number of seconds a
+    carried decode waits before it can emit again. That is the PP residency
+    the phase will actually run to, which #889 established is NOT
+    ``cfg.pp_window_s`` whenever a decode-stall SLO supersedes it.
+
+    Delegates rather than re-derives, deliberately. ``effective_pp_exit_term``
+    already mirrors ``decide``'s guard order and is pinned against it; a second
+    solve of "which bound governs" is precisely the shape of #889, so this is a
+    NAME for that answer in the economy's vocabulary, not another authority on
+    it. ``test_the_named_term_is_the_one_889_reports`` pins the delegation.
+
+    Zero means "no timed bound is declared at all", which the callers must read
+    as UNBOUNDED stranding (a carried decode waits out the whole prefill) --
+    never as free stranding. Reading it as free is the second half of #893: on
+    the configuration ``validate_purity_policy_pair`` recommends -- window
+    cleared, SLO declared -- the surcharge term ``weight x running_bs x 0``
+    switched the entire stranded-decode ladder off while decodes stranded for
+    173.6 s.
+    """
+    return effective_pp_exit_term(cfg)[1]
+
+
 def superseded_pp_bound_warning(cfg: "PhasePolicyConfig") -> Optional[str]:
     """The line a boot must print when one PP bound silences the other (#889).
 
@@ -1601,10 +1640,15 @@ def _differential_flip_threshold(
 
     ``2C`` and not ``C`` because a stranded decode waits out the cutover in
     BOTH directions -- it resumes only once the instance is back in TP -- while
-    the prefill only pays the way in. ``min(W, N/P)`` because the PP window
-    bounds how long the instance may sit in PP: past ``W x P`` tokens the
-    prefill no longer fits one window, the decodes are released at ``W``, and
-    the remainder waits for the next window.
+    the prefill only pays the way in. ``min(W, N/P)`` because the PP residency
+    is bounded: past ``W x P`` tokens the prefill no longer fits one residency,
+    the decodes are released at ``W``, and the remainder waits for the next one.
+
+    ``W`` IS ``stranded_decode_s(cfg)``, the residency that governs -- the
+    solved decode-stall cap where one is declared, the hand-set stopwatch where
+    it is not, 0 when neither is (#893). It is not ``cfg.pp_window_s``: #889
+    established that knob is unreachable under a declared SLO, and this solve
+    reads W three times.
 
     Flipping is justified when ``flip < stay``. Solving for N is linear in
     each of the two regimes ``min()`` selects, so the result is still a single
@@ -1666,35 +1710,51 @@ def _differential_flip_threshold(
     # `base` survives only as the floor it should always have been.
     den_a = (1.0 + b * sigma) / tp_tok_s - (1.0 + b) / pp_tok_s
 
-    if cfg.pp_window_s <= 0.0:
-        # NO WINDOW BOUND. The PP phase is not time-limited, so a carried
-        # decode waits out the whole prefill: the stall is 2C + N/P and
-        # regime A is the ONLY regime. Regime B must not be reached here --
-        # it models the decode charge SATURATING at W, and with W = 0 that
-        # reads as "stranding is free", the opposite of what an absent
-        # window means. Falling through to it produced a threshold that
-        # spiked toward the singularity at den_a -> 0+ and then dropped by
-        # half a million tokens once den_a went negative.
+    # #893: W IS THE RESIDENCY THAT GOVERNS, NOT THE REQUESTED KNOB. All three
+    # uses below -- the "is there a bound at all" guard, the regime boundary
+    # `N/P <= W`, and regime B's saturation term -- are the same quantity: how
+    # long a carried decode waits before it may emit again. Read off
+    # `cfg.pp_window_s` that is silently wrong whenever a decode-stall SLO
+    # supersedes the stopwatch (#889), and wrong in BOTH directions here: a
+    # declared window under an SLO under-charges the stranding, while a CLEARED
+    # window under an SLO sent this solve into the branch below, which denies
+    # that any bound exists and can answer UNREACHABLE for a phase that is in
+    # fact capped at `slo - 2C`.
+    window_s = stranded_decode_s(cfg)
+
+    if window_s <= 0.0:
+        # NO TIMED BOUND OF ANY KIND -- neither stopwatch nor solved cap. The
+        # PP phase is not time-limited, so a carried decode waits out the whole
+        # prefill: the stall is 2C + N/P and regime A is the ONLY regime.
+        # Regime B must not be reached here -- it models the decode charge
+        # SATURATING at W, and with W = 0 that reads as "stranding is free",
+        # the opposite of what an absent bound means. Falling through to it
+        # produced a threshold that spiked toward the singularity at
+        # den_a -> 0+ and then dropped by half a million tokens once den_a
+        # went negative.
         if den_a <= 0.0:
             # No positive N satisfies the inequality: with this little
             # contention and this many decodes, flipping does not repay at
             # ANY backlog. That is a real answer, not a failure, and it is
-            # reached only when the operator has disabled the fairness
-            # window that would otherwise bound the stranding.
+            # reached only when NEITHER bound is declared, so nothing at all
+            # limits the stranding. #893: it used to be reachable with a
+            # declared SLO too, because this branch was selected off the
+            # requested window rather than off the residency that governs --
+            # i.e. a phase capped at slo - 2C was priced as uncapped.
             return UNREACHABLE_FLIP_THRESHOLD
         return max(base, int(round(cost / den_a)))
 
     if den_a > 0.0:
         n_a = cost / den_a
-        # Regime A holds only where the prefill fits inside one PP window.
-        if n_a <= cfg.pp_window_s * pp_tok_s:
+        # Regime A holds only where the prefill fits inside one PP residency.
+        if n_a <= window_s * pp_tok_s:
             return max(base, int(round(n_a)))
 
     # Beyond the window the decode charge saturates at W, which makes this
     # denominator strictly positive (sigma >= 0 and ratio < 1), so the
     # threshold is always solvable and always finite.
     den_b = (1.0 + b * sigma) / tp_tok_s - 1.0 / pp_tok_s
-    return max(base, int(round((cost + b * cfg.pp_window_s) / den_b)))
+    return max(base, int(round((cost + b * window_s) / den_b)))
 
 
 @dataclass(frozen=True)
@@ -3029,11 +3089,17 @@ def _decide_from_load(
                     f"trip to beat prefilling it in tp "
                     f"(seam {seam_s:.2f}s {priced})"
                 )
+            # #893: the seconds NAMED here are the seconds CHARGED above, and
+            # both are the residency that governs -- not `cfg.pp_window_s`,
+            # which under a declared SLO is the number #889 showed can never
+            # end the phase. A refusal line quoting the inert knob invites the
+            # operator to widen a knob that does nothing.
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok > N="
                 f"{n_live} but <= {tp_threshold} with "
                 f"{inp.running_bs} req decoding: flipping would strand them "
-                f"in pp for a {cfg.pp_window_s:g}s window "
+                f"in pp for {stranded_decode_s(cfg):g}s "
+                f"({effective_pp_exit_term(cfg)[0]}) "
                 f"(seam {seam_s:.2f}s {priced})"
             )
         if cfg.drain_mode and inp.pending_prefill_tokens > cfg.pp_exit_tokens:
