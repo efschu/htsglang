@@ -5669,7 +5669,11 @@ class ServerArgs:
             "EXCEEDS TWICE THE SEAM (#889): the stopwatch arm sits behind "
             "`cap <= 0`, so a declared SLO makes this value unreachable and the "
             "bound becomes slo - 2*seam instead. Boot warns and the armed line "
-            "prints `effective pp exit`; read that, not this.",
+            "prints `effective pp exit`; read that, not this. #893: the flip "
+            "economy prices stranded decodes off that SAME effective bound, so "
+            "this value does not set the surcharge either while it is "
+            "superseded -- the `N ladder by decoding reqs` on the armed line "
+            "is the number to read.",
         ),
     ] = None
     phase_policy_decode_stall_slo_s: A[
@@ -5684,7 +5688,12 @@ class ServerArgs:
             "SILENCES --phase-policy-pp-window-s (#889) whenever it exceeds "
             "twice the seam; below that the solved cap collapses to 0 and THIS "
             "flag is the inert one. Boot warns either way and the armed line "
-            "prints the effective term.",
+            "prints the effective term. IT ALSO PRICES THE FLIP (#893): a "
+            "carried decode strands for the solved cap, so raising this raises "
+            "the stranded-decode surcharge and the whole `N ladder by decoding "
+            "reqs` with it. On the live 180s/3.2s pair that ladder is ~9.7x "
+            "what a 15s window would have charged. The base rung (nothing "
+            "decoding) is unaffected -- only the slope.",
         ),
     ] = None
     phase_policy_decode_contention: A[
