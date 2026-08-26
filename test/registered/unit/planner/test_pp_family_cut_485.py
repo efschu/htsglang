@@ -9,6 +9,25 @@ The falsifier is ``test_anti_proportional_cut_is_strictly_worse``: an
 attention split skewed AWAY from the fast card must score strictly worse
 than the solved cut. Without it, "the solver produced a skewed cut" is not
 evidence that the skew is the right one.
+
+PROVENANCE, #910 (checked 2026-08-26, no code change owed). The reference
+checkpoint named throughout this file --
+``/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5``
+-- is GONE from this box. That is deliberately not a skip here, and this
+file is the one site of the four in that drift where it is not: the first
+line above is literal, and it was verified rather than trusted. There is no
+path, no ``model_path`` and no filesystem touch anywhere in this module; the
+geometry constants below and ``TestCheckpointConservation``'s measured
+safetensors constants are INLINED, which is precisely why "a model-cache
+change cannot silently move a regression number" -- and the model cache has
+now changed. 64 passed hermetically with the checkpoint absent.
+
+What the absence DOES cost is re-derivation: the constants in
+``TestCheckpointConservation`` (measured 2026-08-12) can no longer be
+re-measured from the headers they came from, so this file is now their only
+record. A future edit to those numbers therefore cannot be checked against
+the checkpoint and must be treated as a new specimen with its own
+measurement, not as a correction of these.
 """
 
 import dataclasses

@@ -127,23 +127,71 @@ PP0, PP1, PP2 = 0, 1, 2
 #: not just the one-time threshold crossing) are actually exercised.
 N_ITERS = WORLD + 2
 
-#: Generous bound for real process spawn + gloo init + barrier + N_ITERS of
-#: genuinely instant (no artificial delay anywhere) work. Matches the
-#: JOIN_TIMEOUT_S already established in test_pp_admission_wiring_791.py.
-GREEN_JOIN_TIMEOUT_S = 30.0
+# ---------------------------------------------------------------------------
+# TIME BUDGETS -- #899, 2026-08-26. SETUP IS NOT THE MEASUREMENT.
+#
+# Both cases below used to carry ONE wall constant that had to cover two
+# unrelated things at once: getting three real processes to their own
+# starting line, and then watching what they do from there. That is
+# dishonest in both directions, and it was measured to break:
+#
+#   under 96 artificial busy-loop processes on a 32-core box (load ~93), the
+#   RED case failed with
+#     'wraparound-check mode=blocking' not found in '<no progress recorded>'
+#   and the GREEN case with
+#     stuck_ranks [0, 1, 2] != [], progress {0..2: '<no progress recorded>'}
+#   -- i.e. NOT ONE of the three ranks had written its FIRST marker inside
+#   the old 12 s / 30 s bounds. Nothing about the ring, gloo's rendezvous or
+#   either assertion's subject was involved; three `spawn` interpreters each
+#   paying a full `import torch` simply had not reached `dist.init_process_
+#   group`'s far side yet. The same run on the same tree at load 3.7 is
+#   3 passed in 32 s. This is the exact specimen recorded against this module
+#   in gate_partition_build.py's NOT_CROWDING_PROVABLE comment ("under that
+#   load two of the three had recorded no progress at all") -- the verdict
+#   inverted with the box's load, which means the number being asserted
+#   against was never the number the test meant to assert against.
+#
+# THE ASSERTION SEMANTICS ARE UNCHANGED. What each case asserts, and about
+# which rank at which marker, is identical. Only the clock is repaired: the
+# harness now WAITS for every rank to reach its starting line (an explicitly
+# generous, separately named budget that is not part of any verdict), MEASURES
+# what that cost, and only then opens the observation window -- whose size is
+# a floor raised by the measured setup cost, so a box that made spawning 10x
+# slower is assumed to have made everything after it slower too, instead of
+# the test pretending it did not.
+#
+# COST ON A QUIET BOX IS UNCHANGED: setup there is a few seconds, so each
+# observation window collapses onto its floor, which is the old constant.
+# ---------------------------------------------------------------------------
+
+#: Getting three `spawn` interpreters through `import torch` and a gloo
+#: file-store rendezvous. Deliberately far above any measured value (worst
+#: observed: ~75 s at load 93) because NOTHING is asserted against it -- it
+#: is the point at which the harness gives up on the box rather than a bound
+#: any verdict depends on. An overrun is reported as a setup overrun, in
+#: those words, and never as a rank being in the wrong place.
+SETUP_READY_TIMEOUT_S = 300.0
+
+#: Once every rank is at its starting line: the floor for how long the
+#: wedge/no-wedge behaviour is watched. These are the old constants, now
+#: covering only what they were ever able to describe honestly.
+RED_OBSERVE_FLOOR_S = 12.0
+GREEN_OBSERVE_FLOOR_S = 30.0
+
+#: The observation window is `max(floor, measured_setup_s * this)`. A box
+#: that took 90 s to spawn three interpreters is a box whose gloo sends and
+#: process teardowns are slow in the same proportion; the measured spawn cost
+#: is the only load signal this harness can obtain without measuring the box
+#: itself. Factor 1.0 -- not tuned, just "as much again as setup cost".
+OBSERVE_SETUP_FACTOR = 1.0
 
 #: PP1's deliberate non-cooperation window in case "blocking". Chosen only
-#: to comfortably outlast RED_JOIN_TIMEOUT_S below -- the process is
+#: to comfortably outlast the RED observation window -- the process is
 #: terminated well before this ever elapses, so its absolute size does not
-#: set this test's wall-clock cost.
+#: set this test's wall-clock cost. It must also outlast the worst-case
+#: SETUP_READY_TIMEOUT_S + scaled observation window (300 + 300 s), which it
+#: does by an order of magnitude.
 PP1_DELIBERATE_STALL_S = 3600.0
-
-#: Must be large enough to absorb real process spawn (`spawn` context: a
-#: fresh interpreter + torch import) and gloo init/barrier overhead, and
-#: comfortably shorter than PP1_DELIBERATE_STALL_S -- there is no timing
-#: race to lose here since PP1 provably cannot have sent anything within
-#: this window by construction, not by luck.
-RED_JOIN_TIMEOUT_S = 12.0
 
 
 class _RingWire:
@@ -409,7 +457,40 @@ def _relay_worker(rank, init_file, out_dir, mode):
                     pass
 
 
-def _run(mode, join_timeout_s):
+def _rank_reached_starting_line(procs, out_dir, rank):
+    """True once this rank is past `dist.init_process_group` -- i.e. its
+    interpreter booted, `import torch` finished and the gloo rendezvous
+    completed -- or is beyond caring.
+
+    Three sufficient signals, in the order they can occur:
+      * a progress marker exists (every worker writes its first one directly
+        after `init_process_group` returns, before any wire touch);
+      * a result JSON exists (the worker died in its `finally`, e.g. an
+        import or init failure -- setup is over for it either way);
+      * the process is gone (same, minus the chance to write anything).
+    """
+    if os.path.exists(os.path.join(out_dir, f"progress_r{rank}.txt")):
+        return True
+    if os.path.exists(os.path.join(out_dir, f"r{rank}.json")):
+        return True
+    return not procs[rank].is_alive()
+
+
+def _await_starting_line(procs, out_dir, timeout_s):
+    """Block until every rank is at its starting line; return
+    ``(elapsed_s, all_started)``. Nothing here is asserted against -- this
+    measures the box, so the observation window that follows can be sized
+    against a real number instead of a guessed one."""
+    start = time.time()
+    while True:
+        if all(_rank_reached_starting_line(procs, out_dir, r) for r in range(WORLD)):
+            return time.time() - start, True
+        if time.time() - start >= timeout_s:
+            return time.time() - start, False
+        time.sleep(0.05)
+
+
+def _run(mode, observe_floor_s):
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmp:
         init_file = os.path.join(tmp, "pg_init")
@@ -420,7 +501,9 @@ def _run(mode, join_timeout_s):
             )
         for p in procs:
             p.start()
-        deadline = time.time() + join_timeout_s
+        setup_s, all_started = _await_starting_line(procs, tmp, SETUP_READY_TIMEOUT_S)
+        observe_s = max(observe_floor_s, setup_s * OBSERVE_SETUP_FACTOR)
+        deadline = time.time() + observe_s
         for p in procs:
             p.join(timeout=max(0.1, deadline - time.time()))
         stuck_ranks = [r for r, p in enumerate(procs) if p.is_alive()]
@@ -437,10 +520,30 @@ def _run(mode, join_timeout_s):
             with open(path) as f:
                 return json.load(f)
 
-        out = {"stuck_ranks": stuck_ranks, "progress": progress}
+        out = {
+            "stuck_ranks": stuck_ranks,
+            "progress": progress,
+            "setup_s": round(setup_s, 2),
+            "observe_s": round(observe_s, 2),
+            "all_started": all_started,
+        }
         for r in range(WORLD):
             out[f"result_{r}"] = _load(os.path.join(tmp, f"r{r}.json"))
         return out
+
+
+def _assert_ranks_started(case, res):
+    """#899: a setup overrun is reported as a setup overrun. Before this
+    guard the same condition surfaced as "PP0 is not at the marker it should
+    be at", which reads as a product verdict and is not one -- under box load
+    no rank had reached its starting line at all."""
+    case.assertTrue(
+        res["all_started"],
+        "SETUP OVERRUN, not a ring verdict: not every rank reached its "
+        f"starting line within SETUP_READY_TIMEOUT_S={SETUP_READY_TIMEOUT_S}s "
+        f"(spawn + import torch + gloo rendezvous). setup_s={res['setup_s']}, "
+        f"per-rank last position: {res['progress']}",
+    )
 
 
 class PPAdmissionWraparoundBlocks(unittest.TestCase):
@@ -450,27 +553,30 @@ class PPAdmissionWraparoundBlocks(unittest.TestCase):
         all three ranks finish. Per-rank stall location is reported from
         each rank's last progress marker, written before any blocking
         call."""
-        res = _run("blocking", RED_JOIN_TIMEOUT_S)
+        res = _run("blocking", RED_OBSERVE_FLOOR_S)
+        _assert_ranks_started(self, res)
+        timing = f"(setup_s={res['setup_s']} observe_s={res['observe_s']})"
         self.assertEqual(
             res["stuck_ranks"],
             [PP0, PP1, PP2],
             "expected all three ranks still alive at the deadline "
-            f"(closed ring); per-rank last position: {res['progress']}",
+            f"(closed ring) {timing}; per-rank last position: {res['progress']}",
         )
         self.assertIn(
             "wraparound-check mode=blocking",
             res["progress"][PP0],
-            f"PP0 must be captured mid wraparound-check: {res['progress']}",
+            f"PP0 must be captured mid wraparound-check {timing}: {res['progress']}",
         )
         self.assertIn(
             "deliberately stalled",
             res["progress"][PP1],
-            f"PP1 must be captured withholding cooperation: {res['progress']}",
+            f"PP1 must be captured withholding cooperation {timing}: {res['progress']}",
         )
         self.assertIn(
             "i=0 waiting for decision",
             res["progress"][PP2],
-            f"PP2 must be captured blocked on PP1's forward: {res['progress']}",
+            f"PP2 must be captured blocked on PP1's forward {timing}: "
+            f"{res['progress']}",
         )
 
 
@@ -480,7 +586,8 @@ class PPAdmissionWraparoundOpportunistic(unittest.TestCase):
         (`_pp_try_recv_admission_decision`) lets all three ranks complete
         every iteration within a bounded deadline, and PP0's own
         pending-sends bookkeeping never exceeds the real shipped cap."""
-        res = _run("opportunistic", GREEN_JOIN_TIMEOUT_S)
+        res = _run("opportunistic", GREEN_OBSERVE_FLOOR_S)
+        _assert_ranks_started(self, res)
         self.assertEqual(res["stuck_ranks"], [], f"a rank never finished: {res}")
         for name, r in (
             ("PP0", res["result_0"]),
