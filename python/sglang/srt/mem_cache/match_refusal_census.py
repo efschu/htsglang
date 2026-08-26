@@ -234,6 +234,45 @@ class MatchRefusalCensus:
         return f"[{prefix}] {body}"
 
 
+#: #915: why a prefetch was not attempted, counted per reason.
+#:
+#: THE SECOND HALF OF THE SAME ZERO. A walk that matches nothing SHOULD fall
+#: through to an L3 prefetch, so "the match refused" and "no prefetch was
+#: attempted" are two different failures and only the first was instrumented.
+#: The 0826 window attempted 264 prefetches against 675 sampled walks and the
+#: remaining 411 left no trace at all -- not a counter, not a log line. Blame
+#: with no defect, exactly as `refused_tokens_by_component` was before #914.
+#:
+#: Process-wide and unconditional, unlike the match census: this is one integer
+#: increment on a path that already builds a RadixKey and takes a lock, so
+#: there is nothing to arm and nothing to sample. A gate that only counts when
+#: someone remembered to arm it cannot answer "was it ever tried".
+PREFETCH_GATE_COUNTS: Dict[str, int] = {}
+
+
+def note_prefetch_gate(reason: Optional[str], tokens: int = 0) -> None:
+    """Record one prefetch-gate verdict. ``None`` means the prefetch ran.
+
+    ``attempted`` is counted too, and not only the refusals. A denominator that
+    has to be reconstructed from a different log is how #873's narrowed
+    candidate set got read as a decomposition; the parts are kept here so the
+    partition is checkable on one line.
+    """
+    key = "attempted" if reason is None else str(reason)
+    PREFETCH_GATE_COUNTS[key] = PREFETCH_GATE_COUNTS.get(key, 0) + 1
+    if tokens:
+        tk = f"{key}_tokens"
+        PREFETCH_GATE_COUNTS[tk] = PREFETCH_GATE_COUNTS.get(tk, 0) + int(tokens)
+
+
+def format_prefetch_gate() -> str:
+    """One line, stable keys, for a log-counter grep."""
+    if not PREFETCH_GATE_COUNTS:
+        return "[#915 prefetch-gate] no observation"
+    body = " ".join(f"{k}={v}" for k, v in sorted(PREFETCH_GATE_COUNTS.items()))
+    return f"[#915 prefetch-gate] {body}"
+
+
 def classify(
     census: Optional[MatchRefusalCensus],
 ) -> MatchOutcome:

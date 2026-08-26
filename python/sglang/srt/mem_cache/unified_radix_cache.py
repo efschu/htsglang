@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.match_refusal_census import (
     emit as census_emit,
     new_match_census,
+    note_prefetch_gate as _note_prefetch_gate,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -2686,11 +2687,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         #
         # So under `symmetric` local ineligibility only LOWERS THIS RANK'S VOTE;
         # participation itself is unconditional and the payload shape is fixed.
-        eligible = (
-            locally_eligible
-            and prefetch_length >= self.prefetch_threshold
-            and not self.cache_controller.prefetch_rate_limited()
-        )
+        # #915: SAY WHICH TERM DECLINED, because this conjunction is three
+        # different verdicts wearing one boolean and none of them was counted.
+        #
+        # The 0826 window attempted a prefetch on 264 of 675 census-sampled
+        # match walks. The other 411 declined HERE, silently: there is no
+        # counter, no log line, and no way to tell from the boot which of the
+        # three terms fired. That is the #914 shape one module over -- blame
+        # without a defect -- and the three point at unrelated remedies:
+        #   ANCHOR    the caller's local gate (`last_host_node.backuped`, with
+        #             the root admitted on purpose at scheduler.py:4933)
+        #   TOO_SHORT fewer than `prefetch_threshold` (256) new tokens to fetch
+        #   RATE      `prefetch_tokens_occupied >= prefetch_capacity_limit`,
+        #             and that limit is `0.5 * mem_pool_host.size`
+        #             (cache_controller.py:729) -- which across a phase flip is
+        #             not one number. #905 measured the two host tiers at
+        #             703472 rows (PP) and 30518 (TP), a 23x asymmetry, so the
+        #             TP-phase budget is ~15259 tokens, under four prefetches
+        #             of the 4096 this window actually completed.
+        # A counter here decides that on the next boot instead of re-arguing it.
+        #
+        # COUNTED, NOT GATED. Nothing below changes which prefetches run; this
+        # records the verdict the code was already reaching. Order matters only
+        # for attribution, so the terms are evaluated in the order written and
+        # the FIRST failing one is named -- a request can trip several, and
+        # summing them would double-count the way `refused_tokens_by_component`
+        # is documented to.
+        if not locally_eligible:
+            reason = "anchor"
+        elif prefetch_length < self.prefetch_threshold:
+            reason = "too_short"
+        elif self.cache_controller.prefetch_rate_limited():
+            reason = "rate_limited"
+        else:
+            reason = None
+        eligible = reason is None
+        _note_prefetch_gate(reason, prefetch_length)
         if not eligible and not symmetric:
             return
 
