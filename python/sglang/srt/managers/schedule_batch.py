@@ -96,7 +96,11 @@ from sglang.srt.mem_cache.common import (
     peer_needs_mamba_evict,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import CpuCopyUnmappedRows, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    CpuCopyIdsUnreadable,
+    CpuCopyUnmappedRows,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -2060,6 +2064,15 @@ _SEAM_STATE_COUNTS = {
     # second would be invisible inside the first at exactly the rate the first
     # is common.
     "declined_unmapped": 0,
+    # #916: and apart from THAT one again, for the same reason one more time.
+    # `declined_unmapped` is a verdict about the ids -- they were read and they
+    # sit above the backing. `declined_unreadable` is the absence of a verdict:
+    # the device would not answer at all, because the context was already
+    # faulted when the copy was requested (0826 rerun boot #2, 21:53:36). One
+    # says the dial released a page under a live row; the other says something
+    # else had already gone wrong and this path is downstream of it. Reading
+    # the second as the first would send the next window hunting the dial.
+    "declined_unreadable": 0,
 }
 
 
@@ -2137,18 +2150,32 @@ def seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
     try:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     except CpuCopyUnmappedRows as refusal:
-        _SEAM_STATE_COUNTS["declined_unmapped"] += 1
-        n = _SEAM_STATE_COUNTS["declined_unmapped"]
+        # #916: the unreadable-ids refusal is a SUBCLASS of this one on purpose
+        # -- one `except` keeps the decline path unforgettable -- but it is
+        # counted on its own line so the two cannot be read as one population.
+        key = (
+            "declined_unreadable"
+            if isinstance(refusal, CpuCopyIdsUnreadable)
+            else "declined_unmapped"
+        )
+        _SEAM_STATE_COUNTS[key] += 1
+        n = _SEAM_STATE_COUNTS[key]
         if n <= 3 or n % 100 == 0:
             logger.error(
-                "%s SEAM COPY DECLINED (UNMAPPED) rid=%s: %s The rows were "
-                "minted at a larger backing and a dial shrink released their "
-                "pages while this request still held them, so the copy would "
-                "read unmapped device memory. Declined; its tokens are "
-                "recomputed after the flip. occurrence=%d",
+                "%s SEAM COPY DECLINED (%s) rid=%s: %s %s Declined; its tokens "
+                "are recomputed after the flip. occurrence=%d",
                 SEAM_STATE_PREFIX,
+                "IDS UNREADABLE" if key == "declined_unreadable" else "UNMAPPED",
                 getattr(req, "rid", None),
                 refusal,
+                (
+                    "Nothing is claimed about these ids -- the decline is about "
+                    "the device, not about them (#916)."
+                    if key == "declined_unreadable"
+                    else "The rows were minted at a larger backing and a dial "
+                    "shrink released their pages while this request still held "
+                    "them, so the copy would read unmapped device memory."
+                ),
                 n,
             )
         # Leave nothing half-taken: a partially populated copy would be applied
