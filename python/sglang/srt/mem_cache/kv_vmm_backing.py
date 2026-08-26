@@ -1410,12 +1410,29 @@ class KvVmmBufferOwner:
         """The VA reservation in rows -- the CEILING a grow can ever reach.
 
         IMMUTABLE, and that is why it has to be readable (#684). It is fixed
-        at construction from the pool's size at that moment
-        (``reserved_num_tokens=self.size``) and never assigned again, while
-        ``size`` itself is mutable at runtime -- the #330 dial writes it on
-        every step. So a caller that derives a grow target from a remembered
-        or configured row count can aim ABOVE this number, and
-        ``_check_final`` will refuse it every single time.
+        once at construction and never assigned again, while ``size`` itself
+        is mutable at runtime -- the #330 dial writes it on every step. So a
+        caller that derives a grow target from a remembered or configured row
+        count can aim ABOVE this number, and ``_check_final`` will refuse it
+        every single time.
+
+        WHAT THE CONSTRUCTION VALUE IS, and do not re-read the old answer.
+        Until #851 F2 it was ``reserved_num_tokens=self.size`` -- the size at
+        that instant -- and THAT is the #848 wall: the dial moved ``size``
+        past the boot reservation and no grow could ever be accepted again.
+        Since e62b1fae26 the caller passes
+        ``MHATokenToKVPool._lawful_reserved_tokens()``, i.e.
+        ``lawful_reservation_rows(size, admission_reserve, 0)`` =
+        ``size + 1 + reserve`` (memory_pool.py, ``KvVmmBufferOwner(...)``), so
+        the reservation covers the largest floor the rung can demand AT THE
+        BOOT SIZE. #848 is closed and measured 0 from W24 onward.
+
+        WHAT IS STILL NOT COVERED, named rather than implied: the law is not
+        a FIXED POINT. ``size`` may lawfully climb to this reservation, and at
+        ``size == reserved_rows`` the rung's floor is ``reserved_rows + 1 +
+        reserve`` -- above the ceiling again. See
+        ``test_reservation_fixed_point_848.py`` for the arithmetic and the
+        reason it is pinned rather than patched.
 
         Measured 2026-08-16, 02:15:24 to 02:35:26, 59 times on three ranks:
         ``recovery to 270646 rows failed: ... <= reserved=190596``. Recovery
