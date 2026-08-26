@@ -616,11 +616,31 @@ FLOOR_NEED_COMMIT_CLAMPED = "COMMIT-CLAMPED"
 #:     ValueError('final_num_tokens=126977 must satisfy page_size=1 <= final
 #:                 <= reserved=125052')
 #:
-#: The reservation is fixed at construction from the pool's size AT THAT MOMENT
-#: (``reserved_num_tokens=self.size``, memory_pool.py:2690) and never reassigned,
-#: while ``size`` stays mutable and the #330 dial writes it. So a rank whose dial
-#: has moved past its own boot reservation can never grow again, and the reason
-#: is the RESERVATION, not the commit.
+#: The reservation is fixed at construction and never reassigned, while ``size``
+#: stays mutable and the #330 dial writes it. So a rank whose dial has moved past
+#: its own boot reservation can never grow again, and the reason is the
+#: RESERVATION, not the commit.
+#:
+#: THE HALF THAT IS CLOSED, so a future reader does not chase it twice. Window 7
+#: read the specimen as "backing 126976 exceeds reservation 125052". That framing
+#: is RETRACTED by its own root commit (cd0d871824): ``uniform_backed_tokens`` is
+#: CHUNK-GRANULAR and legitimately sits up to one commit chunk per buffer above
+#: the reservation's row count, so the two numbers were never one quantity. The
+#: real defect was the SIZER -- ``reserved_num_tokens=self.size`` reserved for the
+#: size at that instant -- and #851 F2 (e62b1fae26) replaced it with
+#: ``lawful_reservation_rows(size, admission_reserve, 0)``. Measured on metal:
+#: this exit fired 0 times in W24 and every window since (WINDOW9/WINDOW10-RESULT,
+#: "PASS (F2 holds; #848 wall gone)").
+#:
+#: THE HALF THAT IS NOT, named rather than implied. The law is not a FIXED POINT.
+#: The dial may lawfully raise ``size`` all the way to this reservation, and at
+#: ``size == reserved`` the floor the rung can demand is ``reserved + 1 + reserve``
+#: -- above the ceiling again, by exactly the same arithmetic. Unobserved to date
+#: (the dial has never come near the ceiling), pinned in
+#: ``test_reservation_fixed_point_848.py`` rather than patched, because closing it
+#: means either lowering the dial's usable ceiling (a capacity decision that is
+#: the planner's, not this module's) or reserving VA for a growth bound that no
+#: caller supplies today.
 FLOOR_NEED_RESERVATION_CAPPED = "RESERVATION-CAPPED"
 
 
@@ -3426,10 +3446,18 @@ class KvBackingRelief:
                 f"the pool's IMMUTABLE VA reservation is {ceiling} rows and the "
                 f"target is {target}: this rank's dial has already moved its "
                 f"size past its own boot reservation, so no grow can ever be "
-                f"accepted here. This is a BOOT-TIME SIZING defect (the "
-                f"reservation is fixed at construction from the pool size at "
-                f"that moment and never reassigned), not a seam defect -- the "
-                f"seam is reporting it, not causing it (#848)",
+                f"accepted here. This is a BOOT-TIME SIZING defect, not a seam "
+                f"defect -- the seam is reporting it, not causing it (#848). "
+                f"DO NOT RE-DIAGNOSE THE CLOSED HALF: the sizer no longer "
+                f"reserves the size at that instant. Since #851 F2 "
+                f"(e62b1fae26) it reserves lawful_reservation_rows(size, "
+                f"admission_reserve, 0) = size + 1 + reserve, and W24 onward "
+                f"measured this exit 0 times. Reaching it again therefore "
+                f"means the FIXED POINT, not the old wall: size has climbed to "
+                f"the reservation, so the floor it can demand "
+                f"(size + 1 + reserve) is above the ceiling once more. Check "
+                f"the reserve the boot sized against versus the reserve in "
+                f"force now -- see test_reservation_fixed_point_848.py",
             )
             self._note_floor_need_exit(
                 FLOOR_NEED_RESERVATION_CAPPED,
