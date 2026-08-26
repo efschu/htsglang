@@ -279,6 +279,16 @@ class SWAKVPool(BaseSWAKVPool):
             filtered.append(filtered_layer)
         return filtered
 
+    def cpu_copy_layout(self):
+        """#861c: the copy is `{"full", "swa", "swa_mask"}`, so the identity is
+        the pair of sub-pool layouts. Both halves are per-layer and both are
+        split by the same `--pp-stage-ratio`."""
+        return (
+            "swa",
+            self.full_kv_pool.cpu_copy_layout(),
+            self.swa_kv_pool.cpu_copy_layout(),
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices

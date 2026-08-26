@@ -75,6 +75,14 @@ class _StubAllocator:
         # or it would be testing a shape production cannot produce.
         return False
 
+    def cpu_copy_layout(self):
+        # #861c widened the same contract: a real allocator ALWAYS answers this
+        # too (the base class carries it), so the stub answers rather than
+        # modelling a shape production cannot produce. A constant is correct
+        # here -- this file's subject is WHO moves the mamba state, not which
+        # layout it came from.
+        return ("kv", 4, 0)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         return {"full": dict(self.kv), "swa": None}
 
@@ -88,6 +96,11 @@ class _StubMambaPool:
     def __init__(self):
         self.state = {3: "conv+temporal@3"}
         self.asked_for = None
+
+    def cpu_copy_layout(self):
+        # #861c: `MambaPool` states its own per-layer geometry; `Req` stamps the
+        # mamba copy with it.
+        return ("mamba", 4, 0)
 
     def get_cpu_copy(self, indices):
         self.asked_for = [int(i) for i in indices.tolist()]

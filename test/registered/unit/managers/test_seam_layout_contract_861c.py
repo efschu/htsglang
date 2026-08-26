@@ -191,6 +191,76 @@ class TestTheRestoreRefusesOnLayoutDrift(CustomTestCase):
         self.assertIn("rid-861c", blob)
 
 
+MAMBA_PP1 = _Layout(("mamba", 18, 32))
+MAMBA_TP = _Layout(("mamba", 64, 0))
+
+
+class _MambaPool:
+    def __init__(self, layout):
+        self.layout = layout
+        self.loaded = False
+
+    def cpu_copy_layout(self):
+        return self.layout
+
+    def get_cpu_copy(self, indices):
+        return {"layout": self.layout}
+
+    def load_cpu_copy(self, cpu, indices):
+        if cpu["layout"] != self.layout:
+            raise IndexError("list index out of range")
+        self.loaded = True
+
+
+class _AllocWithoutMamba(_Alloc):
+    def supports_mamba_cpu_copy(self):
+        return False  # so `Req` owns the mamba copy, schedule_batch.py:1769
+
+
+class TestTheMambaHalfCarriesItsOwnLayout(CustomTestCase):
+    """The briefing's second named sibling. `Req` takes a SECOND copy from a
+    SECOND pool when the KV pool declares it does not move mamba, and the flip
+    splits the mamba layers by the same `--pp-stage-ratio`. One stamp for both
+    copies would let a mamba-layer change ride in under a matching KV layout."""
+
+    def _req_with_mamba(self, alloc, mamba_pool):
+        req, rtp = _req(alloc)
+        req.mamba_state_cpu_layout = None
+        rtp.mamba_pool = mamba_pool
+        return req, rtp
+
+    def test_offload_records_the_mamba_layout_separately(self):
+        alloc = _AllocWithoutMamba(TP)
+        req, rtp = self._req_with_mamba(alloc, _MambaPool(MAMBA_PP1))
+        req.offload_kv_cache(rtp, alloc)
+        self.assertEqual(req.kv_cache_cpu_layout, TP)
+        self.assertEqual(req.mamba_state_cpu_layout, MAMBA_PP1)
+
+    def test_a_mamba_layout_change_under_a_matching_kv_layout_is_refused(self):
+        """THE CASE A SINGLE STAMP WOULD MISS. The KV layout agrees; only the
+        mamba split moved. Nothing else in the path looks at it."""
+        from sglang.srt.managers.schedule_batch import restore_seam_state
+
+        alloc = _AllocWithoutMamba(TP)
+        req, rtp = self._req_with_mamba(alloc, _MambaPool(MAMBA_PP1))
+        req.offload_kv_cache(rtp, alloc)
+
+        rtp.mamba_pool = _MambaPool(MAMBA_TP)
+        self.assertFalse(restore_seam_state(req, rtp, alloc))
+        self.assertFalse(alloc.loaded)
+        self.assertFalse(rtp.mamba_pool.loaded)
+
+    def test_a_matching_mamba_layout_still_restores(self):
+        from sglang.srt.managers.schedule_batch import restore_seam_state
+
+        alloc = _AllocWithoutMamba(TP)
+        req, rtp = self._req_with_mamba(alloc, _MambaPool(MAMBA_TP))
+        req.offload_kv_cache(rtp, alloc)
+        self.assertTrue(restore_seam_state(req, rtp, alloc))
+        self.assertTrue(alloc.loaded)
+        self.assertTrue(rtp.mamba_pool.loaded)
+
+
 class TestTheMatCHINGCaseStillRestores(CustomTestCase):
     """THE PATH THAT MUST KEEP WORKING. A guard that refuses everything is not
     a fix, it is the feature switched off."""

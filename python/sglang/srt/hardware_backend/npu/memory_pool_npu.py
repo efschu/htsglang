@@ -6,6 +6,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
+    check_cpu_copy_layers,
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
@@ -264,6 +265,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # #861c sibling: same destination-sized loop over a source-sized list.
+        check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
@@ -527,6 +530,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # #861c sibling: same destination-sized loop over a source-sized list.
+        check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None

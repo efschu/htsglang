@@ -58,6 +58,12 @@ class _Alloc:
     def supports_mamba_cpu_copy(self):
         return True  # the rig's pool (HybridLinearKVPool) owns the mamba copy
 
+    def cpu_copy_layout(self):
+        # #861c: the layout stamp lives beside the extent stamp. Constant here,
+        # because this file's subject is the ROW axis; the LAYER axis has its
+        # own file (test_seam_layout_contract_861c.py).
+        return ("kv", 4, 0)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         self.last_indices = int(indices.numel())
         return {"full": dict(self.kv), "n": int(indices.numel())}

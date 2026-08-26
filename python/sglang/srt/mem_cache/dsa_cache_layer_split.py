@@ -587,7 +587,21 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         from sglang.srt.utils import current_platform
 
+        from sglang.srt.mem_cache.memory_pool import check_cpu_copy_layers
+
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
+        # #861c: both lists are sized by the SOURCE pool's layer count and both
+        # loops below are sized by this one. The `shape[0] == 0` skip for
+        # non-owned layers keeps the lists at full `layer_num` length on the
+        # source side too, so an equal count here really does mean an equal
+        # layout -- the skip is not a hole in this check.
+        check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
+        check_cpu_copy_layers(
+            len(kv_cache_cpu_dict["index_k"]),
+            self.layer_num,
+            "restore",
+            "index_k layer",
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):

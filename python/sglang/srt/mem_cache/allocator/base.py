@@ -370,6 +370,28 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             )()
         )
 
+    def cpu_copy_layout(self):
+        """#861c: forward the pool's per-layer identity, one hop like the copy.
+
+        Same shape and same reason as `supports_mamba_cpu_copy` above: every
+        concrete allocator implements `get_cpu_copy` as
+        `self._kvcache.get_cpu_copy(...)`, so a declaration that did not take
+        the same hop would describe the allocator (which has no layers) instead
+        of the pool that built the list.
+
+        THE getattr DEFAULT IS LOAD-BEARING, for the reason named above:
+        `UnifiedKVPool` (unified_memory_pool.py:177) and
+        `DeepSeekV4UnifiedKVPool` (deepseek_v4_memory_pool.py:390) declare no
+        base class and genuinely cannot answer. `None` means UNKNOWN, and the
+        caller treats unknown as "no layout evidence" rather than as a refusal:
+        refusing on silence would switch the seam carry off for pools that never
+        had this defect, and the pool-level `check_cpu_copy_layers` backstop
+        still covers them on the count axis.
+        """
+        pool = getattr(self, "_kvcache", None)
+        fn = getattr(pool, "cpu_copy_layout", None)
+        return fn() if fn is not None else None
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()

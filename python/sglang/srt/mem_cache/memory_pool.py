@@ -29,7 +29,7 @@ import math
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -623,6 +623,88 @@ def check_cpu_copy_rows(indices, rows: int, direction: str, axis: str) -> None:
             f"asynchronous illegal memory access (W40b). These tokens are "
             f"recomputed instead."
         )
+
+
+class CpuCopyLayout(NamedTuple):
+    """#861c: the per-layer geometry a CPU copy was taken from.
+
+    DECLARED BY THE POOL, NOT INFERRED FROM THE PAYLOAD -- the house idiom for
+    exactly this question (`supports_mamba_cpu_copy`, memory_pool.py:2359), for
+    the same reason it gives: asking the copy "which layers are you?" is the
+    mechanism that produced the silent version of the defect.
+
+    `start_layer` is carried and not only `layer_num`, because the count alone
+    is blind to a layout change that preserves it -- two PP stages of the same
+    size, or a permuted stage ratio. `kind` separates the axes so a KV layout
+    can never compare equal to a mamba one.
+    """
+
+    kind: str
+    layer_num: int
+    start_layer: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.kind}[{self.layer_num} layer(s), global "
+            f"{self.start_layer}..{self.start_layer + self.layer_num - 1}]"
+        )
+
+
+def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) -> None:
+    """#861c: a restore must not walk ITS layer count over a list it did not build.
+
+    THE SPECIMEN (W40, boot_w40_857strict_0826_0516.log, 05:20:50, all three
+    ranks, 24 s after health 200). `get_cpu_copy` (:3341) sizes its list with
+    `self.layer_num` -- the layout at COPY time. `load_cpu_copy` (:3366) walks
+    `range(self.layer_num)` -- the layout at RESTORE time. The phase flip makes
+    those two different pools: `scheduler.tp_worker.model_runner.token_to_kv_pool`
+    is the PP stack's, `stacks.tp_worker...` the TP stack's
+    (phase_flip_runtime.py:3374). With `--pp-stage-ratio 32,18,14` a PP rank's
+    pool holds only its stage; the TP pool holds every layer.
+
+    A MODULE FUNCTION for the reason `check_cpu_copy_rows` (:565) is one: the
+    pools that need it do not share a base. `MHATokenToKVPool` and
+    `MLATokenToKVPool` are `KVCache` subclasses, `MambaPool` is not, and a guard
+    installed on one ancestor is silently inert on the other.
+
+    BOTH DIRECTIONS, AND THE QUIET ONE IS THE REASON THIS EXISTS:
+      * found < expected: the loop indexes past the end of the saved list.
+        `IndexError: list index out of range`, dead scheduler -- and by the time
+        it fires it has ALREADY written `found` entries into the wrong global
+        layers. This is the loud half, and only the loud half made us look.
+      * found > expected: NOT AN ERROR AT ALL. The loop simply runs fewer
+        iterations. Copy entry i is global layer `copy.start_layer + i` and
+        lands in destination local slot i, i.e. global `dest.start_layer + i`.
+        On a PP rank starting at layer 32 that restores global layers 0..17 into
+        global layers 32..49 -- wrong-layer KV under a prefix the tree reports
+        as restored. No crash, no log, shipped.
+
+    WHY NOT `range(len(kv_cache_cpu))`. That removes the IndexError and leaves
+    the wrong-layer write, i.e. converts the loud direction into the quiet one.
+    It is the one fix shape that makes the defect harder to find.
+
+    REFUSAL, NEVER A REMAP OR A CLAMP. A remap would be correct only if the copy
+    covered every layer the destination needs, and rank-locally under PP it
+    cannot: 18 of 64 layers restored leaves 46 stale. The KV head sharding also
+    differs between the phases (PP holds all heads of its stage, TP a head shard
+    of every layer), so even the overlapping entries are not interchangeable.
+    A refusal costs one recompute.
+
+    Called BEFORE the first store, so a refused copy leaves the pool
+    byte-identical -- `check_cpu_copy_rows`'s rule, for its reason: a guard that
+    fires halfway through is a louder corruption.
+    """
+    if int(found) == int(expected):
+        return
+    raise ValueError(
+        f"HiCache CPU copy ({direction}): the saved copy covers {int(found)} "
+        f"{what}(s) but this pool has {int(expected)}. The copy was taken from a "
+        f"DIFFERENT per-layer layout -- across a phase flip the PP-stage pool and "
+        f"the TP pool are different objects with different layer counts. "
+        f"Refusing: walking this pool's count over that list either indexes past "
+        f"its end (the W40 IndexError) or silently writes the copy's layers into "
+        f"the wrong global layers. These tokens are recomputed instead."
+    )
 
 
 class MambaPool:
@@ -1255,8 +1337,35 @@ class MambaPool:
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
+    def cpu_copy_layout(self) -> CpuCopyLayout:
+        """#861c: this pool's mamba-layer geometry, as an identity.
+
+        `start_layer` is `self.start_layer` when the pool carries one and 0
+        otherwise -- `MambaPool` is not a `KVCache` and does not always set it,
+        so the attribute is read with a default HERE rather than assumed to
+        exist. The `kind` tag keeps this from ever comparing equal to a KV
+        layout even when both counts coincide.
+        """
+        return CpuCopyLayout(
+            kind="mamba",
+            layer_num=len(self.mamba_cache.conv),
+            start_layer=int(getattr(self, "start_layer", 0) or 0),
+        )
+
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         conv_cpu, temporal_cpu = mamba_cache_cpu
+        # #861c: the conv list was sized by the SOURCE pool's mamba-layer count;
+        # the loop below enumerates the DESTINATION's. Under a phase flip those
+        # differ, and neither direction of the mismatch reports itself.
+        check_cpu_copy_layers(
+            len(conv_cpu), len(self.mamba_cache.conv), "restore", "mamba conv layer"
+        )
+        check_cpu_copy_layers(
+            int(temporal_cpu.shape[0]),
+            int(self.mamba_cache.temporal.shape[0]),
+            "restore",
+            "mamba temporal layer",
+        )
         check_cpu_copy_rows(
             indices, int(self.mamba_cache.conv[0].shape[1]), "restore", "slot"
         )
@@ -2385,6 +2494,25 @@ class KVCache(abc.ABC):
         """
         return False
 
+    def cpu_copy_layout(self):
+        """#861c: the per-layer geometry a copy taken from THIS pool describes.
+
+        Answered on the base because `KVCache.__init__` is where `layer_num` /
+        `start_layer` are set, so every subclass in this tree can answer without
+        restating it. Composite pools (`HybridLinearKVPool`, `SWAKVPool`,
+        `UnifiedSWAKVPool`) override with a tuple of their sub-pools' layouts,
+        since their copy payload is likewise composite.
+
+        The caller (`restore_seam_state`) only ever compares two of these for
+        EQUALITY -- it must not parse one, the same discipline that keeps `Req`
+        independent of the copy payload's shape (schedule_batch.py:1698).
+        """
+        return CpuCopyLayout(
+            kind="kv",
+            layer_num=int(self.layer_num),
+            start_layer=int(self.start_layer),
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
@@ -3358,6 +3486,10 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
+        # #861c: THE SPECIMEN. `kv_cache_cpu` was sized by the pool that took the
+        # copy; the loop below is sized by this one. Across a phase flip they are
+        # different pools with different layer counts.
+        check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
         check_cpu_copy_rows(
             indices, int(self.k_buffer[0].shape[0]), "restore", "row"
         )
@@ -4461,6 +4593,20 @@ class HybridLinearKVPool(KVCache):
         test_unified_mamba_cpu_copy_783."""
         return True
 
+    def cpu_copy_layout(self):
+        """#861c: composite payload, composite identity.
+
+        This pool's copy is `(kv_cpu, mamba_cpu)`, so its layout is the pair of
+        the sub-pools' layouts. Recording only the KV half would leave a flip
+        that changes the mamba-layer split -- which the same `--pp-stage-ratio`
+        does -- invisible to the caller's check.
+        """
+        return (
+            "hybrid",
+            self.full_kv_pool.cpu_copy_layout(),
+            self.mamba_pool.cpu_copy_layout(),
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
@@ -4762,6 +4908,8 @@ class MLATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # #861c sibling of the MHA site: same loop, same axis, same flip.
+        check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -5127,6 +5275,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
+        # #861c: the DSA index/scale buffer is per-layer too, and `super()`'s
+        # guard says nothing about this second list.
+        check_cpu_copy_layers(
+            len(index_k_cpu), self.layer_num, "restore", "index_k layer"
+        )
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)

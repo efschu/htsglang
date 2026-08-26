@@ -1718,6 +1718,25 @@ class Req(ReqDllmMixin):
     #: class -- the guarantee has to be established here.
     kv_cache_cpu_extent: Optional[int] = None
 
+    #: #861c: WHICH per-layer layout `kv_cache_cpu` was taken from. None = the
+    #: pool could not say (see `BaseTokenToKVPoolAllocator.cpu_copy_layout`).
+    #:
+    #: The sibling of `kv_cache_cpu_extent`, one axis over. That field records
+    #: how many ROWS the copy covers; this one records how many LAYERS, and
+    #: which. W40 crashed on the axis that was not recorded: the copy was taken
+    #: from the PP-stage pool (18 layers) and applied to the TP pool (64), and
+    #: the extent contract passed because the ROW count had not changed.
+    #:
+    #: NEVER PARSED HERE, only compared for equality -- the same discipline that
+    #: keeps `Req` independent of the copy payload's shape (see the note on
+    #: `mamba_state_cpu` above). The pools decide what a layout IS.
+    kv_cache_cpu_layout: Optional[object] = None
+
+    #: #861c: and the same for the mamba half, when `Req` owns that copy. It is
+    #: a separate field because it is a separate copy taken from a separate pool
+    #: -- the flip can change the mamba-layer split independently of the KV one.
+    mamba_state_cpu_layout: Optional[object] = None
+
     def _mamba_cpu_copy_is_mine(self, token_to_kv_pool_allocator) -> bool:
         """#783: does THIS caller own the mamba copy, or does the pool?
 
@@ -1756,10 +1775,17 @@ class Req(ReqDllmMixin):
         # #783: say what was covered, so a later restore can tell drift from
         # agreement instead of discovering it as an IndexError.
         self.kv_cache_cpu_extent = int(token_indices.numel())
+        # #861c: say WHICH per-layer layout it was taken from, on the same
+        # principle and for the axis the extent does not cover. Asked of the
+        # allocator rather than derived from the payload: the payload's shape is
+        # the pool's business (tuple, dict, list of lists), and inspecting it
+        # here is exactly the coupling the `mamba_state_cpu` note refuses.
+        self.kv_cache_cpu_layout = token_to_kv_pool_allocator.cpu_copy_layout()
         # #783: and when the pool declares it does NOT move mamba, move it here.
         # Without this the comment above was false on this rig's pool: the KV
         # came back and the GDN state did not.
         self.mamba_state_cpu = None
+        self.mamba_state_cpu_layout = None
         if self._mamba_cpu_copy_is_mine(token_to_kv_pool_allocator):
             mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
             if mamba_pool is not None:
@@ -1768,6 +1794,13 @@ class Req(ReqDllmMixin):
                 )
                 self.mamba_state_cpu = mamba_pool.get_cpu_copy(
                     translate(self.mamba_pool_idx)
+                )
+                # #861c: the mamba copy is a second copy from a second pool, so
+                # it needs its own layout stamp. `MambaPool` is not a `KVCache`
+                # and does not inherit the allocator hop.
+                layout_fn = getattr(mamba_pool, "cpu_copy_layout", None)
+                self.mamba_state_cpu_layout = (
+                    layout_fn() if layout_fn is not None else None
                 )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1788,7 +1821,9 @@ class Req(ReqDllmMixin):
                     self.mamba_state_cpu, translate(self.mamba_pool_idx)
                 )
             self.mamba_state_cpu = None
+            self.mamba_state_cpu_layout = None
         del self.kv_cache_cpu
+        self.kv_cache_cpu_layout = None
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -1983,7 +2018,18 @@ def release_req(
 #: exercised in the failure direction is untested, and `declined` doubles as the
 #: measurement of how often a mid-chunk request meets the seam at all -- i.e. it
 #: MEASURES the PS3 question instead of guessing it.
-_SEAM_STATE_COUNTS = {"copied": 0, "declined": 0, "restored": 0, "refused": 0}
+# `refused` is the #783 extent (ROW) refusal; `refused_layout` is the #861c
+# per-LAYER one. Counted apart on purpose: they diagnose different things. An
+# extent refusal says a request grew across the seam; a layout refusal says the
+# seam carry is structurally impossible in that direction, i.e. every flip loses
+# its prefixes. One number for both would let the second hide inside the first.
+_SEAM_STATE_COUNTS = {
+    "copied": 0,
+    "declined": 0,
+    "restored": 0,
+    "refused": 0,
+    "refused_layout": 0,
+}
 
 
 def _seam_extent_of(req: Req) -> int:
@@ -2085,7 +2131,66 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         )
         req.kv_cache_cpu = None
         req.kv_cache_cpu_extent = None
+        req.kv_cache_cpu_layout = None
         req.mamba_state_cpu = None
+        req.mamba_state_cpu_layout = None
+        return False
+
+    # #861c: the SECOND axis, and the one W40 died on. The extent check above
+    # compares ROW counts; a phase flip does not change those, so it passed and
+    # handed the copy straight to a pool with a different LAYER count. See
+    # `check_cpu_copy_layers` (memory_pool.py) for the mechanism and for why a
+    # remap is refused rather than built.
+    #
+    # THE REFUSAL LIVES HERE AND NOT ONLY IN THE POOL. The pool-level guard
+    # turns the IndexError into a ValueError -- still a dead scheduler, because
+    # `load_kv_cache` is called unguarded. This is the check that keeps the
+    # instance up; the pool's is the backstop for every other caller.
+    #
+    # A None layout on either side means the pool could not state one. That is
+    # tolerated rather than refused: refusing on silence would switch the seam
+    # carry off for pools that never had this defect, and the pool-level count
+    # guard still covers them.
+    saved_layout = getattr(req, "kv_cache_cpu_layout", None)
+    live_layout = token_to_kv_pool_allocator.cpu_copy_layout()
+    saved_mamba_layout = getattr(req, "mamba_state_cpu_layout", None)
+    live_mamba_layout = None
+    if saved_mamba_layout is not None:
+        mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+        layout_fn = getattr(mamba_pool, "cpu_copy_layout", None)
+        live_mamba_layout = layout_fn() if layout_fn is not None else None
+    kv_drifted = (
+        saved_layout is not None
+        and live_layout is not None
+        and saved_layout != live_layout
+    )
+    mamba_drifted = (
+        saved_mamba_layout is not None
+        and live_mamba_layout is not None
+        and saved_mamba_layout != live_mamba_layout
+    )
+    if kv_drifted or mamba_drifted:
+        _SEAM_STATE_COUNTS["refused_layout"] += 1
+        n = _SEAM_STATE_COUNTS["refused_layout"]
+        logger.warning(
+            "%s SEAM RESTORE REFUSED (LAYOUT) rid=%s: the copy was taken from "
+            "%s and this pool is %s (mamba: %s -> %s). Applying it would index "
+            "past the saved per-layer list (the W40 IndexError) or write the "
+            "copy's layers into the wrong global layers -- a wrong answer with "
+            "no crash. Dropped; these tokens are recomputed. occurrence=%d",
+            SEAM_STATE_PREFIX,
+            getattr(req, "rid", None),
+            saved_layout,
+            live_layout,
+            saved_mamba_layout,
+            live_mamba_layout,
+            n,
+        )
+        req.kv_cache_cpu = None
+        req.kv_cache_cpu_extent = None
+        req.kv_cache_cpu_layout = None
+        req.mamba_state_cpu = None
+        req.mamba_state_cpu_layout = None
         return False
 
     # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
