@@ -146,14 +146,83 @@ def _iter_nodes(tree_cache: Any) -> List[Any]:
     return out
 
 
+#: Cache-class/node-class pairs already reported by
+#: ``_warn_if_node_rows_unreadable``. Once per pair per process: this condition
+#: is permanent for a given tree type, and a line per pricing call would bury
+#: the log it exists to inform.
+_UNREADABLE_WARNED: set = set()
+
+
+def _warn_if_node_rows_unreadable(tree_cache: Any, nodes: List[Any]) -> None:
+    """#872 SIBLING: the tree has nodes, and not one of them yields rows.
+
+    ``_node_rows`` reads ``node.value`` duck-typed, and its miss returns
+    ``None`` -- the same answer a genuinely empty node gives. So a tree whose
+    node type simply does not carry ``.value`` prices out at "0 rows
+    evictable", which is INDISTINGUISHABLE from a tree that has nothing to
+    give up, and the consumer in ``kv_backing_relief`` narrates that zero as
+    "healthy if those rows are genuinely live". That is the #872 shape exactly:
+    a duck-typed probe whose miss wears the healthy answer's clothes.
+
+    It is live, not hypothetical. ``UnifiedTreeNode``
+    (``unified_radix_cache.py``) has no ``.value`` at all -- its payload sits
+    at ``component_data[BASE_COMPONENT_TYPE].value`` -- so on the
+    ``UnifiedRadixCache`` this build actually binds, this whole #662 rung has
+    always freed exactly zero rows, silently, on every call.
+
+    THIS FUNCTION ONLY REPORTS. Teaching ``_node_rows`` to read
+    ``component_data`` is NOT enough and is deliberately not done here: the
+    eviction primitives this module then reaches for (``_evict_leaf_node``,
+    ``_delete_leaf``) are equally absent from ``UnifiedRadixCache``, whose
+    eviction is the multi-component ``evict(EvictParams)`` /
+    ``_evict_component_and_detach_lru`` / ``_remove_leaf_from_parent`` shape.
+    Half-fixing the read would turn a silent no-op into a walk that frees rows
+    and never unlinks the node -- a dangling tree node over freed KV rows,
+    which is the #718 silent-corruption family and strictly worse than doing
+    nothing. The rung stays a no-op until someone builds the
+    ``UnifiedRadixCache``-shaped actuator; it just stops being a SILENT one.
+    """
+    if not nodes:
+        return
+    # The already-reported check comes FIRST because it is O(1) and the scan
+    # below is O(nodes). This runs on the gate's unconditional pricing path,
+    # and re-walking every node on every call to re-derive a permanent,
+    # already-reported property is a cost the diagnosis does not need to keep
+    # paying.
+    key = f"{type(tree_cache).__name__}/{type(nodes[0]).__name__}"
+    if key in _UNREADABLE_WARNED:
+        return
+    if any(_node_rows(node) is not None for node in nodes):
+        return
+    _UNREADABLE_WARNED.add(key)
+    logger.error(
+        "%s #872 UNREADABLE NODES: %s holds %d node(s) of type %s and NONE of "
+        "them yields a row tensor via `.value`, so this rung prices every "
+        "tree as 'nothing evictable' and frees nothing, always. That zero is "
+        "a PROBE MISS, not a measurement, and the caller cannot tell the "
+        "difference -- do not read it as 'the tree is genuinely live'. "
+        "%s's rows are reached differently (see UnifiedTreeNode.component_data) "
+        "and its eviction primitive is not the `_delete_leaf` pair this module "
+        "assumes, so the rung needs a cache-shaped actuator, not a wider "
+        "getattr.",
+        LOG_PREFIX,
+        type(tree_cache).__name__,
+        len(nodes),
+        type(nodes[0]).__name__,
+        type(nodes[0]).__name__,
+    )
+
+
 def _leaves_above(tree_cache: Any, target_row: int) -> List[Any]:
     """Unlocked LEAF nodes pinning at least one row above ``target_row``.
 
     Leaves only: the tree's eviction primitive asserts leafness, and a
     node with children still has its rows reachable through them.
     """
+    nodes = _iter_nodes(tree_cache)
+    _warn_if_node_rows_unreadable(tree_cache, nodes)
     out = []
-    for node in _iter_nodes(tree_cache):
+    for node in nodes:
         if _children(node):
             continue
         if not _is_unlocked(node):
@@ -165,8 +234,10 @@ def _leaves_above(tree_cache: Any, target_row: int) -> List[Any]:
 
 def tree_ceiling(tree_cache: Any) -> int:
     """The highest row id the radix tree pins, or -1 for an empty tree."""
+    nodes = _iter_nodes(tree_cache)
+    _warn_if_node_rows_unreadable(tree_cache, nodes)
     ceiling = -1
-    for node in _iter_nodes(tree_cache):
+    for node in nodes:
         ceiling = max(ceiling, _max_row(node))
     return ceiling
 

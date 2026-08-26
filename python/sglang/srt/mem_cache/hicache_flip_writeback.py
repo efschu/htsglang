@@ -308,13 +308,56 @@ def _await_storage_acks(
     collective issued inside the flip seam is the #630 wedge shape; every rank
     runs this hook at the same seam anyway, so a rank draining its own acks
     needs no agreement with its peers.
+
+    #872: BOTH LOOKUPS BELOW ARE LOUD ON A MISS, and that is the point of the
+    ticket rather than a courtesy. These are duck-typed capability probes, and
+    each one's miss path used to return exactly what a healthy no-op returns --
+    "nothing was outstanding", "nothing was acknowledged" -- so a cache class
+    that simply does not carry the name was INDISTINGUISHABLE from a cache with
+    an empty queue. ``UnifiedRadixCache`` was such a class for the whole of its
+    life on this path: it has ``_drain_storage_control_queues_impl`` and had no
+    ``_local`` wrapper, so the fence skipped its wait entirely and reported
+    ``acked=0`` on every fence of every boot while the guards above and the
+    #871 streak alarm all read healthy.
+
+    Naming the method on one more class fixes today's cache and leaves the next
+    one to fail the same invisible way, so the probe itself now reports. The
+    fence still does not raise -- a missed prefix is a later miss, never a
+    wrong answer, and a flip may not die on an instrument -- but the condition
+    is no longer silent, and it is no longer reported as completeness.
     """
     ongoing = getattr(tree_cache, "ongoing_backup", None)
     if ongoing is None:
+        logger.error(
+            "%s #872 UNSERVABLE CACHE: %s carries no `ongoing_backup`, so this "
+            "fence cannot see whether ANY backup is in flight and reports the "
+            "seam complete without having looked. Every prefix it was supposed "
+            "to persist may be lost when the tree is dropped at the cutover, "
+            "and the loss appears only as a post-flip cache miss.",
+            LOG_PREFIX,
+            type(tree_cache).__name__,
+        )
         return 0, 0
     before = len(ongoing)
     drain = getattr(tree_cache, "_drain_storage_control_queues_local", None)
-    if drain is None:
+    if not callable(drain):
+        # Reported as fully OUTSTANDING, never as acknowledged: nothing was
+        # drained, so claiming otherwise would hand `persisted_nothing` and
+        # `complete` a value neither of them earned. This is what makes the
+        # #871 streak alarm able to see the condition at all.
+        logger.error(
+            "%s #872 UNSERVABLE CACHE: %s has no callable "
+            "`_drain_storage_control_queues_local`, so the writeback fence "
+            "cannot wait for storage acknowledgements and did not wait: %d "
+            "backup(s) are left in flight and the tree is dropped at the "
+            "cutover regardless. Add the local-drain wrapper to that class "
+            "(all it needs is `_drain_storage_control_queues_impl` with None "
+            "limits, as UnifiedRadixCache/HiRadixCache/HiMambaRadixCache do) "
+            "-- a fence that never waits is retention that never happens.",
+            LOG_PREFIX,
+            type(tree_cache).__name__,
+            before,
+        )
         return 0, before
     while True:
         try:

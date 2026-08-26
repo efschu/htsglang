@@ -2936,6 +2936,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
+    def _drain_storage_control_queues_local(self) -> None:
+        """Drain the storage control queues on THIS rank, no TP agreement.
+
+        #872: this wrapper was missing here while both sibling caches
+        (``HiRadixCache``, ``HiMambaRadixCache``) carried it, and the flip
+        writeback fence finds its drain by exactly this name
+        (``hicache_flip_writeback._await_storage_acks``). Duck-typed, so its
+        absence was not an error: the fence returned "nothing acknowledged,
+        everything outstanding" at once and waited none of its deadline. Boot
+        ``w40_857strict``: ``acked=0`` on all 21 fence reports, three of them
+        claiming ``deadline reached`` at ``elapsed=0.000s/2.000s`` -- a
+        deadline reached after none of its two seconds, which is the early
+        return and not a slow backend.
+
+        ``None`` limits mean "drain everything on this rank". The steady-state
+        path derives its counts from an all_reduce; a fence, a detach and a
+        shutdown may not depend on a collective their peers may already have
+        left -- issuing one inside the flip seam is the #630 wedge shape.
+        """
+        self._drain_storage_control_queues_impl(
+            n_revoke=None,
+            n_backup=None,
+            n_release=None,
+            extra_release_counts=None,
+            log_metrics=False,
+        )
+
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
