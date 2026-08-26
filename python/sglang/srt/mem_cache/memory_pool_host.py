@@ -177,6 +177,98 @@ def _host_binding_is_stale(pool) -> bool:
     return True
 
 
+def _split_host_indices_by_binding(pool, indices, op: str):
+    """Split host indices into those this pool can still describe, and strays.
+
+    THE SIBLING AXIS OF `_host_binding_is_stale`. That guard protects the
+    POINTER axis (device_buffers captured at construction). This one protects
+    the INDEX axis, which has the same root and had no guard at all.
+
+    `HostPoolGroup.anchor_entry` is fixed at construction (:__init__), so the
+    anchor never moves inside one group -- the GROUP is rebuilt onto a narrower
+    tier at a phase rebind. In-flight prefetch state does not move with it:
+    `unified_radix_cache.check_prefetch_progress` holds `host_indices` minted
+    against the previous, wider tier and frees them after the rebind. The
+    indices are then applied to a pool whose `slot_used` is shorter, and
+    `pool_host/base.py:free` indexes past its end.
+
+    Measured on the W38 acceptance boot (2026-08-26 12:54:28Z, all three ranks):
+    ``IndexError: index 76997 is out of bounds for dimension 0 with size 30518``.
+
+    This is the class `_entry_for_transfer` (:1735) names for #718/#847 -- "a
+    future producer that bypasses the resolver is LOUD rather than wrong". 322f33159a
+    fixed the TRANSFER path and did not sweep the index-taking accessors one
+    level up, so `free()` remained such a producer.
+
+    DROPPING A STRAY IS CORRECT, NOT A PAPER-OVER: a stray names a slot in a
+    tier that has already been torn down wholesale, so there is no slot left to
+    return and nothing leaks. The alternative -- indexing anyway -- is the crash
+    above. Refusing costs a cache miss, which this tier is built to tolerate.
+    Logged once per pool then counted: a retired tier is a steady state, not an
+    event.
+    """
+    size = int(getattr(pool, "size", -1))
+    if size < 0 or indices is None or len(indices) == 0:
+        return indices, 0
+    stray_mask = (indices < 0) | (indices >= size)
+    n_stray = int(stray_mask.sum())
+    if n_stray == 0:
+        return indices, 0
+    pool._stale_index_refusals = getattr(pool, "_stale_index_refusals", 0) + 1
+    if pool._stale_index_refusals == 1:
+        logger.error(
+            "HICACHE-INDEX REFUSED (#718 class, index axis): %s on host pool %r "
+            "was handed %d index(es) outside [0, %d) -- highest %d. These were "
+            "minted against a wider host tier that a phase rebind has since "
+            "retired; the slots they name no longer exist, so they are dropped "
+            "rather than applied. Applying them is the W38 IndexError at "
+            "pool_host/base.py:344. Counting further occurrences silently.",
+            op,
+            getattr(pool, "pool_name", "?"),
+            n_stray,
+            size,
+            int(indices.max()),
+        )
+    return indices[~stray_mask], n_stray
+
+
+class StrayHostIndexError(IndexError):
+    """A host index outlived the tier that minted it. See #718 class, index axis."""
+
+
+def _refuse_stray_host_index(pool, index, op: str) -> None:
+    """Loud form of `_split_host_indices_by_binding` for the data accessors.
+
+    `free()` can drop a stray because a dropped free is a no-op on a tier that
+    no longer exists. An accessor that RETURNS or WRITES a page cannot: dropping
+    would shorten a result or skip a store, and the caller would proceed on data
+    nobody wrote -- "a wrong ANSWER, with no assertion anywhere", which is the
+    exact failure `_entry_for_transfer` was hardened against for #718/#847.
+
+    Subclasses IndexError so existing handlers still catch it, but carries the
+    tier story instead of `index 76997 is out of bounds for dimension 0`.
+    """
+    size = int(getattr(pool, "size", -1))
+    if size < 0 or index is None:
+        return
+    if torch.is_tensor(index):
+        if index.numel() == 0:
+            return
+        lo, hi = int(index.min()), int(index.max())
+    else:
+        lo = hi = int(index)
+    if lo >= 0 and hi < size:
+        return
+    raise StrayHostIndexError(
+        f"HICACHE-INDEX REFUSED (#718 class, index axis): {op} on host pool "
+        f"{getattr(pool, 'pool_name', '?')!r} was handed index range "
+        f"[{lo}, {hi}] outside [0, {size}). These indices were minted against a "
+        f"wider host tier that a phase rebind has since retired. Unlike free(), "
+        f"this call returns or writes a page, so it cannot drop them without "
+        f"producing a wrong answer with no crash -- refusing by name instead."
+    )
+
+
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -1708,6 +1800,13 @@ class HostPoolGroup:
         return self.entry_map[name].host_pool
 
     def get_page_buffer_meta(self, indices):
+        # #718 class, index axis. Unlike free(), this RETURNS DATA: a stray
+        # cannot be dropped without silently shortening the caller's result,
+        # which is the wrong-answer-with-no-crash outcome the sibling refusals
+        # exist to prevent. So it is loud.
+        _refuse_stray_host_index(
+            self.anchor_entry.host_pool, indices, "get_page_buffer_meta"
+        )
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
 
     def clear(self) -> None:
@@ -1721,15 +1820,30 @@ class HostPoolGroup:
         return self.anchor_entry.host_pool.alloc(need_size)
 
     def free(self, indices: torch.Tensor) -> int:
-        return self.anchor_entry.host_pool.free(indices)
+        # #718 class, index axis: strays from a tier this rebind retired are
+        # dropped by name (see _split_host_indices_by_binding). Freeing what
+        # remains is the whole point -- an empty result is still a valid free.
+        pool = self.anchor_entry.host_pool
+        live, n_stray = _split_host_indices_by_binding(pool, indices, "free")
+        if n_stray and len(live) == 0:
+            return 0
+        return pool.free(live)
 
     def get_data_page(self, index, flat: bool = True):
+        # #718 class, index axis. Returns data -- loud, for get_page_buffer_meta's reason.
+        _refuse_stray_host_index(self.anchor_entry.host_pool, index, "get_data_page")
         return self.anchor_entry.host_pool.get_data_page(index, flat)
 
     def get_dummy_flat_data_page(self):
         return self.anchor_entry.host_pool.get_dummy_flat_data_page()
 
     def set_from_flat_data_page(self, index: int, data_page) -> None:
+        # #718 class, index axis. A stray here WRITES into a slot the retired
+        # tier owned -- corruption of whatever now lives at that offset, or an
+        # out-of-bounds store. Loud, never dropped.
+        _refuse_stray_host_index(
+            self.anchor_entry.host_pool, index, "set_from_flat_data_page"
+        )
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
 
     def _entry_for_transfer(self, transfer, direction: str):
