@@ -8,23 +8,21 @@ wrong-layer write in the other. But its own counter comment states the cost --
 direction, i.e. every flip loses its prefixes". The refusal is the honest
 non-answer; this is the first axis of the answer.
 
-THE REFUSAL'S OWN JUSTIFICATION IS WHAT HAD TO GO ON TRIAL FIRST, and one leg of
-it did not survive. `check_cpu_copy_layers` claimed "the KV head sharding also
-differs between the phases (PP holds all heads of its stage, TP a head shard of
-every layer), so even the overlapping entries are not interchangeable". FALSE on
-this rig: under #345 uneven-DCP replication the full-attention cache is
-TOKEN-sharded and every rank stores the FULL kv-heads
-(model_runner_kv_cache_mixin.py:3155-3160, and the boot line at :3228 prints
-`get_total_num_kv_heads()`); the PP pool takes `get_num_kv_heads(attn_tp_size)`
-with `attn_tp_size == 1`, the same total. Identical widths, interchangeable
-entries. The other leg -- "rank-locally under PP it cannot cover the layers" --
-is TRUE but only rank-locally, and the union of the three PP stages IS every
-layer. So the correct statement was never "a remap is impossible", it was "a
-RANK-LOCAL remap is impossible, and nobody asked about a collective one".
+RETRACTION, AND IT IS THE FIRST THING TO READ. This file was written claiming
+the refusal's KV-head leg was false. It is TRUE on this rig and the claim shipped
+for one commit. `uneven_dcp_kv_replicated` is
+`dcp_size > 1 AND get_tp_partition_ratios() is not None`; this rig boots
+`rank_tp_ratio=None`, so the replication branch is never taken, and
+`max(1, num_key_value_heads // attn_tp_size)` with 4 heads gives PP 4 and TP 1.
+The log line I cited as evidence appears zero times in the boot I cited it from.
+
+What survives is the LAYER leg's narrowing: rank-locally impossible, collectively
+exact. That is what this file tests, and it is one axis of THREE.
 
 WHAT THIS FILE COVERS, AND WHAT IT DELIBERATELY DOES NOT. The layer axis only.
 Two other axes stand between here and a shipped carry:
-  HEAD  -- replicated in both phases, no remap needed. Settled, above.
+  HEAD  -- NOT replicated here: PP 4 kv-heads per layer, TP 1. A real remap,
+           and the retraction above is why this line changed.
   TOKEN -- PP holds every token at allocator slots; TP holds an owner-rule
            SUBSET at compacted rows (layers/dcp/owner.py:159). A second
            remap, also unavailable rank-locally, NOT solved.
@@ -72,6 +70,66 @@ def _entries(start, n):
     """Payload that NAMES the global layer it belongs to, so a wrong-layer
     placement is visible as a value and not merely as an absence."""
     return [f"L{start + i}" for i in range(n)]
+
+
+class TestTheHeadLegIsTrueOnThisRig(CustomTestCase):
+    """THE RETRACTION, PINNED. I removed this leg from shipped code on a
+    misreading; these make the misreading impossible to repeat silently.
+
+    The error was not a typo. I read `_pool_kv_head_num`'s replication BRANCH,
+    treated its existence as reachability, and cited a boot line as evidence
+    without checking that the line had ever printed (it had not: zero
+    occurrences). The predicate's INPUTS are what decide it, so the predicate's
+    inputs are what these assert."""
+
+    def test_the_replication_branch_needs_a_rank_tp_ratio_plan(self):
+        """`uneven_dcp_kv_replicated` is `dcp_size > 1 AND
+        get_tp_partition_ratios() is not None`. Without a --rank-tp-ratio base
+        plan it is False no matter what the DCP size is."""
+        import inspect
+
+        from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+
+        src = inspect.getsource(uneven_dcp_kv_replicated)
+        self.assertIn("get_tp_partition_ratios() is not None", src)
+        self.assertIn("dcp_size > 1", src)
+
+    def test_with_no_plan_installed_the_predicate_is_false_at_any_dcp_size(self):
+        from sglang.srt.distributed.utils import (
+            get_tp_partition_ratios,
+            uneven_dcp_kv_replicated,
+        )
+
+        if get_tp_partition_ratios() is not None:
+            self.skipTest("a TP partition plan is installed in this process")
+        for dcp in (1, 2, 3, 8):
+            self.assertFalse(
+                uneven_dcp_kv_replicated(dcp),
+                f"replication claimed at dcp_size={dcp} with no plan installed",
+            )
+
+    def test_the_head_count_differs_between_the_phases_by_four(self):
+        """The arithmetic that settles it. `max(1, total // tp)` with this
+        checkpoint's 4 kv-heads: PP (attn_tp_size 1) -> 4, TP (3) -> 1."""
+        total = 4  # num_key_value_heads, Qwen3.8-27B
+        pp_heads = max(1, total // 1)
+        tp_heads = max(1, total // 3)
+        self.assertEqual(4, pp_heads)
+        self.assertEqual(1, tp_heads)
+        self.assertNotEqual(
+            pp_heads,
+            tp_heads,
+            "if these ever match, the head leg really is void and the refusal's "
+            "justification may be revisited -- but only then",
+        )
+
+    def test_the_fallback_expression_is_the_one_that_runs(self):
+        import inspect
+
+        from sglang.srt.configs.model_config import ModelConfig
+
+        src = inspect.getsource(ModelConfig.get_num_kv_heads)
+        self.assertIn("max(1, total_num_kv_heads // tensor_parallel_size)", src)
 
 
 class TestTheLabellingIsExact(CustomTestCase):

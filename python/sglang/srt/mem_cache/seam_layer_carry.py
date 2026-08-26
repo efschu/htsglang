@@ -7,29 +7,25 @@ IndexError or a silent wrong-layer write -- but it is not the answer: its own
 counter comment says a layout refusal means "every flip loses its prefixes".
 This module is the first of the three axes that answer has to cross.
 
-THE REFUSAL'S STATED REASON WAS WRONG ON ONE LEG, and that is why this module
-exists at all. `check_cpu_copy_layers` said:
+#875 RETRACTION, AT THE TOP BECAUSE IT CHANGES WHAT THIS MODULE IS FOR. This
+file was written on the claim that the seam refusal's KV-head leg was false --
+that both phases carry the full replicated kv-heads, so the entries are
+interchangeable. THAT CLAIM WAS WRONG and it shipped for one commit.
 
-    "A remap would be correct only if the copy covered every layer the
-     destination needs, and rank-locally under PP it cannot [...] The KV head
-     sharding also differs between the phases (PP holds all heads of its stage,
-     TP a head shard of every layer), so even the overlapping entries are not
-     interchangeable."
+`_pool_kv_head_num` returns the replicated total only when
+`uneven_dcp_kv_replicated(dcp_size)` holds, and that is
+`dcp_size > 1 AND get_tp_partition_ratios() is not None` -- it needs a
+`--rank-tp-ratio` base plan. This rig boots `rank_tp_ratio=None`, so the branch
+is not taken. With `num_key_value_heads = 4` and `max(1, 4 // tp)`: PP holds 4
+heads per layer, TP holds 1. A factor of four. I had cited the boot line at
+model_runner_kv_cache_mixin.py:3228 as evidence; it appears ZERO times in that
+boot. I read a branch, treated its existence as reachability, and did not check
+the predicate's inputs.
 
-The second sentence is FALSE on this rig, checked in the code rather than
-assumed. Under `#345` uneven-DCP KV replication the full-attention cache is
-TOKEN-sharded and "every rank stores the FULL, replicated kv-heads"
-(model_runner_kv_cache_mixin.py:3155-3160), and the boot line at :3228 prints
-`get_total_num_kv_heads()` verbatim. The PP-phase pool takes
-`get_num_kv_heads(attn_tp_size)` with `attn_tp_size == 1`, i.e. the same total.
-So a (layer, token) KV row has IDENTICAL width in both phases and the entries
-ARE interchangeable.
-
-The first sentence is true only RANK-LOCALLY, which is not the same as true. PP
-rank r holds its stage's layers for ALL tokens; the union over the three ranks
-is every layer. The data the destination needs exists -- on a peer. So the
-correct reading is not "a remap is impossible" but "a rank-local remap is
-impossible, and nobody asked whether a collective one was available".
+SO THE HEAD AXIS IS A REAL REMAP, and this module covers the layer axis only --
+one of THREE, not one of two. That makes the standing DO-NOT-BUILD verdict
+stronger, not weaker: the carry would need a layer union, a head remap and a
+token remap, and only the first is written here.
 
 THREE AXES, AND ONLY ONE OF THEM IS HERE:
 
@@ -37,7 +33,10 @@ THREE AXES, AND ONLY ONE OF THEM IS HERE:
              `pp_attn_stage_ratio`), TP is complete (16). This module. The
              remap is exact once entries are labelled by GLOBAL layer id, which
              is what `CpuCopyLayout.start_layer` already records.
-  2. HEAD    replicated in both phases. NO remap needed -- see above.
+  2. HEAD    NOT the same in both phases: PP 4 kv-heads per layer, TP 1
+             (`max(1, 4 // attn_tp_size)`). A real remap, and a lossy one in
+             the PP->TP direction is not even well defined -- see the
+             retraction above.
   3. TOKEN   PP holds every token at allocator slots; TP holds an owner-rule
              SUBSET at compacted rows, `(L // cp_S) * cp_ratio + (L % cp_S -
              cp_lo)` (layers/dcp/owner.py:159). A second remap, also not
