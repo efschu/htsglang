@@ -45,7 +45,6 @@ import unittest
 import torch
 
 from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
 from sglang.srt.model_executor.weights_arena import (
     checksum_is_representable,
@@ -54,6 +53,7 @@ from sglang.srt.model_executor.weights_arena import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+from seam_census_double import bind_census_schedulers  # noqa: E402 (sibling)
 from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
     MAP_625,
     N_LAYERS,
@@ -143,6 +143,9 @@ def _runtimes_with_per_rank_live(
                 cutover_fn=lambda d, r=r: cutover_log[r].append(d),
             )
         )
+    # #905: the #856 cutover REFUSES without a census scheduler, so a fixture
+    # that omits it measures the refusal rather than the ballot.
+    bind_census_schedulers(runtimes)
     return runtimes, cutover_log
 
 
@@ -204,54 +207,84 @@ class TestFrameDivergence(CustomTestCase):
         divergence that changes a payload LENGTH."""
         return [live, live[:-1], live]
 
-    def test_can_fail_without_the_ballot_the_divergence_reaches_the_wire(self):
-        """RED ARM: neutralise the ballot and the metal failure returns.
+    # #905 CONTRACT CHANGE: the RED ARM of this class is gone, and the
+    # reason is a production change rather than a test decision.
+    #
+    # `test_can_fail_without_the_ballot_the_divergence_reaches_the_wire`
+    # neutralised `_frame_digest` and `_agree_live_slots`, ran the flip with
+    # rank 1 one slot short, and required a rank to raise with the metal's
+    # "NOT A CHECKSUM" signature -- i.e. it reproduced the acceptance-run
+    # failure on a CPU desk. Since #856 the cutover rebuilds its transfer plan
+    # on `torch.empty(0)`, so no rank frames a payload, nothing reaches the
+    # wire, and the arm cannot arm: with the ballot neutralised the flip now
+    # completes cleanly. A red arm that has stopped going red is worse than no
+    # red arm, because it reads as proof.
+    #
+    # WHAT STILL HOLDS THE LINE. The ballot itself is unchanged and its
+    # protective behaviour is measured by the three tests that follow (abandon
+    # on an unrepairable divergence, repair of the length divergence this file
+    # plants, inertness on agreeing ranks), and the arithmetic falsifiers on
+    # the metal's own numbers live in `TestTheGuardsOwnArithmetic`. What is no
+    # longer measured is the CONSEQUENCE of removing the ballot, because that
+    # consequence is currently unreachable.
+    #
+    # NAMED, NOT BUILT: the framing and checksum guards inside `_cutover`'s
+    # wave loop are dead code on the flip path as long as the plan is built
+    # empty. Whether they should be retired, or the plan should stop being
+    # hard-coded empty, is a PRODUCTION question for the #856 seam owner;
+    # #905 is a test-side ticket and does not answer it. The tripwire below
+    # is what makes the question un-forgettable.
 
-        ``_frame_digest`` is stubbed to a constant, which is exactly the
-        pre-fix state of the vote: the ranks agree on nothing and believe
-        they agree. The flip then runs with mismatched frames, and a rank
-        raises with a trailer that is not a checksum -- the acceptance
-        run's signature, reproduced on a CPU desk.
+    def test_the_seam_frames_nothing_so_the_red_arm_cannot_arm(self):
+        """The tripwire that stands in for the deleted red arm.
+
+        Runs the same neutralised-ballot divergence through the same
+        NCCL-like channel, and pins the reason nothing raises: every exchange
+        is empty in both directions. The day a payload crosses this seam
+        again, this goes red and the red arm #905 removed is owed a return.
         """
-        _ref, live, _ppp, pp_views, tp_pools, tp_views = self._pools(29)
+        _ref, live, _ppp, pp_views, _tpp, tp_views = self._pools(29)
         exchange = _NcclLikeExchange(3)
+        framed = []
+
+        def _factory(rank):
+            inner = exchange.exchange_for(rank)
+
+            def _exchange(outgoing, incoming_nbytes):
+                framed.append(
+                    (
+                        sum(int(t.numel()) for t in outgoing.values()),
+                        sum(int(n) for n in incoming_nbytes.values()),
+                    )
+                )
+                return inner(outgoing, incoming_nbytes)
+
+            return _exchange
+
         runtimes, _ = _runtimes_with_per_rank_live(
             pp_views,
             tp_views,
             self._diverged(live),
-            exchange_factory=exchange.exchange_for,
+            exchange_factory=_factory,
         )
         for rt in runtimes:
             rt._frame_digest = lambda *a, **k: 0
-            # #656 C22-d: the live-slot AGREEMENT is part of the protection
-            # chain now, and it runs one rung EARLIER than the ballot. A red
-            # arm that neutralised only the vote would find nothing left to
-            # diverge, and would go green for a reason that has nothing to do
-            # with the defect it exists to reproduce. Neutralise the chain.
             rt._agree_live_slots = lambda slots, ballot: (slots, "")
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        raised = [e for e in exceptions if e is not None]
-        self.assertTrue(
-            raised,
-            "the frame divergence reached the wire and nothing objected -- "
-            "the red arm is not arming the defect it is meant to reproduce",
+        self.assertEqual(
+            [e for e in exceptions if e is not None],
+            [],
+            "a rank raised with the ballot neutralised -- something DOES "
+            "reach the wire, so the red arm #905 removed can arm again and "
+            "must be restored",
         )
-        # The peers that were waiting on the barrier when the first rank
-        # died come back with BrokenBarrierError -- the harness's version
-        # of the gloo "Connection closed by peer" cascade the acceptance
-        # log shows behind the rank that actually diagnosed the payload.
-        named = [e for e in raised if isinstance(e, KvReshardError)]
-        self.assertTrue(
-            named, f"no rank diagnosed the payload: {[repr(e) for e in raised]}"
+        self.assertTrue(framed, "the seam never reached its byte exchange")
+        self.assertEqual(
+            [pair for pair in framed if pair != (0, 0)],
+            [],
+            "the seam framed bytes; the divergence above can therefore reach "
+            "the wire again and the deleted red arm is owed a return",
         )
-        self.assertTrue(
-            any("NOT A CHECKSUM" in str(e) for e in named),
-            f"expected the framing diagnosis, got: {[str(e) for e in named]}",
-        )
-        # ... and the field it names is the metal's signature: a value no
-        # sum over that payload could produce.
-        self.assertFalse(checksum_is_representable(-6510615555426900571, 1 << 40))
-        self.assertEqual(sum(rt.frame_aborts for rt in runtimes), 0)
 
     def test_the_ballot_abandons_the_flip_instead_of_killing_the_instance(self):
         """GREEN: the same divergence, the ballot on. Nobody raises.
@@ -410,45 +443,24 @@ class TestFrameDivergence(CustomTestCase):
 
 
 class TestTheGuardStillCatchesRealCorruption(CustomTestCase):
-    """The repaired guard must not have been softened into a no-op."""
+    """The repaired guard must not have been softened into a no-op.
 
-    def test_can_fail_planted_corruption_with_frames_agreeing_still_raises(self):
-        """Frames agree, one DATA byte is flipped in flight: loud, and the
-        message says data rather than framing."""
-        _ref, live, _ppp, pp_views, tp_pools, tp_views = _make_layout_pools(
-            MAP_625, VEC, 160, seed=17
-        )
-        tp_before = _clone_pools(tp_pools)
-        exchange = _NcclLikeExchange(3)
+    #905 CONTRACT CHANGE, second half of the one recorded in
+    `TestFrameDivergence`. `test_can_fail_planted_corruption_with_frames_
+    agreeing_still_raises` flipped one DATA byte in flight and required the
+    receiving rank to raise "checksum mismatch ... the DATA differs" rather
+    than the framing diagnosis. There is no longer a byte in flight to flip:
+    #856 rebuilds the plan on `torch.empty(0)`, `received` is empty on every
+    rank, and the corruption is never planted. The test went green-by-vacancy
+    the moment a census scheduler was bound (`exceptions[1]` is None), so it
+    is DELETED rather than left standing as a guard that cannot fire.
 
-        def _factory(rank):
-            inner = exchange.exchange_for(rank)
-
-            def _exchange(outgoing, incoming_nbytes):
-                received = inner(outgoing, incoming_nbytes)
-                if rank == 1:
-                    for _peer, payload in received.items():
-                        if payload.numel():
-                            payload[0] ^= 0xFF
-                            break
-                return received
-
-            return _exchange
-
-        runtimes, _ = _runtimes_with_per_rank_live(
-            pp_views, tp_views, [live] * 3, exchange_factory=_factory
-        )
-        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        self.assertIsInstance(exceptions[1], KvReshardError)
-        message = str(exceptions[1])
-        self.assertIn("checksum mismatch", message)
-        self.assertIn("the DATA differs", message)
-        self.assertNotIn("NOT A CHECKSUM", message)
-        self.assertEqual(runtimes[1].frame_aborts, 0)
-        self.assertTrue(
-            _pools_equal([tp_pools[1]], [tp_before[1]]),
-            "rank 1 scattered bytes after a checksum failure",
-        )
+    The distinction it protected -- framing failure versus data corruption,
+    where the two diagnoses send an operator to opposite ends of the system --
+    survives as arithmetic in `TestTheGuardsOwnArithmetic`, and the
+    reachability tripwire lives in
+    `TestFrameDivergence.test_the_seam_frames_nothing_so_the_red_arm_cannot_arm`.
+    """
 
     def test_the_old_mailbox_path_is_unchanged(self):
         """The pre-existing harness must keep behaving as it did, so this

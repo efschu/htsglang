@@ -46,6 +46,8 @@ from sglang.srt.managers.phase_flip_runtime import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+from seam_census_double import bind_census_schedulers  # noqa: E402 (sibling)
+
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 MAP_625 = ((0, 1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15))
@@ -220,7 +222,22 @@ def _build_runtimes(
     cutover_log=None,
     pre_write_fns=(),
     pre_write_fns_for=None,
+    n_residents=3,
 ):
+    """One runtime per rank, each with a FAITHFUL census scheduler bound.
+
+    #905: the binding is not optional decoration. Since #856 the cutover
+    REFUSES to run without a scheduler that can retract its residents and drop
+    its prefix tree (`SeamOrderError`, phase_flip_runtime.py:8452), so a
+    fixture that omits it does not test a flip -- it tests the refusal. The
+    double is shared across this whole suite (`seam_census_double`) rather than
+    restated per file, and it is faithful in the directions #856's own history
+    proved matter: locked tree nodes, a reset that installs a new root, rows
+    that only `evict` returns, and a live universe a retracted request must
+    leave. `n_residents=0` is available for the fixtures that model an idle
+    instance, and is a DELIBERATE choice at each site rather than the default,
+    because an empty resident set short-circuits the retraction leg entirely.
+    """
     n = len(VEC)
     channel = _BarrierMinChannel(n)
     mailbox = _MailboxExchange(n)
@@ -251,7 +268,13 @@ def _build_runtimes(
                 ),
             )
         )
+    bind_census_schedulers(runtimes, n_residents=n_residents)
     return runtimes, cutover_log
+
+
+def _schedulers(runtimes):
+    """The census schedulers `_build_runtimes` bound, one per rank."""
+    return [rt._census_scheduler for rt in runtimes]
 
 
 def _clone_pools(pools):
@@ -266,43 +289,133 @@ def _pools_equal(a, b):
     return True
 
 
-class TestByteIdentity(CustomTestCase):
-    def test_pp_to_tp_flip_byte_identity(self):
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+class TestTheCutoverMovesNoBytes(CustomTestCase):
+    """#905, and the CONTRACT CHANGE this class records.
+
+    Until #856 this class was ``TestByteIdentity`` and it pinned the opposite
+    promise: after a PP->TP flip the TP pools equal the global reference under
+    the token-owner rule, and the reverse flip round-trips the PP pools
+    byte-identically. That promise was RETIRED by 9fab2cc62e, "the flip carries
+    no KV". The cutover now builds its transfer plan on a hard-coded empty slot
+    tensor (``build_phase_flip_transition(torch.empty(0, ...))``), so no plan
+    the seam runs can have a row in it, and the destination pool is written
+    exactly zero times.
+
+    The old assertions are not weakened here, they are INVERTED, because the
+    new contract makes the same fixture answer a sharper question. A flip that
+    moved even one byte of KV across this seam is now a DEFECT, and this class
+    is where it is caught: the destination is compared against its pre-flip
+    bytes rather than against a reference it is supposed to acquire.
+
+    The fixture still builds a real, non-empty live set and real resident
+    requests -- which is what makes "it moved nothing" a result rather than a
+    tautology. What replaces the carry is asserted too: every resident is
+    retracted, leaves the live universe, returns its rows to the allocator, and
+    is re-admitted to the queue in arrival order.
+    """
+
+    def _assert_residents_were_released_not_carried(self, runtimes):
+        for r, sched in enumerate(_schedulers(runtimes)):
+            with self.subTest(rank=r):
+                self.assertEqual(
+                    sched.seam_carried_bytes(),
+                    0,
+                    "a resident still holds KV rows on the far side of the "
+                    "cutover -- that is a carry, and the seam promises none",
+                )
+                self.assertEqual(sched.live_req_count(), 0)
+                self.assertEqual(
+                    sched.orphaned_rows(),
+                    0,
+                    "rows belonging to nobody after the drop -- the W27-retry "
+                    "leak (152 rows/cycle on metal)",
+                )
+                self.assertEqual(sched.req_to_token_pool.outstanding(), 0)
+                self.assertEqual(
+                    [q.rid for q in sched.waiting_queue],
+                    [
+                        q.rid
+                        for q in sorted(sched.residents, key=lambda x: x.kv_arrival_seq)
+                    ],
+                )
+                sched.assert_batches_in_sync()
+
+    def test_pp_to_tp_cutover_writes_no_byte_into_the_destination(self):
+        _ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 300
         )
+        pp_before = _clone_pools(pp_pools)
+        tp_before = _clone_pools(tp_pools)
         runtimes, cutovers = _build_runtimes(pp_views, tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, msg)
+        self.assertTrue(
+            _pools_equal(tp_pools, tp_before),
+            "the destination pool was written -- the flip carried KV",
+        )
+        self.assertTrue(
+            _pools_equal(pp_pools, pp_before),
+            "the source pool was modified by a flip that moves nothing",
+        )
         for r, rt in enumerate(runtimes):
             self.assertEqual(rt.completed, 1)
             self.assertEqual(rt.phase, "tp")
             self.assertEqual(cutovers[r], [PP_TO_TP])
+        self._assert_residents_were_released_not_carried(runtimes)
 
-    def test_roundtrip_restores_pp_pools(self):
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+    def test_the_round_trip_leaves_both_layouts_untouched(self):
+        _ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 260, seed=9
         )
-        orig = _clone_pools(pp_pools)
+        pp_before = _clone_pools(pp_pools)
+        tp_before = _clone_pools(tp_pools)
         runtimes, _ = _build_runtimes(pp_views, tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        # wipe the PP pools, then flip back on the SAME runtimes
-        for ks, vs in pp_pools:
-            for t in ks + vs:
-                t.zero_()
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[TP_TO_PP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        # live rows must round-trip byte-identically
-        for r in range(3):
-            (ks, vs), (oks, ovs) = pp_pools[r], orig[r]
-            for t, o in zip(ks + vs, oks + ovs):
-                self.assertTrue(torch.equal(t[live], o[live]))
+        self.assertTrue(_pools_equal(pp_pools, pp_before))
+        self.assertTrue(_pools_equal(tp_pools, tp_before))
         for rt in runtimes:
             self.assertEqual(rt.completed, 2)
             self.assertEqual(rt.phase, "pp")
+        # Retracted ONCE per direction: the second cutover finds an empty
+        # resident set, which is the state the first one left behind, and it
+        # still has to drop its tree.
+        for sched in _schedulers(runtimes):
+            self.assertEqual(sched.tree_cache.resets, 2)
+            self.assertEqual([r.retraction_count for r in sched.residents], [1, 1, 1])
+
+    def test_can_fail_a_carry_through_the_seam_turns_this_class_red(self):
+        """RED-FIRST PROOF that the assertions above are not vacuous.
+
+        Assertions of the form "nothing changed" pass just as happily against
+        a fixture that never ran. So the flip is run with ONE byte smuggled
+        into the destination through the seam hook -- the smallest possible
+        carry -- and the same comparison must reject it.
+        """
+        _ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 120, seed=41
+        )
+        tp_before = _clone_pools(tp_pools)
+
+        def _smuggle_for(rank):
+            def _carry(direction, rank=rank):
+                tp_pools[rank][0][0][0, 0, 0] += 1  # one carried element
+
+            return (_carry,)
+
+        runtimes, _ = _build_runtimes(
+            pp_views, tp_views, live, pre_write_fns_for=_smuggle_for
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        self.assertFalse(
+            _pools_equal(tp_pools, tp_before),
+            "a byte was carried through the seam and the comparison used by "
+            "this class did not notice -- every other assertion here is then "
+            "worthless",
+        )
 
 
 class TestConsensusDiscipline(CustomTestCase):
@@ -344,34 +457,71 @@ class TestConsensusDiscipline(CustomTestCase):
                 return gate["count"] > 2  # not ready the first two probes
 
         ready_fns = [lambda: True, _rank1_ready, lambda: True]
+        tp_before = _clone_pools(tp_pools)
         runtimes, _ = _build_runtimes(pp_views, tp_views, live, ready_fns=ready_fns)
         exceptions = _run_ranks(
             3, runtimes=runtimes, directions=[PP_TO_TP] * 3, rounds=10
         )
         self.assertEqual([e for e in exceptions if e], [])
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, msg)
+        # #905: the layout check this line used to make ("the TP pools now
+        # hold the reference rows") was retired by #856 -- the flip carries no
+        # KV. The skew property it was attached to is untouched, and the
+        # no-carry statement replaces it on the same fixture.
+        self.assertTrue(_pools_equal(tp_pools, tp_before))
         for rt in runtimes:
             self.assertEqual(rt.completed, 1)
 
-    def test_checksum_falsifier_corrupted_payload_pool_untouched(self):
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+    # #905 CONTRACT CHANGE, and the two tests it removed from this class.
+    #
+    # `test_checksum_falsifier_corrupted_payload_pool_untouched` and
+    # `test_truncated_payload_is_loud_size_error` planted a corrupt and a
+    # truncated PAYLOAD in the seam's byte exchange and required the receiving
+    # rank to raise. Since #856 the seam exchanges no payload at all: the plan
+    # is rebuilt on `torch.empty(0)`, so `outgoing_payloads` and
+    # `incoming_nbytes` are empty on every rank and the checksum/framing guard
+    # inside the wave loop is UNREACHABLE from the flip path. Both arms went
+    # green-by-vacancy the moment a scheduler was bound (`exceptions[1]` is
+    # None, not a KvReshardError), which is a green that measures nothing.
+    #
+    # They are deleted rather than rewritten because there is no level at
+    # which the same fixture can still drive that guard: it is inline in
+    # `_cutover`, not a callable. What survives them:
+    #   * the guard's ARITHMETIC falsifiers, in
+    #     test_flip_frame_agreement_656.TestTheGuardsOwnArithmetic (green);
+    #   * the tripwire below, which fails the day a payload reappears -- at
+    #     which point these two arms have to come back with it.
+    #
+    # NAMED, NOT BUILT: dead guard code on the flip path is a PRODUCTION
+    # question (phase_flip_runtime.py, the wave loop's checksum block), and
+    # #905 is a test-side ticket.
+
+    def test_the_seam_puts_no_payload_on_the_wire_at_all(self):
+        """The tripwire that replaces the two payload falsifiers.
+
+        Every exchange the seam performs is recorded. Under the no-carry
+        contract each one is empty in both directions, which is exactly why a
+        corrupt or truncated payload can no longer be planted here. If a byte
+        ever crosses again this goes red, and the deleted falsifiers are owed
+        a return.
+        """
+        _ref, live, _pp_pools, pp_views, _tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 160, seed=17
         )
-        tp_before = _clone_pools(tp_pools)
         mailbox = _MailboxExchange(3)
+        seen = []
 
         def _factory(rank):
             inner = mailbox.exchange_for(rank)
 
             def _exchange(outgoing, incoming_nbytes):
-                received = inner(outgoing, incoming_nbytes)
-                if rank == 1:
-                    for peer, payload in received.items():
-                        if payload.numel():
-                            payload[0] ^= 0xFF  # corrupt one byte
-                            break
-                return received
+                seen.append(
+                    (
+                        rank,
+                        sum(int(t.numel()) for t in outgoing.values()),
+                        sum(int(n) for n in incoming_nbytes.values()),
+                    )
+                )
+                return inner(outgoing, incoming_nbytes)
 
             return _exchange
 
@@ -379,39 +529,15 @@ class TestConsensusDiscipline(CustomTestCase):
             pp_views, tp_views, live, exchange_factory=_factory
         )
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        self.assertIsInstance(exceptions[1], KvReshardError)
-        self.assertIn("checksum", str(exceptions[1]))
-        # rank 1 aborted BEFORE its write phase: its TP pool is untouched.
-        self.assertTrue(
-            _pools_equal([tp_pools[1]], [tp_before[1]]),
-            "rank 1 scattered bytes after a checksum failure",
+        self.assertEqual([e for e in exceptions if e], [])
+        self.assertTrue(seen, "the seam never reached its byte exchange at all")
+        self.assertEqual(
+            [(r, o, i) for r, o, i in seen if o or i],
+            [],
+            "the seam sent or expected bytes -- the flip carried KV, and the "
+            "payload falsifiers #905 removed from this class are owed a "
+            "return (see the note above)",
         )
-
-    def test_truncated_payload_is_loud_size_error(self):
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
-            MAP_625, VEC, 150, seed=19
-        )
-        mailbox = _MailboxExchange(3)
-
-        def _factory(rank):
-            inner = mailbox.exchange_for(rank)
-
-            def _exchange(outgoing, incoming_nbytes):
-                received = inner(outgoing, incoming_nbytes)
-                if rank == 2:
-                    for peer, payload in received.items():
-                        received[peer] = payload[:-16]
-                        break
-                return received
-
-            return _exchange
-
-        runtimes, _ = _build_runtimes(
-            pp_views, tp_views, live, exchange_factory=_factory
-        )
-        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        self.assertIsInstance(exceptions[2], KvReshardError)
-        self.assertIn("size mismatch", str(exceptions[2]))
 
 
 class TestValidationAndBounds(CustomTestCase):
@@ -772,6 +898,7 @@ class TestAbortDeferral(CustomTestCase):
                     cutover_fn=lambda d: None,
                 )
             )
+        bind_census_schedulers(runtimes)
         return runtimes
 
     def test_can_fail_abort_applied_on_one_rank_mid_flip_is_refused(self):
@@ -922,11 +1049,11 @@ class TestAbortDeferral(CustomTestCase):
 
     def test_deferral_keeps_flip_clean_then_applies_abort(self):
         # WITH deferral: the disconnect arrives mid-flip on rank 0, is
-        # QUEUED, the flip commits byte-identically on every rank, and
-        # the abort work runs afterwards.
+        # QUEUED, the flip commits cleanly on every rank, and the abort work
+        # runs afterwards.
         from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
 
-        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+        _ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 140, seed=33
         )
         window = AbortDeferralWindow()
@@ -935,11 +1062,17 @@ class TestAbortDeferral(CustomTestCase):
         # The disconnect lands while the window is active (armed flip).
         self.assertTrue(window.submit(lambda: applied.append("abort req X")))
         live_per_rank = [live, live, live]  # deferral kept the set uniform
+        tp_before = _clone_pools(tp_pools)
         runtimes = self._runtimes_with_per_rank_live(live_per_rank, pp_views, tp_views)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, msg)
+        # #905: "commits byte-identically" was the pre-#856 reading of a
+        # clean commit. The flip carries no KV now, so a clean commit is a
+        # completed cutover over an UNTOUCHED destination -- the deferral
+        # property this test owns is unaffected either way.
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.completed, 1, f"rank {r}")
+        self.assertTrue(_pools_equal(tp_pools, tp_before))
         self.assertEqual(applied, [])
         self.assertEqual(window.deactivate_and_drain(), 1)
         self.assertEqual(applied, ["abort req X"])
@@ -1436,104 +1569,83 @@ class TestSharedArenaReadsPrecedeWrites(CustomTestCase):
 
     This pins that ordering by making the two layouts alias. It fails on
     the pre-fix local leg, which read and wrote per layer in one loop.
+
+    #905 CONTRACT CHANGE. The hazard is now UNREACHABLE at this seam rather
+    than merely absent: #856 rebuilds the plan empty, so there is no source
+    read to precede and no destination write to follow, and the local leg the
+    two byte tests here falsified never runs. The alias branch itself is still
+    live and still decides the whole-pool swap's ordering, so what this class
+    asserts now is that branch and the untouched arena -- the strongest
+    statement the fixture can still make honestly.
+
+    DELETED with this change: `test_aliased_result_matches_the_disjoint_
+    reference`, which compared the destination bytes of an aliased run against
+    a disjoint one. Both destinations are now untouched, so the comparison is
+    true for every implementation including one that does nothing.
     """
 
-    def test_pp_to_tp_is_byte_exact_with_aliased_pools(self):
-        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_aliased_layout_pools(
-            MAP_625, VEC, 300
+    def test_the_aliased_arena_is_untouched_and_still_takes_the_alias_branch(self):
+        _ref, live, _pp_pools, pp_views, tp_pools, tp_views = (
+            _make_aliased_layout_pools(MAP_625, VEC, 300)
         )
+        tp_before = _clone_pools(tp_pools)
         runtimes, _cutovers = _build_runtimes(pp_views, tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, f"aliased-arena flip corrupted rows: {msg}")
-
-    def test_aliased_result_matches_the_disjoint_reference(self):
-        """Byte-identity against the same flip run with disjoint pools --
-        sharing must change memory economics, never a single output byte."""
-        ref_a, live_a, _, pp_a, tp_pools_a, tp_a = _make_aliased_layout_pools(
-            MAP_625, VEC, 300, seed=11
+        self.assertTrue(
+            _pools_equal(tp_pools, tp_before),
+            "the aliased arena was written -- with the two layouts overlaying "
+            "the same bytes, a carry here corrupts the source as it writes",
         )
-        rt_a, _ = _build_runtimes(pp_a, tp_a, live_a)
-        self.assertEqual(
-            [e for e in _run_ranks(3, runtimes=rt_a, directions=[PP_TO_TP] * 3) if e],
-            [],
-        )
-
-        ref_b, live_b, _, pp_b, tp_pools_b, tp_b = _make_layout_pools(
-            MAP_625, VEC, 300, seed=11
-        )
-        rt_b, _ = _build_runtimes(pp_b, tp_b, live_b)
-        self.assertEqual(
-            [e for e in _run_ranks(3, runtimes=rt_b, directions=[PP_TO_TP] * 3) if e],
-            [],
-        )
-
-        self.assertTrue(torch.equal(live_a, live_b))
-        owner = owner_of(live_a, VEC)
-        for r in range(3):
-            rows = rows_of(live_a[owner == r], VEC, r)
-            for f in range(N_LAYERS):
-                self.assertTrue(
-                    torch.equal(tp_pools_a[r][0][f][rows], tp_pools_b[r][0][f][rows]),
-                    f"rank {r} ordinal {f} K differs between aliased and disjoint",
-                )
-                self.assertTrue(
-                    torch.equal(tp_pools_a[r][1][f][rows], tp_pools_b[r][1][f][rows]),
-                    f"rank {r} ordinal {f} V differs between aliased and disjoint",
-                )
+        for r, rt in enumerate(runtimes):
+            self.assertTrue(
+                rt._pools_alias(),
+                f"rank {r}: the fixture no longer aliases, so the branch this "
+                f"class exists for is not the one under test",
+            )
 
 
-class TestSeamWavesAreByteIdentical(CustomTestCase):
-    """#631: waving the seam changes memory economics, never a byte.
+class TestSeamWaveSplit(CustomTestCase):
+    """#631's wave split, and what remains of it after #856.
 
-    The move is split into layer WAVES so that only one wave's payload is
-    staged at a time -- the fix for the one-request livelock, where
-    staging tracked the resident live set and a long enough request could
-    never be afforded (HANDOFF_666). The wire format changes shape (one
-    checksummed payload per peer PER WAVE instead of one for the whole
-    plan), so the destination bytes are the thing that must not move.
+    The move was split into layer WAVES so that only one wave's payload is
+    staged at a time -- the fix for the one-request livelock, where staging
+    tracked the resident live set and a long enough request could never be
+    afforded (HANDOFF_666).
 
-    Run the SAME flip at one wave and at the map's default, on
-    independently built but identically seeded pools, and compare every
-    destination row. A single wave is the pre-wave code path, so this is
-    also the A/B that keeps the wave count a one-variable change.
+    #905 CONTRACT CHANGE. The class was `TestSeamWavesAreByteIdentical` and
+    its subject was the DESTINATION BYTES at one wave versus the map's
+    default. Under #856 both runs write zero bytes, so that A/B is true for
+    every implementation and was passing vacuously -- it is deleted, along
+    with `test_the_waved_run_really_did_land_the_reference_rows`, whose whole
+    purpose was to stop the A/B from being satisfied by two identically wrong
+    runs.
+
+    The split itself is NOT retired: `_flip_waves` still computes it, the seam
+    still reports it, and the price the seam reserve is charged still derives
+    from it. Those are what this class asserts now.
     """
 
     def _run_at(self, waves):
-        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+        _ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 300, seed=23
         )
+        before = _clone_pools(tp_pools)
         runtimes, _cutovers = _build_runtimes(pp_views, tp_views, live)
         for rt in runtimes:
             rt._n_waves = waves
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
         self.assertEqual([rt.last_stats["seam_waves"] for rt in runtimes], [waves] * 3)
-        return ref, live, tp_pools
+        return tp_pools, before
 
-    def test_one_wave_and_the_default_split_agree_byte_for_byte(self):
-        _ref_a, live_a, tp_a = self._run_at(1)
-        _ref_b, live_b, tp_b = self._run_at(4)
-        self.assertTrue(torch.equal(live_a, live_b))
-        owner = owner_of(live_a, VEC)
-        for r in range(3):
-            rows = rows_of(live_a[owner == r], VEC, r)
-            for f in range(N_LAYERS):
-                self.assertTrue(
-                    torch.equal(tp_a[r][0][f][rows], tp_b[r][0][f][rows]),
-                    f"rank {r} ordinal {f} K differs between 1 and 4 waves",
-                )
-                self.assertTrue(
-                    torch.equal(tp_a[r][1][f][rows], tp_b[r][1][f][rows]),
-                    f"rank {r} ordinal {f} V differs between 1 and 4 waves",
-                )
-
-    def test_the_waved_run_really_did_land_the_reference_rows(self):
-        """Equality between two runs proves nothing if both are wrong."""
-        ref, live, tp_pools = self._run_at(4)
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, f"waved flip corrupted rows: {msg}")
+    def test_the_reported_split_still_follows_what_was_asked(self):
+        """The seam reports the split it was set to, at both ends of the
+        range -- and neither one moves a byte."""
+        for waves in (1, 4):
+            with self.subTest(waves=waves):
+                tp_pools, before = self._run_at(waves)
+                self.assertTrue(_pools_equal(tp_pools, before))
 
     def test_the_default_wave_count_is_one_layer_per_wave(self):
         """#631 2.1b: the smallest-stage cap (4 for MAP_625) is lifted.
@@ -1568,6 +1680,14 @@ class TestPreWriteSeamOrdering(CustomTestCase):
 
     Ordering is checked per rank: the ranks run concurrently, so a global
     event order would interleave and prove nothing.
+
+    #905: the ordering assertions below are now satisfied by an EMPTY event
+    log, because #856 leaves the seam nothing to read and nothing to write.
+    They are kept -- they cost nothing and they are the ones that would catch
+    a reordering the day a carry returns -- but they are no longer the point.
+    The point is the count assertion added underneath them: zero source reads
+    and zero destination writes, on the same recording instrument, is the
+    no-carry contract stated where this class can actually see it.
     """
 
     def test_hook_fires_between_last_read_and_first_write(self):
@@ -1616,9 +1736,16 @@ class TestPreWriteSeamOrdering(CustomTestCase):
                 [],
                 f"rank {r}: a destination write happened BEFORE the seam: {log}",
             )
-
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, msg)
+            # #905: the no-carry statement, on the same instrument. This
+            # replaces the `_check_tp_layout` line that used to close this
+            # test and asserted the destination had ACQUIRED the reference
+            # rows -- a promise #856 retired.
+            self.assertEqual(
+                [e for e in log if e != "SWAP"],
+                [],
+                f"rank {r}: the flip read or wrote KV rows, and #856 says it "
+                f"carries none: {log}",
+            )
 
 
 class _RecordingSeamSwap:
@@ -1665,40 +1792,89 @@ class _RecordingSeamSwap:
     def finalize_wave(self, direction, wave):
         self._log.append(("finalize", tuple(int(f) for f in wave)))
 
+    # -- #905: the WHOLE-POOL leg, which is the one the seam now takes.
+    #
+    # Since #856 the transfer plan is rebuilt EMPTY at the cutover
+    # (phase_flip_runtime.py: `build_phase_flip_transition(torch.empty(0, ...))`),
+    # so `tr.moves_nothing` is true on every flip and `_cutover` calls
+    # `swap(direction)` once instead of walking waves. A recorder without
+    # `__call__` is not a stand-in for `WavedBackingSwap` any more -- it is a
+    # `TypeError` at the seam, which is precisely how this suite failed for
+    # two days before anyone bound a scheduler to it.
+    #
+    # Models `WavedBackingSwap.__call__` leg for leg: release the SOURCE,
+    # reclaim between, restore the DESTINATION. `TestTheRecorderMatchesTheSwap`
+    # pins that against the real source, so this cannot drift.
+    def __call__(self, direction):
+        self._log.append(("swap_enter", direction))
+        self._log.append(("release_all", None))
+        self.reclaim_between(direction)
+        self._log.append(("restore_all", None))
 
-class TestWavedSeamOrdering(CustomTestCase):
-    """The waved seam's per-wave order: reclaim -> restore -> release.
 
-    #631 section 2.1b. Two DIFFERENT hazards are pinned here and they pull
-    in opposite directions, which is why both assertions have to exist:
+class TestUnwavedSeamOrdering(CustomTestCase):
+    """#905: the seam's backing order, AFTER #856 retired the wave loop.
 
-    * RESTORE BEFORE RELEASE, per wave. Under release-first a wave's
-      destination pages are committed only after its source pages are gone,
-      so the staging peak carries a full wave of drift and the seam's slope
-      is ~4.5 MiB per 1000 live slots per wave. Restore-first budgets the
-      overlap explicitly, which is what lets the wave count rise to
-      ``n_layers`` and drops the slope to ~1.1.
+    THE CONTRACT DELTA, in one sentence: this class used to pin RESTORE
+    BEFORE RELEASE, per wave; the seam now pins RELEASE BEFORE RESTORE, once,
+    for the whole pool -- and the inversion is deliberate, not a regression.
 
-    * RECLAIM AHEAD OF THE FIRST RESTORE. The restore is the allocation that
-      can fail INSIDE the no-return region; it OOM'd on metal on 2026-08-09
-      and took the instance down. Under release-first the reclaim naturally
-      sat at the memory trough. Restore-first moves the destination commit
-      to the PEAK with the source still mapped, so the reclaim must move
-      AHEAD of it rather than following it. An implementation that reorders
-      the pair to restore -> reclaim -> release re-opens that crash and
-      must fail here, not on the rig.
+    What it was (#631 section 2.1b). The move was waved so that only one
+    wave's payload was staged at a time, and within a wave the destination was
+    restored BEFORE the source was released, because release-first carried a
+    full wave of drift in the staging peak (~4.5 MiB per 1000 live slots per
+    wave, against ~1.1 restore-first). The reclaim then had to move AHEAD of
+    the first restore, because restore-first put the destination commit at the
+    memory PEAK with the source still mapped, and that commit is the
+    allocation that OOM'd inside the no-return region on 2026-08-09.
 
-    The whole-pool ``WavedBackingSwap.__call__`` path is NOT covered by this
-    and must KEEP release-first: it holds BOTH layouts for the width of the
-    swap, which is the residency the waved seam exists to remove. Its pins
-    live in ``SeamOrderingTest``
-    (test/registered/unit/managers/test_phase_flip_spill_depth_631.py).
+    What it is (#856/W28). The plan is rebuilt EMPTY, so `tr.moves_nothing` is
+    true on every flip and `_cutover` calls `swap(direction)` once instead of
+    walking waves. The whole-pool swap releases the SOURCE first, reclaims,
+    then restores the DESTINATION -- and that order is not a relaxation of the
+    old rule but the correct one for its case: with no bytes crossing there is
+    no source layer to hold live while its destination is written, so nothing
+    needs bracketing, and release-first keeps the peak at max(src, dst) where
+    the wave loop's was a wave's worth above the resting layout.
+
+    Both premises are still checked here, on the same recorder:
+      * RECLAIM AHEAD OF THE RESTORE survives verbatim. It is still the
+        allocation that can fail inside the no-return region, and reordering
+        the pair to restore -> reclaim re-opens the 2026-08-09 crash.
+      * THE DESTINATION IS RESTORED AT ALL. `finalize_wave` is what used to
+        mark the destination resident; the skip has to reach the same state
+        by another route, or the next phase's pool answers NO to
+        `backing_is_resident` and no kernel may touch it.
+
+    DELETED with this change, each because its subject no longer exists at
+    this seam rather than because it stopped passing:
+      * test_the_seam_is_waved_at_all -> inverted into
+        `test_the_seam_is_no_longer_waved_at_all` below; the fixture guard it
+        was ("a single wave makes the rest vacuous") now has the opposite
+        polarity.
+      * test_each_wave_restores_the_destination_before_releasing_the_source,
+        test_waves_do_not_interleave -- both quantify OVER WAVES, and there
+        are none. Both were passing vacuously over an empty log.
+      * test_each_block_restores_then_releases_and_the_wave_is_finalised,
+        test_blocking_shrinks_the_commit_unit,
+        test_the_streamed_seam_writes_the_same_bytes_as_the_whole_wave_one --
+        the row-blocked streaming path is reached only from inside a wave.
+        `_stream_wave` itself is still exercised by
+        `test_unsorted_rows_are_refused_rather_than_mis_sliced`, which is
+        kept because it calls the method directly.
+      * test_reordering_the_seam_changes_no_byte -- a byte comparison of a
+        seam that moves no bytes.
+
+    The whole-pool swap's own state semantics are pinned against the real
+    pool in test/registered/unit/managers/test_phase_flip_empty_wave_skip_856.py;
+    what is pinned HERE is that the RUNTIME takes that path, once, in that
+    order, on every rank.
     """
 
-    def _run_and_log(self):
-        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
-            MAP_625, VEC, 300
-        )
+    def _run_and_log(self, *, pools=None, blocks=None):
+        if pools is None:
+            pools = _make_layout_pools(MAP_625, VEC, 300)
+        _ref, live, _pp_pools, pp_views, tp_pools, tp_views = pools
         logs = {r: [] for r in range(len(VEC))}
         runtimes, _ = _build_runtimes(
             pp_views,
@@ -1706,51 +1882,87 @@ class TestWavedSeamOrdering(CustomTestCase):
             live,
             pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
         )
-        # WHOLE-WAVE ARM, PINNED EXPLICITLY. This class asserts the order of
-        # release/reclaim/restore INSIDE a whole-layer commit; the streamed
-        # path (now the default block count) emits a different, equally
-        # correct sequence, which TestStreamedSeamOrdering owns. Leaving the
-        # arm implicit made these tests silently follow the default and fail
-        # the moment it moved -- the arm under test must be stated, not
-        # inherited.
-        for rt in runtimes:
-            rt._seam_row_blocks = 1
+        if blocks is not None:
+            for rt in runtimes:
+                rt._seam_row_blocks = blocks
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
-        return logs, tp_pools, ref, live
+        return logs, tp_pools
 
-    def test_the_seam_is_waved_at_all(self):
-        """Guard on the fixture: a single wave would make the rest vacuous."""
-        logs, _tp_pools, _ref, _live = self._run_and_log()
+    def test_the_recorder_matches_the_swap_it_stands_in_for(self):
+        """The recorder is only evidence if it models the real call.
+
+        `_RecordingSeamSwap.__call__` claims to be `WavedBackingSwap.__call__`
+        leg for leg. Pinned against the shipped source, in the same style as
+        `TestTheFakePoolIsFaithful` in the #856 empty-wave suite, so this file
+        cannot quietly drift away from the thing it records.
+        """
+        import inspect
+
+        from sglang.srt.managers.phase_flip_runtime import WavedBackingSwap
+
+        src = inspect.getsource(WavedBackingSwap.__call__)
+        self.assertIn("src.release_backing()", src)
+        self.assertIn("self.reclaim_between(direction)", src)
+        self.assertIn("dst.restore_backing()", src)
+        self.assertLess(
+            src.index("src.release_backing()"),
+            src.index("dst.restore_backing()"),
+            "the real swap no longer releases the source before restoring the "
+            "destination -- this class records the wrong order",
+        )
+
+    def test_the_seam_is_no_longer_waved_at_all(self):
+        """The fixture guard, with its polarity inverted by #856.
+
+        It used to read "a single wave would make the rest vacuous". A wave of
+        ANY count now means the empty-plan skip did not engage and the seam is
+        walking a loop that packs, exchanges and writes nothing -- W27-retry
+        measured 16 such waves at ~314 ms of pure backing churn.
+        """
+        logs, _tp = self._run_and_log()
         for r, log in logs.items():
-            waves = [w for kind, w in log if kind == "restore"]
-            self.assertGreater(
-                len(waves), 1, f"rank {r}: seam ran unwaved, sequence proves nothing"
+            kinds = [k for k, _w in log]
+            self.assertEqual(
+                [k for k in kinds if k in ("restore", "release", "finalize")],
+                [],
+                f"rank {r}: the seam walked waves on a plan that moves nothing: {log}",
+            )
+            self.assertEqual(
+                kinds.count("swap_enter"),
+                1,
+                f"rank {r}: the whole-pool swap must run exactly once: {log}",
             )
 
-    def test_each_wave_restores_the_destination_before_releasing_the_source(self):
-        logs, _tp_pools, _ref, _live = self._run_and_log()
-        for r, log in logs.items():
-            seen = [e for e in log if e[0] in ("restore", "release")]
-            for i in range(0, len(seen), 2):
-                pair = seen[i : i + 2]
-                self.assertEqual(
-                    [k for k, _w in pair],
-                    ["restore", "release"],
-                    f"rank {r}: wave pair {i // 2} ran {[k for k, _w in pair]}, "
-                    f"expected restore then release -- release-first is the "
-                    f"4.5 MiB/1000-slot slope that caps the pool at ~438k "
-                    f"(#631 section 2.1b). Full sequence: {log}",
-                )
-                self.assertEqual(
-                    pair[0][1],
-                    pair[1][1],
-                    f"rank {r}: restore and release disagree about the wave; "
-                    f"the pair must be the SAME wave's layers: {log}",
-                )
+    def test_the_swap_releases_the_source_before_restoring_the_destination(self):
+        """RELEASE-FIRST, the inversion of this class's retired rule.
 
-    def test_reclaim_runs_once_and_ahead_of_the_first_restore(self):
-        logs, _tp_pools, _ref, _live = self._run_and_log()
+        Restoring first would hold BOTH layouts' pages for the width of the
+        swap, which is the residency the flip exists to remove -- and the
+        corridor floor is a CONTINUOUS minimum, so a peak lasting a few
+        milliseconds still counts against it.
+        """
+        logs, _tp = self._run_and_log()
+        for r, log in logs.items():
+            kinds = [k for k, _w in log]
+            self.assertIn("release_all", kinds, f"rank {r}: {log}")
+            self.assertIn("restore_all", kinds, f"rank {r}: {log}")
+            self.assertLess(
+                kinds.index("release_all"),
+                kinds.index("restore_all"),
+                f"rank {r}: the whole-pool swap restored the destination "
+                f"before releasing the source, so both layouts were mapped at "
+                f"once: {log}",
+            )
+
+    def test_reclaim_runs_once_and_ahead_of_the_restore(self):
+        """Carried over verbatim from the waved contract, and for the same
+        reason: the restore is the allocation that can fail INSIDE the
+        no-return region. It OOM'd on metal on 2026-08-09 and took the
+        instance down. An implementation that reorders the pair to
+        restore -> reclaim re-opens that crash and must fail here, not on
+        the rig."""
+        logs, _tp = self._run_and_log()
         for r, log in logs.items():
             kinds = [k for k, _w in log]
             self.assertEqual(
@@ -1761,153 +1973,71 @@ class TestWavedSeamOrdering(CustomTestCase):
             )
             self.assertLess(
                 kinds.index("reclaim"),
-                kinds.index("restore"),
-                f"rank {r}: the reclaim must hand pages back BEFORE the first "
-                f"destination commit -- that commit is the allocation which "
-                f"OOM'd inside the no-return region on 2026-08-09. "
-                f"Sequence: {log}",
+                kinds.index("restore_all"),
+                f"rank {r}: the reclaim must hand pages back BEFORE the "
+                f"destination commit. Sequence: {log}",
             )
 
-    def test_waves_do_not_interleave(self):
-        """Wave j's release must precede wave j+1's restore.
+    def test_the_destination_is_restored_and_not_merely_released(self):
+        """The half a skip is most likely to drop.
 
-        Otherwise two waves' destination pages are committed at once and the
-        peak is two waves wide, which silently undoes the bound that the
-        wave split exists to provide.
+        `finalize_wave` is what used to mark the destination RESIDENT again.
+        A skip that released the source and stopped there would satisfy every
+        ordering assertion above and leave the next phase's pool answering NO
+        to `backing_is_resident` -- and every caller of that property is
+        asking whether a kernel may touch the pool.
         """
-        logs, _tp_pools, _ref, _live = self._run_and_log()
+        logs, _tp = self._run_and_log()
         for r, log in logs.items():
-            order = [(k, w) for k, w in log if k in ("restore", "release")]
-            for i in range(2, len(order), 2):
-                self.assertEqual(
-                    order[i - 1][0],
-                    "release",
-                    f"rank {r}: wave {i // 2} began before the previous wave "
-                    f"released: {log}",
-                )
-
-    def test_aliased_pools_keep_release_first(self):
-        """The alias gate, asserted on ORDER rather than on bytes.
-
-        ``TestSharedArenaReadsPrecedeWrites`` covers the aliased path but
-        checks byte identity only, so if this gate were wrong it would stay
-        green wherever the corruption happened to be invisible to that
-        fixture. It is asserted directly here because the failure is not a
-        slow path or a lost optimisation: when the layouts overlay the same
-        bytes, the destination's pages ARE the source's, so restoring and
-        then releasing hands back the mapping just committed and leaves the
-        destination unbacked.
-        """
-        _ref, live, _pp_pools, pp_views, _tp_pools, tp_views = (
-            _make_aliased_layout_pools(MAP_625, VEC, 300)
-        )
-        logs = {r: [] for r in range(len(VEC))}
-        runtimes, _ = _build_runtimes(
-            pp_views,
-            tp_views,
-            live,
-            pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
-        )
-        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        self.assertEqual([e for e in exceptions if e], [])
-        for r, log in logs.items():
-            kinds = [k for k, _w in log]
             self.assertEqual(
-                kinds.count("restore"),
-                1,
-                f"rank {r}: the aliased seam must run as ONE wave: {log}",
-            )
-            self.assertLess(
-                kinds.index("release"),
-                kinds.index("restore"),
-                f"rank {r}: aliased layouts must release the source BEFORE "
-                f"restoring the destination -- they are the same pages. "
-                f"Sequence: {log}",
+                [k for k, _w in log],
+                ["swap_enter", "release_all", "reclaim", "restore_all"],
+                f"rank {r}: the whole-pool swap is release -> reclaim -> "
+                f"restore, exactly once and with no leg missing: {log}",
             )
 
-    def _run_blocked(self, blocks, seed=31):
-        ref, live, _pp, pp_views, tp_pools, tp_views = _make_layout_pools(
-            MAP_625, VEC, 300, seed=seed
-        )
-        logs = {r: [] for r in range(len(VEC))}
-        runtimes, _ = _build_runtimes(
-            pp_views,
-            tp_views,
-            live,
-            pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
-        )
-        for rt in runtimes:
-            rt._seam_row_blocks = blocks
-        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        self.assertEqual([e for e in exceptions if e], [])
-        return logs, tp_pools, ref, live
+    def test_aliased_pools_take_the_same_single_swap(self):
+        """The alias gate, restated for the unwaved seam.
 
-    def test_the_streamed_seam_writes_the_same_bytes_as_the_whole_wave_one(self):
-        """#631 2.1: blocking changes WHEN pages are mapped, never a byte.
-
-        The strongest available falsifier: the same flip, same seed, run at
-        two block counts, compared tensor by tensor. A row-blocking bug
-        that mis-slices the payload -- writing a peer's rows at the wrong
-        offset -- lands here and essentially nowhere else, because every
-        row still gets written exactly once and the counts still agree.
+        `seam_restore_first` is still computed per flip and still turned off
+        by `_pools_alias()`, but with the wave loop skipped it can no longer
+        change what happens: aliased and disjoint layouts take the identical
+        release-first path. Asserted rather than assumed, because the aliased
+        case is the one where getting it backwards hands back the mapping just
+        committed and leaves the destination unbacked.
         """
-        _l1, tp1, ref1, live1 = self._run_blocked(1)
-        _l4, tp4, ref4, live4 = self._run_blocked(4)
-        self.assertTrue(torch.equal(live1, live4))
-        ok, msg = _check_tp_layout(tp4, ref4, live4, VEC)
-        self.assertTrue(ok, f"streamed seam corrupted rows: {msg}")
-        for r, ((k1, v1), (k4, v4)) in enumerate(zip(tp1, tp4)):
-            for f in range(len(k1)):
-                self.assertTrue(
-                    torch.equal(k1[f], k4[f]),
-                    f"rank {r} layer {f}: streamed K differs from whole-wave K",
-                )
-                self.assertTrue(
-                    torch.equal(v1[f], v4[f]),
-                    f"rank {r} layer {f}: streamed V differs from whole-wave V",
-                )
-
-    def test_each_block_restores_then_releases_and_the_wave_is_finalised(self):
-        logs, _tp, _ref, _live = self._run_blocked(4)
+        aliased = _make_aliased_layout_pools(MAP_625, VEC, 300)
+        logs, _tp = self._run_and_log(pools=aliased)
         for r, log in logs.items():
-            # One segment per wave, cut at its finalize.
-            segments, cur = [], []
-            for kind, payload in log:
-                if kind == "reclaim":
-                    continue
-                cur.append(kind)
-                if kind == "finalize":
-                    segments.append(cur)
-                    cur = []
-            self.assertTrue(segments, f"rank {r}: streamed path never engaged")
-            self.assertEqual(cur, [], f"rank {r}: a wave never reached finalize: {cur}")
-            for w, seg in enumerate(segments):
-                self.assertEqual(
-                    seg,
-                    ["restore_span", "release_span"] * 4 + ["finalize"],
-                    f"rank {r} wave {w}: each block must restore then "
-                    f"release, and finalize must close the wave AFTER the "
-                    f"last block -- finalising early marks the pool "
-                    f"resident while it is still partly unbacked. Got: {seg}",
-                )
+            self.assertEqual(
+                [k for k, _w in log],
+                ["swap_enter", "release_all", "reclaim", "restore_all"],
+                f"rank {r}: aliased layouts must take the same single "
+                f"release-first swap: {log}",
+            )
 
-    def test_blocking_shrinks_the_commit_unit(self):
-        """The point of the change, asserted as a count.
+    def test_can_fail_a_seam_that_still_waved_would_be_caught(self):
+        """RED-FIRST PROOF for this class.
 
-        Four blocks must produce four commit units per wave, not one. If
-        the knob silently fell back to whole-wave commits the transient
-        would be unchanged and every other test here would still pass.
+        Every assertion above is a statement about an ABSENCE (no waves) or a
+        short fixed sequence, and both survive a fixture that never ran. So a
+        waved seam is planted directly into the recorder -- the exact
+        sequence #856 removed -- and the class's own guard must reject it.
         """
-        for blocks in (2, 4):
-            logs, _tp, _ref, _live = self._run_blocked(blocks)
-            for r, log in logs.items():
-                restores = [k for k, _w in log if k == "restore_span"]
-                waves = [k for k, _w in log if k == "finalize"]
-                self.assertEqual(
-                    len(restores),
-                    blocks * len(waves),
-                    f"rank {r}: expected {blocks} commit units per wave",
-                )
+        log = []
+        swap = _RecordingSeamSwap(log)
+        for wave in ((0,), (1,)):
+            swap.restore_wave(PP_TO_TP, wave)
+            swap.release_wave(PP_TO_TP, wave)
+            swap.finalize_wave(PP_TO_TP, wave)
+        kinds = [k for k, _w in log]
+        self.assertNotEqual(
+            [k for k in kinds if k in ("restore", "release", "finalize")],
+            [],
+            "the guard in test_the_seam_is_no_longer_waved_at_all cannot see "
+            "a waved seam, so its green means nothing",
+        )
+        self.assertEqual(kinds.count("swap_enter"), 0)
 
     def test_unsorted_rows_are_refused_rather_than_mis_sliced(self):
         """The can-fail proof for the ascending-rows assumption.
@@ -1916,6 +2046,11 @@ class TestWavedSeamOrdering(CustomTestCase):
         because the plan enumerates slots ascending. If that ever changes,
         the slice would pair the wrong payload with the wrong rows -- a
         silent KV corruption. It must raise instead.
+
+        #905: kept while its siblings went, because it calls `_stream_wave`
+        DIRECTLY. The streaming path is no longer reachable through the
+        cutover (the plan is empty), but the method still exists and is still
+        the one that would mis-slice.
         """
         rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
         rows = torch.tensor([5, 1, 9], dtype=torch.int64)
@@ -1932,17 +2067,6 @@ class TestWavedSeamOrdering(CustomTestCase):
                 [(0, rows, data)],
                 4,
             )
-
-    def test_reordering_the_seam_changes_no_byte(self):
-        """Byte identity is the net under the whole reorder.
-
-        Restore-first changes WHEN physical pages are mapped, never which
-        bytes are read or written, so the flip's output must be unchanged.
-        """
-        logs, tp_pools, ref, live = self._run_and_log()
-        self.assertTrue(all(logs.values()))
-        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
-        self.assertTrue(ok, f"the reordered seam corrupted rows: {msg}")
 
 
 # -- #631 section 2.1 PREREQUISITES (successor 27) ---------------------------

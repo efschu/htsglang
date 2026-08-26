@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+from seam_census_double import bind_census_schedulers  # noqa: E402 (sibling)
 from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
     _BarrierMinChannel,
     _MailboxExchange,
@@ -286,7 +287,15 @@ class _PublishedArgsPatch:
             self.saved = None
         self.overrides = []
         stub = SimpleNamespace(
-            override=lambda reason, **kw: self.overrides.append((reason, kw))
+            override=lambda reason, **kw: self.overrides.append((reason, kw)),
+            # #905: since #856 the cutover retracts its residents, and
+            # `release_kv_cache` reads these three off the PUBLISHED args
+            # rather than off the ones it is handed. A stub that carries only
+            # `override` no longer models what the seam reads.
+            page_size=1,
+            speculative_algorithm=None,
+            strip_thinking_cache=False,
+            disaggregation_mode="null",
         )
         get_context().set_server_args(stub)
         return self
@@ -604,6 +613,11 @@ class TestPin4SchedulerLevelReplay(CustomTestCase):
                         sched.phase_flip_stacks.refill,
                     ),
                 )
+                # #905: since #856 the cutover refuses without a census
+                # scheduler that can retract its residents and drop its tree.
+                # `_StubScheduler` models the ABORT ROUTER, not the census
+                # surface, so the faithful double supplies the latter.
+                bind_census_schedulers([sched.phase_flip_runtime])
 
             errors = [None] * n
 
