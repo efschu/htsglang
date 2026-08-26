@@ -7,25 +7,17 @@ IndexError or a silent wrong-layer write -- but it is not the answer: its own
 counter comment says a layout refusal means "every flip loses its prefixes".
 This module is the first of the three axes that answer has to cross.
 
-#875 RETRACTION, AT THE TOP BECAUSE IT CHANGES WHAT THIS MODULE IS FOR. This
-file was written on the claim that the seam refusal's KV-head leg was false --
-that both phases carry the full replicated kv-heads, so the entries are
-interchangeable. THAT CLAIM WAS WRONG and it shipped for one commit.
+#875 -- THE HEAD AXIS, SETTLED AFTER TWO WRONG JUDGEMENTS OF MINE. I deleted the
+refusal's head leg, restored it, and deleted it again. Final measurement: BOTH
+phases hold 4 kv-heads per layer, so the head axis needs NO remap.
 
-`_pool_kv_head_num` returns the replicated total only when
-`uneven_dcp_kv_replicated(dcp_size)` holds, and that is
-`dcp_size > 1 AND get_tp_partition_ratios() is not None` -- it needs a
-`--rank-tp-ratio` base plan. This rig boots `rank_tp_ratio=None`, so the branch
-is not taken. With `num_key_value_heads = 4` and `max(1, 4 // tp)`: PP holds 4
-heads per layer, TP holds 1. A factor of four. I had cited the boot line at
-model_runner_kv_cache_mixin.py:3228 as evidence; it appears ZERO times in that
-boot. I read a branch, treated its existence as reachability, and did not check
-the predicate's inputs.
-
-SO THE HEAD AXIS IS A REAL REMAP, and this module covers the layer axis only --
-one of THREE, not one of two. That makes the standing DO-NOT-BUILD verdict
-stronger, not weaker: the carry would need a layer union, a head remap and a
-token remap, and only the first is written here.
+The restoration was wrong because `uneven_dcp_kv_replicated`'s docstring names
+`--rank-tp-ratio` while the process state it reads has a SECOND installer: the
+flip installs its own vector (`phase_flip_tp_vector`, '32,16,16' here) at
+phase_flip_boot.py:1428, before the TP worker is built at :1473. So at TP-pool
+build time the predicate is TRUE, the #345 exception is taken, and the pool holds
+the full 4 heads -- while PP, built earlier with ratios still None, holds
+`max(1, 4 // 1)` = 4 as well. Same width, interchangeable entries.
 
 THREE AXES, AND ONLY ONE OF THEM IS HERE:
 
@@ -33,10 +25,8 @@ THREE AXES, AND ONLY ONE OF THEM IS HERE:
              `pp_attn_stage_ratio`), TP is complete (16). This module. The
              remap is exact once entries are labelled by GLOBAL layer id, which
              is what `CpuCopyLayout.start_layer` already records.
-  2. HEAD    NOT the same in both phases: PP 4 kv-heads per layer, TP 1
-             (`max(1, 4 // attn_tp_size)`). A real remap, and a lossy one in
-             the PP->TP direction is not even well defined -- see the
-             retraction above.
+  2. HEAD    4 kv-heads per layer in BOTH phases. NO remap needed -- see the
+             measurement above, and note it took three judgements to settle.
   3. TOKEN   PP holds every token at allocator slots; TP holds an owner-rule
              SUBSET at compacted rows, `(L // cp_S) * cp_ratio + (L % cp_S -
              cp_lo)` (layers/dcp/owner.py:159). A second remap, also not

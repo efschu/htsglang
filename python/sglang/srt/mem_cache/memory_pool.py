@@ -683,27 +683,40 @@ def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) 
     the wrong-layer write, i.e. converts the loud direction into the quiet one.
     It is the one fix shape that makes the defect harder to find.
 
-    REFUSAL, NEVER A CLAMP. Both legs stand, and the head leg was WRONGLY
-    RETRACTED once -- by me, in #875 -- so it is restated here with the
-    arithmetic attached so nobody repeats the mistake.
+    REFUSAL, NEVER A CLAMP. ONE leg stands, and the head leg has now been
+    wrong TWICE -- deleted, restored, deleted again. The measurement is recorded
+    here so it is not litigated a fourth time.
 
-    THE HEAD LEG IS TRUE ON THIS RIG. PP and TP do NOT hold the same head width.
-    `_pool_kv_head_num` (model_runner_kv_cache_mixin.py:3176-3183) returns the
-    REPLICATED total only when `uneven_dcp_kv_replicated(dcp_size)` holds, and
-    that predicate is `dcp_size > 1 AND get_tp_partition_ratios() is not None`
-    (distributed/utils.py:471-479) -- i.e. it needs a `--rank-tp-ratio` base
-    plan. This rig boots `rank_tp_ratio=None`, so the branch is NOT taken and
-    the pool falls through to `get_num_kv_heads(attn_tp_size)`. With
-    `num_key_value_heads = 4` and `max(1, 4 // tp)`
-    (configs/model_config.py:1370): PP (attn_tp_size 1) holds 4 heads, TP
-    (attn_tp_size 3) holds 1. A factor of four. The entries are NOT
-    interchangeable.
+    THE HEAD LEG IS FALSE ON THIS RIG. Both phases hold 4 kv-heads per layer.
+    The chain, verified at the code:
+      * `parse_flip_vector` (phase_flip_boot.py:254) reads
+        `server_args.phase_flip_tp_vector` -- NOT `--rank-tp-ratio`. This boot:
+        '32,16,16'.
+      * `set_tp_partition_ratios(list(vec))` runs at phase_flip_boot.py:1428,
+        and the TP `TpModelWorker` is constructed at :1473 -- AFTER. Nothing
+        between them clears it.
+      * so at TP-pool build time `get_tp_partition_ratios()` returns [32,16,16],
+        not None; with dcp_size 3 `uneven_dcp_kv_replicated` is TRUE, the #345
+        exception is taken, and `_pool_kv_head_num` returns
+        `get_total_num_kv_heads()` = 4.
+      * PP builds earlier, when the only installer that has run is
+        scheduler.py:12223 with `rank_tp_ratio=None` -- so ratios ARE None
+        there, and `max(1, 4 // 1)` = 4.
+      * the `#274` overlay that `get_tp_partition_ratios` consults FIRST is
+        written only by the dual-group lane's scoped context manager
+        (distributed/utils.py:207); `dual_group_lane=False` here, so that layer
+        is inert and cannot shadow the installed plan.
 
-    HOW THE RETRACTION HAPPENED, because the shape recurs: I read the
-    replication BRANCH, treated its existence as reachability, and cited the log
-    line at :3228 as evidence -- a line that appears ZERO times in the boot it
-    was cited from. Existence is not reachability. Check
-    `uneven_dcp_kv_replicated`'s inputs before believing that branch again.
+    WHY I GOT IT WRONG THE SECOND TIME. The predicate's own docstring says "a
+    `--rank-tp-ratio` base plan is installed" -- it names a FLAG for a PROCESS
+    state that has TWO installers, and the flip's own vector is the other one.
+    Reading the docstring is enough to reach the wrong conclusion, which is why
+    the root fix belongs on the docstring and not here.
+
+    RESIDUAL, stated rather than hidden: the chain above is closed by CODE ORDER
+    (1428 < 1473), not by a log line printing the ratios at pool-build time. A
+    failed install between those points would go undetected. No path to one is
+    known.
 
     THE LAYER LEG is narrower than it sounds but stands: a remap needs every
     layer the destination holds, and RANK-LOCALLY under PP it cannot have them
