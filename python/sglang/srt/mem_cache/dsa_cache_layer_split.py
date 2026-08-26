@@ -452,14 +452,21 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # #876: bound the implicit gather temporary; see
+        # memory_pool.inplace_move_ranges for which chunk orders are safe.
+        from sglang.srt.mem_cache.memory_pool import inplace_move_ranges
+
+        ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
         for kv_cache in self.kv_buffer:
             if kv_cache.shape[0] == 0:
                 continue
-            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+            for lo, hi in ranges:
+                kv_cache[tgt_loc_flat[lo:hi]] = kv_cache[src_loc_flat[lo:hi]]
         for index_k in self.index_k_with_scale_buffer:
             if index_k.shape[0] == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            for lo, hi in ranges:
+                index_k[tgt_loc_flat[lo:hi]] = index_k[src_loc_flat[lo:hi]]
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 

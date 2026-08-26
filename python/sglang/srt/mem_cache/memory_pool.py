@@ -3461,9 +3461,7 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
-        check_cpu_copy_rows(
-            indices, int(self.k_buffer[0].shape[0]), "offload", "row"
-        )
+        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "offload", "row")
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -3490,9 +3488,7 @@ class MHATokenToKVPool(KVCache):
         # copy; the loop below is sized by this one. Across a phase flip they are
         # different pools with different layer counts.
         check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
-        check_cpu_copy_rows(
-            indices, int(self.k_buffer[0].shape[0]), "restore", "row"
-        )
+        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "restore", "row")
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -3756,11 +3752,18 @@ class MHATokenToKVPool(KVCache):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
         if self.use_hnd:
-            pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size
-            pages_s, offs_s = src_loc // self.page_size, src_loc % self.page_size
+            # #876: bound the implicit gather temporary; see inplace_move_ranges.
+            # The ordering analysis runs on the TOKEN ids, before the page split,
+            # because that is the axis the overlap lives on.
+            tgt_flat, src_flat = tgt_loc.view(-1).long(), src_loc.view(-1).long()
+            ranges = list(inplace_move_ranges(tgt_flat, src_flat))
             for kb, vb in zip(self.k_buffer, self.v_buffer):
-                kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
-                vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+                for lo, hi in ranges:
+                    t, s = tgt_flat[lo:hi], src_flat[lo:hi]
+                    pt, ot = t // self.page_size, t % self.page_size
+                    ps, os_ = s // self.page_size, s % self.page_size
+                    kb[pt, :, ot, :] = kb[ps, :, os_, :]
+                    vb[pt, :, ot, :] = vb[ps, :, os_, :]
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
@@ -4889,8 +4892,11 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # #876: bound the implicit gather temporary; see inplace_move_ranges.
+        ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
         for kv_cache in self.kv_buffer:
-            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+            for lo, hi in ranges:
+                kv_cache[tgt_loc_flat[lo:hi]] = kv_cache[src_loc_flat[lo:hi]]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
@@ -5166,8 +5172,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # #876: bound the implicit gather temporary; see inplace_move_ranges.
+        ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
         for index_k in self.index_k_with_scale_buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            for lo, hi in ranges:
+                index_k[tgt_loc_flat[lo:hi]] = index_k[src_loc_flat[lo:hi]]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -5313,6 +5322,89 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+#: #876: the widest advanced-index gather an in-place row move may perform in one
+#: expression. NOT A SECOND CONSTANT -- it is the `num_locs_upper` that
+#: `_move_kv_cache_impl` (:3798) already chunks its bounded Triton path at, for
+#: this same reason. Two numbers for one question is how they drift apart.
+INPLACE_MOVE_MAX_ROWS = 256
+
+_INPLACE_MOVE_UNORDERED_WARNED = False
+
+
+def inplace_move_ranges(tgt_flat: torch.Tensor, src_flat: torch.Tensor):
+    """Chunk an in-place row move so its implicit temporary stays bounded.
+
+    THE ALLOCATION NOBODY WROTE DOWN. `buf[tgt] = buf[src]` is correct under
+    arbitrary overlap only because torch evaluates the right-hand side into a
+    temporary before scattering. That temporary is `N x row_bytes`, N is the
+    caller's, and no call site, budget or ledger names it.
+
+    CHUNKING IS NOT UNCONDITIONALLY SAFE, which is the whole difficulty and the
+    reason this is a function rather than a loop inlined at six sites. Splitting
+    the statement makes earlier writes visible to later reads, so a later
+    chunk's source may already have been overwritten. Which orders are safe was
+    established by construction and then measured:
+
+        disjoint tgt/src          -> any order
+        monotone, all tgt <= src  -> ASCENDING  (proven safe; descending is not)
+        monotone, all tgt >= src  -> DESCENDING (ascending is BROKEN -- measured)
+        anything else             -> one gather, i.e. today's behaviour
+
+    Both production callers are the monotone-leftward case (the accept
+    compaction slides a request's rows down), so they chunk. A general
+    permutation -- every destination some other source -- cannot be chunked at
+    all without a staging buffer, and for that case this returns the single
+    full-width range rather than risking silent KV corruption. Wrong KV is worse
+    than a large allocation, and this function refuses to trade the first for
+    the second.
+
+    Yields ``(start, end)`` index ranges; the caller applies its own assignment
+    over ``tgt_flat[start:end]`` / ``src_flat[start:end]``.
+    """
+    n = int(tgt_flat.numel())
+    cap = INPLACE_MOVE_MAX_ROWS
+    if n <= cap:
+        yield (0, n)
+        return
+    try:
+        t_lo, t_hi = int(tgt_flat.min()), int(tgt_flat.max())
+        s_lo, s_hi = int(src_flat.min()), int(src_flat.max())
+        disjoint = t_hi < s_lo or s_hi < t_lo
+        ascending = bool(torch.all(tgt_flat[1:] >= tgt_flat[:-1])) and bool(
+            torch.all(src_flat[1:] >= src_flat[:-1])
+        )
+        leftward = ascending and bool(torch.all(tgt_flat <= src_flat))
+        rightward = ascending and bool(torch.all(tgt_flat >= src_flat))
+    except Exception:  # noqa: BLE001 - never let the analysis break a move
+        yield (0, n)
+        return
+
+    if disjoint or leftward:
+        for s in range(0, n, cap):
+            yield (s, min(s + cap, n))
+        return
+    if rightward:
+        for s in range(((n - 1) // cap) * cap, -1, -cap):
+            yield (s, min(s + cap, n))
+        return
+
+    # Unchunkable. Say so ONCE: this is the branch where the unnamed allocation
+    # is still full-width, and it must be visible rather than inferred.
+    global _INPLACE_MOVE_UNORDERED_WARNED
+    if not _INPLACE_MOVE_UNORDERED_WARNED:
+        _INPLACE_MOVE_UNORDERED_WARNED = True
+        logger.warning(
+            "#876 in-place KV move of %d rows is neither disjoint nor monotone, "
+            "so it cannot be chunked without a staging buffer. Falling back to "
+            "one gather, which allocates a temporary %d rows wide. Correct, but "
+            "unbounded: if this fires, a caller is doing a general permutation "
+            "and the bound has to move to that caller.",
+            n,
+            n,
+        )
+    yield (0, n)
+
+
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
     v_buffer: List[torch.Tensor],
@@ -5335,22 +5427,29 @@ def move_kv_cache_native(
 
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
+    # #876: the ranges are computed ONCE from the token ids and reused for every
+    # layer. The safety analysis is a property of the index vectors, not of the
+    # buffer, so re-deriving it per layer would pay an O(N) scan `layer_num`
+    # times for the same answer.
+    ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
     for k_cache, v_cache in zip(k_buffer, v_buffer):
-        if k_cache.ndim == 4:
-            if page_size == 1:
-                # Degenerate (num_pages, 1, head, dim): token id == page id.
-                k_cache[tgt_loc_flat, 0] = k_cache[src_loc_flat, 0]
-                v_cache[tgt_loc_flat, 0] = v_cache[src_loc_flat, 0]
+        for lo, hi in ranges:
+            t, s = tgt_loc_flat[lo:hi], src_loc_flat[lo:hi]
+            if k_cache.ndim == 4:
+                if page_size == 1:
+                    # Degenerate (num_pages, 1, head, dim): token id == page id.
+                    k_cache[t, 0] = k_cache[s, 0]
+                    v_cache[t, 0] = v_cache[s, 0]
+                else:
+                    k_cache[t // page_size, t % page_size] = k_cache[
+                        s // page_size, s % page_size
+                    ]
+                    v_cache[t // page_size, t % page_size] = v_cache[
+                        s // page_size, s % page_size
+                    ]
             else:
-                tgt_page = tgt_loc_flat // page_size
-                tgt_tok = tgt_loc_flat % page_size
-                src_page = src_loc_flat // page_size
-                src_tok = src_loc_flat % page_size
-                k_cache[tgt_page, tgt_tok] = k_cache[src_page, src_tok]
-                v_cache[tgt_page, tgt_tok] = v_cache[src_page, src_tok]
-        else:
-            k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
-            v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+                k_cache[t] = k_cache[s]
+                v_cache[t] = v_cache[s]
 
 
 @triton.jit
