@@ -79,6 +79,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.mem_cache import seam_layer_carry
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1161,9 +1162,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        assert not self.kv_committed_freed, (
+            f"Committed KV cache already freed ({self.kv_committed_len=})"
+        )
         self.kv_committed_freed = True
         return self._cache_commit_len()
 
@@ -1173,9 +1174,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        assert not self.kv_overallocated_freed, (
+            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        )
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
@@ -2023,12 +2024,20 @@ def release_req(
 # extent refusal says a request grew across the seam; a layout refusal says the
 # seam carry is structurally impossible in that direction, i.e. every flip loses
 # its prefixes. One number for both would let the second hide inside the first.
+# #875d: `carried` is the layout drift that was ANSWERED rather than refused --
+# a copy whose global layers cover the destination's, re-selected onto them
+# rank-locally. It is counted apart from `restored` for the reason `refused` and
+# `refused_layout` are counted apart: folded into `restored` it would be
+# indistinguishable from a same-layout restore, and the one thing an operator
+# needs to read off these numbers is which flips keep their prefixes and by
+# which route. `carried + refused_layout` is every flip that crossed a geometry.
 _SEAM_STATE_COUNTS = {
     "copied": 0,
     "declined": 0,
     "restored": 0,
     "refused": 0,
     "refused_layout": 0,
+    "carried": 0,
 }
 
 
@@ -2136,18 +2145,21 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         req.mamba_state_cpu_layout = None
         return False
 
-    # #875: THIS REFUSAL IS A NON-ANSWER AND IS KNOWN TO BE ONE. The counter
-    # comment above says what it costs -- a layout refusal means every flip in
-    # that direction loses its prefixes. The carry that would replace it needs
-    # TWO collectives, and only one of them is built: `seam_layer_carry.py`
-    # settles the LAYER axis (a PP stage's copy is restorable into a TP pool
-    # once the three stages' copies are unioned, and back again, proven both
-    # directions). The TOKEN axis is not settled: PP holds every token at
-    # allocator slots while TP holds an owner-rule SUBSET at compacted rows
-    # (layers/dcp/owner.py:159). Wiring a layer-correct token-wrong carry here
-    # would produce matching row ids at mismatched widths -- the shape #719
-    # already walked into once. So this stays until that axis is answered, and
-    # it stays as the FALLBACK for whatever the carry does not cover.
+    # #875: THIS REFUSAL WAS A NON-ANSWER FOR BOTH DIRECTIONS AND IS NOW THE
+    # ANSWER FOR ONE. The counter comment above says what it costs -- a layout
+    # refusal means every flip in that direction loses its prefixes. #875d
+    # splits the two directions apart (see the carry attempt below):
+    #   * the copy is MISSING layers (PP stage -> TP pool): they are on a peer,
+    #     the exchange is an all-to-all in the cutover's no-return region, and
+    #     #875 measured it against the recompute it saves and returned DO NOT
+    #     BUILD. This refusal is the answer there, and it names the layers.
+    #   * the copy is a SUPERSET (TP -> PP stage): nothing is missing and the
+    #     answer is a rank-local slice. Carried, not refused.
+    # The TOKEN axis (PP at allocator slots, TP under the owner rule,
+    # layers/dcp/owner.py:159) is untouched by either: the carry moves nothing
+    # on the row axis, so it cannot produce the "matching row ids at mismatched
+    # widths" shape #719 walked into. The extent contract above still owns that
+    # axis and still runs first.
     #
     # #861c: the SECOND axis, and the one W40 died on. The extent check above
     # compares ROW counts; a phase flip does not change those, so it passed and
@@ -2183,6 +2195,75 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         and saved_mamba_layout != live_mamba_layout
     )
     if kv_drifted or mamba_drifted:
+        # #875d: TRY THE CARRY BEFORE PAYING THE RECOMPUTE. Drift is not one
+        # situation, it is two, and only one of them is unanswerable here.
+        #
+        #   the copy is MISSING layers (PP stage -> TP pool). They are on a
+        #   peer. Completing this needs an all-to-all inside the cutover's
+        #   no-return region, measured and refused (#875, DO NOT BUILD). The
+        #   refusal below is the answer, and it now names the layers.
+        #
+        #   the copy has a SUPERSET (TP -> PP stage). Nothing is missing; the
+        #   destination's layers are all in hand and the answer is a rank-local
+        #   SLICE -- no group, no peer, no cutover cost. This was ALSO the
+        #   silent arm: the pool loop runs fewer iterations and writes global
+        #   0..7 into global 8..15 with no crash and no log. So the direction
+        #   nobody could see was the one that never needed a collective.
+        #
+        # The attempt is confined to `seam_layer_carry`, which acts only on
+        # layouts it can identify BY TYPE and payload shapes it can NAME.
+        # Anything else raises and lands on the refusal below, unchanged -- the
+        # opaque layouts #861c's contract test passes here on purpose included.
+        carry_refusal = None
+        try:
+            carried_kv = (
+                seam_layer_carry.carry_payload(
+                    saved_layout, live_layout, req.kv_cache_cpu
+                )
+                if kv_drifted
+                else None
+            )
+            carried_mamba = (
+                seam_layer_carry.carry_payload(
+                    saved_mamba_layout, live_mamba_layout, req.mamba_state_cpu
+                )
+                if mamba_drifted
+                else None
+            )
+        except seam_layer_carry.SeamCarryError as exc:
+            carry_refusal = str(exc)
+        else:
+            # BOTH HALVES OR NEITHER, and the assignment happens only after both
+            # have been built. A carry that wrote the KV half and then refused
+            # the mamba half would leave the request holding attention state
+            # from one geometry and GDN state from another -- the partial
+            # restore this whole path exists to forbid.
+            if kv_drifted:
+                req.kv_cache_cpu = carried_kv
+                req.kv_cache_cpu_layout = live_layout
+            if mamba_drifted:
+                req.mamba_state_cpu = carried_mamba
+                req.mamba_state_cpu_layout = live_mamba_layout
+            _SEAM_STATE_COUNTS["carried"] += 1
+            n = _SEAM_STATE_COUNTS["carried"]
+            if n <= 5 or n % 50 == 0:
+                logger.info(
+                    "%s SEAM RESTORE CARRIED rid=%s: the copy was taken from %s "
+                    "and this pool is %s (mamba: %s -> %s). The copy covers "
+                    "every global layer this pool holds, so it is re-selected "
+                    "onto them rank-locally -- no collective, no peer. These "
+                    "tokens are NOT recomputed. occurrence=%d",
+                    SEAM_STATE_PREFIX,
+                    getattr(req, "rid", None),
+                    saved_layout,
+                    live_layout,
+                    saved_mamba_layout,
+                    live_mamba_layout,
+                    n,
+                )
+            kv_drifted = mamba_drifted = False
+
+    if kv_drifted or mamba_drifted:
         _SEAM_STATE_COUNTS["refused_layout"] += 1
         n = _SEAM_STATE_COUNTS["refused_layout"]
         logger.warning(
@@ -2190,13 +2271,15 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
             "%s and this pool is %s (mamba: %s -> %s). Applying it would index "
             "past the saved per-layer list (the W40 IndexError) or write the "
             "copy's layers into the wrong global layers -- a wrong answer with "
-            "no crash. Dropped; these tokens are recomputed. occurrence=%d",
+            "no crash. No rank-local carry was available either: %s Dropped; "
+            "these tokens are recomputed. occurrence=%d",
             SEAM_STATE_PREFIX,
             getattr(req, "rid", None),
             saved_layout,
             live_layout,
             saved_mamba_layout,
             live_mamba_layout,
+            carry_refusal,
             n,
         )
         req.kv_cache_cpu = None
@@ -2637,9 +2720,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []

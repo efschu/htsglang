@@ -637,13 +637,42 @@ class CpuCopyLayout(NamedTuple):
     is blind to a layout change that preserves it -- two PP stages of the same
     size, or a permuted stage ratio. `kind` separates the axes so a KV layout
     can never compare equal to a mamba one.
+
+    #875d: `layer_ids` IS FOR THE POOLS WHOSE LAYERS ARE NOT A RANGE. Every
+    `KVCache` holds `start_layer .. start_layer + layer_num - 1` and leaves this
+    None, comparing exactly as it did before. `MambaPool` does not: in a hybrid
+    checkpoint its layers are a SUBSET of the global numbering (0, 4, 8, ... on
+    this rig's GDN interleave), so `start_layer + i` is not the id of local slot
+    i and reading it that way is the wrong-layer write with extra steps.
+
+    The field is optional rather than mandatory because a pool that cannot name
+    its ids must keep saying so. `None` means "the range arithmetic is the whole
+    truth", not "unknown" -- `layer_num`/`start_layer` are always populated.
     """
 
     kind: str
     layer_num: int
     start_layer: int
+    layer_ids: Optional[Tuple[int, ...]] = None
+
+    def global_layers(self) -> Tuple[int, ...]:
+        """The GLOBAL layer ids this geometry holds, in LOCAL slot order.
+
+        One place, so the range case and the id-list case cannot answer the same
+        question differently -- which is the drift that produced the defect this
+        field exists to close.
+        """
+        if self.layer_ids is not None:
+            return tuple(int(g) for g in self.layer_ids)
+        return tuple(
+            range(int(self.start_layer), int(self.start_layer) + int(self.layer_num))
+        )
 
     def describe(self) -> str:
+        if self.layer_ids is not None:
+            shown = ", ".join(str(int(g)) for g in self.layer_ids[:8])
+            more = "" if len(self.layer_ids) <= 8 else ", ..."
+            return f"{self.kind}[{self.layer_num} layer(s), global {shown}{more}]"
         return (
             f"{self.kind}[{self.layer_num} layer(s), global "
             f"{self.start_layer}..{self.start_layer + self.layer_num - 1}]"
@@ -818,6 +847,18 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        # #875d: KEEP THE IDENTITY, NOT ONLY ITS LENGTH. This constructor was
+        # handed the GLOBAL layer ids and reduced them to a count on the next
+        # line, so `cpu_copy_layout` had nothing to answer with and defaulted
+        # `start_layer` to 0 for every stage. Two consequences, and the second
+        # is a defect that predates the carry: a stage's copy could not be
+        # placed on the layers it actually holds, AND two stages of EQUAL SIZE
+        # at different offsets compared EQUAL, so #861c's drift check passed
+        # them and the wrong-layer write happened with the guard green.
+        #
+        # A TUPLE, not the caller's list: the identity must not change under a
+        # pool that has already declared it.
+        self.mamba_layer_ids = tuple(int(x) for x in mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -843,9 +884,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -1388,11 +1429,30 @@ class MambaPool:
         so the attribute is read with a default HERE rather than assumed to
         exist. The `kind` tag keeps this from ever comparing equal to a KV
         layout even when both counts coincide.
+
+        #875d: AND `start_layer` ON ITS OWN WAS ALWAYS THAT DEFAULT. Nothing in
+        this tree assigns `MambaPool.start_layer` -- the `getattr` above had no
+        setter to find, so EVERY stage declared itself to start at global 0.
+        Two stages of the same size therefore compared EQUAL and #861c's drift
+        check passed a copy straight into the wrong global layers with no
+        crash, which is the failure mode that guard exists for.
+        `mamba_layer_ids` is the identity the constructor is handed, and it is
+        an ID LIST rather than an offset because these layers are a SUBSET of
+        the global numbering: `start_layer + i` is not the id of local slot i.
+
+        Read with a default for the same reason as `start_layer`: a stand-in or
+        a partially wired pool must still be able to answer, and `None` means
+        "the range arithmetic is the whole truth" rather than "unknown".
         """
+        ids = getattr(self, "mamba_layer_ids", None)
+        ids = tuple(int(x) for x in ids) if ids is not None else None
         return CpuCopyLayout(
             kind="mamba",
             layer_num=len(self.mamba_cache.conv),
-            start_layer=int(getattr(self, "start_layer", 0) or 0),
+            start_layer=int(ids[0])
+            if ids
+            else int(getattr(self, "start_layer", 0) or 0),
+            layer_ids=ids,
         )
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
@@ -1873,13 +1933,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         return None
                     fresh_pingpong_reqs.append(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -2104,7 +2164,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -2655,7 +2717,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -3504,9 +3568,7 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
-        check_cpu_copy_rows(
-            indices, int(self.k_buffer[0].shape[0]), "offload", "row"
-        )
+        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "offload", "row")
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -3533,9 +3595,7 @@ class MHATokenToKVPool(KVCache):
         # copy; the loop below is sized by this one. Across a phase flip they are
         # different pools with different layer counts.
         check_cpu_copy_layers(len(kv_cache_cpu), self.layer_num, "restore", "layer")
-        check_cpu_copy_rows(
-            indices, int(self.k_buffer[0].shape[0]), "restore", "row"
-        )
+        check_cpu_copy_rows(indices, int(self.k_buffer[0].shape[0]), "restore", "row")
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -3820,9 +3880,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -5155,13 +5215,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         self._create_index_buffers()
