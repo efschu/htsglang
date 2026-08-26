@@ -189,6 +189,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.log_cycle_collapse import CycleCollapse
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
+    narrowed_min_free_slots_warning,
     resolve_min_free_slots,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1673,6 +1674,20 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
+        # #894 S4: the resolver caps an explicit value to the DFlash formula
+        # and, below the pool floor, drops it entirely -- and the drop leaves
+        # NO admission gate at all. Both were silent, and the deciding number
+        # (`self.max_running_requests`) is post-#287, i.e. whatever the KV
+        # resolver left, not what the operator wrote. Say so on the rank it
+        # happened on. `narrowed_min_free_slots_warning` explains why this
+        # warns instead of refusing.
+        narrowed = narrowed_min_free_slots_warning(
+            self.server_args.min_free_slots_delay,
+            self.max_running_requests,
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
+        )
+        if narrowed:
+            logger.warning("%s", narrowed)
         if not get_server_args().pp_max_micro_batch_size:
             get_server_args().override(
                 "scheduler.pp_max_micro_batch_size_default",

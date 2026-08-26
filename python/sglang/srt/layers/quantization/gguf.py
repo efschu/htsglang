@@ -559,6 +559,11 @@ _TALL_RATIO = 0.8
 _dev_cap_by_dev: dict = {}
 _mmq_threshold_cached: Optional[bool] = None
 _mmq_threshold_logged: bool = False
+#: #894 S5: one line per process when the env override -- not the CLI flag --
+#: decided the threshold. Separate from `_mmq_threshold_logged`, which fires on
+#: the first actual reroute and therefore never fires for the configuration
+#: this warning is about.
+_mmq_env_override_logged: bool = False
 
 # Decode token-count buckets, registered by the decode CUDA-graph runner(s):
 # bs * num_tokens_per_bs for every captured bs. Target and draft runners both
@@ -592,9 +597,96 @@ def _decode_bucket_for(m: int) -> int:
 def _reset_mmq_threshold_cache() -> None:
     """Test hook: drop the cached enable decision (and registered buckets)."""
     global _mmq_threshold_cached, _decode_token_buckets, _mmq_threshold_logged
+    global _mmq_env_override_logged
     _mmq_threshold_cached = None
     _decode_token_buckets = ()
     _mmq_threshold_logged = False
+    # #894: the override announcement is latched to the same lifetime as the
+    # decision it describes. A hook that cleared one but not the other would
+    # leave the second decision silent again.
+    _mmq_env_override_logged = False
+
+
+def _announce_mmq_env_override(env: str, enabled: bool) -> None:
+    """Say that the env var, not the CLI flag, decided this (#894 S5).
+
+    THE DEFECT THIS EXISTS TO END. ``_mmq_decode_threshold_enabled``
+    short-circuits on the PRESENCE of ``SGLANG_GGUF_MMQ_DECODE_THRESHOLD``, so
+    a stale ``=0`` from an old A/B run beat ``--gguf-mmq-decode-threshold``
+    without consulting it. The only log on the whole path fires when a reroute
+    HAPPENS, so the losing configuration produced zero reroutes and therefore
+    zero output: flag on, nothing rerouted, nothing said. That is #889's shape
+    in a different module.
+
+    WARNING, NOT REFUSAL, decided on the danger direction:
+
+    * This is the GGUF matmul dispatch, reached on the first quantized matmul
+      of a forward pass -- not a parse-time gate. Raising here does not refuse a
+      configuration, it kills a model mid-forward, on precisely the processes
+      that carry a stale env var.
+    * The defect's blast radius is a wrong belief about which kernel ran (and a
+      measurement filed under the wrong arm). A refusal's is the instance.
+    * Nor may the precedence be flipped to "flag wins". The env override is
+      documented in the flag's own help text ("wins over this flag") and exists
+      so an A/B run can change the kernel choice without re-parsing ServerArgs.
+      MMVQ and MMQ are not bit-identical, so quietly moving that selection as a
+      side effect of a logging fix would be a bigger change than the one being
+      fixed. State the truth; do not change it.
+
+    Both spellings of the failure are covered: a value that DISAGREES with the
+    flag, and a value that is not ``0`` or ``1`` at all (``env == "1"`` reads
+    ``"true"`` as OFF, which was the second silence in the same three lines).
+    """
+    global _mmq_env_override_logged
+    if _mmq_env_override_logged:
+        return
+    recognised = env in ("0", "1")
+    flag = None
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        flag = bool(getattr(get_server_args(), "gguf_mmq_decode_threshold", False))
+    except Exception:
+        # Standalone kernel use, unit tests, or a matmul that beat
+        # ModelRunner's publish. The comparison is impossible; the
+        # supersession is not, and the callers here are the ones most likely
+        # to be surprised by it.
+        flag = None
+
+    if recognised and flag is not None and flag == enabled:
+        return  # never ambiguous -- do not train readers to skip the line
+    if flag is None:
+        who = (
+            f"the CLI flag --gguf-mmq-decode-threshold could not be read "
+            f"(ServerArgs not published at this call), so it was not compared"
+        )
+    else:
+        who = (
+            f"--gguf-mmq-decode-threshold={flag} is INERT: it was never "
+            f"consulted"
+        )
+    unparsed = (
+        ""
+        if recognised
+        else (
+            f" The value is not one of 0|1 and is therefore read as OFF; only "
+            f"the exact string '1' enables the reroute."
+        )
+    )
+    _mmq_env_override_logged = True
+    logger.warning(
+        "#894 SUPERSEDED KNOB: %s=%r decided the GGUF MMQ decode threshold "
+        "(resolved %s) -- %s. The env override wins on PRESENCE, not on value, "
+        "so a stale =0 from an earlier A/B run silences the flag and produces "
+        "no reroute and no other log line at all.%s Documented precedence, "
+        "announced rather than refused: unset %s to let the flag govern.",
+        _MMQ_THRESHOLD_ENV,
+        env,
+        "ON" if enabled else "OFF",
+        who,
+        unparsed,
+        _MMQ_THRESHOLD_ENV,
+    )
 
 
 def _mmq_decode_threshold_enabled() -> bool:
@@ -604,7 +696,10 @@ def _mmq_decode_threshold_enabled() -> bool:
         return _mmq_threshold_cached
     env = os.environ.get(_MMQ_THRESHOLD_ENV)
     if env is not None:
-        _mmq_threshold_cached = env == "1"
+        enabled = env == "1"
+        # #894: the env still wins -- it just no longer wins in silence.
+        _announce_mmq_env_override(env, enabled)
+        _mmq_threshold_cached = enabled
         return _mmq_threshold_cached
     try:
         from sglang.srt.runtime_context import get_server_args

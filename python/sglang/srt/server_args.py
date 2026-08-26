@@ -1014,7 +1014,13 @@ class ServerArgs:
             "swapping in a new kernel, not a milder one. "
             "Equivalent env override (same trade-off, documented at the "
             "dispatch site): SGLANG_GGUF_MMQ_DECODE_THRESHOLD=0|1, which "
-            "wins over this flag. "
+            "wins over this flag. IT WINS ON PRESENCE, NOT ON VALUE (#894): a "
+            "stale =0 left over from an A/B run silences this flag entirely, "
+            "and the only other log on that path fires on a reroute -- which "
+            "then never happens -- so the flag produced nothing and said "
+            "nothing. The dispatch now logs one SUPERSEDED KNOB warning "
+            "naming both sides whenever the env decided it, and another when "
+            "the value is not 0|1 (anything else reads as OFF). "
             "Default OFF -> the GGUF dispatch is byte-identical to before.",
         ),
     ] = False
@@ -6398,7 +6404,15 @@ class ServerArgs:
             "speculative decoding with a separate draft prefill pass. Capped to "
             "the DFlash formula (disabled when max-running-requests < 8; "
             "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "this with the formula when unset; other workloads stay disabled. "
+            "BOTH NARROWINGS ARE NOW ANNOUNCED AT RUNTIME (#894): the pool "
+            "floor is checked against the max-running-requests the KV resolver "
+            "left (#287), not the value written here, so a value that survived "
+            "on a larger KV budget can be DISCARDED on a smaller one -- which "
+            "removes the admission gate entirely rather than shrinking it. The "
+            "scheduler logs a MIN-FREE-SLOTS warning naming the requested "
+            "value, the resolved pool and what actually governs; read that, "
+            "not this."
         ),
     ] = None
 

@@ -235,7 +235,11 @@ class TestTheTpExitIsValidatedAtBoot(CustomTestCase):
     the shape `validate_purity_policy_pair` already uses for PP."""
 
     def _cfg(self, **kw):
-        base = dict(drain_mode_strict=True, decode_stall_slo_s=0.0, tp_window_s=0.0)
+        # #894 S3: `tp_window_s` used to be here and is GONE. It was never a
+        # `PhasePolicyConfig` field, and handing the validator a stub that
+        # invented it is why nobody noticed the escape it guarded was dead.
+        # A stand-in must carry only fields the real config has.
+        base = dict(drain_mode_strict=True, decode_stall_slo_s=0.0)
         base.update(kw)
         return types.SimpleNamespace(**base)
 
