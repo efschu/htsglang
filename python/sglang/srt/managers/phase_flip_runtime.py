@@ -3373,7 +3373,7 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
         )
 
 
-def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
+def build_phase_flip_runtime(scheduler) -> PhaseFlipRuntime:
     """Factory mirroring build_kv_reshard_runtime (kv_reshard.py): wires
     the scheduler's real state into PhaseFlipRuntime. Called lazily from
     the first scheduler round (house pattern); by then the boot builder
@@ -3864,7 +3864,7 @@ class WavedBackingSwap:
         seam_census.mark("backing_restore")
 
 
-def _build_kv_backing_swap(scheduler, stacks, my_layers) -> "WavedBackingSwap":
+def _build_kv_backing_swap(scheduler, stacks, my_layers) -> WavedBackingSwap:
     return WavedBackingSwap(scheduler, stacks, my_layers)
 
 
@@ -10245,7 +10245,7 @@ class PhaseFlipRuntime:
             offset += n * width
         return out
 
-    def _row_bounds_detail(self, tr: "PhaseFlipTransition") -> List[str]:
+    def _row_bounds_detail(self, tr: PhaseFlipTransition) -> List[str]:
         """Do BOTH pools cover the rows this plan touches? One list, no side
         effects, so it can be recomputed after the live-slot agreement has
         changed which rows the plan touches (#656 C22-d)."""

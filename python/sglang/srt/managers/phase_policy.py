@@ -1019,7 +1019,7 @@ def break_even_tokens(
     return int(round(flip_cost_s / (1.0 / tp_tok_s - 1.0 / pp_tok_s)))
 
 
-def live_flip_tokens(cfg: "PhasePolicyConfig") -> int:
+def live_flip_tokens(cfg: PhasePolicyConfig) -> int:
     """N, PRICED FROM THE MEASURED SEAM instead of frozen at the boot seed (#819).
 
     THE ACTUATOR #777 DECLINED TO BUILD. ``repriced_flip_tokens`` already
@@ -1113,7 +1113,7 @@ def flip_cost_provenance() -> str:
     return "measured" if est is None else est.provenance()
 
 
-def live_flip_cost_s(cfg: "PhasePolicyConfig") -> float:
+def live_flip_cost_s(cfg: PhasePolicyConfig) -> float:
     """The seam cost C the ladder is priced with, MEASURED where possible (#819).
 
     Repricing N alone is not enough, and the reason is in
@@ -1136,7 +1136,7 @@ def live_flip_cost_s(cfg: "PhasePolicyConfig") -> float:
     return float(cfg.flip_cost_s) if est is None else float(est.value())
 
 
-def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
+def effective_flip_threshold(cfg: PhasePolicyConfig, running_bs: int) -> int:
     """Pending-prefill tokens required to justify `tp_to_pp` RIGHT NOW.
 
     ``break_even_tokens`` prices the seam and nothing else. A cutover also
@@ -1190,7 +1190,7 @@ def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
     return int(round(base * (flip_cost_s + stranded_s) / flip_cost_s))
 
 
-def unpriced_seam_note(cfg: "PhasePolicyConfig", running_bs: int = 0) -> Optional[str]:
+def unpriced_seam_note(cfg: PhasePolicyConfig, running_bs: int = 0) -> Optional[str]:
     """The seam costs seconds and NOTHING is required to justify paying it.
 
     #874. A two-token health-check ping took 15.6-16.6 s on boot w40, three
@@ -1262,7 +1262,7 @@ def unpriced_seam_note(cfg: "PhasePolicyConfig", running_bs: int = 0) -> Optiona
 PROGRESS_STALL_CHUNKS = 3
 
 
-def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
+def pp_progress_stall_window_s(cfg: PhasePolicyConfig) -> float:
     """How long prefill may make NO progress before PP is declared wedged.
 
     SOLVED, NOT SET, and from the two quantities that already describe the
@@ -1294,7 +1294,7 @@ def pp_progress_stall_window_s(cfg: "PhasePolicyConfig") -> float:
 
 
 def prefill_suppressed_in_tp(
-    cfg: "PhasePolicyConfig",
+    cfg: PhasePolicyConfig,
     phase: str,
     flip_unavailable: bool = False,
     running_bs: int = -1,
@@ -1380,7 +1380,7 @@ def prefill_suppressed_in_tp(
     return True
 
 
-def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
+def pp_residency_cap_s(cfg: PhasePolicyConfig) -> float:
     """Seconds the PP phase may hold decodes, SOLVED from the declared SLO.
 
     Returns 0 when nothing is declared, meaning drain alone governs the phase.
@@ -1401,7 +1401,7 @@ PP_EXIT_BY_SLO_CAP = "decode-stall cap"
 PP_EXIT_BY_STOPWATCH = "hand-set stopwatch"
 
 
-def effective_pp_exit_term(cfg: "PhasePolicyConfig") -> tuple[str, float]:
+def effective_pp_exit_term(cfg: PhasePolicyConfig) -> tuple[str, float]:
     """Which timed bound on PP residency is REACHABLE, and how big it is (#889).
 
     THE DEFECT THIS EXISTS TO END. ``decide`` reaches the hand-set stopwatch
@@ -1428,7 +1428,7 @@ def effective_pp_exit_term(cfg: "PhasePolicyConfig") -> tuple[str, float]:
     return PP_EXIT_BY_DRAIN, 0.0
 
 
-def stranded_decode_s(cfg: "PhasePolicyConfig") -> float:
+def stranded_decode_s(cfg: PhasePolicyConfig) -> float:
     """How long a decode carried into PP is REALLY stranded there (#893).
 
     THE ONE READER THE ENTRY ECONOMY IS ALLOWED TO HAVE. Every price a flip
@@ -1456,7 +1456,7 @@ def stranded_decode_s(cfg: "PhasePolicyConfig") -> float:
     return effective_pp_exit_term(cfg)[1]
 
 
-def superseded_pp_bound_warning(cfg: "PhasePolicyConfig") -> Optional[str]:
+def superseded_pp_bound_warning(cfg: PhasePolicyConfig) -> Optional[str]:
     """The line a boot must print when one PP bound silences the other (#889).
 
     ``None`` when at most one of the two is declared: a configuration that was
@@ -1519,7 +1519,7 @@ def superseded_pp_bound_warning(cfg: "PhasePolicyConfig") -> Optional[str]:
     )
 
 
-def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
+def solved_tp_decode_floor_s(cfg: PhasePolicyConfig) -> float:
     """Minimum TP dwell, SOLVED: one full round trip.
 
     A cycle that spends less time serving decode in TP than it just spent
@@ -1530,7 +1530,7 @@ def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
     return 2.0 * cfg.flip_cost_s
 
 
-def drain_stall_deadline_s(cfg: "PhasePolicyConfig") -> float:
+def drain_stall_deadline_s(cfg: PhasePolicyConfig) -> float:
     """How long drain mode waits on an admitted set that is NOT shrinking.
 
     #833. Drain mode's exit condition is an empty decode bundle, and under
@@ -1558,8 +1558,8 @@ def drain_stall_deadline_s(cfg: "PhasePolicyConfig") -> float:
 
 
 def with_decode_contention(
-    cfg: "PhasePolicyConfig", value: object
-) -> "PhasePolicyConfig":
+    cfg: PhasePolicyConfig, value: object
+) -> PhasePolicyConfig:
     """Return ``cfg`` with a new MEASURED decode-contention fraction.
 
     Lives here rather than in the scheduler's ``set_internal_state`` chain so
@@ -1584,9 +1584,9 @@ def with_decode_contention(
 
 
 def _demand_outweighs_a_retry(
-    cfg: "PhasePolicyConfig",
-    inp: "PhasePolicyInputs",
-    state: "PhasePolicyState",
+    cfg: PhasePolicyConfig,
+    inp: PhasePolicyInputs,
+    state: PhasePolicyState,
 ) -> bool:
     """Should a pending backlog override the staging rate limit?
 
@@ -1624,7 +1624,7 @@ def _demand_outweighs_a_retry(
 
 
 def _differential_flip_threshold(
-    cfg: "PhasePolicyConfig", running_bs: int, base: int
+    cfg: PhasePolicyConfig, running_bs: int, base: int
 ) -> int:
     """The threshold once the counterfactual is priced too (#665-F1).
 
@@ -2765,7 +2765,7 @@ def _decide_rules(
     return d
 
 
-def _last_refusal_at(state: "PhasePolicyState", direction: str) -> float:
+def _last_refusal_at(state: PhasePolicyState, direction: str) -> float:
     """When the current hold started, derived from the hold itself.
 
     The state carries the hold's END, not its start, so the start is recovered
