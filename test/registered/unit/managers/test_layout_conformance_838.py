@@ -337,9 +337,17 @@ class CountersAndThrottle(unittest.TestCase):
         # that RAN and declined. It is what makes `c2=0` readable -- with
         # c2ok>0 the detector is alive and healthy, with c2ok=0 it never ran.
         # Zero here because this case recorded only anomalies.
+        #
+        # #887: and `tpc`, the count of TP prefill batches inside the ONE CHUNK
+        # the user permitted the TP phase to compute itself (2026-08-25). It is
+        # NOT an error count and must never be read as one -- but it is not
+        # zero-information either, which is why it is a number here rather than
+        # the silence the first cut of this exemption left behind: 165 permitted
+        # batches on the #857 boot counted as nothing at all. Zero here because
+        # this case recorded no prefill batches.
         self.assertEqual(
             lc.counters().as_field(),
-            "layout-conformance (#838): c1=1, c2=2, c2ok=0",
+            "layout-conformance (#838): c1=1, c2=2, c2ok=0, tpc=0",
         )
 
 

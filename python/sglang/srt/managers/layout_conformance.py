@@ -87,6 +87,11 @@ KIND_ADMIT_VS_EXEC = "admit_vs_exec"
 KIND_VERDICT_VS_ROUTING = "verdict_vs_routing"
 KIND_STALE_RING_RESTORE = "stale_ring_restore"
 
+#: #887/#870: the label on a TP prefill that is INSIDE the user's one-chunk
+#: permission. Deliberately not an ALARM prefix -- it is not a violation -- and
+#: deliberately not silence either: see ``tp_compute_exception_verdict``.
+ALLOWED_TP_COMPUTE = "LAYOUT-ALLOWED tp_compute_one_chunk (#887)"
+
 #: Class-2 illegitimacy labels, likewise.
 ILLEGITIMATE_BELOW_BAR = "below-bar-while-pending-exceeds-bar"
 ILLEGITIMATE_BUNDLE_NOT_DRAINING = "decode-bundle-not-draining"
@@ -119,12 +124,20 @@ class LayoutConformanceCounters:
     #: W25/#854: economy verdicts that RAN and declined. Not an error count --
     #: it is what separates "healthy" from "never ran" when c2 reads 0.
     economy_checks: int = 0
+    #: #887: TP prefill batches inside the user's one-chunk permission. NOT an
+    #: error count and never to be read as one -- but not zero-information
+    #: either, which is the whole reason it exists as a number rather than as
+    #: the silence #870's version left behind. "One chunk" is one; the #857
+    #: boot ran 165, and a permitted-but-constant TP self-prefill is a signal
+    #: about the flip, not about the law.
+    tp_compute_exceptions: int = 0
 
     def as_field(self) -> str:
         """The fragment appended to the periodic stats line."""
         return (
             f"layout-conformance (#838): c1={self.conformance_violations}, "
-            f"c2={self.economy_anomalies}, c2ok={self.economy_checks}"
+            f"c2={self.economy_anomalies}, c2ok={self.economy_checks}, "
+            f"tpc={self.tp_compute_exceptions}"
         )
 
 
@@ -311,6 +324,118 @@ def stale_ring_restore_verdict(
     )
 
 
+def tp_compute_exception_verdict(
+    *,
+    batch_class: str,
+    phase: str,
+    new_tokens: int,
+    chunk_tokens: Optional[int],
+    budget_configured: int = 0,
+    transport_verified: bool = False,
+    cached_tokens: int = 0,
+) -> Optional[str]:
+    """#887: is this wrong-layout batch the user's PERMITTED one-chunk compute?
+
+    Returns the ALLOWED note when it is, else ``None``. Pure and total, so both
+    directions are falsifiable without a scheduler -- and it is the ONE
+    authority for the question: ``work_layout_verdict`` excuses a batch by
+    calling THIS, never by a second copy of the predicate. That is not
+    ceremony. The exemption-implemented-as-a-copy is the exact shape that cost
+    W31 and W32 a window each, recorded in ``phase_purity`` at
+    ``seam_transport_pending_tokens``.
+
+    THE DISCRIMINATOR IS "DID THE CHUNK CAP BIND", NOT "IS THE NUMBER SMALL",
+    and it is #870's (c5d298149e, ``probe/870-detector-modes``), adopted
+    verbatim because it is measured. "Up to one chunk" invites
+    ``new_tokens <= chunk_tokens``. That reading SILENCES THE DEFECT THIS
+    DETECTOR EXISTS FOR: W37-D's 258 batches measured
+    ``#new-token: 4096, #cached-token: 0`` -- exactly one chunk, AT the cap. A
+    ``<=`` test calls all 258 permitted.
+
+    A batch that REACHES the cap was truncated by it, which means more prefill
+    stands behind it: a large cold prefill being served in TP, not "up to one
+    chunk". A batch below the cap is the whole remaining prefill, complete in
+    one chunk -- the permitted case. So the test is strict ``<``, and the
+    boundary falls on the VIOLATION side: a false red costs a look, a false
+    green costs the instrument.
+
+        W37-D  4096 == cap -> STILL A VIOLATION
+        #857   14..170 < cap -> permitted (the ten values measured on the boot)
+
+    RESTORE CAN NEVER TRIP THIS CAP, which is the other half of the user's
+    line. The cap is measured on ``new_tokens`` -- COMPUTED tokens only. Tokens
+    served from HiCache/radix arrive as ``cached_tokens`` and are not in this
+    quantity at all, so a restore of any size passes regardless of magnitude.
+    Unbounded restore is a property of WHICH NUMBER is capped, not of an
+    exemption clause that could rot.
+
+    ``chunk_tokens`` of ``None`` or 0 means the caller could not resolve the
+    chunk size. The safe reading is "no exception", never "any size fits" --
+    and it is what every pre-#887 caller gets, which is what keeps the default
+    byte-identical.
+
+    ``budget_configured`` DOES NOT GATE THE VERDICT, IT NAMES IT, and the split
+    is the correction this makes to #870. Under the user's law a sub-chunk
+    compute in TP is not a violation whether or not an operator wrote a purity
+    budget -- the permission is about the QUANTITY. But "not a violation" is
+    not "not worth seeing": on the #857 boot 165 such batches happened with no
+    valve configured at all, arriving through the seam door, and #870's version
+    returned ``None`` for every one of them. So the note says which case it is,
+    and the caller counts it either way.
+    """
+    if batch_class != "prefill" or phase != "tp":
+        return None
+    # THE TRANSPORT EXCUSE OUTRANKS THIS ONE, AND THE PRECEDENCE LIVES HERE so
+    # both callers inherit it from one place. `work_layout_verdict` checks the
+    # #861k transport clause before delegating, so it was already correct -- but
+    # the metrics caller asks THIS function directly to decide whether to count
+    # a `tpc` event, and without the clause a genuine restore of a few hundred
+    # tokens would be counted as a COMPUTE exception. That inflates the one
+    # counter whose whole purpose is to measure computed work in the wrong
+    # layout, with the mechanics the cap is defined to exclude. Found by reading
+    # the wiring against its own comment, which claimed this and did not do it.
+    if transport_verified and int(cached_tokens) > 0:
+        return None
+    cap = 0 if chunk_tokens is None else int(chunk_tokens)
+    if cap <= 0:
+        return None
+    computed = int(new_tokens)
+    if not (0 < computed < cap):
+        return None
+    budgeted = "yes" if int(budget_configured or 0) > 0 else "no"
+    return (
+        f"{ALLOWED_TP_COMPUTE} new_tokens={computed} chunk_tokens={cap} "
+        f"budgeted={budgeted} -- inside the ONE CHUNK the user permitted the "
+        f"TP phase to prefill itself (2026-08-25). Not a violation of the "
+        f"strict-batch law, and not silence either: a batch AT the cap was "
+        f"truncated by it and stays a violation (W37-D, 258 x 4096). A "
+        f"negative flag above means no purity valve was configured and this "
+        f"arrived through another door -- permitted by quantity, worth a look "
+        f"by frequency."
+        # The tail deliberately does NOT restate the flag token. It did, and
+        # the #887 mutation harness caught what that costs: `"budgeted=no" in
+        # note` was satisfied by this sentence no matter what the flag said, so
+        # the test asserting the negative case passed in both worlds and
+        # measured nothing.
+    )
+
+
+def note_tp_compute_exception(detail: str, now: float) -> bool:
+    """#887: count the permitted chunk always, log it at most once per cadence.
+
+    Separate from ``note_conformance_violation`` so the two counters can never
+    be confused at the point of increment: ``c1`` must stay a clean violation
+    count, or the number an acceptance run reads stops meaning what it says.
+    Returns whether the line was emitted, so a caller under test can assert on
+    the throttle without reading the log.
+    """
+    _COUNTERS.tp_compute_exceptions += 1
+    if not _should_say("tpc:one_chunk", now):
+        return False
+    logger.warning("%s", detail)
+    return True
+
+
 def work_layout_verdict(
     *,
     batch_class: str,
@@ -321,6 +446,8 @@ def work_layout_verdict(
     new_tokens: int,
     cached_tokens: int,
     now: float,
+    chunk_tokens: Optional[int] = None,
+    budget_configured: int = 0,
 ) -> Optional[str]:
     """#861d: WORK IN THE WRONG LAYOUT. The term this detector did not have.
 
@@ -367,6 +494,24 @@ def work_layout_verdict(
     # Partial-restore accounting (cached>0 with large new) is deferred and
     # named here rather than silently folded into either side.
     if transport_verified and int(cached_tokens) > 0:
+        return None
+    # #887: THE PERMITTED ONE-CHUNK SELF-PREFILL, decided by the ONE authority
+    # so this cannot drift from the note the caller emits for the same batch.
+    # Checked AFTER the transport excuse, which is the stricter of the two: a
+    # verified restore is excused at any magnitude, and only what is left over
+    # is measured against the compute cap.
+    if (
+        tp_compute_exception_verdict(
+            batch_class=batch_class,
+            phase=phase,
+            new_tokens=new_tokens,
+            chunk_tokens=chunk_tokens,
+            budget_configured=budget_configured,
+            transport_verified=transport_verified,
+            cached_tokens=cached_tokens,
+        )
+        is not None
+    ):
         return None
     recomputing = int(new_tokens) > 0
     return (
