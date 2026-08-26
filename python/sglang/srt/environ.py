@@ -356,6 +356,7 @@ class Envs:
     # buffered only when the filesystem refuses it.
     SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB = EnvInt(32)
     SGLANG_PHASE_FLIP_REFILL_DEPTH = EnvInt(2)
+    SGLANG_PHASE_FLIP_REFILL_SAVE_SLICES = EnvInt(4)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

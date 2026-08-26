@@ -54,7 +54,10 @@ a measurement, not to a gate:
   * the sliced copy is byte-exact against the serial one, including when the
     slice count does not divide the chunk and when the final chunk is short;
   * one slice, and any degenerate slice count, still copies correctly;
-  * the executor's own stats and phase accounting are unchanged by slicing;
+  * the slices TILE the source exactly once -- no gap, and no overlap, because
+    an overlap is two threads writing the same destination bytes concurrently
+    and a byte-equality assertion passes that by luck;
+  * no more slices are handed out than were asked for;
   * the copy never reaches for a global (`torch.set_num_threads`) -- the worker
     is left in exactly the thread state it was found in, because that setting is
     process-global and other threads share it.
@@ -76,6 +79,16 @@ from sglang.test.test_utils import CustomTestCase
 CHUNK = 4096
 
 
+#: EVERY construction below forces the sliced branch by dropping the size
+#: threshold to 0. Without this the tests run at 4 KiB, the production
+#: threshold is 1 MiB, and the whole file exercises the SERIAL fallback while
+#: appearing to test the slicing -- which is exactly what the first version of
+#: this file did: three of its four mutants survived because the mutated lines
+#: were never reached. Verified by mutation, not assumed.
+def _ops(slices):
+    return TorchRotationOps(save_slices=slices, save_slice_min_bytes=0)
+
+
 def _src(n, seed=0):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, 255, (n,), generator=g, dtype=torch.uint8)
@@ -87,7 +100,7 @@ class TestTheSlicedCopyIsByteExact(CustomTestCase):
     def test_a_full_chunk_round_trips(self):
         src = _src(CHUNK)
         dst = torch.zeros(CHUNK, dtype=torch.uint8)
-        TorchRotationOps(save_slices=4).save(dst, src)
+        _ops(4).save(dst, src)
         self.assertTrue(torch.equal(dst, src))
 
     def test_a_short_final_chunk_writes_only_its_own_bytes(self):
@@ -98,20 +111,28 @@ class TestTheSlicedCopyIsByteExact(CustomTestCase):
         n = CHUNK // 3
         src = _src(n, seed=1)
         dst = torch.full((CHUNK,), 0xAB, dtype=torch.uint8)
-        TorchRotationOps(save_slices=4).save(dst, src)
+        _ops(4).save(dst, src)
         self.assertTrue(torch.equal(dst[:n], src))
         self.assertTrue(
             torch.all(dst[n:] == 0xAB), "the copy wrote past the source length"
         )
 
     def test_a_length_that_does_not_divide_by_the_slice_count(self):
-        """4093 bytes over 4 slices. An even split loses the remainder; this is
-        the case a naive `n // w` slicer gets wrong and a round-trip test on a
-        power-of-two length never sees."""
+        """4093 bytes over 4 slices, i.e. a length the slice count does not
+        divide.
+
+        NOT a remainder-loss test, and the earlier wording here said it was.
+        `range(0, n, step)` with `min(o + step, n)` tiles [0, n) for ANY
+        positive step, so both a floor and a ceiling split copy every byte --
+        a mutation to floor division left this test green. What the split
+        actually changes is the slice COUNT, which
+        TestTheSlicingItselfIsObservable asserts. This case stays because an
+        indivisible length is still the one a slicer is most likely to get
+        wrong; it is simply not sufficient on its own."""
         n = 4093
         src = _src(n, seed=2)
         dst = torch.zeros(n, dtype=torch.uint8)
-        TorchRotationOps(save_slices=4).save(dst, src)
+        _ops(4).save(dst, src)
         self.assertTrue(torch.equal(dst, src))
 
     def test_every_slice_count_agrees_with_the_serial_copy(self):
@@ -120,11 +141,11 @@ class TestTheSlicedCopyIsByteExact(CustomTestCase):
         for n in (1, 7, 4095, 4096, 4097):
             src = _src(n, seed=n)
             reference = torch.zeros(n, dtype=torch.uint8)
-            TorchRotationOps(save_slices=1).save(reference, src)
+            _ops(1).save(reference, src)
             self.assertTrue(torch.equal(reference, src), f"serial path wrong at n={n}")
             for w in (1, 2, 3, 4, 8, 64):
                 dst = torch.zeros(n, dtype=torch.uint8)
-                TorchRotationOps(save_slices=w).save(dst, src)
+                _ops(w).save(dst, src)
                 self.assertTrue(
                     torch.equal(dst, reference),
                     f"sliced x{w} disagrees with the serial copy at n={n}",
@@ -132,8 +153,64 @@ class TestTheSlicedCopyIsByteExact(CustomTestCase):
 
     def test_a_zero_length_source_is_a_no_op(self):
         dst = torch.full((16,), 9, dtype=torch.uint8)
-        TorchRotationOps(save_slices=4).save(dst, torch.empty(0, dtype=torch.uint8))
+        _ops(4).save(dst, torch.empty(0, dtype=torch.uint8))
         self.assertTrue(torch.all(dst == 9))
+
+
+class TestTheSlicingItselfIsObservable(CustomTestCase):
+    """Byte-exactness alone cannot see how the work was divided -- several wrong
+    divisions still copy every byte. These assert the DIVISION, by recording the
+    bounds the copy actually hands out."""
+
+    def _bounds_for(self, n, workers):
+        import sglang.srt.model_executor.rotation_executor as rex
+
+        seen = []
+
+        class _Recorder:
+            def map(self, fn, bounds):
+                got = list(bounds)
+                seen.extend(got)
+                return [fn(b) for b in got]
+
+        real = rex._save_pool
+        rex._save_pool = lambda width: _Recorder()
+        try:
+            src = _src(n, seed=11)
+            dst = torch.zeros(n, dtype=torch.uint8)
+            _ops(workers).save(dst, src)
+            self.assertTrue(torch.equal(dst, src), "the recorded run lost bytes")
+        finally:
+            rex._save_pool = real
+        return seen
+
+    def test_the_slices_tile_the_source_exactly_once(self):
+        """No gap and no overlap. An overlap is two threads writing the same
+        destination bytes concurrently, which is a data race that a
+        byte-equality test passes by luck."""
+        for n, w in ((4093, 4), (4096, 4), (1000, 3), (7, 4)):
+            bounds = self._bounds_for(n, w)
+            covered = []
+            for lo, hi in bounds:
+                covered.extend(range(lo, hi))
+            self.assertEqual(
+                list(range(n)),
+                sorted(covered),
+                f"slices do not tile [0,{n}) exactly once at workers={w}: {bounds}",
+            )
+            self.assertEqual(
+                len(covered), len(set(covered)), f"slices OVERLAP at n={n} w={w}"
+            )
+
+    def test_no_more_slices_than_requested(self):
+        """A floor split produces `workers + 1` slices, the last a sliver, and
+        pays a thread hand-off for a few bytes. Bytes stay correct, so only a
+        count assertion can see it."""
+        for n, w in ((4093, 4), (1000, 3), (999, 8)):
+            bounds = self._bounds_for(n, w)
+            self.assertLessEqual(
+                len(bounds), w, f"got {len(bounds)} slices for workers={w} at n={n}"
+            )
 
 
 class TestTheSliceCountIsSanitised(CustomTestCase):
@@ -144,13 +221,25 @@ class TestTheSliceCountIsSanitised(CustomTestCase):
         for w in (0, -1, -100):
             src = _src(256, seed=3)
             dst = torch.zeros(256, dtype=torch.uint8)
-            TorchRotationOps(save_slices=w).save(dst, src)
+            _ops(w).save(dst, src)
             self.assertTrue(torch.equal(dst, src), f"save_slices={w} lost bytes")
+
+    def test_a_negative_slice_count_is_clamped_at_construction(self):
+        """The stored value, not just the resulting bytes. A negative count
+        happens to reach the serial branch anyway, so byte-equality cannot see
+        whether the clamp exists -- and a later refactor of that branch would
+        then inherit a negative width silently."""
+        for w in (0, -1, -100):
+            self.assertGreaterEqual(
+                int(TorchRotationOps(save_slices=w)._save_slices),
+                1,
+                f"save_slices={w} was stored unclamped",
+            )
 
     def test_more_slices_than_bytes_still_copies_every_byte(self):
         src = _src(3, seed=4)
         dst = torch.zeros(3, dtype=torch.uint8)
-        TorchRotationOps(save_slices=64).save(dst, src)
+        _ops(64).save(dst, src)
         self.assertTrue(torch.equal(dst, src))
 
 
@@ -167,7 +256,7 @@ class TestTheWorkerThreadStateIsNotTouched(CustomTestCase):
             torch.set_num_threads(1)
             src = _src(CHUNK, seed=5)
             dst = torch.zeros(CHUNK, dtype=torch.uint8)
-            TorchRotationOps(save_slices=4).save(dst, src)
+            _ops(4).save(dst, src)  # _ops forces the SLICED branch
             self.assertEqual(
                 1,
                 torch.get_num_threads(),
