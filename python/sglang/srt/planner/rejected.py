@@ -364,13 +364,17 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         ),
         level=BLOCKED,
         evidence=(
-            "server_args.py:19436 (if pp_size > 1) and server_args.py:19451 "
+            "server_args.py:19480 (if pp_size > 1) and server_args.py:19495 "
             "(spec assert, "
             "'or self.enable_phase_flip'); the overlap half is auto-disabled "
             "first at arg_groups/overrides.py:2163 "
             "(_pipeline_parallel_overlap_disable). Re-verified #704b; the "
             "earlier :16240-16245 cite had drifted and its verdict text "
-            "predated both the phase-flip exemption and the auto-disable"
+            "predated both the phase-flip exemption and the auto-disable. "
+            "Re-pinned again on the 0826 train (+44): the same guard, moved "
+            "by the day's server_args.py additions (#889, #893, #894, #897, "
+            "#887/#890), not a changed verdict -- which is exactly what the "
+            "line-drift test is for"
         ),
         tags=("pipeline-parallel", "speculation"),
         scope="general",
