@@ -118,6 +118,7 @@ DISCIPLINE
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -352,6 +353,19 @@ class SeamCensus:
             return None
         return max(0, base - low[1])
 
+    def segments_ms(self) -> List[Tuple[str, float]]:
+        """``[(label_a->label_b, wall_ms)]`` in mark order (#885).
+
+        The ONE place a segment's name and cost are derived, because two readers
+        now want them -- the timing line, which sorts them by size for this
+        flip, and the cross-flip shape test, which needs them keyed identically
+        across flips or its history is silently split between two spellings.
+        """
+        return [
+            (f"{a_label}->{b_label}", (b_t - a_t) * 1000.0)
+            for (a_label, a_t), (b_label, b_t) in zip(self.times, self.times[1:])
+        ]
+
     def format_timing_line(self) -> str:
         """One line per flip per rank: per-segment WALL MILLISECONDS.
 
@@ -376,9 +390,7 @@ class SeamCensus:
                 f"{LOG_PREFIX} timing {self.direction} rank {self.rank}: "
                 f"only {len(self.times)} stage mark(s), no segment to time"
             )
-        segs = []
-        for (a_label, a_t), (b_label, b_t) in zip(self.times, self.times[1:]):
-            segs.append((f"{a_label}->{b_label}", (b_t - a_t) * 1000.0))
+        segs = self.segments_ms()
         total_ms = (self.times[-1][1] - self.times[0][1]) * 1000.0
         ranked = sorted(segs, key=lambda kv: kv[1], reverse=True)
         body = " | ".join(f"{name} {ms:.1f}" for name, ms in ranked)
@@ -521,6 +533,156 @@ class SeamCensus:
         return head + " | " + " | ".join(parts)
 
 
+# #885: WAITING THAT IS DRESSED AS WORK, DETECTED BY ITS SHAPE.
+#
+# A segment that WAITS FOR A PERIODIC TICK has a fingerprint no work has: enter
+# a 1/P Hz cycle at an arbitrary phase and the wait is UNIFORM on [0, P], flat
+# from floor to ceiling, with a hard cap at the period. Work does not look like
+# that -- work has a mode and a tail, because its cost tracks an input.
+#
+# The instance this exists for is `hicache_quiesce->resident_release`: 1959 flip
+# legs, median 461 ms, flat across [0, 1009 ms], IDENTICAL on all three ranks in
+# both directions, while ZERO residents were being released. It was measured and
+# reported as unexplained, and the number alone carried no signal that it was a
+# wait at all -- the SHAPE did, and nothing was looking at the shape.
+#
+# SO THE CHECK IS ON THE SHAPE AND NOT ON A LIST OF KNOWN SITES. It knows no
+# segment names and no subsystem; it asks only whether a segment's distribution
+# is indistinguishable from uniform under a round-number ceiling. Any future
+# segment that starts waiting on any poll loop is caught by the same test
+# without anyone having to remember to add it.
+#
+# The periods are the round numbers a poll loop is actually written with. This
+# is deliberately not "any period fitted to the data": a fitted period explains
+# every distribution and therefore flags everything.
+_TICK_PERIODS_MS = (50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0)
+
+# Below this a uniform-looking segment is not worth a line: sampling noise on a
+# cheap segment reads as flat, and a tick nobody waits long for is not a defect.
+_TICK_MIN_MEDIAN_MS = 25.0
+
+# A distribution needs enough samples before "flat" means anything. At n=24 the
+# KS band below is still wide enough that ordinary work is not mistaken for a
+# tick.
+_TICK_MIN_SAMPLES = 24
+
+
+def tick_suspect(samples_ms) -> Optional[str]:
+    """Is this segment WAITING ON A TICK rather than doing work? (#885)
+
+    Returns a sentence naming the suspected period, or ``None``.
+
+    THE TEST IS KOLMOGOROV-SMIRNOV AGAINST ``U(0, P)``, not a bucket-flatness
+    eyeball. Buckets need a bin width, and the answer then depends on the bin
+    width -- which is how a shape test turns into a tuning exercise. The KS
+    statistic is bin-free: it is the largest gap between the observed CDF and
+    the straight line a uniform distribution would draw, and its critical value
+    is a known function of ``n``.
+
+    ``1.36/sqrt(n)`` is the 95% two-sided critical value. Reading it the way it
+    is read here -- "D BELOW the critical value, so uniformity CANNOT be
+    rejected" -- is deliberately the weak direction of the test, and this
+    function claims no more than that: it says SUSPECT, never "is". The
+    conclusion is a place to look, and the confirmation is reading the code and
+    finding the poll loop.
+
+    Returns None rather than raising on anything unusable. This runs on the flip
+    path, where the module's standing rule is that an instrument may cost a
+    missing line and never a flip.
+    """
+    try:
+        samples = sorted(float(s) for s in samples_ms if s is not None and s >= 0.0)
+    except (TypeError, ValueError):
+        return None
+    n = len(samples)
+    if n < _TICK_MIN_SAMPLES:
+        return None
+    observed_max = samples[-1]
+    median = samples[n // 2]
+    if median < _TICK_MIN_MEDIAN_MS or observed_max <= 0.0:
+        return None
+
+    # The ceiling must be a round period the observations nearly reach. "Nearly"
+    # is two-sided on purpose: a sample may overshoot the period slightly (the
+    # loop still has to notice and unwind), and with finite n the largest sample
+    # sits a little under it.
+    period = None
+    for candidate in _TICK_PERIODS_MS:
+        if 0.9 * candidate <= observed_max <= 1.08 * candidate:
+            period = candidate
+            break
+    if period is None:
+        return None
+    # A single overshooting sample must not be allowed to define the ceiling,
+    # and a distribution that piles up AT the cap is a timeout being hit, not a
+    # phase being entered -- the opposite finding, and not this one.
+    if samples[int(n * 0.98)] > 1.02 * period:
+        return None
+
+    # KS against U(0, period).
+    d_stat = 0.0
+    for i, value in enumerate(samples):
+        expected = min(1.0, max(0.0, value / period))
+        d_stat = max(d_stat, abs((i + 1) / n - expected), abs(expected - i / n))
+    critical = 1.36 / math.sqrt(n)
+    if d_stat >= critical:
+        return None
+
+    mean_ms = sum(samples) / n
+    return (
+        f"SUSPECTED TICK WAIT, not work: {n} samples are indistinguishable "
+        f"from uniform on [0, {period:.0f} ms] (KS D={d_stat:.3f} < "
+        f"{critical:.3f}, median {median:.1f}, mean {mean_ms:.1f} ~ "
+        f"{period / 2:.0f} = P/2, max {observed_max:.1f}). A flat "
+        f"distribution under a round ceiling is what entering a {1000.0 / period:.3g} Hz "
+        f"cycle at a random phase looks like; work has a mode and a tail. Look "
+        f"for a poll loop, a queue.get/Event.wait timeout or a sleep of "
+        f"{period / 1000.0:.3g}s on this segment's path, and ask whether the "
+        f"caller has to wait for it at all (#885 was exactly this: "
+        f"HiCacheController.reset joining threads that only read their stop "
+        f"event between 1 s queue polls)"
+    )
+
+
+# Per-segment wall times across the flips of THIS process, capped so a long boot
+# cannot grow it without bound. Keyed by segment name only: the whole point is
+# that a tick is the same tick in both directions, so pooling the directions is
+# what makes it visible sooner rather than what blurs it.
+_TICK_HISTORY_CAP = 256
+_tick_history: Dict[str, List[float]] = {}
+_tick_reported: set = set()
+
+
+def observe_segments_for_tick(segs) -> List[str]:
+    """Feed one flip's segments to the shape test; return any new verdicts.
+
+    Reported ONCE per segment per process. A standing defect that reprints on
+    every flip becomes log furniture, and log furniture is not read.
+    """
+    out: List[str] = []
+    try:
+        for name, ms in segs:
+            history = _tick_history.setdefault(str(name), [])
+            history.append(float(ms))
+            if len(history) > _TICK_HISTORY_CAP:
+                del history[: len(history) - _TICK_HISTORY_CAP]
+            if name in _tick_reported:
+                continue
+            verdict = tick_suspect(history)
+            if verdict:
+                _tick_reported.add(name)
+                out.append(f"segment '{name}': {verdict}")
+    except Exception:  # noqa: BLE001 - an instrument may never break a flip
+        return out
+    return out
+
+
+def reset_tick_history() -> None:
+    """For tests, and for a boot that wants a fresh window."""
+    _tick_history.clear()
+    _tick_reported.clear()
+
+
 _active: Optional[SeamCensus] = None
 
 
@@ -587,6 +749,14 @@ def end() -> Optional[SeamCensus]:
         logger.info("%s", census.format_line())
         logger.info("%s", census.format_timing_line())
     except Exception:  # pragma: no cover
+        pass
+    # #885: the shape test runs on the SAME segments that were just printed, and
+    # is separately guarded. It reads across flips, so it is the one reader here
+    # that can say something the single flip's line cannot.
+    try:
+        for verdict in observe_segments_for_tick(census.segments_ms()):
+            logger.warning("%s %s", LOG_PREFIX, verdict)
+    except Exception:  # pragma: no cover - an instrument, never a gate
         pass
     return census
 

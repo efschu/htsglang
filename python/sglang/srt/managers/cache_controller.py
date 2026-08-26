@@ -605,16 +605,9 @@ class HiCacheController:
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
 
-        # Best-effort wakeups so threads exit promptly even if blocked on queues.
-        try:
-            if hasattr(self, "prefetch_queue"):
-                self.prefetch_queue.put_nowait(None)
-            if hasattr(self, "backup_queue"):
-                self.backup_queue.put_nowait(None)
-            if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
-        except Exception:
-            pass
+        # Best-effort wakeups so threads exit promptly even if blocked on
+        # queues. The event alone is not one; see `_wake_storage_threads`.
+        self._wake_storage_threads()
 
         # Best-effort joins (threads are daemon, but join keeps state clean).
         threads = []
@@ -1015,8 +1008,74 @@ class HiCacheController:
         )
         return window
 
+    def _wake_storage_threads(self) -> None:
+        """Unblock every storage thread parked in a ``Queue.get`` (#885).
+
+        ``storage_stop_event`` is the STOP SIGNAL and nothing more. A
+        ``threading.Event`` cannot wake a thread blocked in ``Queue.get``, and
+        every one of these loops spends essentially all of its time exactly
+        there, on a 1 s timeout. So setting the event decides that the thread
+        will stop; this decides WHEN -- now, rather than at the next tick of a
+        1 Hz poll.
+
+        ``None`` is the wake-up because ``None`` is already the protocol: each
+        of the three loops opens with ``if operation is None: continue``, which
+        sends it straight back to its ``while`` condition, where the event it
+        has just been told about is read. Nothing new is introduced and no loop
+        needs to change.
+
+        Best-effort by construction. It is called on both stop paths (`reset`
+        at the flip seam, `detach` at teardown), the joins that follow are the
+        real contract, and a queue that refuses an enqueue must degrade to the
+        old poll latency rather than break a flip.
+        """
+        for name in ("prefetch_queue", "backup_queue", "prefetch_buffer"):
+            queue = getattr(self, name, None)
+            if queue is None:
+                continue
+            try:
+                queue.put_nowait(None)
+            except Exception:  # noqa: BLE001 - a wake-up may never break a stop
+                pass
+
     def reset(self):
+        # THE STOP EVENT IS NOT A WAKE-UP, AND THE JOINS BELOW USED TO PAY FOR
+        # THAT (#885).
+        #
+        # All three storage threads observe `storage_stop_event` only at the
+        # TOP of their loop, and every loop body parks in
+        # `queue.get(block=True, timeout=1)`. `Queue.get` is woken by an
+        # enqueue, never by an unrelated Event, so setting the event while a
+        # thread sits in that get buys nothing: the thread notices at its next
+        # poll, i.e. after the current 1 s timeout expires. The joins therefore
+        # waited out the REMAINDER of a 1 Hz poll, entered at whatever phase the
+        # caller happened to arrive at -- a cost uniformly distributed on
+        # [0, 1000 ms] with no relation whatsoever to how much work there was.
+        #
+        # MEASURED, on the #856 no-carry flip seam, where this `reset()` is the
+        # body of the `hicache_quiesce -> resident_release` census segment: 1959
+        # flip legs, median 461 ms, mean 487 ms, max 1009 ms, and a FLAT
+        # histogram over [0, 1009] -- identical on all three ranks, in both flip
+        # directions, while ZERO residents were being released. A flat
+        # distribution under a hard round-period ceiling is the fingerprint of
+        # waiting on a tick, not of doing work; work has a mode and a tail.
+        #
+        # THE JOINS THEMSELVES STAY, AND STAY UNBOUNDED. They are a real
+        # rendezvous, not ceremony: `UnifiedRadixCache._reset_full` calls
+        # `mem_pool_host.clear()` on the very next line, and a prefetch or
+        # backup thread still touching host pages while they are cleared is the
+        # #760 use-after-release class verbatim. Deleting the wait would trade
+        # 0.5 s for silent corruption. What is removed is the POLL LATENCY, not
+        # the synchronisation.
+        #
+        # THE WAKE-UP IS THE SENTINEL THE PROTOCOL ALREADY HAS. Each loop
+        # already reads `if operation is None: continue`, and `detach()` in this
+        # same class already stops these same threads this way. Two shutdown
+        # paths for one set of threads, only one of them woken -- so this is the
+        # missing half of an existing authority, not a new mechanism.
         self.storage_stop_event.set()
+        if self.enable_storage:
+            self._wake_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1025,6 +1084,36 @@ class HiCacheController:
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
+            # READ AFTER THE JOIN, NOT BEFORE. `prefetch_thread_func` binds
+            # `prefetch_io_aux_thread` as its first act, so between a previous
+            # `reset` starting the replacement prefetch thread and that thread
+            # reaching its first line, this attribute still names the PREVIOUS
+            # generation's aux thread. Reading it before the join can therefore
+            # hand back an already-dead handle while the live aux thread goes
+            # unjoined -- the leak this block exists to close, reintroduced by
+            # reading one line too early. Once `prefetch_thread.join()` has
+            # returned, the thread that binds it has run and exited, so the
+            # attribute is settled.
+            aux_thread = getattr(self, "prefetch_io_aux_thread", None)
+            # A second wake for the same reason: an aux thread created after the
+            # first wake never saw that sentinel, and `prefetch_thread_func`
+            # rebinds `prefetch_buffer` too, so the first `None` may have gone
+            # into a queue nobody is reading any more.
+            self._wake_storage_threads()
+            # THE AUX THREAD IS JOINED TOO, AND THAT IS NOT COSMETIC.
+            #
+            # It was never joined here, only in `detach`. It exits on the same
+            # event, which `reset` CLEARS a few lines below -- so an aux thread
+            # that had not yet reached its poll when the clear landed saw the
+            # event unset, stayed alive, and was then joined by nothing while
+            # `prefetch_thread_func` started a second one. The old join latency
+            # hid this: the ~0.5 s spent waiting on the two joins was usually
+            # long enough for the aux thread to notice on its own. Removing that
+            # latency without joining the aux thread would have converted this
+            # tick into a thread leak, one per flip -- which is why the two
+            # changes belong in the same edit.
+            if aux_thread is not None and aux_thread is not threading.current_thread():
+                aux_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
