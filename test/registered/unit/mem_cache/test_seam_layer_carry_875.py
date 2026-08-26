@@ -8,21 +8,22 @@ wrong-layer write in the other. But its own counter comment states the cost --
 direction, i.e. every flip loses its prefixes". The refusal is the honest
 non-answer; this is the first axis of the answer.
 
-RETRACTION, AND IT IS THE FIRST THING TO READ. This file was written claiming
-the refusal's KV-head leg was false. It is TRUE on this rig and the claim shipped
-for one commit. `uneven_dcp_kv_replicated` is
-`dcp_size > 1 AND get_tp_partition_ratios() is not None`; this rig boots
-`rank_tp_ratio=None`, so the replication branch is never taken, and
-`max(1, num_key_value_heads // attn_tp_size)` with 4 heads gives PP 4 and TP 1.
-The log line I cited as evidence appears zero times in the boot I cited it from.
+THE HEAD LEG, SETTLED ON THE THIRD JUDGEMENT. I deleted it, restored it, and
+deleted it again. It is FALSE on this rig: both phases hold 4 kv-heads per layer.
+The flip installs its OWN vector (`phase_flip_tp_vector` '32,16,16') at
+phase_flip_boot.py:1428, before the TP worker at :1473, so
+`uneven_dcp_kv_replicated` is TRUE at TP-pool build time and the #345 exception
+returns the full head count; PP, built earlier with ratios None, gets
+`max(1, 4 // 1)` = 4. The predicate's docstring names only `--rank-tp-ratio` and
+there are two installers -- which is why reading it is enough to get this wrong.
 
 What survives is the LAYER leg's narrowing: rank-locally impossible, collectively
 exact. That is what this file tests, and it is one axis of THREE.
 
 WHAT THIS FILE COVERS, AND WHAT IT DELIBERATELY DOES NOT. The layer axis only.
 Two other axes stand between here and a shipped carry:
-  HEAD  -- NOT replicated here: PP 4 kv-heads per layer, TP 1. A real remap,
-           and the retraction above is why this line changed.
+  HEAD  -- 4 kv-heads per layer in both phases. No remap needed. Settled above,
+           after three judgements.
   TOKEN -- PP holds every token at allocator slots; TP holds an owner-rule
            SUBSET at compacted rows (layers/dcp/owner.py:159). A second
            remap, also unavailable rank-locally, NOT solved.
@@ -72,64 +73,75 @@ def _entries(start, n):
     return [f"L{start + i}" for i in range(n)]
 
 
-class TestTheHeadLegIsTrueOnThisRig(CustomTestCase):
-    """THE RETRACTION, PINNED. I removed this leg from shipped code on a
-    misreading; these make the misreading impossible to repeat silently.
+class TestTheHeadLegIsFalseOnThisRig(CustomTestCase):
+    """THE THIRD JUDGEMENT ON THIS AXIS, and the two before it were wrong in
+    opposite directions. These assert the CHAIN, because the chain is what
+    decides it and the predicate's docstring is what misleads.
 
-    The error was not a typo. I read `_pool_kv_head_num`'s replication BRANCH,
-    treated its existence as reachability, and cited a boot line as evidence
-    without checking that the line had ever printed (it had not: zero
-    occurrences). The predicate's INPUTS are what decide it, so the predicate's
-    inputs are what these assert."""
+    The trap: `uneven_dcp_kv_replicated`'s docstring names `--rank-tp-ratio`,
+    but the process state it reads has TWO installers, and the flip is the
+    other one. Asserting the flag would reproduce my second error; asserting the
+    ORDER and the SOURCE is what makes the answer stable."""
 
-    def test_the_replication_branch_needs_a_rank_tp_ratio_plan(self):
-        """`uneven_dcp_kv_replicated` is `dcp_size > 1 AND
-        get_tp_partition_ratios() is not None`. Without a --rank-tp-ratio base
-        plan it is False no matter what the DCP size is."""
+    def test_the_flip_installs_its_OWN_vector_not_rank_tp_ratio(self):
+        """`parse_flip_vector` reads `phase_flip_tp_vector`. This is the
+        installer the predicate's docstring does not mention."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+
+        src = inspect.getsource(phase_flip_boot.parse_flip_vector)
+        self.assertIn("server_args.phase_flip_tp_vector", src)
+        self.assertNotIn("rank_tp_ratio", src)
+
+    def test_the_plan_is_installed_BEFORE_the_tp_worker_is_built(self):
+        """Code ORDER is what closes the chain -- 1428 before 1473. If a future
+        edit moves the install after the pool, the TP pool silently reverts to a
+        head SHARD and the head axis becomes real again."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+
+        src = inspect.getsource(phase_flip_boot)
+        install = src.index("set_tp_partition_ratios(list(vec)")
+        worker = src.index("tp_worker = TpModelWorker(")
+        self.assertLess(
+            install,
+            worker,
+            "the TP partition plan is no longer installed before the TP worker "
+            "is constructed; the pool would build with ratios None and take a "
+            "head shard, and the head axis would stop being void",
+        )
+
+    def test_the_predicate_needs_only_a_plan_not_that_specific_flag(self):
+        """`dcp_size > 1 AND get_tp_partition_ratios() is not None` -- any
+        installer satisfies it. Reading the docstring's flag name instead of the
+        expression is exactly how I got this wrong."""
         import inspect
 
         from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
 
         src = inspect.getsource(uneven_dcp_kv_replicated)
         self.assertIn("get_tp_partition_ratios() is not None", src)
-        self.assertIn("dcp_size > 1", src)
 
-    def test_with_no_plan_installed_the_predicate_is_false_at_any_dcp_size(self):
-        from sglang.srt.distributed.utils import (
-            get_tp_partition_ratios,
-            uneven_dcp_kv_replicated,
-        )
-
-        if get_tp_partition_ratios() is not None:
-            self.skipTest("a TP partition plan is installed in this process")
-        for dcp in (1, 2, 3, 8):
-            self.assertFalse(
-                uneven_dcp_kv_replicated(dcp),
-                f"replication claimed at dcp_size={dcp} with no plan installed",
-            )
-
-    def test_the_head_count_differs_between_the_phases_by_four(self):
-        """The arithmetic that settles it. `max(1, total // tp)` with this
-        checkpoint's 4 kv-heads: PP (attn_tp_size 1) -> 4, TP (3) -> 1."""
+    def test_both_phases_end_up_with_the_same_head_count(self):
+        """The arithmetic, both sides. TP takes the #345 exception and gets the
+        replicated total; PP has ratios None but attn_tp_size 1. Both 4."""
         total = 4  # num_key_value_heads, Qwen3.8-27B
+        tp_heads = total  # #345 exception: get_total_num_kv_heads()
         pp_heads = max(1, total // 1)
-        tp_heads = max(1, total // 3)
-        self.assertEqual(4, pp_heads)
-        self.assertEqual(1, tp_heads)
-        self.assertNotEqual(
-            pp_heads,
-            tp_heads,
-            "if these ever match, the head leg really is void and the refusal's "
-            "justification may be revisited -- but only then",
-        )
+        self.assertEqual(pp_heads, tp_heads)
 
-    def test_the_fallback_expression_is_the_one_that_runs(self):
+    def test_the_dual_group_overlay_cannot_shadow_the_plan_here(self):
+        """`get_tp_partition_ratios` reads a context-local overlay FIRST. It is
+        written only by the #274 dual-group lane's scoped manager, which is off
+        on this rig -- so the installed plan is what is read."""
         import inspect
 
-        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.distributed import utils as dutils
 
-        src = inspect.getsource(ModelConfig.get_num_kv_heads)
-        self.assertIn("max(1, total_num_kv_heads // tensor_parallel_size)", src)
+        src = inspect.getsource(dutils.get_tp_partition_ratios)
+        self.assertIn("_TP_PARTITION_OVERLAY.get()", src)
 
 
 class TestTheLabellingIsExact(CustomTestCase):
