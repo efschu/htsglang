@@ -275,16 +275,21 @@ class TestTheHeadroomArithmetic(CustomTestCase):
     def test_the_total_ask_is_96_mib_of_host_ram(self):
         self.assertEqual(96.0, 3 * self.CHUNK_MIB)
 
-    def test_the_ask_is_a_small_fraction_of_the_measured_host_headroom(self):
-        """#721: cgroup peak 111.3 of 118 GiB. The images are PINNED HOST
-        buffers, so this never touches the VRAM corridor or the arming floor."""
-        headroom_mib = (118.0 - 111.3) * 1024.0
+    def test_the_ask_is_negligible_against_MEASURED_host_ram(self):
+        """Against a figure taken on this box, not a borrowed one.
+
+        The #721 "111.3 of 118 GiB, oom_kill=17" I first used here had NO
+        in-tree source -- the citation sweep found none for `oom_kill=17` and
+        the only `111.3` is `111.3%` in a benchmark table. Withdrawn. This box
+        reports 128711 MB total / 76971 MB free (numactl), and the images are
+        PINNED HOST buffers, so the ask never touches the VRAM corridor or the
+        arming floor."""
+        free_mib = 76971.0
         ask_mib = 3 * self.CHUNK_MIB
         self.assertLess(
-            ask_mib / headroom_mib,
-            0.02,
-            "the ask stopped being negligible against #721's headroom; the "
-            "funding argument has to be redone before the scheme is built",
+            ask_mib / free_mib,
+            0.005,
+            "the ask stopped being negligible against measured free host RAM",
         )
 
 

@@ -37,9 +37,12 @@ the first and N == 0 for the second (topk-1 == 0 makes the tensor empty). The
 temporary is per LAYER -- the loops iterate layer buffers one at a time -- so it
 is kilobytes, not gigabytes.
 
-So the #721 host-OOM shape (cgroup oom_kill=17, system.slice peak 111.3 of
-118 GiB) is NOT reachable through these sites today. Said with the number
-rather than left as a worry.
+So the #721 host-OOM shape is NOT reachable through these sites today. The
+specific figures I first cited for it ("oom_kill=17, peak 111.3 of 118 GiB") are
+WITHDRAWN -- the citation sweep found no in-tree source for either; they came
+from a briefing and I repeated them as measured. The conclusion does not depend
+on them: N <= 72 rows of a per-LAYER temporary is kilobytes, and separately none
+of these six sites is even constructed on this rig.
 
 WHAT IS STILL WRONG IS THAT THE BOUND IS A PROPERTY OF TODAY'S CALLERS. Nothing
 in these functions enforces it. A future defrag pass handing a pool-sized index
