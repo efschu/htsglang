@@ -241,10 +241,28 @@ class TorchRotationOps:
     whether the CUDA lanes can overlap at all, and it does so without a device.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        save_slices: Optional[int] = None,
+        save_slice_min_bytes: Optional[int] = None,
+    ) -> None:
         self._d2h_stream = None
         self._h2d_stream = None
         self._outstanding_h2d = 0
+        self._save_slices = (
+            _save_slices_default() if save_slices is None else max(1, int(save_slices))
+        )
+        #: #875: INJECTABLE SO A TEST CAN REACH THE SLICED PATH. The production
+        #: threshold is 1 MiB against 32 MiB chunks, so a unit test written at a
+        #: natural size falls entirely into the serial branch and asserts
+        #: nothing about the slicing -- which is what the first version of
+        #: test_rotation_save_slices_875 did, and three of its four mutants
+        #: survived because of it.
+        self._save_slice_min_bytes = (
+            _SAVE_SLICE_MIN_BYTES
+            if save_slice_min_bytes is None
+            else max(0, int(save_slice_min_bytes))
+        )
 
     # -- lane setup -------------------------------------------------------
     def _streams(self):
@@ -264,8 +282,74 @@ class TorchRotationOps:
 
     # -- the three primitives --------------------------------------------
     def save(self, dst_buf: torch.Tensor, src: torch.Tensor) -> None:
-        """Host-to-host: hold the incoming chunk while its pages are reused."""
-        dst_buf[: src.numel()].copy_(src)
+        """Host-to-host: hold the incoming chunk while its pages are reused.
+
+        #875: SPLIT ACROSS PYTHON THREADS, because this copy is the seam's
+        largest single term and it was running on one core.
+
+        WHY IT EXISTS AT ALL, so nobody deletes it looking for the win. The
+        rotation is an in-place transform whose two streams share ONE
+        coordinate system: on the host the H2D READS ``host_image[off:off+len]``
+        while the D2H WRITES it; on the arena the D2H READS
+        ``arena[off:off+len]`` while the H2D WRITES it -- and
+        ``d2h_offset == h2d_offset`` on every interleaved step (498 of 512 on
+        PP0, 268 of 281 on PP1, 268 of 297 on PP2, against the real layout
+        vectors). So each region must be read before it is written AND written
+        before it is read. That cycle is what ``RotationHazard`` below names,
+        and it cannot be broken by lagging the copy-back (a lagging D2H would
+        read arena bytes the H2D has already overwritten) nor by reordering
+        (both streams run sequentially from 0, so there is no better
+        permutation). The staging copy is structural; only its RATE was not.
+
+        WHY THREADS AND NOT ``torch.set_num_threads``. Every CUDA worker runs
+        under a process-global ``torch.set_num_threads(1)``
+        (model_runner.py:2224), set for weight loading. Raising it here would
+        change it under every other thread in the process for the duration of
+        the seam, and restoring it in a ``finally`` still leaves it wrong in
+        between. ``Tensor.copy_`` releases the GIL, so N Python threads over N
+        disjoint slices get the same parallelism and touch no global.
+
+        THE MEASURED GAIN IS 1.42x, NOT 8x, and the difference is the whole
+        reason this docstring carries numbers. On this box (5950X, 16 cores,
+        one NUMA node), streaming 3-4 GiB through a 32 MiB ring:
+
+            1 rank,  serial     4957-5109 MiB/s
+            1 rank,  sliced x4      40860 MiB/s   8.0x  -- and a mirage
+            3 ranks, serial     3757-3869 MiB/s         -- reproduces the
+                                                           flip's own 2687-3768
+            3 ranks, sliced x4  5353-5701 MiB/s   1.42x -- the real one
+
+        Three concurrent ranks are DRAM-bandwidth-bound, not core-bound:
+        aggregate copy rises from ~11.5 to ~16.5 GB/s and stops. PP0's ``save``
+        therefore goes 4.342 s -> ~3.06 s, not to ~0.5 s. Benchmarking a
+        three-rank operation on one rank overstates it by 5.6x.
+
+        Slices are computed so every byte lands exactly once for any length and
+        any slice count, including a short final chunk (the two layouts differ
+        in size, so the tails never line up) and a length that does not divide
+        by the slice count.
+        """
+        n = int(src.numel())
+        if n <= 0:
+            return
+        workers = min(int(self._save_slices), n)
+        if workers <= 1 or n < self._save_slice_min_bytes:
+            dst_buf[:n].copy_(src)
+            return
+        # Ceiling division. COVERAGE does not depend on it -- `range(0, n, step)`
+        # with `min(o + step, n)` tiles [0, n) exactly once for any positive
+        # step -- so this is about the slice COUNT, not correctness: a floor
+        # split yields `workers + 1` slices, the last one a sliver, which costs
+        # a thread hand-off for a few bytes. Said precisely because the earlier
+        # wording here claimed a floor split "leaves the remainder uncopied",
+        # and a mutation test proved that claim false.
+        step = -(-n // workers)
+        bounds = [(o, min(o + step, n)) for o in range(0, n, step)]
+        pool = _save_pool(len(bounds))
+        if pool is None:
+            dst_buf[:n].copy_(src)
+            return
+        list(pool.map(lambda b: dst_buf[b[0] : b[1]].copy_(src[b[0] : b[1]]), bounds))
 
     def d2h(self, src: torch.Tensor, dst: torch.Tensor) -> Any:
         """Device -> host, on the copy-back lane."""
@@ -388,6 +472,53 @@ def rotation_host_bytes(pp_bytes: int, tp_bytes: int, chunk_bytes: int, depth: i
 
 def _overlaps(a_off: int, a_len: int, b_off: int, b_len: int) -> bool:
     return a_len > 0 and b_len > 0 and a_off < b_off + b_len and b_off < a_off + a_len
+
+
+#: #875: below this, thread hand-off costs more than the copy. Chunks are 32 MiB
+#: by default (SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB), so the real path is never
+#: near this bound; it exists so a small-chunk configuration degrades to the
+#: serial copy instead of paying scheduling overhead per slice.
+_SAVE_SLICE_MIN_BYTES = 1 << 20
+
+#: One pool for the process, built on first use and reused by every flip.
+#: Per-chunk construction would dominate: a leg is 281-512 chunks.
+_SAVE_POOL = None
+_SAVE_POOL_WIDTH = 0
+
+
+def _save_slices_default() -> int:
+    """How many slices the staging copy is split into. 1 restores the old path.
+
+    Default 4, which is where the three-rank measurement flattens (5353-5701
+    MiB/s per rank against 3757-3869 serial); 8 buys nothing once the memory
+    controller is the bound. Env-settable because the right value is a property
+    of the box's memory system, not of this code.
+    """
+    try:
+        from sglang.srt.environ import envs
+
+        return max(1, int(envs.SGLANG_PHASE_FLIP_REFILL_SAVE_SLICES.get()))
+    except Exception:  # noqa: BLE001 - a knob may never break a flip
+        return 4
+
+
+def _save_pool(width: int):
+    """The shared slice pool, grown but never shrunk. None if threads are
+    unavailable, in which case the caller copies serially -- a rotation may not
+    fail because a thread could not be started."""
+    global _SAVE_POOL, _SAVE_POOL_WIDTH
+    if _SAVE_POOL is not None and _SAVE_POOL_WIDTH >= width:
+        return _SAVE_POOL
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _SAVE_POOL = ThreadPoolExecutor(
+            max_workers=width, thread_name_prefix="flip-save"
+        )
+        _SAVE_POOL_WIDTH = width
+        return _SAVE_POOL
+    except Exception:  # noqa: BLE001 - fall back to the serial copy
+        return None
 
 
 def rotate_arena(
