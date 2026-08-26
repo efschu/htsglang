@@ -1383,6 +1383,103 @@ def pp_residency_cap_s(cfg: "PhasePolicyConfig") -> float:
     return max(0.0, cfg.decode_stall_slo_s - 2.0 * cfg.flip_cost_s)
 
 
+#: #889 -- the three things that can end a PP residency on a CLOCK, named so a
+#: boot line can say which one is live instead of printing a knob that is not.
+PP_EXIT_BY_DRAIN = "drain only"
+PP_EXIT_BY_SLO_CAP = "decode-stall cap"
+PP_EXIT_BY_STOPWATCH = "hand-set stopwatch"
+
+
+def effective_pp_exit_term(cfg: "PhasePolicyConfig") -> tuple[str, float]:
+    """Which timed bound on PP residency is REACHABLE, and how big it is (#889).
+
+    THE DEFECT THIS EXISTS TO END. ``decide`` reaches the hand-set stopwatch
+    only through ``cap <= 0 and cfg.pp_window_s > 0``, so a declared
+    ``decode_stall_slo_s`` above ``2 * flip_cost_s`` makes
+    ``--phase-policy-pp-window-s`` UNREACHABLE. That supersession is intended
+    (``phase_purity.validate_purity_policy_pair`` accepts the SLO as the
+    substitute bound on purpose) -- what was not intended is that it happened
+    without a word, while the boot line kept printing the inert number. Live on
+    the w38b/w39/w40 line: window 15 s declared, SLO 180 s, seam 3.2 s, so the
+    phase actually ran to 173.6 s -- 11.573x longer than every reader believed.
+
+    THE GUARD ORDER HERE MIRRORS ``decide`` DELIBERATELY, and
+    ``test_decide_agrees_with_the_reported_term_on_both_sides`` pins that they
+    cannot drift apart. A reporter that derives the answer independently would
+    be a second authority on the same question, which is the shape of the bug,
+    not of the fix.
+    """
+    cap = pp_residency_cap_s(cfg)
+    if cap > 0:
+        return PP_EXIT_BY_SLO_CAP, cap
+    if cfg.pp_window_s > 0:
+        return PP_EXIT_BY_STOPWATCH, float(cfg.pp_window_s)
+    return PP_EXIT_BY_DRAIN, 0.0
+
+
+def superseded_pp_bound_warning(cfg: "PhasePolicyConfig") -> Optional[str]:
+    """The line a boot must print when one PP bound silences the other (#889).
+
+    ``None`` when at most one of the two is declared: a configuration that was
+    never ambiguous must not acquire a warning, or the warning stops being read.
+
+    WARNING, NOT REFUSAL -- decided on the danger direction, not on taste.
+
+    * The combination is SANCTIONED, not broken. ``validate_purity_policy_pair``
+      (phase_purity.py) explicitly accepts a declared SLO as the bound the
+      stopwatch used to supply, and calls it "a better one". Refusing at parse
+      what another validator accepts by design would make the two disagree
+      about the same configuration.
+    * The failure being fixed is a MISREAD, and its blast radius is a wrong
+      belief. The failure a refusal would introduce is a DEAD BOOT, and its
+      blast radius is the instance -- on a shipping config, since
+      ``deploy/turnkey/stack.rig3.toml:41`` and ``ship_env.capture:38`` set the
+      window unconditionally. Trading a documentation defect for an
+      availability defect is the worse direction, and it is the direction a
+      refusal picks.
+    * Nor may the code silently "honour both" with ``min(cap, window)``. On the
+      live pair that would cut the effective residency 173.6 s -> 15 s, i.e.
+      raise the flip rate by ~11x -- which is verbatim the mechanism the block
+      comment at ``DEFAULT_PP_WINDOW_S`` records as having killed three
+      consecutive boots (12 flips in four minutes, allocation failure at the
+      cutover seam). The safe move is to state the truth, not to change it.
+
+    Both directions of supersession are reported, because both are silent: an
+    SLO at or below the round trip collapses the cap to zero and is itself the
+    inert knob.
+    """
+    window = float(cfg.pp_window_s)
+    slo = float(cfg.decode_stall_slo_s)
+    if window <= 0 or slo <= 0:
+        return None
+    seam = float(cfg.flip_cost_s)
+    cap = pp_residency_cap_s(cfg)
+    if cap > 0:
+        direction = "LONGER" if cap > window else "SHORTER"
+        ratio = cap / window
+        return (
+            f"{LOG_PREFIX} #889 SUPERSEDED KNOB: --phase-policy-pp-window-s "
+            f"={window:g}s is INERT. A decode stall SLO of {slo:g}s is declared, "
+            f"so the reachable bound on PP residency is the solved decode-stall "
+            f"cap {cap:g}s (= {slo:g}s - 2x{seam:g}s seam), and the stopwatch "
+            f"arm sits behind `cap <= 0` and can never fire. EFFECTIVE PP "
+            f"RESIDENCY IS {ratio:.3g}x {direction} THAN THE REQUESTED WINDOW "
+            f"({cap:g}s vs {window:g}s). Intended supersession, announced rather "
+            f"than refused -- but read every PP-residency number against "
+            f"{cap:g}s, not against {window:g}s. To make the window govern, "
+            f"clear SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S / "
+            f"--phase-policy-decode-stall-slo-s."
+        )
+    return (
+        f"{LOG_PREFIX} #889 SUPERSEDED KNOB: --phase-policy-decode-stall-slo-s "
+        f"={slo:g}s is INERT. It does not clear the round trip it must contain "
+        f"(2x{seam:g}s seam = {2 * seam:g}s), so the solved cap collapses to 0 "
+        f"and the hand-set stopwatch governs instead: PP residency is bounded "
+        f"at {window:g}s, not at {slo:g}s. Declare an SLO above {2 * seam:g}s "
+        f"for it to take effect."
+    )
+
+
 def solved_tp_decode_floor_s(cfg: "PhasePolicyConfig") -> float:
     """Minimum TP dwell, SOLVED: one full round trip.
 
@@ -3957,7 +4054,7 @@ def config_from_env(
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
             "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g, "
             "decode contention %g, N ladder by decoding reqs %s, "
-            "resting layout %s (%s)",
+            "effective pp exit %s %gs, resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
@@ -3972,9 +4069,22 @@ def config_from_env(
             # top rung is exactly the defect #665-F1 was, and it is invisible
             # if only the first rung is logged.
             [effective_flip_threshold(cfg, b) for b in range(5)],
+            # #889: `pp window` above is the REQUESTED knob, and a declared
+            # decode-stall SLO makes it unreachable without touching it. The
+            # same line therefore has to carry the bound that actually ends the
+            # PP residency, or the one artifact an operator reads keeps
+            # reporting a number the policy no longer uses. This pair (15s
+            # requested, 173.6s effective) is the whole of #889.
+            *effective_pp_exit_term(cfg),
             cfg.rest_phase,
             cfg.rest_state,
         )
+        # #889: and when the two disagree, say so in its own line rather than
+        # leaving it to be spotted in a 14-field one. See
+        # `superseded_pp_bound_warning` for why this warns instead of refusing.
+        superseded = superseded_pp_bound_warning(cfg)
+        if superseded:
+            logger.warning("%s", superseded)
     return cfg
 
 
@@ -3994,6 +4104,12 @@ __all__ = [
     "PhasePolicyState",
     "break_even_tokens",
     "config_from_env",
+    # #889 -- the effective PP exit term and the supersession announcement.
+    "PP_EXIT_BY_DRAIN",
+    "PP_EXIT_BY_SLO_CAP",
+    "PP_EXIT_BY_STOPWATCH",
+    "effective_pp_exit_term",
+    "superseded_pp_bound_warning",
     "decide",
     "note_flip_armed",
     "note_flip_completed",

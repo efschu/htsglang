@@ -5659,7 +5659,11 @@ class ServerArgs:
             help="PP prefill window in seconds. Promoted from "
             "SGLANG_PHASE_POLICY_PP_WINDOW_S (#781). The in-code default is a "
             "MEASURED retreat to 0: non-zero 15/10-second defaults killed "
-            "three boots.",
+            "three boots. SUPERSEDED WHENEVER --phase-policy-decode-stall-slo-s "
+            "EXCEEDS TWICE THE SEAM (#889): the stopwatch arm sits behind "
+            "`cap <= 0`, so a declared SLO makes this value unreachable and the "
+            "bound becomes slo - 2*seam instead. Boot warns and the armed line "
+            "prints `effective pp exit`; read that, not this.",
         ),
     ] = None
     phase_policy_decode_stall_slo_s: A[
@@ -5670,7 +5674,11 @@ class ServerArgs:
             "to break the blocked-admission wedge, where PP cannot admit "
             "pending prefill because every state slot is held by a carried "
             "decode, so DRAINED can never fire. 0 disables the cap. Promoted "
-            "from SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (#781).",
+            "from SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (#781). SETTING THIS "
+            "SILENCES --phase-policy-pp-window-s (#889) whenever it exceeds "
+            "twice the seam; below that the solved cap collapses to 0 and THIS "
+            "flag is the inert one. Boot warns either way and the armed line "
+            "prints the effective term.",
         ),
     ] = None
     phase_policy_decode_contention: A[
