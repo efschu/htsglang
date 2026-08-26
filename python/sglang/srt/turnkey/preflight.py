@@ -25,6 +25,7 @@ suggestion.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import shutil
 import socket
@@ -162,18 +163,24 @@ def _real_cards() -> Sequence[CardObs]:
     out: List[CardObs] = []
     for d in nvml.list_devices():
         mem = nvml.memory_info_for_uuid(d.uuid)
-        out.append(CardObs(uuid=d.uuid, name=d.name, total_bytes=d.total_bytes,
-                           # The NVML FREE column, never total-used: the
-                           # driver carve-out is excluded from free and
-                           # included in used, so the subtraction reads ~0
-                           # and hides the shortfall.
-                           free_bytes=mem.free_bytes,
-                           # ...and carry the carve-out itself, so the
-                           # occupancy check can subtract the term instead of
-                           # comparing against a constant guessed above it.
-                           # NVML already measures this; preflight used to be
-                           # the one consumer in the tree that dropped it.
-                           reserved_bytes=mem.reserved_bytes))
+        out.append(
+            CardObs(
+                uuid=d.uuid,
+                name=d.name,
+                total_bytes=d.total_bytes,
+                # The NVML FREE column, never total-used: the
+                # driver carve-out is excluded from free and
+                # included in used, so the subtraction reads ~0
+                # and hides the shortfall.
+                free_bytes=mem.free_bytes,
+                # ...and carry the carve-out itself, so the
+                # occupancy check can subtract the term instead of
+                # comparing against a constant guessed above it.
+                # NVML already measures this; preflight used to be
+                # the one consumer in the tree that dropped it.
+                reserved_bytes=mem.reserved_bytes,
+            )
+        )
     return out
 
 
@@ -183,12 +190,69 @@ def _real_procs_on(uuid: str) -> Dict[int, int]:
     return nvml.process_bytes_on_uuid(uuid)
 
 
+logger = logging.getLogger(__name__)
+
+#: Returned by :func:`_real_mem_available` when host RAM cannot be established
+#: honestly. NEGATIVE on purpose, so it can never be mistaken for a size: a
+#: sentinel of 0 would read as "no RAM available" and refuse every boot on a
+#: box whose cgroup files are absent, which is the opposite of the rule the
+#: owner module states -- "a caller that cannot get a number must say so, not
+#: invent one", and refusing a boot on a fabricated figure is worse than not
+#: checking.
+MEM_AVAILABLE_UNKNOWN: int = -1
+
+#: The scope the figure below describes, named because it is not the only
+#: possible answer. Measured on this box, three cgroup levels report three
+#: different `memory.current` -- root 23.5 GiB, system.slice 23.3 GiB,
+#: system.slice/claude.service 22.3 GiB -- and all three carry
+#: `memory.max = max`. A headroom refusal that prints a bare GiB figure cannot
+#: be checked against any of them, because the reader cannot tell which
+#: question was asked.
+MEM_SCOPE = "cgroup /sys/fs/cgroup (container aggregate), #407 owner"
+
+
 def _real_mem_available() -> int:
-    with open("/proc/meminfo", "r") as fh:
-        for line in fh:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    raise RuntimeError("MemAvailable missing from /proc/meminfo")
+    """Host bytes a boot may believe, from the #407 owner.
+
+    THIS USED TO READ ``/proc/meminfo`` DIRECTLY, and it gates a HARD refusal
+    (``check_host_headroom`` -> ``REFUSE_HOST_HEADROOM``), so it is the boot
+    gate rather than a diagnostic. Reading that file here over-reported free
+    RAM twice over, and both halves are already written down elsewhere in this
+    tree:
+
+    * LXCFS SCOPE -- ``memtier/profile.py:honest_host_memory_bytes``: inside
+      this container ``/proc/meminfo`` is synthesised, ``MemAvailable`` can
+      EXCEED ``MemTotal`` (observed on this rig), and with ``memory.max``
+      unlimited it reports the HOST's figures on a box other containers are
+      also spending.
+    * CGROUP RESIDENT -- the owner additionally clamps by what this cgroup
+      already holds. Measured here: MemAvailable 113.19 GiB -> honest 112.95.
+
+    A gate that over-reports free RAM ADMITS a boot that should have been
+    refused, and #721 is that outcome on this box: a real container OOM with
+    ``oom_kill=17``.
+
+    #534, AN OPEN QUESTION CARRIED RATHER THAN GUESSED. CUDA pinned host memory
+    is accounted in the cgroup's ``file`` bucket, not ``anon`` -- measured in
+    commit c043235272, "the offload ledger reported 49.66 GiB of pinned pool
+    while ``anon`` sat steady at 14.6 GiB", and confirmed live on this box
+    (anon 2.12 GiB, file 19.06 GiB, current 21.39 GiB). The owner deliberately
+    never charges ``file``, correctly, because page cache is reclaimable --
+    pinned bytes there are not. Whether that makes this gate over-report AGAIN,
+    on top of what is corrected here, is decidable only by watching anon/file
+    across a real pin allocation, i.e. a boot. It is NOT guessed at here;
+    ``scripts/window_871a_verify.py`` prints the pair so the next boot with
+    pins answers it.
+    """
+    from sglang.srt.memtier.profile import host_memory_bytes_for_pinning
+
+    try:
+        _total, available = host_memory_bytes_for_pinning()
+    except Exception:  # noqa: BLE001 - a probe may never break the preflight
+        return MEM_AVAILABLE_UNKNOWN
+    if available is None:
+        return MEM_AVAILABLE_UNKNOWN
+    return int(available)
 
 
 def _real_disk_free(path: str) -> int:
@@ -295,9 +359,13 @@ def check_paths(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
     for lane in cfg.enabled_lanes():
         d = os.path.dirname(lane.boot_log)
         if d and not p.path_exists(d):
-            return refuse(REFUSE_PATH_MISSING, f"serving.{lane.name}.boot_log",
-                          f"parent dir {d} absent", "an existing directory",
-                          remedy="the unit's ExecStartPre creates log_dir")
+            return refuse(
+                REFUSE_PATH_MISSING,
+                f"serving.{lane.name}.boot_log",
+                f"parent dir {d} absent",
+                "an existing directory",
+                remedy="the unit's ExecStartPre creates log_dir",
+            )
     return None
 
 
@@ -317,22 +385,36 @@ def check_wheel(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
         try:
             obs = p.probe_import(module, "int8_scaled_mm")
         except ImportError as e:
-            return refuse(REFUSE_WHEEL_SHADOW, module, f"ImportError: {e}",
-                          f"an importable {module}")
+            return refuse(
+                REFUSE_WHEEL_SHADOW,
+                module,
+                f"ImportError: {e}",
+                f"an importable {module}",
+            )
         if w.version and obs.version != w.version:
-            return refuse(REFUSE_WHEEL_SHADOW, f"{module}.__version__",
-                          obs.version or "<none>", w.version,
-                          remedy="a shadowing dist owns the files; see "
-                                 "rig-runbook 2.1")
+            return refuse(
+                REFUSE_WHEEL_SHADOW,
+                f"{module}.__version__",
+                obs.version or "<none>",
+                w.version,
+                remedy="a shadowing dist owns the files; see " "rig-runbook 2.1",
+            )
         if not obs.has_arm:
             return refuse(
-                REFUSE_WHEEL_SHADOW, f"{module}.int8_scaled_mm", "absent",
+                REFUSE_WHEEL_SHADOW,
+                f"{module}.int8_scaled_mm",
+                "absent",
                 "present",
                 remedy="the INT8 arm was dropped by a plain pip install; "
-                       "reinstall the pinned wheel per rig-runbook 2.1")
+                "reinstall the pinned wheel per rig-runbook 2.1",
+            )
         if w.expect_prefix and not obs.module_file.startswith(w.expect_prefix):
-            return refuse(REFUSE_WHEEL_SHADOW, f"{module}.__file__",
-                          obs.module_file, f"a path under {w.expect_prefix}")
+            return refuse(
+                REFUSE_WHEEL_SHADOW,
+                f"{module}.__file__",
+                obs.module_file,
+                f"a path under {w.expect_prefix}",
+            )
     return None
 
 
@@ -394,20 +476,26 @@ def check_cards(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
     try:
         observed = list(p.cards())
     except Exception as e:  # driver absent, NVML unavailable
-        return refuse(REFUSE_CARD_CENSUS, "nvml", f"unavailable: {e}",
-                      "a working NVML")
+        return refuse(REFUSE_CARD_CENSUS, "nvml", f"unavailable: {e}", "a working NVML")
     by_uuid = {c.uuid: c for c in observed}
 
     for want in cfg.cards:
         got = by_uuid.get(want.uuid)
         if got is None:
             return refuse(
-                REFUSE_CARD_UNKNOWN_UUID, want.label or want.uuid, "absent",
+                REFUSE_CARD_UNKNOWN_UUID,
+                want.label or want.uuid,
+                "absent",
                 want.uuid,
-                remedy="present UUIDs: " + ", ".join(sorted(by_uuid)))
+                remedy="present UUIDs: " + ", ".join(sorted(by_uuid)),
+            )
         if want.expect_name and want.expect_name not in got.name:
-            return refuse(REFUSE_CARD_CENSUS, want.label or want.uuid,
-                          got.name, f"a name containing {want.expect_name}")
+            return refuse(
+                REFUSE_CARD_CENSUS,
+                want.label or want.uuid,
+                got.name,
+                f"a name containing {want.expect_name}",
+            )
 
     # Occupancy: a card the config claims must not already carry foreign
     # VRAM. The orphan-container trap -- a dead-but-not-reaped tenant holds
@@ -433,17 +521,23 @@ def check_cards(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
                 procs = p.procs_on(uuid)
             except Exception:
                 procs = {}
-            who = ", ".join(f"pid {pid}={b // MIB}MiB"
-                            for pid, b in sorted(procs.items())) or "no compute pids"
+            who = (
+                ", ".join(
+                    f"pid {pid}={b // MIB}MiB" for pid, b in sorted(procs.items())
+                )
+                or "no compute pids"
+            )
             spec = cfg.card_by_uuid(uuid)
             carve_mib = card.reserved_bytes // MIB
             return refuse(
-                REFUSE_CARD_BUSY, (spec.label if spec else "") or uuid,
+                REFUSE_CARD_BUSY,
+                (spec.label if spec else "") or uuid,
                 f"{foreign_mib} MiB foreign ({who}); "
                 f"NVML driver carve-out {carve_mib} MiB already discounted",
                 f"<= {cfg.preflight.card_busy_mib} MiB foreign",
                 remedy="stop the named pids BY PID; never pkill -f, which "
-                       "also matches the router")
+                "also matches the router",
+            )
     return None
 
 
@@ -452,11 +546,31 @@ def check_host_headroom(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
     if want <= 0:
         return None
     got = p.mem_available_bytes()
+    if got < 0:
+        # #871b: NO HONEST NUMBER -> NO GUARD, never a refusal. The sentinel is
+        # negative precisely so this branch is reachable: read as a size it
+        # would be "less than any want" and refuse every boot on a box whose
+        # cgroup files are absent. The owner module states the rule -- refusing
+        # a boot on a fabricated figure is worse than not checking -- and this
+        # is the one place in the preflight where getting that backwards costs
+        # an instance that would have run.
+        logger.warning(
+            "preflight: host RAM could not be established honestly from %s; "
+            "the %d GiB headroom gate is STANDING DOWN for this boot. Size the "
+            "host against the machine yourself.",
+            MEM_SCOPE,
+            want,
+        )
+        return None
     if got < want * GIB:
-        return refuse(REFUSE_HOST_HEADROOM, "MemAvailable",
-                      f"{got / GIB:.1f} GiB", f">= {want} GiB",
-                      remedy="a boot that starts short of host RAM dies in "
-                             "weight load, after paying for it")
+        return refuse(
+            REFUSE_HOST_HEADROOM,
+            f"host RAM available [{MEM_SCOPE}]",
+            f"{got / GIB:.1f} GiB",
+            f">= {want} GiB",
+            remedy="a boot that starts short of host RAM dies in "
+            "weight load, after paying for it",
+        )
     return None
 
 
@@ -467,8 +581,9 @@ def check_disk(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
         except OSError as e:
             return refuse(REFUSE_PATH_MISSING, path, str(e), "an existing path")
         if got < want_gib * GIB:
-            return refuse(REFUSE_DISK_HEADROOM, path, f"{got / GIB:.1f} GiB",
-                          f">= {want_gib} GiB")
+            return refuse(
+                REFUSE_DISK_HEADROOM, path, f"{got / GIB:.1f} GiB", f">= {want_gib} GiB"
+            )
     return None
 
 
@@ -479,18 +594,21 @@ def check_ports(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
     liveness is a standing law. A preflight that expected it free would, at
     best, refuse every boot; at worst it would invite somebody to free it.
     """
-    wanted: List[tuple] = [(lane.port, f"serving.{lane.name}.port")
-                           for lane in cfg.enabled_lanes()]
-    wanted += [(port, "preflight.check_ports")
-               for port in cfg.preflight.check_ports]
+    wanted: List[tuple] = [
+        (lane.port, f"serving.{lane.name}.port") for lane in cfg.enabled_lanes()
+    ]
+    wanted += [(port, "preflight.check_ports") for port in cfg.preflight.check_ports]
     for port, subject in wanted:
         if port in cfg.preflight.protected_ports:
             continue
         if p.port_busy(port):
-            return refuse(REFUSE_PORT_BUSY, subject, f"port {port} answers",
-                          "a free port",
-                          remedy="find the holder with `ss -ltnp` and stop it "
-                                 "by pid")
+            return refuse(
+                REFUSE_PORT_BUSY,
+                subject,
+                f"port {port} answers",
+                "a free port",
+                remedy="find the holder with `ss -ltnp` and stop it " "by pid",
+            )
     return None
 
 
@@ -546,9 +664,16 @@ def run_all(cfg: StackConfig, p: Optional[Probes] = None) -> List[Refusal]:
         r = fn(cfg)
         if r:
             out.append(r)
-    for fn in (check_paths, check_wheel, check_wheel_dist_shadow, check_cards,
-               check_host_headroom, check_disk, check_ports,
-               check_vram_calibration):
+    for fn in (
+        check_paths,
+        check_wheel,
+        check_wheel_dist_shadow,
+        check_cards,
+        check_host_headroom,
+        check_disk,
+        check_ports,
+        check_vram_calibration,
+    ):
         try:
             r = fn(cfg, p)
         except RefusalError as e:

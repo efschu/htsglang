@@ -182,7 +182,36 @@ class MachineResources:
 
 
 def read_meminfo(path: str = "/proc/meminfo") -> tuple[int, int]:
-    """``(MemTotal, MemAvailable)`` in bytes. ``(0, 0)`` off Linux."""
+    """``(MemTotal, MemAvailable)`` in bytes. ``(0, 0)`` off Linux.
+
+    #871b: THE SECOND COPY OF THE SAME REIMPLEMENTATION, closed in the same
+    pass as the first. This is only ADVISORY -- unlike
+    ``turnkey/preflight.py``, nothing here refuses a boot -- but a defect class
+    with a known second instance does not get left pending, because that is
+    exactly how the first one survived long enough to reach a gate.
+
+    The default path now goes through ``memtier.profile`` (#407 owner), which
+    corrects for two things a raw ``/proc/meminfo`` read cannot: inside this
+    container the file is synthesised by lxcfs (``MemAvailable`` can exceed
+    ``MemTotal``, and with ``memory.max`` unlimited it reports the HOST's
+    figures), and the owner additionally clamps by what this cgroup already
+    holds.
+
+    An EXPLICIT ``path`` still reads that file directly. Callers that pass one
+    are asking about a specific file -- the tests do -- and silently ignoring
+    an argument would be worse than the reading it corrects.
+    """
+    if path == "/proc/meminfo":
+        try:
+            from sglang.srt.memtier.profile import host_memory_bytes_for_pinning
+
+            total, available = host_memory_bytes_for_pinning()
+            if total is not None and available is not None:
+                return int(total), int(available)
+        except Exception:  # noqa: BLE001 - advisory probe, never raises
+            pass
+        # Fall through: the owner could not establish a pair, so the raw file
+        # is a better answer than zeros -- this caller only reports.
     try:
         values: dict[str, int] = {}
         with open(path, "r", encoding="utf-8") as handle:
