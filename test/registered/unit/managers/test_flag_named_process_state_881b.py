@@ -120,9 +120,29 @@ def _files() -> dict:
     }
 
 
+def _strip_prose(text: str) -> str:
+    """Remove docstrings and comments before counting CALL SITES.
+
+    #881c, AND IT IS MY OWN DEFECT. The first version counted literal
+    ``set_X(`` occurrences minus ``def`` lines. So when #881's corrected
+    docstring NAMED both installers in prose, the scan counted those two
+    sentences as installers and reported FOUR where the tree has TWO.
+
+    A counter that counts its own documentation inflates exactly when someone
+    documents the thing it measures -- that is, immediately after a fix, which
+    is the worst possible moment. Same family as the 900-char window: the probe
+    did not report its own reach, so its number could not be read.
+    """
+    text = re.sub(r'"""(?:.|\n)*?"""', "", text)
+    text = re.sub(r"'''(?:.|\n)*?'''", "", text)
+    return re.sub(r"#[^\n]*", "", text)
+
+
 def _findings() -> dict:
+    # Docstrings are stripped for the INSTALLER count but kept for the
+    # docstring scan below, which needs exactly the prose this removes.
     files = _files()
-    blob = "\n".join(files.values())
+    blob = _strip_prose("\n".join(files.values()))
     calls = collections.Counter(_SET.findall(blob))
     defs = collections.Counter(_DEF.findall(blob))
     multi = {n: calls[n] - defs[n] for n in calls if calls[n] - defs[n] >= 2}
@@ -148,18 +168,18 @@ class TestFlagNamedProcessState(CustomTestCase):
     def test_the_criterion_finds_more_installers_than_hand_search_did(self):
         """Derived, not inherited: the specimen hunt found two installers of
         the plan by hand. The structural count must not be smaller."""
-        files = _files()
-        blob = "\n".join(files.values())
+        blob = _strip_prose("\n".join(_files().values()))
         n = len(_SET.findall(blob)) - len(_DEF.findall(blob))
         self.assertGreater(n, 20, "the installer scan collapsed")
         calls = collections.Counter(_SET.findall(blob))
         defs = collections.Counter(_DEF.findall(blob))
         self.assertGreaterEqual(
             calls["set_tp_partition_ratios"] - defs["set_tp_partition_ratios"],
-            3,
-            "get_tp_partition_ratios should have at least three installers; a "
-            "smaller count means the scan stopped seeing them, not that they "
-            "went away",
+            2,
+            "get_tp_partition_ratios has TWO real call sites (scheduler.py, "
+            "phase_flip_boot.py). An earlier version of this test demanded "
+            "THREE and passed only because #881's docstring named them in "
+            "prose -- the scan was counting its own documentation.",
         )
 
     def test_it_covers_the_specimen(self):
