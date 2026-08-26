@@ -1239,8 +1239,15 @@ def _apply_stack_result(
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
     if result.register_req_to_token_counter:
+        # #904: THE LIVE WIRING. registry.py:107-110 routes hybrid SSM +
+        # hicache here (HiMambaRadixCache has no construction site), so this
+        # is the call that decides whether the recurrent read can join its
+        # own H2D transfer. The frame is the controller's step count -- one
+        # number, handed from the stack that built both, so the pool cannot
+        # wait in an index space the producer does not count in.
         params.req_to_token_pool.register_layer_transfer_counter(
-            result.cache_controller.layer_done_counter
+            result.cache_controller.layer_done_counter,
+            mamba_transfer_frame=result.transfer_layer_num,
         )
 
     logger.info(
@@ -1582,7 +1589,8 @@ def attach_hybrid_pool_to_mamba_cache(
         mamba_cache.host_pool_group = host_pool_group
         mamba_cache.cache_controller = cache_controller
         params.req_to_token_pool.register_layer_transfer_counter(
-            cache_controller.layer_done_counter
+            cache_controller.layer_done_counter,
+            mamba_transfer_frame=mamba_cache.transfer_layer_num,
         )
         hybrid_kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
         logger.info(
