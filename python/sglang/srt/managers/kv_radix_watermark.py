@@ -74,8 +74,35 @@ LOG_PREFIX = "KV-WATERMARK"
 MAX_PASSES = 64
 
 
+def _node_rows_readable(node: Any) -> bool:
+    """Can this module read a row slot off this node AT ALL?
+
+    #872b: a TYPE question, deliberately not a value question, and that is the
+    whole point. ``_node_rows`` answers ``None`` both for "this node holds no
+    rows" (ordinary, correct) and for "this node's rows are somewhere I do not
+    know how to look" (a defect), and those two must not be told apart by
+    whether any node happened to hold rows -- a tree whose nodes are all
+    momentarily empty would then be reported as broken, which is the
+    crying-wolf gate that gets an alarm muted.
+
+    Asking the type removes the ambiguity entirely: ``.value`` either exists as
+    a slot on this object or it does not, whatever it currently contains. An
+    evicted node with ``value = None`` is READABLE and empty; a
+    ``UnifiedTreeNode``, whose rows live at ``component_data[<type>].value``,
+    is UNREADABLE and its emptiness is an artefact of this module looking in
+    the wrong place.
+    """
+    return hasattr(node, "value")
+
+
 def _node_rows(node: Any) -> Optional[Any]:
-    """The row-id tensor a node holds, or None when it holds none."""
+    """The row-id tensor a node holds, or None when it holds none.
+
+    Callers that need to distinguish "holds none" from "this module cannot see
+    this node's rows" must ask ``_node_rows_readable`` -- this function
+    deliberately keeps its two-valued contract so its many call sites stay
+    unchanged.
+    """
     value = getattr(node, "value", None)
     if value is None:
         return None
@@ -100,14 +127,48 @@ def _max_row(node: Any) -> int:
         return int(max(value))
 
 
+#: The reference counters this module knows how to read off a node. A node
+#: carrying NONE of them has a lock state this module cannot see at all --
+#: which is not the same as a node that is unlocked.
+_LOCK_REF_ATTRS = ("full_lock_ref", "mamba_lock_ref", "lock_ref")
+
+
+def _lock_state_readable(node: Any) -> bool:
+    """Can this module see this node's reference counts AT ALL?
+
+    #872b, and the reason it matters more than the row probe: the default on
+    the ``getattr`` below is ``0``, and ``0`` means UNLOCKED. So for a node
+    type carrying none of these names the miss does not resolve to "I don't
+    know", it resolves to "evict me" -- the permissive direction.
+
+    ``UnifiedTreeNode`` is exactly such a type: its counters are per component,
+    at ``component_data[ct].lock_ref`` / ``.host_lock_ref``, so every node of
+    the live cache -- including one pinned by a running request -- reads as
+    unlocked here.
+    """
+    return any(hasattr(node, attr) for attr in _LOCK_REF_ATTRS)
+
+
 def _is_unlocked(node: Any) -> bool:
     """Evictable by the cache's own policy: nothing holds a reference.
 
     Both counters are consulted because the mamba tree locks the two
     payloads independently, and a node whose mamba state is locked cannot
     be passed to ``_evict_leaf_node`` -- it asserts on exactly that.
+
+    #872b: AN UNREADABLE LOCK STATE IS TREATED AS LOCKED. The alternative is
+    what this function used to do -- read "no counter present" as "no
+    reference held" and offer the node up for eviction. Today that is masked,
+    because ``_node_rows`` misses on the same node types and nothing ever
+    reaches the actuator; the two are one row-probe fix apart from evicting
+    rows a request is still using, which is the #718 family. Failing safe
+    costs nothing measurable: on the node types this module CAN read, the
+    counters decide as before, and on the ones it cannot, the rung already
+    frees nothing.
     """
-    for attr in ("full_lock_ref", "mamba_lock_ref", "lock_ref"):
+    if not _lock_state_readable(node):
+        return False
+    for attr in _LOCK_REF_ATTRS:
         ref = getattr(node, attr, 0)
         try:
             if int(ref) > 0:
@@ -184,22 +245,28 @@ def _warn_if_node_rows_unreadable(tree_cache: Any, nodes: List[Any]) -> None:
     """
     if not nodes:
         return
-    # The already-reported check comes FIRST because it is O(1) and the scan
-    # below is O(nodes). This runs on the gate's unconditional pricing path,
-    # and re-walking every node on every call to re-derive a permanent,
-    # already-reported property is a cost the diagnosis does not need to keep
-    # paying.
+    # #872b: BOTH CHECKS ARE O(1), and the second one is a TYPE test rather
+    # than the value scan this used to run.
+    #
+    # The old form asked "did any node yield rows", which is a scan of the
+    # whole walk AND is wrong at the edge: a tree whose nodes are all
+    # momentarily empty (every `value` present but zero-length) reports as
+    # unreadable and draws an alarm it has not earned. Since a radix tree
+    # builds its children from one factory -- `UnifiedRadixCache` literally
+    # does `defaultdict(partial(UnifiedTreeNode, ...))` -- every node in a
+    # given tree is the same class, so the first node's TYPE answers for all
+    # of them, exactly and in constant time.
     key = f"{type(tree_cache).__name__}/{type(nodes[0]).__name__}"
     if key in _UNREADABLE_WARNED:
         return
-    if any(_node_rows(node) is not None for node in nodes):
+    if _node_rows_readable(nodes[0]):
         return
     _UNREADABLE_WARNED.add(key)
     logger.error(
-        "%s #872 UNREADABLE NODES: %s holds %d node(s) of type %s and NONE of "
-        "them yields a row tensor via `.value`, so this rung prices every "
-        "tree as 'nothing evictable' and frees nothing, always. That zero is "
-        "a PROBE MISS, not a measurement, and the caller cannot tell the "
+        "%s #872 UNREADABLE NODES: %s holds %d node(s) of type %s, which "
+        "exposes no `.value` row slot at all, so this rung prices every tree "
+        "as 'nothing evictable' and frees nothing, always. That zero is a "
+        "PROBE MISS, not a measurement, and the caller cannot tell the "
         "difference -- do not read it as 'the tree is genuinely live'. "
         "%s's rows are reached differently (see UnifiedTreeNode.component_data) "
         "and its eviction primitive is not the `_delete_leaf` pair this module "
