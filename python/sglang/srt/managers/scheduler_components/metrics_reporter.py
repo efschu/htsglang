@@ -151,18 +151,52 @@ def _note_work_layout(scheduler, batch, prefill_stats) -> None:
         from sglang.srt.managers.phase_purity import purity_of
 
         now = time.perf_counter()
+        purity = purity_of(scheduler)
+        batch_class = "prefill"
+        phase = "tp" if phase_flip_tp_routing_active() else "pp"
+        new_tokens = int(getattr(prefill_stats, "log_input_tokens", 0) or 0)
+        # #887/#870: the chunk size the permitted TP self-prefill is measured
+        # against. getattr with None, so a scheduler stand-in without
+        # server_args gets the pre-#887 verdict rather than a 0 that would
+        # read as "no cap" -- and `budget_configured` NAMES which case it is
+        # without gating it (the permission is about the quantity, not about
+        # whether an operator wrote the flag).
+        chunk_tokens = getattr(
+            getattr(scheduler, "server_args", None), "chunked_prefill_size", None
+        )
+        budget_configured = int(getattr(purity, "tp_compute_chunk_budget", 0) or 0)
+        transport_verified = bool(getattr(batch, "is_seam_transport", False))
+        cached_tokens = int(getattr(prefill_stats, "log_hit_tokens", 0) or 0)
+        allowed = layout_conformance.tp_compute_exception_verdict(
+            batch_class=batch_class,
+            phase=phase,
+            new_tokens=new_tokens,
+            chunk_tokens=chunk_tokens,
+            budget_configured=budget_configured,
+            # THE SAME INPUTS THE VERDICT BELOW GETS, so this caller cannot
+            # reach a different answer than the one that decides the violation.
+            # A genuine restore is excused by the transport clause INSIDE this
+            # function, which is why the precedence lives there and not in an
+            # extra condition on the `elif`.
+            transport_verified=transport_verified,
+            cached_tokens=cached_tokens,
+        )
         detail = layout_conformance.work_layout_verdict(
-            batch_class="prefill",
-            phase="tp" if phase_flip_tp_routing_active() else "pp",
-            strict=bool(purity_of(scheduler).strict),
-            transport_verified=bool(getattr(batch, "is_seam_transport", False)),
+            batch_class=batch_class,
+            phase=phase,
+            strict=bool(purity.strict),
+            transport_verified=transport_verified,
             n_reqs=int(getattr(prefill_stats, "num_new_seqs", 0) or 0),
-            new_tokens=int(getattr(prefill_stats, "log_input_tokens", 0) or 0),
-            cached_tokens=int(getattr(prefill_stats, "log_hit_tokens", 0) or 0),
+            new_tokens=new_tokens,
+            cached_tokens=cached_tokens,
             now=now,
+            chunk_tokens=chunk_tokens,
+            budget_configured=budget_configured,
         )
         if detail:
             layout_conformance.note_conformance_violation(detail, now)
+        elif allowed and bool(purity.strict):
+            layout_conformance.note_tp_compute_exception(allowed, now)
     except Exception:  # noqa: BLE001 - an instrument may never break the stats line
         pass
 
