@@ -162,7 +162,7 @@ class TreeComponent(ABC):
         ...
 
     def explain_match_refusal(
-        self, node: "UnifiedTreeNode", depth: int, match_device_only: bool = False
+        self, node: UnifiedTreeNode, depth: int, match_device_only: bool = False
     ) -> Optional[str]:
         """Which of this component's conditions declined ``node``, or None.
 

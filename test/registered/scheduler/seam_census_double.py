@@ -205,7 +205,7 @@ class FaithfulTreeCache:
     def __init__(
         self,
         ledger: RowLedger,
-        req_to_token_pool: "ReqSlotPool",
+        req_to_token_pool: ReqSlotPool,
         *,
         cached_rows: int = 12,
     ):
