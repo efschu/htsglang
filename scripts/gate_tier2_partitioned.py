@@ -424,10 +424,19 @@ def main() -> int:
         if inconclusive and rc == 0:
             rc = 3
             print("  VERDICT: INCONCLUSIVE -- a solo re-run could not answer.")
-        # 6 only when the crowding is the ONLY thing wrong. One genuine failure
-        # anywhere -- including in the serial lane, which is not re-run -- and
-        # the ordinary red code wins, so a real regression is never filed under
-        # a flake's name.
+        # 6 only when non-reproduction is the ONLY thing wrong. One genuine
+        # failure anywhere in the run and the ordinary red code wins, so a real
+        # regression is never filed under a flake's name.
+        #
+        # KNOWN LIMIT, measured 2026-08-26: the re-run happens on this box,
+        # seconds after the lane it is classifying, so it inherits whatever the
+        # lane left behind -- warm CPUs, sockets in TIME_WAIT, ranks still
+        # exiting. `test_pp_admission_wraparound_never_blocks` is 5/5 green
+        # alone on a settled box and failed the gate's own re-run immediately
+        # after the serial lane. That error runs toward GENUINE, i.e. toward
+        # red, which is the safe direction: the re-run can call a load artefact
+        # real, never the reverse. A settling delay or a quarantine re-run is
+        # owed, not built.
         elif rc == 0 and not_reproduced and not (union - set(not_reproduced)):
             rc = 6
             print("  VERDICT: exit 6 -- every failure in this run is unrecorded and")
