@@ -529,6 +529,13 @@ class Envs:
     # checkpoints per radix path evict_mamba keeps live (best effort; a
     # second eviction pass ignores the window when the pool must yield).
     SGLANG_MAMBA_CKPT_WINDOW = EnvInt(2)
+    # #904 (g)/(h): split `#cached-token: 0` into its three worlds --
+    # NOT_PRESENT (nothing stored: the write-side null #869b measured), DEAD
+    # (evicted, no host backup) and REFUSED (bytes reachable, a component
+    # validator declined them). Only the last two mean a row was loaded and
+    # then invalidated before it could be read. 0 = off, and the walk builds
+    # no census object at all; N = emit every Nth match, plus EVERY refusal.
+    SGLANG_MATCH_REFUSAL_CENSUS_EVERY = EnvInt(0)
     # --mamba-checkpoint-interval: resume only at the DEEPEST interval
     # boundary of the full-KV match (else recompute from 0) instead of the
     # deepest surviving on-grid checkpoint.

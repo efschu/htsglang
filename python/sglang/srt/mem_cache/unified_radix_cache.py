@@ -56,6 +56,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.match_refusal_census import (
+    emit as census_emit,
+    new_match_census,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -1296,13 +1300,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for comp in self._components_tuple
             )
 
+        # #904 (g)/(h): the read-side discriminator. None unless armed, and
+        # when it is None the walk below does not build or feed anything --
+        # see match_refusal_census for why a zero hit is three worlds, not
+        # one, and why only two of them are defects.
+        census = new_match_census()
+        if census is not None:
+            # An armed walk always counts as observed, even when it traverses
+            # nothing: "the root had no matching child" is NOT_PRESENT, a real
+            # verdict, and must not be reported as "I did not measure".
+            census.note_reached(0)
+        component_names = tuple(type(comp).__name__ for comp in self._components_tuple)
+
         def _all_valid(validators, node, depth):
             return all([v(node, depth) for v in validators])
 
-        def _update_best_if_valid(node, depth):
+        def _census_refusals(node, depth, tokens):
+            """Attribute a refusal to the component(s) that declined it.
+
+            Runs ONLY on the armed path and ONLY for a node that was already
+            found invalid, so the extra validator calls cost nothing in the
+            default configuration and nothing on an accepted node.
+            """
+            for name, validator in zip(component_names, validators):
+                if not validator(node, depth):
+                    census.note_refused(name, tokens)
+
+        def _update_best_if_valid(node, depth, key_tokens=0):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
             matched = _all_valid(validators, node, depth)
+            if census is not None:
+                census.note_reached(key_tokens)
+                if matched:
+                    census.note_accepted(key_tokens)
+                else:
+                    _census_refusals(node, depth, key_tokens)
             if matched:
                 best_match_node = node
 
@@ -1327,6 +1360,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
+                # #904: the tree kept this node's SHAPE without its bytes.
+                # The key matched, so the prefix was stored once; recording
+                # the tokens it would have contributed is what separates
+                # "loaded then invalidated" from "never written".
+                if census is not None:
+                    census.note_dead_stop(
+                        child.key.match(key, page_size=self.page_size)
+                    )
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
@@ -1335,18 +1376,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 cum_tokens += prefix_len
-                _update_best_if_valid(node, cum_tokens)
+                _update_best_if_valid(node, cum_tokens, prefix_len)
                 break
 
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             cum_tokens += prefix_len
-            _update_best_if_valid(node, cum_tokens)
+            _update_best_if_valid(node, cum_tokens, prefix_len)
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
 
+        census_emit(census, logger)
         return (
             value,
             best_match_node,
