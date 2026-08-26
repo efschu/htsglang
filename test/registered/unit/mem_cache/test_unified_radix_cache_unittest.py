@@ -2379,7 +2379,15 @@ class UnifiedRadixCacheSuite:
                     return 1 + names.index(PoolName.SWA)
             return None
 
-        def fake(tensor, op=None, group=None):
+        def fake(tensor, op=None, group=None, async_op=False):
+            # ``async_op`` is not optional decoration: hiradix_cache.py:267,275
+            # ALWAYS passes ``async_op=True`` and hands the result to
+            # ``_wait_bounded``. A double that cannot accept it raises TypeError
+            # inside mock's dispatch before any assertion below runs, which is
+            # what made these tests fail on every machine that had a card --
+            # and pass nowhere, because every machine without one skips them.
+            # Returning None stays correct: bounded_wait documents None as a
+            # completed no-op (hicache_collective.py:190-196).
             if op == dist.ReduceOp.MIN:
                 min_sizes.append(tensor.numel())
                 if drop_swa:
