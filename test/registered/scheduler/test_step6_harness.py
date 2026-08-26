@@ -77,7 +77,21 @@ class TestFlipStatsParserAgainstRealFormat(CustomTestCase):
         for r in kv:
             self.assertEqual(r["direction"], "pp_to_tp")
             self.assertGreaterEqual(r["total_ms"], 0.0)
-            self.assertGreaterEqual(r["live_slots"], 1)
+            # #905 CONTRACT CHANGE. This line read `>= 1` -- a flip that
+            # reported zero slots was a flip whose live-set enumeration had
+            # gone blind, and that reading was correct until #856. The seam
+            # now retracts every resident and rebuilds the plan on an EMPTY
+            # slot tensor before it emits this line, so the honest expectation
+            # inverted: EXACTLY ZERO. A DONE line reporting slots is a flip
+            # that carried KV, which the no-carry seam forbids -- so the
+            # assertion still fails on a blind enumeration (it would have to
+            # report a nonzero count to do so) and now also fails on a carry.
+            self.assertEqual(
+                r["live_slots"],
+                0,
+                "the runtime reported a non-empty transfer plan at the "
+                "cutover; #856 rebuilds it empty and the flip carries no KV",
+            )
 
         # GDN line: emitted through the real mover logger call signature.
         gdn_logger_line = (
