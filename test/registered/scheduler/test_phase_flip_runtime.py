@@ -560,10 +560,23 @@ class TestSchedulerSideHelpers(CustomTestCase):
         for over in (
             {"chunked_req": object()},
             {"result_queue": [object()]},
-            # A request that exists ONLY in last_batch: not yet merged
-            # into the resident set the carry harvests, so flipping now
-            # would leave it behind. Clears itself in one iteration.
-            {"last_batch": SimpleNamespace(reqs=[SimpleNamespace(rid="new")])},
+            # THE ORPHAN GATE WAS HERE AND IT IS GONE, not narrowed.
+            #
+            # This row asserted that a request reachable only through
+            # last_batch -- "not yet merged into the resident set the carry
+            # harvests" -- blocks the flip. #856 (9fab2cc62e, 2026-08-24)
+            # deleted the carry: the seam retracts residents and drops the
+            # tree instead of harvesting them. c2e69c22cd [#858] 2026-08-25
+            # then removed the gate from `build_flip_quiescence_fn` in as many
+            # words ("THE ORPHAN GATE IS GONE, NOT NARROWED"), because
+            # `_live_reqs` already enumerates last_batch and the retraction
+            # therefore already sees that request. The production commit did
+            # not touch this file, so the row stood for a mechanism that no
+            # longer exists (#898, determined 2026-08-26).
+            #
+            # The replacement contract is pinned one test down, in the
+            # positive direction:
+            # `test_last_batch_mirroring_the_resident_set_does_not_block_the_flip`.
             # An in-flight PP microbatch: the pipeline is not quiet.
             {"mbs": [SimpleNamespace(is_empty=lambda: False)]},
         ):

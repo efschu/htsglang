@@ -385,10 +385,33 @@ class TestThrottleBeforeRetractOrdering(unittest.TestCase):
         end = src.index("\n    def ", start + 1)
         return src[start:end]
 
+    #: The retraction fallback inside ``update_running_batch``. #679
+    #: (82ba7e2c10, 2026-08-16) moved the body behind
+    #: ``_retract_decode_and_requeue``; the literal pinned here was
+    #: ``batch.retract_decode(``, which stopped existing at that commit while
+    #: this test was left as it was (#898, determined 2026-08-26).
+    RETRACT_CALL = "self._retract_decode_and_requeue("
+    THROTTLE_CALL = "throttle_before_retract("
+
+    def _locate(self, block: str, needle: str) -> int:
+        """``str.index`` raises a bare ``ValueError: substring not found``,
+        which says neither which literal went missing nor where to look. A
+        source pin that drifts must name its own drift -- that is the whole
+        reason the pin exists."""
+        at = block.find(needle)
+        if at < 0:
+            self.fail(
+                f"{needle!r} no longer appears in Scheduler.update_running_batch "
+                f"({_SCHEDULER_PY}). Either the ordering this test guards was "
+                f"refactored away, or the call was renamed and this pin must "
+                f"follow it. Block is {len(block)} chars."
+            )
+        return at
+
     def test_source_calls_throttle_before_retract_decode(self):
         block = self._update_running_batch_source()
-        throttle_at = block.index("throttle_before_retract(")
-        retract_at = block.index("batch.retract_decode(")
+        throttle_at = self._locate(block, self.THROTTLE_CALL)
+        retract_at = self._locate(block, self.RETRACT_CALL)
         self.assertLess(
             throttle_at,
             retract_at,
