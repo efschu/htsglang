@@ -234,5 +234,83 @@ class OneRootKillsBothTicketsIncluding866(unittest.TestCase):
         self.assertIsNone(getattr(sched, "admission_wedge_recovery_channel", None))
 
 
+class TheThirdInstanceLayoutConformance838(unittest.TestCase):
+    """#838's permitted one-chunk TP self-prefill -- the same class again.
+
+    The user permitted the TP phase to prefill up to ONE CHUNK itself on
+    2026-08-25 and predicted this blind spot in the same breath. On the #857
+    boot the detector flagged 165 batches -- EVERY TP prefill batch on a boot
+    whose acceptance passed -- with new_tokens between 14 and 170 against a
+    4096 budget.
+
+    The discriminator is NOT "is the number small". It is "did the chunk
+    budget BIND": a batch at the budget was truncated by it, so more prefill
+    stands behind it. W37-D's 258 batches measured exactly 4096 with 0 cached,
+    and a cap written `<=` would have called every one of them permitted.
+    """
+
+    BUDGET = 4096
+
+    def _verdict(self, **kw):
+        from sglang.srt.managers import layout_conformance
+
+        args = dict(
+            batch_class="prefill",
+            phase="tp",
+            strict=True,
+            transport_verified=True,
+            n_reqs=8,
+            new_tokens=160,
+            cached_tokens=0,
+            now=0.0,
+            chunk_budget=self.BUDGET,
+        )
+        args.update(kw)
+        return layout_conformance.work_layout_verdict(**args)
+
+    def test_the_live_857_batches_are_permitted(self):
+        # Every distinct new_tokens value measured in the boot log.
+        for n in (14, 18, 20, 25, 52, 67, 70, 160, 167, 170):
+            self.assertIsNone(self._verdict(new_tokens=n), f"new_tokens={n}")
+
+    def test_W37D_IS_STILL_A_VIOLATION(self):
+        """The can-fail that matters: the defect #838 exists for."""
+        detail = self._verdict(new_tokens=self.BUDGET, n_reqs=258)
+        self.assertIsNotNone(detail, "a batch AT the budget is chunk-limited")
+        self.assertIn("work_in_wrong_layout", detail)
+
+    def test_beyond_the_budget_is_a_violation(self):
+        self.assertIsNotNone(self._verdict(new_tokens=self.BUDGET + 1))
+
+    def test_without_a_budget_the_pre_870_verdict_is_unchanged(self):
+        self.assertIsNotNone(self._verdict(chunk_budget=None))
+
+    def test_a_restore_of_any_size_never_trips_the_cap(self):
+        # The cap is measured on COMPUTED tokens. Restored tokens are not in
+        # that quantity, so restore is unlimited by construction.
+        self.assertIsNone(self._verdict(new_tokens=8, cached_tokens=1_000_000))
+        self.assertIsNone(self._verdict(new_tokens=1, cached_tokens=500_000))
+
+    def test_a_huge_recompute_wearing_transports_clothes_still_alarms(self):
+        # cached_tokens == 0 under a transport claim, above the budget: the
+        # W37-G shape, untouched by the new allowance.
+        self.assertIsNotNone(
+            self._verdict(new_tokens=100_000, cached_tokens=0, transport_verified=True)
+        )
+
+    def test_non_strict_is_still_silent(self):
+        self.assertIsNone(self._verdict(strict=False, new_tokens=self.BUDGET))
+
+    def test_the_allowance_does_not_leak_to_decode_in_pp(self):
+        # The permission the user gave is for TP self-PREFILL only.
+        self.assertIsNotNone(
+            self._verdict(batch_class="decode", phase="pp", new_tokens=160)
+        )
+
+    def test_the_budget_boundary_is_exact(self):
+        self.assertIsNone(self._verdict(new_tokens=self.BUDGET - 1))
+        self.assertIsNotNone(self._verdict(new_tokens=self.BUDGET))
+
+
 if __name__ == "__main__":
     unittest.main()

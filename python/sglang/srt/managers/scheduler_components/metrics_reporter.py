@@ -160,6 +160,13 @@ def _note_work_layout(scheduler, batch, prefill_stats) -> None:
             new_tokens=int(getattr(prefill_stats, "log_input_tokens", 0) or 0),
             cached_tokens=int(getattr(prefill_stats, "log_hit_tokens", 0) or 0),
             now=now,
+            # #870: the one-chunk budget the permitted TP self-prefill is
+            # measured against. getattr with None, so a scheduler stand-in
+            # without server_args gets the pre-#870 verdict rather than a
+            # zero that would read as "no budget".
+            chunk_budget=getattr(
+                getattr(scheduler, "server_args", None), "chunked_prefill_size", None
+            ),
         )
         if detail:
             layout_conformance.note_conformance_violation(detail, now)

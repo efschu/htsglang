@@ -17,7 +17,11 @@ throughout.
 ## RESULT IN ONE BLOCK
 
     class            a detector's signature was made AMBIGUOUS by a legitimate
-                     new operating mode -- second instance, after #739
+                     new operating mode -- THREE instances now, after #739
+    instance 1       #699/#739 admission wedge   41 alarms (53 lines) -- fixed
+    instance 2       #838 layout conformance    165 alarms          -- fixed
+    instance 3       the liveness-monitor chain that forwards both to the
+                     operator channel -- fixed AT SOURCE by 1 and 2
     root             TWO defects, and the second survives fixing the first:
                      (1) `idle_locked_seen` was never passed by the only
                          production caller -- unwired since it was written
@@ -29,8 +33,9 @@ throughout.
     fix              a third suppression term in #739's idiom: NAMED hold AND
                      ARMED flip AND bounded age. Any one missing -> alarm.
                      Over the bound -> still alarms, but as a STUCK FLIP.
-    tests            12 new, hermetic, 0.1 s; wedge family 151 passed +
-                     92 subtests, 0 failed. The 17 true hits untouched.
+    tests            21 new, hermetic; wedge+conformance family green;
+                     full managers suite 15 failed / 4369 passed, and those
+                     15 are EXACTLY the #868 device-module baseline (7+4+4)
     NOT measured     the fix has never run on a card. No boot, no restart.
 
 ---
@@ -238,6 +243,97 @@ supported, and which would have been wrong.
 
 ---
 
+## 5.2 INSTANCE 2 — #838, and the fix that would have silenced the detector
+
+The same boot flags **165 layout-conformance violations** (the operator counted
+159 at 00:36Z; 165 by 00:37:24 — still growing, like instance 1). Tally: 165
+lines, 165 `new_tokens` values, all `kind=work_in_wrong_layout`.
+
+**All 165 are identical in shape:**
+`cached_tokens=0 transport_claimed=True recomputing=True`.
+
+`new_tokens` distribution, which is richer than the four values reported:
+
+    14 (x120)  160 (x18)  18 (x6)  20  25  52  67  70  167  170 (x3 each)
+
+**Maximum 170, against a `chunked_prefill_size=4096` read from the boot's own
+config line.** Every one of the 165 is deep inside the permission the user
+granted on 2026-08-25: the TP phase may prefill up to ONE CHUNK itself. The
+user predicted this blind spot in the same breath, and it landed.
+
+### The fix that suggests itself is the one that must not be made
+
+The permission reads "up to one chunk", so the obvious cap is
+`new_tokens <= budget`. **That would silence the defect #838 exists for.**
+W37-D's 258 batches measured `#new-token: 4096, #cached-token: 0` — exactly one
+chunk, at the budget. A `<=` cap calls all 258 permitted, and the instrument
+that was built to catch them stops catching them.
+
+**The discriminator is not "is the number small". It is "did the chunk budget
+BIND".** A batch that reaches the budget was truncated by it, so more prefill
+stands behind it — that is a large cold prefill being served in TP. A batch
+below the budget is the whole remaining prefill, complete in one chunk — the
+permitted case. So the test is strict `<`, and the boundary
+(remaining == budget exactly) falls on the VIOLATION side: a false red costs a
+look, a false green costs the instrument.
+
+Both specimens are separated by this, and both are pinned:
+
+    W37-D  new_tokens=4096 == budget  -> STILL A VIOLATION  (test_W37D_IS_STILL_A_VIOLATION)
+    #857   new_tokens<=170 <  budget  -> permitted          (all ten measured values)
+
+### COMPUTE vs RESTORE — carried by which number is capped
+
+The user's other line — computed prefill in TP is capped, HiCache/radix RESTORE
+in TP is unlimited and must never trip the cap — needs no exemption clause and
+gets none. **The cap is measured on `new_tokens`, which is COMPUTED tokens
+only.** Tokens served from the store arrive as `cached_tokens` and are not in
+that quantity at all, so a restore passes at any magnitude. Unlimited restore
+is a property of WHICH NUMBER is capped, not of an exemption that could rot.
+Pinned at 1,000,000 restored tokens.
+
+### The line names its own second ticket — class analysis, not my fix
+
+`cached_tokens=0 ... recomputing=True` on all 165 says the store served nothing
+and the prompt recomputed. That is the disarmed device tier (#871/#718/#847)
+seen from the layout detector's side: **one event, observed twice, filed as two
+tickets.** The line carried the link the whole time; it was never read to the
+end. Recorded here because it belongs in the class analysis — R9 owns #871, and
+this note changes only the detector.
+
+## 5.3 INSTANCE 3 — the forwarding chain, and a number I could not reproduce
+
+`/root/bin/serving-liveness-monitor.sh` greps the boot log and re-emits matches
+as `SERVING WARN` on the operator channel, so a noisy detector becomes operator
+noise.
+
+**The briefing says 98 WARN/ERROR lines. I measure 7, and I could not
+reproduce 98 from any pattern I tried.** The file has 302 lines:
+
+    WARN|ERROR   7        <- 6 x #838, 1 x ADMISSION-WEDGE
+    FAIL         204      <- SERVING DOWN / STILL DOWN, from earlier outages
+    DOWN         204
+
+The 7 span 15:36Z–23:59Z, i.e. several boots; **3 fall inside this boot**
+(23:48:25, 23:56:26, 23:59:41). So the chain is heavily throttled — it fires
+once per episode by design (`serving-liveness-monitor.sh:14`) and turned 165
+detector violations into 3 operator-visible lines. The forwarding is not the
+amplifier; it is working. But all 3 are FALSE, and they are false because the
+source is false, which is what instances 1 and 2 fix.
+
+**One non-finding, checked so it is not reported as one:** the log's last line
+is 23:59:41 and the monitor has been silent for ~41 minutes. PID 430 is alive;
+the silence is the design (it logs episodes, not successful checks), not a dead
+monitor.
+
+**A correction to my own extraction, since I nearly published it:** my first
+per-boot count used `awk '$0 >= "[2026-08-25 23:42"'` and returned 83. These
+timestamps carry NO DATE — they are `[HH:MM:SSZ]` — so that filter compared
+against the wrong thing and the 83 is meaningless. The 3 above is by reading
+the seven lines.
+
+---
+
 ## 6. WURZEL-VOR-WIRKUNG
 
 **(1) CLASS.** A detector whose signature was made AMBIGUOUS by a legitimate
@@ -246,10 +342,22 @@ exactly one thing when it was written and now means two, and the detector reads
 the numbers without the reason. Second instance after #739 (whose blind spot
 was "prefill counts as progress"); first written up in RESIDUAL_739.
 
-**(2) SIBLINGS.** §5 — six detectors, one of which (#838) already does it
-right, four of which do not, and no shared helper. Swept from source, not
-guessed. The unwired `progress_liveness.inhibited` (§0.2) is where the shared
-helper was supposed to be.
+**(2) SIBLINGS.** §5 — six detectors, swept from source, not guessed. #838 was
+listed there as "the only one that checks hold legitimacy", and §5.2 shows that
+verdict was too generous: it checks the *transport* premise and had no term at
+all for the one-chunk permission, which is why it produced 165 false alarms on
+the same boot. Corrected in this note rather than left standing. The unwired
+`progress_liveness.inhibited` (§0.2) is where the shared helper was supposed to
+be.
+
+**Can ONE change fix all three? No — checked, because I was told to check.**
+#739's mechanism is not a registry (§0.3), so instances 1 and 2 needed two
+different terms: a *bounded named hold* for the wedge clock, a *chunk-budget
+bind* for the layout rule. What they share is the IDIOM — an optional signal,
+`getattr` with a `None` fallback to the pre-existing verdict, and a suppression
+that is refused unless every part of it is present. Instance 3 needed no change
+of its own: it forwards what the detectors say, so fixing the source fixes the
+channel.
 
 **(3) CHECK.** The detector now reads the hold REASON, not only the clock, and
 the reason must be corroborated by an armed flip and bounded in time.

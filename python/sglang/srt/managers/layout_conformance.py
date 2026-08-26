@@ -321,6 +321,7 @@ def work_layout_verdict(
     new_tokens: int,
     cached_tokens: int,
     now: float,
+    chunk_budget: Optional[int] = None,
 ) -> Optional[str]:
     """#861d: WORK IN THE WRONG LAYOUT. The term this detector did not have.
 
@@ -367,6 +368,49 @@ def work_layout_verdict(
     # Partial-restore accounting (cached>0 with large new) is deferred and
     # named here rather than silently folded into either side.
     if transport_verified and int(cached_tokens) > 0:
+        return None
+    # #870: THE PERMITTED ONE-CHUNK SELF-PREFILL, and the discriminator is
+    # "did the chunk budget BIND", not "is the number small".
+    #
+    # The user permitted the TP phase to prefill up to ONE CHUNK itself
+    # (2026-08-25) and predicted this blind spot in the same breath: the
+    # detector must be able to tell the permitted single chunk from a real
+    # violation, or the exemption becomes the blind spot. It did not, and on
+    # the #857 boot it flagged 165 permitted batches -- every TP prefill batch
+    # on a boot whose acceptance passed, new_tokens 14..170 against a 4096
+    # budget.
+    #
+    # WHY NOT `new_tokens <= budget`. That is the reading the permission
+    # invites and it would SILENCE THE DEFECT THIS DETECTOR EXISTS FOR: W37-D's
+    # 258 batches measured `#new-token: 4096, #cached-token: 0` -- exactly one
+    # chunk, at the budget. A cap written as `<=` would have called all 258
+    # permitted.
+    #
+    # A batch that reaches the budget was TRUNCATED BY it, which means more
+    # prefill stands behind it: that is a large cold prefill being served in
+    # TP, not "up to one chunk". A batch below the budget is the whole
+    # remaining prefill, complete in one chunk -- the permitted case. So the
+    # test is strict `<`, and the boundary (remaining == budget exactly) falls
+    # on the VIOLATION side: a false red costs a look, a false green costs the
+    # instrument.
+    #
+    # RESTORE CAN NEVER TRIP THIS CAP, which is the other half of the user's
+    # line. The cap is measured on ``new_tokens`` -- COMPUTED tokens only.
+    # Tokens served from HiCache/radix arrive as ``cached_tokens`` and are not
+    # in this quantity at all, so a restore of any size passes regardless of
+    # its magnitude. Unlimited restore is a property of WHICH NUMBER is
+    # capped, not of an exemption that could rot.
+    #
+    # ``None`` (an older caller that passes no budget) reproduces the pre-#870
+    # verdict exactly, in the same idiom #739 used for its own second signal.
+    budget = None if chunk_budget is None else int(chunk_budget)
+    if (
+        budget is not None
+        and budget > 0
+        and batch_class == "prefill"
+        and phase == "tp"
+        and 0 < int(new_tokens) < budget
+    ):
         return None
     recomputing = int(new_tokens) > 0
     return (
