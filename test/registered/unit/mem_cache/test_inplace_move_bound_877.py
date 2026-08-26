@@ -244,6 +244,148 @@ class TestTheTemporaryIsBoundedByTheCap(CustomTestCase):
         self.assertEqual(256, mp.INPLACE_MOVE_MAX_ROWS)
 
 
+class TestTheTwoLayoutsIVerifiedByReadingOnly(CustomTestCase):
+    """POSTEN 2. The #877 report named HND and PageMajor as the weakest part of
+    the change: their chunking was verified by READING, not by RUNNING. "No test
+    exists" is not a closure -- it is the desk-written-never-executed shape. Both
+    turn out to be hermetically exercisable, so there is nothing to refuse.
+
+    Neither path needs a device. HND is plain 4-D advanced indexing; PageMajor
+    routes to `move_kv_cache_native` with `page_size > 1` (memory_pool.py:4192,
+    "the tiled copy kernel assumes stride == row bytes, so always take the native
+    move"). `maybe_detect_oob` is a no-op unless SGLANG_ENABLE_ASYNC_ASSERT is
+    set, and `torch._assert_async` needs no CUDA on CPU tensors.
+    """
+
+    def _hnd_pool(self, num_pages, page_size, heads=2, dim=3):
+        """A stub carrying the REAL `MHATokenToKVPool.move_kv_cache`.
+
+        HND layout is [num_pages, head, page_size, dim] and the move indexes
+        `kb[page, :, off, :]` -- a different axis pair from every other site,
+        which is exactly why reading it was not enough."""
+        import types
+
+        pool = types.SimpleNamespace()
+        pool.use_hnd = True
+        pool.page_size = page_size
+        pool.layer_num = 2
+        pool.size = num_pages * page_size
+        n = num_pages * page_size
+        pool.k_buffer = [
+            torch.arange(n * heads * dim, dtype=torch.float32).reshape(
+                num_pages, heads, page_size, dim
+            )
+            + 1000 * i
+            for i in range(pool.layer_num)
+        ]
+        pool.v_buffer = [b.clone() + 7.0 for b in pool.k_buffer]
+        pool.move_kv_cache = types.MethodType(mp.MHATokenToKVPool.move_kv_cache, pool)
+        return pool
+
+    def _hnd_reference(self, pool, tgt, src):
+        """What the UNCHUNKED statement would have produced. The reference is the
+        old code's semantics, not a reimplementation of the new one."""
+        want_k, want_v = [], []
+        for kb, vb in zip(pool.k_buffer, pool.v_buffer):
+            pt, ot = tgt // pool.page_size, tgt % pool.page_size
+            ps, os_ = src // pool.page_size, src % pool.page_size
+            k, v = kb.clone(), vb.clone()
+            k[pt, :, ot, :] = kb[ps, :, os_, :].clone()
+            v[pt, :, ot, :] = vb[ps, :, os_, :].clone()
+            want_k.append(k)
+            want_v.append(v)
+        return want_k, want_v
+
+    def test_hnd_small_move_matches_the_unchunked_semantics(self):
+        pool = self._hnd_pool(num_pages=8, page_size=4)
+        src = torch.arange(4, 28, dtype=torch.long)
+        tgt = torch.arange(0, 24, dtype=torch.long)
+        wk, wv = self._hnd_reference(pool, tgt, src)
+        pool.move_kv_cache(tgt, src)
+        for i, (k, v) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
+            self.assertTrue(torch.equal(k, wk[i]), f"HND layer {i} K differs")
+            self.assertTrue(torch.equal(v, wv[i]), f"HND layer {i} V differs")
+
+    def test_hnd_LARGE_move_actually_chunks_and_stays_exact(self):
+        """Over the cap, so the chunking really runs on this layout -- which is
+        the case reading could not check."""
+        n = 4000
+        pool = self._hnd_pool(num_pages=(n + 64) // 4, page_size=4)
+        src = torch.arange(4, n + 4, dtype=torch.long)
+        tgt = torch.arange(0, n, dtype=torch.long)
+        self.assertGreater(
+            len(list(mp.inplace_move_ranges(tgt, src))), 1, "this case must CHUNK"
+        )
+        wk, wv = self._hnd_reference(pool, tgt, src)
+        pool.move_kv_cache(tgt, src)
+        for i, (k, v) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
+            self.assertTrue(torch.equal(k, wk[i]), f"HND chunked layer {i} K differs")
+            self.assertTrue(torch.equal(v, wv[i]), f"HND chunked layer {i} V differs")
+
+    def test_hnd_rightward_move_is_exact(self):
+        """The direction whose ascending chunking is measurably BROKEN."""
+        n = 4000
+        pool = self._hnd_pool(num_pages=(n + 64) // 4, page_size=4)
+        src = torch.arange(0, n, dtype=torch.long)
+        tgt = torch.arange(4, n + 4, dtype=torch.long)
+        wk, wv = self._hnd_reference(pool, tgt, src)
+        pool.move_kv_cache(tgt, src)
+        for i, k in enumerate(pool.k_buffer):
+            self.assertTrue(torch.equal(k, wk[i]), f"HND rightward layer {i} differs")
+
+    def _page_major_bufs(self, num_pages, page_size, heads=2, dim=3):
+        n = num_pages * page_size * heads * dim
+        k = torch.arange(n, dtype=torch.float32).reshape(
+            num_pages, page_size, heads, dim
+        )
+        return [k], [k.clone() + 5.0]
+
+    def test_page_major_4d_move_matches_the_unchunked_semantics(self):
+        """PageMajor always takes the native move with page_size > 1
+        (memory_pool.py:4192), i.e. the 4-D `(page_id, slot_in_page)` branch."""
+        page_size = 4
+        kb, vb = self._page_major_bufs(num_pages=16, page_size=page_size)
+        n = 48
+        src = torch.arange(4, n + 4, dtype=torch.long)
+        tgt = torch.arange(0, n, dtype=torch.long)
+        wk = kb[0].clone()
+        wk[tgt // page_size, tgt % page_size] = kb[0][
+            src // page_size, src % page_size
+        ].clone()
+        mp.move_kv_cache_native(kb, vb, tgt, src, page_size=page_size)
+        self.assertTrue(torch.equal(kb[0], wk), "page-major 4-D move differs")
+
+    def test_page_major_LARGE_move_chunks_and_stays_exact(self):
+        page_size = 4
+        n = 4000
+        kb, vb = self._page_major_bufs(
+            num_pages=(n + 64) // page_size, page_size=page_size
+        )
+        src = torch.arange(4, n + 4, dtype=torch.long)
+        tgt = torch.arange(0, n, dtype=torch.long)
+        self.assertGreater(
+            len(list(mp.inplace_move_ranges(tgt, src))), 1, "this case must CHUNK"
+        )
+        wk = kb[0].clone()
+        wk[tgt // page_size, tgt % page_size] = kb[0][
+            src // page_size, src % page_size
+        ].clone()
+        mp.move_kv_cache_native(kb, vb, tgt, src, page_size=page_size)
+        self.assertTrue(torch.equal(kb[0], wk), "page-major chunked move differs")
+
+    def test_page_major_degenerate_page_size_one_branch(self):
+        """The third shape: 4-D buffers with page_size == 1, where token id ==
+        page id. A separate branch in the source, so a separate case here."""
+        kb, vb = self._page_major_bufs(num_pages=4096, page_size=1)
+        n = 4000
+        src = torch.arange(4, n + 4, dtype=torch.long)
+        tgt = torch.arange(0, n, dtype=torch.long)
+        wk = kb[0].clone()
+        wk[tgt, 0] = kb[0][src, 0].clone()
+        mp.move_kv_cache_native(kb, vb, tgt, src, page_size=1)
+        self.assertTrue(torch.equal(kb[0], wk), "page_size==1 4-D branch differs")
+
+
 class TestTheSitesAreEnumerated(CustomTestCase):
     """Six sites, every one verified by hand for this ticket -- which is what
     makes an allowlist here a check rather than a rubber stamp. The #875 report
