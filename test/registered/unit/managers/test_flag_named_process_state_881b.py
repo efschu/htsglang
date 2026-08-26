@@ -71,8 +71,24 @@ RECORDED = {
     ("get_tp_partition_ratios", "_uneven_tp_num_kv_heads"): (
         "THE MOST LOAD-BEARING SIBLING: it computes the kv-head count, on the "
         "very axis that carried two wrong judgments. Documented as "
-        "--rank-tp-ratio while reading the process plan. Wording only; the "
-        "behaviour reads the plan and is correct."
+        "--rank-tp-ratio while reading the process plan.\n"
+        "#881d MEASURED, HALF: it is NOT phase-blind. All three inputs track "
+        "the phase -- `tensor_parallel_size` (PP 1 / TP 3), the process plan, "
+        "and the auto-resolved `get_parallel().attn_tp_rank` (a contextvar the "
+        "flip overrides). The gate `tp_plan_active` is "
+        "`len(ratios) == tp_size`, so the LENGTH MATCH is itself the phase "
+        "discriminator: in PP the 3-entry plan does not apply to tp_size=1 and "
+        "the even split returns 4//1 = 4.\n"
+        "IT IS ALSO HEAVILY WIRED -- 25 production call sites "
+        "(callsite_contract.py on `get_num_kv_heads --param rank`), including "
+        "six in pool_configurator and model_runner_kv_cache_mixin:3318, so the "
+        "result IS read bindingly. Not the `solve_arming_floor` shape.\n"
+        "STILL UNMEASURED, and deliberately not started here: whether any "
+        "caller derives a WRONG head count. 23 of 25 production sites OMIT "
+        "`rank` and rely on the auto-resolve, whose except-branch falls to "
+        "`min(sizes)`. That is a correctness question on the KV axis and is "
+        "its own strand -- recording it as 'behaviour correct' would be the "
+        "fourth judgment on an axis that has already carried three."
     ),
     # The remaining reads of the same accessor. All verified to READ the plan
     # (behaviour correct); all document a single --flag for state with four
