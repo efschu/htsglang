@@ -2136,6 +2136,19 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         req.mamba_state_cpu_layout = None
         return False
 
+    # #875: THIS REFUSAL IS A NON-ANSWER AND IS KNOWN TO BE ONE. The counter
+    # comment above says what it costs -- a layout refusal means every flip in
+    # that direction loses its prefixes. The carry that would replace it needs
+    # TWO collectives, and only one of them is built: `seam_layer_carry.py`
+    # settles the LAYER axis (a PP stage's copy is restorable into a TP pool
+    # once the three stages' copies are unioned, and back again, proven both
+    # directions). The TOKEN axis is not settled: PP holds every token at
+    # allocator slots while TP holds an owner-rule SUBSET at compacted rows
+    # (layers/dcp/owner.py:159). Wiring a layer-correct token-wrong carry here
+    # would produce matching row ids at mismatched widths -- the shape #719
+    # already walked into once. So this stays until that axis is answered, and
+    # it stays as the FALLBACK for whatever the carry does not cover.
+    #
     # #861c: the SECOND axis, and the one W40 died on. The extent check above
     # compares ROW counts; a phase flip does not change those, so it passed and
     # handed the copy straight to a pool with a different LAYER count. See
