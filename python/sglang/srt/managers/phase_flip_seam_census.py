@@ -224,6 +224,74 @@ class SeamCensus:
         #: decomposition and fitted a model to the bar instead. A third
         #: instrument would have left that unchanged.
         self.explained: Dict[str, Tuple[Tuple[str, float], ...]] = {}
+        #: #917: (label, error) of the FIRST stage boundary whose probe failed
+        #: with a POISON-class CUDA error, and the last label whose probe came
+        #: back clean. Together they bracket the interval the context died in.
+        #:
+        #: WHY THIS PAIR IS THE WHOLE INSTRUMENT. `mark()` runs at ~19 named
+        #: boundaries of the cutover and its probe is a DRIVER CALL
+        #: (`mem_get_info`). On a poisoned context that call raises, so the
+        #: census has been touching the driver at every candidate boundary all
+        #: along -- and swallowing the answer as "probe-failed". Classifying it
+        #: turns a record that already exists into an origin bracket, without
+        #: adding a single call site or a second taxonomy of stage names.
+        self.probe_poison: Optional[Tuple[str, str]] = None
+        self.last_clean_label: Optional[str] = None
+        #: Probe failures that were NOT poison-class, counted separately. A
+        #: transient `mem_get_info` hiccup and a dead context must never again
+        #: be one row -- that conflation is #867's class, and this module held
+        #: the second instance of it.
+        self.probe_failures = 0
+
+    def _classify_probe_failure(self, label: str, exc: BaseException) -> None:
+        """Split a failed stage probe into "hiccup" and "the context is gone".
+
+        #917, AND IT IS #867's CLASS ARRIVING IN A SECOND MODULE. `mark()`
+        caught bare `Exception` around a driver call and recorded every outcome
+        as ``probe-failed``. That is right for a transient and wrong for a
+        sticky CUDA fault, and it could not tell them apart -- the same defect
+        `barlink_abort_gate.poll_status_words` carried until #867 narrowed its
+        handler. The sweep that found the first instance never reached here,
+        so the cutover's own instrument was quietly discarding the earliest
+        host-visible evidence of a poisoned context at the exact boundaries
+        that would have named the interval it was born in.
+
+        WHAT THIS BUYS, CONCRETELY. In the 0826 rerun (boot #2, 21:53:36) the
+        first three reports of the fault were the barlink watchdog poll, the
+        #760 stream quiesce, and a scheduler traceback in `get_cpu_copy` --
+        three sites, one sticky fault, and NOTE_867's standing verdict that
+        earliest-in-time is evidence for origin and not proof. The watchdog
+        thread polls on a timer, so it wins the race to observe an
+        already-poisoned context no matter who poisoned it; that ordering
+        cannot discriminate and never could. These marks run on the SCHEDULER
+        thread, in the cutover's own order, so the bracket
+        ``[last_clean_label, probe_poison label]`` names ONE segment of the
+        walk -- and each segment has one candidate in it.
+
+        Registered with `barlink_abort_gate.record_poison`, which is
+        FIRST-WINS across the process: if a census boundary records the origin,
+        the watchdog's later report says so instead of claiming it.
+
+        DEGRADES, NEVER RAISES. An instrument on the no-return path may not be
+        the reason a flip dies -- the rule this module already states for
+        `_check_law`. The import is local because `managers` importing
+        `distributed` at module scope is a cycle this file does not need.
+        """
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                barlink_abort_gate,
+            )
+
+            if not barlink_abort_gate.is_poison_error(exc):
+                self.probe_failures += 1
+                return
+            if self.probe_poison is None:
+                self.probe_poison = (str(label), str(exc))
+            barlink_abort_gate.record_poison(
+                f"seam-census probe at stage '{label}'", exc
+            )
+        except Exception:  # pragma: no cover - the no-return path owns this
+            self.probe_failures += 1
 
     def explain(self, label: str, terms) -> None:
         """Register what the segment ENDING at ``label`` was made of.
@@ -269,12 +337,17 @@ class SeamCensus:
         self.times.append((str(label), time.monotonic()))
         try:
             sample = self._probe()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - classified (#917), then degraded
             sample = None
+            self._classify_probe_failure(str(label), exc)
         if sample is None:
             self.stages.append((str(label), -1, -1, -1))
             return
         free, reserved, allocated = sample
+        # #917: a boundary whose driver call ANSWERED proves the context was
+        # still alive when the walk passed it. That is the lower end of the
+        # bracket, and it is only ever set here.
+        self.last_clean_label = str(label)
         self.stages.append((str(label), free, reserved, allocated))
         self._check_law(str(label), free, reserved, allocated)
 
@@ -518,7 +591,60 @@ class SeamCensus:
                 f"{min(free for _lbl, free in self.below_law) // _MIB} MiB "
                 f"at '{self.below_law[0][0]}' ***"
             )
+        head += self._poison_clause()
         return head + " | " + " | ".join(parts)
+
+    def _poison_clause(self) -> str:
+        """The origin BRACKET, or nothing at all. #917.
+
+        DECLARED AS AN INSTRUMENT, NOT A FIX. It does not stop a fault; it
+        answers the one question the 0826 specimens could not -- which segment
+        of the cutover the context died in -- and it answers it with the
+        cutover's own stage names rather than a taxonomy invented for the
+        occasion. Read it as: everything up to and including
+        ``last clean`` executed against a live context; the fault was born in
+        the segment that ends at ``poisoned``.
+
+        TWO SHAPES, BECAUSE THERE ARE TWO WAYS TO LEARN THIS.
+
+        * This census caught it: it names both ends itself.
+        * Another thread caught it first -- in practice the barlink watchdog,
+          which polls on a timer and therefore almost always wins the race to
+          observe an already-poisoned context. Its record carries no position
+          in the walk, so the clause supplies one: the last boundary this rank
+          passed cleanly. That converts "somebody saw poison" into "poison
+          appeared after <stage>", which is the reading the W40 and 0826
+          specimens each lacked, and it is exactly NOTE_867's open question 2
+          made answerable WITHOUT silencing the watchdog. `pause_polling()`
+          would have answered it by removing the fastest detector from the
+          no-return path; this answers it by giving that detector a coordinate.
+
+        Silent when nothing was poisoned, so a healthy flip's line is
+        byte-identical to before.
+        """
+        if self.probe_poison is not None:
+            label, err = self.probe_poison
+            clean = self.last_clean_label or "<none>"
+            return (
+                f" *** #917 CONTEXT POISONED between '{clean}' and '{label}': "
+                f"{err.splitlines()[0] if err else '?'} ***"
+            )
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                barlink_abort_gate,
+            )
+
+            record = barlink_abort_gate.poison_record()
+        except Exception:  # pragma: no cover - the no-return path owns this
+            record = None
+        if not record:
+            return ""
+        clean = self.last_clean_label or "<none>"
+        return (
+            f" *** #917 CONTEXT POISONED, first reported by "
+            f"{record.get('source')!r}; this rank's last clean stage "
+            f"boundary was '{clean}' ***"
+        )
 
 
 _active: Optional[SeamCensus] = None
