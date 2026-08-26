@@ -940,8 +940,21 @@ class PhaseFlipStacks:
         plus a disk read when the pages were reclaimed"; without a timer that
         claim is unfalsifiable on metal.
         This wraps the copy that the #690 high-water marks already bracket
-        (``_commit_refill_high_water`` immediately above every call), so the
-        number is the refill leg proper and nothing else.
+        (``_commit_refill_high_water`` immediately above every call).
+
+        #873 CORRECTION, because the sentence that stood here -- "so the number
+        is the refill leg proper and nothing else" -- is what let this number be
+        read as a transfer. It is the refill leg, and the leg is not one
+        mechanism. Measured, boot_w40_857strict_0826_0516.log, PP0 pp_to_tp:
+        4.818 s = save 4.342 + checksum 0.319 + wait 0.084 + d2h-issue 0.026 +
+        h2d-issue 0.020 + ring 0.001 + plan 0.001, with `gpu-span d2h 0.000s /
+        h2d 0.000s`. The dominant term is ``ops.save`` -- a HOST-TO-HOST memcpy
+        into the staging ring, which in-place aliasing forces on 90-97 % of the
+        chunks (rotation_executor.py, the ``aliased`` branch) -- and not the
+        PCIe transfer the name implies. The rate this line prints is therefore
+        an aggregate over staging, checksum and transfer; it is comparable to
+        another leg's aggregate and to nothing else. The decomposition is
+        registered with the seam census below so the two are read together.
 
         PER RANK, NOT REDUCED. The flip's cost is the SLOWEST rank's copy --
         the layouts differ in size per rank (pp 17219 / tp 16329 MiB on PP0
@@ -1008,6 +1021,36 @@ class PhaseFlipStacks:
         # nothing has verified.
         self.image_holds = "pp" if wants == "tp" else "tp"
         elapsed = _time.perf_counter() - started
+        # #873: HAND THE CENSUS THE DECOMPOSITION IT WAS MISSING. This leg is
+        # the seam's dominant segment on every rank of every flip, and the
+        # census reported it as one bar while THIS function already held the
+        # #809/W28 phase breakdown and logged it to a separate, unreferenced
+        # line. An operator reading the census line could not find that line
+        # and hand-fitted a rate-plus-constant model to the bar instead,
+        # deriving a 3.0 s "byte-independent constant" that is the intercept of
+        # a model applied to four mechanisms with four cost drivers. What that
+        # boot's own phase lines actually say, PP0 pp_to_tp: save 4.342 +
+        # checksum 0.319 + wait 0.084 + d2h-issue 0.026 + h2d-issue 0.020,
+        # gpu-span d2h 0.000s / h2d 0.000s -- the mass is the host-side staging
+        # memcpy that in-place aliasing forces, not the transfer the segment's
+        # name implies.
+        #
+        # Registered against `weights_refill` because that is the mark the walk
+        # stamps when this returns, i.e. the mark that CLOSES this segment.
+        from sglang.srt.managers import phase_flip_seam_census as seam_census
+
+        seam_census.explain(
+            "weights_refill",
+            (
+                ("save", rot_phases.save_s),
+                ("checksum", rot_phases.checksum_s),
+                ("wait", rot_phases.wait_s),
+                ("d2h-issue", rot_phases.d2h_issue_s),
+                ("h2d-issue", rot_phases.h2d_issue_s),
+                ("ring", rot_phases.ring_s),
+                ("plan", rot_phases.plan_s),
+            ),
+        )
         # #677: FEED THE ECONOMICS THE MEASURED LEG, NOT A REMEMBERED ONE.
         # The flip policy priced a leg at a 3.2 s pinned-era constant while the
         # file-backed arm measured 22-24 s -- 7.03x too cheap, which moved
@@ -1089,6 +1132,18 @@ class PhaseFlipStacks:
         # 'weights_refill' bar, and a commit that stalls on the driver is
         # indistinguishable from a transfer that is merely bandwidth-bound --
         # the two have different fixes and live in different modules.
+        #
+        # #873: THIS MARK WORKS, AND ITS ANSWER HAS BEEN IN EVERY CENSUS LINE.
+        # The commit is the segment `gdn_state->refill_highwater`, and on
+        # boot_w40_857strict_0826_0516.log it reads 0.2 / 7.0 / 0.2 ms across
+        # the three ranks -- so page commit is NOT where a flip's seconds go,
+        # and that was already established rather than open. It was read as
+        # open because `format_timing_line` sorts descending and a 0.2 ms
+        # segment that ANSWERS a question about a 4819.9 ms segment lands at the
+        # far end of the line where it reads as noise. The boundary below is
+        # therefore kept as it is; what #873 changes is that the dominant
+        # segment now carries its own decomposition, so a reader is not left to
+        # reconstruct one from a sorted bar chart.
         #
         # Marked OUTSIDE the carrier guard on purpose: with no carrier the
         # commit is a no-op and the boundary is a zero-width step, which is

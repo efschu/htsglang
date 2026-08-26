@@ -221,5 +221,93 @@ class TestTheInstrumentCannotKillAFlip(CustomTestCase):
         self.assertIsInstance(census.format_timing_line(), str)
 
 
+class TestTheRefillWiringExists(CustomTestCase):
+    """The static half, and deliberately a SMALL one.
+
+    The runtime half above is the real check for this class: whichever segment
+    dominates a given flip is not knowable at the desk, so the enforceable rule
+    is that the DOMINANT one is attributed or announced -- which the formatter
+    now guarantees for every walk, on every rank, without anyone maintaining a
+    list.
+
+    What a static test CAN add is that the one decomposition the tree already
+    knows how to produce stays WIRED. Delete the `explain` call and the log
+    stays honest -- it reverts to "NOT DECOMPOSED" -- but the information that
+    exists in the process is lost again, which is the exact state #873 found.
+
+    NOT A PER-MARK CLASSIFICATION AUDIT, and that is a judgement rather than an
+    omission. The walk has ~20 possible marks across two files and two
+    registration mechanisms (`mark("x")` and a mover's `census_label`), and an
+    allowlist asserting what each one brackets would be twenty claims this
+    change did not verify. An allowlist of unverified reasons is the rubber
+    stamp the #861c audit's dead-entry rule exists to prevent; it is filed
+    rather than smuggled in here.
+    """
+
+    def test_the_refill_leg_registers_its_rotation_phases(self):
+        import ast
+        from pathlib import Path
+
+        import sglang.srt.managers.phase_flip_boot as boot
+
+        tree = ast.parse(Path(boot.__file__).read_text())
+        labels = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "explain"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                labels.add(node.args[0].value)
+        self.assertIn(
+            "weights_refill",
+            labels,
+            "the refill leg no longer registers its #809/W28 phase breakdown "
+            "with the seam census. The census line will fall back to 'NOT "
+            "DECOMPOSED' -- honest, but the decomposition exists in this very "
+            "process and would again be emitted only to an unreferenced line",
+        )
+
+    def test_the_registered_terms_cover_every_rotation_phase(self):
+        """A decomposition that silently drops a term reconciles worse and
+        blames the remainder. `RotationPhases.accounted_s` is the tree's own
+        statement of which terms make up the leg; the registration must carry
+        all of them."""
+        import ast
+        from pathlib import Path
+
+        import sglang.srt.managers.phase_flip_boot as boot
+        from sglang.srt.model_executor.rotation_executor import RotationPhases
+
+        src = Path(boot.__file__).read_text()
+        tree = ast.parse(src)
+        registered = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "explain"
+            ):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Attribute) and sub.attr.endswith("_s"):
+                        registered.add(sub.attr)
+        expected = {
+            f.name
+            for f in RotationPhases.__dataclass_fields__.values()
+            if f.name.endswith("_s")
+            and f.name not in ("total_s", "gpu_d2h_s", "gpu_h2d_s")
+        }
+        self.assertEqual(
+            expected,
+            registered & expected,
+            "RotationPhases grew a term the census registration does not carry; "
+            "it would land in UNEXPLAINED and read as instrument error rather "
+            "than as the named phase it is. Missing: "
+            + ", ".join(sorted(expected - registered)),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

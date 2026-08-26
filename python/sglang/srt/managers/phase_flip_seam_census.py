@@ -119,7 +119,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,44 @@ class SeamCensus:
         #: Kept PARALLEL to ``stages`` rather than widening that tuple, whose
         #: shape ``format_line`` and the #485 excursion analysis both read.
         self.times: List[Tuple[str, float]] = []
+        #: #873: per-segment decompositions, keyed by the label that CLOSES the
+        #: segment, in seconds. Registered by whoever ran the work, because
+        #: that is the only code that knows what the work was made of.
+        #:
+        #: WHY A LINK AND NOT A NEW MARK. The decomposition of this walk's
+        #: dominant segment ALREADY EXISTED -- `rotation_phase_report`
+        #: (#809/W28) emits it -- as a separate log line that this line never
+        #: mentioned. Two instruments over one segment with nothing joining
+        #: them, so the reader of the dominant term could not find the
+        #: decomposition and fitted a model to the bar instead. A third
+        #: instrument would have left that unchanged.
+        self.explained: Dict[str, Tuple[Tuple[str, float], ...]] = {}
+
+    def explain(self, label: str, terms) -> None:
+        """Register what the segment ENDING at ``label`` was made of.
+
+        Keyed on the CLOSING mark because that is the mark the work's own code
+        stamps when it finishes: `stacks.refill` runs, then the walk stamps
+        `weights_refill`. Keying on the opening mark would ask the caller to
+        know what ran before it, which it does not.
+
+        TOTALLY DEFENSIVE, and not as a habit. This is called from inside the
+        flip's no-return region, where an instrument that raises is an instance
+        rather than a missing log line -- the contract `mark()` above already
+        carries. Anything that is not a sequence of (name, seconds) pairs is
+        dropped here rather than at format time, so a bad registration costs
+        the line its decomposition and nothing else.
+        """
+        try:
+            clean = tuple(
+                (str(name), float(secs))
+                for name, secs in terms
+                if secs is not None and float(secs) == float(secs)  # rejects NaN
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            return
+        if clean:
+            self.explained[str(label)] = clean
 
     def mark(self, label: str) -> None:
         """Record one stage boundary.
@@ -349,9 +387,52 @@ class SeamCensus:
         return (
             f"{LOG_PREFIX} timing {self.direction} rank {self.rank}: "
             f"{total_ms:.1f} ms across {len(segs)} segment(s), worst "
-            f"'{top_name}' {top_ms:.1f} ms ({share:.0f}% of the walk). "
+            f"'{top_name}' {top_ms:.1f} ms ({share:.0f}% of the walk)"
+            f"{self._worst_attribution(top_name, top_ms)}. "
             f"ms by segment, descending -- {body}"
         )
+
+    def _worst_attribution(self, top_name: str, top_ms: float) -> str:
+        """#873: the dominant segment either shows its parts or says it has none.
+
+        THE DOMINANT ONE AND NO OTHER. A decomposition printed for every segment
+        is a wall of numbers; the segment a reader ACTS on is the worst one, and
+        that is the one that has to be either attributed or declared
+        unattributable. The other twelve keep their bare millisecond, which is
+        all a bar chart needs to be.
+
+        THE REMAINDER IS NAMED, NEVER DISTRIBUTED (#846, and the rule
+        `RotationPhases.residual_s` already states for its own sum): a
+        decomposition that silently absorbs its leftover into its largest term
+        is how a reconciliation is made to pass without meaning anything. An
+        OVERRUN -- terms wider than the segment, which two clocks and a
+        late-stamped mark can genuinely produce -- is reported for the same
+        reason and is not clamped to zero, because a clamp reads as perfect
+        agreement.
+        """
+        terms = self.explained.get(str(top_name).split("->")[-1])
+        if not terms:
+            return (
+                " -- NOT DECOMPOSED: this is a boundary between two marks, not "
+                "a mechanism. Whatever ran here may be several kinds of work "
+                "with different cost drivers, so do not fit a rate-plus-"
+                "constant model to it; register a decomposition with "
+                "SeamCensus.explain() from the code that runs it"
+            )
+        try:
+            body = " + ".join(f"{name} {secs * 1000.0:.1f}" for name, secs in terms)
+            accounted_ms = sum(float(secs) for _n, secs in terms) * 1000.0
+            gap = float(top_ms) - accounted_ms
+            tail = (
+                f" + UNEXPLAINED {gap:.1f}"
+                if gap >= 0
+                else f" -- OVERRUN by {-gap:.1f} ms (the terms are wider than "
+                "the segment: two clocks, or a mark stamped after the work it "
+                "closes)"
+            )
+            return f" = {body}{tail}"
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            return " -- decomposition present but unformattable"
 
     def format_line(self) -> str:
         """One line per flip per rank: per-stage DELTAS against baseline.
@@ -474,6 +555,22 @@ def mark(label: str) -> None:
         return
     try:
         census.mark(label)
+    except Exception:  # pragma: no cover - the no-return path owns this
+        pass
+
+
+def explain(label: str, terms) -> None:
+    """#873: register a decomposition for the segment ending at ``label``.
+
+    No-op when no census is open, exactly like ``mark()`` above and for the
+    same reason: the work that knows the decomposition also runs on boot paths
+    where no flip census exists, and it may not have to ask.
+    """
+    census = _active
+    if census is None:
+        return
+    try:
+        census.explain(label, terms)
     except Exception:  # pragma: no cover - the no-return path owns this
         pass
 
