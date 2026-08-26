@@ -452,7 +452,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        # #876: bound the implicit gather temporary; see
+        # #877: bound the implicit gather temporary; see
         # memory_pool.inplace_move_ranges for which chunk orders are safe.
         from sglang.srt.mem_cache.memory_pool import inplace_move_ranges
 

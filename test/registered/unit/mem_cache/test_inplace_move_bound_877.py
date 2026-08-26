@@ -1,4 +1,4 @@
-"""#876: an in-place row move whose staging temporary is an UNSPOKEN allocation.
+"""#877: an in-place row move whose staging temporary is an UNSPOKEN allocation.
 
 THE SHAPE. Six sites move KV rows within one buffer as
 

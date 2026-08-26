@@ -3752,7 +3752,7 @@ class MHATokenToKVPool(KVCache):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
         if self.use_hnd:
-            # #876: bound the implicit gather temporary; see inplace_move_ranges.
+            # #877: bound the implicit gather temporary; see inplace_move_ranges.
             # The ordering analysis runs on the TOKEN ids, before the page split,
             # because that is the axis the overlap lives on.
             tgt_flat, src_flat = tgt_loc.view(-1).long(), src_loc.view(-1).long()
@@ -4892,7 +4892,7 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        # #876: bound the implicit gather temporary; see inplace_move_ranges.
+        # #877: bound the implicit gather temporary; see inplace_move_ranges.
         ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
         for kv_cache in self.kv_buffer:
             for lo, hi in ranges:
@@ -5172,7 +5172,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        # #876: bound the implicit gather temporary; see inplace_move_ranges.
+        # #877: bound the implicit gather temporary; see inplace_move_ranges.
         ranges = list(inplace_move_ranges(tgt_loc_flat, src_loc_flat))
         for index_k in self.index_k_with_scale_buffer:
             for lo, hi in ranges:
@@ -5322,7 +5322,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
-#: #876: the widest advanced-index gather an in-place row move may perform in one
+#: #877: the widest advanced-index gather an in-place row move may perform in one
 #: expression. NOT A SECOND CONSTANT -- it is the `num_locs_upper` that
 #: `_move_kv_cache_impl` (:3798) already chunks its bounded Triton path at, for
 #: this same reason. Two numbers for one question is how they drift apart.
@@ -5394,7 +5394,7 @@ def inplace_move_ranges(tgt_flat: torch.Tensor, src_flat: torch.Tensor):
     if not _INPLACE_MOVE_UNORDERED_WARNED:
         _INPLACE_MOVE_UNORDERED_WARNED = True
         logger.warning(
-            "#876 in-place KV move of %d rows is neither disjoint nor monotone, "
+            "#877 in-place KV move of %d rows is neither disjoint nor monotone, "
             "so it cannot be chunked without a staging buffer. Falling back to "
             "one gather, which allocates a temporary %d rows wide. Correct, but "
             "unbounded: if this fires, a caller is doing a general permutation "
@@ -5427,7 +5427,7 @@ def move_kv_cache_native(
 
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
-    # #876: the ranges are computed ONCE from the token ids and reused for every
+    # #877: the ranges are computed ONCE from the token ids and reused for every
     # layer. The safety analysis is a property of the index vectors, not of the
     # buffer, so re-deriving it per layer would pay an O(N) scan `layer_num`
     # times for the same answer.

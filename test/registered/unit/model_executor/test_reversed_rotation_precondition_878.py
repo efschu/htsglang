@@ -1,4 +1,4 @@
-"""#876b: the reversed copy-back's precondition -- and the checksum cannot supply it.
+"""#878: the reversed copy-back's precondition -- and the checksum cannot supply it.
 
 WHY THIS EXISTS. #875 established that the flip's `save` term (host-to-host
 staging, 4.342 s of a 4.801 s leg on PP0, 90 % of the seam's dominant segment)
