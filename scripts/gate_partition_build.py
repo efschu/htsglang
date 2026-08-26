@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import sys
 from pathlib import Path
 
@@ -155,6 +156,40 @@ def needs_live_server(source: str) -> str | None:
     return None
 
 
+# #862: the source probe reads ONE module's own bytes, and that is one hop too
+# few. `test/registered/radix_cache/unified_radix_tree` holds 8 modules; 7 carry
+# the marker and the 8th,
+# `test_unified_radix_cache_kl_dsv4_pp.py`, is four lines of
+#
+#     import test_unified_radix_cache_kl_dsv4 as dsv4_kl
+#     class TestUnifiedDeepSeekV4FlashHiCachePP4TP2(dsv4_kl.TestUnified...):
+#
+# It inherits setUpClass from a sibling that launches a real server, so it
+# launches one too -- and the own-bytes probe would have ADMITTED it to a lane,
+# where it dies in setUpClass with the same `FileNotFoundError: 'sglang'` as the
+# 7 it sits next to. A test-class inheritance edge crossing a module boundary is
+# invisible to the marker; the import that carries it is not.
+#
+# Deliberately narrow: SIBLING modules only (the bare-name import that works
+# because pytest puts the test's own directory on sys.path), and only from a
+# module already refused by the own-bytes probe. It is a one-hop closure of an
+# existing verdict, not an import graph walk.
+#
+# PRECISION, measured 2026-08-26 before the rule was written, the way #898
+# measured its own: it fires on 1 of 710 modules across
+# test/registered/unit/{managers,planner,server_args,mem_cache},
+# test/registered/scheduler and test/registered/radix_cache/unified_radix_tree
+# -- that one module -- and on 0 in every path that already has a table, so it
+# CANNOT move an existing row.
+def needs_live_server_via_sibling(source: str, launcher_stems: set[str]) -> str | None:
+    for stem in sorted(launcher_stems):
+        name = re.escape(stem)
+        pattern = rf"^\s*(?:import\s+{name}\b|from\s+{name}\s+import)"
+        if re.search(pattern, source, re.M):
+            return f"needs_server:inherits_from_launcher_sibling:{stem}"
+    return None
+
+
 RANK_SPAWN_MARKERS = (
     "multiprocessing",
     "mp.Process",
@@ -198,6 +233,15 @@ def main() -> int:
 
     modules = sorted(p.relative_to(root).as_posix() for p in gate_dir.glob("test_*.py"))
 
+    # #862: the sibling-inheritance closure needs to know which modules the
+    # own-bytes probe already refuses, so it is computed once over the whole
+    # gate path before any row is decided.
+    launcher_stems = {
+        Path(m).stem
+        for m in modules
+        if needs_live_server((root / m).read_text(errors="replace"))
+    }
+
     rows = []
     stats = {"PARALLEL": 0, "RANKS": 0, "SERIAL": 0, "EXCLUDED": 0}
     for mod in modules:
@@ -213,7 +257,9 @@ def main() -> int:
         # #898: refused BEFORE the solo comparison, and before the module is
         # ever handed to a lane. Unlike the sets above this one is decided from
         # the SOURCE, so it needs no measurement and cannot go stale.
-        srv = needs_live_server(src)
+        srv = needs_live_server(src) or needs_live_server_via_sibling(
+            src, launcher_stems - {Path(mod).stem}
+        )
         if srv:
             rows.append((mod, "EXCLUDED", srv, h, ref))
             stats["EXCLUDED"] += 1
