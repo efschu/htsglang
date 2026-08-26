@@ -9,6 +9,13 @@
 # solo dir    /tmp/868_solo
 # hermetic    every run behind this table used CUDA_VISIBLE_DEVICES=""
 #
+# #895 (2026-08-26): four rows RE-CLASSIFIED RANKS -> SERIAL by the
+# NOT_CROWDING_PROVABLE rule added to gate_partition_build.py. The rule is
+# in the builder, so a future rebuild reproduces it; the rows were applied
+# here without a rebuild because the logs behind this table (/tmp/868_solo,
+# /tmp/868_serial_ref.log) no longer exist. sha256 and ref_failures are
+# UNCHANGED from the original measurement -- only verdict and reason moved.
+#
 # verdicts
 #   PARALLEL  solo failure set == serial failure set -> wide lane
 #   RANKS     same proof, but the module spawns real ranks -> narrow lane,
@@ -16,7 +23,7 @@
 #   SERIAL    proof failed -> one process, one order (reason below)
 #   EXCLUDED  cannot run at the desk at all (needs a card) -> neither track,
 #             reported on every run so the gate is never read wider than it is
-# totals      {'PARALLEL': 270, 'RANKS': 35, 'SERIAL': 1, 'EXCLUDED': 3}
+# totals      {'PARALLEL': 270, 'RANKS': 31, 'SERIAL': 5, 'EXCLUDED': 3}
 #
 #module	verdict	reason	sha256	ref_failures
 test/registered/unit/managers/test_admission_intake_713.py	PARALLEL	solo_equals_serial	993535b4dd1e1662	
@@ -189,7 +196,7 @@ test/registered/unit/managers/test_pp_admission_retry_livelock_630.py	PARALLEL	s
 test/registered/unit/managers/test_pp_admission_send_handle_dropped_796.py	RANKS	solo_equals_serial;spawns_real_ranks:multiprocessing,torch.distributed	2417d352f216bcef	
 test/registered/unit/managers/test_pp_admission_trace_vacuous_788.py	PARALLEL	solo_equals_serial	7240749fa95cb020	
 test/registered/unit/managers/test_pp_admission_wiring_791.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	187eb98418b713e5	
-test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	SERIAL	solo_differs:fails_only_solo=PPAdmissionWraparoundBlocks::test_blocking_wraparound_wedges_the_ring	e617c4b28129f81f	
+test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	e617c4b28129f81f	
 test/registered/unit/managers/test_pp_arm_slot_outlives_ring_829.py	PARALLEL	solo_equals_serial	089d88dd37797114	
 test/registered/unit/managers/test_pp_chain_abort_check_824.py	PARALLEL	solo_equals_serial	77c5cbe5d8e03e3a	
 test/registered/unit/managers/test_pp_chain_flush_deadlock_788.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	4fa1bbeb0abea3dc	
@@ -211,10 +218,10 @@ test/registered/unit/managers/test_pp_presence_futile_wait_850.py	PARALLEL	solo_
 test/registered/unit/managers/test_pp_presence_stash_on_real_wire_800.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	3b29058313dc43b9	
 test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py	PARALLEL	solo_equals_serial	881563b75486a3af	
 test/registered/unit/managers/test_pp_progress_exit_677.py	PARALLEL	solo_equals_serial	a3938985e54ac20f	
-test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	ffb5924affbf9dcd	
-test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	0b93d601eeddbb95	
-test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	97672c13c37c386b	
-test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	641b08fadf14dd3e	
+test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	ffb5924affbf9dcd	
+test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	0b93d601eeddbb95	
+test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	97672c13c37c386b	
+test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	641b08fadf14dd3e	
 test/registered/unit/managers/test_pp_proxy_stamp_631.py	PARALLEL	solo_equals_serial	c96bb2dc6aed7109	
 test/registered/unit/managers/test_pp_reconcile_slot_blind_798.py	PARALLEL	solo_equals_serial	08810f5ef6623082	
 test/registered/unit/managers/test_pp_retracted_pass_void_797.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	5c0f3bbfa1bc9105	

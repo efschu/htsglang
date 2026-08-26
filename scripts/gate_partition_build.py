@@ -65,6 +65,63 @@ NEEDS_DEVICE = {
 # Membership is read from the SOURCE, never from a hand-kept name list: a
 # module that starts real workers imports one of these. A name list goes stale
 # the moment somebody adds a module; a source probe does not.
+# #895, measured 2026-08-26 on a SHARED box: the narrow lane's worker bound is
+# a mitigation against the lane's OWN crowding, and nothing else. Two members
+# of the pp_proxy family went red in two consecutive gate runs, a different
+# member each time, while the box carried 14-28 of external load from other
+# strands:
+#
+#   run 1  test_pp_proxy_cross_epoch_mispair_795   gloo connectFullMesh failed
+#                                                  "Connection closed by peer"
+#   run 2  test_pp_proxy_readiness_contract_789    "PROXY READINESS TIMEOUT 0.4s"
+#
+# Both passed 4/0 alone, on the base commit AND on the fix under test, so
+# neither is a product failure. This is NOTE #868 §2.5's SIMULTANEITY class --
+# an assert about where concurrent real ranks stand at a deadline -- and §2.5
+# says in as many words that a single solo measurement cannot settle it,
+# because its independent variable is the load on the box. The solo proof
+# therefore ADMITS these modules, exactly as it would admit a device-requiring
+# one; both need a refusal that does not come from the measurement.
+#
+# BY NAME, not by source probe, and the reason is worth recording: a probe for
+# short wall-clock margins finds the 0.4 s budget in ...readiness_contract_789
+# but finds NOTHING in ...cross_epoch_mispair_795, whose failure was in the
+# gloo rendezvous itself, before any assert of its own. The marker owed in
+# NOTE #868 §6 would have caught one of the two.
+#
+# SCOPE, honestly: this is a rate reduction, not the class fix. Every module in
+# the RANKS lane shares the hazard in principle; demoting all 35 would cost the
+# gate its reason to exist (766 s -> 345 s is the whole point). The CLASS is
+# handled in the runner instead -- #895 gives an unrecorded parallel-lane
+# failure its own named exit and an automatic solo re-run, so any other member
+# that goes this way is classified by machine on the run it happens. Demoted
+# here are the members with demonstrated recurrence.
+NOT_CROWDING_PROVABLE = {
+    "test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py",
+    "test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py",
+    # Same harness, same 3-rank gloo rendezvous, same shortened readiness
+    # budget: the two above are the members that were observed, not the only
+    # members that share the shape. The family is the unit.
+    "test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py",
+    "test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py",
+    # Same class, found by the #895 gate run rather than looked for. #868
+    # classified this one SERIAL with the reason
+    # `solo_differs:fails_only_solo=PPAdmissionWraparoundBlocks::
+    # test_blocking_wraparound_wedges_the_ring` -- it failed ALONE and passed
+    # in the full serial run. On 2026-08-26 it did the exact opposite: it
+    # failed in the SERIAL lane while two foreign gate runs put the box at load
+    # 150, and passed 3/3 alone 4 minutes later at load 10. Its RED case asserts
+    # which of three real ranks has reached which progress marker at a deadline;
+    # under that load two of the three had recorded no progress at all. A
+    # verdict that inverts with the box's load is not "differs solo" -- the
+    # lane was never the variable. The lane it lands in does not change (SERIAL
+    # either way), the NAME of the reason does, and the name is what a reader
+    # acts on.
+    "test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py",
+}
+
+SIMULTANEITY_REASON = "simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26"
+
 RANK_SPAWN_MARKERS = (
     "multiprocessing",
     "mp.Process",
@@ -118,6 +175,13 @@ def main() -> int:
         if mod in NEEDS_DEVICE:
             rows.append((mod, "EXCLUDED", "needs_device:CVD_empty_fails_NOTE860_0.7", h, ref))
             stats["EXCLUDED"] += 1
+            continue
+
+        # Refused BEFORE the solo comparison, for the same reason NEEDS_DEVICE
+        # is: the solo measurement would admit it. See the set's own comment.
+        if mod in NOT_CROWDING_PROVABLE:
+            rows.append((mod, "SERIAL", SIMULTANEITY_REASON, h, ref))
+            stats["SERIAL"] += 1
             continue
 
         solo_log = Path(args.solo_dir) / (Path(mod).stem + ".log")
