@@ -1741,6 +1741,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        # #904: set only by a stack whose counter has a step per mamba layer.
+        self._mamba_transfer_frame: Optional[int] = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1824,8 +1826,46 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 )
             )
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+    def register_layer_transfer_counter(
+        self,
+        layer_transfer_counter: LayerDoneCounter,
+        mamba_transfer_frame: Optional[int] = None,
+    ):
+        """Install the hicache layer counter, and say whether it COVERS mamba.
+
+        #904. Storing the counter is not the same as being able to wait on it:
+        the threshold is an index into ONE producer's step sequence, and only
+        the stack that actually moves mamba state has a step per mamba layer.
+        `mamba_transfer_frame` is that stack's `transfer_layer_num` -- the
+        controller's own `layer_num`, handed over by the assembler that built
+        both -- and `None` means "this counter has no mamba step", which is
+        the historic no-wait behaviour, unchanged.
+        """
         self.layer_transfer_counter = layer_transfer_counter
+        self._mamba_transfer_frame = mamba_transfer_frame
+
+    def _wait_for_mamba_layer(self, layer_id: int) -> None:
+        """Join the load stream at the step that filled THIS mamba layer.
+
+        #904. `HybridCacheController.start_loading` walks
+        `for i in range(transfer_layer_num)` and calls
+        `producer_event.complete(i)` after step i's copies are enqueued on
+        `load_stream`; `_make_layer_mapper` makes step i the step that moves
+        GLOBAL layer i. So the threshold is the global layer id -- the same
+        frame the KV half waits in, NOT the mamba slot and NOT `local_slot`
+        (the KV pool's indexing half, which is what #752 crashed on).
+
+        Refuses rather than guesses outside the frame: a counter that has no
+        step for this layer cannot be waited on meaningfully, and indexing
+        past its events would raise inside a forward.
+        """
+        counter = self.layer_transfer_counter
+        frame = self._mamba_transfer_frame
+        if counter is None or frame is None:
+            return
+        if not 0 <= layer_id < frame:
+            return
+        counter.wait_until(layer_id)
 
     def bind_tree_cache(self, tree_cache) -> None:
         """Give the pool a handle on the radix cache that owns its cached
@@ -1962,20 +2002,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
-        # #752: the hicache layer transfer counter is DELIBERATELY not
-        # consulted here. It instruments the one transfer that overlaps the
-        # forward -- the layer-by-layer full-attention KV load-back -- and
-        # the cache controller wires it to the full-attention pool alone
-        # (cache_controller.py unwraps HybridLinearKVPool to full_kv_pool
-        # for every layer-wise op). Mamba states move as WHOLE blobs through
-        # the mamba component's PoolTransfer and are complete before the
-        # batch launches, so there is no per-layer mamba progress the
-        # counter could report: a wait keyed by a mamba layer id is a
-        # category error (and on the local_slot form of this method it was
-        # the AttributeError that killed the first GDN forward under
-        # --enable-hierarchical-cache; see
-        # test_hicache_gdn_layer_counter_752.py). The KV pools' own
-        # get_key_buffer/get_kv_buffer waits are untouched.
+        # #904 (supersedes the #752 note that stood here). The recurrent step
+        # joins the load stream at the transfer step that filled THIS layer.
+        #
+        # #752 REMOVED a wait and gave two reasons. The first stands: the
+        # threshold must never be `local_slot(layer_id)`, the KV pool's
+        # indexing half -- that consult was the AttributeError which killed
+        # the first GDN forward under --enable-hierarchical-cache. The second
+        # does not: it read "mamba states move as WHOLE blobs through the
+        # component's PoolTransfer and are complete before the batch
+        # launches", and a reader took that as a guarantee of ordering. It is
+        # not one. On the live stack (`registry.py:107-110` routes hybrid SSM
+        # + hicache to UnifiedRadixCache) the mamba blob rides the SAME
+        # asynchronous per-layer loop as the KV, on `load_stream`, enqueued at
+        # its own global layer index -- see
+        # `hybrid_cache_controller.start_loading` and
+        # `memory_pool_host.HostPoolGroup.load_to_device_per_layer`. Nothing
+        # between `ready_to_load_host_cache()` (scheduler.py:8712) and the
+        # forward waits for it: `check_hicache_events` drains the PREVIOUS
+        # batch's acks and runs earlier in the same function.
+        #
+        # So a whole blob is not a landed blob, and "no per-layer mamba
+        # progress" was false -- the counter has a step per mamba layer, it
+        # was simply never asked. A GDN layer whose global id precedes the
+        # first attention layer read in a forward had no join at all.
+        # Same shape as 09c4e49bb7 (moe-offload scratch region): a side stream
+        # joined to compute in one direction only.
+        self._wait_for_mamba_layer(layer_id)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:

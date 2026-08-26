@@ -214,8 +214,15 @@ class TestApplyStackResult(unittest.TestCase):
         kvcache.register_layer_transfer_counter.assert_called_once_with(
             controller.layer_done_counter
         )
+        # #904: the frame travels WITH the counter. Registering the counter
+        # alone leaves the mamba read unable to name a threshold, so the wait
+        # it is supposed to perform is silently inert -- the
+        # PRESENT-BUT-UNWIRED state. `transfer_layer_num` is the controller's
+        # own step count, so the pool waits in the index space the producer
+        # counts in.
         params.req_to_token_pool.register_layer_transfer_counter.assert_called_once_with(
-            controller.layer_done_counter
+            controller.layer_done_counter,
+            mamba_transfer_frame=result.transfer_layer_num,
         )
 
     def test_skips_req_to_token_counter_when_flag_false(self):
