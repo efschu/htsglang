@@ -683,24 +683,33 @@ def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) 
     the wrong-layer write, i.e. converts the loud direction into the quiet one.
     It is the one fix shape that makes the defect harder to find.
 
-    REFUSAL, NEVER A CLAMP -- and the reason stated here was WRONG on one leg
-    until #875 put it on trial. It used to read "the KV head sharding also
-    differs between the phases (PP holds all heads of its stage, TP a head shard
-    of every layer), so even the overlapping entries are not interchangeable".
-    That is FALSE on this rig: under #345 uneven-DCP replication the
-    full-attention cache is TOKEN-sharded and every rank stores the FULL,
-    replicated kv-heads (model_runner_kv_cache_mixin.py:3155-3160; the boot line
-    at :3228 prints `get_total_num_kv_heads()`), and the PP pool takes
-    `get_num_kv_heads(attn_tp_size)` with `attn_tp_size == 1` -- the same total.
-    Identical widths. The entries ARE interchangeable, and a comment claiming
-    otherwise would have kept the next reader from looking.
+    REFUSAL, NEVER A CLAMP. Both legs stand, and the head leg was WRONGLY
+    RETRACTED once -- by me, in #875 -- so it is restated here with the
+    arithmetic attached so nobody repeats the mistake.
 
-    The surviving leg is narrower than it sounded: a remap needs every layer the
-    destination holds, and RANK-LOCALLY under PP it cannot have them -- 8 of 16
-    on this rig's `pp_attn_stage_ratio`. But the union over the three PP stages
-    IS every layer, and PP holds all tokens, so the data exists on a peer. The
-    honest statement is therefore "a RANK-LOCAL remap is impossible", not "a
-    remap is impossible".
+    THE HEAD LEG IS TRUE ON THIS RIG. PP and TP do NOT hold the same head width.
+    `_pool_kv_head_num` (model_runner_kv_cache_mixin.py:3176-3183) returns the
+    REPLICATED total only when `uneven_dcp_kv_replicated(dcp_size)` holds, and
+    that predicate is `dcp_size > 1 AND get_tp_partition_ratios() is not None`
+    (distributed/utils.py:471-479) -- i.e. it needs a `--rank-tp-ratio` base
+    plan. This rig boots `rank_tp_ratio=None`, so the branch is NOT taken and
+    the pool falls through to `get_num_kv_heads(attn_tp_size)`. With
+    `num_key_value_heads = 4` and `max(1, 4 // tp)`
+    (configs/model_config.py:1370): PP (attn_tp_size 1) holds 4 heads, TP
+    (attn_tp_size 3) holds 1. A factor of four. The entries are NOT
+    interchangeable.
+
+    HOW THE RETRACTION HAPPENED, because the shape recurs: I read the
+    replication BRANCH, treated its existence as reachability, and cited the log
+    line at :3228 as evidence -- a line that appears ZERO times in the boot it
+    was cited from. Existence is not reachability. Check
+    `uneven_dcp_kv_replicated`'s inputs before believing that branch again.
+
+    THE LAYER LEG is narrower than it sounds but stands: a remap needs every
+    layer the destination holds, and RANK-LOCALLY under PP it cannot have them
+    -- 8 of 16 on this rig's `pp_attn_stage_ratio`. The union over the three PP
+    stages IS every layer, so the honest statement is "a RANK-LOCAL remap is
+    impossible", not "a remap is impossible".
 
     WHY THIS STILL REFUSES rather than carrying: a carry needs a collective, and
     it needs TWO of them -- the layer axis (this one) and the TOKEN axis, where
