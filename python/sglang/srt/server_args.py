@@ -1014,7 +1014,13 @@ class ServerArgs:
             "swapping in a new kernel, not a milder one. "
             "Equivalent env override (same trade-off, documented at the "
             "dispatch site): SGLANG_GGUF_MMQ_DECODE_THRESHOLD=0|1, which "
-            "wins over this flag. "
+            "wins over this flag. IT WINS ON PRESENCE, NOT ON VALUE (#894): a "
+            "stale =0 left over from an A/B run silences this flag entirely, "
+            "and the only other log on that path fires on a reroute -- which "
+            "then never happens -- so the flag produced nothing and said "
+            "nothing. The dispatch now logs one SUPERSEDED KNOB warning "
+            "naming both sides whenever the env decided it, and another when "
+            "the value is not 0|1 (anything else reads as OFF). "
             "Default OFF -> the GGUF dispatch is byte-identical to before.",
         ),
     ] = False
@@ -5659,7 +5665,11 @@ class ServerArgs:
             help="PP prefill window in seconds. Promoted from "
             "SGLANG_PHASE_POLICY_PP_WINDOW_S (#781). The in-code default is a "
             "MEASURED retreat to 0: non-zero 15/10-second defaults killed "
-            "three boots.",
+            "three boots. SUPERSEDED WHENEVER --phase-policy-decode-stall-slo-s "
+            "EXCEEDS TWICE THE SEAM (#889): the stopwatch arm sits behind "
+            "`cap <= 0`, so a declared SLO makes this value unreachable and the "
+            "bound becomes slo - 2*seam instead. Boot warns and the armed line "
+            "prints `effective pp exit`; read that, not this.",
         ),
     ] = None
     phase_policy_decode_stall_slo_s: A[
@@ -5670,7 +5680,11 @@ class ServerArgs:
             "to break the blocked-admission wedge, where PP cannot admit "
             "pending prefill because every state slot is held by a carried "
             "decode, so DRAINED can never fire. 0 disables the cap. Promoted "
-            "from SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (#781).",
+            "from SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S (#781). SETTING THIS "
+            "SILENCES --phase-policy-pp-window-s (#889) whenever it exceeds "
+            "twice the seam; below that the solved cap collapses to 0 and THIS "
+            "flag is the inert one. Boot warns either way and the armed line "
+            "prints the effective term.",
         ),
     ] = None
     phase_policy_decode_contention: A[
@@ -6390,7 +6404,15 @@ class ServerArgs:
             "speculative decoding with a separate draft prefill pass. Capped to "
             "the DFlash formula (disabled when max-running-requests < 8; "
             "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "this with the formula when unset; other workloads stay disabled. "
+            "BOTH NARROWINGS ARE NOW ANNOUNCED AT RUNTIME (#894): the pool "
+            "floor is checked against the max-running-requests the KV resolver "
+            "left (#287), not the value written here, so a value that survived "
+            "on a larger KV budget can be DISCARDED on a smaller one -- which "
+            "removes the admission gate entirely rather than shrinking it. The "
+            "scheduler logs a MIN-FREE-SLOTS warning naming the requested "
+            "value, the resolved pool and what actually governs; read that, "
+            "not this."
         ),
     ] = None
 

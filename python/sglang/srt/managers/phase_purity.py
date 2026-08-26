@@ -291,25 +291,46 @@ def validate_tp_exit_pair(purity: PhasePurity, policy_cfg) -> None:
 
     Checkable triple: strict purity + strict drain mode + no bounded TP
     residency.
+
+    #894 S3 -- THERE IS EXACTLY ONE BOUNDED TP EXIT, AND IT IS THE SLO.
+    This function used to read a second escape,
+    ``getattr(policy_cfg, "tp_window_s", 0.0)``, and let ``tp_window > 0``
+    return early. ``PhasePolicyConfig`` has no ``tp_window_s`` field and never
+    had one, so that read was the constant ``0.0``: the branch was UNREACHABLE,
+    the refusal was stricter than its own source read, and -- the part that
+    cost operator time -- the message below told the reader to "set a bounded
+    TP window", a knob that does not exist as a flag, an env var or a config
+    field. Following the instruction changed nothing and hit the same refusal.
+
+    The repair is the DELETION, not a new knob. A ``tp_window_s`` field would
+    need a consumer inside ``phase_policy.decide``; there is none, and adding
+    one here would manufacture a fresh instance of the class #889/#894 exist to
+    close (a shipped knob that produces nothing and says nothing). Behaviour is
+    unchanged for every real configuration, because the branch was already
+    dead. What changes is that the code and the message stop describing an
+    escape that is not there. ``TestNoPhantomPolicyFields`` in
+    ``test_silent_superseded_knobs_894.py`` walks this module's AST and fails
+    on the next defaulted read of a name the dataclass does not carry.
     """
     if not purity.strict:
         return
     if not bool(getattr(policy_cfg, "drain_mode_strict", False)):
         return
     slo = float(getattr(policy_cfg, "decode_stall_slo_s", 0.0) or 0.0)
-    tp_window = float(getattr(policy_cfg, "tp_window_s", 0.0) or 0.0)
-    if slo > 0 or tp_window > 0:
+    if slo > 0:
         return
     raise PhasePurityError(
         f"{LOG_PREFIX} purity={purity.describe()} with strict drain mode has "
-        f"no bounded TP residency: tp_window_s={tp_window!r} and "
-        f"decode_stall_slo_s={slo!r}. `tp_decode_floor_s` is a MINIMUM dwell "
-        f"and cannot end a hold. Under strict the TP phase may not admit "
-        f"prefill, so a tp_to_pp arm waiting on a pending prefill waits for "
-        f"work this layout forbids and nothing times it out -- the PP guard "
-        f"above refuses exactly this shape for the other direction. Declare "
-        f"SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S, or set a bounded TP window, "
-        f"or run --phase-flip-purity off."
+        f"no bounded TP residency: decode_stall_slo_s={slo!r} is the only "
+        f"bound this layout has, and it is not declared. `tp_decode_floor_s` "
+        f"is a MINIMUM dwell and cannot end a hold, and there is no TP "
+        f"counterpart to `pp_window_s` -- the SLO is the whole of the TP exit. "
+        f"Under strict the TP phase may not admit prefill, so a tp_to_pp arm "
+        f"waiting on a pending prefill waits for work this layout forbids and "
+        f"nothing times it out -- the PP guard above refuses exactly this "
+        f"shape for the other direction. Declare "
+        f"SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S "
+        f"(--phase-policy-decode-stall-slo-s), or run --phase-flip-purity off."
     )
 
 
