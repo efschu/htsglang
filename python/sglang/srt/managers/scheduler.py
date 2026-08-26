@@ -673,6 +673,22 @@ class Scheduler(
                 self.phase_policy_cfg = dataclasses.replace(
                     self.phase_policy_cfg, prefill_runs_in_tp=False
                 )
+                # #874: AND SAY WHAT THAT COSTS, HERE, WHERE IT IS DECIDED.
+                # Collapsing the threshold is correct for the mode and it is
+                # also the moment a large fixed cost loses its price gate. The
+                # instance already reports the flip RATE (counts) and the flip
+                # UNIT COST (DONE lines) -- in two different places, never
+                # multiplied -- so the product stayed invisible until a user
+                # timed a two-token ping at 16.6 s. Reported from config at
+                # boot rather than discovered by timing.
+                from sglang.srt.managers.phase_policy import (
+                    LOG_PREFIX as _PP_LOG_PREFIX,
+                    unpriced_seam_note,
+                )
+
+                _note = unpriced_seam_note(self.phase_policy_cfg)
+                if _note:
+                    logger.warning("%s %s", _PP_LOG_PREFIX, _note)
             # The PP phase is drained when less than one chunk is left, and
             # the chunk size is a runtime fact, not a policy guess. Only fill
             # it in when the operator has not pinned one.
