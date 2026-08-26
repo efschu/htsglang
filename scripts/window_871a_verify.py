@@ -76,8 +76,18 @@ def read_cgroup_facts() -> dict:
     pinned-host guard can see its own posts at all. Desk reading on this box
     before any boot: anon 2.12 GiB, file 19.06 GiB, current 21.39 GiB.
     """
+    # SCOPE, RECORDED RATHER THAN ASSUMED. `/sys/fs/cgroup` from inside this
+    # container is the container's ROOT view, which aggregates every process in
+    # it -- serving, lanes and this script alike. That is the right scope for a
+    # host-RAM question, but it is NOT the scope #721's "system.slice peak
+    # 111.3 GiB" was taken at, and confusing the two is easy: measured here,
+    # root / system.slice / system.slice+claude.service report three different
+    # `memory.current` values and all three carry `memory.max = max`. The path
+    # is printed with the numbers so a later reader can tell which one they are
+    # looking at instead of inferring it.
     root = "/sys/fs/cgroup"
     out: dict = {k: None for k in ("anon", "file", "shmem", "current", "peak")}
+    out["scope"] = root
     for name in ("memory.current", "memory.peak"):
         try:
             with open(f"{root}/{name}", encoding="utf-8") as fh:
@@ -236,7 +246,10 @@ def run(text: str, cg_before: dict, cg_after: dict) -> int:
         print(f"            {c.detail}")
 
     print("-" * 78)
-    print("HOST LEDGER (#721) -- cgroup bytes, before vs after")
+    print(
+        f"HOST LEDGER (#721) -- cgroup bytes, before vs after "
+        f"[scope: {cg_after.get('scope') or cg_before.get('scope') or 'unknown'}]"
+    )
 
     def g(v):
         return "unknown" if v is None else f"{v / 2**30:.2f} GiB"
