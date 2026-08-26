@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt import knob_resolution as _knob
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
 
@@ -563,7 +564,10 @@ _mmq_threshold_logged: bool = False
 #: decided the threshold. Separate from `_mmq_threshold_logged`, which fires on
 #: the first actual reroute and therefore never fires for the configuration
 #: this warning is about.
-_mmq_env_override_logged: bool = False
+#: #901: the hand-rolled module-level bool and its reset are the authority's
+#: ``Announcer`` now -- the same latch three of the four migrated sites had
+#: written out by hand, with the reset contract #894's own suite pins.
+_mmq_announcer = _knob.Announcer("gguf.mmq_decode_threshold")
 
 # Decode token-count buckets, registered by the decode CUDA-graph runner(s):
 # bs * num_tokens_per_bs for every captured bs. Target and draft runners both
@@ -597,14 +601,13 @@ def _decode_bucket_for(m: int) -> int:
 def _reset_mmq_threshold_cache() -> None:
     """Test hook: drop the cached enable decision (and registered buckets)."""
     global _mmq_threshold_cached, _decode_token_buckets, _mmq_threshold_logged
-    global _mmq_env_override_logged
     _mmq_threshold_cached = None
     _decode_token_buckets = ()
     _mmq_threshold_logged = False
     # #894: the override announcement is latched to the same lifetime as the
     # decision it describes. A hook that cleared one but not the other would
     # leave the second decision silent again.
-    _mmq_env_override_logged = False
+    _mmq_announcer.reset()
 
 
 def _announce_mmq_env_override(env: str, enabled: bool) -> None:
@@ -636,9 +639,16 @@ def _announce_mmq_env_override(env: str, enabled: bool) -> None:
     Both spellings of the failure are covered: a value that DISAGREES with the
     flag, and a value that is not ``0`` or ``1`` at all (``env == "1"`` reads
     ``"true"`` as OFF, which was the second silence in the same three lines).
+
+    #901: the ladder, the equivalence test, the latch and the printed skeleton
+    all come from ``srt/knob_resolution``. Two things about this site are NOT
+    generic and stay here: the presence rule is ``is not None`` rather than
+    "non-empty" (``_mmq_decode_threshold_enabled`` short-circuits on presence
+    and then tests ``== "1"``, so ``FOO=`` IS a source here and reads as OFF),
+    and the equivalence test normalises an env STRING against a flag BOOLEAN.
+    Both are declared as parameters instead of being re-decided in prose.
     """
-    global _mmq_env_override_logged
-    if _mmq_env_override_logged:
+    if _mmq_announcer.said:
         return
     recognised = env in ("0", "1")
     flag = None
@@ -653,49 +663,90 @@ def _announce_mmq_env_override(env: str, enabled: bool) -> None:
         # to be surprised by it.
         flag = None
 
-    if recognised and flag is not None and flag == enabled:
+    resolution = _knob.resolve_knob(
+        [
+            _knob.KnobSource(
+                source=_knob.env_source(_MMQ_THRESHOLD_ENV),
+                value=enabled,
+                present=True,  # the caller only reaches here on presence
+                kind=_knob.KIND_ENV,
+                label=f"{_MMQ_THRESHOLD_ENV}={env!r}",
+            ),
+            _knob.KnobSource(
+                source=_knob.flag_source("gguf_mmq_decode_threshold"),
+                value=flag,
+                present=flag is not None,
+                kind=_knob.KIND_FLAG,
+                label=f"--gguf-mmq-decode-threshold={flag}",
+                cost="it was never consulted, so the flag is INERT",
+            ),
+        ],
+        normalize=bool,
+    )
+
+    # An UNRECOGNISED value is a defect on its own, independent of who won:
+    # 'true' and 'yes' are read as OFF in silence. So the line fires either
+    # when something was superseded, or when the value was not 0|1 at all.
+    if recognised and flag is not None and not resolution.lost_anything:
         return  # never ambiguous -- do not train readers to skip the line
     if flag is None:
-        who = (
-            f"the CLI flag --gguf-mmq-decode-threshold could not be read "
-            f"(ServerArgs not published at this call), so it was not compared"
+        loss = _knob.unreadable_loss_clause(
+            "--gguf-mmq-decode-threshold",
+            "could not be read (ServerArgs not published at this call), so it "
+            "was not compared",
         )
     else:
-        who = (
-            f"--gguf-mmq-decode-threshold={flag} is INERT: it was never "
-            f"consulted"
+        loss = _knob.loss_clause(
+            f"--gguf-mmq-decode-threshold={flag}", resolution.ladder[1].cost
         )
-    unparsed = (
+    note = (
         ""
         if recognised
         else (
-            f" The value is not one of 0|1 and is therefore read as OFF; only "
-            f"the exact string '1' enables the reroute."
+            " The value is not one of 0|1 and is therefore read as OFF; only "
+            "the exact string '1' enables the reroute."
         )
     )
-    _mmq_env_override_logged = True
-    logger.warning(
-        "#894 SUPERSEDED KNOB: %s=%r decided the GGUF MMQ decode threshold "
-        "(resolved %s) -- %s. The env override wins on PRESENCE, not on value, "
-        "so a stale =0 from an earlier A/B run silences the flag and produces "
-        "no reroute and no other log line at all.%s Documented precedence, "
-        "announced rather than refused: unset %s to let the flag govern.",
-        _MMQ_THRESHOLD_ENV,
-        env,
-        "ON" if enabled else "OFF",
-        who,
-        unparsed,
-        _MMQ_THRESHOLD_ENV,
+    _mmq_announcer.say(
+        logger,
+        _knob.supersession_line(
+            "894",
+            winner=f"{_MMQ_THRESHOLD_ENV}={env!r}",
+            subject="the GGUF MMQ decode threshold",
+            effective="this boot gets %s" % ("ON" if enabled else "OFF"),
+            loss=loss,
+            note=note,
+            presence_rule=(
+                "The env override wins on PRESENCE, not on value, so a stale "
+                "=0 from an earlier A/B run silences the flag and produces no "
+                "reroute and no other log line at all."
+            ),
+            # #901 CONTRACT CHANGE, deliberate: the old remedy said "unset
+            # SGLANG_GGUF_MMQ_DECODE_THRESHOLD", which does not close this
+            # site's own trap -- the presence rule here is `is not None`, so
+            # `export SGLANG_GGUF_MMQ_DECODE_THRESHOLD=` leaves the override
+            # PRESENT and still reading as OFF. The shared remedy says REMOVE
+            # and names the empty-string trap.
+            remedy=_knob.removal_remedy(_MMQ_THRESHOLD_ENV),
+        ),
     )
 
 
 def _mmq_decode_threshold_enabled() -> bool:
-    """Opt-in gate: --gguf-mmq-decode-threshold, or the env override."""
+    """Opt-in gate: --gguf-mmq-decode-threshold, or the env override.
+
+    #901: the PRESENCE RULE is asked of the authority rather than spelled
+    ``os.environ.get(...) is not None`` here. It is the dangerous one of the
+    two -- ``FOO=`` is a source and reads as OFF -- and having it written out
+    inline is how it came to differ from the rule two modules over without
+    anyone comparing them. The precedence itself does not move: the env still
+    wins on presence, which is the documented, restart-free A/B override.
+    """
     global _mmq_threshold_cached
     if _mmq_threshold_cached is not None:
         return _mmq_threshold_cached
-    env = os.environ.get(_MMQ_THRESHOLD_ENV)
-    if env is not None:
+    if _knob.env_present(_MMQ_THRESHOLD_ENV):
+        env = _knob.env_value(_MMQ_THRESHOLD_ENV)
         enabled = env == "1"
         # #894: the env still wins -- it just no longer wins in silence.
         _announce_mmq_env_override(env, enabled)

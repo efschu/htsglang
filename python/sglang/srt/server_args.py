@@ -42,6 +42,7 @@ from typing import (
 )
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.srt import knob_resolution
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -125,6 +126,13 @@ from sglang.utils import is_in_ci
 FLA_CHUNK_SIZE = 64
 
 logger = logging.getLogger(__name__)
+
+#: #901: one line per process when the ambient environment, not this argv,
+#: supplied the KV token vector that this argv's ROLE is published beside.
+#: The authority's shared latch rather than a fifth hand-rolled boolean.
+_token_vector_publication_announcer = knob_resolution.Announcer(
+    "server_args.uneven_token_vector"
+)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -18026,6 +18034,96 @@ class ServerArgs:
         # without the other. Refusing it would forbid the attribution run the
         # overrides exist for.
 
+    def _resolve_token_vector_publication_901(self):
+        """Publish the KV token vector, or say the environment kept deciding it.
+
+        THE ASYMMETRY THIS CLOSES (#901). ``_publish_promoted_781_flags``
+        visited ``SGLANG_UNEVEN_TOKEN_VECTOR`` only when the flag was set and
+        ``SGLANG_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally. The role's own
+        comment gives the reason it is unconditional -- "'no vector set' and
+        'vector set, role pin' must stay distinguishable from a stale env left
+        by an earlier process in the same shell" -- and that reason applies
+        with equal force to the vector, which is exactly why the pair was
+        wrong rather than merely uneven. The stale-shell case the role guards
+        against is the case in which the role is published and the vector is
+        not, so the two halves of one decision end up sourced from two
+        different processes.
+
+        BOTH RUNGS ARE NOW VISITED. Flag set: the flag's truth is published,
+        overwriting a stale value, exactly as before. Flag unset: the ambient
+        variable keeps governing -- that is the deliberate calibration-reapply
+        path, and taking it away would change which vector serves, which is a
+        bigger change than the one being made -- and the authority announces
+        it once, naming the role this process stamped onto a vector it did not
+        choose, with the shared REMOVE-never-blank remedy.
+
+        Parse-time and cheap: two attribute reads and, in the announced case,
+        one log line per process.
+        """
+        if self.uneven_token_vector is not None:
+            # The decode-phase KV token split. Published rather than read from
+            # a ServerArgs field by the consumer because the resolver runs
+            # inside the flip's SECOND stack build, where the geometry is TP
+            # and not the boot-time PP -- exactly the scope split the #754 fix
+            # is about. Publishing keeps one value visible to both stacks.
+            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = str(self.uneven_token_vector)
+            return
+
+        ambient = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
+        if ambient in (None, ""):
+            # Nothing set, nothing inherited: the flagless default path, and
+            # there is no decision to report.
+            return
+
+        resolution = knob_resolution.resolve_knob(
+            [
+                knob_resolution.KnobSource(
+                    source=knob_resolution.env_source("SGLANG_UNEVEN_TOKEN_VECTOR"),
+                    value=ambient,
+                    present=True,
+                    kind=knob_resolution.KIND_ENV,
+                    label=f"SGLANG_UNEVEN_TOKEN_VECTOR={ambient!r}",
+                ),
+                knob_resolution.KnobSource(
+                    source=knob_resolution.flag_source("uneven_token_vector"),
+                    value=None,
+                    present=False,  # unset -- that IS the case being reported
+                    kind=knob_resolution.KIND_FLAG,
+                    label="--uneven-token-vector",
+                ),
+            ]
+        )
+        _token_vector_publication_announcer.say(
+            logger,
+            knob_resolution.supersession_line(
+                "901",
+                winner=resolution.winner.loss_label(),
+                subject="the uneven-DCP KV token vector this process publishes",
+                effective=(
+                    f"this boot inherits it from the ambient environment while "
+                    f"publishing SGLANG_UNEVEN_TOKEN_VECTOR_ROLE="
+                    f"{str(self.uneven_token_vector_role)!r} from THIS command "
+                    f"line beside it"
+                ),
+                loss=knob_resolution.loss_clause(
+                    "--uneven-token-vector",
+                    "it is unset, so the role above describes a vector this "
+                    "argv never chose -- the two halves of one decision come "
+                    "from two different processes",
+                ),
+                presence_rule=(
+                    "The env override wins on PRESENCE, not on value, and this "
+                    "is deliberate: the KV calibration writes its measured "
+                    "optimum back into the environment so the next boot "
+                    "re-applies it without re-parsing ServerArgs."
+                ),
+                remedy=knob_resolution.removal_remedy(
+                    "SGLANG_UNEVEN_TOKEN_VECTOR",
+                    govern="this command line govern the vector as well as the role",
+                ),
+            ),
+        )
+
     def _publish_promoted_781_flags(self):
         """Publish the #781 promoted flags to the consumers that read env.
 
@@ -18059,13 +18157,26 @@ class ServerArgs:
         def _b(value) -> str:
             return "1" if value else "0"
 
-        if self.uneven_token_vector is not None:
-            # The decode-phase KV token split. Published rather than read from
-            # a ServerArgs field by the consumer because the resolver runs
-            # inside the flip's SECOND stack build, where the geometry is TP
-            # and not the boot-time PP -- exactly the scope split the #754 fix
-            # is about. Publishing keeps one value visible to both stacks.
-            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = str(self.uneven_token_vector)
+        # #901: THE VECTOR IS NOW ALWAYS RESOLVED HERE, not only when the flag
+        # is set. Before, this branch was the only visit: a set flag overwrote
+        # whatever the environment carried, and an unset flag left the shell's
+        # stale vector in place -- while the ROLE eight lines below was
+        # published UNCONDITIONALLY. That asymmetry is the defect, and it is
+        # worse than an untidy pair: with the flag unset, this process stamps
+        # its own default role onto a vector some earlier process left behind,
+        # so `SGLANG_UNEVEN_TOKEN_VECTOR_ROLE` speaks with the authority of
+        # this argv about a vector this argv never chose.
+        #
+        # What does NOT change is which value serves. Env-over-flag here is
+        # design (the KV calibration writes its measured optimum back into the
+        # environment and the next boot re-applies it without re-parsing
+        # ServerArgs), so an unset flag still leaves the ambient vector
+        # governing. What changes is that the case is no longer SILENT: the
+        # else-branch hands it to the knob-resolution authority, which says
+        # once that the environment, not this command line, decided it -- and
+        # says it with the same remedy every other superseded env override
+        # gets. Symmetric visit, unchanged precedence, one announcement.
+        self._resolve_token_vector_publication_901()
         # #797: the ROLE travels with the vector, for the same reason the
         # vector itself is published rather than read off a ServerArgs field --
         # the resolver runs inside the flip's SECOND stack build, where this
