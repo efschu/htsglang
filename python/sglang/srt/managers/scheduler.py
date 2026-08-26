@@ -12498,6 +12498,7 @@ def configure_scheduler_process(
     # even modulo DCP path. Gated behind dcp_size>1 (auto-set for a
     # non-uniform --rank-tp-ratio) so the default path is untouched.
     from sglang.srt.distributed.utils import (
+        announce_superseded_rank_kv_ratio,
         resolve_cp_token_ratios,
         set_cp_token_ratios,
     )
@@ -12518,6 +12519,12 @@ def configure_scheduler_process(
         and base_plan is not None
         and server_args.uneven_weighted_dcp_enabled()
     ):
+        # #897: SGLANG_UNEVEN_TOKEN_VECTOR beats --rank-kv-ratio on PRESENCE
+        # inside the resolver, which is a documented pure function and says
+        # nothing. This is the boot-time site that installs the vector, so it
+        # is where the loss is announced -- once per process, before the
+        # resolution, so the line stands even if the resolver then refuses.
+        announce_superseded_rank_kv_ratio(server_args)
         cp_vector = resolve_cp_token_ratios(server_args)
         set_cp_token_ratios(cp_vector)
         if cp_vector is not None:

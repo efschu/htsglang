@@ -743,6 +743,169 @@ def _refuse_retracted_token_vector(server_args, vector, source: str) -> None:
     )
 
 
+#: #897: set once the KV-ratio supersession below has been reported, so a
+#: process that resolves the vector more than once (the boot gate calls the
+#: resolver, the phase flip builds a second stack) says it once, not per call.
+_kv_ratio_supersession_announced = False
+
+
+def reset_kv_ratio_supersession_announcement() -> None:
+    """Forget that the #897 supersession was announced in this process.
+
+    Test hook only. The latch exists so the boot log carries the line once;
+    a suite that drives several boots in one interpreter needs to clear it
+    between them or it would be testing the latch instead of the message.
+    """
+    global _kv_ratio_supersession_announced
+    _kv_ratio_supersession_announced = False
+
+
+def _gcd_reduced(vector: Sequence[int]) -> List[int]:
+    """The form ``resolve_cp_token_ratios`` compares and installs."""
+    g = math.gcd(*vector)
+    return [v // g for v in vector]
+
+
+def announce_superseded_rank_kv_ratio(server_args) -> None:
+    """Say that SGLANG_UNEVEN_TOKEN_VECTOR, not --rank-kv-ratio, decided the
+    KV-token ownership vector (#897).
+
+    THE DEFECT THIS EXISTS TO END. ``resolve_cp_token_ratios`` reads the env
+    vector first and returns on its PRESENCE, not on a comparison with the
+    flag. So a value left behind by an earlier A/B run -- or written into the
+    environment by this process's own KV calibration -- beats an explicit
+    ``--rank-kv-ratio`` without consulting it, and the whole resolver contains
+    no logger call: the operator sees his flag in ``ps`` and in the ServerArgs
+    repr while a different vector sizes every rank's KV pool. Same shape as
+    #894 S5 (``SGLANG_GGUF_MMQ_DECODE_THRESHOLD``), one module down.
+
+    WHY HERE AND NOT IN THE RESOLVER. ``resolve_cp_token_ratios`` is
+    documented as a DETERMINISTIC PURE FUNCTION of the args, because every
+    rank must derive the same vector for the pool pinning and the owner rule
+    to agree; it has several callers, direct unit calls among them. A logger
+    inside it would fire once per call site and per rank, and would make a
+    function whose contract is "same input, same output, no side effects"
+    carry one. The announcement therefore lives beside the precedence it
+    describes -- in this module, so it cannot drift from the rule -- and is
+    CALLED from the boot-time site that installs the vector
+    (``scheduler.configure_scheduler_process``), once per process.
+
+    WHY NOT #896's ``_flag_or_env`` RECORDER. That helper resolves one SCALAR
+    knob from ``getattr(server_args, field)`` against one env reader and
+    returns the value; it lives in ``managers/phase_policy.py``, which sits
+    above this module. It cannot express a five-level vector precedence with
+    gcd reduction, a retraction refusal and the #797 seed arming, and reusing
+    it would mean importing ``managers`` from ``distributed``. The reusable
+    part is the SHAPE of #894 S5 -- one latched module-level warner, warning
+    and not refusal -- and that is what this is.
+
+    WARNING, NOT REFUSAL, decided on the danger direction:
+
+    * The precedence is documented in the flag's own help text ("The
+      environment variable SGLANG_UNEVEN_TOKEN_VECTOR (explicit vector) takes
+      precedence over this flag") and the env is how the KV calibration feeds
+      its measured optimum back in. Flipping it, or refusing the combination,
+      would change which vector serves -- a bigger change than the one being
+      made, and not this ticket's to make.
+    * Refusing here kills a boot on every process that carries the variable,
+      including the in-process writeback path
+      (``model_runner_kv_cache_mixin`` sets it after profiling). The defect's
+      blast radius is a wrong belief about which vector sized the pools.
+
+    The remedy named in the message is to REMOVE the variable, never to set
+    it empty: server_args.py:5607 records what an empty override already cost
+    once -- SGLANG_UNEVEN_TOKEN_VECTOR set, then blanked by a later append,
+    uneven token sharding off for a day with nobody aware.
+    """
+    global _kv_ratio_supersession_announced
+    if _kv_ratio_supersession_announced:
+        return
+
+    from sglang.srt.environ import envs as _envs
+
+    env_vec = _envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+    if not env_vec:
+        return
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    if kv_flag is None or kv_flag == "coupled":
+        # 'coupled' is the default and asks for exactly the env-gated
+        # behaviour. Nothing the operator chose is being taken away, so
+        # saying it would train readers to skip the line.
+        return
+    dcp_size = getattr(server_args, "dcp_size", 1)
+    if dcp_size <= 1:
+        return
+    try:
+        parsed = [int(x) for x in str(env_vec).split(",") if x.strip() != ""]
+    except ValueError:
+        parsed = []
+    if not parsed or len(parsed) != dcp_size or any(v <= 0 for v in parsed):
+        # Malformed or wrong length: resolve_cp_token_ratios raises on exactly
+        # this, naming the variable and the shape it wants. A second, quieter
+        # report here would only compete with the loud one.
+        return
+    winner = _gcd_reduced(parsed)
+    role = _token_vector_role(server_args)
+    # An all-equal env vector is not installed as a vector at all: the resolver
+    # returns None for it, which IS the even-modulo owner rule. Printing
+    # "installed as 1,1" there would name something no code holds.
+    effective = (
+        "uniform token ownership, the even-modulo owner rule"
+        if len(set(winner)) == 1
+        else "the vector %s" % ",".join(str(v) for v in winner)
+    )
+
+    if isinstance(kv_flag, list):
+        if len(kv_flag) != dcp_size:
+            return
+        if _gcd_reduced(kv_flag) == winner:
+            # Same vector either way. Never ambiguous, so nothing to report --
+            # a line that also fires when nothing was lost is a line readers
+            # learn to skip.
+            return
+        lost = "--rank-kv-ratio %s" % ",".join(str(v) for v in kv_flag)
+        cost = (
+            "that vector is INERT -- the resolver returns on the env "
+            "variable's presence before the flag is read at all"
+        )
+    else:
+        lost = "--rank-kv-ratio %s" % kv_flag
+        if role == "seed":
+            cost = (
+                "the mode's phase-1 estimate is skipped; because the vector "
+                "is role='seed' the measured optimum still supersedes it "
+                "in-process after profiling, so the mode arrives late rather "
+                "than not at all"
+            )
+        else:
+            cost = (
+                "the mode is INERT in both phases -- its phase-1 estimate is "
+                "skipped here, and a role='pin' env vector also suppresses "
+                "the post-profiling measured install "
+                "(model_runner_kv_cache_mixin, `pinned_vector`), so the "
+                "measured optimum is printed as advice and never installed"
+            )
+
+    _kv_ratio_supersession_announced = True
+    logger.warning(
+        "#897 SUPERSEDED KNOB: SGLANG_UNEVEN_TOKEN_VECTOR=%r decided the "
+        "uneven-DCP KV-token ownership -- this boot gets %s (role=%r) -- and "
+        "%s did not decide it: %s. The env override wins on PRESENCE, not on "
+        "value, so a stale vector from an earlier A/B run -- or one this "
+        "process's own KV calibration wrote back -- beats the flag without "
+        "being compared to it. Documented precedence, announced rather than "
+        "refused: to let the flag govern, REMOVE SGLANG_UNEVEN_TOKEN_VECTOR "
+        "from the environment -- not by setting it to an empty string, which "
+        "is how uneven token sharding was silently switched off for a day "
+        "once already (server_args.py:5607).",
+        env_vec,
+        effective,
+        role,
+        lost,
+        cost,
+    )
+
+
 def resolve_cp_token_ratios(
     server_args, checkpoint_size_mib: Optional[int] = None
 ) -> Optional[list]:
@@ -767,6 +930,12 @@ def resolve_cp_token_ratios(
     estimate here (phase 1) and installs the MEASURED optimal vector after
     the post-weight-load profiling instead (phase 2, see
     ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector).
+
+    That first step wins on the env variable's PRESENCE, never on a
+    comparison with the flag below it. #897: this function stays silent about
+    it -- see ``announce_superseded_rank_kv_ratio`` above, which says it once
+    per process from the boot-time install site, so the rule and its
+    announcement live in one module while this one stays pure.
 
     Deterministic pure function of the args so every rank computes the same
     vector (the pool pinning and owner rule must agree across ranks)."""

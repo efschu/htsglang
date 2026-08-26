@@ -74,6 +74,16 @@ not silently fixed here). The measured-`P_r` route below is model-agnostic
   weights — a legitimate point on the slider.
 - Precedence (matches the mlp/moe/vocab family convention): env
   `SGLANG_UNEVEN_TOKEN_VECTOR` > flag list > capacity/coupled derivation.
+  The env wins on **presence**, not on value, and it is never compared to the
+  flag. #897: that loss is announced once per process by
+  `distributed/utils.py` `announce_superseded_rank_kv_ratio`, called from the
+  boot-time install site in `configure_scheduler_process` — the resolver
+  itself stays a silent pure function. Unlike the role and provenance
+  variables, `SGLANG_UNEVEN_TOKEN_VECTOR` is published from
+  `--uneven-token-vector` only when that flag is set
+  (`server_args.py` `_publish_promoted_781_flags`), so a value from an earlier
+  process survives instead of being overwritten. To let the flag govern,
+  REMOVE the variable — never blank it (`server_args.py:5607`).
 - Validation (fail fast in `_handle_uneven_tp`): non-`coupled` requires
   `--rank-gpu-id` and an uneven `--rank-tp-ratio` plan; explicit list with a
   collapsed-to-even auto plan is a hard error; `capacity` on a collapsed plan

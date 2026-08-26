@@ -408,7 +408,9 @@ _SUPERSESSION_PROSE = re.compile(
 #: Every ``ServerArgs`` field whose own help text says another knob can beat
 #: it, classified. Determined 2026-08-26 at base 2b13ba92d1 (= pin 0cd27d957d
 #: + #889); a verdict is a SNAPSHOT and carries its date, so re-read it against
-#: the pin before trusting it.
+#: the pin before trusting it. AMENDED 2026-08-26 at base 65a4b8dbd2 by #897:
+#: ``rank_kv_ratio`` moved KNOWN_SILENT -> WARNED, which is why the
+#: KNOWN_SILENT set is now empty.
 #:
 #: WARNED             the loss is announced at runtime; the value names where.
 #: NOT_A_PAIR         the prose is not one knob silencing another.
@@ -458,18 +460,20 @@ _CLASSIFIED = {
         "an artifact path that has nothing to write when its producer "
         "(--regime-controller) is off; no second knob competes for it",
     ),
-    # -- named debt -----------------------------------------------------------
+    # -- the debt #894 named, paid by #897 ------------------------------------
     "rank_kv_ratio": (
-        "KNOWN_SILENT",
-        "FOUND BY THE #894 RE-SWEEP, NOT FIXED HERE. "
-        "distributed/utils.py:816-838 (`resolve_cp_token_ratios`) lets "
-        "SGLANG_UNEVEN_TOKEN_VECTOR win on presence over an explicit "
-        "--rank-kv-ratio and logs nothing -- `grep -n 'logger\\.' ` over the "
-        "whole function returns zero. Same class as #894 S5. Left open "
-        "deliberately: that resolver is documented as a DETERMINISTIC PURE "
-        "FUNCTION called from several sites, so the announcement belongs at a "
-        "boot-time site and that placement needs its own red-first, not a "
-        "logger bolted inside a pure function.",
+        "WARNED",
+        "distributed/utils.py:announce_superseded_rank_kv_ratio, called once "
+        "per process from scheduler.configure_scheduler_process (#897). "
+        "#894 left this KNOWN_SILENT for a stated reason: "
+        "`resolve_cp_token_ratios` still lets SGLANG_UNEVEN_TOKEN_VECTOR win "
+        "on presence over an explicit --rank-kv-ratio, and it is documented "
+        "as a DETERMINISTIC PURE FUNCTION with several call sites, so the "
+        "announcement could not go inside it. #897 put the warner beside the "
+        "precedence rule in the same module and CALLS it from the boot-time "
+        "install site instead; the resolver still contains zero logger calls "
+        "and is pinned that way by "
+        "test_kv_ratio_supersession_897.TestTheResolverStaysPure.",
     ),
     # -- not this fork --------------------------------------------------------
     "max_queued_requests": (
@@ -552,11 +556,18 @@ class TestEverySupersessionInHelpTextIsClassified(CustomTestCase):
                 self.assertIn(verdict, _VERDICTS)
                 self.assertGreater(len(reason), 20, "a verdict needs a reason")
 
-    def test_the_known_silent_set_is_exactly_what_894_left_open(self):
+    def test_the_known_silent_set_is_exactly_what_is_still_open(self):
         """The debt is pinned, so it cannot grow without someone editing this
-        line and noticing what they are doing."""
+        line and noticing what they are doing.
+
+        #894 left exactly one entry here, ``rank_kv_ratio``. #897 fixed it and
+        reclassified it to WARNED, so the set is now EMPTY -- and an empty
+        expectation is the strongest form of this guard: the next author who
+        parks a knob as KNOWN_SILENT has to come here and write its name in,
+        rather than appending to a list that already had one.
+        """
         silent = sorted(f for f, (v, _) in _CLASSIFIED.items() if v == "KNOWN_SILENT")
-        self.assertEqual(silent, ["rank_kv_ratio"])
+        self.assertEqual(silent, [])
 
     def test_the_scanner_finds_new_prose(self):
         """Can-fail proof for the ratchet: an unclassified field must be
