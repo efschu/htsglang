@@ -34,13 +34,19 @@ log="$OUTDIR/$base.log"
 
 mkdir -p "$OUTDIR"
 cd "$ROOT"
-start=$(date +%s.%N)
+# Wall time in shell integer arithmetic over nanoseconds, NOT `bc` (#895).
+# `bc` is not installed on this box, and the failure was silent in exactly the
+# way a measurement must never fail: the substitution produced an empty string,
+# printf turned it into `0.00`, and every solo log recorded a zero-second run
+# that reads like a real measurement.
+start=$(date +%s%N)
 CUDA_VISIBLE_DEVICES="" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT/python" \
   timeout "$TMO" "$PY" -m pytest "$mod" \
     -q -p no:randomly -p no:cacheprovider --color=no -rfE \
     > "$log" 2>&1
 rc=$?
-end=$(date +%s.%N)
-printf '#SOLO_RC %d\n#SOLO_WALL %.2f\n#SOLO_MODULE %s\n' \
-  "$rc" "$(echo "$end - $start" | bc)" "$mod" >> "$log"
+end=$(date +%s%N)
+ms=$(( (end - start) / 1000000 ))
+printf '#SOLO_RC %d\n#SOLO_WALL %d.%02d\n#SOLO_MODULE %s\n' \
+  "$rc" "$(( ms / 1000 ))" "$(( (ms % 1000) / 10 ))" "$mod" >> "$log"
 echo "$base rc=$rc"
