@@ -122,6 +122,39 @@ NOT_CROWDING_PROVABLE = {
 
 SIMULTANEITY_REASON = "simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26"
 
+# #898, measured 2026-08-26: the SECOND exclusion class, and it is not the
+# NEEDS_DEVICE one. A module that calls `popen_launch_server` does not merely
+# want a card -- it starts a REAL server process out of process, loads a model
+# and talks HTTP to it. At the desk that is refused twice over: the hermetic
+# run has no card, and the `sglang` console script is not on the gate's PATH,
+# so the module dies in setUpClass with
+# `FileNotFoundError: No such file or directory: 'sglang'` before a single
+# assertion of its own runs.
+#
+# WHY IT MUST BE ITS OWN CLASS RATHER THAN FOLDED INTO NEEDS_DEVICE. The two
+# behave differently in the one direction that matters. A NEEDS_DEVICE module
+# fails a test; a launcher module fails at SETUP, and a setup failure is an
+# ERROR, not a FAILURE -- pytest counts it in a different column, and the
+# summary line reads `46 failed ... 25 errors`. Every extraction that greps
+# `^FAILED` therefore reports 46 where the truth is 71. The 25 that class
+# exactly are the ones this rule excludes, so naming the class also repairs the
+# count (Extraktions-Zaehlprobe).
+#
+# BY SOURCE PROBE, NOT BY NAME, for the reason the RANKS lane already gives:
+# a hand-kept name list goes stale the moment somebody adds a module. Measured
+# on this tree: the marker fires on 7 of 34 modules in test/registered/scheduler
+# and on 0 of 337 in test/registered/unit/{managers,planner,server_args,
+# mem_cache}, so adding it CANNOT move a row in the existing managers table.
+SERVER_LAUNCH_MARKERS = ("popen_launch_server",)
+
+
+def needs_live_server(source: str) -> str | None:
+    hit = [m for m in SERVER_LAUNCH_MARKERS if m in source]
+    if hit:
+        return "needs_server:launches_real_server:" + ",".join(sorted(hit))
+    return None
+
+
 RANK_SPAWN_MARKERS = (
     "multiprocessing",
     "mp.Process",
@@ -174,6 +207,15 @@ def main() -> int:
 
         if mod in NEEDS_DEVICE:
             rows.append((mod, "EXCLUDED", "needs_device:CVD_empty_fails_NOTE860_0.7", h, ref))
+            stats["EXCLUDED"] += 1
+            continue
+
+        # #898: refused BEFORE the solo comparison, and before the module is
+        # ever handed to a lane. Unlike the sets above this one is decided from
+        # the SOURCE, so it needs no measurement and cannot go stale.
+        srv = needs_live_server(src)
+        if srv:
+            rows.append((mod, "EXCLUDED", srv, h, ref))
             stats["EXCLUDED"] += 1
             continue
 

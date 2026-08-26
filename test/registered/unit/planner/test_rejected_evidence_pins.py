@@ -66,10 +66,51 @@ class PpWithSpecEvidenceTest(unittest.TestCase):
         for cited in cites:
             self.assertLessEqual(cited, len(lines), "cite past end of server_args.py")
         head, spec = cites
-        self.assertIn("pp_size > 1", "\n".join(lines[head - 1 : head + 2]))
+        advice = self._where_the_guard_actually_is(lines)
+        self.assertIn("pp_size > 1", "\n".join(lines[head - 1 : head + 2]), advice)
         window = "\n".join(lines[max(0, spec - 3) : spec + 8])
-        self.assertIn("speculative_algorithm is None", window)
-        self.assertIn("enable_phase_flip", window)
+        self.assertIn("speculative_algorithm is None", window, advice)
+        self.assertIn("enable_phase_flip", window, advice)
+
+    @staticmethod
+    def _where_the_guard_actually_is(lines) -> str:
+        """Say what the cite SHOULD read, not merely that it is wrong.
+
+        #898, 2026-08-26: this cite has now drifted and been re-pinned FOUR
+        times -- #625 (:11214 -> :16240-16245), #815 78d27da51d
+        (-> :18958/:18973), #810 a09e71f4a4, #837 ddf009c43f (-> :19269/:19284)
+        -- and drifted a fifth time to :19436/:19451. Each re-pin was a hunt
+        through server_args.py by hand.
+
+        The CLASS is an absolute line number kept in prose about a file that
+        grows above it; the class fix is a landmark-based citation format,
+        which changes `_LINE_REF`, every code-site row and every reader, and is
+        NOT free. What IS free is refusing to make the next reader hunt: the
+        test that notices the drift already knows how to find the guard, so it
+        prints the correct pair. See DETERMINATION_898 §4.4.
+        """
+        head = spec = None
+        for i, line in enumerate(lines, start=1):
+            if head is None and line.strip() == "if self.pp_size > 1:":
+                candidate = i
+                for j in range(i, min(i + 40, len(lines))):
+                    if (
+                        "speculative_algorithm is None or self.enable_phase_flip"
+                        in lines[j]
+                    ):
+                        head, spec = candidate, j + 1
+                        break
+        if head is None:
+            return (
+                "the pp_size>1 / speculation guard was not found in "
+                "server_args.py at all -- the row may describe a guard that "
+                "no longer exists"
+            )
+        return (
+            f"evidence cite has drifted; the guard now sits at "
+            f"server_args.py:{head} (if pp_size > 1) and server_args.py:{spec} "
+            f"(spec assert). Update the pp_with_spec row in planner/rejected.py."
+        )
 
     def test_the_spec_half_is_still_a_hard_assert(self):
         """The verdict says 'hard assert, not an auto-disable'. Pin that word.
