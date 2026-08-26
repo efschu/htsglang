@@ -3327,6 +3327,11 @@ class Scheduler(
         #: makes a stale verdict safe -- a verdict from the other layout is
         #: discarded rather than trusted.
         self._parked_decode_verdict: Tuple[Optional[str], bool] = (None, False)
+        #: #888b: the relief's receipts are level-triggered on a per-round
+        #: gate, so a steady residency would restate them forever -- the same
+        #: 140184-lines-in-ten-minutes shape the parked set's own reconcile
+        #: receipt already pays for. Collapsed on the same detector.
+        self._parked_relief_collapse = CycleCollapse()
         logger.info(
             "%s parking %s: GDN slot pool %d, concurrency cap %d, phase flip "
             "%s. Armed, a carrier this phase forbids to decode stops counting "
@@ -4089,6 +4094,196 @@ class Scheduler(
         if not blocked or phase != getattr(self, "phase_flip_active_stack", None):
             return 0
         return min(self.parked_decode_set.carrier_discount(), max(0, int(running_bs)))
+
+    # -- #888b: a resident the phase forbids to run must be able to yield ---
+
+    def _decode_forbidden_this_phase(self) -> bool:
+        """Does the ACTIVE layout forbid decode, as recorded this residency?
+
+        THE SAME TWO CLAMPS AS ``_parked_carrier_discount``, reused rather
+        than re-derived, and the reuse is the point: a second reading of the
+        purity verdict would be a second thing to keep true. The verdict is
+        recorded by the decode branch, which does not run on every round, so
+        it can outlive the layout that produced it -- a PP verdict read inside
+        TP would report a prohibition that has already lifted, and everything
+        #888b does downstream of this predicate is destructive.
+        """
+        phase, blocked = getattr(self, "_parked_decode_verdict", (None, False))
+        if not blocked:
+            return False
+        return phase == getattr(self, "phase_flip_active_stack", None)
+
+    def _rederive_latched_batch_full(self, running_batch) -> bool:
+        """Under a phase prohibition, ``batch_is_full`` is not a latch.
+
+        #888b, half one. The flag is set by the admission gate itself and
+        every clear site it has -- ``update_running_batch`` and the finish
+        paths -- lives on the DECODE path. Strict purity forbids that path in
+        PP, so one pass with a full seat table latches the flag for the whole
+        residency and every later pass returns at the flag, ABOVE the seat
+        test and above every relief. Measured on boot_w38rerun_0826_1304:
+        sixty of sixty emitted declines inside the 156s stall named
+        ``batch_full_or_empty_queue`` and ZERO named ``no_allocatable_reqs``,
+        with 12876 KV tokens free and 33 tokens of prefill pending.
+
+        Clearing it does not admit anything. It restores the question: the
+        gate below re-derives whether the batch is still full, which is what
+        a non-purity boot gets for free from the decode path every round.
+
+        NOT A SECOND AUTHORITY. In a phase that permits decode this returns
+        False and the flag keeps its stock owners -- the one direction that
+        must stay byte-identical.
+        """
+        from sglang.srt.managers.parked_carrier_relief import (
+            latched_flag_must_be_rederived,
+            parked_carrier_relief_enabled,
+        )
+
+        if not parked_carrier_relief_enabled():
+            return False
+        if not latched_flag_must_be_rederived(
+            decode_forbidden=self._decode_forbidden_this_phase(),
+            flag_is_latched=bool(getattr(running_batch, "batch_is_full", False)),
+        ):
+            return False
+        running_batch.batch_is_full = False
+        collapse = self._parked_relief_collapse.observe(
+            "#888b re-derived a latched batch_is_full: the phase forbids "
+            "decode, so every clear site of the flag is unreachable and a "
+            "stale True would refuse admission for the whole residency"
+        )
+        if collapse.rollup:
+            logger.info(
+                "#888b suppressed=%d batch_is_full re-derivations repeating a "
+                "%d-pass cycle since the last emitted line",
+                collapse.rollup,
+                collapse.period,
+            )
+        if collapse.emit:
+            logger.info(
+                "#888b re-derived a latched batch_is_full: the phase forbids "
+                "decode, so every clear site of the flag is unreachable and a "
+                "stale True would refuse admission for the whole residency"
+            )
+        return True
+
+    def _maybe_yield_parked_carrier(
+        self, running_batch, running_bs: int, allocatable: int
+    ) -> int:
+        """Take back ONE request seat so a starved drain can proceed.
+
+        #888b, half two, and the half that removes the REASON rather than the
+        symptom. Under strict purity the PP phase holds while prefill is
+        pending; the pending prefill needs a seat in ``req_to_token_pool``,
+        which is sized to ``max_running_requests``; every seat is held by a
+        carrier the phase may not run to completion; and nothing takes a seat
+        back. The phase waits for an event its own occupancy forbids.
+
+        #677 phase 1 answered the same wedge with arithmetic -- stop charging
+        a parked carrier to ``max_running`` -- and that was correct and
+        insufficient: it removed the cap that was not binding and left the
+        pool that was. A discount cannot free a seat the discounted carrier
+        is still sitting in.
+
+        THE DECISION IS ELSEWHERE, on purpose. ``parked_carrier_relief``
+        holds it as pure arithmetic with the binder NAMED from measurement,
+        because the stall this fixes was mis-attributed from a
+        pool-utilisation reading and a verdict that assumes its binder cannot
+        be falsified against a boot log.
+
+        THE ACTUATOR IS #679's. ``_retract_decode_and_requeue`` was extracted
+        exactly so a caller like this one would not own a second copy of a
+        retraction -- and a second copy that forgot to re-queue its victims
+        would leak a user's request, which is worse than the wedge.
+
+        Returns the number of seats gained (0 or 1).
+        """
+        from sglang.srt.managers.parked_carrier_relief import (
+            hold_receipt,
+            parked_carrier_relief_enabled,
+            relief_receipt,
+        )
+        from sglang.srt.managers.parked_carrier_relief import (
+            carrier_relief_verdict as _verdict,
+        )
+
+        if not parked_carrier_relief_enabled():
+            return 0
+        try:
+            seats = self.req_to_token_pool
+            seats_before = int(seats.available_size())
+            mamba_allocator = getattr(seats, "mamba_allocator", None)
+            mamba_free = (
+                int(mamba_allocator.available_size())
+                if mamba_allocator is not None
+                else 0
+            )
+            pending = int(self._admissible_prefill_tokens())
+            verdict = _verdict(
+                decode_forbidden=self._decode_forbidden_this_phase(),
+                pending_prefill_tokens=pending,
+                queue_len=len(self.waiting_queue),
+                allocatable_reqs=int(allocatable),
+                resident_bs=int(running_bs),
+                parked_count=int(
+                    getattr(self.parked_decode_set, "resident_count", 0)
+                ),
+                chunk_in_flight=self.chunked_req is not None,
+                req_slots_free=seats_before,
+                kv_avail_tokens=int(self.token_to_kv_pool_allocator.available_size()),
+                kv_need_tokens=pending,
+                mamba_slots_free=mamba_free,
+            )
+        except Exception as e:  # noqa: BLE001 - relief must never fail a boot
+            logger.warning(
+                "#888b carrier-relief verdict failed (%s); admission proceeds "
+                "and the gate decides unaided",
+                e,
+            )
+            return 0
+
+        if not verdict.yield_carrier:
+            note = hold_receipt(verdict)
+            if note is not None:
+                collapse = self._parked_relief_collapse.observe(note)
+                if collapse.emit:
+                    logger.info("%s", note)
+            return 0
+
+        try:
+            # THE #583 PRECONDITION, and it is not optional: `retract_decode`
+            # bounds its loop and its last-survivor test on this value, and
+            # #583 is exactly the case where the entry decision was uniform
+            # and the loop bound was not, so ranks popped DIFFERENT numbers
+            # of victims. The entry decision above is uniform for the same
+            # reason #679's ladder's is -- every quantity it branches on is
+            # either replicated (the queue, the phase verdict) or the group
+            # floor -- and the victim count is the constant one.
+            running_batch.uniform_avail_floor = self.uniform_min_avail()
+            tokens = self._retract_decode_and_requeue(
+                running_batch,
+                kv_full_retract_flag=False,
+                reason=(
+                    f"#888b yielding a parked carrier's request seat "
+                    f"(binder={verdict.binder}). "
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("#888b carrier yield failed: %s", e)
+            return 0
+
+        seats_after = int(self.req_to_token_pool.available_size())
+        logger.warning(
+            "%s",
+            relief_receipt(
+                verdict,
+                seats_before=seats_before,
+                seats_after=seats_after,
+                tokens_gained=int(tokens or 0),
+                victims=max(0, int(running_bs) - len(running_batch.reqs)),
+            ),
+        )
+        return max(0, seats_after - seats_before)
 
     def init_admission_limiter(self) -> None:
         """Build this group's floating admission limit (#287).
@@ -8064,6 +8259,14 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        # #888b: and the same reset, for the same reason, in the one phase
+        # whose prohibition makes the flag unclearable. Placed HERE -- above
+        # the gate, below the pass's collectives -- because the gate below is
+        # the read that wedged: it returns before the seat test, before #677's
+        # carrier discount and before any relief. Inert unless a recorded
+        # purity verdict says this layout forbids decode.
+        self._rederive_latched_batch_full(running_batch)
+
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
@@ -8094,6 +8297,26 @@ class Scheduler(
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and self.chunked_req is None
+            and not self.enable_priority_preemption
+        ):
+            # #888b: SPEND A SEAT BEFORE LATCHING, not instead of latching.
+            # This is the point at which the drain provably starved: the seat
+            # table is full of carriers the phase forbids to run, and the
+            # pending prefill behind them can only be admitted if one of them
+            # gives its seat back. The yield takes at most ONE, then the gate
+            # below re-reads the same expression and still decides -- a pass
+            # that cannot admit even after the yield declines exactly as it
+            # did before, which is #679's self-clearing park shape.
+            #
+            # ORDER IS THE CONTRACT (DESIGN_679 §4 rule 1): relief changes
+            # what there is to decide from; it never admits anything itself.
+            if self._maybe_yield_parked_carrier(
+                running_batch, running_bs, self.get_num_allocatable_reqs(running_bs)
+            ):
+                running_bs = len(running_batch.reqs)
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
@@ -8950,7 +9173,11 @@ class Scheduler(
         )
 
     def _retract_decode_and_requeue(
-        self, batch: ScheduleBatch, *, kv_full_retract_flag: bool
+        self,
+        batch: ScheduleBatch,
+        *,
+        kv_full_retract_flag: bool,
+        reason: Optional[str] = None,
     ) -> int:
         """Retract decode victims and put every one of them back. Returns the
         tokens the pool gained.
@@ -9018,10 +9245,21 @@ class Scheduler(
                 req,
             )
 
+        # #888b: a THIRD caller needs a third sentence. The two below are the
+        # only reasons this actuator used to run, and neither is true when a
+        # carrier yields its request seat: "KV cache pool is full" is exactly
+        # the mis-attribution that ticket corrects (12876 tokens were free at
+        # the measured stall) and "Testing retraction" is simply false. A
+        # caller that supplies its own reason gets it; `reason=None` keeps the
+        # two existing call sites byte-identical.
         msg_prefix = (
-            "KV cache pool is full. Retract requests. "
-            if kv_full_retract_flag
-            else "Testing retraction. "
+            reason
+            if reason
+            else (
+                "KV cache pool is full. Retract requests. "
+                if kv_full_retract_flag
+                else "Testing retraction. "
+            )
         )
         msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
         if mamba_num_gained is not None:
