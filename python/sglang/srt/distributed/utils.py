@@ -469,13 +469,39 @@ def cp_token_split_factor(dcp_size: int) -> int:
 
 
 def uneven_dcp_kv_replicated(dcp_size: int) -> bool:
-    """True when the uneven-TP + DCP KV-replication path is in force: DCP spans
-    the whole TP group (dcp_size>1) AND a --rank-tp-ratio base plan is installed
-    (so kv-heads are split UNEVENLY and cannot be head-sharded across the DCP
-    group). Under this path every rank stores the FULL (replicated) kv-heads but
-    only its owned token slots. Covers BOTH the even-modulo (no token vector) and
-    the weighted (token vector installed) owner rules. False -> stock behavior
-    (even head-sharded DCP, or no DCP), keeping those paths bit-identical."""
+    """True when the uneven-TP + DCP KV-replication path is in force.
+
+    Both conjuncts: DCP spans the whole TP group (``dcp_size > 1``) AND a base
+    shard plan is INSTALLED IN THIS PROCESS. Under this path every rank stores
+    the FULL (replicated) kv-heads but only its owned token slots. Covers BOTH
+    the even-modulo (no token vector) and the weighted (token vector installed)
+    owner rules. False -> stock behavior (even head-sharded DCP, or no DCP),
+    keeping those paths bit-identical.
+
+    #881 -- READ THE PROCESS STATE, NOT A FLAG. This docstring used to say "a
+    ``--rank-tp-ratio`` base plan is installed", naming a FLAG for something
+    that is PROCESS STATE with TWO INSTALLERS:
+
+      * ``managers/scheduler.py`` ``set_tp_partition_ratios(...)`` -- the
+        startup path, usually carrying ``--rank-tp-ratio``;
+      * ``managers/phase_flip_boot.py`` ``set_tp_partition_ratios(list(vec))``
+        where ``vec = parse_flip_vector(server_args)`` reads
+        ``--phase-flip-tp-vector`` -- A DIFFERENT FLAG ON A DIFFERENT AXIS
+        (weight shard, not token split), installed at flip-boot BEFORE the TP
+        worker and therefore before the KV pool is shaped.
+
+    SO ``--rank-tp-ratio`` BEING UNSET PROVES NOTHING ABOUT THIS PREDICATE. On a
+    flip boot it is None while this returns True. Two readers concluded the
+    opposite from the old wording on one day, the second while correcting the
+    first; the wording invited it. If you are about to decide something on this
+    predicate, call ``get_tp_partition_ratios()`` -- or read a log line that
+    printed it -- and do not substitute a flag for it.
+
+    Getting this wrong is not a sizing error. ``_pool_kv_head_num`` turns it
+    into a pool ROW STRIDE, so a False here where True belongs makes every owned
+    slot land at the wrong address (#345, measured 57% wrong at L00.o_proj on
+    the first decode step while prefill sat at the noise floor).
+    """
     return dcp_size > 1 and get_tp_partition_ratios() is not None
 
 
@@ -1753,7 +1779,6 @@ PP_CROSSING_WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
 def pp_crossing_wire_enabled() -> bool:
     """True when the #753 mid-loop crossing wire is switched on."""
     return os.getenv(PP_CROSSING_WIRE_ENV, "") not in ("", "0", "false", "False")
-
 
 
 class PPLayerSetError(ValueError):
