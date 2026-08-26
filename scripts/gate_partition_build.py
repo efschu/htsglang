@@ -97,14 +97,50 @@ NEEDS_DEVICE = {
 # failure its own named exit and an automatic solo re-run, so any other member
 # that goes this way is classified by machine on the run it happens. Demoted
 # here are the members with demonstrated recurrence.
+SIMULTANEITY_REASON = "simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26"
+
+# #899, 2026-08-26: the wraparound module's load sensitivity was ROOTED and
+# HARDENED rather than left demoted, so its row no longer stands on the same
+# ground as the four above and must not claim to. Measured, both directions,
+# on this box:
+#
+#   before, 96 busy-loop processes on 32 cores (load 93)  2 of 3 FAILED --
+#     'wraparound-check mode=blocking' not found in '<no progress recorded>'
+#     and stuck_ranks [0,1,2] != [] with all three progress files absent.
+#     NOT ONE rank had reached its first marker inside the old 12 s / 30 s
+#     wall constants: three `spawn` interpreters had not finished
+#     `import torch` and the gloo rendezvous.
+#   after, same generator, load 158-211 (harsher)          3 passed, 341 s.
+#   quiet box, before and after                            3 passed, ~32 s.
+#
+# The repair is in the module: setup is WAITED OUT under its own named budget
+# and MEASURED, and the observation window is `max(floor, measured_setup)`.
+# No assertion's subject, rank or marker changed. That is why #898 §6's
+# refusal does not reach it -- that refusal was of ONE SHARED deadline
+# multiplier across this family, on the evidence that two of the five members
+# carry no deadline literal at all and that scaling `789`'s 0.4 s budget would
+# disarm the specimen it exists to fire on. Neither objection applies to
+# repairing one module's own clock in place.
+#
+# STILL SERIAL, and this is a measurement gap rather than a doubt: promotion
+# to the RANKS lane needs `solo failure set == serial failure set` taken
+# against the new bytes, and the logs this table was built from
+# (/tmp/868_serial_ref.log, /tmp/868_solo) no longer exist. Naming the ground
+# correctly is what lets that promotion be a measurement next time instead of
+# a re-litigation.
+HARDENED_REASON = "simultaneity:hardened_899_2026-08-26;serial_pending_solo_reproof"
+
+# Module -> the reason its row carries. Membership is the refusal; the value
+# is the ground that refusal stands on, which is not the same for every member
+# and should not be reported as if it were.
 NOT_CROWDING_PROVABLE = {
-    "test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py",
-    "test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py",
+    "test/registered/unit/managers/test_pp_proxy_cross_epoch_mispair_795.py": SIMULTANEITY_REASON,
+    "test/registered/unit/managers/test_pp_proxy_readiness_contract_789.py": SIMULTANEITY_REASON,
     # Same harness, same 3-rank gloo rendezvous, same shortened readiness
     # budget: the two above are the members that were observed, not the only
     # members that share the shape. The family is the unit.
-    "test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py",
-    "test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py",
+    "test/registered/unit/managers/test_pp_proxy_readiness_rendezvous_789.py": SIMULTANEITY_REASON,
+    "test/registered/unit/managers/test_pp_proxy_retracted_pass_mispair_791c.py": SIMULTANEITY_REASON,
     # Same class, found by the #895 gate run rather than looked for. #868
     # classified this one SERIAL with the reason
     # `solo_differs:fails_only_solo=PPAdmissionWraparoundBlocks::
@@ -117,11 +153,9 @@ NOT_CROWDING_PROVABLE = {
     # verdict that inverts with the box's load is not "differs solo" -- the
     # lane was never the variable. The lane it lands in does not change (SERIAL
     # either way), the NAME of the reason does, and the name is what a reader
-    # acts on.
-    "test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py",
+    # acts on. #899 then rooted it -- see HARDENED_REASON above.
+    "test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py": HARDENED_REASON,
 }
-
-SIMULTANEITY_REASON = "simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26"
 
 # #898, measured 2026-08-26: the SECOND exclusion class, and it is not the
 # NEEDS_DEVICE one. A module that calls `popen_launch_server` does not merely
@@ -268,7 +302,7 @@ def main() -> int:
         # Refused BEFORE the solo comparison, for the same reason NEEDS_DEVICE
         # is: the solo measurement would admit it. See the set's own comment.
         if mod in NOT_CROWDING_PROVABLE:
-            rows.append((mod, "SERIAL", SIMULTANEITY_REASON, h, ref))
+            rows.append((mod, "SERIAL", NOT_CROWDING_PROVABLE[mod], h, ref))
             stats["SERIAL"] += 1
             continue
 

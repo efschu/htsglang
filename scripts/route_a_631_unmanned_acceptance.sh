@@ -34,6 +34,27 @@ MIXED_SECONDS="${MIXED_SECONDS:-300}"
 IDLE_SECONDS="${IDLE_SECONDS:-60}"
 NEEDLE_TOKENS="${NEEDLE_TOKENS:-300000}"
 MODEL_DIR="${MODEL_DIR:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5}"
+
+# #910: REFUSE AT THE TOP, not 300 s of mixed load later. The default above is
+# the Qwen3.6 checkpoint the #631 Route A acceptance ran on, and it is no
+# longer on this box. Every property this script measures -- the derived KV
+# pool per phase, the corridor floor, the 262144 native ceiling the long-context
+# leg goes past -- is a number FOR THAT CHECKPOINT, so the default is not
+# repointed at a surviving build: a run against another model would produce a
+# full evidence directory whose numbers mean something else. Naming another
+# checkpoint explicitly via MODEL_DIR is the operator's call and is still
+# allowed; silently accepting an absent one is not.
+if [ ! -d "$MODEL_DIR" ]; then
+  echo "REFUSING: MODEL_DIR does not exist: $MODEL_DIR" >&2
+  echo "  This is the #631 Route A acceptance checkpoint. It is gone from this" >&2
+  echo "  box, and the acceptance numbers (per-phase KV pool, 1024 MiB corridor" >&2
+  echo "  floor, the 262144 native ceiling the bs=1 leg exceeds) are numbers for" >&2
+  echo "  THAT checkpoint -- an evidence directory produced against a different" >&2
+  echo "  model is not this acceptance run." >&2
+  echo "  Pass MODEL_DIR=<path> explicitly to accept a different specimen." >&2
+  exit 2
+fi
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${OUT:-/spinning/evidence-631/unmanned_acceptance_${STAMP}}"
 mkdir -p "$OUT"

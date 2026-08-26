@@ -62,16 +62,50 @@ from sglang.srt.server_args import ServerArgs
 #: THE GATE IS THEREFORE NOT DISCHARGED BY A CPU RUN. Closing it needs a
 #: device-visible arm in a GPU window; a skip is an honest "not measured",
 #: never a pass.
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason=(
-        "needs a visible device: every case builds a real ServerArgs, whose "
-        "__post_init__ resolves one. 7/7 pass with a device; without one, 4 "
-        "of 7 fail in device resolution before reaching an assertion."
-    ),
-)
-
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5"
+
+#: #910 (the second of #862's two restposten): this file's OTHER requirement,
+#: and it is not the device. ``MODEL`` is the Qwen3.6 checkpoint the
+#: 2026-08-13 boot ran on, and it is no longer on this box -- so on a machine
+#: that DOES have a card, every ``ServerArgs(**_flip_args())`` below now dies
+#: in huggingface_hub with ``HFValidationError: Repo id must be in the form
+#: 'repo_name' or 'namespace/repo_name'``, which names neither the file nor
+#: the missing directory. The device skip above hid it at the desk.
+#:
+#: NOT REPOINTED, for the reason #862 gave for
+#: test_gdn_resident_cap_floor_656.py: the assertions quote that boot
+#: literally. ``651498`` in
+#: ``test_a_pool_above_the_old_quarantine_is_no_longer_refused`` is the pool
+#: the seam-aware sizer DERIVED for this checkpoint on this rig, and the
+#: ``phase_flip_tp_vector="32,16,16"`` / ``pp_stage_ratio=[14,10,8]`` geometry
+#: below is that boot's. Aiming the module at a surviving Qwen3.8 build would
+#: keep the numbers and change what they are numbers ABOUT, which is the one
+#: failure a proof gate must not have. Name the dependency and let a box that
+#: carries the checkpoint run it.
+#:
+#: Both markers stay, and neither subsumes the other: with a card but no
+#: checkpoint this skips on the checkpoint, with the checkpoint but no card it
+#: skips on the device.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "needs a visible device: every case builds a real ServerArgs, whose "
+            "__post_init__ resolves one. 7/7 pass with a device; without one, 4 "
+            "of 7 fail in device resolution before reaching an assertion."
+        ),
+    ),
+    pytest.mark.skipif(
+        not os.path.isdir(MODEL),
+        reason=(
+            f"requires the #656 phase-flip acceptance checkpoint {MODEL}, which "
+            "is gone from this box: the assertions quote that boot literally "
+            "(derived pool 651498, tp vector 32,16,16, stage ratio 14/10/8), so "
+            "the module cannot be repointed at another checkpoint without "
+            "changing the specimen it pins."
+        ),
+    ),
+]
 OLD_QUARANTINE = 620000
 ENV = "SGLANG_PHASE_FLIP_UNPROVEN_POOL"
 

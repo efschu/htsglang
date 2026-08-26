@@ -16,6 +16,19 @@
 # /tmp/868_serial_ref.log) no longer exist. sha256 and ref_failures are
 # UNCHANGED from the original measurement -- only verdict and reason moved.
 #
+# #899 (2026-08-26): ONE row re-derived the same way, and for the same reason
+# the logs are still gone. test_pp_admission_wraparound_never_blocks.py was
+# HARDENED (its wall-clock deadline split into a measured setup wait plus an
+# observation window scaled by it; no assertion's subject changed), so its
+# bytes moved. Both changed fields come from the builder, not from a hand
+# judgement: the reason is NOT_CROWDING_PROVABLE[mod] and the sha256 is
+# gate_partition_build.sha() over the new bytes. Verdict and ref_failures are
+# UNCHANGED -- the row stays SERIAL, and it stays SERIAL for a stated reason:
+# promoting it needs a fresh solo-equals-serial proof, which needs the logs.
+# The runner only sha-checks PARALLEL/RANKS rows, so this row's lane was never
+# at risk either way; the sha is corrected because a stale one is a false
+# provenance record, not because the gate would have mis-routed.
+#
 # verdicts
 #   PARALLEL  solo failure set == serial failure set -> wide lane
 #   RANKS     same proof, but the module spawns real ranks -> narrow lane,
@@ -196,7 +209,7 @@ test/registered/unit/managers/test_pp_admission_retry_livelock_630.py	PARALLEL	s
 test/registered/unit/managers/test_pp_admission_send_handle_dropped_796.py	RANKS	solo_equals_serial;spawns_real_ranks:multiprocessing,torch.distributed	2417d352f216bcef	
 test/registered/unit/managers/test_pp_admission_trace_vacuous_788.py	PARALLEL	solo_equals_serial	7240749fa95cb020	
 test/registered/unit/managers/test_pp_admission_wiring_791.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	187eb98418b713e5	
-test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	SERIAL	simultaneity:NOTE868_2.5_not_solo_provable;895_observed_2026-08-26	e617c4b28129f81f	
+test/registered/unit/managers/test_pp_admission_wraparound_never_blocks.py	SERIAL	simultaneity:hardened_899_2026-08-26;serial_pending_solo_reproof	d5c5ad73c0fffdd2	
 test/registered/unit/managers/test_pp_arm_slot_outlives_ring_829.py	PARALLEL	solo_equals_serial	089d88dd37797114	
 test/registered/unit/managers/test_pp_chain_abort_check_824.py	PARALLEL	solo_equals_serial	77c5cbe5d8e03e3a	
 test/registered/unit/managers/test_pp_chain_flush_deadlock_788.py	RANKS	solo_equals_serial;spawns_real_ranks:init_process_group,multiprocessing,torch.distributed	4fa1bbeb0abea3dc	

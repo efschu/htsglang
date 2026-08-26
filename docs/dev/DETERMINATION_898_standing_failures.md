@@ -503,6 +503,54 @@ Until then the `#895` runner classifies each new member by machine on the run it
 happens (solo re-run, exit 6), which is the rate-reduction the base already
 ships.
 
+### 6.2 SUPERSEDED IN PART — #899, 2026-08-26: one member was rooted
+
+§6 above refused **one shared deadline multiplier across the family**, and that
+refusal stands unchanged: two of the five carry no deadline literal, `795`
+failed inside the gloo rendezvous before any assert of its own, and scaling
+`789`'s `SHORT_READINESS_BUDGET_S = 0.4` would disarm the specimen it exists to
+fire on.
+
+What it did NOT settle, and was read as if it had, is whether an INDIVIDUAL
+member's clock can be repaired in place. For
+`test_pp_admission_wraparound_never_blocks.py` it can, and now is:
+
+* **ROOT, measured both directions.** Under 96 busy-loop processes on 32 cores
+  (load 93) the module failed 2 of 3 — `'wraparound-check mode=blocking' not
+  found in '<no progress recorded>'` and `stuck_ranks [0,1,2] != []` with all
+  three progress files absent. **Not one rank had reached its first marker.**
+  The old 12 s / 30 s wall constants had to cover three `spawn` interpreters
+  each paying a full `import torch` plus a gloo rendezvous, AND the behaviour
+  being observed, in one number. It was not the ring, not `connectFullMesh`,
+  and not either assertion's subject.
+* **FIX.** Setup is waited out under its own named budget
+  (`SETUP_READY_TIMEOUT_S`, asserted against by nothing) and MEASURED; the
+  observation window is then `max(floor, measured_setup)`. Every assertion's
+  subject, rank and marker is byte-identical. A setup overrun now reports
+  itself as a setup overrun instead of as a rank being in the wrong place.
+* **PROOF.** Same generator, harsher box (load 158-211): **3 passed**, 341 s.
+  Quiet box before and after: 3 passed, ~32 s — the floors are the old
+  constants, so nothing was bought with wall-clock on a normal run.
+
+**SIBLING SWEEP, so the class posten has a size rather than a feeling.**
+`grep -l 'JOIN_TIMEOUT\|join(timeout'` over `test/registered/unit/managers`
+returns **25 modules** that join spawned processes against a wall constant —
+five times the `NOT_CROWDING_PROVABLE` set, and it includes
+`test_pp_void_send_contract_801.py`, which is §6.1's own narrow-lane wanderer.
+Not repaired one at a time here, for §6's reason: 25 hand-edits with 25
+meanings is the shared-multiplier mistake in slow motion. What the repair above
+does establish is the SHAPE such a marker would check — "how long did getting
+to the starting line cost, and is the module's budget larger than that" — which
+is a number a module can now declare because one module measures it.
+
+**Verdict, dated 2026-08-26: BUILT for one member, SWEPT and SIZED (25) for the
+class, still NAMED for the other four**, and `#868 §6`'s per-module wall-clock
+margin marker remains the class answer. The row stays SERIAL: promotion to the RANKS lane needs a fresh
+`solo == serial` proof against the new bytes, and the logs this table was built
+from are gone. `gate_partition_build.py` now carries the ground per module
+(`NOT_CROWDING_PROVABLE` is a dict, not a set), so the table reports which
+member stands on `895_observed` and which on `hardened_899`.
+
 ## 7. WHAT WAS DONE, IN ONE BLOCK
 
     FIXED (red-first, each falsified)
