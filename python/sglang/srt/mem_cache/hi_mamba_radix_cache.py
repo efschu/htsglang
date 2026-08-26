@@ -831,12 +831,35 @@ class HiMambaRadixCache(MambaRadixCache):
         if node.mamba_value is None:
             return 0
         mamba_num = len(node.mamba_value)
-        self.req_to_token_pool.mamba_allocator.free(node.mamba_value)
+        # #904: REFUSE a locked slot instead of unlocking it.
+        #
+        # This method used to free first and then, on finding
+        # `mamba_lock_ref > 0`, move the accounting from protected to freed
+        # and set the ref to 0 -- i.e. it treated a live pin as bookkeeping to
+        # be corrected rather than as a reason not to act. A pin is exactly
+        # what `load_back` takes over the window between "the H2D copy is
+        # enqueued" and "a reader has consumed it" (:1612, `inc_lock_ref`
+        # before the load completes), so the one thing this branch could pull
+        # out from under a caller is a slot that was just loaded and not yet
+        # read: the load-then-invalidate half of #904.
+        #
+        # Every sibling in the family already asserts instead:
+        # `evict_mamba` (:1137), `MambaRadixCache._evict_leaf_node`
+        # (mamba_radix_cache.py:1149-1178) and `_evict_mamba_pass`
+        # (:1286-1299), `SWARadixCache.evict` (swa_radix_cache.py:600,638).
+        # A third behaviour for one role is what makes the family's guarantee
+        # unreadable, so this one joins them rather than inventing a fourth.
         if node.mamba_lock_ref > 0:
-            self.mamba_protected_size_ -= mamba_num
-            node.mamba_lock_ref = 0
-        else:
-            self.mamba_evictable_size_ -= mamba_num
+            raise ValueError(
+                f"#904: refusing to free mamba slot(s) of node {node.id} "
+                f"while mamba_lock_ref={node.mamba_lock_ref}. A pin here is a "
+                "load-back or an active request; freeing under it hands a "
+                "recycled slot to a reader that has not read yet. The caller "
+                "must select an unlocked node (mamba_lru_list.get_lru_no_lock "
+                "/ evictable leaf sets), not clear the lock."
+            )
+        self.req_to_token_pool.mamba_allocator.free(node.mamba_value)
+        self.mamba_evictable_size_ -= mamba_num
         if self.mamba_lru_list.in_list(node):
             self.mamba_lru_list.remove_node(node)
         node.mamba_value = None

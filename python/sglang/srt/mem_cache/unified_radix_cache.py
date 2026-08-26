@@ -1834,6 +1834,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
+        # #904: MAKE THE ORDERING ENFORCED, NOT ASSUMED.
+        #
+        # Every caller of this funnel already selects an unlocked node --
+        # `drive_eviction` walks `lru.get_lru_no_lock()`, `_evict_device_leaf`
+        # asserts `_is_device_leaf` (which excludes `lock_ref > 0`), and
+        # `_evict_to_host` is reached only from those. But that is a property
+        # of the CALLERS, and a component's rows are freed HERE. A pin is
+        # precisely what covers the window between "the H2D copy is enqueued"
+        # and "a reader has consumed it"; freeing under one is the
+        # load-then-invalidate half of #904, and it would be silent -- the
+        # slot is recycled and the next reader gets someone else's state, with
+        # no assertion anywhere.
+        #
+        # The family's own convention is an ACT-time check, not a selection-
+        # time one: mamba_radix_cache.py:1149-1178 and :1286-1299,
+        # swa_radix_cache.py:600 and :638, hi_mamba_radix_cache.py:1137 all
+        # assert at the free. This funnel is the one place that did not, so
+        # it joins them rather than relying on six callers staying correct.
+        if EvictLayer.DEVICE in target:
+            cd = node.component_data[comp.component_type]
+            if cd.value is not None and cd.lock_ref > 0:
+                raise ValueError(
+                    f"#904: refusing to free {comp.component_type.name} device "
+                    f"rows of node {node.id} while lock_ref={cd.lock_ref}. The "
+                    "pin covers a load-back or a running request; the caller "
+                    "must select an unlocked node, never free under the pin."
+                )
         device_freed, host_freed = comp.evict_component(node, target=target)
         if tracker is not None:
             if EvictLayer.DEVICE in target:
