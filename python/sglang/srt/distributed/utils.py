@@ -20,6 +20,10 @@ from typing import Any, Deque, Dict, FrozenSet, List, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+# #901: the single knob-resolution authority. Lives at srt/ level, below both
+# `managers` and `distributed`, so neither has to import the other to share it.
+from sglang.srt import knob_resolution as _knob
+
 logger = logging.getLogger(__name__)
 
 
@@ -746,7 +750,8 @@ def _refuse_retracted_token_vector(server_args, vector, source: str) -> None:
 #: #897: set once the KV-ratio supersession below has been reported, so a
 #: process that resolves the vector more than once (the boot gate calls the
 #: resolver, the phase flip builds a second stack) says it once, not per call.
-_kv_ratio_supersession_announced = False
+#: #901: the authority's shared latch, not a fourth hand-rolled bool.
+_kv_ratio_announcer = _knob.Announcer("distributed.rank_kv_ratio")
 
 
 def reset_kv_ratio_supersession_announcement() -> None:
@@ -756,8 +761,7 @@ def reset_kv_ratio_supersession_announcement() -> None:
     a suite that drives several boots in one interpreter needs to clear it
     between them or it would be testing the latch instead of the message.
     """
-    global _kv_ratio_supersession_announced
-    _kv_ratio_supersession_announced = False
+    _kv_ratio_announcer.reset()
 
 
 def _gcd_reduced(vector: Sequence[int]) -> List[int]:
@@ -790,14 +794,28 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
     CALLED from the boot-time site that installs the vector
     (``scheduler.configure_scheduler_process``), once per process.
 
-    WHY NOT #896's ``_flag_or_env`` RECORDER. That helper resolves one SCALAR
-    knob from ``getattr(server_args, field)`` against one env reader and
-    returns the value; it lives in ``managers/phase_policy.py``, which sits
-    above this module. It cannot express a five-level vector precedence with
-    gcd reduction, a retraction refusal and the #797 seed arming, and reusing
-    it would mean importing ``managers`` from ``distributed``. The reusable
-    part is the SHAPE of #894 S5 -- one latched module-level warner, warning
-    and not refusal -- and that is what this is.
+    WHY NOT #896's ``_flag_or_env`` RECORDER -- AND WHAT #901 CHANGED. That
+    helper resolved one SCALAR knob from ``getattr(server_args, field)``
+    against one env reader and returned the value, from inside
+    ``managers/phase_policy.py``, which sits ABOVE this module. It could not
+    express a five-level vector precedence with gcd reduction, and reusing it
+    would have meant importing ``managers`` from ``distributed``. Both
+    objections were about that helper's LOCATION and SHAPE, not about the
+    idea, so #901 moved the idea into ``srt/knob_resolution`` -- below both
+    modules, importing neither -- and widened it until this case fits:
+
+    * the ladder is a SEQUENCE, so five rungs are not a special case;
+    * a rung's value is opaque, so a list is not a special case;
+    * the equivalence test is a parameter, so ``_gcd_reduced`` plugs in and
+      "6,2 is the same ownership split as 3,1" stays this module's fact;
+    * the announcement is a separate call, so ``resolve_cp_token_ratios``
+      keeps its zero-logger contract (pinned by
+      ``TestTheResolverStaysPure``).
+
+    What did NOT move: the #797 retraction refusal and the seed arming stay
+    here. They are not reporting, they are policy about a specific vector's
+    lineage, and folding them into a general resolver would have made the
+    authority carry one site's semantics.
 
     WARNING, NOT REFUSAL, decided on the danger direction:
 
@@ -817,8 +835,7 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
     once -- SGLANG_UNEVEN_TOKEN_VECTOR set, then blanked by a later append,
     uneven token sharding off for a day with nobody aware.
     """
-    global _kv_ratio_supersession_announced
-    if _kv_ratio_supersession_announced:
+    if _kv_ratio_announcer.said:
         return
 
     from sglang.srt.environ import envs as _envs
@@ -844,8 +861,77 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
         # this, naming the variable and the shape it wants. A second, quieter
         # report here would only compete with the loud one.
         return
-    winner = _gcd_reduced(parsed)
     role = _token_vector_role(server_args)
+
+    # #901: the FIVE-LEVEL precedence of `resolve_cp_token_ratios`, declared
+    # rather than re-walked by hand. Rungs 3-5 (the planner's capacity seed,
+    # the budget estimate, the weights fallback) are named so the ladder in
+    # the code is the ladder in the docstring; they are only PRESENT when they
+    # could actually have supplied a vector, and a present rung that resolves
+    # to the same split as the winner is not reported at all.
+    #
+    # The equivalence test is `_gcd_reduced`: 6,2 and 3,1 are the same
+    # ownership split, and a warning that fired on the difference between
+    # them would be noise. That is exactly the kind of site knowledge the
+    # authority takes as a parameter instead of guessing at.
+    seed = getattr(server_args, "rank_kv_capacity_seed", None)
+    resolution = _knob.resolve_knob(
+        [
+            _knob.KnobSource(
+                source=_knob.env_source("SGLANG_UNEVEN_TOKEN_VECTOR"),
+                value=parsed,
+                present=True,  # non-empty, well-formed, right length: checked above
+                kind=_knob.KIND_ENV,
+                label=f"SGLANG_UNEVEN_TOKEN_VECTOR={env_vec!r}",
+            ),
+            _knob.KnobSource(
+                source=_knob.flag_source("rank_kv_ratio"),
+                value=kv_flag if isinstance(kv_flag, list) else None,
+                present=isinstance(kv_flag, list) and len(kv_flag) == dcp_size,
+                kind=_knob.KIND_FLAG,
+                label="--rank-kv-ratio %s"
+                % (
+                    ",".join(str(v) for v in kv_flag)
+                    if isinstance(kv_flag, list)
+                    else kv_flag
+                ),
+                cost=(
+                    "that vector is INERT -- the resolver returns on the env "
+                    "variable's presence before the flag is read at all"
+                ),
+            ),
+            _knob.KnobSource(
+                source="the planner's predicted capacity match "
+                "(--rank-kv-capacity-seed)",
+                value=list(seed) if seed else None,
+                present=bool(seed) and len(seed) == dcp_size,
+                kind=_knob.KIND_DERIVED,
+                label="--rank-kv-capacity-seed",
+                cost="the predicted match is skipped",
+            ),
+            # The last two rungs are derived INSIDE the resolver from things
+            # the operator did not write, so losing at them is not a loss to
+            # report -- see KnobSource.reportable. They stay in the ladder so
+            # the ladder in the code is the five-level ladder in the
+            # resolver's docstring, and not a truncated one that reads as if
+            # precedence stopped at the seed.
+            _knob.KnobSource(
+                source="the per-rank free-KV budget estimate",
+                present=True,
+                kind=_knob.KIND_DERIVED,
+                reportable=False,
+            ),
+            _knob.KnobSource(
+                source="the gcd-reduced --rank-tp-ratio weights fallback",
+                present=True,
+                kind=_knob.KIND_DEFAULT,
+                reportable=False,
+            ),
+        ],
+        normalize=lambda v: _gcd_reduced(v) if v else None,
+    )
+
+    winner = _gcd_reduced(parsed)
     # An all-equal env vector is not installed as a vector at all: the resolver
     # returns None for it, which IS the even-modulo owner rule. Printing
     # "installed as 1,1" there would name something no code holds.
@@ -858,17 +944,18 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
     if isinstance(kv_flag, list):
         if len(kv_flag) != dcp_size:
             return
-        if _gcd_reduced(kv_flag) == winner:
+        if not resolution.lost_anything:
             # Same vector either way. Never ambiguous, so nothing to report --
             # a line that also fires when nothing was lost is a line readers
             # learn to skip.
             return
-        lost = "--rank-kv-ratio %s" % ",".join(str(v) for v in kv_flag)
-        cost = (
-            "that vector is INERT -- the resolver returns on the env "
-            "variable's presence before the flag is read at all"
-        )
+        lost = resolution.top_loser.loss_label()
+        cost = resolution.top_loser.cost
     else:
+        # A MODE, not a vector: '--rank-kv-ratio capacity|auto' has no value to
+        # compare, so the ladder cannot answer whether it lost -- the fact that
+        # it never ran is the loss. What it costs depends on the role the env
+        # vector carries, which is #797's semantics and stays here.
         lost = "--rank-kv-ratio %s" % kv_flag
         if role == "seed":
             cost = (
@@ -885,24 +972,27 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
                 "(model_runner_kv_cache_mixin, `pinned_vector`), so the "
                 "measured optimum is printed as advice and never installed"
             )
-
-    _kv_ratio_supersession_announced = True
-    logger.warning(
-        "#897 SUPERSEDED KNOB: SGLANG_UNEVEN_TOKEN_VECTOR=%r decided the "
-        "uneven-DCP KV-token ownership -- this boot gets %s (role=%r) -- and "
-        "%s did not decide it: %s. The env override wins on PRESENCE, not on "
-        "value, so a stale vector from an earlier A/B run -- or one this "
-        "process's own KV calibration wrote back -- beats the flag without "
-        "being compared to it. Documented precedence, announced rather than "
-        "refused: to let the flag govern, REMOVE SGLANG_UNEVEN_TOKEN_VECTOR "
-        "from the environment -- not by setting it to an empty string, which "
-        "is how uneven token sharding was silently switched off for a day "
-        "once already (server_args.py:5607).",
-        env_vec,
-        effective,
-        role,
-        lost,
-        cost,
+    # #901: the same skeleton the GGUF site now prints -- ticket, winner,
+    # subject, what this boot actually gets, what did not decide it and what
+    # that costs, the presence rule, and the one remedy. Byte-identical to the
+    # hand-built line #897 shipped; that is the point of migrating onto a
+    # format rather than inventing a fifth one.
+    _kv_ratio_announcer.say(
+        logger,
+        _knob.supersession_line(
+            "897",
+            winner=f"SGLANG_UNEVEN_TOKEN_VECTOR={env_vec!r}",
+            subject="the uneven-DCP KV-token ownership",
+            effective=f"this boot gets {effective} (role={role!r})",
+            loss=_knob.loss_clause(lost, cost),
+            presence_rule=(
+                "The env override wins on PRESENCE, not on value, so a stale "
+                "vector from an earlier A/B run -- or one this process's own "
+                "KV calibration wrote back -- beats the flag without being "
+                "compared to it."
+            ),
+            remedy=_knob.removal_remedy("SGLANG_UNEVEN_TOKEN_VECTOR"),
+        ),
     )
 
 

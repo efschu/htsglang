@@ -1,6 +1,8 @@
 import logging
 from typing import Optional, Tuple
 
+from sglang.srt import knob_resolution as _knob
+
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "MIN-FREE-SLOTS"
@@ -8,9 +10,20 @@ LOG_PREFIX = "MIN-FREE-SLOTS"
 #: The three things ``min_free_slots_verdict`` can do with what the operator
 #: asked for (#894 S4). Named so a caller can say which one happened instead of
 #: silently substituting a different number, or none.
-MIN_FREE_SLOTS_HONOURED = "honoured"
-MIN_FREE_SLOTS_CAPPED = "capped"
-MIN_FREE_SLOTS_DISABLED_SMALL_POOL = "disabled_small_pool"
+#:
+#: #901: these are now ALIASES of the authority's shared constraint vocabulary
+#: rather than three private strings. The names stay -- ``scheduler.py`` and the
+#: registered #894 suite import them and compare by constant, never by literal
+#: -- but the values are the same three words every other narrowed knob will
+#: use. CONTRACT CHANGE, stated rather than hidden: the wire value of
+#: ``MIN_FREE_SLOTS_DISABLED_SMALL_POOL`` moves from ``"disabled_small_pool"``
+#: to ``"discarded"``. Nothing serialises or persists these; they are compared
+#: against the constant at every call site in the tree (verified by grep before
+#: the change), which is why generalising the word is safe and keeping a
+#: site-specific one would have made the vocabulary un-shareable.
+MIN_FREE_SLOTS_HONOURED = _knob.VERDICT_HONOURED
+MIN_FREE_SLOTS_CAPPED = _knob.VERDICT_CAPPED
+MIN_FREE_SLOTS_DISABLED_SMALL_POOL = _knob.VERDICT_DISCARDED
 
 #: Below this many running-request slots the delayer is not built at all: with
 #: a pool that small, holding admissions until N slots free would keep the
@@ -48,27 +61,67 @@ def min_free_slots_verdict(
     The discard is the dangerous half: a capped value still delays, a discarded
     one leaves ``Scheduler.min_free_slots_delayer`` at ``None``, so the gate the
     operator configured is simply absent from the admission path.
-    """
-    max_running_requests = max(0, int(max_running_requests))
-    formula = _dflash_formula(max_running_requests)
-    requested = user_value
-    if user_value is None:
-        user_value = formula if is_dflash_family else None
 
-    if user_value is None or user_value <= 1:
-        # Nothing was asked for (or the request is the documented "off"), so
-        # nothing was taken away.
-        return None, MIN_FREE_SLOTS_HONOURED
-    if max_running_requests < MIN_POOL_FOR_DELAY:
-        return None, (
-            MIN_FREE_SLOTS_DISABLED_SMALL_POOL
-            if requested is not None
-            else MIN_FREE_SLOTS_HONOURED
-        )
-    resolved = min(user_value, formula)
-    if requested is not None and resolved < requested:
-        return resolved, MIN_FREE_SLOTS_CAPPED
-    return resolved, MIN_FREE_SLOTS_HONOURED
+    #901: THE LADDER AND THE CONSTRAINT ARE NOW DECLARED SEPARATELY, which is
+    what this knob was always about and what the hand-written chain conflated.
+    The ladder answers WHO supplied the value -- the flag, the DFlash family
+    derivation, or the off default -- and the constraint answers WHAT SURVIVED
+    of it. The verdict this function returns is the constraint's, because for
+    this knob nothing ever supersedes anything: there is no competing source,
+    only a cap and a floor. Expressing that in the authority's two-question
+    vocabulary is precisely why a fifth silent knob elsewhere does not need a
+    fifth private reporter.
+
+    Every number is unchanged; ``test_resolve_min_free_slots_is_unchanged_on_
+    every_verdict`` pins that across eleven cases.
+    """
+    pool = max(0, int(max_running_requests))
+    formula = _dflash_formula(pool)
+
+    def _cap_and_floor(value, winner):
+        if value is None or value <= 1:
+            # Nothing was asked for (or the request is the documented "off"),
+            # so nothing was taken away.
+            return None, MIN_FREE_SLOTS_HONOURED
+        # Only a value the OPERATOR wrote can be narrowed; the DFlash
+        # derivation and the default are this code's own choices and reporting
+        # them as losses would train readers to skip the line.
+        by_flag = winner.kind == _knob.KIND_FLAG
+        if pool < MIN_POOL_FOR_DELAY:
+            return None, (
+                MIN_FREE_SLOTS_DISABLED_SMALL_POOL
+                if by_flag
+                else MIN_FREE_SLOTS_HONOURED
+            )
+        resolved = min(value, formula)
+        if by_flag and resolved < value:
+            return resolved, MIN_FREE_SLOTS_CAPPED
+        return resolved, MIN_FREE_SLOTS_HONOURED
+
+    resolution = _knob.resolve_knob(
+        [
+            _knob.KnobSource(
+                source=_knob.flag_source("min_free_slots_delay"),
+                value=user_value,
+                present=user_value is not None,
+                kind=_knob.KIND_FLAG,
+            ),
+            _knob.KnobSource(
+                source="the DFlash family default",
+                value=formula,
+                present=bool(is_dflash_family),
+                kind=_knob.KIND_DERIVED,
+            ),
+            _knob.KnobSource(
+                source=_knob.PROVENANCE_DEFAULT,
+                value=None,
+                present=True,
+                kind=_knob.KIND_DEFAULT,
+            ),
+        ],
+        constraint=_cap_and_floor,
+    )
+    return resolution.value, resolution.constraint_verdict
 
 
 def narrowed_min_free_slots_warning(
@@ -105,10 +158,13 @@ def narrowed_min_free_slots_warning(
     if reason == MIN_FREE_SLOTS_HONOURED:
         return None
     pool = max(0, int(max_running_requests))
+    # #901: the head of the line -- prefix, ticket, the word NARROWED and the
+    # flag's own spelling -- comes from the authority, so the next capped knob
+    # inherits the grammar instead of inventing one.
+    head = _knob.narrowed_head("894", LOG_PREFIX, "min_free_slots_delay", user_value)
     if reason == MIN_FREE_SLOTS_DISABLED_SMALL_POOL:
         return (
-            f"{LOG_PREFIX} #894 NARROWED KNOB: --min-free-slots-delay="
-            f"{user_value} is DISCARDED, not capped -- there is NO ADMISSION "
+            f"{head} is DISCARDED, not capped -- there is NO ADMISSION "
             f"DELAY on this boot. The delayer is only built at "
             f"max_running_requests >= {MIN_POOL_FOR_DELAY}, and this rank "
             f"resolved {pool}. Note that value is not the ServerArgs ceiling: "
@@ -118,8 +174,7 @@ def narrowed_min_free_slots_warning(
             f"{MIN_POOL_FOR_DELAY}, or drop the flag."
         )
     return (
-        f"{LOG_PREFIX} #894 NARROWED KNOB: --min-free-slots-delay="
-        f"{user_value} was CAPPED to {resolved}. The trigger may never delay "
+        f"{head} was CAPPED to {resolved}. The trigger may never delay "
         f"more aggressively than the DFlash formula min(4, max(2, "
         f"(max_running_requests + 5) // 6)), which is {_dflash_formula(pool)} "
         f"at max_running_requests={pool}. Read admission behaviour against "

@@ -128,6 +128,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+# #901: the single knob-resolution authority. Imported as a module rather than
+# by name so every use below reads as "the authority said this", and so a new
+# helper cannot be added to the import list and then quietly shadowed by a
+# local of the same name.
+from sglang.srt import knob_resolution as _knob
+
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-POLICY"
@@ -3910,7 +3916,11 @@ ENV_DRAIN_MODE_STRICT = "SGLANG_PHASE_POLICY_DRAIN_MODE_STRICT"
 #: principle, unfindable in practice, so two follow-up tickets hung their
 #: semantics on a number nobody could source. These three words are the whole
 #: fix: they say FLAG, ENV or DEFAULT at the point the value starts governing.
-PROVENANCE_DEFAULT = "default"
+#:
+#: #901: re-exported from the authority rather than redefined here. Four
+#: modules grew this vocabulary independently in one day; one definition is
+#: the point of that ticket.
+PROVENANCE_DEFAULT = _knob.PROVENANCE_DEFAULT
 
 
 def _env_source(env_name: str) -> str:
@@ -3918,11 +3928,13 @@ def _env_source(env_name: str) -> str:
 
     An env var set to the empty string is NOT a source -- ``_env_float`` and
     friends fall through to the default for it, so reporting "env" there would
-    name a source that did not supply the value.
+    name a source that did not supply the value. That rule now lives in
+    ``knob_resolution.env_present_nonempty`` (#901), beside the other presence
+    rule (``is not None``, which #894 S5's site needs) so the difference
+    between them is visible in one place instead of being re-decided per
+    module.
     """
-    if os.environ.get(env_name) not in (None, ""):
-        return f"env {env_name}"
-    return PROVENANCE_DEFAULT
+    return _knob.env_provenance(env_name)
 
 
 def _flag_or_env(
@@ -3946,29 +3958,59 @@ def _flag_or_env(
     remaining users are visible instead of silent.
 
     ``record``, when supplied, collects the PROVENANCE of every knob resolved
-    through here, keyed by ``field`` (#896). The resolution order already lives
-    in this function and nowhere else, so this is the only place that can name
-    the winning source without guessing at it afterwards.
+    through here, keyed by ``field`` (#896).
+
+    #901: THE LADDER IS NOW DECLARED, NOT HAND-WALKED. The three rungs below
+    say the same thing the if/elif chain said -- flag, then a non-empty env,
+    then the default -- but they say it in the vocabulary
+    ``knob_resolution.resolve_knob`` shares with the other three reporters.
+    The ORDER is still this site's own: flag-over-env is #781's deliberate
+    promotion, and the authority takes a precedence order as a parameter
+    precisely so it never has to have an opinion about one.
+
+    The env and default rungs both read through ``env_reader``, lazily, which
+    is byte-identical to the old tail (it returned ``env_reader(env_name,
+    default)`` for both) and additionally means a losing rung is never parsed.
     """
-    value = getattr(server_args, field, None) if server_args is not None else None
-    if value is not None:
-        if record is not None:
-            record[field] = "flag --" + field.replace("_", "-")
-        return value
-    if os.environ.get(env_name) not in (None, ""):
-        if record is not None:
-            record[field] = f"env {env_name}"
+    flag_value = getattr(server_args, field, None) if server_args is not None else None
+
+    def _read():
+        return env_reader(env_name, default)
+
+    resolution = _knob.resolve_knob(
+        [
+            _knob.KnobSource(
+                source=_knob.flag_source(field),
+                value=flag_value,
+                present=flag_value is not None,
+                kind=_knob.KIND_FLAG,
+            ),
+            _knob.KnobSource(
+                source=_knob.env_source(env_name),
+                present=_knob.env_present_nonempty(env_name),
+                reader=_read,
+                kind=_knob.KIND_ENV,
+            ),
+            _knob.KnobSource(
+                source=_knob.PROVENANCE_DEFAULT,
+                present=True,
+                reader=_read,
+                kind=_knob.KIND_DEFAULT,
+            ),
+        ]
+    )
+    if record is not None:
+        record[field] = resolution.source
+    if resolution.winner.kind == _knob.KIND_ENV:
         try:
             from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
 
             _warn_deprecated_env_to_cli_flag(env_name, "--" + field.replace("_", "-"))
         except Exception:
             # A missing/renamed helper must never cost a boot: the warning is
-            # advisory, the value below is what matters.
+            # advisory, the value is what matters.
             pass
-    elif record is not None:
-        record[field] = PROVENANCE_DEFAULT
-    return env_reader(env_name, default)
+    return resolution.value
 
 
 def config_from_env(
@@ -4079,6 +4121,11 @@ def config_from_env(
     else:
         flip_tokens = 0
         source = "unset (policy off)"
+    # #901: flip_tokens' provenance is a DERIVATION, not a flag/env/default
+    # rung -- the string above names the measurement N was priced from. It
+    # goes into the same record as the rest so the provenance line can be
+    # built by one loop instead of having this one field appended by hand.
+    prov["flip_tokens"] = source
 
     # #777: remember HOW N was priced, so the first real flip can say whether
     # the measurement has left it behind. Recorded for the explicit case too --
@@ -4236,59 +4283,94 @@ def config_from_env(
         # standing runsheets, and provenance is a different question from
         # arming. Every knob, not just the SLO -- a per-knob exception is how
         # the next one goes silent.
+        #
+        # #901: the field and the line are built by the authority
+        # (``knob_resolution.provenance_field`` / ``provenance_line``), so the
+        # separator rule and the ``name=<value> from <source>`` grammar have
+        # one definition for all four migrated reporters. The knob table stays
+        # here -- WHICH knobs govern a phase cutover is this module's fact, not
+        # the authority's.
         logger.warning(
-            "%s knob provenance: %s",
-            LOG_PREFIX,
-            # " | " rather than ", ": a source may itself contain a comma
-            # (the seam reports seed AND estimator state), and a separator a
-            # field can also produce is not a separator.
-            " | ".join(
-                f"{name}={value:g} from {prov.get(key, PROVENANCE_DEFAULT)}"
-                for name, key, value in (
-                    ("min_dwell_s", "phase_policy_min_dwell_s", cfg.min_dwell_s),
-                    ("idle_dwell_s", "idle_dwell_s", cfg.idle_dwell_s),
-                    ("pp_window_s", "phase_policy_pp_window_s", cfg.pp_window_s),
-                    (
-                        "tp_decode_floor_s",
-                        "phase_policy_tp_decode_floor_s",
-                        cfg.tp_decode_floor_s,
-                    ),
-                    ("flip_cost_s", "flip_cost_s", cfg.flip_cost_s),
-                    (
-                        "decode_strand_weight",
-                        "decode_strand_weight",
-                        cfg.decode_strand_weight,
-                    ),
-                    (
-                        "decode_contention",
-                        "phase_policy_decode_contention",
-                        cfg.decode_contention,
-                    ),
-                    (
-                        "decode_stall_slo_s",
-                        "phase_policy_decode_stall_slo_s",
-                        cfg.decode_stall_slo_s,
-                    ),
-                    ("tp_prefill_tok_s", "tp_prefill_tok_s", cfg.tp_prefill_tok_s),
-                    ("pp_prefill_tok_s", "pp_prefill_tok_s", cfg.pp_prefill_tok_s),
-                    ("pp_exit_tokens", "pp_exit_tokens", cfg.pp_exit_tokens),
-                    (
-                        "refusal_backoff_cap_s",
-                        "refusal_backoff_cap_s",
-                        cfg.refusal_backoff_cap_s,
-                    ),
-                    (
-                        "refusal_degrade_after",
-                        "refusal_degrade_after",
-                        cfg.refusal_degrade_after,
-                    ),
-                )
-            )
-            # flip_tokens and rest_state are not floats, so they carry their
-            # own formatting rather than being bent into the %g loop above.
-            + f" | flip_tokens={cfg.flip_tokens:d} from {source}"
-            + f" | rest_state={cfg.rest_state} from "
-            + prov.get("rest_state", PROVENANCE_DEFAULT),
+            "%s",
+            _knob.provenance_line(
+                LOG_PREFIX,
+                [
+                    _knob.provenance_field(
+                        name, value, prov.get(key, PROVENANCE_DEFAULT), fmt
+                    )
+                    for name, key, value, fmt in (
+                        (
+                            "min_dwell_s",
+                            "phase_policy_min_dwell_s",
+                            cfg.min_dwell_s,
+                            "g",
+                        ),
+                        ("idle_dwell_s", "idle_dwell_s", cfg.idle_dwell_s, "g"),
+                        (
+                            "pp_window_s",
+                            "phase_policy_pp_window_s",
+                            cfg.pp_window_s,
+                            "g",
+                        ),
+                        (
+                            "tp_decode_floor_s",
+                            "phase_policy_tp_decode_floor_s",
+                            cfg.tp_decode_floor_s,
+                            "g",
+                        ),
+                        ("flip_cost_s", "flip_cost_s", cfg.flip_cost_s, "g"),
+                        (
+                            "decode_strand_weight",
+                            "decode_strand_weight",
+                            cfg.decode_strand_weight,
+                            "g",
+                        ),
+                        (
+                            "decode_contention",
+                            "phase_policy_decode_contention",
+                            cfg.decode_contention,
+                            "g",
+                        ),
+                        (
+                            "decode_stall_slo_s",
+                            "phase_policy_decode_stall_slo_s",
+                            cfg.decode_stall_slo_s,
+                            "g",
+                        ),
+                        (
+                            "tp_prefill_tok_s",
+                            "tp_prefill_tok_s",
+                            cfg.tp_prefill_tok_s,
+                            "g",
+                        ),
+                        (
+                            "pp_prefill_tok_s",
+                            "pp_prefill_tok_s",
+                            cfg.pp_prefill_tok_s,
+                            "g",
+                        ),
+                        ("pp_exit_tokens", "pp_exit_tokens", cfg.pp_exit_tokens, "g"),
+                        (
+                            "refusal_backoff_cap_s",
+                            "refusal_backoff_cap_s",
+                            cfg.refusal_backoff_cap_s,
+                            "g",
+                        ),
+                        (
+                            "refusal_degrade_after",
+                            "refusal_degrade_after",
+                            cfg.refusal_degrade_after,
+                            "g",
+                        ),
+                        # flip_tokens is a count and rest_state a string; the
+                        # per-field format spec is what lets them ride the same
+                        # builder instead of being appended by hand, which is
+                        # how they were carried before #901.
+                        ("flip_tokens", "flip_tokens", cfg.flip_tokens, "d"),
+                        ("rest_state", "rest_state", cfg.rest_state, ""),
+                    )
+                ],
+            ),
         )
     return cfg
 
