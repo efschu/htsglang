@@ -545,6 +545,23 @@ ADMISSION_WEDGE_SECONDS: float = 20.0
 
 ADMISSION_WEDGE = "ADMISSION-WEDGE"
 
+#: #870: how long a NAMED layout-admission hold with an ARMED flip may run
+#: before the detector alarms anyway.
+#:
+#: This is not a safety margin, it is the boundary between two different
+#: defects. Below it, "queued, 0 running, no first token" is the specified
+#: behaviour of strict batch: the work is waiting for a flip that exists and
+#: is coming. Above it, the flip itself has stopped making progress -- still a
+#: real fault, still worth an alarm, but a DIFFERENT one, and the message says
+#: so instead of blaming admission.
+#:
+#: Set to 3x the alarm threshold rather than to a flip duration: the quantity
+#: that must not be exceeded is how long a request may be held with nothing
+#: visible happening, and that is the same quantity ADMISSION_WEDGE_SECONDS
+#: already pins. A flip that cannot finish inside three alarm windows is not
+#: "a slow flip" on this rig, where the measured pp_to_tp cycle is seconds.
+ADMISSION_WEDGE_HOLD_GRACE_SECONDS: float = ADMISSION_WEDGE_SECONDS * 3
+
 
 def admission_wedge_verdict(
     queued: int,
@@ -553,6 +570,10 @@ def admission_wedge_verdict(
     threshold: float = ADMISSION_WEDGE_SECONDS,
     idle_locked_seen: bool = False,
     seconds_since_prefill_progress: Optional[float] = None,
+    flip_armed: Optional[bool] = None,
+    seconds_since_layout_hold: Optional[float] = None,
+    layout_hold_reason: Optional[str] = None,
+    hold_grace: float = ADMISSION_WEDGE_HOLD_GRACE_SECONDS,
 ):
     """``(alarm, detail)`` for the admission-wedge class (#699, from #713).
 
@@ -616,6 +637,25 @@ def admission_wedge_verdict(
             f"(< {float(threshold):.1f}s): the box is PREFILLING, not wedged. A "
             f"mega-prefill produces no first token for minutes by construction"
         )
+    # #870: THE THIRD SUPPRESSION TERM, and the same shape as #739's.
+    #
+    # All three signals below must be present together. A hold REASON without
+    # an armed flip is a hold nothing is ending, which is a wedge; an armed
+    # flip without a named reason is an arm this detector cannot attribute,
+    # and it must not be trusted to explain the silence.
+    hold_age = (
+        None if seconds_since_layout_hold is None else float(seconds_since_layout_hold)
+    )
+    named_hold = bool(flip_armed) and bool(layout_hold_reason) and hold_age is not None
+    if named_hold and hold_age < float(hold_grace):
+        return False, (
+            f"queued {q}, running 0, and no first token for {age:.1f}s -- but a "
+            f"flip is ARMED and the phase policy named the hold "
+            f"{hold_age:.1f}s ago (< {float(hold_grace):.1f}s): this is a "
+            f"LAYOUT-ADMISSION HOLD, the specified behaviour of strict batch, "
+            f"not a wedge. The work is waiting for a flip that exists. "
+            f"Hold reason: {layout_hold_reason}"
+        )
     return True, (
         f"{ADMISSION_WEDGE}: {q} queued, 0 running, and NO first token for "
         f"{age:.1f}s (>= {float(threshold):.1f}s)"
@@ -624,8 +664,19 @@ def admission_wedge_verdict(
             if prefill_age is not None
             else " (no prefill-progress signal available)"
         )
-        + ". Work is admissible and "
-        f"nothing is serving it. forward_ct and health both read healthy in "
+        + (
+            # #870: an alarm that survived the hold suppression is still an
+            # alarm, but it is not the admission wedge -- naming it as one sent
+            # the last hunt at ADMISSION when the flip was the thing stuck.
+            f". A flip is ARMED and the named hold has run {hold_age:.1f}s "
+            f"(>= {float(hold_grace):.1f}s), so this is a STUCK FLIP, not an "
+            f"admission wedge: the layout hold is real and legitimate, and it "
+            f"is not ending. Look at the flip, not at admission. "
+            f"Hold reason: {layout_hold_reason}"
+            if named_hold
+            else ". Work is admissible and nothing is serving it"
+        )
+        + f". forward_ct and health both read healthy in "
         f"this state, which is why neither catches it"
         + (
             "; PHASE-POLICY IDLE-LOCKED TERMS corroborates on this round"
@@ -712,11 +763,41 @@ def check_admission_wedge_once(
         None if prefill_stamp is None else now - prefill_stamp
     )
 
+    # #870: the layout-admission hold, read in #739's idiom -- getattr with a
+    # None fallback, so a scheduler stand-in that carries none of these fields
+    # produces the pre-#870 verdict unchanged.
+    #
+    # WHERE THIS SHOULD EVENTUALLY LIVE. ``progress_liveness.py`` already
+    # defines exactly this concept, generically: ``ProgressSample.inhibited`` /
+    # ``inhibit_reason``, documented at :82 as "Deliberate pause: a phase flip,
+    # a maintenance hold, a GPU-arb claim", and ``assess`` at :195 already
+    # returns "not a stall" when any sample in the window is inhibited. That
+    # module is wired to NOTHING -- no caller anywhere in srt/. So the general
+    # mechanism for this exact problem was designed, named, and never
+    # connected, and this detector has been paying for the disconnection.
+    # Converging the two is the structural fix and it is NOT done here: it
+    # replaces this detector's whole input path with a windowed sampler, on a
+    # shipped line, with no card to validate it on. The names below are chosen
+    # to make that convergence a rename rather than a redesign.
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    is_armed = getattr(rt, "is_armed", None) if rt is not None else None
+    flip_armed = None
+    if callable(is_armed):
+        try:
+            flip_armed = bool(is_armed())
+        except Exception:  # noqa: BLE001 - a probe must never break the check
+            flip_armed = None
+    hold_stamp = getattr(scheduler, "last_layout_hold_time", None)
+    seconds_since_layout_hold = None if hold_stamp is None else now - hold_stamp
+
     alarm, verdict_detail = admission_wedge_verdict(
         queued,
         running,
         age,
         seconds_since_prefill_progress=seconds_since_prefill_progress,
+        flip_armed=flip_armed,
+        seconds_since_layout_hold=seconds_since_layout_hold,
+        layout_hold_reason=getattr(scheduler, "last_layout_hold_reason", None),
     )
     detail = (
         f"queue age {age:.1f}s since last first-token progress "

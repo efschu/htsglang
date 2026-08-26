@@ -11466,10 +11466,33 @@ class Scheduler(
         # sitting there). Recorded on the runtime so the funding path can see
         # WHY this flip was armed; cleared by the runtime once it is read.
         rt_for_funding = getattr(self, "phase_flip_runtime", None)
+        _idle_locked_arm = bool((decision.reason or "").startswith(POLICY_IDLE_LOCKED))
         if rt_for_funding is not None:
-            rt_for_funding.armed_idle_locked = bool(
-                (decision.reason or "").startswith(POLICY_IDLE_LOCKED)
-            )
+            rt_for_funding.armed_idle_locked = _idle_locked_arm
+        # #870 PUBLISH THE HOLD, because the #699 detector already asks for it
+        # and nothing ever answered.
+        #
+        # An IDLE-LOCKED arm IS the layout-admission hold: neither layout can
+        # build a batch, so the queued work is waiting for THIS flip and for
+        # nothing else. Under strict batch that wait is the specified
+        # behaviour, not a defect -- but the detector's "queued > 0, running 0,
+        # no first token" signature is identical either way, and without a
+        # reason it must assume the worst. The stamp below is what lets it tell
+        # the two apart.
+        #
+        # Published HERE rather than in a new subsystem: this is already the
+        # one line that classifies an arm as idle-locked, and a second place
+        # deciding the same thing is a second thing to keep in sync (the
+        # argument ``is_armed`` makes against mirrored flags,
+        # phase_flip_runtime.py:6350).
+        #
+        # DELIBERATELY NOT CLEARED on the non-idle-locked branch. The stamp is
+        # an EVENT TIME, read only against the current arm state; clearing it
+        # would make "how long has this hold run" unanswerable across the
+        # re-arms that a long hold is made of.
+        if _idle_locked_arm:
+            self.last_layout_hold_time = time.perf_counter()
+            self.last_layout_hold_reason = (decision.reason or "")[:160]
         # #688 ANTI-OSCILLATION AS A RUNTIME INVARIANT, not a test premise.
         #
         # The hermetic test asserted that the target runs after the flip by
