@@ -983,6 +983,42 @@ def seam_transport_premise_holds(scheduler) -> bool:
     return False
 
 
+def seam_transport_deduction(tokens, *, in_tp: bool, premise_holds: bool) -> int:
+    """#869c: how many seam-transport tokens may be deducted from pending.
+
+    ONE RULE FOR BOTH SUBTRACTIONS, which is the whole point of this function
+    existing rather than a second inline condition.
+
+    THE DEFECT IT CLOSES. The economics subtraction (``_pending_now -=
+    _seam_transport_now``) ran UNCONDITIONALLY, while its twin twelve lines
+    below -- the #861j serviceable credit -- was gated on the TP phase AND on
+    ``seam_transport_premise_holds``. Both rest on the SAME justification: that
+    a seam re-admission is cheap flip transport rather than real workload,
+    because "their prefixes are served by read-through from the canonical
+    store". #861j verified that premise for the existence term and never
+    backported the verification to the economics term.
+
+    WHY THE PREMISE MUST BE CHECKED AND NOT ASSUMED. When read-through cannot
+    serve those prefixes, the tokens are not transport at all -- they are a full
+    cold prefill of real work, and deducting them tells the policy that work
+    does not exist. The consumer that pays is the one still reading RAW pending:
+    the #677(a) blocked-admission stall escape, whose threshold is
+    ``pending > pp_exit_tokens``. A deflated pending holds a genuine stall below
+    its own escape, which is the wedge that escape was written to end.
+
+    PHASE, TOO, for the same reason the twin carries it: a re-admission is only
+    "transport that will land here" in the layout that can admit it. In PP the
+    stamp buys nothing, so the deduction has no premise to stand on at all.
+
+    Pure and total, so both directions are falsifiable without a scheduler.
+    Returns the DEDUCTION, never the remainder -- the caller keeps its own
+    ``max(0, ...)`` floor, so this can never manufacture negative pending.
+    """
+    if not (in_tp and premise_holds):
+        return 0
+    return max(0, int(tokens or 0))
+
+
 def seam_transport_exempt(scheduler) -> bool:
     """Is this round's TP prefill a SEAM RE-ADMISSION, i.e. flip transport?
 

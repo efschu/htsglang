@@ -11184,7 +11184,43 @@ class Scheduler(
             _seam_transport_now = int(seam_transport_pending_tokens(self) or 0)
         except Exception:  # noqa: BLE001 - an input probe never breaks arming
             _seam_transport_now = 0
-        _pending_now = max(0, _pending_now - _seam_transport_now)
+        # #869c: THE PREMISE, ASKED ONCE, FOR BOTH SUBTRACTIONS.
+        #
+        # This deduction used to be unconditional while its twin below was
+        # gated on the TP phase AND on `seam_transport_premise_holds`. Both rest
+        # on the same claim -- that a seam re-admission is cheap flip transport
+        # because read-through serves its prefix -- and #861j verified that
+        # claim for the existence term only. Hoisted here so ONE predicate and
+        # ONE clock answer for both, which is that function's own contract and
+        # the #861g fix principle applied to the pair that broke it.
+        #
+        # When the premise is FALSE the tokens are a cold prefill of real work,
+        # and deducting them tells the policy that work does not exist. The
+        # consumer that pays is the #677(a) blocked-admission stall escape,
+        # which still reads RAW pending: a deflated pending holds a genuine
+        # stall below its own escape threshold.
+        _in_tp_now = getattr(runtime, "phase", None) == "tp"
+        _seam_premise_now = False
+        if _seam_transport_now > 0 and _in_tp_now:
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    seam_transport_premise_holds,
+                )
+
+                _seam_premise_now = bool(seam_transport_premise_holds(self))
+            except Exception:  # noqa: BLE001 - an input probe never breaks arming
+                _seam_premise_now = False
+        from sglang.srt.managers.phase_purity import seam_transport_deduction
+
+        _pending_now = max(
+            0,
+            _pending_now
+            - seam_transport_deduction(
+                _seam_transport_now,
+                in_tp=_in_tp_now,
+                premise_holds=_seam_premise_now,
+            ),
+        )
         # #861j DOOR 1: the SERVICEABLE-HERE subset of the seam transport.
         #
         # W37-F, three boots: the cutover re-admits its retracted residents,
@@ -11207,17 +11243,13 @@ class Scheduler(
         # demand fires, and the work goes to PP exactly as it does today --
         # one bounded delay, never a wedge.
         _seam_serviceable_now = 0
-        _in_tp_now = getattr(runtime, "phase", None) == "tp"
         if _seam_transport_now > 0 and _in_tp_now:
-            try:
-                from sglang.srt.managers.phase_purity import (
-                    seam_transport_premise_holds,
-                )
-
-                if seam_transport_premise_holds(self):
-                    _seam_serviceable_now = _seam_transport_now
-            except Exception:  # noqa: BLE001 - an input probe never breaks arming
-                _seam_serviceable_now = 0
+            # #869c: the SAME premise reading the deduction above used. It was
+            # asked here a second time; one predicate, one clock, per
+            # `seam_transport_premise_holds`'s own contract -- and two calls a
+            # round could disagree if the debt clock lapsed between them.
+            if _seam_premise_now:
+                _seam_serviceable_now = _seam_transport_now
             _debt_since = getattr(self, "_seam_transport_debt_since", None)
             if _debt_since is None:
                 self._seam_transport_debt_since = time.perf_counter()
