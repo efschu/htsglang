@@ -205,6 +205,9 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
+from sglang.srt.managers.phase_purity import (
+    tp_compute_budget_remaining as phase_tp_compute_budget_remaining,
+)
 
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
 # `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
@@ -3757,10 +3760,9 @@ class Scheduler(
             # simulation answer differently for the two phases on a fully
             # cached backlog -- the asymmetry the docstring's "ONE SIMULATION"
             # claim exists to forbid.
-            if (
-                max(int(pending_tokens), int(self._admissible_prefill_tokens())) > 0
-                and self._purity_allows("prefill_in_tp", running_bs)
-            ):
+            if max(
+                int(pending_tokens), int(self._admissible_prefill_tokens())
+            ) > 0 and self._purity_allows("prefill_in_tp", running_bs):
                 if self._layout_admits_prefill(rows, pending_tokens):
                     return True
             if int(running_bs) <= 0:
@@ -3951,7 +3953,20 @@ class Scheduler(
 
                 if seam_readmit_candidates(self):
                     return True
-                if not purity.prefill_allowed_in_tp():
+                # #887: THE HYPOTHETICAL ASKS THE BUDGETED FORM, AND SPENDS
+                # NOTHING. With a chunk still owed this phase, the TP layout
+                # COULD admit prefill -- and a `target_can_admit=False`
+                # computed without that term is precisely how the arm auditor
+                # concludes the verdict was wrong while the mechanism to make
+                # it right is installed, which is the W33 defect this site was
+                # already fixed for once. `tp_compute_chunks_spent` is a pure
+                # read; the grant is booked only on the real decision path in
+                # `prefill_blocked_here`, so a probe can never empty the valve.
+                from sglang.srt.managers.phase_purity import (
+                    tp_compute_chunks_spent,
+                )
+
+                if not purity.prefill_allowed_in_tp_now(tp_compute_chunks_spent(self)):
                     return False
                 from sglang.srt.managers.phase_policy import (
                     PHASE_TP,
@@ -7068,8 +7083,15 @@ class Scheduler(
                 # #858b: same direction term as the ready_fn caller. A
                 # direction-blind hold deadlocks tp_to_pp, which is armed FOR
                 # the prefill that strict forbids in the TP layout.
+                # #887: and the SAME budget term as the ready_fn caller. A
+                # chunk still owed to this TP phase is an exit the hold must
+                # see, or the valve is installed and unreachable.
                 prefill_runnable_here=prefill_runnable_in_current_layout(
-                    self.phase_flip_runtime.pending, self._phase_purity
+                    self.phase_flip_runtime.pending,
+                    self._phase_purity,
+                    budget_remaining=phase_tp_compute_budget_remaining(
+                        self, self._phase_purity
+                    ),
                 ),
             )
         ):
@@ -11379,8 +11401,7 @@ class Scheduler(
             # behaviour rather than raise in the arming path.
             decode_runs_in_this_phase=_decode_runs_here,
             retracted_unfinished_bs=int(
-                (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))()
-                or 0
+                (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))() or 0
             ),
             seam_transport_tokens=_seam_transport_now,
             # #861j: the serviceable-here subset computed above; 0 outside TP

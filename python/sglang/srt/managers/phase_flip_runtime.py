@@ -119,7 +119,9 @@ def advance_fence_blind_streak(
     return 0
 
 
-def prefill_runnable_in_current_layout(direction, purity) -> bool:
+def prefill_runnable_in_current_layout(
+    direction, purity, budget_remaining: int = 0
+) -> bool:
     """#858b: can a pending prefill make progress in the layout we are in NOW?
 
     The armed DIRECTION names the layout that currently holds:
@@ -135,8 +137,18 @@ def prefill_runnable_in_current_layout(direction, purity) -> bool:
 
     Measured, boot_w40_857strict_0825_1931: 225 of 228 holds were tp_to_pp,
     258 ADMISSION-WEDGE, 11 queued / 0 running, no first token for 535 s.
+
+    #887: ``budget_remaining`` IS THE ANSWER TO THE SAME QUESTION IN THE OTHER
+    CURRENCY, and it has to be asked here or the valve is installed and
+    unreachable -- the W31 shape, where a correct exemption sat below a gate
+    that returned first and fired once in 144 flips. With a chunk still owed,
+    a pending prefill CAN make progress in the TP layout, so a hold that
+    ignores it is the #858b wedge with the fix already in the tree. Default 0
+    keeps every pre-#887 caller's answer byte-identical.
     """
     if direction == TP_TO_PP:
+        if int(budget_remaining or 0) > 0:
+            return True
         return bool(getattr(purity, "prefill_allowed_in_tp", lambda: True)())
     return True
 
@@ -753,17 +765,30 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         # #858: the strict term travels WITH the shared predicate. Both
         # callers must ask the same question; passing it here and not at the
         # park site is exactly the drift this helper exists to prevent.
-        from sglang.srt.managers.phase_purity import purity_of
+        from sglang.srt.managers.phase_purity import (
+            purity_of,
+            tp_compute_budget_remaining,
+        )
 
         try:
             _purity = purity_of(scheduler)
             _strict = bool(_purity.strict)
         except Exception:  # noqa: BLE001 - a purity read may never break a flip
             _purity, _strict = None, False
+        # #887: the one-chunk allowance travels WITH the shared predicate for
+        # the same reason the strict term does -- both callers must ask the
+        # same question, and passing it at one site only is exactly the drift
+        # this helper exists to prevent.
+        try:
+            _budget = tp_compute_budget_remaining(scheduler, _purity)
+        except Exception:  # noqa: BLE001 - a ledger read may never break a flip
+            _budget = 0
         # #858b: the ARMED DIRECTION decides whether waiting can ever end.
         _rt = getattr(scheduler, "phase_flip_runtime", None)
         _dir = getattr(_rt, "pending", None) if _rt is not None else None
-        _runnable = prefill_runnable_in_current_layout(_dir, _purity)
+        _runnable = prefill_runnable_in_current_layout(
+            _dir, _purity, budget_remaining=_budget
+        )
         if chunk_blocks_quiescence(
             chunked, strict=_strict, prefill_runnable_here=_runnable
         ):

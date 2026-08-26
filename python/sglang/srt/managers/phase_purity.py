@@ -143,6 +143,11 @@ class PhasePurity:
     #: Only meaningful for ``threshold``: how many requests may decode in
     #: the PP layout before the strict prohibition applies again.
     decode_in_pp_threshold: int = 0
+    #: #887. Only meaningful for ``strict``: how many CHUNKS of genuinely
+    #: computed prefill the TP layout may run per TP phase before the strict
+    #: prohibition applies again. 0 -- the default on every mode -- is exactly
+    #: the pre-#887 behaviour. See ``prefill_allowed_in_tp_now``.
+    tp_compute_chunk_budget: int = 0
 
     @property
     def strict(self) -> bool:
@@ -191,17 +196,64 @@ class PhasePurity:
     def prefill_allowed_in_tp(self) -> bool:
         """May a prefill batch be BUILT in the TP layout right now?
 
+        THE MODE QUESTION, NOT THE ROUND QUESTION, and #887 makes the two
+        distinct rather than collapsing them. This answers "may the
+        break-even machinery run in TP at all", which is what BOOT-TIME
+        consumers need: ``scheduler.py`` collapses the policy's threshold from
+        it, and ``model_runner_kv_cache_mixin`` sizes a survivable TP prefill
+        from it. Both must go on reading ``False`` under a budgeted ``strict``
+        -- the one-chunk valve is a bounded exception, not a mode change, and
+        the flip is still demanded for the pending prefill behind it.
+
         No threshold form HERE on purpose: the amortisation is not a second
         purity knob, it is ``phase_policy.break_even_tokens`` -- the pending
         prefill above which paying the seam beats prefilling in the slower
-        layout. This method only says whether that machinery is allowed to
-        run at all; ``strict`` forces it to 0 and every prefill flips.
+        layout. ``strict`` forces it to 0 and every prefill flips.
+
+        The per-ROUND question is ``prefill_allowed_in_tp_now``.
         """
         return self.mode in (MODE_OFF, MODE_PREFILL_IN_TP)
+
+    def prefill_allowed_in_tp_now(self, chunks_spent: int) -> bool:
+        """#887: may a prefill batch be built in TP THIS ROUND?
+
+        THE CLASS THIS METHOD EXISTS TO END: a YES/NO where the user's rule is
+        a BUDGET. The user permitted the TP phase to prefill up to ONE CHUNK
+        itself (2026-08-25, during the #857 acceptance boot) -- and the code
+        had nowhere to put a "once". ``prefill_allowed_in_tp`` takes no token
+        argument at all, so ``strict`` meant never and ``prefill_in_tp`` meant
+        always, with the quantity delegated to a different axis entirely: the
+        policy's break-even N, measured at 13791 tokens in
+        WINDOW_TICKET_874.md -- 3.4x the permission that was given. Either side
+        of that gap was measured (W29-RESULT.md): 153 TP prefill batches under
+        ``prefill_in_tp``, 0 under ``strict``. The truth the user asked for is
+        between them and no signature could express it.
+
+        SCOPE IS THE TP PHASE, NOT THE PROCESS. "Die TP-Phase darf bis zu EINEM
+        Chunk selbst prefillen" is per phase; ``chunks_spent`` is re-keyed on
+        the flip epoch by ``tp_compute_chunks_spent``, so a cutover restores
+        the allowance without a reset hook anybody has to remember to call.
+
+        COMPUTE ONLY. A HiCache/radix restore never reaches this method: the
+        seam-transport exemption is checked ABOVE it in ``prefill_blocked_here``
+        and returns unconditionally. That is the user's own qualification --
+        *"wenn das hicache reinladen als prefill gilt, dann darf es das
+        natuerlich ueber einen chunk hinaus tun"* -- carried by ORDER rather
+        than by an exemption clause that could rot.
+        """
+        if self.prefill_allowed_in_tp():
+            return True
+        return self.tp_compute_budget_remaining(chunks_spent) > 0
+
+    def tp_compute_budget_remaining(self, chunks_spent: int) -> int:
+        """Chunks of computed TP prefill still owed in this phase. Never < 0."""
+        return max(0, int(self.tp_compute_chunk_budget) - max(0, int(chunks_spent)))
 
     def describe(self) -> str:
         if self.mode == MODE_THRESHOLD:
             return f"threshold:{self.decode_in_pp_threshold}"
+        if self.mode == MODE_STRICT and self.tp_compute_chunk_budget > 0:
+            return f"{MODE_STRICT}:{self.tp_compute_chunk_budget}"
         return self.mode
 
 
@@ -212,6 +264,36 @@ def parse_purity(raw: Optional[str]) -> PhasePurity:
     value = str(raw).strip().lower()
     if value == MODE_STRICT:
         return PhasePurity(mode=MODE_STRICT)
+    if value.startswith(MODE_STRICT + ":"):
+        # #887: `strict:<n>` -- strict, with n chunks of COMPUTED prefill
+        # permitted in the TP layout per TP phase. Written where the mode is
+        # written, and in the grammar `threshold:<n>` already established, so
+        # an operator reading one boot line sees the rule AND its exception
+        # rather than having to correlate a mode with a separate env var.
+        rest = value[len(MODE_STRICT) + 1 :]
+        try:
+            chunks = int(rest)
+        except ValueError:
+            raise PhasePurityError(
+                f"{LOG_PREFIX} purity {raw!r} has a non-integer chunk budget "
+                f"{rest!r}; write 'strict:<n>', e.g. 'strict:1' to let the TP "
+                f"phase compute at most ONE chunk of prefill per TP phase"
+            )
+        if chunks < 0:
+            raise PhasePurityError(
+                f"{LOG_PREFIX} purity chunk budget {chunks} is negative; use 0 "
+                f"(which is exactly 'strict') or a positive count of chunks"
+            )
+        # `strict:0` COLLAPSES STRUCTURALLY, not by a branch, and the #887
+        # mutation harness is what established the difference: a
+        # `if chunks == 0: return PhasePurity(mode=MODE_STRICT)` special case
+        # sat here first and SURVIVED its own mutant -- deleting it changed no
+        # behaviour, because the frozen dataclass already compares equal to a
+        # bare `strict` at budget 0 and `describe()` already prints `strict`.
+        # A guard that cannot fail is not a guard; it is a claim that the
+        # collapse needs defending when it does not. `threshold:0` needs its
+        # branch because it maps onto a DIFFERENT mode; this one does not.
+        return PhasePurity(mode=MODE_STRICT, tp_compute_chunk_budget=chunks)
     if value == MODE_OFF:
         return PhasePurity(mode=MODE_OFF)
     if value == MODE_PREFILL_IN_TP:
@@ -266,7 +348,21 @@ def purity_from_server_args(server_args) -> PhasePurity:
                 else f"allowed up to bs {purity.decode_in_pp_threshold}"
             )
         ),
-        "allowed" if purity.prefill_allowed_in_tp() else "forbidden",
+        (
+            "allowed"
+            if purity.prefill_allowed_in_tp()
+            # #887: "forbidden" alone would misreport a budgeted strict as
+            # the mode it is not. The exception is a deliberate operator
+            # choice and has to be legible in the one line that states the
+            # rule, or nobody can tell the two strict boots apart.
+            else (
+                f"forbidden, EXCEPT {purity.tp_compute_chunk_budget} computed "
+                f"chunk(s) per TP phase (#887; a HiCache restore is separate "
+                f"and unbounded)"
+                if purity.tp_compute_chunk_budget > 0
+                else "forbidden"
+            )
+        ),
     )
     return purity
 
@@ -723,6 +819,118 @@ def _relaxed(scheduler, work: str) -> bool:
     return True
 
 
+#: #887: the scheduler attribute holding ``(epoch, chunks_spent)`` for the
+#: one-chunk compute exception. KEYED ON THE EPOCH RATHER THAN RESET AT THE
+#: CUTOVER, deliberately: the allowance is scoped to a TP phase, and a ledger
+#: whose scope is derived from the event cannot drift from it the way a
+#: separate reset hook can be forgotten at one of the seam's several commit
+#: paths. A stale key simply reads as a fresh phase, which is the correct
+#: answer for the phase that key belongs to.
+TP_COMPUTE_LEDGER_ATTR = "_tp_compute_prefill_ledger"
+
+
+def _tp_phase_epoch(scheduler) -> int:
+    """The flip epoch, or 0 when there is no runtime to ask.
+
+    Group-uniform: the epoch advances on a cutover that commits on every rank
+    or on none, which is the same property the seam's own readmit stamp relies
+    on (``phase_flip_runtime`` stamps ``seam_readmit_epoch`` from it). A
+    rank-local input here would split the group across branches with mismatched
+    collectives -- the family this whole module argues against.
+    """
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    try:
+        return int(getattr(rt, "epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def tp_compute_chunks_spent(scheduler) -> int:
+    """Chunks of computed TP prefill this TP phase has already spent."""
+    book = getattr(scheduler, TP_COMPUTE_LEDGER_ATTR, None)
+    try:
+        epoch, spent = book
+    except (TypeError, ValueError):
+        return 0
+    if epoch != _tp_phase_epoch(scheduler):
+        return 0
+    return max(0, int(spent))
+
+
+def tp_compute_budget_remaining(scheduler, purity=None) -> int:
+    """Chunks of computed TP prefill still owed in this TP phase."""
+    rule = purity_of(scheduler) if purity is None else purity
+    return rule.tp_compute_budget_remaining(tp_compute_chunks_spent(scheduler))
+
+
+def tp_compute_fits_in_one_chunk(scheduler) -> Optional[bool]:
+    """#887: does ALL the pending prefill fit inside ONE chunk? None = unknown.
+
+    THE GATE AND THE #838 DETECTOR MUST BE ONE RULE, and without this term they
+    were two. `layout_conformance.tp_compute_exception_verdict` permits a batch
+    only when ``new_tokens < chunk_tokens`` -- #870's measured discriminator,
+    whose whole argument is that a batch REACHING the cap was TRUNCATED by it,
+    so more prefill stands behind it and what is really running in TP is a large
+    cold prefill. A gate that granted the chunk regardless would hand the batch
+    builder a round whose resulting batch its own detector then calls a
+    violation: the instance alarming on the exception it was configured to take,
+    once per TP phase, for as long as a big prefill is pending.
+
+    IT IS ALSO WHAT THE USER ASKED FOR. The permission is for the case where
+    letting TP finish the work "einfacher funktionieren wuerde" -- the request
+    completes in this layout and no cutover is needed for it at all. When more
+    than a chunk is pending the cutover is coming anyway, and computing 4096
+    tokens at TP's 1681 tok/s instead of PP's 7245 spends ~1.9 s of the slow
+    layout on work the flip was going to do properly. That is the throughput
+    extension the rule explicitly reserves for a separate user decision.
+
+    UNKNOWN IS REFUSAL, never permission -- the same direction as an unresolved
+    chunk size at the detector. A scheduler stand-in without the accessor or
+    without a chunk size gets None and the strict rule stands.
+
+    Rank-uniform on this module's standing argument: read in the TP layout only,
+    where ``waiting_queue`` and ``chunked_req`` are replicated across the ranks
+    -- the property ``seam_readmit_candidates`` already relies on.
+    """
+    chunk = getattr(getattr(scheduler, "server_args", None), "chunked_prefill_size", 0)
+    try:
+        chunk = int(chunk or 0)
+    except (TypeError, ValueError):
+        return None
+    if chunk <= 0:
+        return None
+    fn = getattr(scheduler, "_pending_prefill_tokens", None)
+    if not callable(fn):
+        return None
+    try:
+        pending = int(fn() or 0)
+    except Exception:  # noqa: BLE001 - an unreadable queue is not a permission
+        return None
+    # Strictly LESS than the chunk, matching the detector's boundary exactly:
+    # pending == chunk would fill the batch to the cap and be flagged there.
+    return 0 < pending < chunk
+
+
+def _spend_tp_compute_chunk(scheduler) -> None:
+    """Book one chunk against this TP phase's allowance.
+
+    SPENT AT THE GRANT, NOT AT THE BATCH, and the direction of that choice is
+    the safe one. The grant is what ``prefill_blocked_here`` hands the batch
+    builder; if the builder then finds nothing to build, the allowance is gone
+    for this phase. That is conservative in the direction the user's law runs
+    -- never MORE than the permitted chunk -- and it keeps the ledger on the
+    one rank-uniform decision path rather than on a measured instrument that
+    is wrapped in a blanket ``try/except`` and may legitimately not run.
+    """
+    spent = tp_compute_chunks_spent(scheduler)
+    try:
+        setattr(
+            scheduler, TP_COMPUTE_LEDGER_ATTR, (_tp_phase_epoch(scheduler), spent + 1)
+        )
+    except Exception:  # noqa: BLE001 - a ledger may never break the gate
+        pass
+
+
 def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
     """True when a prefill batch must NOT be built this iteration.
 
@@ -828,8 +1036,61 @@ def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
             "the TP layout has stopped prefilling.",
             LOG_PREFIX,
         )
-    if purity_of(scheduler).prefill_allowed_in_tp():
+    purity = purity_of(scheduler)
+    if purity.prefill_allowed_in_tp():
         return False
+    # #887 THE ONE-CHUNK EXCEPTION, and it sits HERE for two reasons that are
+    # both about order.
+    #
+    # BELOW DRAIN-MODE SUPPRESSION, which therefore still outranks it. Drain
+    # mode's contract is "a TP window entered to finish a bundle must not admit
+    # the work it was entered to escape", and its suppression lifts by itself
+    # at ``running_bs == 0`` (phase_policy: "with running_bs == 0 the bundle is
+    # finished"). That is exactly the state the valve exists for -- the #858
+    # wedge was 11 queued / 0 running -- so the exception reaches its own case
+    # without being able to interrupt a draining bundle.
+    #
+    # BELOW THE SEAM-TRANSPORT EXEMPTION at the top of this function, which is
+    # what carries the user's own qualification: *"wenn das hicache reinladen
+    # als prefill gilt, dann darf es das natuerlich ueber einen chunk hinaus
+    # tun"*. A verified restore returns up there and never reaches the ledger,
+    # so unbounded restore is a property of ORDER, not of a second exemption
+    # clause that could rot out of agreement with the first.
+    #
+    # SPENDING HERE IS SPENDING ON THE ONE DECISION PATH. This function is
+    # called once per round from ``get_next_batch_to_run``; the hypothetical
+    # ``target_can_admit`` probe asks ``prefill_allowed_in_tp_now`` directly and
+    # books nothing, which is what keeps a probe from emptying the valve
+    # without a batch ever being built (the W33 divergence class, in the new
+    # currency). Rank-uniform on this function's own standing argument: static
+    # purity config, a replicated active layout, and a group-unanimous epoch.
+    if purity.tp_compute_chunk_budget > 0:
+        spent = tp_compute_chunks_spent(scheduler)
+        # AND THE WORK MUST FIT, or the gate and the #838 detector are two
+        # rules: the detector permits only a batch BELOW the chunk cap, so
+        # granting a round whose batch fills the cap makes the instance alarm on
+        # its own configured exception. See `tp_compute_fits_in_one_chunk`.
+        if purity.prefill_allowed_in_tp_now(spent) and tp_compute_fits_in_one_chunk(
+            scheduler
+        ):
+            _spend_tp_compute_chunk(scheduler)
+            if not getattr(scheduler, "_tp_compute_exception_announced", False):
+                scheduler._tp_compute_exception_announced = True
+                logger.warning(
+                    "%s ONE-CHUNK EXCEPTION TAKEN: purity=%s permits %d chunk(s) "
+                    "of COMPUTED prefill per TP phase and this phase has now "
+                    "spent %d. Granted by the user on 2026-08-25 as a valve "
+                    "against the #858 shape (TP may admit no prefill -> hold "
+                    "with no exit -> wedge), NOT as a relaxation of the "
+                    "strict-batch mode: the flip is still demanded for the "
+                    "prefill behind this chunk, and the allowance returns at "
+                    "the next cutover. A HiCache restore does not spend it.",
+                    LOG_PREFIX,
+                    purity.describe(),
+                    purity.tp_compute_chunk_budget,
+                    spent + 1,
+                )
+            return False
     # (The seam-transport exemption is checked at the TOP of this function --
     # see the W31 note there. It must outrank the drain-mode suppression, so
     # it cannot live down here.)
