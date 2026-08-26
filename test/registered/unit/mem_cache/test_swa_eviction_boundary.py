@@ -106,6 +106,13 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         origin_input_ids=token_ids,
         output_ids=[],
         cache_protected_len=cache_protected_len,
+        # #862: the real Req has carried this since schedule_batch.py:778 and
+        # mem_cache/common.py:82 reads it as
+        # ``max(req.cache_protected_len, req.swa_evict_floor)``. The stub had
+        # drifted behind that field; the drift was invisible because the whole
+        # module skipped hermetically on get_device(). 0 is the production
+        # default, so the eviction boundary under test is unchanged.
+        swa_evict_floor=0,
         swa_evicted_seqlen=0,
         extra_key=None,
         last_node=tree.root_node,

@@ -18,12 +18,39 @@ mixed load and then died with SIGQUIT out of `alloc_req_slots`
 across an admission. A parse-time refusal is what that boot was owed.
 """
 
+import os
+
 import pytest
 
 from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
 from sglang.srt.server_args import ServerArgs
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5"
+
+# #862: this module was dark hermetically -- the mem_cache conftest turned
+# get_device() into a skip, so nobody saw that its checkpoint dependency had
+# rotted. With the conftest handing out "cpu" instead, ServerArgs() reaches
+# huggingface_hub and the absent directory surfaces as an opaque
+# `HFValidationError: Repo id must be in the form ...`.
+#
+# The dependency is REAL and is not repointed here. The assertions pin the
+# 2026-08-13 acceptance specimen literally ("--gdn-resident-state-slots to at
+# least 12"); 12 is that checkpoint's mamba floor, so aiming the module at a
+# surviving Qwen3.8 build would silently change the specimen the test claims to
+# pin. Name the dependency instead, and let a box that carries the checkpoint
+# run it. The same retired path is still referenced by
+# test/srt/test_phase_flip_serving_proof_gate.py,
+# test/registered/unit/planner/test_pp_family_cut_485.py and
+# scripts/route_a_631_unmanned_acceptance.sh -- one drift, four sites.
+pytestmark = pytest.mark.skipif(
+    not os.path.isdir(MODEL),
+    reason=(
+        f"requires the #656 acceptance checkpoint {MODEL}, which is not on this "
+        "box: the assertions quote that boot's floor of 12 literally, so the "
+        "module cannot be repointed at another checkpoint without changing the "
+        "specimen it pins."
+    ),
+)
 
 
 def _args(**extra):
