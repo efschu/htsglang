@@ -215,9 +215,7 @@ def _default_http(
             wall_ms=(time.time() - t0) * 1000.0,
         )
     except Exception as e:
-        return HttpResult(
-            status=0, error=str(e), wall_ms=(time.time() - t0) * 1000.0
-        )
+        return HttpResult(status=0, error=str(e), wall_ms=(time.time() - t0) * 1000.0)
 
 
 # ===========================================================================
@@ -233,7 +231,7 @@ class Capabilities:
     """
 
     chat_template_basic: bool = True
-    tool_parser: Optional[str] = None       # None -> not tool-aware
+    tool_parser: Optional[str] = None  # None -> not tool-aware
     reasoning_parser: Optional[str] = None  # None -> not thinking-aware
     streaming: bool = True
     spec_decode: bool = False
@@ -323,56 +321,70 @@ def _no_think(body: dict) -> dict:
 
 def request_basic(model: str) -> dict:
     """Test 1 -- verify-full.sh [3/8]."""
-    return _no_think({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "What is the capital of France? One short sentence.",
-        }],
-        "max_tokens": 30,
-        "temperature": 0.6,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? One short sentence.",
+                }
+            ],
+            "max_tokens": 30,
+            "temperature": 0.6,
+        }
+    )
 
 
 def request_tool_call(model: str) -> dict:
     """Test 2 -- verify-full.sh [4/8]."""
-    return _no_think({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "What is the weather in San Francisco? "
-                       "Use the get_weather tool.",
-        }],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            },
-        }],
-        "tool_choice": "auto",
-        "max_tokens": 200,
-        "temperature": 0.3,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather in San Francisco? "
+                    "Use the get_weather tool.",
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 200,
+            "temperature": 0.3,
+        }
+    )
 
 
 def request_streaming(model: str) -> dict:
     """Test 3 -- verify-full.sh [5/8]."""
-    return _no_think({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "Write a three-sentence haiku about debugging.",
-        }],
-        "max_tokens": 120,
-        "temperature": 0.6,
-        "stream": True,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a three-sentence haiku about debugging.",
+                }
+            ],
+            "max_tokens": 120,
+            "temperature": 0.6,
+            "stream": True,
+        }
+    )
 
 
 #: bench-agentic.sh system prompt (verbatim; fixed so prefix caching warms).
@@ -393,14 +405,23 @@ AGENTIC_SYSTEM = (
 
 #: bench-agentic.sh 10-tool schema set (verbatim).
 AGENTIC_TOOLS = [
-    {"type": "function", "function": {
-        "name": n, "description": d,
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "command": {"type": "string"},
-            "pattern": {"type": "string"},
-            "recursive": {"type": "boolean"},
-        }, "required": []}}}
+    {
+        "type": "function",
+        "function": {
+            "name": n,
+            "description": d,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "command": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "recursive": {"type": "boolean"},
+                },
+                "required": [],
+            },
+        },
+    }
     for n, d in [
         ("Read", "Read a UTF-8 file from the repository."),
         ("Bash", "Execute a shell command and return stdout+stderr."),
@@ -427,29 +448,33 @@ AGENTIC_FIXTURE_USER = (
 
 def request_agentic_turn(model: str) -> dict:
     """Test 4 -- bench-agentic.sh single streamed turn."""
-    return _no_think({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": AGENTIC_SYSTEM},
-            {"role": "user", "content": AGENTIC_FIXTURE_USER},
-        ],
-        "tools": AGENTIC_TOOLS,
-        "tool_choice": "required",
-        "max_tokens": 150,
-        "temperature": 0.3,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": AGENTIC_SYSTEM},
+                {"role": "user", "content": AGENTIC_FIXTURE_USER},
+            ],
+            "tools": AGENTIC_TOOLS,
+            "tool_choice": "required",
+            "max_tokens": 150,
+            "temperature": 0.3,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    )
 
 
 def request_thinking(model: str) -> dict:
     """Test 5 -- verify-full.sh [6/8]."""
     return {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "What is 2+2? One-line answer.",
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 2+2? One-line answer.",
+            }
+        ],
         "max_tokens": 4000,
         "temperature": 0.3,
         "chat_template_kwargs": {"enable_thinking": True},
@@ -458,33 +483,41 @@ def request_thinking(model: str) -> dict:
 
 def request_quality(model: str) -> dict:
     """Test 6 -- verify-full.sh [7/8] (cascade / degeneracy scan)."""
-    return _no_think({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "Write a detailed 1500-word essay explaining how "
-                       "transformer attention works. Cover: query/key/value "
-                       "projections, scaled dot-product attention, softmax, "
-                       "multi-head attention, positional encodings, and a "
-                       "brief comparison with RNN-based attention.",
-        }],
-        "max_tokens": 2000,
-        "temperature": 0.6,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a detailed 1500-word essay explaining how "
+                    "transformer attention works. Cover: query/key/value "
+                    "projections, scaled dot-product attention, softmax, "
+                    "multi-head attention, positional encodings, and a "
+                    "brief comparison with RNN-based attention.",
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.6,
+        }
+    )
 
 
 def request_mtp_trigger(model: str) -> dict:
     """Test 7 -- verify-full.sh [8/8] decode driver (AL then read from
     /metrics, see the module docstring)."""
-    return _no_think({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "Count from 1 to 80, one number per line.",
-        }],
-        "max_tokens": 500,
-        "temperature": 0.0,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Count from 1 to 80, one number per line.",
+                }
+            ],
+            "max_tokens": 500,
+            "temperature": 0.0,
+        }
+    )
 
 
 #: verify-stress.sh needle filler block (verbatim).
@@ -497,10 +530,26 @@ NEEDLE_BLOCK = (
     "and AI. "
 )
 
-_NEEDLE_ANIMALS = ["otter", "falcon", "platypus", "iguana", "narwhal",
-                   "chinchilla", "capybara", "axolotl"]
-_NEEDLE_COLORS = ["crimson", "turquoise", "amber", "violet", "emerald",
-                  "sapphire", "silver", "golden"]
+_NEEDLE_ANIMALS = [
+    "otter",
+    "falcon",
+    "platypus",
+    "iguana",
+    "narwhal",
+    "chinchilla",
+    "capybara",
+    "axolotl",
+]
+_NEEDLE_COLORS = [
+    "crimson",
+    "turquoise",
+    "amber",
+    "violet",
+    "emerald",
+    "sapphire",
+    "silver",
+    "golden",
+]
 
 
 def make_needle_secret(rng: Optional[random.Random] = None) -> str:
@@ -517,22 +566,24 @@ def request_needle(model: str, filler_scale: int, secret: str) -> dict:
     Secret at ~50% depth, retrieval question at the end, max 30 tokens t0."""
     half = filler_scale // 2
     content = (
-        NEEDLE_BLOCK * half
-        + f"\n\nIMPORTANT MEMORY: The hidden phrase is '{secret}'. "
-          "Remember this exactly.\n\n"
-        + NEEDLE_BLOCK * (filler_scale - half)
+        NEEDLE_BLOCK * half + f"\n\nIMPORTANT MEMORY: The hidden phrase is '{secret}'. "
+        "Remember this exactly.\n\n"
+        + NEEDLE_BLOCK
+        * (filler_scale - half)
         + "\n\nQuestion: In the middle of the document above I wrote "
-          "'The hidden phrase is ___'. What was the hidden phrase? "
-          "Reply with only the phrase, no other text."
+        "'The hidden phrase is ___'. What was the hidden phrase? "
+        "Reply with only the phrase, no other text."
     )
-    return _no_think({
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 30,
-        "temperature": 0.0,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 30,
+            "temperature": 0.0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    )
 
 
 #: verify-stress.sh check 2 mock tool-response news blocks (verbatim subset --
@@ -581,27 +632,41 @@ def request_tool_prefill(model: str, target_chars: int = 100000) -> dict:
             },
         },
     }
-    return _no_think({
-        "model": model,
-        "messages": [
-            {"role": "user",
-             "content": "What's happening in financial markets today?"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_news_1", "type": "function",
-                 "function": {"name": "fetch_news",
-                              "arguments": json.dumps({"topic": "markets"})}}
-            ]},
-            {"role": "tool", "tool_call_id": "call_news_1",
-             "content": content},
-            {"role": "user",
-             "content": "Summarize the top 3 themes from this news data in "
-                        "about 100 words."},
-        ],
-        "tools": [tool_def],
-        "tool_choice": "auto",
-        "max_tokens": 500,
-        "temperature": 0.6,
-    })
+    return _no_think(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What's happening in financial markets today?",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_news_1",
+                            "type": "function",
+                            "function": {
+                                "name": "fetch_news",
+                                "arguments": json.dumps({"topic": "markets"}),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_news_1", "content": content},
+                {
+                    "role": "user",
+                    "content": "Summarize the top 3 themes from this news data in "
+                    "about 100 words.",
+                },
+            ],
+            "tools": [tool_def],
+            "tool_choice": "auto",
+            "max_tokens": 500,
+            "temperature": 0.6,
+        }
+    )
 
 
 def request_ide_agent(model: str) -> dict:
@@ -625,21 +690,29 @@ def request_ide_agent(model: str) -> dict:
         "destructive commands without explicit confirmation. "
     ) * 5
     tools = [
-        {"type": "function", "function": {
-            "name": n, "description": d,
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string"},
-                "pattern": {"type": "string"},
-                "command": {"type": "string"},
-                "content": {"type": "string"},
-                "recursive": {"type": "boolean"},
-                "encoding": {"type": "string", "default": "utf-8"},
-            }, "required": ["path"]}}}
+        {
+            "type": "function",
+            "function": {
+                "name": n,
+                "description": d,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "command": {"type": "string"},
+                        "content": {"type": "string"},
+                        "recursive": {"type": "boolean"},
+                        "encoding": {"type": "string", "default": "utf-8"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        }
         for n, d in [
             ("read_file", "Read the contents of a file at the given path."),
             ("write_file", "Write content to a file at the given path."),
-            ("list_directory",
-             "List files at the given path, optionally recursive."),
+            ("list_directory", "List files at the given path, optionally recursive."),
             ("search_code", "Search for a regex pattern across the codebase."),
             ("run_command", "Execute a shell command in the project directory."),
             ("get_file_metadata", "Get metadata for a file."),
@@ -679,13 +752,22 @@ def request_multiturn_agent(model: str) -> dict:
         "result before proceeding to the next step. "
     ) * 8
     tools = [
-        {"type": "function", "function": {
-            "name": n, "description": d,
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "pattern": {"type": "string"},
-            }, "required": ["path"]}}}
+        {
+            "type": "function",
+            "function": {
+                "name": n,
+                "description": d,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "pattern": {"type": "string"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        }
         for n, d in [
             ("read_file", "Read a file."),
             ("write_file", "Write a file."),
@@ -701,19 +783,29 @@ def request_multiturn_agent(model: str) -> dict:
         "model": model,
         "messages": [
             {"role": "system", "content": sys_text},
-            {"role": "user",
-             "content": "Read src/utils.py and tell me what functions are "
-                        "defined."},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_read_1", "type": "function",
-                 "function": {"name": "read_file",
-                              "arguments": '{"path": "src/utils.py"}'}}
-            ]},
-            {"role": "tool", "tool_call_id": "call_read_1",
-             "content": mock_file},
-            {"role": "user",
-             "content": "Now refactor function_5 to use a different "
-                        "multiplier."},
+            {
+                "role": "user",
+                "content": "Read src/utils.py and tell me what functions are defined.",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_read_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "src/utils.py"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_read_1", "content": mock_file},
+            {
+                "role": "user",
+                "content": "Now refactor function_5 to use a different multiplier.",
+            },
         ],
         "tools": tools,
         "tool_choice": "auto",
@@ -787,13 +879,17 @@ def request_reasoning_heavy(model: str) -> dict:
 
 #: bench.sh canonical prompts (verbatim).
 THROUGHPUT_PROMPTS = (
-    ("narrative",
-     "Write a detailed 800-word essay explaining transformer attention.",
-     1000),
-    ("code",
-     "Write a Python implementation of quicksort with comments explaining "
-     "each step.",
-     800),
+    (
+        "narrative",
+        "Write a detailed 800-word essay explaining transformer attention.",
+        1000,
+    ),
+    (
+        "code",
+        "Write a Python implementation of quicksort with comments explaining "
+        "each step.",
+        800,
+    ),
 )
 
 
@@ -878,9 +974,9 @@ def reassemble_stream(sse_lines: Iterable[str]) -> Dict[str, Any]:
 def analyze_output_quality(content: str) -> Dict[str, Any]:
     """The verify-full.sh [7/8] cascade / degeneracy scan:
 
-      * tool-call cascade: literal ``<tool_call>`` in normal content
-      * repetition cascade: same non-empty line >= 5x consecutively
-      * lexical variety over the first 200 words (>= 0.30 is healthy)
+    * tool-call cascade: literal ``<tool_call>`` in normal content
+    * repetition cascade: same non-empty line >= 5x consecutively
+    * lexical variety over the first 200 words (>= 0.30 is healthy)
     """
     cascade = "<tool_call>" in content
     lines = [l.strip() for l in content.split("\n") if l.strip()]
@@ -958,35 +1054,79 @@ class TestSpec:
         }
 
 
-TEST_CATALOG: Dict[int, TestSpec] = {s.test_id: s for s in [
-    TestSpec(1, "basic", "Basic completion (Paris)", "basic"),
-    TestSpec(2, "tool_call", "Tool calling", "tool-aware", tools=True),
-    TestSpec(3, "streaming", "Streaming SSE", "basic", streaming=True),
-    TestSpec(4, "agentic_stream", "Streaming tool-calls (agentic turn)",
-             "tool-aware", tools=True, streaming=True),
-    TestSpec(5, "thinking", "Thinking / reasoning mode", "thinking-aware",
-             thinking=True),
-    TestSpec(6, "output_quality", "Output quality / cascade detection",
-             "basic"),
-    TestSpec(7, "mtp_acceptance", "MTP acceptance length", "basic",
-             spec_decode=True),
-    TestSpec(8, "needle_small", "Needle small rungs (10K / 30K)", "basic",
-             streaming=True, longctx_rungs=(10000, 30000)),
-    TestSpec(9, "tool_prefill", "Tool-response prefill OOM (~25K tokens)",
-             "tool-aware", tools=True),
-    TestSpec(10, "ide_agent", "IDE-agent one-shot (Cliff-1 probe)",
-             "tool-aware", tools=True),
-    TestSpec(11, "multiturn_agent", "Multi-turn agent", "tool-aware",
-             tools=True),
-    TestSpec(12, "lcb_coding", "LCB-coding shape", "basic"),
-    TestSpec(13, "reasoning_heavy", "Reasoning-heavy (8K budget)", "basic"),
-    TestSpec(14, "needle_large", "Needle large rungs (60K / 90K, Cliff-2)",
-             "basic", streaming=True, longctx_rungs=(60000, 90000)),
-    TestSpec(15, "ceiling_ladder", "Context ceiling ladder (NIAH)", "basic",
-             streaming=True, longctx_rungs=(95000,), optional=True),
-    TestSpec(16, "throughput", "Throughput (narrative + code)", "basic",
-             streaming=True, optional=True),
-]}
+TEST_CATALOG: Dict[int, TestSpec] = {
+    s.test_id: s
+    for s in [
+        TestSpec(1, "basic", "Basic completion (Paris)", "basic"),
+        TestSpec(2, "tool_call", "Tool calling", "tool-aware", tools=True),
+        TestSpec(3, "streaming", "Streaming SSE", "basic", streaming=True),
+        TestSpec(
+            4,
+            "agentic_stream",
+            "Streaming tool-calls (agentic turn)",
+            "tool-aware",
+            tools=True,
+            streaming=True,
+        ),
+        TestSpec(
+            5, "thinking", "Thinking / reasoning mode", "thinking-aware", thinking=True
+        ),
+        TestSpec(6, "output_quality", "Output quality / cascade detection", "basic"),
+        TestSpec(
+            7, "mtp_acceptance", "MTP acceptance length", "basic", spec_decode=True
+        ),
+        TestSpec(
+            8,
+            "needle_small",
+            "Needle small rungs (10K / 30K)",
+            "basic",
+            streaming=True,
+            longctx_rungs=(10000, 30000),
+        ),
+        TestSpec(
+            9,
+            "tool_prefill",
+            "Tool-response prefill OOM (~25K tokens)",
+            "tool-aware",
+            tools=True,
+        ),
+        TestSpec(
+            10,
+            "ide_agent",
+            "IDE-agent one-shot (Cliff-1 probe)",
+            "tool-aware",
+            tools=True,
+        ),
+        TestSpec(11, "multiturn_agent", "Multi-turn agent", "tool-aware", tools=True),
+        TestSpec(12, "lcb_coding", "LCB-coding shape", "basic"),
+        TestSpec(13, "reasoning_heavy", "Reasoning-heavy (8K budget)", "basic"),
+        TestSpec(
+            14,
+            "needle_large",
+            "Needle large rungs (60K / 90K, Cliff-2)",
+            "basic",
+            streaming=True,
+            longctx_rungs=(60000, 90000),
+        ),
+        TestSpec(
+            15,
+            "ceiling_ladder",
+            "Context ceiling ladder (NIAH)",
+            "basic",
+            streaming=True,
+            longctx_rungs=(95000,),
+            optional=True,
+        ),
+        TestSpec(
+            16,
+            "throughput",
+            "Throughput (narrative + code)",
+            "basic",
+            streaming=True,
+            optional=True,
+        ),
+    ]
+}
 
 #: Preset -> test ids (run order comes from :func:`order_selected`).
 PRESETS: Dict[str, Tuple[int, ...]] = {
@@ -1026,8 +1166,9 @@ class GateDecision:
     rungs: Optional[List[int]] = None
 
 
-def gate_test(spec: TestSpec, caps: Optional[Capabilities],
-              force: bool = False) -> GateDecision:
+def gate_test(
+    spec: TestSpec, caps: Optional[Capabilities], force: bool = False
+) -> GateDecision:
     """Apply the design's chat-template gating matrix. ``force=True`` lifts
     ONLY the tool-parser warn+block (to deliberately surface the cascade
     fail); the basic-template block and the spec-off skip always hold."""
@@ -1040,7 +1181,7 @@ def gate_test(spec: TestSpec, caps: Optional[Capabilities],
         return GateDecision(
             status="blocked",
             reason="no working basic chat template (chat ping failed / "
-                   "template 'none') -- all chat tests blocked",
+            "template 'none') -- all chat tests blocked",
         )
 
     if spec.chat_template == "tool-aware" and not caps.tool_parser:
@@ -1048,15 +1189,17 @@ def gate_test(spec: TestSpec, caps: Optional[Capabilities],
             return GateDecision(
                 status="blocked",
                 reason="no --tool-call-parser on the server: tool-aware "
-                       "template missing, test would show the <tool_call> "
-                       "cascade. Blocked by default; force-run to surface it.",
+                "template missing, test would show the <tool_call> "
+                "cascade. Blocked by default; force-run to surface it.",
             )
 
     note = None
     if spec.chat_template == "thinking-aware" and not caps.reasoning_parser:
-        note = ("no --reasoning-parser on the server: reasoning_content will "
-                "be empty and the >=50-char gate fails. Pre-flagged "
-                "expected-fail (reported as warn, not fail).")
+        note = (
+            "no --reasoning-parser on the server: reasoning_content will "
+            "be empty and the >=50-char gate fails. Pre-flagged "
+            "expected-fail (reported as warn, not fail)."
+        )
 
     if spec.spec_decode and not caps.spec_decode:
         return GateDecision(
@@ -1073,7 +1216,7 @@ def gate_test(spec: TestSpec, caps: Optional[Capabilities],
                 return GateDecision(
                     status="skip",
                     reason=f"all rungs {rungs} exceed max_model_len="
-                           f"{caps.max_model_len} (graceful skip, not a fail)",
+                    f"{caps.max_model_len} (graceful skip, not a fail)",
                 )
             rungs = in_budget
 
@@ -1105,11 +1248,15 @@ class _RunCtx:
     def base(self) -> str:
         return self.endpoint.rstrip("/")
 
-    def chat(self, body: dict, stream: bool = False,
-             timeout: Optional[float] = None) -> HttpResult:
+    def chat(
+        self, body: dict, stream: bool = False, timeout: Optional[float] = None
+    ) -> HttpResult:
         res = self.http(
-            "POST", self.base + "/v1/chat/completions", body=body,
-            stream=stream, timeout=timeout or self.timeout,
+            "POST",
+            self.base + "/v1/chat/completions",
+            body=body,
+            stream=stream,
+            timeout=timeout or self.timeout,
         )
         self._record(body, res, stream)
         return res
@@ -1125,21 +1272,24 @@ class _RunCtx:
         elif res.body:
             msg, _usage, _finish = _parse_chat_json(res)
             answer = (msg or {}).get("content") or res.body
-        self.transcript.append({
-            "test_id": self.test_id,
-            "request": body,
-            "http_code": res.status,
-            "answer": answer,
-            "raw_body": None if stream else (res.body or None),
-            "sse_lines": list(res.sse_lines) if stream and res.sse_lines else None,
-            "ttft_ms": res.ttft_ms,
-            "wall_ms": res.wall_ms,
-            "error": res.error,
-        })
+        self.transcript.append(
+            {
+                "test_id": self.test_id,
+                "request": body,
+                "http_code": res.status,
+                "answer": answer,
+                "raw_body": None if stream else (res.body or None),
+                "sse_lines": list(res.sse_lines) if stream and res.sse_lines else None,
+                "ttft_ms": res.ttft_ms,
+                "wall_ms": res.wall_ms,
+                "error": res.error,
+            }
+        )
 
 
-def _metric(name: str, value: Any, numeric: Optional[float] = None,
-            unit: Optional[str] = None) -> dict:
+def _metric(
+    name: str, value: Any, numeric: Optional[float] = None, unit: Optional[str] = None
+) -> dict:
     return {"name": name, "value": value, "numeric": numeric, "unit": unit}
 
 
@@ -1162,8 +1312,7 @@ def _run_basic(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_basic(ctx.model), timeout=60)
     msg, usage, finish = _parse_chat_json(res)
     content = msg.get("content") or ""
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status != 200:
         return "fail", _metric("http", res.status), detail
     if re.search(r"paris", content, re.I):
@@ -1175,25 +1324,26 @@ def _run_basic(ctx: _RunCtx) -> Tuple[str, dict, dict]:
 def _run_tool_call(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_tool_call(ctx.model), timeout=90)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status != 200:
         return "fail", _metric("http", res.status), detail
     tool_calls = msg.get("tool_calls") or []
     content = msg.get("content") or ""
     if tool_calls:
-        names = [
-            (tc.get("function") or {}).get("name") for tc in tool_calls
-        ]
+        names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
         if "get_weather" in names:
             return "pass", _metric("tool_calls", len(tool_calls)), detail
         detail["tool_call_names"] = names
         return "fail", _metric("tool_calls", "unexpected tool"), detail
     if "<tool_call>" in content:
-        return ("fail",
-                _metric("cascade", "tool-call cascade: literal <tool_call> "
-                                   "in content, tool_calls[] empty"),
-                detail)
+        return (
+            "fail",
+            _metric(
+                "cascade",
+                "tool-call cascade: literal <tool_call> in content, tool_calls[] empty",
+            ),
+            detail,
+        )
     detail["content_head"] = content[:120]
     return "fail", _metric("tool_calls", "empty"), detail
 
@@ -1210,14 +1360,16 @@ def _run_streaming(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     if st["chunks"] == 0 or not text:
         return "fail", _metric("chunks", 0, 0.0), detail
     if st["chunks"] < 5:
-        return ("fail",
-                _metric("chunks", f"only {st['chunks']} (SSE buffering?)",
-                        float(st["chunks"])),
-                detail)
+        return (
+            "fail",
+            _metric(
+                "chunks", f"only {st['chunks']} (SSE buffering?)", float(st["chunks"])
+            ),
+            detail,
+        )
     if len(text) < 20:
         return "fail", _metric("chars", len(text), float(len(text))), detail
-    return ("pass",
-            _metric("chunks", st["chunks"], float(st["chunks"])), detail)
+    return ("pass", _metric("chunks", st["chunks"], float(st["chunks"])), detail)
 
 
 def _run_agentic_stream(ctx: _RunCtx) -> Tuple[str, dict, dict]:
@@ -1242,20 +1394,22 @@ def _run_agentic_stream(ctx: _RunCtx) -> Tuple[str, dict, dict]:
             continue
     detail["tool_call_names"] = parseable
     if parseable:
-        return ("pass",
-                _metric("tool_calls", len(parseable), float(len(parseable))),
-                detail)
-    return ("fail",
-            _metric("tool_calls",
-                    "no parseable tool call despite tool_choice=required"),
-            detail)
+        return (
+            "pass",
+            _metric("tool_calls", len(parseable), float(len(parseable))),
+            detail,
+        )
+    return (
+        "fail",
+        _metric("tool_calls", "no parseable tool call despite tool_choice=required"),
+        detail,
+    )
 
 
 def _run_thinking(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_thinking(ctx.model), timeout=180)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status != 200:
         return "fail", _metric("http", res.status), detail
     reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
@@ -1263,24 +1417,24 @@ def _run_thinking(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     detail["reasoning_chars"] = len(reasoning)
     detail["content_chars"] = len(content)
     if len(reasoning) < 50:
-        return ("fail",
-                _metric("reasoning_chars", len(reasoning),
-                        float(len(reasoning))),
-                detail)
-    if not content and finish != "length":
-        return ("fail",
-                _metric("content", f"empty with finish={finish}"),
-                detail)
-    return ("pass",
+        return (
+            "fail",
             _metric("reasoning_chars", len(reasoning), float(len(reasoning))),
-            detail)
+            detail,
+        )
+    if not content and finish != "length":
+        return ("fail", _metric("content", f"empty with finish={finish}"), detail)
+    return (
+        "pass",
+        _metric("reasoning_chars", len(reasoning), float(len(reasoning))),
+        detail,
+    )
 
 
 def _run_quality(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_quality(ctx.model), timeout=240)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status != 200:
         return "fail", _metric("http", res.status), detail
     content = msg.get("content") or ""
@@ -1289,24 +1443,30 @@ def _run_quality(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     if qa["chars"] == 0:
         return "fail", _metric("chars", 0, 0.0), detail
     if qa["tool_call_cascade"]:
-        return ("fail",
-                _metric("cascade", "tool-call cascade: <tool_call> emitted "
-                                   "in normal text"),
-                detail)
+        return (
+            "fail",
+            _metric("cascade", "tool-call cascade: <tool_call> emitted in normal text"),
+            detail,
+        )
     if qa["max_line_repeat"] >= 5:
-        return ("fail",
-                _metric("max_line_repeat", qa["max_line_repeat"],
-                        float(qa["max_line_repeat"])),
-                detail)
+        return (
+            "fail",
+            _metric(
+                "max_line_repeat", qa["max_line_repeat"], float(qa["max_line_repeat"])
+            ),
+            detail,
+        )
     if qa["lexical_variety"] < 0.30:
-        return ("fail",
-                _metric("lexical_variety", qa["lexical_variety"],
-                        qa["lexical_variety"]),
-                detail)
-    return ("pass",
-            _metric("lexical_variety", qa["lexical_variety"],
-                    qa["lexical_variety"]),
-            detail)
+        return (
+            "fail",
+            _metric("lexical_variety", qa["lexical_variety"], qa["lexical_variety"]),
+            detail,
+        )
+    return (
+        "pass",
+        _metric("lexical_variety", qa["lexical_variety"], qa["lexical_variety"]),
+        detail,
+    )
 
 
 def _run_mtp_acceptance(ctx: _RunCtx) -> Tuple[str, dict, dict]:
@@ -1323,18 +1483,25 @@ def _run_mtp_acceptance(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     mres = ctx.http("GET", ctx.base + "/metrics", timeout=15)
     if mres.status != 200:
         detail["metrics_http_code"] = mres.status
-        return ("skip",
-                _metric("acceptance_length",
-                        "/metrics unreachable (server without "
-                        "--enable-metrics?)"),
-                detail)
+        return (
+            "skip",
+            _metric(
+                "acceptance_length",
+                "/metrics unreachable (server without --enable-metrics?)",
+            ),
+            detail,
+        )
     flat = parse_prometheus_metrics(mres.body)
     if SPEC_EMA_ACCEPT_LEN_METRIC not in flat:
-        return ("skip",
-                _metric("acceptance_length",
-                        f"{SPEC_EMA_ACCEPT_LEN_METRIC} absent from /metrics "
-                        "(spec metrics not exported)"),
-                detail)
+        return (
+            "skip",
+            _metric(
+                "acceptance_length",
+                f"{SPEC_EMA_ACCEPT_LEN_METRIC} absent from /metrics "
+                "(spec metrics not exported)",
+            ),
+            detail,
+        )
     al = flat[SPEC_EMA_ACCEPT_LEN_METRIC]
     detail["spec_accept_rate"] = flat.get(SPEC_ACCEPT_RATE_METRIC)
     detail["spec_num_steps"] = flat.get(SPEC_NUM_STEPS_METRIC)
@@ -1344,14 +1511,14 @@ def _run_mtp_acceptance(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     return status, _metric("acceptance_length", round(al, 2), al, "tokens"), detail
 
 
-def _needle_rung(ctx: _RunCtx, target_tokens: int,
-                 timeout: float) -> Dict[str, Any]:
+def _needle_rung(ctx: _RunCtx, target_tokens: int, timeout: float) -> Dict[str, Any]:
     """One NIAH rung: build request, stream it, judge recall. Returns a
     per-rung record for the test detail."""
     secret = make_needle_secret(ctx.rng)
     scale = max(100, target_tokens // TOKENS_PER_FILLER_SCALE)
-    res = ctx.chat(request_needle(ctx.model, scale, secret), stream=True,
-                   timeout=timeout)
+    res = ctx.chat(
+        request_needle(ctx.model, scale, secret), stream=True, timeout=timeout
+    )
     rec: Dict[str, Any] = {
         "target_tokens": target_tokens,
         "http_code": res.status,
@@ -1369,9 +1536,7 @@ def _needle_rung(ctx: _RunCtx, target_tokens: int,
     usage = st["usage"]
     rec["prompt_tokens"] = usage.get("prompt_tokens")
     if res.ttft_ms and usage.get("prompt_tokens"):
-        rec["prefill_tps"] = round(
-            usage["prompt_tokens"] / (res.ttft_ms / 1000.0), 1
-        )
+        rec["prefill_tps"] = round(usage["prompt_tokens"] / (res.ttft_ms / 1000.0), 1)
     if needle_recall_ok(st["content"], secret):
         rec["outcome"] = "pass"
     else:
@@ -1398,23 +1563,33 @@ def _needle_result(rungs_out: List[dict], detail: dict) -> Tuple[str, dict, dict
         default=0,
     )
     if "fail" in outcomes:
-        return ("fail",
-                _metric("needle", "system failure (HTTP 5xx / timeout)"),
-                detail)
+        return (
+            "fail",
+            _metric("needle", "system failure (HTTP 5xx / timeout)"),
+            detail,
+        )
     if "info" in outcomes:
-        return ("info",
-                _metric("recall_ceiling_tokens", deepest or None,
-                        float(deepest) if deepest else None, "tokens"),
-                detail)
+        return (
+            "info",
+            _metric(
+                "recall_ceiling_tokens",
+                deepest or None,
+                float(deepest) if deepest else None,
+                "tokens",
+            ),
+            detail,
+        )
     if passed:
-        return ("pass",
-                _metric("deepest_recall_tokens", deepest, float(deepest),
-                        "tokens"),
-                detail)
-    return ("skip",
-            _metric("needle", "all rungs rejected by engine pre-check "
-                              "(HTTP 400)"),
-            detail)
+        return (
+            "pass",
+            _metric("deepest_recall_tokens", deepest, float(deepest), "tokens"),
+            detail,
+        )
+    return (
+        "skip",
+        _metric("needle", "all rungs rejected by engine pre-check (HTTP 400)"),
+        detail,
+    )
 
 
 def _run_needle(ctx: _RunCtx, rungs: List[int]) -> Tuple[str, dict, dict]:
@@ -1431,8 +1606,7 @@ def _run_needle(ctx: _RunCtx, rungs: List[int]) -> Tuple[str, dict, dict]:
 def _run_tool_prefill(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_tool_prefill(ctx.model), timeout=480)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status == 200:
         content = msg.get("content") or ""
         tool_calls = msg.get("tool_calls") or []
@@ -1440,59 +1614,74 @@ def _run_tool_prefill(ctx: _RunCtx) -> Tuple[str, dict, dict]:
         detail["tool_calls"] = len(tool_calls)
         if len(content) >= 50 or tool_calls:
             return "pass", _metric("prefill", "survived ~25K-token prefill"), detail
-        return ("fail",
-                _metric("prefill", "HTTP 200 but empty response (silent "
-                                   "prefill truncation)"),
-                detail)
+        return (
+            "fail",
+            _metric(
+                "prefill", "HTTP 200 but empty response (silent prefill truncation)"
+            ),
+            detail,
+        )
     if res.status == 500:
-        return ("fail",
-                _metric("prefill", "HTTP 500 -- OOM during ~25K-token "
-                                   "tool-response prefill"),
-                detail)
+        return (
+            "fail",
+            _metric(
+                "prefill", "HTTP 500 -- OOM during ~25K-token tool-response prefill"
+            ),
+            detail,
+        )
     if res.status == 0:
-        return ("fail",
-                _metric("prefill", "no HTTP response (timeout or engine "
-                                   "died)"),
-                detail)
+        return (
+            "fail",
+            _metric("prefill", "no HTTP response (timeout or engine died)"),
+            detail,
+        )
     return "fail", _metric("http", res.status), detail
 
 
-def _http200_probe(ctx: _RunCtx, body: dict, timeout: float,
-                   fail_hint_500: str) -> Tuple[str, dict, dict]:
+def _http200_probe(
+    ctx: _RunCtx, body: dict, timeout: float, fail_hint_500: str
+) -> Tuple[str, dict, dict]:
     """Shared shape for the crash probes 10/11/12: any HTTP 200 passes."""
     res = ctx.chat(body, timeout=timeout)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     detail["completion_tokens"] = usage.get("completion_tokens")
     if res.status == 200:
         return "pass", _metric("http", 200, 200.0), detail
     if res.status == 500:
         return "fail", _metric("http", f"500 -- {fail_hint_500}", 500.0), detail
     if res.status == 0:
-        return ("fail",
-                _metric("http", "no response (timeout or engine died)", 0.0),
-                detail)
+        return (
+            "fail",
+            _metric("http", "no response (timeout or engine died)", 0.0),
+            detail,
+        )
     return "fail", _metric("http", res.status, float(res.status)), detail
 
 
 def _run_ide_agent(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     return _http200_probe(
-        ctx, request_ide_agent(ctx.model), 240,
+        ctx,
+        request_ide_agent(ctx.model),
+        240,
         "likely Cliff-1 mech B (inductor FFN intermediate OOM)",
     )
 
 
 def _run_multiturn_agent(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     return _http200_probe(
-        ctx, request_multiturn_agent(ctx.model), 240,
+        ctx,
+        request_multiturn_agent(ctx.model),
+        240,
         "multi-turn prefill crashed the engine",
     )
 
 
 def _run_lcb_coding(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     return _http200_probe(
-        ctx, request_lcb_coding(ctx.model), 300,
+        ctx,
+        request_lcb_coding(ctx.model),
+        300,
         "LCB-coding shape crashed the engine (DS conv-state class)",
     )
 
@@ -1500,44 +1689,105 @@ def _run_lcb_coding(ctx: _RunCtx) -> Tuple[str, dict, dict]:
 def _run_reasoning_heavy(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     res = ctx.chat(request_reasoning_heavy(ctx.model), timeout=700)
     msg, usage, finish = _parse_chat_json(res)
-    detail = _detail(res, finish=finish,
-                     prompt_tokens=usage.get("prompt_tokens"))
+    detail = _detail(res, finish=finish, prompt_tokens=usage.get("prompt_tokens"))
     if res.status != 200:
         if res.status == 500:
-            return ("fail",
-                    _metric("http", "500 -- long generation crashed the "
-                                    "engine", 500.0),
-                    detail)
+            return (
+                "fail",
+                _metric("http", "500 -- long generation crashed the engine", 500.0),
+                detail,
+            )
         return "fail", _metric("http", res.status, float(res.status)), detail
     completion = usage.get("completion_tokens") or 0
     detail["completion_tokens"] = completion
     if completion < 500:
-        return ("fail",
-                _metric("completion_tokens", completion, float(completion),
-                        "tokens"),
-                detail)
-    return ("pass",
-            _metric("completion_tokens", completion, float(completion),
-                    "tokens"),
-            detail)
+        return (
+            "fail",
+            _metric("completion_tokens", completion, float(completion), "tokens"),
+            detail,
+        )
+    return (
+        "pass",
+        _metric("completion_tokens", completion, float(completion), "tokens"),
+        detail,
+    )
+
+
+def _ceiling_margin_level(free_mib: int):
+    """``(phase, level_name, level_mib, net_mib, band_floor_mib)`` for the
+    ceiling-ladder margin note.
+
+    THE DEFECT THIS REPLACES (#784/#602). The line used to read
+    ``vram_after < 1024``: a hardcoded bound on FREE VRAM, which is the
+    phase-dependent quantity, measured as a single reading after the ladder.
+    #602 named that exact number as overstating the gap on flip boots -- the
+    binding level there was the arming floor at 1728/1825/2467 MiB, not 1024.
+    A warning that fires systematically wrongly devalues the warnings that are
+    right, which is the #739 alarm-noise economy.
+
+    So the bound is now the BINDING LEVEL: the arming floor where the boot has
+    one, the band floor where it does not. Both come from
+    ``corridor_guard`` -- imported, never re-derived. A second authority for
+    the same quantity is how the verdict and the runtime came to disagree
+    about the band ceiling by 1 MiB, and it would be tomorrow's root.
+
+    The comparison is corridor_guard's own: NET free (free minus the arming
+    reserve the flip has committed) against the band floor. That is
+    algebraically the same test as ``free < arming_floor`` and it is written
+    the way the shipped verdict writes it, so the two cannot drift.
+
+    Presence of a phase marker is what says whether an arming floor applies:
+    a boot with no flip has no seam to enter and is graded on the band alone.
+    """
+    band_floor = 819
+    phase = "unknown"
+    level_name, level = "band_floor", band_floor
+    try:
+        from sglang.srt.managers.corridor_guard import (
+            arming_floor_mib,
+            corridor_band_floor_mib,
+            net_free_mib,
+        )
+
+        band_floor = corridor_band_floor_mib()
+        level_name, level = "band_floor", band_floor
+        try:
+            from sglang.srt.managers.phase_flip_presence import read_active_phase
+
+            live = read_active_phase()
+        except Exception:  # noqa: BLE001 - an instrument must not raise
+            live = None
+        if live:
+            phase = live
+            level_name, level = "arming_floor", arming_floor_mib()
+        return phase, level_name, level, net_free_mib(free_mib, level), band_floor
+    except Exception:  # noqa: BLE001
+        # corridor_guard unavailable: grade on the band alone and SAY so,
+        # rather than falling back to the 1024 this function exists to remove.
+        return phase, "band_floor(fallback)", band_floor, int(free_mib), band_floor
 
 
 def _run_ceiling_ladder(ctx: _RunCtx, start_rungs: List[int]) -> Tuple[str, dict, dict]:
     """Test 15 -- staggered NIAH from ~95K up to ~92% of n_ctx in 30K steps,
-    with a free-VRAM margin check (>= 1024 MiB) after the ladder."""
+    with a free-VRAM margin check against the BINDING LEVEL after the
+    ladder -- the arming floor where the boot has one, the band floor where it
+    does not. Never a hardcoded 1024: see _ceiling_margin_level."""
     detail = _detail()
     n_ctx = ctx.caps.max_model_len if ctx.caps else None
     start = start_rungs[0] if start_rungs else 95000
     if not n_ctx:
-        return ("skip",
-                _metric("ceiling", "n_ctx unknown (no max_model_len)"),
-                detail)
+        return ("skip", _metric("ceiling", "n_ctx unknown (no max_model_len)"), detail)
     top = int(n_ctx * 0.92)
     if top <= start:
-        return ("skip",
-                _metric("ceiling", f"ceiling target {top} <= start {start} "
-                                   "(needle-large already covers this range)"),
-                detail)
+        return (
+            "skip",
+            _metric(
+                "ceiling",
+                f"ceiling target {top} <= start {start} "
+                "(needle-large already covers this range)",
+            ),
+            detail,
+        )
     rungs = list(range(start, top, 30000))
     if not rungs or rungs[-1] != top:
         rungs.append(top)
@@ -1554,12 +1804,18 @@ def _run_ceiling_ladder(ctx: _RunCtx, start_rungs: List[int]) -> Tuple[str, dict
     vram_after = ctx.vram_free_mib() if ctx.vram_free_mib else None
     detail["vram_free_mib_before"] = vram_before
     detail["vram_free_mib_after"] = vram_after
-    if status == "pass" and vram_after is not None and vram_after < 1024:
-        # Recall fine but margin thin: informational warning, not a hard fail.
-        detail["vram_margin_note"] = (
-            f"free VRAM {vram_after} MiB < 1024 MiB threshold at ceiling"
-        )
-        return "warn", metric, detail
+    if status == "pass" and vram_after is not None:
+        phase, level_name, level, net, floor = _ceiling_margin_level(vram_after)
+        if net < floor:
+            # Recall fine but margin thin: informational warning, not a hard
+            # fail. WARN-only is deliberate -- this is an instrument, not the
+            # runtime path.
+            detail["vram_margin_note"] = (
+                f"phase={phase} level={level_name}({level} MiB): free "
+                f"{vram_after} MiB, net {net} MiB < band floor {floor} MiB "
+                f"at ceiling"
+            )
+            return "warn", metric, detail
     return status, metric, detail
 
 
@@ -1570,17 +1826,16 @@ def _run_throughput(ctx: _RunCtx) -> Tuple[str, dict, dict]:
     runs: Dict[str, dict] = {}
     decode_vals: List[float] = []
     for kind, _, _ in THROUGHPUT_PROMPTS:
-        res = ctx.chat(request_throughput(ctx.model, kind), stream=True,
-                       timeout=600)
-        rec: Dict[str, Any] = {"http_code": res.status,
-                               "ttft_ms": res.ttft_ms,
-                               "wall_ms": res.wall_ms}
+        res = ctx.chat(request_throughput(ctx.model, kind), stream=True, timeout=600)
+        rec: Dict[str, Any] = {
+            "http_code": res.status,
+            "ttft_ms": res.ttft_ms,
+            "wall_ms": res.wall_ms,
+        }
         if res.status != 200:
             runs[kind] = rec
             detail["runs"] = runs
-            return ("fail",
-                    _metric("http", f"{kind}: HTTP {res.status}"),
-                    detail)
+            return ("fail", _metric("http", f"{kind}: HTTP {res.status}"), detail)
         st = reassemble_stream(res.sse_lines or [])
         usage = st["usage"]
         rec["prompt_tokens"] = usage.get("prompt_tokens")
@@ -1591,21 +1846,15 @@ def _run_throughput(ctx: _RunCtx) -> Tuple[str, dict, dict]:
             )
             if res.ttft_ms is not None:
                 decode_s = max((res.wall_ms - res.ttft_ms) / 1000.0, 1e-6)
-                rec["decode_tps"] = round(
-                    usage["completion_tokens"] / decode_s, 1
-                )
+                rec["decode_tps"] = round(usage["completion_tokens"] / decode_s, 1)
                 decode_vals.append(rec["decode_tps"])
         runs[kind] = rec
     detail["runs"] = runs
     detail["http_code"] = 200
     if decode_vals:
         mean = round(sum(decode_vals) / len(decode_vals), 1)
-        return ("info",
-                _metric("decode_tps_mean", mean, float(mean), "tok/s"),
-                detail)
-    return ("info",
-            _metric("decode_tps_mean", "no usage data from stream"),
-            detail)
+        return ("info", _metric("decode_tps_mean", mean, float(mean), "tok/s"), detail)
+    return ("info", _metric("decode_tps_mean", "no usage data from stream"), detail)
 
 
 # ===========================================================================
@@ -1616,9 +1865,13 @@ def _engine_healthy(ctx: _RunCtx) -> bool:
     return res.status == 200
 
 
-def _result_dict(spec: TestSpec, status: str, metric: Optional[dict] = None,
-                 detail: Optional[dict] = None,
-                 reason: Optional[str] = None) -> dict:
+def _result_dict(
+    spec: TestSpec,
+    status: str,
+    metric: Optional[dict] = None,
+    detail: Optional[dict] = None,
+    reason: Optional[str] = None,
+) -> dict:
     out = {
         "test_id": spec.test_id,
         "label": spec.label,
@@ -1711,9 +1964,10 @@ def run_suite(
 
         if engine_down_after is not None:
             result = _result_dict(
-                spec, "skip",
+                spec,
+                "skip",
                 reason=f"engine unhealthy after test {engine_down_after}; "
-                       "not restarting (manual restart required)",
+                "not restarting (manual restart required)",
             )
             if progress_cb:
                 progress_cb(result)
@@ -1722,8 +1976,7 @@ def run_suite(
 
         decision = gate_test(spec, caps, force=force)
         if decision.status is not None:
-            result = _result_dict(spec, decision.status,
-                                  reason=decision.reason)
+            result = _result_dict(spec, decision.status, reason=decision.reason)
             if progress_cb:
                 progress_cb(result)
             yield result
@@ -1742,9 +1995,7 @@ def run_suite(
             else:
                 status, metric, detail = runners[tid](ctx)
         except Exception as e:  # defensive: a runner bug must not kill the SSE
-            status, metric, detail = (
-                "fail", _metric("exception", str(e)), _detail()
-            )
+            status, metric, detail = ("fail", _metric("exception", str(e)), _detail())
 
         reason = None
         if status == "fail" and decision.expected_fail_note:
