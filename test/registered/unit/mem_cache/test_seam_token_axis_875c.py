@@ -61,17 +61,34 @@ THE VERDICT, which the stop criterion explicitly permits: DO NOT BUILD.
   specimen  = 16 layers x 13 rows, fp8 KV. At a typical 8x128 GQA head config
               that is ~2 KiB per layer-token, i.e. ~416 KiB for the whole
               request across the whole group.
-  transport = no P2P and no NVLink on this rig, all PHB. The tree's own
-              measurement of this interconnect (#656) is 43.9 KiB per crossing
-              at 166 us enqueue and 1777-9201 us receive -- latency-dominated
-              at this size.
+  transport = NOT PRICED. WITHDRAWN, see below.
   refusal   = recompute `extent` tokens of prefill. For 13 tokens that is
               sub-millisecond of GPU work.
 
-So at specimen scale a new all-to-all inside the cutover's NO-RETURN region
-costs milliseconds to save microseconds, and it buys that by adding a collective
-to the one region where a collective is the #630 wedge shape. The risk is
-unbounded and the benefit is bounded by `extent`.
+THE TRANSPORT TERM IS WITHDRAWN, and the citation sweep is why. I attributed
+"43.9 KiB per crossing, 166 us enqueue, 1777-9201 us receive" to #656. It is not
+in #656. It is in `13c55d7b86` "[PP] #201 slice 2: the stage boundary across two
+rigs" -- a CROSS-RIG, two-node measurement over a 40G line, on a different model
+(Qwen3.5-4B fp16), timing PP microbatch crossings rather than an intra-node
+collective. Worse, its own text refuses the reading I gave it: "`recv` is
+BLOCKING, i.e. bubble plus wire -- 9.2 ms on stage 1 is that stage waiting for
+stage 0, NOT the 40G line". I used a pipeline bubble as a transport latency, from
+the wrong ticket, for the wrong link. I have no measured local collective figure
+and am not substituting one.
+
+SO THE VERDICT NO LONGER RESTS ON A TIMING COMPARISON. What carries it instead,
+neither term needing a transport number:
+
+  1. THE HEAD AXIS IS LOSSY. PP holds 4 kv-heads per layer and TP holds 1
+     (`max(1, 4 // attn_tp_size)`). PP->TP is not a remap at all until someone
+     decides WHICH heads survive, and no such rule exists. A carry cannot be
+     built over an undefined reduction.
+  2. A new collective in the cutover's NO-RETURN region is the #630 wedge shape.
+     That is a risk argument, unbounded, and independent of how fast the link is.
+
+Point 1 alone is decisive. The payload being sub-MiB at specimen scale still
+holds and still means any collective would be latency-dominated -- but that is
+now a remark, not the load-bearing term.
 
 WHAT WOULD CHANGE THE VERDICT, stated so it is falsifiable rather than final:
 `extent` is `seqlen - 1`, the request's whole context, so it is 13 only because
