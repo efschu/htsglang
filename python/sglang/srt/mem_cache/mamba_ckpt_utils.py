@@ -64,8 +64,71 @@ def is_resume_candidate(
     ``interval=None`` degenerates to the pure presence test, byte-identical
     to the pre-#747 behaviour of both walks.
     """
+    return (
+        resume_refusal_reason(
+            depth,
+            interval,
+            has_device_value,
+            has_host_value=has_host_value,
+            device_only=device_only,
+        )
+        is None
+    )
+
+
+#: The two ways a node can fail to be a resume anchor. They are NOT variants of
+#: one defect and their fixes point in opposite directions, which is the whole
+#: reason they are named apart -- see ``resume_refusal_reason``.
+RESUME_REFUSAL_ABSENT = "absent"
+RESUME_REFUSAL_OFF_GRID = "off_grid"
+
+
+def resume_refusal_reason(
+    depth: int,
+    interval: Optional[int],
+    has_device_value: bool,
+    has_host_value: bool = False,
+    device_only: bool = True,
+) -> Optional[str]:
+    """Why this node is not a resume anchor, or ``None`` when it is one.
+
+    THE COMPOUND RULE HAD ONE BIT OF OUTPUT AND TWO CAUSES, and #913/W42
+    measured what that costs. The #904 match census named ``MambaComponent``
+    as the refuser of 671 of 675 walks and could say nothing further, so the
+    two readings below were indistinguishable in the only instrument that
+    watches this path:
+
+      ABSENT   the node carries no recurrent state at all. On the commit side
+               that is the TOMBSTONE: ``commit_insert_component_data``
+               declined the value (off-grid finish, or an exhausted int8
+               checkpoint pool) and the node kept its KV without its state.
+               The fix is on the WRITE side -- make the state exist.
+      OFF_GRID the node HAS a state and sits at a position that is not a
+               multiple of ``--mamba-checkpoint-interval``. Nothing is
+               missing; the grid rule is declining a usable anchor to keep
+               resume points from moving with traffic (#747 determinism).
+               The fix, if any, is a POLICY change on the read side, and it
+               is the one that must never be made blindly: accepting an
+               off-grid anchor is exactly the #767 corruption direction when
+               the state is not in fact the state at that depth.
+
+    A single boolean forces whoever reads the census to guess which of those
+    two it is looking at, and the guesses point at opposite files. This
+    function is the one place the distinction is drawn; ``is_resume_candidate``
+    is defined in terms of it so the predicate and the explanation cannot
+    drift the way #747 records the two match lineages doing.
+
+    Presence is checked FIRST and reported alone. An absent state that also
+    sits off-grid is an ABSENT node: the grid is a property of a checkpoint,
+    and there is no checkpoint to be on or off it. Reporting the grid there
+    would send a reader to the read-side policy for a write-side hole.
+    """
     present = has_device_value or (not device_only and has_host_value)
-    return present and is_on_interval(depth, interval)
+    if not present:
+        return RESUME_REFUSAL_ABSENT
+    if not is_on_interval(depth, interval):
+        return RESUME_REFUSAL_OFF_GRID
+    return None
 
 
 def protect_deepest_anchors(

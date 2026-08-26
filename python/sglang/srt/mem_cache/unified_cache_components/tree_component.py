@@ -76,7 +76,6 @@ class EvictLayer(IntFlag):
 
 
 class CacheTransferPhase(str, Enum):
-
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
@@ -84,7 +83,6 @@ class CacheTransferPhase(str, Enum):
 
 
 class LRURefreshPhase(str, Enum):
-
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
     MATCH_END = "match_end"  # end of a successful prefix match
     INSERT_END = "insert_end"  # after a new/updated leaf is committed
@@ -162,6 +160,29 @@ class TreeComponent(ABC):
         - Mamba: returns True iff the node has mamba component data AND, with
           --mamba-checkpoint-interval set, sits on the checkpoint grid."""
         ...
+
+    def explain_match_refusal(
+        self, node: "UnifiedTreeNode", depth: int, match_device_only: bool = False
+    ) -> Optional[str]:
+        """Which of this component's conditions declined ``node``, or None.
+
+        #913/W42: ``create_match_validator`` returns one bit, and a component
+        whose predicate is a conjunction has as many defects behind that bit
+        as it has terms. The #904 census could therefore name the refusing
+        component and nothing else, and for MambaComponent the two terms sit
+        in different files with opposite remedies (see
+        ``mamba_ckpt_utils.resume_refusal_reason``).
+
+        DEFAULT None, DELIBERATELY, and it is recorded as ``unexplained``
+        rather than dropped. A component with a single-term predicate has
+        nothing to add -- its name already is the reason -- and one that
+        genuinely cannot say must be visible as such, because an instrument
+        that silently omits what it did not measure is the #829 shape.
+
+        Called ONLY on the armed census path and ONLY for a node already
+        found invalid, so it is off the hot path by construction.
+        """
+        return None
 
     def finalize_match_result(
         self,

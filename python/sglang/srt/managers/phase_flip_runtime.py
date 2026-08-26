@@ -6022,7 +6022,7 @@ class PhaseFlipRuntime:
             # anything had moved. None means the enumeration had no verdict,
             # and is passed through as such rather than as an empty owner.
             resident = _resident_rows(self._census_scheduler)
-            audit_pool_census(
+            found = audit_pool_census(
                 authority,
                 exposed=int(size),
                 committed=self._committed_backing_rows(),
@@ -6034,6 +6034,49 @@ class PhaseFlipRuntime:
                 resident_rows=None if resident is None else {"requests": resident},
                 why=str(why),
             )
+            # #912: publish the EXCLUSIVITY law's own "claimed by more than one
+            # owner" count onto the allocator, in the same place and the same
+            # unit KvRowCap already publishes `residency_withheld_slots`
+            # (kv_backing_relief.py:800-849). A row the free list AND the tree
+            # (or a resident request) both claim is counted once in
+            # `available`/`evictable`/`session_held` for EACH claim, which is a
+            # SURPLUS against `total`, not a deficit -- exactly the shape
+            # test_free_group_lifecycle_827.py's CORRECTION 2 named and left
+            # "filed separately" (PP0, [('free_list', 'radix_cache')], 16384
+            # rows) and #912 reproduced at 21-22 rows on five idle checks
+            # across two boots. The on_idle invariant (invariant_checker.py)
+            # had no term for this and read the surplus as a leak; this is
+            # that term, sourced from the law that already detects it rather
+            # than guessed at the checker.
+            from sglang.srt.mem_cache.kv_row_ownership import (
+                EXCLUSIVITY_DOUBLED,
+                Law,
+            )
+
+            # STRUCTURAL discriminator, not prose-matching. LAW.EXCLUSIVITY
+            # covers two non-overlapping shapes -- "claimed by more than one
+            # owner" (a SURPLUS against `total`, this term's business) and
+            # "belong to no enumerated owner" (a DEFICIT, #814/#902's shape,
+            # and never this term's business). `Violation.detail` is
+            # documented as "never load-bearing" (kv_row_ownership.py's own
+            # docstring); matching a substring of it to pick a code path is
+            # exactly the "line_gate-Substring-Defekt -> #908" shape, so the
+            # two shapes carry a real field (`Violation.kind`) instead, set
+            # once at the point each is constructed
+            # (kv_row_ownership.py:~491,~557). Letting the unowned/deficit
+            # shape in here by accident would mean subtracting the SIZE OF A
+            # REAL LEAK from the ledger and calling the result closed.
+            double_owned = sum(
+                v.rows
+                for v in found
+                if v.law == Law.EXCLUSIVITY and v.kind == EXCLUSIVITY_DOUBLED
+            )
+            alloc_obj = getattr(self._census_scheduler, "token_to_kv_pool_allocator", None)
+            if alloc_obj is not None:
+                try:
+                    alloc_obj.double_owned_slots = int(double_owned)
+                except Exception:  # pragma: no cover - exotic allocator objects
+                    pass
         except Exception:  # noqa: BLE001 -- an instrument, never a gate
             logger.debug("%s census ownership audit skipped", LOG_PREFIX, exc_info=True)
 
@@ -6163,6 +6206,26 @@ class PhaseFlipRuntime:
                 exposed=exposed,
                 committed=exposed if committed is None else committed,
             )
+            # #912: a `double_owned_slots` reading published by the LAST
+            # census is a snapshot of the OLD id space's claims. Retirement
+            # just dropped every one of those claims by epoch (`dropped`
+            # above), so the snapshot is now unconditionally stale -- it
+            # cannot be re-validated by comparing it to anything, because
+            # there is nothing left to compare it against until the next
+            # census (`_pool_census("post-cutover", ...)`, called right after
+            # this) republishes a fresh reading. Clearing it to `None` here
+            # (never `0`) means the on-idle check reads it via
+            # `getattr(..., "double_owned_slots", 0) or 0` as "no correction
+            # currently known" and falls back to the pre-#912 raw comparison
+            # for the short window before the post-cutover census runs --
+            # erring towards a possible false leak flag in that window rather
+            # than letting a pre-cutover number silently correct a post-
+            # cutover ledger it was never measured against.
+            if alloc is not None:
+                try:
+                    alloc.double_owned_slots = None
+                except Exception:  # pragma: no cover - exotic allocator objects
+                    pass
             logger.info(
                 "%s ID-SPACE RETIRED at %s cutover: epoch=%d dropped=%d "
                 "exposed=%d committed=%s",

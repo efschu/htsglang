@@ -155,6 +155,12 @@ class Law(str, Enum):
     RETIREMENT = "retirement"
 
 
+#: LAW.EXCLUSIVITY's "claimed twice" shape -- see ``Violation.kind``.
+EXCLUSIVITY_DOUBLED = "claimed_by_multiple"
+#: LAW.EXCLUSIVITY's "claimed by no one" shape -- see ``Violation.kind``.
+EXCLUSIVITY_UNOWNED = "unclaimed"
+
+
 @dataclass(frozen=True)
 class Violation:
     """One broken law, carrying the numbers that broke it.
@@ -173,6 +179,18 @@ class Violation:
     #: the minimum say nothing about the rest; a contiguity claim was made and
     #: withdrawn on exactly that evidence.
     sample: Tuple[int, ...] = ()
+    #: structural discriminator for LAW.EXCLUSIVITY's two non-overlapping
+    #: shapes -- rows claimed by more than one owner
+    #: (``EXCLUSIVITY_DOUBLED``) versus rows claimed by none
+    #: (``EXCLUSIVITY_UNOWNED``). #912's consumer (phase_flip_runtime.py's
+    #: ownership census) needs to tell these apart to subtract only the
+    #: former from a leak check; matching ``"more than one owner" in
+    #: detail`` to do that is exactly the "line_gate-Substring-Defekt ->
+    #: #908" shape (parsing human prose as control flow), so the
+    #: discriminator is a real field here instead, set once at the point
+    #: each violation is actually constructed. Empty string for the other
+    #: three laws, which have only one shape each and need no split.
+    kind: str = ""
 
     def __str__(self) -> str:  # pragma: no cover - formatting only
         tail = f" sample={list(self.sample)}" if self.sample else ""
@@ -497,6 +515,7 @@ class RowOwnershipAuthority:
                         f"corruption, not a crash"
                     ),
                     sample=_sample(doubled),
+                    kind=EXCLUSIVITY_DOUBLED,
                 )
             )
         if expect_full_coverage:
@@ -544,6 +563,7 @@ class RowOwnershipAuthority:
                             f"meant an un-enumerated second pool object, not a leak"
                         ),
                         sample=_sample(unowned),
+                        kind=EXCLUSIVITY_UNOWNED,
                     )
                 )
 

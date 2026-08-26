@@ -37,6 +37,7 @@ from sglang.srt.managers.wedge_recovery import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.kv_row_ownership import read_free_rows
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
@@ -109,9 +110,10 @@ class SchedulerInvariantChecker:
         total: int,
         uncached: int = 0,
         withheld: int = 0,
+        double_owned: int = 0,
     ) -> Tuple[bool, str]:
         """Check: available + evictable + protected + session_held + uncached
-        + withheld == total.
+        + withheld - double_owned == total.
 
         ``withheld`` is capacity the #656 residency controller has DELIBERATELY
         taken out of circulation: slot ids above the KV pool's backed watermark,
@@ -123,14 +125,44 @@ class SchedulerInvariantChecker:
         It is a NAMED POSTEN for the #486 reason: anything that durably occupies
         or removes pool slots must be named in this ledger, or the next
         unexplained delta gets attributed to the wrong holder.
+
+        ``double_owned`` is #912's posten, and it is SUBTRACTED rather than
+        added because it does not occupy anything -- it is the count of rows
+        the #822 ``RowOwnershipAuthority`` found claimed by MORE THAN ONE of
+        the other terms at once (e.g. a row the free list still lists in
+        ``available`` while the prefix tree also counts it in ``evictable``,
+        or a resident request also counts it in ``session_held``). Each such
+        row is a genuine ownership defect ("silent corruption, not a crash",
+        kv_row_ownership.py's own EXCLUSIVITY wording) and is reported
+        separately by the authority; here it is only subtracted so that a
+        SURPLUS against ``total`` is not misread as an unexplained leak. Five
+        specimens across two boots (2026-08-26,
+        /spinning/evidence-665-f1/boot_accept0826_0826_1754.log:1861,1886,1911
+        and boot_accept0826r2_0826_1748.log:2360,2385,2411) all showed
+        ``available + evictable + withheld`` exceeding ``total`` by exactly
+        22 -- never a deficit -- while the SAME boot's own "PHASE-FLIP POOL
+        CENSUS" line balanced ``free + withheld == total`` exactly, because
+        that census's ``free`` figure is the authority's deduplicated
+        enumeration and the checker's ``available`` was the raw, non-
+        deduplicating ``available_size()``. A deficit (rows with NO owner,
+        e.g. #832/#856) is the opposite sign and stays fatal -- this term
+        never turns a real leak into a pass, because a real leak's
+        ``double_owned`` reading is zero.
         """
         total_accounted = (
-            available + evictable + protected + session_held + uncached + withheld
+            available
+            + evictable
+            + protected
+            + session_held
+            + uncached
+            + withheld
+            - double_owned
         )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}, {withheld=}"
+            f"{protected=}, {session_held=}, {uncached=}, {withheld=}, "
+            f"{double_owned=}"
         )
         return leak, msg
 
@@ -176,6 +208,34 @@ class SchedulerInvariantChecker:
             )
         full_evictable_size = ps.full_evictable_size
         allocator = self.token_to_kv_pool_allocator
+        # #912: read free capacity the SAME way the phase-flip census and the
+        # #822 authority already do, instead of re-deriving it from the raw
+        # allocator method. `TokenToKVPoolAllocator.available_size()`
+        # (allocator/token.py:52-54) is `len(free_pages) + len(release_pages)`,
+        # a plain SUM that double-counts any row id present in both lists.
+        # `read_free_rows()` (kv_row_ownership.py:743-843) answers the same
+        # question with `frozenset(free_pages) | frozenset(release_pages)`
+        # (kv_row_ownership.py:814), a UNION that counts such a row once. Five
+        # measured specimens (2026-08-26,
+        # /spinning/evidence-665-f1/boot_accept0826_0826_1754.log:1861,1886,1911
+        # and boot_accept0826r2_0826_1748.log:2360,2385,2411) showed the raw
+        # sum reading exactly 21 higher than the SAME boot's own "PHASE-FLIP
+        # POOL CENSUS" free= field at the same withheld= value (e.g.
+        # boot_accept0826_0826_1730.log:1826: free=124928 vs the crash's
+        # available=124949, withheld=344053 identical on both sides) -- the
+        # union-vs-sum divergence this reader now closes. `available_size()`
+        # itself is left untouched: it also feeds admission/capacity math
+        # (pool_stats_observer.py:245,265) where over-reporting free capacity
+        # by a transient list overlap is a separate, pre-existing concern, not
+        # this ticket's; only the LEAK CHECK's own comparison is re-pointed at
+        # the one authority the census and #822 already share, per that
+        # function's own "ONE authority, used by both consumers" rationale.
+        free_reading = read_free_rows(allocator)
+        full_available_size = (
+            free_reading.count
+            if free_reading.is_enumerable
+            else ps.full_available_size
+        )
         if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
             # DCP stores logical tokens in widened physical pages.  Prefix cache
             # counters are logical-token based, while the allocator frees whole
@@ -187,7 +247,7 @@ class SchedulerInvariantChecker:
             )
         leak, msg = self._check_pool_invariant(
             "full",
-            ps.full_available_size,
+            full_available_size,
             full_evictable_size,
             protected,
             session_held,
@@ -197,6 +257,14 @@ class SchedulerInvariantChecker:
             # the pages under them are unmapped (#656 item 12). Published by
             # KvRowCap in the same unit available_size() reports.
             int(getattr(allocator, "residency_withheld_slots", 0) or 0),
+            # #912: rows the #822 authority's EXCLUSIVITY law found claimed by
+            # more than one owner (free list + tree, free list + a resident
+            # request, ...) at the last phase-flip census. Published by
+            # phase_flip_runtime.py's `_census_ownership_audit`
+            # (kv_row_ownership.py's own detection, not re-derived here).
+            # Zero whenever no census has run or nothing was double-claimed,
+            # so this is a no-op on every path that does not exercise #822.
+            int(getattr(allocator, "double_owned_slots", 0) or 0),
         )
         if (
             leak

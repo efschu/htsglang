@@ -88,6 +88,18 @@ class MatchRefusalCensus:
     refused_tokens_by_component: Dict[str, int] = dataclasses.field(
         default_factory=dict
     )
+    #: The same tokens keyed by ``component:reason`` when the component can
+    #: explain itself, and by ``component:unexplained`` when it cannot.
+    #:
+    #: #913/W42: naming the refusing COMPONENT was not enough to act on. The
+    #: window census read ``refusers=MambaComponent:45`` on 671 of 675 walks,
+    #: which is a component and a token count and no verdict: a node with no
+    #: recurrent state (a write-side tombstone) and a node whose state sits
+    #: off the checkpoint grid (a read-side determinism policy) produce the
+    #: identical line, and their fixes are in different files pointing in
+    #: opposite directions. An instrument that cannot separate the two is
+    #: reporting the blame without the defect.
+    refused_tokens_by_reason: Dict[str, int] = dataclasses.field(default_factory=dict)
     #: Key tokens the walk stopped short of because the node was evicted with
     #: no host backup. Zero when the walk ran to the end of the key.
     dead_tokens: int = 0
@@ -104,7 +116,9 @@ class MatchRefusalCensus:
         self.observed = True
         self.accepted_tokens += int(tokens)
 
-    def note_refused(self, component: str, tokens: int) -> None:
+    def note_refused(
+        self, component: str, tokens: int, reason: Optional[str] = None
+    ) -> None:
         """One component declined a node holding ``tokens`` key tokens.
 
         Several components may decline the SAME node; each is recorded, so
@@ -112,11 +126,21 @@ class MatchRefusalCensus:
         intentional -- the partition below is computed from ``reached`` and
         ``accepted``, never by summing this dict, precisely so a
         double-attributed node cannot break it.
+
+        ``reason`` is the component's own account of WHICH of its conditions
+        failed. ``None`` means the component was not asked or could not say,
+        and is recorded as ``unexplained`` rather than dropped: a missing
+        explanation is a fact about the instrument and has to be visible as
+        one, not silently absent from a dict that otherwise reads as complete.
         """
         self.observed = True
         key = str(component)
         self.refused_tokens_by_component[key] = self.refused_tokens_by_component.get(
             key, 0
+        ) + int(tokens)
+        reason_key = f"{key}:{reason or 'unexplained'}"
+        self.refused_tokens_by_reason[reason_key] = self.refused_tokens_by_reason.get(
+            reason_key, 0
         ) + int(tokens)
 
     def note_dead_stop(self, tokens: int) -> None:
@@ -177,6 +201,14 @@ class MatchRefusalCensus:
         )
         return tuple(items[:limit])
 
+    def top_reasons(self, limit: int = 3) -> Tuple[Tuple[str, int], ...]:
+        """Same ranking over ``component:reason`` keys. See the field's note."""
+        items = sorted(
+            self.refused_tokens_by_reason.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return tuple(items[:limit])
+
     def log_fields(self) -> Dict[str, object]:
         """Flat fields for ONE log line. Stable keys, host-side only (#790).
 
@@ -193,12 +225,52 @@ class MatchRefusalCensus:
             "refused": self.refused_tokens,
             "dead": self.dead_tokens,
             "refusers": ",".join(f"{n}:{t}" for n, t in self.top_refusers()) or "-",
+            "why": ",".join(f"{n}={t}" for n, t in self.top_reasons()) or "-",
         }
 
     def format_line(self, prefix: str = "#904 match-census") -> str:
         fields = self.log_fields()
         body = " ".join(f"{k}={v}" for k, v in fields.items())
         return f"[{prefix}] {body}"
+
+
+#: #915: why a prefetch was not attempted, counted per reason.
+#:
+#: THE SECOND HALF OF THE SAME ZERO. A walk that matches nothing SHOULD fall
+#: through to an L3 prefetch, so "the match refused" and "no prefetch was
+#: attempted" are two different failures and only the first was instrumented.
+#: The 0826 window attempted 264 prefetches against 675 sampled walks and the
+#: remaining 411 left no trace at all -- not a counter, not a log line. Blame
+#: with no defect, exactly as `refused_tokens_by_component` was before #914.
+#:
+#: Process-wide and unconditional, unlike the match census: this is one integer
+#: increment on a path that already builds a RadixKey and takes a lock, so
+#: there is nothing to arm and nothing to sample. A gate that only counts when
+#: someone remembered to arm it cannot answer "was it ever tried".
+PREFETCH_GATE_COUNTS: Dict[str, int] = {}
+
+
+def note_prefetch_gate(reason: Optional[str], tokens: int = 0) -> None:
+    """Record one prefetch-gate verdict. ``None`` means the prefetch ran.
+
+    ``attempted`` is counted too, and not only the refusals. A denominator that
+    has to be reconstructed from a different log is how #873's narrowed
+    candidate set got read as a decomposition; the parts are kept here so the
+    partition is checkable on one line.
+    """
+    key = "attempted" if reason is None else str(reason)
+    PREFETCH_GATE_COUNTS[key] = PREFETCH_GATE_COUNTS.get(key, 0) + 1
+    if tokens:
+        tk = f"{key}_tokens"
+        PREFETCH_GATE_COUNTS[tk] = PREFETCH_GATE_COUNTS.get(tk, 0) + int(tokens)
+
+
+def format_prefetch_gate() -> str:
+    """One line, stable keys, for a log-counter grep."""
+    if not PREFETCH_GATE_COUNTS:
+        return "[#915 prefetch-gate] no observation"
+    body = " ".join(f"{k}={v}" for k, v in sorted(PREFETCH_GATE_COUNTS.items()))
+    return f"[#915 prefetch-gate] {body}"
 
 
 def classify(
