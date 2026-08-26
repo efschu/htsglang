@@ -307,6 +307,23 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def clear(self):
+        # DIAGNOSTIC ONLY (#905 window, 2026-08-26): count how many times this
+        # pool's slot bookkeeping has been wiped. A `clear()` makes EVERY index
+        # handed out before it look "not currently allocated" afterwards, which
+        # is exactly what the double-free assertion below reports. Comparing the
+        # epoch a span was allocated under against the epoch it is freed under
+        # turns that assertion from a symptom into a mechanism. No behaviour
+        # change: a counter and a log line.
+        self._clear_epoch = getattr(self, "_clear_epoch", 0) + 1
+        logger.warning(
+            "#905 HOST-POOL CLEAR: pool %r id=%d size=%d -> clear_epoch=%d. "
+            "Every index allocated before this instant now reads as "
+            "'not currently allocated'.",
+            getattr(self, "pool_name", "?"),
+            id(self),
+            int(getattr(self, "size", -1)),
+            self._clear_epoch,
+        )
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
@@ -341,6 +358,25 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         indices_cpu = indices.cpu()
+        # DIAGNOSTIC ONLY (#905 window): say WHICH pool object and WHICH clear
+        # epoch refused, before the assertion below fires. Same raise, same
+        # control flow -- only the story is added.
+        if not bool(self.slot_used[indices_cpu].all()):
+            _stale = indices_cpu[~self.slot_used[indices_cpu]]
+            logger.error(
+                "#905 HOST-POOL DOUBLE-FREE about to raise: pool %r id=%d "
+                "size=%d clear_epoch=%d | %d of %d index(es) are in range but "
+                "not allocated, span [%d, %d] | free_slots=%d",
+                getattr(self, "pool_name", "?"),
+                id(self),
+                int(getattr(self, "size", -1)),
+                int(getattr(self, "_clear_epoch", 0)),
+                int(_stale.numel()),
+                int(indices_cpu.numel()),
+                int(_stale.min()) if _stale.numel() else -1,
+                int(_stale.max()) if _stale.numel() else -1,
+                int(len(self.free_slots)),
+            )
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
