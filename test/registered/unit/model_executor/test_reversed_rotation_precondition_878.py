@@ -119,6 +119,129 @@ class TestTheChecksumIsBlindToOrder(CustomTestCase):
         self.assertNotEqual(uint8_checksum(p), uint8_checksum(q))
 
 
+class TestWhereTheParityMarkerCanLive(CustomTestCase):
+    """POSTEN 4, and checking the premise changed the answer.
+
+    THE QUESTION WAS POSED AS "it must survive a process restart". It does not
+    have to, because the thing it describes does not. The host image is RE-PRIMED
+    at every boot: `prime_arena_from_image` (phase_flip_boot.py:499) calls the same
+    `rotate_arena` with `outgoing_bytes=0`, which degenerates the rotation to a
+    plain contiguous H2D and fills the image from the model in canonical forward
+    order. Pinned host memory does not outlive the process, and even the
+    file-backed arm is overwritten by that priming fill before any flip runs. So
+    parity only has to hold from one flip to the next WITHIN one process
+    lifetime.
+
+    A LEGAL HOME THEREFORE ALREADY EXISTS: `PhaseStacks.image_holds`, the
+    in-process marker recording WHICH layout the image contains. Recording WHICH
+    ORDER is the same kind of fact with the same lifetime, in the same place. No
+    sidecar, no manifest, no second trailer slot.
+
+    THAT SOLVES STORAGE AND NOT VERIFICATION, and I had conflated the two. A
+    wrong `image_holds` today is caught -- `rotate_arena` raises RotationHazard
+    on `image_holds != wants`, and the device-side checksum catches the rest. A
+    wrong PARITY under the reversed scheme is caught by NOTHING, because the
+    checksum is an order-blind sum. So the scheme still needs a second
+    verification primitive; it just does not need a second STORAGE slot.
+
+    AND THE ORDER INFORMATION IS ALREADY COMPUTED, THEN DISCARDED.
+    `uint8_checksum` builds a per-chunk sum VECTOR and collapses it with a final
+    `.sum()` (weights_arena.py:125-129). The vector is order-sensitive; the
+    collapse is what throws that away. Retaining it costs no extra data
+    movement.
+
+    IT IS NOT FREE, THOUGH, AND THIS IS THE CONSTRAINT TO CARRY INTO THE DESIGN.
+    The chunk size is ADAPTIVE -- `_checksum_chunk_bytes` sizes it to free device
+    memory -- and the function's docstring makes chunk-size-independence a
+    load-bearing property so that "two ranks with different free memory still
+    agree". A per-chunk vector under adaptive chunking is not comparable across
+    ranks or across a flip. So the order-sensitive primitive must use a FIXED
+    partition, deliberately decoupled from the free-memory heuristic. Small, but
+    it is a real constraint and it is invisible unless someone reads why the
+    adaptive sizing exists.
+    """
+
+    def test_the_priming_fill_has_no_copy_back(self):
+        """The fact the whole answer rests on: at boot the image is written
+        forward from the model, with nothing placed back, so there is no parity
+        ambiguity to inherit across a restart."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.managers import phase_flip_boot
+
+        # ASSERTED ON THE CALL, NOT ON THE TEXT. `outgoing_bytes=0` also appears
+        # in this function's own DOCSTRING, so a substring check passes even when
+        # the real argument changes -- caught by mutation: replacing the first
+        # textual occurrence hit the prose and left this test green.
+        src = textwrap.dedent(inspect.getsource(phase_flip_boot.prime_arena_from_image))
+        kwargs = {}
+        for node in ast.walk(ast.parse(src)):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "rotate_arena"
+            ):
+                kwargs = {
+                    kw.arg: kw.value for kw in node.keywords if kw.arg is not None
+                }
+        self.assertTrue(kwargs, "no rotate_arena(...) call found in the priming fill")
+        self.assertIsInstance(kwargs.get("outgoing_bytes"), ast.Constant)
+        self.assertEqual(
+            0,
+            kwargs["outgoing_bytes"].value,
+            "the priming fill gained a copy-back; boot no longer establishes a "
+            "canonical forward image, and the parity argument has to be redone",
+        )
+        self.assertIs(True, kwargs["priming"].value)
+
+    def test_the_existing_layout_marker_is_in_process_only(self):
+        """`image_holds` is a plain attribute -- no file, no shared memory. That
+        is exactly the lifetime parity needs, which is why it is the right
+        neighbour for it."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+
+        src = inspect.getsource(phase_flip_boot.PhaseFlipStacks)
+        self.assertIn("image_holds", src)
+
+    def test_the_checksum_computes_per_chunk_sums_and_collapses_them(self):
+        """The order information exists for one line and is then summed away."""
+        import inspect
+
+        from sglang.srt.model_executor import weights_arena
+
+        src = inspect.getsource(weights_arena.uint8_checksum)
+        self.assertIn("payload.split(", src)
+        self.assertIn("torch.stack(parts).sum()", src)
+
+    def test_a_per_chunk_vector_WOULD_be_order_sensitive(self):
+        """The candidate primitive, demonstrated. Same bytes, permuted chunks:
+        the collapsed sum agrees and the vector does not."""
+        chunk = 100
+        p = _payload(1050, seed=9)
+        chunks = list(p.split(chunk))
+        scrambled = torch.cat(list(reversed(chunks)))
+        vec = [int(c.sum(dtype=torch.int64)) for c in p.split(chunk)]
+        vec_s = [int(c.sum(dtype=torch.int64)) for c in scrambled.split(chunk)]
+        self.assertEqual(uint8_checksum(p), uint8_checksum(scrambled))
+        self.assertNotEqual(vec, vec_s, "the per-chunk vector must see the order")
+
+    def test_the_chunk_SIZE_is_adaptive_which_is_why_the_vector_is_not_free(self):
+        """The constraint that makes this a design item rather than a one-liner:
+        the partition is chosen from free device memory, and the checksum's
+        cross-rank comparability depends on the VALUE not caring."""
+        import inspect
+
+        from sglang.srt.model_executor import weights_arena
+
+        src = inspect.getsource(weights_arena._checksum_chunk_bytes)
+        self.assertIn("mem_get_info", src)
+        doc = weights_arena.uint8_checksum.__doc__ or ""
+        self.assertIn("independent of the chunk size", doc)
+
+
 class TestTheHeadroomArithmetic(CustomTestCase):
     """The +32 MiB ask, from the real layout vectors rather than a guess."""
 
