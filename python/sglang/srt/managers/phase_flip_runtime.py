@@ -86,6 +86,38 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP"
 
+#: #871: consecutive work-retracting cutovers whose fence persisted nothing
+#: before the blind-fence alarm fires. FOUR, taken from #719's settled reading
+#: at the stale-gate streak: two quiet cutovers are an ordinary stretch, so a
+#: threshold of 2 would alarm on normal operation and a threshold that alarms
+#: on normal operation gets ignored, which is how the condition stayed
+#: invisible in the first place.
+FENCE_BLIND_STREAK = 4
+
+
+def advance_fence_blind_streak(
+    previous, *, released: bool, persisted_nothing: bool
+) -> int:
+    """#871: one step of the blind-fence streak. Pure, so it can be falsified.
+
+    THE GATE IS ``released``, MIRRORING #719's BUSY GATE, and it is the whole
+    reason this is not a crying-wolf alarm. A fence over an empty tree is
+    CORRECT to persist nothing -- there was nothing to persist -- so an idle
+    instance must never accumulate a streak. The streak advances only when this
+    cutover actually took work away AND nothing was written that could give it
+    back. Any cutover that persists something, or that retracts nothing, resets
+    it: this reports a SUSTAINED condition, never a historical one.
+
+    Extracted from the seam rather than left inline so it is reachable without a
+    scheduler. A guard whose logic can only be exercised by booting is a guard
+    that gets shipped unexercised, which is the failure mode this whole ticket
+    is about.
+    """
+    prior = int(previous or 0)
+    if released and persisted_nothing:
+        return prior + 1
+    return 0
+
 
 def prefill_runnable_in_current_layout(direction, purity) -> bool:
     """#858b: can a pending prefill make progress in the layout we are in NOW?
@@ -8549,9 +8581,67 @@ class PhaseFlipRuntime:
         #
         # Read defensively: a stand-in report is the ordinary state in tests and
         # an instrument may never be the thing that breaks a flip.
-        if released and getattr(
-            getattr(self, "_last_writeback_report", None), "persisted_nothing", False
-        ):
+        # #871 THE STREAK, AGGREGATED AT THE INSTRUMENT THAT ALREADY EXISTS.
+        #
+        # `persisted_nothing` already answers the per-cutover question, and the
+        # warning below already fires. What it cannot say is the one thing that
+        # decides whether the instance can make progress at all: ONE empty
+        # fence is legitimate (nothing was persistable), EVERY empty fence
+        # means the canonical store can never be populated, so the read-through
+        # the no-carry seam depends on can never hit -- and that shows up only
+        # as latency, never as an error. W37-G is the specimen (12 flips, zero
+        # completions); the W40 #857 boot is the milder form (57 of 186 fences
+        # persisted nothing and `#cached-token: 0` on all 243 prefill batches).
+        #
+        # NO SECOND COUNTER: this reads `persisted_nothing` off the existing
+        # report and keeps one int. A parallel "recomputed prefix tokens"
+        # counter would measure what this and `#cached-token` already measure
+        # between them, which is how #838 acquired a silent multi-valued zero.
+        #
+        # GATED ON `released`, MIRRORING #719's BUSY GATE at :8678, and for the
+        # same reason that gate exists: a fence over an empty tree is CORRECT
+        # to persist nothing, so counting quiet cutovers would build a
+        # crying-wolf alarm out of the instrument written to replace one. The
+        # streak advances only when this cutover actually retracted residents
+        # -- real work was taken away AND nothing was persisted to give it
+        # back. Threshold 4, the same "two quiet cutovers are ordinary" reading
+        # #719 settled on.
+        _persisted_nothing = bool(
+            getattr(
+                getattr(self, "_last_writeback_report", None),
+                "persisted_nothing",
+                False,
+            )
+        )
+        try:
+            _pn_streak = advance_fence_blind_streak(
+                getattr(self, "_fence_persisted_nothing_streak", 0),
+                released=bool(released),
+                persisted_nothing=_persisted_nothing,
+            )
+            self._fence_persisted_nothing_streak = _pn_streak
+            if _pn_streak >= FENCE_BLIND_STREAK:
+                logger.error(
+                    "%s #871 FENCE BLIND: the writeback fence PERSISTED NOTHING "
+                    "on %d consecutive cutovers that retracted work. The "
+                    "canonical store cannot be populated, so every read-through "
+                    "after every cutover misses and each retracted prefix is "
+                    "recomputed in full -- the instance pays a full re-prefill "
+                    "per flip and the cost appears only as latency. Two causes "
+                    "carry this, both already diagnosed: the #718/#847 rebind "
+                    "refusing on pool coverage (grep '#719 HiCache rebind "
+                    "refused' -- if it refuses every cutover the phase host "
+                    "tier is not built with the full pool set, see #871), and "
+                    "finish-only retention (a request retracted mid-generation "
+                    "never inserts its output tokens, so the next fence has "
+                    "nothing to persist). A store whose only writer is an event "
+                    "the seam preempts can never be read.",
+                    LOG_PREFIX,
+                    _pn_streak,
+                )
+        except Exception:  # noqa: BLE001 - telemetry never breaks a seam
+            pass
+        if released and _persisted_nothing:
             logger.warning(
                 "%s #783: re-admitting %d resident(s) for %s after a fence that "
                 "RAN AND PERSISTED NOTHING (%s). No storage ack and no host "

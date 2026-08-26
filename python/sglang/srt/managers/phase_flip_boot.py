@@ -1896,6 +1896,108 @@ def _staging_pin_gib(scheduler, device_pool, fallback_pool=None) -> float:
     return (tokens * cell) / float(1 << 30)
 
 
+def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, logger):
+    """#871: the KV+MAMBA entry pair for the 'tp' staging pin, or None.
+
+    MIRRORS ``build_hybrid_mamba_stack`` (hybrid_pool_assembler.py) rather than
+    re-deriving it: same primitives, same layer mappings, same
+    ``transfer_layer_num`` rule. That assembler is the contract for what a
+    kv+mamba ``HostPoolGroup`` looks like, and a second hand-rolled opinion
+    about it is exactly the drift #847 warned about when it refused to clone
+    ``type(pp_host)``.
+
+    WHAT IS DELIBERATELY NOT REUSED: ``build_hybrid_mamba_stack`` itself, because
+    it also constructs a ``HybridCacheController``. This pin needs a host VIEW to
+    rebind readers onto; a second controller would be a second writer against the
+    same device pool. Entries yes, controller no.
+
+    SIZING IS PER-SLOT, NOT PER-GB, and that is the one place this must NOT copy
+    the KV half. The KV pin is sized in bytes from a token count
+    (``_staging_pin_gib``). Mamba state is allocated per REQUEST slot, and
+    ``MambaPoolHost`` reads ``host_size`` in GB only when it is > 0, otherwise
+    ``int(device_pool.size * host_to_device_ratio)``. Passing the KV pin's GB
+    figure here would size the mamba view by a budget derived for a different
+    unit. Ratio 1.0 with ``host_size=0`` mirrors the device pool exactly, which
+    is what "phase-matched staging pin" means: able to stage what the other
+    phase can actually hold, and no more.
+
+    Returns ``None`` when the TP side cannot supply the mamba handles. The
+    caller then keeps today's KV-only pin, ``check_pool_coverage`` keeps
+    refusing, and the operator gets a named reason -- the current state
+    preserved rather than a narrowed tier smuggled past a guard.
+    """
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        build_pool_entry,
+    )
+    from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+
+    req_pool = getattr(tp_runner, "req_to_token_pool", None)
+    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    mamba_map = getattr(req_pool, "mamba_map", None)
+    mamba_allocator = getattr(req_pool, "mamba_allocator", None)
+    missing = [
+        n
+        for n, v in (
+            ("req_to_token_pool", req_pool),
+            ("mamba_pool", mamba_pool),
+            ("mamba_map", mamba_map),
+            ("mamba_allocator", mamba_allocator),
+        )
+        if v is None
+    ]
+    if missing:
+        logger.error(
+            "#871 PHASE-FLIP REBIND: the bound tier describes MAMBA but the TP "
+            "phase stack does not expose %s, so the staging pin cannot mirror "
+            "it. Keeping the KV-only pin: the rebind will keep refusing on "
+            "coverage, which is the correct state, and this line is the reason.",
+            ", ".join(missing),
+        )
+        return None
+
+    # The pool's OWN mapping, exactly as `_MambaStrategy` reads it.
+    full_map = dict(getattr(tp_device_pool, "full_attention_layer_id_mapping", {}) or {})
+    mamba_map = dict(mamba_map)
+    if not full_map:
+        logger.error(
+            "#871 PHASE-FLIP REBIND: the TP device pool exposes no "
+            "full_attention_layer_id_mapping, so the KV half of a hybrid pin "
+            "cannot be given the transfer indices the mamba half must not "
+            "collide with. Keeping the KV-only pin."
+        )
+        return None
+    transfer_layer_num = len(full_map | mamba_map)
+
+    mamba_host = MambaPoolHost(
+        mamba_pool,
+        1.0,  # host_to_device_ratio: mirror the device pool, see docstring
+        0,  # host_size GB: 0 selects the ratio path
+        allocator_type=getattr(sa, "hicache_storage_backend", "default") or "default",
+        layout=getattr(sa, "hicache_mem_layout", "layer_first") or "layer_first",
+    )
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host,
+            device_pool=inner_pool,
+            layer_mapping=full_map,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.MAMBA,
+            host_pool=mamba_host,
+            device_pool=mamba_pool,
+            layer_mapping=mamba_map,
+            transfer_layer_num=transfer_layer_num,
+            device_alloc_fn=mamba_allocator.alloc,
+            device_free_fn=mamba_allocator.free,
+        ),
+    ]
+    return entries, mamba_host
+
+
 def build_phase_flip_host_pools(scheduler):
     """#847: the WRITER for ``scheduler.phase_flip_host_pools``.
 
@@ -2016,20 +2118,84 @@ def build_phase_flip_host_pools(scheduler):
             server_args=sa_pin,
             use_mla=use_mla,
         )
-        tp_host = HostPoolGroup(
-            [
-                build_pool_entry(
-                    name=PoolName.KV,
-                    host_pool=kv_host,
-                    device_pool=inner_pool,
-                    # Identity: this pool carries the TP phase's own layers,
-                    # so transfer index i IS device layer i.
-                    layer_mapping={i: i for i in range(layers)},
-                    transfer_layer_num=layers,
-                    is_anchor=True,
-                )
-            ]
-        )
+        # #871: MIRROR THE BOUND TIER'S POOL SET, NOT JUST ITS KV HALF.
+        #
+        # THE DEFECT THIS CLOSES, and it is #718/#847's own unmet precondition
+        # rather than a new finding. This pin was built with ONE entry, KV. On
+        # a hybrid model the live tier carries KV *and* MAMBA, so
+        # `check_pool_coverage` computed `missing = {MAMBA}` and refused the
+        # rebind -- correctly, every single time. Measured on the W40 #857
+        # acceptance boot: 60 refusals, 0 arms, and `#cached-token: 0` on all
+        # 243 prefill batches, because a refused rebind leaves the #718 device
+        # tier DISARMED and every read-through misses.
+        #
+        # That guard's docstring states the remedy exactly, and this is it:
+        # "A phase host tier has to be built with the FULL POOL SET before this
+        # rebind can arm; until then the #718 disarm is the correct state and a
+        # read-through miss is the correct cost."
+        #
+        # THE GUARD IS NOT TOUCHED. It must stop firing because its
+        # precondition is MET, never because it was removed -- the difference
+        # between a fix and a disarm. `check_pool_coverage` stays exactly as
+        # strict as it is, and `test_phase_tier_full_pool_set_871.py` asserts
+        # BOTH directions: a full-set tier arms, a narrowed one still refuses.
+        #
+        # DERIVED FROM THE BOUND TIER, not from the model config: the set that
+        # must be covered is whatever the READER actually names, which is the
+        # same quantity `check_pool_coverage` compares against. Reading the
+        # config instead would be a second opinion about the same fact, and the
+        # two would drift.
+        _pp_names = set(getattr(pp_host, "entry_map", None) or ())
+        _extra = _pp_names - {PoolName.KV}
+        entries = [
+            build_pool_entry(
+                name=PoolName.KV,
+                host_pool=kv_host,
+                device_pool=inner_pool,
+                # Identity: this pool carries the TP phase's own layers,
+                # so transfer index i IS device layer i.
+                layer_mapping={i: i for i in range(layers)},
+                transfer_layer_num=layers,
+                is_anchor=True,
+            )
+        ]
+        mamba_host = None
+        if PoolName.MAMBA in _extra:
+            # REBUILDS BOTH ENTRIES, and the reason is the transfer index.
+            # `build_hybrid_mamba_stack` sets `transfer_layer_num =
+            # len(full_layer_mapping | mamba_layer_mapping)` and gives each
+            # entry the pool's OWN mapping. The KV-only pin above uses an
+            # identity map over `range(layers)`, which is right while KV is the
+            # only entry and wrong the moment a second pool shares the transfer
+            # index space -- the two maps would collide at index 0. So the
+            # hybrid case is built from the assembler's contract rather than
+            # patched onto the identity one.
+            _hybrid = _hybrid_pin_entries(
+                tp_runner=tp_runner,
+                sa=sa,
+                kv_host=kv_host,
+                inner_pool=inner_pool,
+                tp_device_pool=tp_device_pool,
+                logger=logger,
+            )
+            if _hybrid is not None:
+                entries, mamba_host = _hybrid
+        _unhandled = _extra - {PoolName.MAMBA}
+        if _unhandled:
+            # NAMED, NOT SWALLOWED. A pool set this builder does not know how to
+            # mirror will still be refused by `check_pool_coverage`, which is the
+            # safe outcome -- but the operator must learn it here, at the cause,
+            # rather than from a coverage message that only says a name is
+            # missing. Every such pool is a follow-up of this ticket.
+            logger.error(
+                "#871 PHASE-FLIP REBIND: the bound tier also describes %s, "
+                "which this builder cannot yet mirror into the 'tp' staging "
+                "pin. The rebind will keep refusing on coverage until that "
+                "pool is added here. The guard is doing its job; the pin is "
+                "incomplete.",
+                sorted(str(n) for n in _unhandled),
+            )
+        tp_host = HostPoolGroup(entries)
     except Exception as exc:  # noqa: BLE001 - a refusal must be legible
         logger.error(
             "#847 PHASE-FLIP REBIND: could not allocate the phase-matched "
@@ -2055,17 +2221,44 @@ def build_phase_flip_host_pools(scheduler):
         )
     except Exception:  # noqa: BLE001 - the ledger must not break the boot
         free_g = -1
+    # #871: the MAMBA half is a POST OF ITS OWN, priced from what was actually
+    # allocated rather than from the intention. An unpriced post is the thing
+    # the ledger exists to prevent, and adding a second pinned pool without
+    # naming it would have been exactly that.
+    mamba_bytes = 0
+    if mamba_host is not None:
+        try:
+            mamba_bytes = int(
+                getattr(mamba_host, "size", 0) * getattr(mamba_host, "size_per_token", 0)
+            )
+        except Exception:  # noqa: BLE001 - the ledger must not break the boot
+            mamba_bytes = -1
     logger.warning(
-        "HOST-LEDGER POST #847 phase-flip staging pin: %d GB pinned for the "
-        "'tp' phase-matched host view (%.3f GiB derived from %d tok x cell), "
-        "host free after = %s GB against the 16 GB floor. This post exists so "
-        "the #718 device tier stays ARMED across the cutover; without it "
-        "load() returns None for the whole TP phase and every read-through "
-        "misses. The POST shrinks if it does not fit -- the FLOOR never does.",
+        "HOST-LEDGER POST #847/#871 phase-flip staging pin: %d GB pinned for "
+        "the 'tp' phase-matched host view (%.3f GiB derived from %d tok x "
+        "cell) + MAMBA half %s (%s slots mirroring the device pool, ratio 1.0 "
+        "-- per-SLOT not per-GB), pools=%s, host free after = %s GB against "
+        "the 16 GB floor. This post exists so the #718 device tier stays ARMED "
+        "across the cutover; without it load() returns None for the whole TP "
+        "phase and every read-through misses. The POST shrinks if it does not "
+        "fit -- the FLOOR never does.",
         size_gb,
         gib,
         int(getattr(sa, "chunked_prefill_size", 4096) or 4096)
         * int(getattr(sa, "max_running_requests", 1) or 1),
+        (
+            "not built"
+            if mamba_host is None
+            else ("unpriceable" if mamba_bytes < 0 else f"{mamba_bytes / 2**30:.3f} GiB")
+        ),
+        "0" if mamba_host is None else getattr(mamba_host, "size", "?"),
+        # getattr, for the SAME STAND-IN reason this module states at its other
+        # probes and which I broke by not reading it first: this writer is
+        # driven in tests by scheduler and pool STAND-INS carrying only what
+        # the writer uses, and `HostPoolGroup` itself is patched there. An
+        # instrument may never be the thing that breaks a boot -- reporting
+        # "unknown" is the honest answer when the shape is not there.
+        sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ())) or "unknown",
         free_g if free_g >= 0 else "unknown",
     )
     return {"pp": pp_host, "tp": tp_host}
