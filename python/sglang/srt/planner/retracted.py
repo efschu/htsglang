@@ -33,17 +33,25 @@ volunteers the incriminating fact is not a rule:
 1.  DECLARED provenance. ``--uneven-token-vector-provenance '#602'`` names the
     lineage; if that names a retracted investigation the vector is refused.
     This is the durable, general rule and it is value-independent.
-2.  UNDECLARED provenance. A retraction records the concrete values the
-    investigation emitted, and a vector matching one of them is refused with
-    the same verdict. Without this, the rule would be toothless on exactly the
-    vector that motivated it, because the launch that ships ``29,19,16``
-    naturally declares no provenance at all.
+2.  VALUE. A retraction records the concrete values the investigation
+    emitted, and a vector matching one of them is refused with the same
+    verdict. Without this, the rule would be toothless on exactly the vector
+    that motivated it, because the launch that ships ``29,19,16`` naturally
+    declares no provenance at all.
+
+The layering is ADDITIVE, not alternative (#900). Mode 2 runs whenever mode 1
+did not already convict -- including when a provenance WAS declared and names
+an investigation that is not retracted. A stated lineage is evidence about
+where a number came from; it is not evidence that the number is clean, and a
+stale ``SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE`` left in a shell must not be
+able to walk a withdrawn vector past the gate.
 
 Mode 2 is deliberately narrow: it matches the gcd-reduced vector, so it cannot
 be dodged by writing ``58,38,32``, and it names what to do instead rather than
 just refusing. A value that is genuinely re-derived by measurement is not
-matched by it, because a measured install stamps ``PROVENANCE_MEASURED`` and
-mode 1 short-circuits before any value comparison happens.
+matched by it, because a measured install stamps ``PROVENANCE_MEASURED``,
+which is the one provenance that does short-circuit -- it asserts a
+measurement rather than naming an investigation.
 
 Adding a retraction here is the whole cost of enforcing one. The register is
 data; the gate reads it.
@@ -183,18 +191,35 @@ def find_retracted_token_vector(
     regardless of the vector's value. ``PROVENANCE_MEASURED`` short-circuits
     to None -- a vector this boot measured has no lineage to withdraw.
 
-    Mode 2 (undeclared): with no provenance given, the gcd-reduced vector is
-    matched against the values each retraction emitted.
+    Mode 2 (value): the gcd-reduced vector is matched against the values each
+    retraction emitted.
 
-    A DECLARED, non-retracted provenance also short-circuits to None: the
-    operator has stated where the number came from, and mode 2's value match
-    is a fallback for an unstated lineage, not an override of a stated one.
+    THE TWO MODES ADD, THEY DO NOT REPLACE EACH OTHER (#900). Mode 1 can
+    convict a vector whose value looks innocent; it can never acquit one whose
+    value does not. A declared provenance naming a NON-retracted investigation
+    used to return None here, and that short-circuited mode 2 entirely -- so
+    the shipped 29,19,16 from retracted #602 rode in under any unrelated
+    lineage. The env twin ``SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE`` outlives a
+    process, so the disarming input is one stale shell variable, not an exotic
+    launch. Provenance is an optimisation over the value match, never a
+    substitute for it: a retracted vector must never pass.
+
+    ``PROVENANCE_MEASURED`` keeps its exemption, and it is not the same shape.
+    It names no investigation -- it asserts that this boot profiled the value
+    itself -- so matching it by value would refuse a measurement for
+    resembling the withdrawn estimate it replaced. That exemption is #797's
+    and is tested directly in
+    ``test_retracted_vector_boot_refusal_797.py::TestWhatMustNotBeRefused797``.
     """
     declared = _normalise(provenance)
+    if declared == _normalise(PROVENANCE_MEASURED) and declared:
+        return None
     if declared:
-        if declared == _normalise(PROVENANCE_MEASURED):
-            return None
-        return by_investigation(declared)
+        entry = by_investigation(declared)
+        if entry is not None:
+            return entry
+        # Fall through -- deliberately. A stated lineage that is not retracted
+        # says nothing about whether the VALUE is (#900).
     if not vector:
         return None
     reduced = reduce_vector(vector)
