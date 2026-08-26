@@ -2792,6 +2792,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # DIAGNOSTIC ONLY (#905 window): stamp the host pool identity and its
+        # clear-epoch AT REGISTRATION, i.e. at the instant these host slots were
+        # allocated. The completion path below compares them against the pool it
+        # actually frees against. Stamped on the operation rather than in
+        # `_OngoingPrefetch` because that record is a NamedTuple and is unpacked
+        # positionally in five places.
+        try:
+            _p = self.cache_controller.mem_pool_host
+            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
+            operation._host_pool_id_at_reg = id(_p)
+            operation._host_pool_epoch_at_reg = int(getattr(_p, "_clear_epoch", 0))
+        except Exception:  # noqa: BLE001 - a diagnostic may never break a path
+            operation._host_pool_id_at_reg = None
+            operation._host_pool_epoch_at_reg = None
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
@@ -2919,9 +2933,79 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if insert_result.host_span_unclaimed
             else insert_result.prefix_len
         )
-        self.cache_controller.mem_pool_host.free(host_indices[:unclaimed_to])
+        # DIAGNOSTIC ONLY (#905 window): the decisive datum. If the pool object
+        # or its clear-epoch moved between registration and here, the span being
+        # freed was minted under a bookkeeping state that no longer exists, and
+        # the double-free is a CUTOVER LIFETIME defect rather than a
+        # free-it-twice defect. Logged unconditionally (one line per completion,
+        # this is a diagnostic boot) so the NEGATIVE case is visible too.
+        try:
+            _p = self.cache_controller.mem_pool_host
+            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
+            logger.warning(
+                "#905 PREFETCH-COMPLETE free-site: req=%s unclaimed_to=%d "
+                "completed=%d min_synced=%d | pool id now=%d epoch now=%d | "
+                "at registration id=%s epoch=%s | MOVED=%s",
+                req_id,
+                int(unclaimed_to),
+                int(completed_tokens),
+                int(min_completed_tokens),
+                id(_p),
+                int(getattr(_p, "_clear_epoch", 0)),
+                getattr(operation, "_host_pool_id_at_reg", None),
+                getattr(operation, "_host_pool_epoch_at_reg", None),
+                (
+                    id(_p) != getattr(operation, "_host_pool_id_at_reg", id(_p))
+                    or int(getattr(_p, "_clear_epoch", 0))
+                    != int(getattr(operation, "_host_pool_epoch_at_reg", 0) or 0)
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic may never break a path
+            pass
+        # #905 FIX. MEASURED MECHANISM (R6 diagnostic boot, 2026-08-26 18:15Z,
+        # all three ranks, six of six completions):
+        #
+        #   free-site: unclaimed_to=49 | pool id now=138604341884544 epoch 2
+        #              size 30518 | at registration id=138604342978576 epoch 3
+        #              size 703472 | MOVED=True
+        #   -> Double-free: 49 of 49 in range but not allocated, span [0, 48],
+        #      free_slots=30518 (i.e. the pool being freed against holds NOTHING)
+        #
+        # The prefetch allocates its host slots from the PP-phase host tier
+        # (703472 rows) and completes after a cutover has rebound
+        # `mem_pool_host` to the TP-phase tier (30518 rows) -- a DIFFERENT pool
+        # object. A raw `.free()` here therefore returns slots to a pool that
+        # never handed them out. Because 49 < 30518 the indices are IN RANGE,
+        # so the #718 index-axis guard (628d9705b1, orphaned off this train)
+        # cannot see them: same root, the other side of the same axis.
+        #
+        # The route already exists and is already used by `_drain_revoke`
+        # (below): `append_host_mem_release(..., generation=...)` sends a span
+        # stamped with a superseded binding to `host_pool_for_generation`, i.e.
+        # to the pool that minted it, instead of to whatever is bound now.
+        # `PrefetchOperation` inherits that stamp from `StorageOperation`
+        # (cache_controller.py:177, "the binding this operation was OPENED
+        # under"), so nothing new has to be carried.
+        #
+        # The tail below moves to the same call for the same reason: head and
+        # tail of one prefetch belong to one pool, and having them take two
+        # different routes is how they drifted apart in the first place.
+        #
+        # REACHABILITY, and why this fired now and not before: `unclaimed_to`
+        # is 0 for a prefetch whose fetched span is adopted whole, and
+        # `free([])` is a no-op. It is 49 exactly when a component validator
+        # declines the fetched head -- the #904 census on this same run reports
+        # `verdict=refused refusers=MambaComponent:49`. The refusal does not
+        # cause this defect; it is what makes a latent lifetime defect
+        # reachable, which is why a quiet single-stream probe never hit it.
+        _binding_generation = getattr(operation, "binding_generation", None)
         self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
+            host_indices=host_indices[:unclaimed_to],
+            generation=_binding_generation,
+        )
+        self.cache_controller.append_host_mem_release(
+            host_indices=host_indices[min_completed_tokens:completed_tokens],
+            generation=_binding_generation,
         )
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
