@@ -273,13 +273,32 @@ def check_and_register_pinned_post(
     # absent from `available`. The true marginal cost of that boot was the 5.24
     # GB tier, which fits in 23.23 GB with 18 GB to spare.
     #
-    # THE PRECONDITION, CORRECTED (#550). An earlier version of this comment
-    # said crediting is sound "because registration FOLLOWS allocation for every
-    # producer". That is FALSE and was a misreading: `_register_image_post`
-    # declares the post BEFORE `_alloc_host_image` allocates
-    # (weights_arena.py:458 vs :476), deliberately, so the registry refuses an
+    # THE PRECONDITION, CORRECTED TWICE (#550, then #871c).
+    #
+    # #550 corrected an earlier claim that crediting is sound "because
+    # registration FOLLOWS allocation for every producer". That is FALSE:
+    # `_register_image_post` declares the post BEFORE `_alloc_host_image`
+    # allocates. So far so good.
+    #
+    # BUT #550'S OWN REPLACEMENT CLAUSE WAS ALSO WRONG, and it is the more
+    # dangerous of the two because it describes a guard that does not exist. It
+    # said the early declaration happens "so the registry refuses an
     # over-commitment at the DECLARATION rather than discovering it at the
-    # allocation.
+    # allocation". THE REGISTRY REFUSES NOTHING THERE. `register_pinned_post`
+    # above is a bare dict write with no comparison in it, `_register_image_post`
+    # says "Never raises" in its own first line, and `weights_arena` does not
+    # call `check_and_register_pinned_post` anywhere -- checked with
+    # `grep -c check_and_register_pinned_post weights_arena.py` -> 0.
+    #
+    # The early declaration is deliberate for a DIFFERENT reason, stated at the
+    # call site (weights_arena.py, `_alloc_host_image`): "Registered, not
+    # CHECKED: a new refusal path here could break a boot that works today, and
+    # the diagnosis this is for is served by the number being present, not by a
+    # veto." That is a reasoned #695 decision about the largest post in the
+    # system -- the phase-flip host weight images -- and it stands. What must
+    # not stand is a comment HERE promising a veto THERE: a later reader sizing
+    # against this module would believe the biggest claimant is admitted when
+    # it is only counted.
     #
     # What actually makes the credit sound is weaker and sufficient: by the time
     # a LATER post is weighed, the EARLIER posts' allocations have COMPLETED, so
