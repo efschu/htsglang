@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     floor_to_interval,
     is_on_interval,
     is_resume_candidate,
+    resume_refusal_reason,
     retention_shrinks_protected,
 )
 from sglang.srt.runtime_context import get_server_args
@@ -196,6 +197,41 @@ class MambaComponent(TreeComponent):
             return ok
 
         return _resume_with_host
+
+    def explain_match_refusal(
+        self, node, depth: int, match_device_only: bool = False
+    ) -> Optional[str]:
+        """Which term of the resume rule declined this node (#913/W42).
+
+        THE MEASUREMENT THIS UNBLOCKS. The 0826 acceptance window's census read
+        ``verdict=refused reached=45 accepted=0 refusers=MambaComponent:45`` on
+        361 walks and the same at 49 on 301 more -- 671 of 675 -- and the line
+        could not say whether those nodes held no recurrent state (a write-side
+        tombstone from ``commit_insert_component_data``) or held one at a
+        position off the ``--mamba-checkpoint-interval`` grid (a read-side
+        determinism policy that is refusing a usable anchor on purpose). The
+        remedies are in different files and one of them is the #767 corruption
+        direction, so guessing between them is not an option.
+
+        Routed through ``resume_refusal_reason``, which is the same expression
+        ``is_resume_candidate`` is now defined in terms of -- so the predicate
+        and its explanation cannot disagree about a node, which is exactly how
+        #747 records the two match lineages drifting apart before.
+
+        Returns None if the node is in fact admissible: the caller only asks
+        about nodes some validator refused, and on a multi-component walk that
+        refuser may have been a DIFFERENT component. Answering "no reason" then
+        is the truthful answer, not a missing one.
+        """
+        ct = self.component_type
+        data = node.component_data[ct]
+        return resume_refusal_reason(
+            self._raw_token_pos(depth),
+            self.mamba_checkpoint_interval,
+            has_device_value=data.value is not None,
+            has_host_value=data.host_value is not None,
+            device_only=match_device_only or self.cache.cache_controller is None,
+        )
 
     def finalize_match_result(
         self,

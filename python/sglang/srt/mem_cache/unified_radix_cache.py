@@ -1321,10 +1321,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             Runs ONLY on the armed path and ONLY for a node that was already
             found invalid, so the extra validator calls cost nothing in the
             default configuration and nothing on an accepted node.
+
+            #913/W42: the component NAME alone was not actionable. A validator
+            that is a conjunction hides one defect per term behind its single
+            bit, and the 0826 window spent its whole census budget learning
+            only that ``MambaComponent`` refused -- not which of its two terms,
+            whose fixes are in different files. ``explain_match_refusal`` is
+            asked here, beside the predicate that already said no, so the
+            reason travels on the same line as the blame instead of having to
+            be inferred from a second log.
+
+            The component is asked with the SAME ``match_device_only`` this
+            walk built its validators with, or the two would answer about
+            different rules -- a host-backed node is admissible to one and not
+            the other, and an explanation drawn from the wrong one would name a
+            term the predicate never evaluated.
             """
-            for name, validator in zip(component_names, validators):
+            for name, component, validator in zip(
+                component_names, self._components_tuple, validators
+            ):
                 if not validator(node, depth):
-                    census.note_refused(name, tokens)
+                    try:
+                        reason = component.explain_match_refusal(
+                            node, depth, match_device_only=not separate_device_match
+                        )
+                    except Exception:  # noqa: BLE001 - never break a match walk
+                        reason = None
+                    census.note_refused(name, tokens, reason)
 
         def _update_best_if_valid(node, depth, key_tokens=0):
             nonlocal best_match_node
