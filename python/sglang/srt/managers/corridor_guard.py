@@ -129,7 +129,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -821,6 +821,87 @@ class _Provider:
 
 
 @dataclass
+class ProviderDelivery:
+    """What one provider PROMISED and what the driver actually gave back (#852).
+
+    THE CLASS #852 LEFT STANDING. :meth:`CorridorGuard.register` states the law
+    in its own docstring -- ``free_up_to`` "must ... return the bytes it
+    actually gave back to the DRIVER -- not to torch's cache" -- and nothing
+    measured it, so no provider could be asked whether it obeyed. #852 answered
+    that question for ONE funder by hand (the allocator cache, priced at what
+    an ``empty_cache()`` draw can return, then narrowed again by R3's
+    graph-pool term). This makes it answerable for EVERY provider, including
+    the ones nobody has suspected yet, which is the only version of the fix
+    that survives the next funder.
+
+    ``claimed_bytes`` is the sum of the providers' own return values.
+    ``delivered_bytes`` is the sum of the DRIVER's free-column delta across
+    each call -- the corridor law's own unit, and already sampled on every
+    ladder iteration before this existed.
+
+    ``observations`` is the number of times the provider was actually CALLED.
+    Zero means never measured, which is why :attr:`delivery_ratio` is ``None``
+    there rather than ``0.0``: "no probe has recorded this" and "recorded and
+    delivered nothing" are the two readings this whole ticket family exists to
+    keep apart, and a default of ``0`` is exactly how the first silently reads
+    as the second.
+    """
+
+    name: str
+    claimed_bytes: int = 0
+    delivered_bytes: int = 0
+    observations: int = 0
+    #: Passes in which the provider claimed bytes and the driver saw none.
+    #: One is an anecdote; W24's phantom ran 43 times in 21.6 minutes.
+    phantom_passes: int = 0
+    #: Law 2's memory, and it is the LAST observation, not the history. A
+    #: provider that comes good must be able to earn its credit back -- a
+    #: derate that could only ratchet down would strand a funder that started
+    #: paying, which is the seam-stickiness defect with the sign flipped.
+    last_claimed_bytes: int = 0
+    last_delivered_bytes: int = 0
+
+    @property
+    def delivery_ratio(self) -> Optional[float]:
+        """Delivered over claimed across the record, or ``None`` if unobserved.
+
+        A provider that claimed nothing but was called has nothing to be wrong
+        about, so it reads 1.0 rather than dividing by zero.
+        """
+        if self.observations == 0:
+            return None
+        if self.claimed_bytes <= 0:
+            return 1.0
+        return self.delivered_bytes / self.claimed_bytes
+
+    @property
+    def is_phantom(self) -> bool:
+        """The standing verdict, from the LAST observation only.
+
+        Deliberately not a rate over the history: the question a caller asks is
+        "should I believe this provider's next claim", and the only evidence
+        about the next claim is the most recent one.
+        """
+        return self.observations > 0 and (
+            self.last_claimed_bytes > 0 and self.last_delivered_bytes <= 0
+        )
+
+    def describe(self) -> str:
+        if self.observations == 0:
+            return f"{self.name}: never measured"
+        return (
+            f"{self.name}: claimed {self.claimed_bytes / _MIB:.0f} MiB, "
+            f"delivered {self.delivered_bytes / _MIB:.0f} MiB over "
+            f"{self.observations} pass(es)"
+            + (
+                f", {self.phantom_passes} of them phantom"
+                if self.phantom_passes
+                else ""
+            )
+        )
+
+
+@dataclass
 class GuardResult:
     """What the gate did, in bytes, so a caller can log or account for it."""
 
@@ -905,6 +986,12 @@ class CorridorGuard:
         # of CUDA_VISIBLE_DEVICES, so no rank has to be asked.
         self._fleet_probe = fleet_probe
         self._providers: List[_Provider] = []
+        #: #852 CLASS: promised-vs-delivered, per provider, for the life of the
+        #: guard. Keyed by name and created at REGISTRATION rather than at
+        #: first spend, so a provider that has never been called reads "never
+        #: measured" instead of being absent -- an absent key and a zero
+        #: delivery are the two readings this family keeps confusing.
+        self._delivery: Dict[str, ProviderDelivery] = {}
         self.arm_count = 0
         self.refuse_count = 0
         self.host_blocked_count = 0
@@ -938,6 +1025,18 @@ class CorridorGuard:
         a provider that only returns memory to the caching allocator has
         freed nothing the law can see.
 
+        THAT LAW IS NOW MEASURED RATHER THAN TRUSTED (#852). It stood here as
+        prose for the whole life of this module, and a provider that broke it
+        was credited in full: the ladder summed return values while the driver
+        delta it sampled on every iteration was discarded. Each call is now
+        recorded in :meth:`delivery_report` -- what the provider claimed
+        against what the free column actually did -- so a provider that breaks
+        the contract is NAMED on the first pass instead of after a GPU window,
+        and no judgement rests on its own account of itself. Breaking the law
+        is still not an error: the ledger reports, it does not refuse. A
+        provider that cannot measure its own delta may simply return its best
+        figure and let the guard find the truth.
+
         ``cost`` orders the spend: lower is cheaper to give up and to get
         back. Ties are resolved by registration order.
 
@@ -957,6 +1056,11 @@ class CorridorGuard:
             )
         self._providers.append(_Provider(int(tier), int(cost), str(name), free_up_to))
         self._providers.sort(key=lambda p: (p.tier, p.cost))
+        # #852: open the ledger now, so "registered but never called" is a
+        # readable state rather than a missing key. setdefault, because a
+        # re-registration under the same name must not erase what that name
+        # has already been measured doing.
+        self._delivery.setdefault(str(name), ProviderDelivery(str(name)))
         logger.info(
             "%s registered provider %r in tier %s at cost %d (device %d); "
             "spend order is now: %s",
@@ -1115,7 +1219,14 @@ class CorridorGuard:
         fleet_level = self._host_tier_permitted(column)
         host_ok = fleet_level or bool(refusal_is_fatal)
         host_forced = bool(refusal_is_fatal) and not fleet_level
-        reclaimed, free_now, used, used_host, host_blocked = self._spend_ladder(
+        (
+            reclaimed,
+            claimed,
+            free_now,
+            used,
+            used_host,
+            host_blocked,
+        ) = self._spend_ladder(
             target=target,
             free_now=free_before,
             column=column,
@@ -1125,6 +1236,15 @@ class CorridorGuard:
             reason=reason,
         )
 
+        # #852: ``reclaimed`` IS THE DRIVER'S DELTA NOW, not the sum of what
+        # the providers said. The lender was given this treatment when it was
+        # written -- "this chain has three times credited bytes that went to an
+        # allocator free-list instead of to the driver" -- and the gate was
+        # exempted on the argument that "its verdict is re-probed anyway".
+        # That argument holds for ``ok`` and fails for ``must_reclaim``, which
+        # is a SECOND verdict, decided on this number, and whose own refusal
+        # text says it judges "the DELTA and nothing else". W24 is the shape:
+        # a funder promising ~320 MiB against a free column that never moved.
         self.reclaimed_total += reclaimed
         # USER DECISION 2026-08-16: THE LAW IS ADVISORY HERE, OOM IS NOT.
         #
@@ -1270,6 +1390,28 @@ class CorridorGuard:
         # it was, because it is the truthful record of what the gate actually
         # spent. And a clean success still says nothing -- an ask that needed
         # no money does not have to explain the money it did not need.
+        # #852 CLASS: NAME THE DIVERGENCE ON THE FIRST PASS IT HAPPENS.
+        #
+        # Discovering that a funder promised ~320 MiB and delivered 0 cost W24
+        # a whole GPU window and a ticket, and the evidence was in hand at the
+        # instant of the draw. Placed HERE, at the same last-possible point as
+        # the F4 clause and for the same #853(ii) reason: every path that ends
+        # in a REFUSED, a CLEARED or a CANNOT-FULLY-HOLD line passes through
+        # this statement, and the ``must_reclaim`` branch above rebuilds
+        # ``detail`` from scratch, so anything appended earlier is lost on
+        # exactly the emission that needs it most.
+        #
+        # UNCONDITIONAL, unlike F4's clause. A CLEARED pass that spent a
+        # phantom provider is the case that HIDES this defect -- W25 cleared
+        # its way to 8 phantom_capacity readings and a TP-sticky instance --
+        # so a report gated on refusal would go quiet precisely where the
+        # ladder is being lied to and getting away with it. It costs nothing
+        # on an honest ladder: the clause is empty unless a provider this pass
+        # claimed bytes the driver did not see.
+        #
+        # Appended, never substituted: the ladder's own list stays the truthful
+        # record of what the gate spent.
+        detail += self._phantom_clause(used)
         if not ok or law_breached:
             named = self._offledger_detail(want)
             if named:
@@ -1339,11 +1481,21 @@ class CorridorGuard:
 
         ``max_tier`` may terminate the loop rather than skip, because
         ``_providers`` is kept sorted by ``(tier, cost)``.
+
+        RETURNS DELIVERED AND CLAIMED, SEPARATELY (#852). The loop already
+        re-probed the driver after every provider -- to decide when to stop --
+        and then discarded the delta, which is the one number the corridor law
+        is written in. Summing the providers' own return values instead is how
+        this ladder credited bytes that went to an allocator free-list, and the
+        ``must_reclaim`` branch DECIDES on that sum. Both figures now leave
+        here: the delivered one for every judgement, the claimed one so a
+        divergence can be NAMED rather than silently absorbed.
         """
         used: List[str] = []
         used_host = False
         host_blocked = False
         reclaimed = 0
+        claimed_total = 0
         for provider in self._providers:
             if free_now >= target:
                 break
@@ -1384,16 +1536,85 @@ class CorridorGuard:
                 )
                 continue
             if got <= 0:
+                # A provider that declined was still ASKED. Recording the pass
+                # with a zero claim keeps "asked and had nothing" apart from
+                # "never asked", and only the second is an unmeasured post.
+                self._record_delivery(provider.name, claimed=0, delivered=0)
                 continue
-            reclaimed += got
+            claimed_total += got
             used.append(provider.name)
             # Re-probe rather than trusting the provider's arithmetic: the
             # law is what the DRIVER reports, and a provider that returns
             # its payload size while the pages went to torch's cache has
             # freed nothing the corridor can see.
+            free_before_provider = free_now
             free_now = self.free_bytes()
+            # #852: THE DELTA WAS ALWAYS HERE, AND WAS ALWAYS THROWN AWAY.
+            # A fall between the probes -- another process taking memory
+            # mid-ladder -- reads as 0 rather than as a negative, matching the
+            # rule ``lend_to_level`` already applies to its own figure; a
+            # negative credit would make the running total lie in the other
+            # direction. The converse caveat is the lender's too and is stated
+            # there: the delta credits this provider with anything another
+            # process happened to release in the same interval, so it
+            # over-reports in the PERMISSIVE direction, never the suppressive
+            # one. That asymmetry is deliberate -- an under-reporting ladder
+            # would refuse relief that was really available and make the flip
+            # stickier, which is the defect #852 exists to remove.
+            delivered = max(0, free_now - free_before_provider)
+            reclaimed += delivered
+            self._record_delivery(provider.name, claimed=got, delivered=delivered)
 
-        return reclaimed, free_now, used, used_host, host_blocked
+        return reclaimed, claimed_total, free_now, used, used_host, host_blocked
+
+    def _record_delivery(self, name: str, *, claimed: int, delivered: int) -> None:
+        """One observation into the promised-vs-delivered ledger (#852)."""
+        rec = self._delivery.setdefault(name, ProviderDelivery(name))
+        rec.observations += 1
+        rec.claimed_bytes += int(claimed)
+        rec.delivered_bytes += int(delivered)
+        rec.last_claimed_bytes = int(claimed)
+        rec.last_delivered_bytes = int(delivered)
+        if claimed > 0 and delivered <= 0:
+            rec.phantom_passes += 1
+
+    def delivery_report(self) -> Dict[str, ProviderDelivery]:
+        """What every registered provider PROMISED against what it DELIVERED.
+
+        The answer #852 could give for one funder only, made askable of all of
+        them. Includes providers that have never been called -- their record
+        reads ``observations == 0`` and ``delivery_ratio is None``, which is
+        the honest "never measured", not a zero.
+        """
+        return dict(self._delivery)
+
+    def _phantom_clause(self, used: Sequence[str]) -> str:
+        """The sentence W24 cost a GPU window to discover, priced at nothing.
+
+        EDGE-TRIGGERED ON DIVERGENCE, and scoped to the providers this pass
+        actually spent. A clause that fires on every pass is a clause nobody
+        reads, and the honest ladder is the common case.
+        """
+        parts = []
+        for name in used:
+            rec = self._delivery.get(name)
+            if rec is None or not rec.is_phantom:
+                continue
+            parts.append(
+                f"{name} claimed {rec.last_claimed_bytes / _MIB:.0f} MiB and "
+                f"delivered only {rec.last_delivered_bytes / _MIB:.0f} MiB to "
+                f"the driver (phantom on {rec.phantom_passes} of "
+                f"{rec.observations} passes)"
+            )
+        if not parts:
+            return ""
+        return (
+            "; PHANTOM CAPACITY: "
+            + "; ".join(parts)
+            + ". The corridor law is stated in the driver's free column, so a "
+            "release that only reached torch's cache funds nothing this gate "
+            "can spend"
+        )
 
     # -- item 16's first relief stage --------------------------------------
 
@@ -1448,7 +1669,7 @@ class CorridorGuard:
         # user order, and the lender runs precisely when the fleet is UNLEVEL,
         # which is the one state in which host RAM is forbidden.
         ceiling = min(int(max_tier), RELIEF_PARK)
-        claimed, free_now, used, _used_host, _blocked = self._spend_ladder(
+        _delivered, claimed, free_now, used, _used_host, _blocked = self._spend_ladder(
             target=target,
             free_now=free_before,
             column=list(column),
