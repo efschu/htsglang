@@ -49,6 +49,36 @@ seam is the #630 wedge shape and this runs with requests parked.
 It refuses loudly without the canonical store. Writing pages named by this
 phase's geometry, at the seam of a phase change, would buy exactly nothing:
 the other phase cannot name them. Better to say so than to spend the IO.
+
+#872, MEASURED 2026-08-26 (R7, ``boot_accept0826r7fix_0826_1817.log``): the
+ticket's symptom -- "retention fires at the seam but nothing reaches the
+store" -- is REFUTED for the shipped configuration, and the paragraph above is
+the reason the wrong conclusion was easy to reach. It describes the
+``write_back`` policy; the live boot runs ``hicache_write_policy='write_through'``,
+under which the ORDINARY insert path already carries a node all the way to the
+store: ``_inc_hit_count`` -> ``write_backup`` -> ack -> ``_finish_write_through_ack``
+-> ``write_backup_storage`` (``unified_radix_cache.py:2328``, the sole caller
+of that method inside the tree). So by the time the fence runs, most eligible
+nodes are ``backuped`` AND already persisted, and the fence's ``already_staged``
+skip below is a correct idempotent no-op rather than a lost prefix.
+
+``already_staged`` implies "was offered to the store" because ``backuped`` --
+``component_data[FULL].host_value is not None`` -- has only three writers:
+``full_component.py:340`` (the BACKUP_HOST commit, i.e. ``write_backup``,
+which acks into ``write_backup_storage``), ``full_component.py:100-103`` (a
+node SPLIT, which re-slices host indices whose per-page keys are already in
+the store at ``page_size == 1``), and ``unified_radix_cache.py:1764`` (the
+host-only insert of a prefetch, whose bytes came OUT of the store). None of
+the three can produce a host copy the store never saw.
+
+The three measurements that close it, all from the R7 window (18:17-18:28):
+24277 canonical pages written under ``/tmp/hicache_783``; all 16 attention
+slots non-zero in 400 of 400 sampled pages, so the pages are COMPLETE rather
+than PP-stage slices; and 126 of 264 storage prefetches returned
+``completed_local=4096``, so the keys written are the keys the read side asks
+for. What remains of the fence's own failure surface is the silent zero
+counted as ``refused_silently`` below -- 3 node visits of 408 in that same
+window (96 fence lines: 210 staged, 195 already staged, 3 unaccounted).
 """
 
 from __future__ import annotations
@@ -81,6 +111,16 @@ class FlipWritebackReport:
     outstanding: int  # storage backups still in flight when time ran out
     elapsed_s: float
     deadline_s: float
+    # #872: nodes the loop actually HANDED to `write_backup` and that came back
+    # falsy. Appended with a default so every existing constructor keeps
+    # working; see the counter's own comment at the call site for why a plain
+    # `if written:` made this population indistinguishable from "nothing to do".
+    refused_silently: int = 0
+    # Of those, the share attributable to the #581/#773 mamba write-through pin
+    # budget, read from the tree's own monotone counter. -1 when the tree does
+    # not carry that counter, which is NOT the same as zero and must not be
+    # printed as zero.
+    refused_mamba_pin: int = -1
 
     @property
     def complete(self) -> bool:
@@ -106,19 +146,40 @@ class FlipWritebackReport:
 
         DELIBERATELY NARROW: true only when NEITHER route survives -- no storage
         acknowledgement AND no pre-existing host copy. A fence that acked
-        nothing but left `already_staged` nodes behind is NOT claimed here; that
-        host copy may still serve the read-through, and that case already draws
-        the "deadline reached with backups still in flight" warning. Widening
-        this to cover it would double-report one condition and make a
-        crying-wolf gate out of the instrument built to replace one.
+        nothing but left `already_staged` nodes behind is NOT claimed here.
+
+        #872 2026-08-26 -- THE REASON GIVEN FOR THAT NARROWING WAS WRONG, while
+        the narrowing itself was right. The old wording was "that host copy may
+        still serve the read-through", which this module's own opening
+        paragraphs refute: the host tier mirrors the pool that built it, so
+        after the cutover it is not the live pool and cannot serve anything.
+        The correct reason is stronger and is proved in the module docstring:
+        under every writer of `backuped`, an `already_staged` node has ALREADY
+        been offered to the store, so a fence that finds only such nodes has
+        lost nothing and has nothing to do. Widening this to cover it would
+        double-report one condition and make a crying-wolf gate out of the
+        instrument built to replace one.
+
+        `refused_silently` is deliberately NOT part of this predicate. It names
+        a population the fence tried and failed to persist, which is a real
+        loss, but a fence can carry a silent refusal and still have persisted
+        everything else -- reporting that whole fence as having persisted
+        nothing would be the same conflation in the other direction.
         """
         return self.acknowledged == 0 and self.already_staged == 0
 
     def as_log(self) -> str:
+        # `refused_mamba_pin` prints `?` rather than 0 when the tree carries no
+        # such counter: an unmeasured share and a measured zero are different
+        # facts and a log line that spells them the same way is the #872 probe
+        # failure one level up.
+        mamba = "?" if self.refused_mamba_pin < 0 else str(self.refused_mamba_pin)
         return (
             f"eligible={self.eligible} staged={self.staged} "
             f"already_staged={self.already_staged} acked={self.acknowledged} "
             f"outstanding={self.outstanding} "
+            f"refused_silently={self.refused_silently} "
+            f"refused_mamba_pin={mamba} "
             f"elapsed={self.elapsed_s:.3f}s/{self.deadline_s:.3f}s"
         )
 
@@ -185,6 +246,21 @@ def _hashed_nodes(tree_cache: Any) -> list:
     return out
 
 
+def _mamba_pin_skipped(tree_cache: Any) -> int:
+    """The tree's monotone #581/#773 pin-budget refusal counter, or -1.
+
+    -1 means UNMEASURED, and the caller must keep it distinguishable from 0 all
+    the way into the log line. A probe whose miss path returns what a healthy
+    zero returns is the exact defect #872 was opened for one level down, in
+    ``_await_storage_acks``; repeating it here to save a sentinel would be
+    building the same blind spot on purpose.
+    """
+    value = getattr(tree_cache, "_mamba_pin_skipped", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
+    return value
+
+
 def flip_writeback(
     tree_cache: Any,
     *,
@@ -215,6 +291,8 @@ def flip_writeback(
     staged = 0
     already = 0
     skipped_unbacked_parent = 0
+    refused_silently = 0
+    mamba_pin_before = _mamba_pin_skipped(tree_cache)
     for node in nodes:
         if getattr(node, "backuped", False):
             already += 1
@@ -223,7 +301,8 @@ def flip_writeback(
         # "the parent is in this same list, earlier, so the invariant holds
         # by construction", and staged the child regardless with
         # write_back=True -- which ALSO disarms write_backup's own parent gate
-        # at unified_radix_cache.py:1943-1948. Both halves of that reasoning
+        # at unified_radix_cache.py:2129-2134 (cited as :1943-1948 until
+        # 2026-08-26; that range is an LRU helper and always was). Both halves
         # fail: an unhashed parent is never in the list at all (see
         # _hashed_nodes), and a parent that IS in the list can still have had
         # its own write_backup refused a moment earlier -- the mamba pin
@@ -252,6 +331,35 @@ def flip_writeback(
             continue
         if written:
             staged += 1
+        else:
+            # #872 THE SILENT ZERO. `write_backup` has SEVEN paths that return
+            # a bare 0 without raising and without logging -- in
+            # `unified_radix_cache.py`: no controller (:2111), the #581/#773
+            # mamba write-through pin budget (:2125), the write-through parent
+            # recursion (:2131, unreachable from here because write_back=True),
+            # the #639/#645 rank-uniform host floor (:2210), an `evict_host`
+            # that freed less than `needed` (:2215), the #810 staging-ring
+            # refusal (:2226), and a `cache_controller.write` that returned
+            # None (:2234). Every one of them means THIS node will not cross
+            # the flip: it has no host copy, so there is nothing for
+            # `write_backup_storage` to read, and the tree is dropped at the
+            # cutover regardless.
+            #
+            # `if written: staged += 1` alone discarded that verdict, so a node
+            # the fence TRIED and FAILED to persist counted exactly like a node
+            # the fence never had to touch. That is the #872 probe failure --
+            # a miss path that returns what a healthy no-op returns -- one
+            # level up from the drain lookup below, and it is why the R7 lines
+            # `eligible=9 staged=0 already_staged=8` needed subtraction to be
+            # read at all: 3 of 96 fence lines, one node each, out of 408
+            # eligible node visits in that boot.
+            #
+            # Counted, never repaired: there is no fallback to reach for. The
+            # store write reads `host_value`, which is exactly what the refusal
+            # withheld, so staging this node anyway would mean writing bytes
+            # whose host state does not exist. An honest skip with a named line
+            # is the whole of the correct behaviour here.
+            refused_silently += 1
     if skipped_unbacked_parent:
         logger.info(
             "%s skipped %d node(s) whose parent carries no host copy; staging "
@@ -259,6 +367,26 @@ def flip_writeback(
             "the idle path.",
             LOG_PREFIX,
             skipped_unbacked_parent,
+        )
+
+    mamba_pin_after = _mamba_pin_skipped(tree_cache)
+    if mamba_pin_before < 0 or mamba_pin_after < 0:
+        refused_mamba_pin = -1
+    else:
+        refused_mamba_pin = max(0, mamba_pin_after - mamba_pin_before)
+    if refused_silently:
+        logger.warning(
+            "%s #872 %d node(s) were handed to write_backup and refused "
+            "without raising; those prefixes have no host copy, so nothing "
+            "can be written to the store for them and they are lost when the "
+            "tree is dropped at the cutover. Attributable to the mamba "
+            "write-through pin budget: %s. The other refusal paths are the "
+            "rank-uniform host floor (unified_radix_cache.py:2210), a short "
+            "evict_host (:2215), the staging ring (:2226) and a host write "
+            "that returned None (:2234).",
+            LOG_PREFIX,
+            refused_silently,
+            "unmeasured" if refused_mamba_pin < 0 else refused_mamba_pin,
         )
 
     # Complete the device->host copies. This is also what triggers the
@@ -280,6 +408,8 @@ def flip_writeback(
         outstanding=outstanding,
         elapsed_s=now() - started,
         deadline_s=float(deadline_s),
+        refused_silently=refused_silently,
+        refused_mamba_pin=refused_mamba_pin,
     )
     if report.complete:
         logger.info("%s %s", LOG_PREFIX, report.as_log())
