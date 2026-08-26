@@ -683,12 +683,33 @@ def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) 
     the wrong-layer write, i.e. converts the loud direction into the quiet one.
     It is the one fix shape that makes the defect harder to find.
 
-    REFUSAL, NEVER A REMAP OR A CLAMP. A remap would be correct only if the copy
-    covered every layer the destination needs, and rank-locally under PP it
-    cannot: 18 of 64 layers restored leaves 46 stale. The KV head sharding also
+    REFUSAL, NEVER A CLAMP -- and the reason stated here was WRONG on one leg
+    until #875 put it on trial. It used to read "the KV head sharding also
     differs between the phases (PP holds all heads of its stage, TP a head shard
-    of every layer), so even the overlapping entries are not interchangeable.
-    A refusal costs one recompute.
+    of every layer), so even the overlapping entries are not interchangeable".
+    That is FALSE on this rig: under #345 uneven-DCP replication the
+    full-attention cache is TOKEN-sharded and every rank stores the FULL,
+    replicated kv-heads (model_runner_kv_cache_mixin.py:3155-3160; the boot line
+    at :3228 prints `get_total_num_kv_heads()`), and the PP pool takes
+    `get_num_kv_heads(attn_tp_size)` with `attn_tp_size == 1` -- the same total.
+    Identical widths. The entries ARE interchangeable, and a comment claiming
+    otherwise would have kept the next reader from looking.
+
+    The surviving leg is narrower than it sounded: a remap needs every layer the
+    destination holds, and RANK-LOCALLY under PP it cannot have them -- 8 of 16
+    on this rig's `pp_attn_stage_ratio`. But the union over the three PP stages
+    IS every layer, and PP holds all tokens, so the data exists on a peer. The
+    honest statement is therefore "a RANK-LOCAL remap is impossible", not "a
+    remap is impossible".
+
+    WHY THIS STILL REFUSES rather than carrying: a carry needs a collective, and
+    it needs TWO of them -- the layer axis (this one) and the TOKEN axis, where
+    PP holds every token at allocator slots while TP holds an owner-rule SUBSET
+    at compacted rows (layers/dcp/owner.py:159). The layer half is built and
+    proven in `seam_layer_carry.py`; the token half is not, and a layer-correct
+    token-wrong carry is the "matching row ids, mismatched widths" corruption
+    #719 already walked into. Until then a refusal costs one recompute, which is
+    the cheaper of the two wrong answers.
 
     Called BEFORE the first store, so a refused copy leaves the pool
     byte-identical -- `check_cpu_copy_rows`'s rule, for its reason: a guard that
