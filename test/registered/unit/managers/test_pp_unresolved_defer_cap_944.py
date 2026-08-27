@@ -219,6 +219,9 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
         return PPAdmissionCongruenceGuard(**kw)
 
     def _defer_once(self, guard, rid=RID):
+        """A LAP that arrives -- i.e. the healthy case. Still exercised,
+        because when the ring turns this is how the population gets its NAME
+        (`unresolved_rounds`). It is no longer how the bound is reached."""
         guard.record_return_trip(
             _decision(
                 512,
@@ -230,6 +233,21 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
                 unresolved=True,
             )
         )
+
+    def _reoffer(self, guard, n, rid=RID, candidate=4096):
+        """#944b DRIVE THE BOUND THE WAY PRODUCTION DOES: PP0 re-offers the
+        same rid the same length, pass after pass, and NOTHING comes back.
+
+        These sites previously reached the cap by calling `record_return_trip`
+        -- i.e. by handing the guard the very delivery whose absence is the
+        defect. The live boot of 2026-08-27 showed that delivery never happens
+        on a voided pass (the void blocks the ring), so the old trigger was
+        unreachable in production while these tests were green. INVERTED
+        DELIBERATELY, reasoning recorded, nothing deleted: the behaviour under
+        test (a non-progressing offer must be bounded) is unchanged; only what
+        drives it moved off the wire and onto PP0's own local observation.
+        """
+        return [guard.prefix_len_for(rid, candidate) for _ in range(n)]
 
     def test_below_the_cap_the_offer_is_not_clamped(self):
         g = self._guard()
@@ -244,8 +262,8 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_at_the_cap_the_offer_is_pinned_to_zero(self):
         g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP):
-            self._defer_once(g)
+        offers = self._reoffer(g, UNRESOLVED_DEFER_CAP)
+        self.assertEqual(offers, [4096] * UNRESOLVED_DEFER_CAP, "not yet capped")
         self.assertEqual(
             g.prefix_len_for(RID, 4096),
             0,
@@ -255,8 +273,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_the_escalation_is_loud_and_names_the_four_lookup_locations(self):
         g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP):
-            self._defer_once(g)
+        self._reoffer(g, UNRESOLVED_DEFER_CAP)
         catcher = _Catcher(logging.ERROR)
         log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
         log.addHandler(catcher)
@@ -280,8 +297,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_the_escalation_fires_once_not_once_per_offer(self):
         g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP):
-            self._defer_once(g)
+        self._reoffer(g, UNRESOLVED_DEFER_CAP)
         catcher = _Catcher(logging.ERROR)
         log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
         log.addHandler(catcher)
@@ -299,8 +315,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_a_served_rid_forgets_both_the_floor_and_the_count(self):
         g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP):
-            self._defer_once(g)
+        self._reoffer(g, UNRESOLVED_DEFER_CAP)
         self.assertEqual(g.prefix_len_for(RID, 4096), 0)
         g.record_return_trip(_decision(0, admitted=True))
         self.assertEqual(
@@ -342,8 +357,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_the_cap_is_disableable_and_that_restores_the_pre_944_shape(self):
         g = self._guard(unresolved_defer_cap=0)
-        for _ in range(UNRESOLVED_DEFER_CAP + 5):
-            self._defer_once(g)
+        self._reoffer(g, UNRESOLVED_DEFER_CAP + 5)
         self.assertEqual(
             g.prefix_len_for(RID, 4096),
             4096,
@@ -354,8 +368,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
 
     def test_the_count_is_per_rid(self):
         g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP):
-            self._defer_once(g, rid="rid-a")
+        self._reoffer(g, UNRESOLVED_DEFER_CAP, rid="rid-a")
         self.assertEqual(g.prefix_len_for("rid-a", 4096), 0)
         self.assertEqual(g.prefix_len_for("rid-b", 4096), 4096)
 
@@ -365,11 +378,90 @@ class TheBoundActuallyTerminates(unittest.TestCase):
     real PP0 guard against the real downstream reconcile, with the lookup
     permanently blinded, and requires the pass to run."""
 
-    def _round(self, guard, candidate):
+    def _round(self, guard, candidate, deliver=True):
+        """One pass. `deliver=False` models THE BROKEN RING, which is not a
+        hypothetical: the void that must be counted is carried home by the
+        output lap, and the same void parks a middle rank in
+        `_pp_drain_voided_proxy`, so on the live rig the lap does not arrive
+        (measured 2026-08-27: 4010 UNRESOLVED, 0 escalations, told frozen at
+        8192 for 8023 lines).
+
+        The first version of this test always delivered, which is why it
+        passed while the shipped bound was dead code -- A TEST THAT SUPPLIES
+        THE DELIVERY UNDER QUESTION CANNOT TEST THAT DELIVERY.
+        """
         told = guard.prefix_len_for(RID, candidate)
         effective, amended = _reconcile(told, None)
-        guard.record_return_trip(amended)
+        if deliver:
+            guard.record_return_trip(amended)
         return told, effective
+
+    def test_the_bound_holds_with_the_RING_BROKEN(self):
+        """#944b THE REGRESSION THE LIVE BOOT FOUND, as a desk test.
+
+        No lap is ever delivered -- `record_return_trip` is never called, which
+        is the measured live condition. The bound must still terminate, because
+        a bound that needs the ring cannot end a failure that stops the ring.
+        """
+        g = PPAdmissionCongruenceGuard()
+        tolds, served_at = [], None
+        for i in range(UNRESOLVED_DEFER_CAP + 5):
+            told, effective = self._round(g, 4096, deliver=False)
+            tolds.append(told)
+            if RID in effective:
+                served_at = i
+                break
+        self.assertIsNotNone(
+            served_at,
+            f"THE 2026-08-27 LIVE FAILURE, reproduced: told never moved and "
+            f"nothing was ever served -- {tolds}. A lap-fed counter reads 0 "
+            f"exactly when the ring is broken, which is when it must not.",
+        )
+        self.assertEqual(tolds[-1], 0, f"the terminator is told=0: {tolds}")
+        self.assertEqual(
+            g.unresolved_rounds(RID),
+            0,
+            "and it terminated with the LAP-FED counter still at zero -- proof "
+            "the bound did not lean on the return trip",
+        )
+        self.assertGreater(g.offer_streak(RID), 0)
+
+    def test_the_630_SHORTFALL_loop_is_bounded_too_when_the_ring_is_broken(self):
+        """SIBLING SWEEP RESULT (#630, the THIRD instance of the class).
+
+        `_learned_floor` is the other thing `record_return_trip` writes, and it
+        is written on the LEARN side -- so #630's termination argument ("every
+        new retraction sets the floor strictly below the told that just
+        failed") holds only while laps arrive. With the ring broken, a genuine
+        MEASURED shortfall re-offers the identical told for ever, exactly like
+        the unresolved one did. Same class, different population.
+
+        It needs no separate fix, and that is the point of counting the OFFER
+        rather than the reported round: the streak does not care WHY the offer
+        stopped moving. This test is the proof that the class fix covers the
+        sibling, not just the instance that was reported.
+        """
+        g = PPAdmissionCongruenceGuard()
+        tolds = []
+        for _ in range(UNRESOLVED_DEFER_CAP + 3):
+            told = g.prefix_len_for(RID, 4096)
+            tolds.append(told)
+            # A real, MEASURED shortfall (not a miss): local=128 < told. No lap
+            # is delivered, so the floor is never learned.
+            _reconcile(told, 128)
+            if told == 0:
+                break
+        self.assertEqual(
+            tolds[-1],
+            0,
+            f"a measured shortfall whose lesson never gets home must be "
+            f"bounded by the same lap-free streak: {tolds}",
+        )
+        self.assertIsNone(
+            g.learned_floor(RID),
+            "and it terminated with NO floor learned -- proving the bound and "
+            "the #630 floor are independent mechanisms",
+        )
 
     def test_a_permanently_unresolvable_rid_is_served_within_the_cap(self):
         g = PPAdmissionCongruenceGuard()

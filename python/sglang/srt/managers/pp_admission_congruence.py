@@ -347,10 +347,47 @@ class PPAdmissionCongruenceGuard:
         #: `defer_limit` carries, so a can-fail proof can take the cap down on
         #: its own without taking the sentinel down with it.
         self._unresolved_defer_cap = int(unresolved_defer_cap)
+        #: #944b THE LAP-FREE BOUND: rid -> (told last offered, how many
+        #: CONSECUTIVE passes that identical told has been offered).
+        #:
+        #: WHY THIS EXISTS AND `_unresolved_rounds` DOES NOT SUFFICE, measured
+        #: on the live rig 2026-08-27: `_unresolved_rounds` is fed by
+        #: `record_return_trip`, which is fed by a RING LAP -- the void output
+        #: carrying the chain-reconciled decision home
+        #: (`scheduler_pp_mixin.py:6357` -> `_pp_void_output_payload:6394` ->
+        #: `pp_output_payload_with_return_trip:1060`, absorbed at
+        #: `_pp_absorb_void_output:6414` -> `pp_absorb_admission_return:6473`).
+        #: THE VOID THAT MUST BE COUNTED IS THE SAME EVENT THAT BLOCKS THE LAP:
+        #: the voided pass parks a middle rank in `_pp_drain_voided_proxy`
+        #: (blocking `_pp_recv_typed_dict`), so the output never completes the
+        #: ring, PP0 never absorbs, the guard never learns, and the cap never
+        #: arms. Measured: 4010 UNRESOLVED, 0 UNRESOLVABLE, ONE rid, 8023 lines,
+        #: `told=8192` on every one of them -- the offer never moved.
+        #:
+        #: So the bound may not depend on ANY downstream fact. This one is
+        #: derived entirely from what PP0 itself does: it re-offered the same
+        #: rid the same length again. That observation needs no peer, no lap and
+        #: no collective, which is exactly why it survives the failure it is
+        #: meant to bound.
+        self._offer_streak: Dict[str, Tuple[int, int]] = {}
 
     def unresolved_rounds(self, rid: str) -> int:
-        """#944 diagnostic/test hook: consecutive unresolved rounds for `rid`."""
+        """#944 diagnostic/test hook: consecutive unresolved rounds for `rid`.
+
+        LAP-FED, so it reads 0 exactly when the ring is broken -- which is when
+        it would matter most. Kept because it NAMES the population correctly
+        when laps do arrive; it is no longer what bounds anything. See
+        `offer_streak`.
+        """
         return self._unresolved_rounds.get(rid, 0)
+
+    def offer_streak(self, rid: str) -> int:
+        """#944b diagnostic/test hook: consecutive identical re-offers of `rid`.
+
+        The LAP-FREE counter that actually bounds the loop. Reads 0 for a rid
+        that has never been offered or whose offer just changed.
+        """
+        return self._offer_streak.get(rid, (None, 0))[1]
 
     def learned_floor(self, rid: str) -> Optional[int]:
         """Diagnostic/test hook: the outstanding floor for `rid`, or None.
@@ -372,11 +409,39 @@ class PPAdmissionCongruenceGuard:
         not constrained by this guard at all).
 
         #944 ESCALATION, AND IT IS DECIDED HERE BECAUSE ONLY PP0 CAN ACT ON IT.
-        A rid that has come back UNRESOLVED `UNRESOLVED_DEFER_CAP` times in a
-        row is pinned to `told=0` and refused loudly, once. Downstream ranks
-        observe the miss but cannot fix it -- they do not choose `told`, and a
-        rank that rewrote the geometry mid-ring would be the instr20 crash --
-        so the report rides the wire and the single decision is taken here.
+        A rid PP0 has re-offered the SAME `told` for more than
+        `UNRESOLVED_DEFER_CAP` consecutive passes is pinned to `told=0` and
+        refused loudly, once. Downstream ranks observe the miss but cannot fix
+        it -- they do not choose `told`, and a rank that rewrote the geometry
+        mid-ring would be the instr20 crash -- so the single decision is here.
+
+        #944b THE TRIGGER IS PP0'S OWN RE-OFFER, NOT A REPORTED ROUND COUNT,
+        and that correction is the whole lesson of the 2026-08-27 acceptance
+        boot. The first version counted `_unresolved_rounds`, fed by
+        `record_return_trip`, fed by a RING LAP. But the lap is carried by the
+        void output, and the void parks a middle rank in
+        `_pp_drain_voided_proxy` -- so the event that must be counted is the
+        same event that stops the counting. Measured: 4010 UNRESOLVED lines, 0
+        escalations, one rid, `told=8192` on all 8023 of its lines. The bound
+        was dead code on precisely the path it was built for, which is the
+        #939 class ("a compensator made unreachable by the refusal it exists to
+        compensate") for the second time.
+
+        A RE-OFFER IS OBSERVABLE WITHOUT ANY PEER. PP0 already knows what it
+        told last pass and what it is about to tell now; if those are equal
+        again and again, the loop is not progressing, and that is true whoever
+        broke the ring and whether or not anything ever comes back. Any bound
+        that needs a downstream fact needs a lap, and the lap is the thing the
+        defect breaks -- so a lap-free trigger is not a convenience here, it is
+        the only kind that can work.
+
+        IT DOES NOT MISFIRE ON THE #630 SHORTFALL PATH. A genuine shortfall
+        learns a floor, and `_learned_floor` makes the next `told` STRICTLY
+        SMALLER (see this class's termination argument above), so the streak
+        resets on every healthy retraction and never reaches the cap. Only a
+        `told` that stops moving -- which is exactly the non-progressing case --
+        can accumulate. `_unresolved_rounds` is kept as the population NAME and
+        as corroboration when laps do arrive; it no longer bounds anything.
 
         WHY told=0 WHEN THIS CLASS'S OWN DOCSTRING REJECTS A told=0 PIN. It
         rejects it as the GENERAL policy for an ordinary shortfall, where
@@ -390,32 +455,49 @@ class PPAdmissionCongruenceGuard:
         after three voided rounds; the alternative is the unbounded re-offer,
         which is the #858 livelock shape.
         """
-        if self._unresolved_defer_cap > 0:
-            rounds = self._unresolved_rounds.get(rid, 0)
-            if rounds >= self._unresolved_defer_cap:
-                if rid not in self._escalated:
-                    self._escalated.add(rid)
-                    logger.error(
-                        "#944 PP-ADMISSION UNRESOLVABLE rid=%s: %d consecutive "
-                        "rounds in which no PP rank could locate this request "
-                        "in any of the four places a request can live -- the "
-                        "waiting queue, `chunked_req`, the named slot's "
-                        "chunked req, or the running batch. No rank measured a "
-                        "prefix, so no floor can be learned and the offer "
-                        "cannot be damped by measurement. Offering told=0 "
-                        "instead: it is honourable without a measurement, so "
-                        "the pass runs, at the cost of this request's prefix "
-                        "reuse for one pass. If this line repeats for many "
-                        "rids, the lookup chain has a FIFTH gap and that is "
-                        "the bug -- not this refusal.",
-                        rid,
-                        rounds,
-                    )
-                return 0
         floor = self._learned_floor.get(rid)
-        if floor is None:
-            return candidate_prefix_len
-        return min(candidate_prefix_len, floor)
+        told = (
+            candidate_prefix_len if floor is None else min(candidate_prefix_len, floor)
+        )
+        if self._unresolved_defer_cap <= 0:
+            return told
+
+        # Count THIS offer before deciding on it: the streak is "how many
+        # passes in a row have proposed this exact length", so the offer being
+        # made now is part of it.
+        prev_told, streak = self._offer_streak.get(rid, (None, 0))
+        streak = streak + 1 if prev_told == told else 1
+        self._offer_streak[rid] = (told, streak)
+
+        # `told <= 0` is already the terminator, so a rid sitting at 0 is
+        # progressing by definition and must never be "escalated" to 0 again.
+        if told <= 0 or streak <= self._unresolved_defer_cap:
+            return told
+
+        if rid not in self._escalated:
+            self._escalated.add(rid)
+            logger.error(
+                "#944 PP-ADMISSION UNRESOLVABLE rid=%s: this rank has offered "
+                "the SAME prefix length (told=%d) for %d consecutive passes "
+                "without the request ever being served. Reported unresolved "
+                "rounds for it: %d -- if that is 0 while this streak is not, "
+                "the return trip is not completing, which is the ring being "
+                "blocked by the very void this bound exists to end. No rank "
+                "could locate the request in any of the four places one can "
+                "live -- the waiting queue, `chunked_req`, the named slot's "
+                "chunked req, or the running batch -- so no rank measured a "
+                "prefix, no floor can be learned, and the offer cannot be "
+                "damped by measurement. Offering told=0 instead: it "
+                "is honourable without a measurement, so the pass runs, at the "
+                "cost of this request's prefix reuse for one pass. If this "
+                "line repeats for many rids, the lookup chain has a FIFTH gap "
+                "and that is the bug -- not this refusal.",
+                rid,
+                told,
+                streak,
+                self._unresolved_rounds.get(rid, 0),
+            )
+        return 0
 
     def record_return_trip(self, decision: PPAdmissionDecision) -> None:
         """Consume a fully chain-reconciled decision on its way back to PP0.
@@ -487,6 +569,13 @@ class PPAdmissionCongruenceGuard:
                 # rid genuinely becomes unresolvable a second time.
                 self._unresolved_rounds.pop(entry.rid, None)
                 self._escalated.discard(entry.rid)
+                # #944b The lap-free streak clears here TOO, and only here.
+                # The asymmetry is deliberate and is the point: the INCREMENT
+                # must survive a broken ring (so it is lap-free), the CLEAR
+                # only has to work when the ring turns -- and a pass that
+                # actually served the rid is, by construction, a pass on which
+                # it turned.
+                self._offer_streak.pop(entry.rid, None)
 
     def outstanding_rids(self) -> Tuple[str, ...]:
         """Diagnostic/test hook: rids currently carrying a learned floor."""

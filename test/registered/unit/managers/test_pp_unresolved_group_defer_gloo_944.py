@@ -155,7 +155,7 @@ class _Catcher(logging.Handler):
         self.records.append(record)
 
 
-def _worker(rank, init_file, out_dir, scenario, mutant):
+def _worker(rank, init_file, out_dir, scenario, mutant, deliver=True):
     """One PP rank. Drives `rounds` full ring laps of ONE rid, where PP1 (and,
     under scenario 'all', every rank) can never resolve it."""
     from sglang.srt.managers import pp_admission_congruence as pac
@@ -240,16 +240,21 @@ def _worker(rank, init_file, out_dir, scenario, mutant):
                 # wire codec they use, are the shipped functions. Only the
                 # transport under them stands in for the output ring.
                 msg = wire.recv_tensor_dict(src=PP2)
-                # Decoded once for observation, then handed to the shipped
-                # absorber -- which POPS the payload, so the order matters and
-                # the copy is not decoration.
+                # Decoded once for observation. Whether the shipped absorber
+                # then runs is THE VARIABLE OF THIS FILE (see `deliver`).
                 returned = spm_mod.pp_admission_decision_from_wire(dict(msg))
-                self_took = spm_mod.pp_absorb_admission_return(h, msg)
-                if not self_took:
-                    raise AssertionError(
-                        "the shipped absorber refused the return trip; the "
-                        "guard never learns and nothing below means anything"
-                    )
+                if deliver:
+                    if not spm_mod.pp_absorb_admission_return(h, msg):
+                        raise AssertionError(
+                            "the shipped absorber refused the return trip"
+                        )
+                # deliver=False IS THE MEASURED LIVE CONDITION, not a
+                # hypothetical: the lap is carried by the void output, and the
+                # void parks a middle rank in `_pp_drain_voided_proxy`, so on
+                # a permanently-voiding pass PP0 never absorbs anything. The
+                # first version of this file always delivered -- it handed the
+                # guard the very input whose delivery was in question, which is
+                # why it was green while the shipped bound was dead code.
                 entry = returned.entries[0]
                 res.setdefault("wire", []).append(
                     {
@@ -322,12 +327,14 @@ def _worker(rank, init_file, out_dir, scenario, mutant):
                     pass
 
 
-def _run(scenario, mutant=False):
+def _run(scenario, mutant=False, deliver=True):
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmp:
         init_file = os.path.join(tmp, "pg_init")
         procs = [
-            ctx.Process(target=_worker, args=(r, init_file, tmp, scenario, mutant))
+            ctx.Process(
+                target=_worker, args=(r, init_file, tmp, scenario, mutant, deliver)
+            )
             for r in range(WORLD)
         ]
         for p in procs:
@@ -473,6 +480,50 @@ class FalsifierBCapExhaustionIsLoudNeverAHang(unittest.TestCase):
             r0["served_round"],
             UNRESOLVED_DEFER_CAP,
             f"the bound must be the cap, exactly, not 'eventually': {r0['tolds']}",
+        )
+
+
+class FalsifierDTheBoundMustSurviveABrokenRing(unittest.TestCase):
+    """#944b THE ARM THE FIRST THREE WERE MISSING, and the reason the shipped
+    bound was dead code on the rig while this file was green.
+
+    (a)-(c) all call `pp_absorb_admission_return` in the worker themselves.
+    That is the delivery whose ABSENCE is the defect -- so those arms hand the
+    guard the very input under question and cannot test that it arrives. On the
+    live boot of 2026-08-27 it does not: the lap rides the void output, and the
+    void parks a middle rank in `_pp_drain_voided_proxy`, so PP0 absorbs
+    nothing. Measured there: 4010 UNRESOLVED lines, 0 escalations, one rid,
+    `told=8192` on all 8023 of its lines.
+
+    Here the ring still TURNS -- every rank reconciles and forwards over real
+    gloo, exactly as in (a) -- but PP0 never absorbs. The bound must still end
+    the loop, because a bound that needs the ring cannot end a failure that
+    stops the ring.
+    """
+
+    def test_the_group_still_terminates_when_nothing_comes_home(self):
+        res = _run("all", deliver=False)
+        r0, _r1, _r2 = _require_clean(self, res)
+
+        self.assertIsNotNone(
+            r0["served_round"],
+            f"THE LIVE FAILURE, reproduced in three processes: told never "
+            f"moved and nothing was served -- {r0['tolds']}",
+        )
+        self.assertEqual(
+            r0["tolds"][-1], 0, f"the terminator is still told=0: {r0['tolds']}"
+        )
+        self.assertEqual(
+            len(r0["escalations"]),
+            1,
+            f"exactly one loud refusal, even with the ring broken: {r0['escalations']}",
+        )
+        self.assertEqual(
+            r0["unresolved_rounds"],
+            0,
+            "and the LAP-FED counter stayed at zero throughout -- which is "
+            "the proof the bound no longer leans on the return trip. If this "
+            "is non-zero the harness delivered something and the arm is void.",
         )
 
 
