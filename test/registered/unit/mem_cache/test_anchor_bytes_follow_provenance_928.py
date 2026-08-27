@@ -79,6 +79,30 @@ the matching mamba state would be silently wrong, so the whole match is zeroed."
 That is the refusal this seam needs and does not have -- a refusal costs a
 re-prefill, the silence costs a wrong answer.
 
+CORROBORATED FROM THE OTHER SIDE (#929 analysis,
+/spinning/evidence-665-f1/ANALYSE_929_mamba_slot_deficit.md): at the re-admit
+insert the tree answers ``mamba_exist=True`` with ``len(key) == 0``
+(unified_radix_cache.py:1569/:1668) -- the whole key, full prefix, IS in the
+tree and DOES carry a mamba value -- and the decode is garbage anyway. That
+removes "no anchor" as the explanation and leaves only "the anchor was read
+from the wrong place", which is what this test pins. Anchor DEPTH is not the
+remaining suspect either: the donate pairs key and state at one position by
+construction (``cache_len = req.mamba_last_track_seqlen``,
+mamba_component.py:721, and mamba_ckpt_utils' "Never floor" rule). Provenance
+is the term that is unheld.
+
+NOT THE SAME BUG AS #929'S ORPHANED SLOT, and the counter-check is cheap. On
+the plain-finished path with ``mamba_exist=True`` the freshly allocated donate
+slot (mamba_component.py:902-903) is dropped without being freed:
+``cleanup_after_caching_req``'s ``enable_mamba_extra_buffer`` branch (:947-956)
+frees only ``req``'s own slots, and the ``insert_params.mamba_value`` free
+exists only on the int8 branch (:942-943) and the unfinished branch (:961-963).
+That slot leaks -- but it leaks precisely BECAUSE it was never attached to a
+node, and the resume's COW source is ``last_node.component_data[ct].value``,
+i.e. a slot the TREE holds. Orphaned-and-unreachable and tree-held are disjoint
+sets, so the resume can never read the orphan. #929 explains the rank-0 +1 slot
+divergence as one insert-side booking; it is not a second root of this garbage.
+
 THE TEST drives the real ``install_phase_aware_mamba_state_pool`` and the real
 ``active_mamba_state_pool`` over two distinct pool objects and asks the seam the
 question the resume asks it: with the anchor donated while PP computed, which
