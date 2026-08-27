@@ -956,6 +956,32 @@ class MambaComponent(TreeComponent):
                 return
 
             if not mamba_value_inserted:
+                # #929 THE DONATION IS A SEPARATE SLOT AND IT NEEDED ITS OWN
+                # RELEASE. On this path `_donate_mamba_value` ALLOCATES a fresh
+                # slot (:902-903) and copies the state into it, so
+                # `insert_params.mamba_value` is NOT `req.mamba_pool_idx`.
+                # `free_mamba_cache(req)` releases only the request's slot, so
+                # when the tree did not take the donation nothing released it:
+                # it is on neither the free list nor in any node, which is
+                # exactly what the on-idle ledger reported as
+                # `leaked_mamba_pages={11}` (window 2g, one slot of twenty,
+                # available=19 against peers at 20/20).
+                #
+                # This mirrors, rather than invents, what the two sibling paths
+                # already do: the int8 branch above (`insert_value_unused`) and
+                # the not-finished branch below both release an unused
+                # donation. Only this one lacked it.
+                #
+                # GUARDED ON `not mamba_value_inserted` DELIBERATELY. If the
+                # tree DID take the donation it owns live state, and returning
+                # it here would let `alloc()` hand one Mamba state to two
+                # requests -- a wrong answer that never crashes, strictly worse
+                # than the leak this replaces. `insert_params` is Optional in
+                # the signature (see the `is_finished=True` callsite at
+                # `unified_radix_cache.py:1081`, which passes neither result
+                # nor params), so it is checked rather than assumed.
+                if insert_params is not None and insert_params.mamba_value is not None:
+                    self._free_mamba_value(insert_params.mamba_value)
                 pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
