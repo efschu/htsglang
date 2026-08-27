@@ -87,6 +87,24 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _row_capacity(buffers) -> Optional[int]:
+    """#923: rows of the tensor the transfer kernels actually slice, or None.
+
+    Read from the buffer itself rather than from a ``size`` attribute, because
+    the kernel slices the buffer: ``at::Tensor::slice`` CLAMPS an out-of-range
+    start to an EMPTY slice instead of raising, so a row id past the end
+    reaches ``copy_`` as a zero-length source and surfaces as the bare
+    "The size of tensor a (N) must match the size of tensor b (0)" -- which
+    names neither pool, neither index, nor the direction. Any capacity that is
+    not exactly the sliced tensor's row count would either miss that or refuse
+    a legal transfer, so nothing is derived and nothing is assumed.
+    """
+    try:
+        return int(buffers[0].shape[0])
+    except (TypeError, IndexError, AttributeError):
+        return None
+
+
 def _guard_kv_transfer(host_pool, device_pool, host_indices, device_indices, *, where):
     """#760 seam guard. Metadata only -- O(layers) integer comparisons.
 
@@ -98,6 +116,20 @@ def _guard_kv_transfer(host_pool, device_pool, host_indices, device_indices, *, 
         from sglang.srt.mem_cache.kv_transfer_guard import validate_kv_transfer
 
         validate_kv_transfer(
+            # #923: the capacities the guard's own bounds check has always
+            # wanted and never got -- the live callsite passed neither, so the
+            # ARMED line printed "src_capacity=None dst_capacity=None" and the
+            # bounds half of check 4 was vacuous on every transfer this rig has
+            # ever made. The host side is passed only for ``layer_first``,
+            # where ``k_data_refs[i]`` is indexed by host slot one-to-one; the
+            # paged layouts index a different axis and get None rather than a
+            # guess.
+            src_capacity=_row_capacity(getattr(device_pool, "k_buffer", None)),
+            dst_capacity=(
+                _row_capacity(getattr(host_pool, "k_data_refs", None))
+                if getattr(host_pool, "layout", None) == "layer_first"
+                else None
+            ),
             src_ptr_vectors=[
                 getattr(device_pool, "k_data_ptrs", None),
                 getattr(device_pool, "v_data_ptrs", None),

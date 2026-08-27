@@ -469,6 +469,16 @@ class HybridCacheController(BaseHiCacheController):
         # cheap failure.
         if device_tier_disarmed("write"):
             return None
+        # #923: THE SAME OMISSION AS #760's, one question further on. The base
+        # class now also asks whether the row this copy would READ is a row of
+        # this rank's device pool; this override must ask it too, because on a
+        # hybrid deployment this override IS the write path. The specimen is a
+        # global allocator slot reaching the TP phase's compact pool after a
+        # cutover: below the row count it copies another token's KV under this
+        # request's key, above it the kernel's slice clamps to empty and the
+        # copy dies with a bare tensor-size RuntimeError.
+        if self._refuse_unaddressable_kv_rows(device_indices, "write"):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -585,6 +595,12 @@ class HybridCacheController(BaseHiCacheController):
         else:
             device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
+                return None
+            # #923: sibling of the write refusal. Asked before any extra pool
+            # allocation, and the KV allocation is handed back so a refusal
+            # costs nothing but the prefetch.
+            if self._refuse_unaddressable_kv_rows(device_indices, "load"):
+                full_allocator.free(device_indices)
                 return None
 
         pool_transfers = self._resolve_pool_transfers_allocation(

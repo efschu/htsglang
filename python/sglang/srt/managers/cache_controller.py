@@ -496,6 +496,12 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        # #923: the owner rule this controller translates device slots with is
+        # a CUTOVER-DEPENDENT quantity, not a boot constant. Join the #297
+        # registry here so every installer of a token vector -- the reshard
+        # cutover and the phase flip alike -- drops the memo through the same
+        # call, instead of each site remembering to reach in and delete it.
+        self._register_owner_bounds_refresh()
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -1097,6 +1103,11 @@ class HiCacheController:
         # later, which is the cheap failure.
         if device_tier_disarmed("write"):
             return None
+        # #923: and the row this copy would READ must be a row this rank's
+        # device pool has. Asked before the host allocation, so a refusal
+        # strands nothing.
+        if self._refuse_unaddressable_kv_rows(device_indices, "write"):
+            return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -1200,6 +1211,14 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
+        # #923: the write direction's sibling. The slots were just allocated,
+        # so they are in the ALLOCATOR's id space by construction -- the
+        # question this asks is whether the owner rule this controller holds
+        # maps them into THIS pool's rows, which is exactly what a cutover
+        # changes. Free the allocation on refusal: the caller only learns None.
+        if self._refuse_unaddressable_kv_rows(device_indices, "load"):
+            self.mem_pool_device_allocator.free(device_indices)
+            return None
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -1208,16 +1227,135 @@ class HiCacheController:
     def _dcp_owner_ctx(self) -> Optional[tuple]:
         """(S, lo, hi) of this rank's weighted uneven-DCP owner range, or None.
 
-        Cached: the token vector is installed once at engine init, before the
-        cache controller is constructed. When active, the radix tree hands the
-        controller GLOBAL allocator indices while the device KV pool only holds
-        this rank's COMPACT owned slots -- every device-side KV transfer must
-        go through _dcp_kv_transfer_pairs (task #60)."""
+        Memoized, and the memo is DROPPED at every token-vector cutover:
+        ``refresh_dcp_owner_bounds`` is the #297 registry's hook and this
+        controller registers for it in ``__init__``. When active, the radix
+        tree hands the controller GLOBAL allocator indices while the device KV
+        pool only holds this rank's COMPACT owned slots -- every device-side KV
+        transfer must go through _dcp_kv_transfer_pairs (task #60).
+
+        #923: the memo used to be taken once for process life, on the reasoning
+        "the token vector is installed once at engine init". The phase flip
+        falsifies that reasoning -- ``dcp_size`` goes 1 -> 3 at every pp_to_tp
+        cutover and back, and ``phase_flip_runtime._cutover`` reinstalls the
+        token vector on each leg. A memo taken in the PP phase says None, which
+        makes _dcp_kv_transfer_pairs the IDENTITY, which hands the TP phase's
+        compact device pool a GLOBAL slot id. Below the pool's row count that
+        addresses a different token's row (silent wrong KV in the host tier);
+        above it, ``at::Tensor::slice`` CLAMPS to an empty slice and the copy
+        dies as "The size of tensor a (N) must match the size of tensor b (0)".
+        """
         if not hasattr(self, "_dcp_owner_ctx_cache"):
             from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
 
             self._dcp_owner_ctx_cache = uneven_dcp_owner_bounds()
         return self._dcp_owner_ctx_cache
+
+    def refresh_dcp_owner_bounds(self) -> None:
+        """#297 cutover hook (#923): forget the memoized owner ctx.
+
+        The registry calls this on every registered consumer whenever a token
+        vector is installed -- the #297 reshard cutover and the phase flip both
+        go through ``refresh_all_owner_bounds()``. Dropping the attribute
+        rather than re-deriving it here keeps the derivation in ONE place
+        (:meth:`_dcp_owner_ctx`) and makes the next reader pay for it lazily,
+        which is what a cutover wants: the groups are re-routed a few lines
+        later in the same cutover.
+        """
+        self.__dict__.pop("_dcp_owner_ctx_cache", None)
+
+    def _register_owner_bounds_refresh(self) -> None:
+        """#923: join the ONE cutover registry instead of being invalidated by
+        hand at each cutover site.
+
+        There used to be exactly one hand-written invalidation, in
+        ``kv_reshard._cutover_fn_for``, guarded by the comment "Stage A refuses
+        to arm with hicache active, but a stale memo must still not survive".
+        The phase flip is a second installer of the same payload and had no
+        such line, so the memo survived every cutover on the live rig. A second
+        bespoke ``delattr`` would have been a third mover of the same payload;
+        registering is the reconciliation.
+        """
+        from sglang.srt.layers.dcp.owner import register_owner_bounds_consumer
+
+        register_owner_bounds_consumer(self)
+
+    def _dcp_owned_device_rows(self, device_indices: torch.Tensor):
+        """``(owned_mask, compact_rows)`` for a vector of GLOBAL device slots.
+
+        ``(None, device_indices)`` when the token-sharded gate is off, which is
+        the identity the stock path relies on. THE single place the owner rule
+        is applied to a HiCache transfer -- :meth:`_dcp_kv_transfer_pairs` and
+        the #923 addressability refusal both read it, so the two can never
+        disagree about which row a transfer would touch.
+        """
+        ctx = self._dcp_owner_ctx()
+        if ctx is None:
+            return None, device_indices
+        S, lo, hi = ctx
+        dev = device_indices.to(torch.int64)
+        off = dev % S
+        owned = (off >= lo) & (off < hi)
+        compact = (dev // S) * (hi - lo) + (off - lo)
+        return owned, compact[owned]
+
+    def _kv_device_row_capacity(self) -> Optional[int]:
+        """Rows of this rank's device KV pool, read off the buffer the transfer
+        kernels actually slice. ``None`` when it cannot be read -- absence is
+        not a mismatch, same contract as the #760 seam guard.
+        """
+        buffers = getattr(self.mem_pool_device, "k_buffer", None)
+        try:
+            return int(buffers[0].shape[0])
+        except (TypeError, IndexError, AttributeError):
+            return None
+
+    def _refuse_unaddressable_kv_rows(self, device_indices, where: str) -> bool:
+        """#923: True when this transfer would index a row the device KV pool
+        does not have -- SAID, counted, and refused before anything commits.
+
+        WHY REFUSE HERE AND NOT AT THE KERNEL. ``write()``/``load()`` may return
+        None; that is the established contract ("a refused write is a prefix
+        that misses later, which is the cheap failure") and, crucially, the
+        caller has not yet marked the node backuped. A refusal further down --
+        after ``commit_hicache_transfer`` -- would leave the tree believing the
+        node is on the host tier while nothing was copied, which is the #767
+        silent-wrongness direction and strictly worse than the crash it
+        replaces. So: never a silent skip, and never a late one.
+        """
+        cap = self._kv_device_row_capacity()
+        if cap is None or device_indices is None or device_indices.numel() == 0:
+            return False
+        _, rows = self._dcp_owned_device_rows(device_indices)
+        if rows.numel() == 0:
+            return False
+        row_max = int(rows.max())
+        row_min = int(rows.min())
+        if row_min >= 0 and row_max < cap:
+            return False
+        n = getattr(self, "_unaddressable_kv_rows_refused", 0) + 1
+        self._unaddressable_kv_rows_refused = n
+        # Rate-limited on the same cadence as the other HiCache refusals in
+        # this file: this can fire per operation, and an unbounded emitter is
+        # its own outage. The COUNT is the finding, not the line.
+        if n <= 3 or n % 200 == 0:
+            logger.error(
+                "#923 HICACHE %s REFUSED: the transfer would index device KV "
+                "row(s) in [%d, %d] of a pool that has %d row(s). Owner ctx "
+                "(S, lo, hi)=%s. A global allocator slot reaching a compact "
+                "pool means the owner rule this controller holds is not the "
+                "one the pools were built under -- the copy is refused rather "
+                "than clamped to an empty slice (which dies in the kernel) or "
+                "wrapped onto another token's row (which does not die at all). "
+                "The affected prefix simply misses later. (%d so far.)",
+                where,
+                row_min,
+                row_max,
+                cap,
+                self._dcp_owner_ctx(),
+                n,
+            )
+        return True
 
     def _dcp_kv_transfer_pairs(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
@@ -1232,16 +1370,11 @@ class HiCacheController:
         up nor loaded here (their L3 page file is written by the owner rank
         and holds the FULL replicated kv-heads). Gate off -> identity, keeping
         the stock path byte-identical."""
-        ctx = self._dcp_owner_ctx()
-        if ctx is None:
+        owned, compact = self._dcp_owned_device_rows(device_indices)
+        if owned is None:
             return host_indices, device_indices
-        S, lo, hi = ctx
-        dev = device_indices.to(torch.int64)
-        off = dev % S
-        owned = (off >= lo) & (off < hi)
-        compact = (dev // S) * (hi - lo) + (off - lo)
         host_owned = host_indices[owned.to(host_indices.device)]
-        return host_owned, compact[owned]
+        return host_owned, compact
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
