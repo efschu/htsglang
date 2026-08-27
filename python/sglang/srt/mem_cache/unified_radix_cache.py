@@ -3389,12 +3389,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             else 0
         )
 
-        vote = torch.tensor([digest, -digest], dtype=torch.int64)
+        # #943: RIDE THIS REDUCE TO ANSWER THE ONE QUESTION THE RE-ISSUE NEEDS.
+        #
+        # Making #937's refusal reachable for a re-issue means re-registering a
+        # prefetch from a per-round hook, and that is only legal if the refusal
+        # VERDICT is rank-uniform. It looks uniform -- the stamp is taken at a
+        # registration that happens for the same request on every rank, and the
+        # generation is advanced by the cutover rebind, which runs on every rank
+        # -- but that is reasoning, and `_prefetch_done_for` already spells out
+        # what reasoning costs here: a collective entered on a subset of ranks
+        # is the #580 failure, "refused rather than risked".
+        #
+        # So it is MEASURED, and measured for free: this reduce already runs
+        # every round, so the running refusal total rides along as two more
+        # elements. All ranks build the same numel because they run this same
+        # line, and MIN over [n, -n] yields min and max in one pass -- the shape
+        # the digest half already uses.
+        #
+        # AN INSTRUMENT, NOT A GATE. It never changes what the drain does; a
+        # divergence is reported and the drain proceeds exactly as before. The
+        # re-issue is NOT built on top of this yet, deliberately: this line has
+        # to report from metal first, which is the same discipline #938 Stage A
+        # used before its own hypothesis was allowed to become a fix.
+        stale_refusals = int(getattr(self, "_prefetch_insert_refused_stale", 0))
+        vote = torch.tensor(
+            [digest, -digest, stale_refusals, -stale_refusals], dtype=torch.int64
+        )
         self._all_reduce_attn_groups(
             vote, torch.distributed.ReduceOp.MIN, label="drain_retired_prefetch"
         )
         agreed_min = int(vote[0].item())
         agreed_max = -int(vote[1].item())
+        refusals_min = int(vote[2].item())
+        refusals_max = -int(vote[3].item())
+        if refusals_min != refusals_max:
+            self._stale_refusal_divergences = (
+                getattr(self, "_stale_refusal_divergences", 0) + 1
+            )
+            logger.error(
+                "#943 STALE-REFUSAL VERDICT DIVERGES ACROSS RANKS: this rank has "
+                "refused %d stale prefetch insert(s), the group spans [%d, %d]. "
+                "The #937 verdict is therefore NOT rank-uniform, and a re-issue "
+                "driven from it would enter a collective on a subset of ranks -- "
+                "the #580 failure. Do not wire the re-issue on this reading. "
+                "(divergence %d)",
+                stale_refusals,
+                refusals_min,
+                refusals_max,
+                self._stale_refusal_divergences,
+            )
+        elif stale_refusals > 0 and not getattr(self, "_stale_refusal_agreed_once", 0):
+            self._stale_refusal_agreed_once = 1
+            logger.info(
+                "#943 STALE-REFUSAL VERDICT AGREES ACROSS RANKS at %d refusal(s) "
+                "-- the first affirmative reading that the #937 verdict is "
+                "rank-uniform. One agreeing round is not the property; the "
+                "absence of a DIVERGES line over a whole boot is.",
+                stale_refusals,
+            )
         if agreed_min == 0 or agreed_min != agreed_max:
             # No agreement this round (or nothing anywhere to drain). The
             # record keeps its host span and its lock ref until every rank
