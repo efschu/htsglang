@@ -234,3 +234,62 @@ class TheDangerDirection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheDonationIsSometimesTheRequestsOwnSlot(unittest.TestCase):
+    """REGRESSION, boot 2i (2026-08-27): my own #929 fix double-freed.
+
+    `_donate_mamba_value` does NOT always allocate a fresh slot. On the path
+    taken when there is no int8 checkpoint pool -- this rig's configuration --
+    `mamba_component.py:956` builds
+
+        active_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+
+    and `:965` assigns `insert_params.mamba_value = active_value`. The
+    "donation" is then the REQUEST'S OWN SLOT ID, not a second slot.
+
+    The fix as first written freed `insert_params.mamba_value` and then called
+    `free_mamba_cache(req)`, which releases `req.mamba_pool_idx`. Same slot,
+    twice. The #924 guard caught it at metal and killed the boot:
+
+      [09:38:17 PP0] #924 MAMBA SLOT DOUBLE FREE: slot(s) [6] are already on
+      the free list and were returned again.
+      ... mamba_component.py:1097 cleanup_after_caching_req
+       -> memory_pool.py:2370 free_mamba_cache -> allocator/mamba.py:114 free
+
+    My original tests could not see this: `_setup()` always allocated a
+    SEPARATE donation, so the one case where the two are the same object was
+    never modelled. That is the gap, not the guard.
+    """
+
+    def test_a_donation_that_is_the_requests_own_slot_is_freed_once(self):
+        alloc = MambaSlotAllocator(size=20, device="cpu")
+        alloc.clear()
+        comp = _component(alloc)
+        comp._free_mamba_value = lambda v: alloc.free(v)
+
+        req_slot = alloc.alloc(1)
+        req = SimpleNamespace(mamba_pool_idx=req_slot, mamba_last_track_seqlen=3)
+        # the :956/:965 shape -- a CLONE carrying the request's own slot ID.
+        # What matters is the ID, not the dimensionality: production builds it
+        # from a 0-d `req.mamba_pool_idx` via unsqueeze(-1); here the allocator
+        # already hands back a 1-d tensor, so a plain clone is the same value.
+        params = SimpleNamespace(mamba_value=req_slot.clone())
+
+        # must not raise MambaSlotDoubleFree
+        comp.cleanup_after_caching_req(
+            req, True, SimpleNamespace(mamba_exist=True), params
+        )
+
+        self.assertEqual(
+            alloc.available_size(),
+            20,
+            "the slot must come back exactly once: it is the request's slot AND "
+            "the donation, so releasing both handles is one release, not two",
+        )
+        self.assertEqual(
+            sorted(int(x) for x in alloc.free_slots.tolist()).count(int(req_slot[0])),
+            1,
+            "the slot must appear ONCE on the free list; twice is the #924 "
+            "double free that killed boot 2i",
+        )
