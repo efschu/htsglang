@@ -8844,9 +8844,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     _note_skip("batch_full_break", req.rid)
                     break
@@ -9145,6 +9144,23 @@ class Scheduler(
                     pp_mark_premise_dead as _pp_mark_premise_dead,
                 )
 
+                from sglang.srt.managers.scheduler_pp_mixin import (
+                    pp_premise_probe as _pp_premise_probe,
+                )
+
+                # #948 COUNTER (a): was the escalated rid actually in
+                # `can_run_list` when this loop ran? A miss means no mark was
+                # ever written, and every downstream reading would then be
+                # about an absence rather than a mechanism.
+                _esc = [r for r in getattr(_guard, "_escalated", ()) or ()]
+                _in_list = {getattr(r, "rid", None) for r in can_run_list}
+                for _rid in _esc:
+                    if _rid in _in_list:
+                        _pp_premise_probe(self, "mark_hit", rid=_rid)
+                    else:
+                        _pp_premise_probe(
+                            self, "mark_miss", rid=_rid, list_size=len(_in_list)
+                        )
                 for _req in can_run_list:
                     if _guard.is_escalated(getattr(_req, "rid", None)):
                         _pp_mark_premise_dead(_req)
@@ -12619,9 +12635,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert (
-        scheduler.disaggregation_mode == DisaggregationMode.NULL
-    ), "phase flip x PD disaggregation is refused at argument time"
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:

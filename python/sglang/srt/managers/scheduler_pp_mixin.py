@@ -1203,6 +1203,67 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         )
 
 
+def pp_premise_probe(holder, kind: str, **fields) -> None:
+    """#948: the three counters that separate why the armed actuator never acts.
+
+    window-947 established what is NOT the answer. Both candidate sites run
+    under the failure (`prefill:chunked_block` 4117, `ring:pre_plan` 12483), the
+    escalation fires on exactly the frozen rid, and the actuator is armed -- yet
+    `pp_premise_is_dead(self.chunked_req)` is never true at the ring. Three
+    explanations survived that boot and it could not separate them, so each gets
+    ONE counter rather than a fourth guess:
+
+      mark_hit / mark_miss   (a) was the escalated rid in `can_run_list` when
+                                 the marking loop ran? A miss means no mark was
+                                 ever written.
+      act_rid_mismatch       (b) at the ring, is `self.chunked_req` the request
+                                 that was marked? A mismatch means the mark
+                                 exists on a request the act never looks at --
+                                 and `where=` then says which of the four places
+                                 the marked rid actually lives in.
+      gen_mismatch           (c) did the generation stamp move between mark and
+                                 act? Counted WITH BOTH VALUES, because "they
+                                 differ" without the numbers cannot distinguish
+                                 a cutover from an unreadable stamp.
+
+    ABSENT IS NOT ZERO, the same rule the #947 census carries: a kind that never
+    fires does not appear in the map at all, so "this counter is missing" and
+    "this counter measured zero" can never be confused. That distinction is what
+    makes a null reading admissible evidence rather than a shrug.
+
+    Rate-limited on the same pattern and for the same reason: this runs in the
+    hot loop of a wedged instance, and 9471 log lines is the defect under
+    investigation, not a licence.
+    """
+    counts = getattr(holder, "_pp_premise_probe_counts", None)
+    if counts is None:
+        counts = {}
+        holder._pp_premise_probe_counts = counts
+    counts[kind] = counts.get(kind, 0) + 1
+    samples = getattr(holder, "_pp_premise_probe_samples", None)
+    if samples is None:
+        samples = {}
+        holder._pp_premise_probe_samples = samples
+    if fields and kind not in samples:
+        # FIRST OCCURRENCE ONLY, kept verbatim. The counts say how often; one
+        # concrete sample says what, and a sample per occurrence would be the
+        # log flood this instrument exists to avoid.
+        samples[kind] = dict(fields)
+    total = sum(counts.values())
+    every = int(os.environ.get("SGLANG_948_PROBE_EVERY", "500") or 500)
+    if every > 0 and total % every == 0:
+        logger.warning(
+            "#948 PREMISE PROBE: counts=%s first-samples=%s. A kind ABSENT "
+            "from counts did not occur at all -- that is not the same as zero, "
+            "and it is the reading that separates the three candidates: "
+            "mark_miss means no mark was written, act_rid_mismatch means the "
+            "mark is on a request the act never inspects, gen_mismatch means "
+            "the stamp moved between writing and reading.",
+            dict(sorted(counts.items())),
+            samples,
+        )
+
+
 def pp_request_locations(holder) -> Dict[str, object]:
     """#946: every place a request can live, as one rid -> req mapping.
 
@@ -1339,6 +1400,24 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
     cannot re-fire on every chunk -- that would be the 2106-line log in a new
     colour.
     """
+    # #948 COUNTER (c): did the stamp move between mark and act? Counted with
+    # BOTH values, because "they differ" without the numbers cannot tell a
+    # cutover from an unreadable stamp.
+    stamped = getattr(req, _PREMISE_DEAD_STAMP, None) if req is not None else None
+    if stamped is not None and not pp_premise_is_dead(req):
+        from sglang.srt.mem_cache import hicache_phase_binding as _hpb
+
+        try:
+            _now = int(_hpb.current_generation())
+        except Exception:  # noqa: BLE001 - unreadable generation is itself the datum
+            _now = None
+        pp_premise_probe(
+            holder,
+            "gen_mismatch",
+            rid=getattr(req, "rid", "?"),
+            stamped=stamped,
+            now=_now,
+        )
     if not pp_premise_is_dead(req):
         return "none"
     try:
@@ -1373,6 +1452,39 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
     if callable(truncate):
         truncate(0)
     return "recompute"
+
+
+def pp_apply_dead_premise_anywhere(holder) -> Dict[str, str]:
+    """#948: apply the dead-premise escape wherever the marked request LIVES.
+
+    THE FIX FOR THE ONE THING window-947 LEFT STANDING, and the desk separated
+    it before any metal was spent: the actuator was correct and its ARGUMENT was
+    wrong. The mark is written over `can_run_list`; the act read a single field
+    (`self.chunked_req`). A request marked anywhere else was marked for ever and
+    inspected never -- which is exactly why an ARMED actuator produced
+    `#946 PREMISE RECOMPUTE` 0 while `UNRESOLVABLE` fired on the right rid.
+
+    Proven hermetically rather than argued: handed `chunked_req` the actuator
+    returns "none"; handed the request the mark is actually on, the SAME
+    actuator returns "recompute". Same code, different argument.
+
+    THE ENUMERATION IS NOT NEW. `pp_request_locations` already lists the four
+    places a request can live, and this is its second consumer -- which is why
+    it was factored out of the #943b candidate set instead of inlined there. A
+    fifth place is now one edit for both consumers rather than a fifth ticket.
+
+    Returns `rid -> outcome` for every request acted on, empty when nothing is
+    marked. The empty case walks four short sequences and touches nothing,
+    which is the default path on every healthy pass.
+    """
+    out: Dict[str, str] = {}
+    for rid, req in pp_request_locations(holder).items():
+        if getattr(req, _PREMISE_DEAD_STAMP, None) is None:
+            continue
+        outcome = pp_apply_dead_premise_at_chunk_boundary(holder, req)
+        if outcome != "none":
+            out[rid] = outcome
+    return out
 
 
 def pp_chunked_local_match(req) -> Optional[int]:
@@ -1810,9 +1922,52 @@ class SchedulerPPMixin:
                     self, "ring:pre_plan", bool(self._pp_admission_pass_voided)
                 )
                 if pp_act_at_ring_enabled():
-                    pp_apply_dead_premise_at_chunk_boundary(
-                        self, getattr(self, "chunked_req", None)
-                    )
+                    # #948 COUNTER (b): is the request the act inspects the one
+                    # that was marked? The mark is written over `can_run_list`;
+                    # the act reads ONE field. If a marked rid lives anywhere
+                    # else, the mark is real and permanently invisible here.
+                    # `where=` names which of the four places it actually is,
+                    # using the enumeration #946 already built.
+                    _ck = getattr(self, "chunked_req", None)
+                    _marked = [
+                        r
+                        for r in pp_request_locations(self).values()
+                        if getattr(r, _PREMISE_DEAD_STAMP, None) is not None
+                    ]
+                    if _marked:
+                        _ck_rid = getattr(_ck, "rid", None)
+                        _hit = any(getattr(r, "rid", None) == _ck_rid for r in _marked)
+                        if _hit:
+                            pp_premise_probe(self, "act_rid_hit", rid=_ck_rid)
+                        else:
+                            _where = {}
+                            for _name, _src in (
+                                ("waiting_queue", getattr(self, "waiting_queue", None)),
+                                (
+                                    "running_batch",
+                                    getattr(
+                                        getattr(self, "running_batch", None),
+                                        "reqs",
+                                        None,
+                                    ),
+                                ),
+                            ):
+                                for _r in _src or ():
+                                    if getattr(_r, _PREMISE_DEAD_STAMP, None):
+                                        _where[_name] = _where.get(_name, 0) + 1
+                            pp_premise_probe(
+                                self,
+                                "act_rid_mismatch",
+                                chunked_rid=_ck_rid,
+                                marked_rids=[getattr(r, "rid", "?") for r in _marked][
+                                    :3
+                                ],
+                                where=_where or "neither_queue_nor_running",
+                            )
+                    # #948 SWEEP THE FOUR PLACES, not one field. The mark is
+                    # written over `can_run_list`; reading only `chunked_req`
+                    # is why the armed actuator never fired on metal.
+                    pp_apply_dead_premise_anywhere(self)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch

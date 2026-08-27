@@ -404,3 +404,197 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
                 os.environ.pop("SGLANG_946_ACT_AT_RING", None)
             else:
                 os.environ["SGLANG_946_ACT_AT_RING"] = old
+
+
+class TheThreeCandidatesMustBeSEPARABLE(unittest.TestCase):
+    """#948: window-947 left three explanations standing and could not choose.
+    Each gets ONE counter, and each counter gets a CAN-FAIL arm -- a constructed
+    case that makes exactly that counter non-zero and the other two absent.
+
+    Without the can-fail arms these counters would be three more indicators
+    nobody had shown could move, which is the failure mode this whole family is
+    a list of.
+    """
+
+    def _probe(self, holder, kind, **f):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_probe
+
+        return pp_premise_probe(holder, kind, **f)
+
+    def _counts(self, holder):
+        return getattr(holder, "_pp_premise_probe_counts", {})
+
+    def test_ABSENT_is_not_zero(self):
+        """The load-bearing semantics: a kind that never fired must not appear.
+        'Missing' and 'measured zero' must never be confusable, or a null
+        reading proves nothing."""
+        h = _holder()
+        self._probe(h, "mark_hit", rid="r")
+        self.assertIn("mark_hit", self._counts(h))
+        self.assertNotIn("mark_miss", self._counts(h))
+        self.assertNotIn("act_rid_mismatch", self._counts(h))
+        self.assertNotIn("gen_mismatch", self._counts(h))
+
+    def test_canfail_a_mark_miss_moves_only_its_own_counter(self):
+        h = _holder()
+        self._probe(h, "mark_miss", rid="r", list_size=0)
+        self.assertEqual(self._counts(h), {"mark_miss": 1})
+
+    def test_canfail_b_act_rid_mismatch_moves_only_its_own_counter(self):
+        h = _holder()
+        self._probe(h, "act_rid_mismatch", chunked_rid=None, marked_rids=["r"])
+        self.assertEqual(self._counts(h), {"act_rid_mismatch": 1})
+
+    def test_canfail_c_gen_mismatch_carries_BOTH_values(self):
+        """'They differ' without the numbers cannot tell a cutover from an
+        unreadable stamp, so the sample must carry both."""
+        h = _holder()
+        self._probe(h, "gen_mismatch", rid="r", stamped=7, now=9)
+        self.assertEqual(self._counts(h), {"gen_mismatch": 1})
+        s = h._pp_premise_probe_samples["gen_mismatch"]
+        self.assertEqual((s["stamped"], s["now"]), (7, 9))
+
+    def test_the_first_sample_is_kept_and_not_overwritten(self):
+        h = _holder()
+        self._probe(h, "gen_mismatch", rid="first", stamped=1, now=2)
+        self._probe(h, "gen_mismatch", rid="second", stamped=3, now=4)
+        self.assertEqual(self._counts(h)["gen_mismatch"], 2)
+        self.assertEqual(h._pp_premise_probe_samples["gen_mismatch"]["rid"], "first")
+
+    def test_the_gen_mismatch_counter_fires_from_the_REAL_act_path(self):
+        """Not a hand-called probe: drive the shipped actuator with a stamp
+        from a superseded generation and require counter (c) to move."""
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            _PREMISE_DEAD_STAMP,
+            pp_apply_dead_premise_at_chunk_boundary,
+        )
+        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+
+        req = _Req(RID_CHUNKED, prefix_len=8192, extend_len=4096)
+        setattr(req, _PREMISE_DEAD_STAMP, int(hpb.current_generation()) - 1)
+        h = _holder(chunked_req=req)
+        self.assertEqual(pp_apply_dead_premise_at_chunk_boundary(h, req), "none")
+        self.assertIn("gen_mismatch", self._counts(h))
+
+    def test_THE_SEPARATION_a_marked_request_that_is_not_the_chunked_req(self):
+        """THE LIVE SHAPE, reproduced hermetically.
+
+        The mark is written over `can_run_list`; the act reads ONE field
+        (`self.chunked_req`). A request marked anywhere else is marked forever
+        and inspected never -- which is candidate (b), and it needs no metal to
+        demonstrate: it is a property of the two call sites.
+        """
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_apply_dead_premise_at_chunk_boundary,
+            pp_mark_premise_dead,
+            pp_request_locations,
+        )
+
+        stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
+        other = _Req(RID_CHUNKED, prefix_len=16, extend_len=16)
+        h = _holder(
+            chunked_req=other,
+            running_batch=types.SimpleNamespace(reqs=[stuck]),
+        )
+        pp_mark_premise_dead(stuck)
+
+        self.assertIn(
+            RID_RUNNING,
+            pp_request_locations(h),
+            "the marked request IS findable -- the four-place enumeration sees "
+            "it, so this is not an absence",
+        )
+        self.assertEqual(
+            pp_apply_dead_premise_at_chunk_boundary(h, h.chunked_req),
+            "none",
+            "...and the act still does nothing, because it inspects one field "
+            "instead of the places the request can live. THAT is why the "
+            "armed actuator never fired on metal.",
+        )
+        self.assertEqual(
+            pp_apply_dead_premise_at_chunk_boundary(h, stuck),
+            "recompute",
+            "handed the request it was marked on, the same actuator acts -- so "
+            "the actuator is correct and its ARGUMENT was wrong",
+        )
+
+
+class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
+    """#948 THE FIX, red first.
+
+    Desk verdict from the separation above: the actuator is correct and its
+    ARGUMENT was wrong. The mark is written over `can_run_list`; the act read
+    `self.chunked_req`. A request marked anywhere else was marked forever and
+    inspected never -- which is exactly why the armed actuator produced
+    `PREMISE RECOMPUTE` 0 on metal while `UNRESOLVABLE` fired on the right rid.
+
+    The enumeration to sweep already exists: `pp_request_locations`, built for
+    #946's candidate set. The fix is to use it here too -- the same list, a
+    second consumer, which is the whole reason it was factored out rather than
+    inlined.
+    """
+
+    def _sweep(self, holder):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_apply_dead_premise_anywhere,
+        )
+
+        return pp_apply_dead_premise_anywhere(holder)
+
+    def test_it_acts_on_a_marked_request_in_the_RUNNING_BATCH(self):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
+        h = _holder(
+            chunked_req=_Req(RID_CHUNKED, prefix_len=16),
+            running_batch=types.SimpleNamespace(reqs=[stuck]),
+        )
+        pp_mark_premise_dead(stuck)
+        self.assertEqual(self._sweep(h), {RID_RUNNING: "recompute"})
+        self.assertEqual(len(stuck.prefix_indices), 0, "the terminator applied")
+
+    def test_it_acts_on_a_marked_request_in_the_WAITING_QUEUE(self):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        stuck = _Req(RID_WAITING, prefix_len=8192, extend_len=4096)
+        h = _holder(waiting_queue=[stuck])
+        h._prefetch_kvcache = lambda r: None
+        pp_mark_premise_dead(stuck)
+        self.assertEqual(self._sweep(h), {RID_WAITING: "refetch"})
+
+    def test_it_still_prefers_the_refetch_and_keeps_the_prefix(self):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
+        seen = []
+        h = _holder(running_batch=types.SimpleNamespace(reqs=[stuck]))
+        h._prefetch_kvcache = lambda r: seen.append(r.rid)
+        pp_mark_premise_dead(stuck)
+        self.assertEqual(self._sweep(h), {RID_RUNNING: "refetch"})
+        self.assertEqual(seen, [RID_RUNNING])
+        self.assertEqual(
+            len(stuck.prefix_indices),
+            8192,
+            "Kein-Doppel-Prefill: a re-fetch must KEEP the premise",
+        )
+
+    def test_an_unmarked_scheduler_is_a_complete_no_op(self):
+        """THE DEFAULT PATH. Nothing marked anywhere -> empty result, nothing
+        touched, and no cost beyond one walk of the four places."""
+        h = _holder(
+            waiting_queue=[_Req("a", 8)],
+            chunked_req=_Req("b", 8),
+            running_batch=types.SimpleNamespace(reqs=[_Req("c", 8)]),
+        )
+        self.assertEqual(self._sweep(h), {})
+
+    def test_each_marked_request_is_acted_on_ONCE(self):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
+        h = _holder(running_batch=types.SimpleNamespace(reqs=[stuck]))
+        pp_mark_premise_dead(stuck)
+        self.assertEqual(self._sweep(h), {RID_RUNNING: "recompute"})
+        self.assertEqual(
+            self._sweep(h), {}, "the mark is consumed -- no re-firing per pass"
+        )
