@@ -5309,6 +5309,28 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def _note_seam_chunk_refused(self, req) -> None:
+        """#906: one line per refused continuation, rate-limited.
+
+        A refusal that leaves no trace is indistinguishable from a scheduler
+        that simply built nothing, which is the state this posten exists to
+        tell apart. Counted rather than logged every time, because the refusal
+        repeats once per round until the policy flips the layout.
+        """
+        n = getattr(self, "_seam_chunk_refusals", 0) + 1
+        self._seam_chunk_refusals = n
+        if n <= 3 or n % 1000 == 0:
+            logger.info(
+                "[#906] SEAM CHUNK REFUSED rid=%s: its transport grant is "
+                "spent, so the next chunk is not seam mechanics but ordinary "
+                "prefill and may not run in the TP layout. The request keeps "
+                "its place as the chunked request and its remaining tokens "
+                "now count as pending prefill, which is what arms the flip to "
+                "PP. occurrence=%d",
+                getattr(req, "rid", None),
+                n,
+            )
+
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
@@ -8612,7 +8634,31 @@ class Scheduler(
             # ladder that admitted work itself would be a second admission
             # authority, and the park guard would no longer be final.
             self._maybe_spend_admission_relief(running_batch)
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            # #906 / #890 hole 2: THE CONTINUATION NEVER PASSED THE GATE.
+            # `add_chunked_req` runs here, ~50 lines BEFORE the transport_only
+            # filter, so a chunked request advanced chunk after chunk without
+            # the seam exemption ever being consulted again -- "the next chunk
+            # on a consumed permission" (#858's shape). That is the mechanism
+            # behind the live 20k-token TP wave: one grant, unbounded chunks,
+            # every one `#cached-token: 0`.
+            #
+            # Refusing here is safe in the one way that matters: the request
+            # stays `self.chunked_req` and is NOT dropped, and because its
+            # grant is spent it has left `seam_readmit_candidates`, so its
+            # remaining tokens count as ordinary pending prefill and the policy
+            # arms `tp_to_pp`. It resumes in PP, in the right layout, mid-chunk
+            # and unharmed -- never a wedge.
+            from sglang.srt.managers.phase_purity import (
+                SEAM_TRANSPORT_ROUND_ATTR as _STR_ATTR,
+                seam_grant_is_open as _grant_open,
+            )
+
+            if bool(getattr(self, _STR_ATTR, False)) and not _grant_open(
+                self.chunked_req
+            ):
+                self._note_seam_chunk_refused(self.chunked_req)
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {
@@ -8662,13 +8708,22 @@ class Scheduler(
         from sglang.srt.managers.phase_purity import (
             SEAM_READMIT_ATTR,
             SEAM_TRANSPORT_ROUND_ATTR,
+            consume_seam_grant,
+            seam_grant_is_open,
         )
 
         transport_only = bool(getattr(self, SEAM_TRANSPORT_ROUND_ATTR, False))
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if transport_only and getattr(req, SEAM_READMIT_ATTR, None) is None:
+            if transport_only and not seam_grant_is_open(req):
+                # #906: unstamped OR already spent. The old test was the bare
+                # stamp, which never expires, so one retraction licensed an
+                # unbounded run of TP chunks (live: a 20k-token wave, every
+                # chunk `#cached-token: 0`). A spent grant also drops the
+                # request from `seam_readmit_candidates`, which hands its
+                # remaining tokens back to the policy as ordinary pending
+                # prefill -- that is what sends it to PP instead of wedging it.
                 _note_skip("seam_transport_only", req.rid)
                 continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -8809,6 +8864,23 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+
+            # #906: DEBIT THE GRANT WHERE IT IS SPENT. The request is in
+            # `can_run_list`, so this exempt round has bought its one chunk;
+            # any further chunk needs a grant of its own. Debiting at the
+            # admission (rather than at the batch's end) is what makes the
+            # chunked continuation below refusable -- `add_chunked_req` runs
+            # BEFORE this filter on the next round (#890's second hole), so a
+            # ledger written later would always be read too late.
+            if (
+                transport_only
+                and adder.can_run_list
+                and req is adder.can_run_list[-1]
+            ):
+                # Identity against the tail, the same test the `added = ...`
+                # line below uses -- an equality scan over the list would cost
+                # more and mean less.
+                consume_seam_grant(req)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
