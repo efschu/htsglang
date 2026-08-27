@@ -3200,6 +3200,8 @@ class Scheduler(
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            # #927 sibling: resolve the allocator per access, not once here.
+            get_token_to_kv_pool_allocator=lambda: self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             offload_tags=self.weight_updater.offload_tags,
             ps=self.ps,
@@ -3259,6 +3261,8 @@ class Scheduler(
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            # #927 sibling: resolve the allocator per access, not once here.
+            get_token_to_kv_pool_allocator=lambda: self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,
@@ -3289,6 +3293,13 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            # #927: the allocator is REBOUND at every phase cutover
+            # (hicache_phase_binding._stamp), and this scheduler is one of the
+            # three readers that rebind moves. Hand the checker a LIVE read of
+            # this attribute instead of the object it happens to hold now, or
+            # the on-idle ledger keeps auditing the boot phase's pool for the
+            # rest of the process -- see SchedulerInvariantChecker._allocator.
+            get_token_to_kv_pool_allocator=lambda: self.token_to_kv_pool_allocator,
         )
 
     def init_parked_decode_set(self) -> None:

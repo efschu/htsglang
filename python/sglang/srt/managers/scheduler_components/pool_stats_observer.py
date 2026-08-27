@@ -142,6 +142,8 @@ class PoolStats:
 class SchedulerPoolStatsObserver:
     tree_cache: BasePrefixCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    #: #927: resolve the allocator PER ACCESS. See :meth:`_allocator`.
+    get_token_to_kv_pool_allocator: Optional[Callable] = None
     req_to_token_pool: ReqToTokenPool
     session_controller: Any
     hisparse_coordinator: Any
@@ -153,6 +155,23 @@ class SchedulerPoolStatsObserver:
     max_total_num_tokens: int
     get_last_batch: Callable
     get_running_batch: Callable
+
+    def _allocator(self):
+        """The KV allocator AS BOUND RIGHT NOW (#927 sibling).
+
+        Same defect as ``SchedulerInvariantChecker._allocator``, same class:
+        a dataclass field holding an object the phase flip REBINDS
+        (``hicache_phase_binding._stamp``), on a component ``readers_of`` does
+        not name -- so after the first cutover this audits the boot phase's
+        pool for the rest of the process. Resolved per access, which is the
+        form the next component cannot forget.
+        """
+        getter = self.get_token_to_kv_pool_allocator
+        if getter is not None:
+            live = getter()
+            if live is not None:
+                return live
+        return self.token_to_kv_pool_allocator
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -214,7 +233,7 @@ class SchedulerPoolStatsObserver:
         return pool_stats
 
     def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = self._allocator().available_size()
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
@@ -242,7 +261,7 @@ class SchedulerPoolStatsObserver:
         is_mamba_radix_cache = (
             self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
         )
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_available_size = self._allocator().available_size()
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
@@ -261,13 +280,13 @@ class SchedulerPoolStatsObserver:
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
+        full_num_used = self._allocator().size - (
             full_available_size + full_evictable_size
         )
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
             mamba_available_size + mamba_evictable_size
         )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
+        full_token_usage = full_num_used / self._allocator().size
         mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
 
         return PoolStats(
@@ -283,9 +302,9 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_available_size = self._allocator().full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_available_size = self._allocator().swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
