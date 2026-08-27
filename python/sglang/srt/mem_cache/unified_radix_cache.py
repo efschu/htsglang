@@ -1811,6 +1811,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         trigger_priority = trigger.eviction_priority(is_leaf)
 
+        #: #927: did THIS cascade free the Full component's device rows? The
+        #: tombstone below used to ask whether Full was the TRIGGER, which is a
+        #: different question -- see its comment.
+        base_rows_freed = trigger.component_type == BASE_COMPONENT_TYPE
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
@@ -1834,15 +1838,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._evict_component_and_detach_lru(
                         node, comp, target=target, tracker=tracker
                     )
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        base_rows_freed = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
         # This is deferred from evict_component because free_swa needs it.
-        if (
-            target is EvictLayer.DEVICE
-            and trigger.component_type == BASE_COMPONENT_TYPE
-        ):
-            node.component_data[trigger.component_type].value = None
+        #
+        # #927 THE CONDITION WAS THE WRONG QUESTION. `full_component.
+        # evict_component` frees the rows on ANY cascade that reaches it
+        # (":115-118", `self._free_full(cd.value)`) and leaves `cd.value` set,
+        # because clearing it here is what lets `free_swa` read it first. But
+        # this asked whether Full was the TRIGGER. A cascade triggered by
+        # MAMBA or SWA (`mamba_component.py:529`, `swa_component.py:441`) that
+        # reaches Full therefore freed its rows and never tombstoned them, so
+        # the node went on naming ids the allocator had already handed back.
+        #
+        # A LIVE TREE NODE NAMING FREE ROWS IS THE EXCLUSIVITY DEFECT ITSELF,
+        # not merely an accounting one: those ids stay matchable, so a later
+        # prefix hit can serve KV out of rows that have been reissued -- the
+        # #767 direction. It surfaced first as arithmetic because the on-idle
+        # ledger looks for it: `_live_double_claimed_rows` intersects the free
+        # list with `all_values_flatten()`, which reads exactly this `value`
+        # and does not test `evicted`.
+        #
+        # WHY NOW, AND WHY IT IS OLD: the intersection can only be as large as
+        # the tree, and until the mamba checkpoint grid stopped vetoing every
+        # anchor no prefix match ever succeeded, so the tree stayed at
+        # evictable=1 and the term measured ~1 row (the 2c precedent that
+        # motivated it). The first real 8538-row cached prefix turned it into
+        # 8129 against a 120-row surplus -- an 8009-row DEFICIT -- and PP0
+        # raised 14s after the first hit (SPECIMEN-2026-08-27T0643Z-HIT-
+        # DOUBLE-OWNED-CRASH.txt). Rank-local because only the matching rank
+        # locked the prefix, which is what put Full at the bottom of a
+        # mamba-triggered cascade there and not on its peers.
+        if target is EvictLayer.DEVICE and base_rows_freed:
+            node.component_data[BASE_COMPONENT_TYPE].value = None
 
         self._update_evictable_leaf_sets(node)
 

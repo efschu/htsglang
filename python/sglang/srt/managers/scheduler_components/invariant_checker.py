@@ -332,6 +332,48 @@ class SchedulerInvariantChecker:
             if live_double_owned:
                 double_owned = int(live_double_owned)
                 double_owned_src = "live"
+                # #927: SAY WHICH OF THE TWO FREE READINGS IS SPEAKING.
+                #
+                # This term is subtracted from a ledger built on
+                # `available_size()` (a COUNT) while it is itself derived from
+                # `free_reading.rows` (an ENUMERATION). The type's own docstring
+                # warns that "HOW MANY" and "WHICH ONES" are different questions
+                # on this allocator family, and nothing compared them here.
+                #
+                # Measured, boot 2f repro (0649Z): the ledger balanced EXACTLY
+                # -- available 125865 + protected 8192 + evictable 1111 = 135168
+                # = the post-cutover free pool, + withheld 305265 = total
+                # 440433, surplus ZERO -- and the run still died, because
+                # subtracting a live reading of 8192 turned that exact balance
+                # into an 8192-row deficit. A correction that large against a
+                # ledger with nothing to correct means the two readings disagree
+                # by exactly the protected count, and the log could not say so.
+                #
+                # Printed, not acted on. Whether the enumeration over-reports or
+                # `available_size()` under-reports decides which side is the
+                # defect, and that is a different fix on each side -- so this
+                # names the disagreement and leaves the verdict to the reader,
+                # rather than guessing and calling one of them wrong.
+                try:
+                    enumerated = len(free_reading.rows)
+                    counted = free_reading.count
+                    if counted is not None and enumerated != counted:
+                        logger.warning(
+                            "#927 FREE READING DISAGREES WITH ITSELF: the "
+                            "enumeration holds %d row(s) while the count says "
+                            "%d (delta %d); double_owned=%d is derived from the "
+                            "ENUMERATION and subtracted from a ledger built on "
+                            "the COUNT. available=%s evictable=%s protected=%s",
+                            enumerated,
+                            counted,
+                            enumerated - counted,
+                            double_owned,
+                            full_available_size,
+                            full_evictable_size,
+                            protected,
+                        )
+                except Exception:  # noqa: BLE001 - a diagnostic may never raise
+                    pass
         leak, msg = self._check_pool_invariant(
             "full",
             full_available_size,
