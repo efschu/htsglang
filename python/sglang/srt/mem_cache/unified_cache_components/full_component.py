@@ -37,15 +37,68 @@ class FullComponent(TreeComponent):
 
     def __init__(self, cache, params):
         super().__init__(cache, params)
-        allocator = cache.token_to_kv_pool_allocator
-        # When SWA is present, only free full-attention KV here;
-        # SWA KV will be freed by cascade via SWAComponent.evict_component.
-        if ComponentType.SWA in cache.tree_components:
-            self._free_full = allocator.full_attn_allocator.free
-        else:
-            self._free_full = allocator.free
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+
+    def _free_full(self, values) -> None:
+        """Give rows back to the CURRENTLY BOUND allocator, resolved per access.
+
+        #941: THIS WAS A BOUND METHOD CAPTURED IN ``__init__``::
+
+            allocator = cache.token_to_kv_pool_allocator
+            self._free_full = allocator.free
+
+        and a bound method carries its instance. ``hicache_phase_binding``
+        states the law this broke -- "THREE READERS, AND WHY A PARTIAL REBIND IS
+        WORSE THAN NONE ... If one moves and another does not, the readers
+        disagree about which pool a row id names, and the disagreement is
+        invisible: every call still succeeds, against different memory". Its
+        ``_stamp`` moves ``token_to_kv_pool_allocator`` on the scheduler, the
+        tree and the controller; it could not reach this capture, and
+        ``coherence_check`` could not see it either, because that check compares
+        ``hicache_binding_generation`` over the three NAMED readers and this
+        component is a fourth. Green indicator, stale free path.
+
+        MEASURED (window 2k, boot_2k_dd0e3bc224_0827_1237.log, PP0). At a
+        ``tp_to_pp`` drop::
+
+            at-arm      free=470650 cached=267 unaccounted=332
+            RESIDENTS RELEASED ... the prefix tree dropped returning 267 row(s)
+            pre-cutover free=470650 cached=0   unaccounted=599
+
+        267 rows leave the tree, the bound allocator's free count does not move,
+        and ``unaccounted`` rises by exactly 267 -- five cycles, five exact
+        matches. The rows are not destroyed: they land on the OTHER phase's free
+        list as DUPLICATES of ids it already calls free, which is why that
+        allocator's ``available_size`` (a raw length) drifts above its own
+        enumerated free set by the same running total. A leak on one side and a
+        second writer waiting on the other.
+
+        ONLY ONE OF THE TWO DROPS COULD SHOW IT. The seam retracts and drops
+        BEFORE the cutover rebinds, so at a ``pp_to_tp`` drop the live binding is
+        still the phase that minted the rows and the stale capture agrees by
+        accident. At a ``tp_to_pp`` drop it does not, which is why the loss is
+        once per cutover PAIR and is sized by the TP phase's allocation.
+
+        RESOLVED PER ACCESS, NOT RE-STAMPED. Re-stamping would add a fifth thing
+        to keep in step; reading the binding at the moment of use cannot go
+        stale, and it is the rule this codebase already applies to rebindable
+        pools elsewhere ("Candidates are resolved PER ACCESS, never held -- a
+        construction reference to a rebindable pool is the #927 class",
+        phase_flip_runtime.py). ``tree_components`` is fixed at construction, so
+        the SWA branch below is a constant test, not a second binding.
+
+        THIS CHANGES WHERE A FREE IS ADDRESSED, NEVER WHETHER ONE HAPPENS. No
+        row is freed here that was not already being freed by this same call at
+        this same moment, so there is no new release to pair with a later drop
+        and no double-free to build.
+        """
+        allocator = self.cache.token_to_kv_pool_allocator
+        # When SWA is present, only free full-attention KV here;
+        # SWA KV will be freed by cascade via SWAComponent.evict_component.
+        if ComponentType.SWA in self.cache.tree_components:
+            allocator = allocator.full_attn_allocator
+        allocator.free(values)
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -202,9 +255,9 @@ class FullComponent(TreeComponent):
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert cd.value is not None, (
-                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
-            )
+            assert (
+                cd.value is not None
+            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.cache.component_evictable_size_[ct] -= key_len

@@ -6650,14 +6650,39 @@ class PhaseFlipRuntime:
             "draft_allocator", getattr(sched, "draft_token_to_kv_pool_allocator", None)
         )
         _add("draft_pool", getattr(sched, "draft_token_to_kv_pool", None))
+        # #941: THE PP STACK IS NOT ON `stacks`, AND LOOKING FOR IT THERE MADE
+        # THIS PROBE VACUOUS IN THE ONLY PHASE THAT NEEDED IT.
+        #
+        # The loop here read `stacks.tp_worker` and `stacks.pp_worker`.
+        # `PhaseFlipStacks` (phase_flip_boot.py:784) carries a `tp_worker` and
+        # NO `pp_worker`: the PP stack is the scheduler's own `tp_worker`, which
+        # is exactly how `_census_owner_probe` twenty lines below reads it, under
+        # the label PP_STACK. So the second name resolved to None on every call,
+        # and the first resolved -- while the TP phase was live -- to the
+        # allocator the census had ALREADY enumerated, which `_add` skips by
+        # design. In the TP phase, the only phase in which this rig reports
+        # UNOWNED rows at all, the candidate list came out EMPTY and the verdict
+        # was the `not candidates` branch: "no second pool object is reachable
+        # from here".
+        #
+        # THAT IS AN ABSTENTION PRINTED AS A NEGATIVE, and it is the reading that
+        # sent #938 hunting release paths and write-through acks. The second pool
+        # was one attribute away and it had the rows: on the 2k boot the drop's
+        # eviction paid them to the PP stack's allocator (#941), and this line
+        # was the one instrument whose job was to say so.
+        #
+        # BOTH DIRECTIONS, ONE LIST. In the PP phase the PP allocator is the
+        # enumerated one and the TP allocator is the candidate; in the TP phase
+        # it is the other way round. `_add`'s identity skip does the switching,
+        # so this names "the other phase's pool" without asking which phase it
+        # is in -- a question this frame has no reliable way to answer.
         stacks = getattr(sched, "phase_flip_stacks", None)
-        for stack_name in ("tp_worker", "pp_worker"):
-            worker = getattr(stacks, stack_name, None) if stacks else None
+        for label, worker in (
+            ("tp_stack_allocator", getattr(stacks, "tp_worker", None)),
+            ("pp_stack_allocator", getattr(sched, "tp_worker", None)),
+        ):
             runner = getattr(worker, "model_runner", None)
-            _add(
-                f"{stack_name}_allocator",
-                getattr(runner, "token_to_kv_pool_allocator", None),
-            )
+            _add(label, getattr(runner, "token_to_kv_pool_allocator", None))
         return out
 
     def _note_unenumerated_owner(self, found) -> None:
