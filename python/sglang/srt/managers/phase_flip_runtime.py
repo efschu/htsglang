@@ -1052,6 +1052,86 @@ def seam_copy_addresses_the_bound_pool(scheduler) -> bool:
     return rows >= size
 
 
+_EXTENT_FALLBACK_SAID: set = set()
+
+
+def _warn_extent_fallback(req, n: int) -> None:
+    """#922: say it once per rid when the authoritative extent is missing.
+
+    Silence here would be the old behaviour wearing the new code's name --
+    the exact shape this ticket closes.
+    """
+    rid = str(getattr(req, "rid", "?"))
+    if rid in _EXTENT_FALLBACK_SAID:
+        return
+    _EXTENT_FALLBACK_SAID.add(rid)
+    logger.warning(
+        "%s #922 EXTENT FALLBACK rid=%s: kv_allocated_len is unavailable, so "
+        "this enumeration uses seqlen=%d, which is known to over-count by the "
+        "spec reserve. One stale row may be moved; none is dropped.",
+        LOG_PREFIX,
+        rid,
+        n,
+    )
+
+
+def owned_row_extent(req, page_size: int = 1) -> int:
+    """Rows the ALLOCATOR has handed this request. #922.
+
+    ONE DEFINITION, TWO CALLERS, and that is the point rather than tidiness.
+    `_resident_rows` says it in its own docstring -- "two enumerations of
+    'which rows does this request hold' that can disagree is the shape #822
+    exists to end" -- and the two enumerations then disagreed about the
+    EXTENT instead of the membership, which is the same defect one level down.
+
+    `req.seqlen` is `len(origin_input_ids) + len(output_ids)`: a property of
+    the SEQUENCE. `req.kv_allocated_len` is what the allocator handed out and
+    is precisely what the invariant checker charges to the pool, page-aligned.
+    Both readers sliced with the former.
+
+    THE SIGN, MEASURED TWICE, ON TWO BOOTS AND TWO CONFIGS:
+      * 2026-08-09 (phase_flip_presence.py:513-516): `seqlen=82
+        kv_allocated_len=81 delta_vs_seqlen=-1`;
+      * 2026-08-27, boot 2f/2g: SIXTY-THREE of 63 `FLIP EXTENT PROBE`
+        emissions, three ranks, every flip, `delta_vs_seqlen=-1` -- at
+        `seqlen=9448/kv_allocated_len=9447` and at `seqlen=2/
+        kv_allocated_len=1`.
+    `seqlen` OVER-counts by one, so `req_to_token[idx, :seqlen]` reads one row
+    BEYOND what the allocator owns: a stale cell left by that row's previous
+    tenant.
+
+    BOTH CALL SITES DEFERRED THE CHANGE PENDING EXACTLY THIS EVIDENCE.
+    presence.py:521-524: "NOT yet changed: one measurement on one config is
+    not enough to re-cut an enumeration whose errors are silent, and the
+    change is a one-liner once a second flip confirms the sign."
+    build_flip_live_slots_fn: "change this only on that evidence." The second
+    flip has now confirmed the sign 63 times, so this is that one-liner.
+
+    Returns -1 when the request cannot state its extent. The two callers
+    degrade differently ON PURPOSE and the asymmetry is the safety argument:
+    the census answers "no verdict" (declaring an owner that holds the wrong
+    rows is worse than declaring none), while the mover falls back to the OLD
+    extent and says so, because moving one stale row is what it does today
+    while DROPPING a live one would lose a request's context.
+    """
+    alloc = int(getattr(req, "kv_allocated_len", -1) or -1)
+    if alloc <= 0:
+        return -1
+    return ceil_align(alloc, page_size) if page_size > 1 else alloc
+
+
+def _page_size_of(scheduler) -> int:
+    try:
+        return int(
+            getattr(
+                getattr(scheduler, "token_to_kv_pool_allocator", None), "page_size", 1
+            )
+            or 1
+        )
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
     """Live slots = radix tree values UNION parked requests' rows.
 
@@ -1107,7 +1187,22 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
         # happen" is what made it a crash instead of a log line.
         skipped_no_slot: List[str] = []
         for req in reqs:
-            n = int(req.seqlen)
+            # #922: the allocator's extent, with a LOUD fallback. The
+            # comment above asked for the probe's evidence before re-cutting
+            # this; 63 of 63 emissions on boot 2f/2g report
+            # delta_vs_seqlen=-1, so seqlen moves one row the allocator does
+            # not own -- a stale cell "moved as if it were live KV"
+            # (phase_flip_presence.py:516-519).
+            #
+            # FALLING BACK RATHER THAN SKIPPING, and the direction is the
+            # whole safety argument: moving one stale row is what this does
+            # today and is recoverable; DROPPING a live row loses a request's
+            # context at the seam, silently. So a request that cannot state
+            # its extent keeps the old one and says so.
+            n = owned_row_extent(req, _page_size_of(scheduler))
+            if n < 0:
+                n = int(req.seqlen)
+                _warn_extent_fallback(req, n)
             if n <= 0:
                 continue
             if getattr(req, "req_pool_idx", None) is None:
@@ -1954,11 +2049,24 @@ def _resident_rows(scheduler) -> Optional[set]:
         if req_to_token is None:
             return None
         rows: set = set()
+        page = _page_size_of(scheduler)
         for req in _live_reqs(scheduler):
-            n = int(getattr(req, "seqlen", 0) or 0)
-            if n <= 0:
-                continue
             if getattr(req, "req_pool_idx", None) is None:
+                continue
+            # #922: the ALLOCATOR's extent, not the sequence's. Slicing to
+            # seqlen read one row past the allocation -- a stale cell from the
+            # row's previous tenant -- and handed it to the census as
+            # resident-owned. Downstream that is a false EXCLUSIVITY_DOUBLED
+            # whenever the stale id is also in the free list or the tree
+            # (#912 publishes that count onto the allocator and on_idle
+            # consumes it), and a false ACQUITTAL whenever the stale id is a
+            # genuinely unaccounted row that now looks owned.
+            n = owned_row_extent(req, page)
+            if n < 0:
+                # No verdict, per this function's own contract: a partial or
+                # wrong owner set turns the working set back into a leak.
+                return None
+            if n == 0:
                 continue
             rows.update(int(r) for r in req_to_token[req.req_pool_idx, :n].tolist())
         return rows
