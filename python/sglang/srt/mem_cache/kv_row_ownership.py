@@ -1288,3 +1288,96 @@ CLAMP_BASELINE_ROWS_0823 = {
     "PP1": (466994, 124928, 342066),
     "PP2": (466994, 133120, 333874),
 }
+
+
+# ---------------------------------------------------------------------------
+# #919: WHICH OWNER WAS NOT ENUMERATED.
+#
+# The EXCLUSIVITY_UNOWNED line already tells the reader what it has historically
+# meant -- "on this stack that has meant an un-enumerated second pool object,
+# not a leak" -- and then leaves them to find that object by hand. Measured on
+# the 0826 rerun, three ranks, both boots: 4096 committed ids of 228897 /
+# 140961 / 148289 unowned, always `sample=[1..8]`, i.e. the same fixed block at
+# the BOTTOM of the id space while the withheld set is by construction the top.
+# The same shape appeared in the 2g boot at 2047-of-2048, i.e. the whole
+# committed backing.
+#
+# #919 as filed read that line as "the tree LOSES 4096 rows without free" and
+# hung #842 on it. The line says the other thing. This probe closes the gap the
+# line leaves instead of arguing about the reading: it asks, at the moment of
+# the violation, whether a second pool object exists and whether its id space
+# covers the block nobody claimed.
+#
+# THE VERDICT IS THE DELIVERABLE, and it is three-valued on purpose -- the two
+# "not a leak" answers and the one that sends the hunt onward are different
+# conclusions and must not share a line.
+# ---------------------------------------------------------------------------
+
+#: A second pool object exists and its id space covers every sampled unowned
+#: row. The census simply did not enumerate it: an ENUMERATION GAP, not a leak.
+CANDIDATE_COVERS = "SECOND-POOL-COVERS"
+#: A second pool object exists but its id space does not cover the sample.
+#: Not the explanation; the block is still unaccounted for.
+CANDIDATE_DISJOINT = "SECOND-POOL-EXISTS-BUT-DISJOINT"
+#: No second pool object is reachable at all. The block is genuinely ownerless
+#: and the hunt goes to the release/retirement paths (reset_tree,
+#: drop_prefix_tree_returning_rows, the #920 id-space retirement neighbourhood).
+CANDIDATE_ABSENT = "NO-SECOND-POOL"
+
+
+@dataclass(frozen=True)
+class OwnerCandidate:
+    """A pool object the census did NOT enumerate, and the ids it could own.
+
+    ``hi`` is EXCLUSIVE. Ranges are 1-based to match the census's own
+    ``range(1, size + 1)`` id space -- the off-by-one here would silently turn
+    a covering candidate into a disjoint one, which is the wrong answer in the
+    expensive direction (it would send the hunt to reset_tree for a block that
+    was explained all along).
+    """
+
+    name: str
+    lo: int
+    hi: int
+
+    def covers(self, rows: Iterable[int]) -> bool:
+        return all(self.lo <= int(r) < self.hi for r in rows)
+
+
+def unenumerated_owner_verdict(
+    sample: Iterable[int], candidates: Sequence[OwnerCandidate]
+) -> Tuple[str, str]:
+    """Three-valued: does an un-enumerated pool explain this unowned block?
+
+    PURE. The caller resolves the candidates per access (never a construction
+    reference -- that is the #927 class, and this module's own census reads its
+    allocator per access for exactly that reason) and this decides.
+
+    Judged on the SAMPLE, which is bounded and is all the violation carries.
+    That is a real limit and it is stated rather than papered over: a candidate
+    that covers the sample is evidence, not proof, for the whole block. It is
+    still the difference between "look for a second pool" and "hunt the release
+    paths", which is the decision this exists to make.
+    """
+    rows = [int(r) for r in sample]
+    if not candidates:
+        return CANDIDATE_ABSENT, "no second pool object is reachable from here"
+    if not rows:
+        return (
+            CANDIDATE_DISJOINT,
+            "the violation carried no sample, so no candidate can be tested "
+            f"({len(candidates)} present)",
+        )
+    for cand in candidates:
+        if cand.covers(rows):
+            return (
+                CANDIDATE_COVERS,
+                f"{cand.name} owns ids [{cand.lo}, {cand.hi}) and covers every "
+                f"sampled row -- the census did not enumerate it",
+            )
+    shown = ", ".join(f"{c.name}=[{c.lo}, {c.hi})" for c in candidates[:4])
+    return (
+        CANDIDATE_DISJOINT,
+        f"{len(candidates)} second pool object(s) present but none covers the "
+        f"sample: {shown}",
+    )

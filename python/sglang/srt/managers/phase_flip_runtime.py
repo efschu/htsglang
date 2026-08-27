@@ -6299,6 +6299,22 @@ class PhaseFlipRuntime:
                 resident_rows=None if resident is None else {"requests": resident},
                 why=str(why),
             )
+            # #919: NAME THE OWNER THE CENSUS DID NOT ENUMERATE.
+            #
+            # The UNOWNED line already says what it has historically meant --
+            # "an un-enumerated second pool object, not a leak" -- and then
+            # leaves the reader to find that object by hand. #919 as filed read
+            # the same line as "the tree LOSES 4096 rows without free" and hung
+            # #842 on it. This answers the question the line leaves open, at
+            # the moment it is asked, instead of arguing about the reading.
+            #
+            # ADDITIVE ONLY: `found` is not touched, no violation is added,
+            # removed or reclassified. One extra line per unowned violation.
+            #
+            # Candidates are resolved PER ACCESS, never held -- a construction
+            # reference to a rebindable pool is the #927 class, and this very
+            # census reads its own allocator per access for that reason.
+            self._note_unenumerated_owner(found)
             # #912: publish the EXCLUSIVITY law's own "claimed by more than one
             # owner" count onto the allocator, in the same place and the same
             # unit KvRowCap already publishes `residency_withheld_slots`
@@ -6360,6 +6376,83 @@ class PhaseFlipRuntime:
                     pass
         except Exception:  # noqa: BLE001 -- an instrument, never a gate
             logger.debug("%s census ownership audit skipped", LOG_PREFIX, exc_info=True)
+
+    def _unenumerated_owner_candidates(self) -> list:
+        """Pool objects the census does NOT enumerate, resolved PER ACCESS.
+
+        Never cached and never held: a construction reference to a rebindable
+        pool is the #927 class, which this module's own census already avoids
+        by re-reading its allocator from the scheduler each time.
+
+        Two families, and the second is the one this rig makes likely: the
+        DRAFT pool (cutover_participants records it as "#861 the draft KV pool
+        was never registered -- a whole pool, missed") and the OTHER PHASE's
+        stack, which owns its own pool object across a flip. `_census_owner_probe`
+        found ~94000 rows owned by a pool object the census never enumerated;
+        this names which one rather than counting them again.
+        """
+        from sglang.srt.mem_cache.kv_row_ownership import OwnerCandidate
+
+        out = []
+        sched = self._census_scheduler
+        if sched is None:
+            return out
+        enumerated = id(getattr(sched, "token_to_kv_pool_allocator", None))
+
+        def _add(name, obj):
+            if obj is None or id(obj) == enumerated:
+                return
+            size = getattr(obj, "size", None)
+            if not isinstance(size, int) or size <= 0:
+                return
+            out.append(OwnerCandidate(name=name, lo=1, hi=size + 1))
+
+        _add("draft_allocator", getattr(sched, "draft_token_to_kv_pool_allocator", None))
+        _add("draft_pool", getattr(sched, "draft_token_to_kv_pool", None))
+        stacks = getattr(sched, "phase_flip_stacks", None)
+        for stack_name in ("tp_worker", "pp_worker"):
+            worker = getattr(stacks, stack_name, None) if stacks else None
+            runner = getattr(worker, "model_runner", None)
+            _add(
+                f"{stack_name}_allocator",
+                getattr(runner, "token_to_kv_pool_allocator", None),
+            )
+        return out
+
+    def _note_unenumerated_owner(self, found) -> None:
+        """#919: one line per UNOWNED violation, naming the missing owner.
+
+        Three-valued, because the two "not a leak" answers and the one that
+        sends the hunt onward are different conclusions and must not share a
+        line. Never raises and never changes a verdict.
+        """
+        try:
+            from sglang.srt.mem_cache.kv_row_ownership import (
+                EXCLUSIVITY_UNOWNED,
+                Law,
+                unenumerated_owner_verdict,
+            )
+
+            unowned = [
+                v
+                for v in (found or ())
+                if v.law == Law.EXCLUSIVITY and v.kind == EXCLUSIVITY_UNOWNED
+            ]
+            if not unowned:
+                return
+            candidates = self._unenumerated_owner_candidates()
+            for v in unowned:
+                verdict, detail = unenumerated_owner_verdict(v.sample, candidates)
+                logger.warning(
+                    "%s #919 UNOWNED-BLOCK %s: %d row(s), sample=%s -- %s",
+                    LOG_PREFIX,
+                    verdict,
+                    v.rows,
+                    list(v.sample),
+                    detail,
+                )
+        except Exception:  # noqa: BLE001 - an instrument, never a gate
+            logger.debug("%s #919 candidate probe skipped", LOG_PREFIX, exc_info=True)
 
     def _enforce_exposure_at_seam(self, when: str) -> int:
         """#851 F1: hold the allocator to the EXPOSURE law at a seam event.
