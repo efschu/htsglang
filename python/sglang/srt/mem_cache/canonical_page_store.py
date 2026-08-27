@@ -443,6 +443,101 @@ def resolve_attn_layer_ids(model_config) -> list[int]:
     )
 
 
+def resolve_linear_layer_ids(model_config) -> list[int]:
+    """The model's GDN/linear layer ids, or a NAMED refusal. #931.
+
+    THE SIBLING ``resolve_attn_layer_ids`` WAS GIVEN AND THIS HALF WAS NOT.
+    The attention half above got this ladder on 2026-08-17 because
+    ``full_attention_layer_ids or range(n)`` could not tell NOT HYBRID from NOT
+    POPULATED. The mamba half kept a bare lookup -- and it was not merely
+    fragile, it was aimed at the wrong object:
+
+        cache_params = getattr(model_config, "mamba2_cache_params", None)
+
+    ``mamba2_cache_params`` is a property of the CHECKPOINT config
+    (``Qwen3NextConfig.mamba2_cache_params``, configs/qwen3_next.py:288, whose
+    ``layers=self.linear_layer_ids``), never of sglang's ``ModelConfig``:
+    ``grep -c mamba2_cache_params configs/model_config.py`` is 0. So the getattr
+    missed on EVERY model, the id list was always empty, and
+    ``CacheController._canonical_mamba_window`` returned ``None`` through its
+    one silent branch on every boot since a38f39f1ee landed (2026-08-17).
+
+    WHAT THAT COST, measured on boot 2g (2026-08-27,
+    boot_2f_698cd396ce_0827_0704.log): with the format explicitly armed
+    (``phase_flip_canonical_kv_page=True``, writeback on, 'file' backend,
+    page_size 1) the log carries "#706 canonical KV page active" three times,
+    once per rank -- and "#706 canonical GDN blob active" ZERO times, with zero
+    refusals. Exactly the split ``_canonical_mamba_window``'s own docstring
+    names as fatal: "a canonical KV page beside a phase-local GDN blob delivers
+    ZERO usable prefix ... Silently running KV-only would look like the feature
+    was on while every cross-phase lookup missed." The KV crossed the flip
+    geometry-neutrally; the recurrent anchor stayed phase-local, and #928 is
+    what that reads like at the API.
+
+    THE SAME LADDER, deliberately, so the two halves cannot drift again:
+
+    (a) ``ModelConfig``'s own list, when a future ModelConfig populates one.
+        Empty today for every model, which is why it may never be read as
+        "this model has no linear layers".
+    (b) the checkpoint config's OWN properties -- ``linear_layer_ids`` first
+        (the primitive; Qwen3-Next derives it from ``layers_block_type`` and
+        Qwen3_5TextConfig inherits it), then ``mamba2_cache_params.layers``,
+        which is that same list wrapped. Read through ``hf_text_config``, the
+        hop ``gdn_flip_mover.py:929`` already uses for GDN geometry.
+    (c) ``[]`` ONLY on a POSITIVE DENSE PROOF: no layer kinds declared and no
+        hybrid flag. An empty list from here is the ONE case where "no blob" is
+        the right answer, and the caller may then skip the blob safely.
+    (d) anything else -- kinds declared but no id list -- is a REFUSAL. A
+        hybrid whose blob cannot be made canonical must not run with canonical
+        KV pages alone; that combination hits nothing at all and, worse, serves
+        the other phase's recurrent bytes rather than missing cleanly.
+    """
+    # (a) ModelConfig's own, when it has an answer.
+    ids = getattr(model_config, "linear_layer_ids", None)
+    if ids:
+        return [int(i) for i in ids]
+
+    text_config = getattr(model_config, "hf_text_config", None)
+
+    # (b) the checkpoint's own properties, primitive first.
+    own = getattr(text_config, "linear_layer_ids", None) if text_config else None
+    if own:
+        return [int(i) for i in own]
+    cache_params = (
+        getattr(text_config, "mamba2_cache_params", None) if text_config else None
+    )
+    wrapped = getattr(cache_params, "layers", None)
+    if wrapped:
+        return [int(i) for i in wrapped]
+
+    # (c) no linear layers, PROVEN rather than assumed.
+    kinds = None
+    for attr in ("layer_types", "layers_block_type", "hybrid_layer_pattern"):
+        kinds = getattr(text_config, attr, None) if text_config else None
+        if kinds:
+            break
+    declares_hybrid = bool(getattr(model_config, "is_hybrid", None)) or bool(
+        getattr(model_config, "is_hybrid_swa", None)
+    )
+    if not kinds and not declares_hybrid:
+        return []
+
+    # (d) kinds declared, nothing resolved them: refuse and say what was seen.
+    arch = getattr(getattr(model_config, "hf_config", None), "architectures", None)
+    seen = sorted({str(k) for k in (kinds or [])})
+    raise CanonicalPageError(
+        f"cannot resolve the GDN/linear layer ids for {arch}: the checkpoint "
+        f"config ({type(text_config).__name__}) exposes neither a "
+        f"linear_layer_ids property nor mamba2_cache_params.layers, and it "
+        f"declares layer kinds {seen}. This is a hybrid, so treating it as "
+        f"having no recurrent layers would attach a canonical KV page with a "
+        f"PHASE-LOCAL GDN blob -- a prefix that hits nothing, and whose "
+        f"recurrent state comes from whichever phase wrote it last (#928). "
+        f"Give that config class a linear_layer_ids property, as "
+        f"Qwen3NextConfig has."
+    )
+
+
 def build_page_window(
     attn_layer_ids: Sequence[int], device_pool, host_pool
 ) -> CanonicalPageWindow:
