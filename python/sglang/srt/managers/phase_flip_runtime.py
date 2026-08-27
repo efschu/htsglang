@@ -1552,6 +1552,63 @@ def tree_evictable_full_rows(tree) -> Optional[int]:
         return None
 
 
+#: #938: rows the drop left PROTECTED, summed over this process's cutovers.
+#: Module-level because `drop_prefix_tree_returning_rows` is a free function
+#: and the quantity only means anything as a running total: the specimen's
+#: signature is a block that grows by one request's allocation per cutover,
+#: which a per-drop number cannot show and a total can.
+_PROTECTED_RESIDUE_ORPHANED_ROWS = 0
+_PROTECTED_RESIDUE_ORPHANED_DROPS = 0
+
+
+def tree_protected_full_rows(tree) -> Optional[int]:
+    """How many FULL-pool rows the prefix tree holds LOCKED, or ``None``.
+
+    THE OTHER HALF OF THE SAME BASE-CLASS CONTRACT. ``full_protected_size()``
+    is declared on ``BasePrefixCache`` beside ``full_evictable_size()`` and
+    implemented by every cache in this tree; on ``UnifiedRadixCache`` it
+    returns ``component_protected_size_[BASE_COMPONENT_TYPE]``. Same reader
+    shape, same abstention rule -- ``None`` means the tree could not answer
+    and is NOT zero, because zero here reads as "nothing was orphaned" which
+    is exactly the sentence this instrument exists to stop being assumed.
+    """
+    reader = getattr(tree, "full_protected_size", None)
+    if not callable(reader):
+        return None
+    try:
+        return max(0, int(reader()))
+    except Exception:  # noqa: BLE001 - an unreadable count is not zero rows
+        return None
+
+
+def _protected_node_sample(tree, limit: int = 4) -> str:
+    """Best-effort: name a few of the locked nodes, with their lock refs.
+
+    Diagnostic garnish, never load-bearing -- the COUNT above is the finding.
+    The root is skipped on purpose: ``_reset_full`` gives it ``lock_ref = 1``
+    on every component by construction, so including it would report a
+    permanent false positive on every drop.
+    """
+    try:
+        nodes = tree._collect_all_nodes()
+    except Exception:  # noqa: BLE001 - a sample may never break a seam
+        return "unavailable"
+    root = getattr(tree, "root_node", None)
+    out = []
+    try:
+        for node in nodes:
+            if node is root:
+                continue
+            locks = [int(cd.lock_ref) for cd in node.component_data]
+            if any(lock > 0 for lock in locks):
+                out.append(f"id={getattr(node, 'id', '?')} locks={locks}")
+                if len(out) >= limit:
+                    break
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+    return "; ".join(out) if out else "none"
+
+
 def drop_prefix_tree_returning_rows(tree) -> int:
     """Empty the prefix tree AND return its rows, then reset it (#856).
 
@@ -1639,6 +1696,72 @@ def drop_prefix_tree_returning_rows(tree) -> int:
                     evictable,
                     returned,
                 )
+    # #938 INSTRUMENT ONLY -- IT MEASURES, IT NEVER FREES.
+    #
+    # THE RESIDUE GUARD ABOVE IS BLIND IN ONE DIRECTION. It re-reads
+    # `tree_evictable_full_rows`, a metric that EXCLUDES locked rows by
+    # definition, so protected residue reads back as 0 and the check designed
+    # to catch "the tree still holds rows reset() is about to orphan" cannot
+    # see the one kind of row that is guaranteed to still be held. `evict`
+    # walks leaves and refuses locked nodes; `_reset_full` then sets
+    # `component_protected_size_` to 0 and installs a fresh root without
+    # freeing a single device row. So a protected row is dropped silently and
+    # is visible to nobody until the pool census reads it as unaccounted.
+    #
+    # WHY THIS IS A COUNTER AND NOT A FIX. A node is still locked here mainly
+    # because a write-through is IN FLIGHT against it -- a live reader that is
+    # copying those exact device rows to the host. Releasing the lock and
+    # evicting mid-flight would free the copy's source underneath it, which is
+    # a use-after-free in the #913 IMA family: strictly worse than the leak it
+    # would close. The row's release has to be hung off the write-through ACK
+    # instead, and which mechanism does that is a decision for AFTER this line
+    # has reported a number from metal, not before.
+    #
+    # WHAT THE NUMBER SETTLES. The 2j forensics (SPECIMEN-2026-08-27T1125Z-2j-
+    # UNOWNED-FORENSIK.txt) measured an unowned block growing ~283 rows per
+    # cutover -- one retracted request's full allocation, kv_allocated_len ==
+    # kv_committed_len == cache_protected_len, no gap. If this line reports
+    # that same quantity, the retract-donated anchor is the leak and the ACK
+    # route is the fix. If it reports 0 while the block still grows, the loss
+    # is somewhere else entirely and this hypothesis is dead. Logged
+    # UNCONDITIONALLY, including the zero, because the negative reading is
+    # what makes the comparison decisive rather than suggestive.
+    global _PROTECTED_RESIDUE_ORPHANED_ROWS, _PROTECTED_RESIDUE_ORPHANED_DROPS
+    protected = tree_protected_full_rows(tree)
+    if protected is None:
+        logger.error(
+            "%s #938: %s cannot answer full_protected_size(); reset() is about "
+            "to orphan any locked rows and this drop cannot say how many. An "
+            "unreadable count is not zero rows -- give the tree the "
+            "BasePrefixCache contract",
+            LOG_PREFIX,
+            type(tree).__name__,
+        )
+    elif protected > 0:
+        _PROTECTED_RESIDUE_ORPHANED_ROWS += protected
+        _PROTECTED_RESIDUE_ORPHANED_DROPS += 1
+        logger.error(
+            "%s #938 PROTECTED RESIDUE ORPHANED: %d row(s) still locked after "
+            "a drop that evicted %d; reset() zeroes the protected book without "
+            "freeing them, so they belong to nobody from here on. Sample: %s. "
+            "(%d row(s) over %d drop(s) this process.) NOT freed here on "
+            "purpose: a lock at this point is usually an in-flight "
+            "write-through still reading these rows.",
+            LOG_PREFIX,
+            protected,
+            returned,
+            _protected_node_sample(tree),
+            _PROTECTED_RESIDUE_ORPHANED_ROWS,
+            _PROTECTED_RESIDUE_ORPHANED_DROPS,
+        )
+    else:
+        logger.info(
+            "%s #938 protected residue at drop: 0 row(s) (evicted %d). The "
+            "negative reading is logged so a growing unowned block can be "
+            "attributed away from the retract-donated anchor.",
+            LOG_PREFIX,
+            returned,
+        )
     try:
         tree.reset()
     except Exception:  # noqa: BLE001
@@ -6482,7 +6605,9 @@ class PhaseFlipRuntime:
             # whenever the verdict does -- which is precisely what #916 just
             # did to it.
             double_owned += int(authority.shared_reference_rows())
-            alloc_obj = getattr(self._census_scheduler, "token_to_kv_pool_allocator", None)
+            alloc_obj = getattr(
+                self._census_scheduler, "token_to_kv_pool_allocator", None
+            )
             if alloc_obj is not None:
                 try:
                     alloc_obj.double_owned_slots = int(double_owned)
@@ -6521,7 +6646,9 @@ class PhaseFlipRuntime:
                 return
             out.append(OwnerCandidate(name=name, lo=1, hi=size + 1))
 
-        _add("draft_allocator", getattr(sched, "draft_token_to_kv_pool_allocator", None))
+        _add(
+            "draft_allocator", getattr(sched, "draft_token_to_kv_pool_allocator", None)
+        )
         _add("draft_pool", getattr(sched, "draft_token_to_kv_pool", None))
         stacks = getattr(sched, "phase_flip_stacks", None)
         for stack_name in ("tp_worker", "pp_worker"):
@@ -9084,9 +9211,11 @@ class PhaseFlipRuntime:
                     logger.info(
                         "%s #792 post-retract writeback fence: %s",
                         LOG_PREFIX,
-                        post_report.as_log()
-                        if hasattr(post_report, "as_log")
-                        else post_report,
+                        (
+                            post_report.as_log()
+                            if hasattr(post_report, "as_log")
+                            else post_report
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001 - never break the cutover
                 logger.warning(

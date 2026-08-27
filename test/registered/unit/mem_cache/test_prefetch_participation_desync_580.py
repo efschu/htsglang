@@ -133,6 +133,13 @@ def make_cache(
         page_size=page_size,
         prefetch_threshold=prefetch_threshold,
         ongoing_prefetch={},
+        # #939: the registration retires any incumbent record under the same
+        # req_id before taking the slot. Carried here as the REAL bound method
+        # (like prefetch_from_storage below) rather than a stub, so this
+        # stand-in keeps exercising what production runs.
+        _retired_prefetch=[],
+        _retired_prefetch_attempts={},
+        _retired_prefetch_recompute=0,
         _components_tuple=(),
         _all_reduce_attn_groups=all_reduce,
         _hicache_prefetch_symmetric=lambda: symmetric,
@@ -145,6 +152,9 @@ def make_cache(
     )
     cache.prefetch_from_storage = types.MethodType(
         UnifiedRadixCache.prefetch_from_storage, cache
+    )
+    cache._retire_ongoing_prefetch = types.MethodType(
+        UnifiedRadixCache._retire_ongoing_prefetch, cache
     )
     return cache
 
