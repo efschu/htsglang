@@ -4760,6 +4760,80 @@ class PhaseFlipRuntime:
         )
         return True, ""
 
+    def _at_arm_census_due(self) -> bool:
+        """#926: may the at-arm census run on THIS arm?
+
+        THE INSTRUMENT BECAME THE DEFECT. `_pool_census("at-arm", ...)` walks
+        the pool and, through `_census_ownership_audit`, the KV row-ownership
+        map. #631 J installed it unconditionally, which was affordable when an
+        arm was rare. It is not: the 0827 window measured 69 cutovers in five
+        minutes, and one of four boots died in a CPU spin whose hot frame was
+        this census. An arm is now a routine event and a full-pool walk per
+        arm is a per-flip O(pool) tax on the scheduler thread.
+
+        A CADENCE GATE, NOT A DELETION, and the difference is the whole point.
+        The census is the only instrument that can see the #631 J page loss,
+        so it must keep being ABLE to fire; what changes is how often. Two
+        independent admissions, either of which opens the gate:
+
+          * the first arm after `SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S` of wall
+            clock (default 30s), so a slow-arming instance censuses every arm
+            exactly as before;
+          * every Nth arm (`SGLANG_PP_ARM_CENSUS_EVERY_N`, default 16), so a
+            fast-arming instance still gets a bounded sample rather than none.
+
+        Either env set to 0 disables that admission; setting BOTH to 0 restores
+        the unconditional pre-#926 behaviour, which is the escape hatch an
+        operator needs when chasing exactly the page loss this watches for.
+
+        NEVER SILENTLY FALSE. A skipped census is counted and the count rides
+        the next census that does run, so a reader can never mistake "sampled"
+        for "clean" -- the #829/INDIKATOR-GESETZ rule that an instrument must
+        be able to say what it did not measure.
+        """
+        from sglang.srt.environ import envs
+
+        n = int(getattr(self, "_at_arm_census_arms", 0)) + 1
+        self._at_arm_census_arms = n
+
+        every_n = envs.SGLANG_PP_ARM_CENSUS_EVERY_N.get()
+        min_interval = envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.get()
+
+        if not every_n and not min_interval:
+            return True  # both admissions disabled: pre-#926 behaviour
+
+        now = time.time()
+        last = getattr(self, "_at_arm_census_last_s", None)
+
+        due = False
+        if every_n and n % int(every_n) == 0:
+            due = True
+        if min_interval and (last is None or now - last >= float(min_interval)):
+            due = True
+
+        if not due:
+            self._at_arm_census_skipped = (
+                int(getattr(self, "_at_arm_census_skipped", 0)) + 1
+            )
+            return False
+
+        skipped = int(getattr(self, "_at_arm_census_skipped", 0))
+        if skipped:
+            logger.info(
+                "%s #926 at-arm census sampling: %d arm(s) since the last one "
+                "were NOT censused (arm #%d, every_n=%s, min_interval_s=%s). "
+                "The window this census covers is therefore a SAMPLE, not a "
+                "continuous record.",
+                LOG_PREFIX,
+                skipped,
+                n,
+                every_n,
+                min_interval,
+            )
+            self._at_arm_census_skipped = 0
+        self._at_arm_census_last_s = now
+        return True
+
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
         """Arm a flip. Replicated call; the consensus round commits it once
         every rank is armed AND ready. Returns (ok, msg)."""
@@ -4954,7 +5028,8 @@ class PhaseFlipRuntime:
         # and the cutover innocent (identical unaccounted set on both
         # sides), and a no-flip control boot stayed clean, so the page goes
         # missing somewhere in the ARMED window. This bracket closes it.
-        self._pool_census("at-arm", direction)
+        if self._at_arm_census_due():
+            self._pool_census("at-arm", direction)
         # #853(i): ENFORCE THE EXPOSURE LAW HERE TOO, BECAUSE THE CUTOVER MAY
         # NEVER COME. W24's stuck phase ran 23.6 minutes with 153 arms and ZERO
         # cutovers, and enforcement was wired to the cutover alone -- so it went
