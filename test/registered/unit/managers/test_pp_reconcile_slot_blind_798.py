@@ -203,7 +203,22 @@ class TestTheGuardMustStillBeAbleToFire(unittest.TestCase):
             "a rank that really has nothing for this rid MUST retract, or the "
             "pass it runs is a strict subset of the one already launched",
         )
-        self.assertEqual(entry.observed_local, 0)
+        # #944 CONTRACT INVERTED, NOT RELAXED. This pinned the miss as the
+        # specimen's exact 0 -- correct while a lookup miss was SPELLED AS A
+        # MEASUREMENT, which is the class #944 removes (#797c, #798 and #944
+        # are three instances of it). The BEHAVIOUR reproduced here is
+        # unchanged: the entry is still retracted and still absent from
+        # `effective`. Only the number changes, from a 0 indistinguishable
+        # from "no prefix" to a named sentinel. Inverted deliberately and
+        # never deleted -- this file is the proof the class fix landed.
+        self.assertIsNone(entry.observed_local)
+        self.assertTrue(
+            entry.unresolved,
+            "and it says WHY it retracted: no slot holds this rid, so nothing "
+            "was measured. A rank that had measured a genuine 0 would say the "
+            "opposite -- those are the two populations, and keeping them "
+            "apart is the fix",
+        )
         self.assertNotIn(RID_STUCK, effective)
 
     def test_a_short_local_match_is_still_retracted(self):
@@ -340,10 +355,27 @@ class TestNeuteringTheSlotLookupRestoresTheDefect(unittest.TestCase):
             "false negative -- if it does not, this test file is not "
             "measuring the fix it claims to measure",
         )
-        self.assertEqual(
+        # #944 CONTRACT INVERTED, NOT RELAXED. This pinned the miss as the
+        # specimen's exact 0 -- correct while a lookup miss was SPELLED AS A
+        # MEASUREMENT, which is the class #944 removes (#797c, #798 and #944
+        # are three instances of it). The BEHAVIOUR reproduced here is
+        # unchanged: the entry is still retracted and still absent from
+        # `effective`. Only the number changes, from a 0 indistinguishable
+        # from "no prefix" to a named sentinel. Inverted deliberately and
+        # never deleted -- this file is the proof the class fix landed.
+        self.assertIsNone(
             entry.observed_local,
-            0,
-            "and the false measurement must be the specimen's exact 0",
+            "the blinded lookup must still reproduce the defect, and it does; "
+            "the miss now teaches the learned floor NOTHING instead of "
+            "clamping it from a number nobody measured",
+        )
+        self.assertTrue(
+            entry.unresolved,
+            "and the blinded lookup is reported as a LOOKUP failure -- which "
+            "is what makes this neuter visible at all. Before #944 blinding a "
+            "lookup and having a genuinely cold rank produced byte-identical "
+            "output, so a can-fail proof of a lookup could not distinguish "
+            "itself from the thing it was proving",
         )
 
     def test_the_shipped_chunked_lookup_is_a_separate_edge(self):

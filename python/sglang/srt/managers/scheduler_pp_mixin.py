@@ -40,6 +40,7 @@ from sglang.srt.managers.phase_flip_counters import (
     CHAN_SLOT,
 )
 from sglang.srt.managers.pp_admission_congruence import (
+    UNKNOWN_MATCH,
     PPAdmissionDecision,
     PPAdmissionEntry,
     entries_retracted_by_rank,
@@ -233,6 +234,12 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     bool(e.retracted),
                     e.retracted_by_rank,
                     e.observed_local,
+                    # #944: the miss travels as its OWN field, never as a
+                    # sentinel value of `observed_local` -- PP0 is the rank
+                    # that must act on it and is never the rank that observes
+                    # it. Both ends of this codec ship together, so the tuple
+                    # width is a single-version fact.
+                    bool(e.unresolved),
                 )
                 for e in decision.entries
             ),
@@ -252,6 +259,7 @@ def pp_admission_decision_from_wire(message: Dict[str, object]) -> PPAdmissionDe
             retracted=retracted,
             retracted_by_rank=retracted_by_rank,
             observed_local=observed_local,
+            unresolved=unresolved,
         )
         for (
             rid,
@@ -261,6 +269,7 @@ def pp_admission_decision_from_wire(message: Dict[str, object]) -> PPAdmissionDe
             retracted,
             retracted_by_rank,
             observed_local,
+            unresolved,
         ) in raw_entries
     )
     return PPAdmissionDecision(mb_id=int(mb_id), entries=entries)
@@ -5047,14 +5056,26 @@ class SchedulerPPMixin:
         `reconcile_pp_admission_decision` (#791/#630) for the actual
         safe-truncate / unsafe-retract verdict and the exactly-once warning.
 
-        A rid the decision names that is not (yet, or any more) in this
-        rank's own waiting_queue is treated as a local match of 0 --
-        physically indistinguishable from "this rank's cache has nothing
-        for it", which is exactly what "local < told" already means; it
-        needs no special case.
+        FOUR PLACES A REQUEST CAN LIVE, and a rid found in NONE of them is
+        `UNKNOWN_MATCH`, never 0.
 
-        #797c EXCEPTION, AND IT IS THE ONE REQUEST THAT SENTENCE IS WRONG
-        ABOUT. The CHUNKED request is dropped from `waiting_queue` the moment
+        The sentence that stood here said a rid missing from `waiting_queue`
+        "is treated as a local match of 0 -- physically indistinguishable from
+        'this rank's cache has nothing for it' ... it needs no special case".
+        That was wrong three times over, and each time it cost a boot: #797c
+        (the rid is in `chunked_req`), #798 (it is in ANOTHER slot's chunked
+        req), #944 (it is in the RUNNING BATCH). The two facts are not
+        indistinguishable at all -- one is a statement about this rank's cache,
+        the other about this lookup -- and spelling them the same way is what
+        made three instances of one class read as three separate defects. The
+        lookup chain below is exhaustive as far as it is known to be; what has
+        changed is that running out of places to look now says so.
+
+        #797c, THE FIRST OF THE THREE, IN FULL -- kept because it is the
+        clearest specimen of the false negative and the reason the second and
+        third lookups exist at all.
+
+        The CHUNKED request is dropped from `waiting_queue` the moment
         it is first admitted (scheduler.py's `self.waiting_queue = [x for x in
         self.waiting_queue if x not in can_run_set]`) and lives in
         `self.chunked_req` from then on -- so the lookup above misses it by
@@ -5110,7 +5131,35 @@ class SchedulerPPMixin:
                     if computed is not None:
                         local_match_lens[entry.rid] = computed
                         continue
-                local_match_lens[entry.rid] = 0
+                # #944 THE FOURTH PLACE A REQUEST CAN LIVE, and the one that
+                # wedged the instance. Once a request finishes its chunked
+                # prefill it is in NEITHER the waiting queue NOR `chunked_req`
+                # NOR the slot's chunked req -- it is in the RUNNING BATCH.
+                # `self.running_batch` is on this object and is read elsewhere
+                # in this file; this resolution chain never consulted it, so a
+                # rank holding the whole prefix answered 0.
+                #
+                # Measured under real agent-shaped load (long SHARED prefixes,
+                # which is what puts requests into the running batch while new
+                # admissions for the same prefix keep arriving): 2106
+                # unhonourable-prefix events, 2107 voided passes, and a
+                # three-rank hang 35 s after health.
+                running = getattr(self, "running_batch", None)
+                running_reqs = getattr(running, "reqs", None) or ()
+                for r in running_reqs:
+                    if getattr(r, "rid", None) == entry.rid:
+                        local_match_lens[entry.rid] = int(
+                            getattr(r, "kv_committed_len", 0) or 0
+                        )
+                        break
+                else:
+                    # #944 A MISS IS NOT A ZERO. Writing 0 here is what made
+                    # #797c and #798 look like two unrelated defects instead of
+                    # one class seen twice: the consumer cannot tell "no prefix"
+                    # from "not found", and it voids the pass on both. The
+                    # sentinel makes the two separable at the reader; the reader
+                    # decides what to do about it.
+                    local_match_lens[entry.rid] = UNKNOWN_MATCH
                 continue
             req.init_next_round_input(self.tree_cache)
             local_match_lens[entry.rid] = len(req.prefix_indices)

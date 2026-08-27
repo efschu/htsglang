@@ -160,6 +160,48 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
+#: #944: "this rank could not FIND the request", which is not the same fact as
+#: "this rank has no prefix for it" and must never be spelled the same way.
+#:
+#: THE CLASS, and this is its THIRD instance. `_pp_reconcile_incoming_admission`
+#: resolves a rid through a chain of lookups and, on a total miss, used to write
+#: 0 into `local_match_lens`. The consumer below then read that 0 as a
+#: MEASUREMENT and voided the pass. #797c fixed the chunked_req miss, #798 fixed
+#: the wrong-slot miss -- two symptom patches of one class, each adding a lookup
+#: while the miss kept answering with a number. #944 is the running-batch miss,
+#: measured: 2106 unhonourable-prefix events, 2107 voided passes and a
+#: three-rank hang in 35 s under real agent load.
+#:
+#: The idiom is not invented here. `tp_head_congruence._ABSENT_MATCH` (-1)
+#: already distinguishes "does not hold this rid" from a length, one file over,
+#: and MIN-reduces to itself for exactly this reason.
+#:
+#: SCOPE: this value lives INSIDE the resolution path (`local_match_lens` and
+#: the reader immediately below it) and never crosses the wire. A rank reports
+#: a miss to its peers as `PPAdmissionEntry.unresolved`, a boolean, because
+#: `observed_local` has readers that treat it as a length -- see that field.
+UNKNOWN_MATCH = -1
+
+#: #944: how many consecutive rounds a rid may be DEFERRED for being
+#: unresolvable before PP0 stops asking, refuses loudly, and pins the next
+#: offer to `told=0`.
+#:
+#: WHY A CAP IS LOAD-BEARING AND NOT HOUSEKEEPING. `_learned_floor` is what
+#: damped the re-offer before, and it is fed from `observed_local` -- which a
+#: lookup miss must not set, because nothing was measured. So `UNKNOWN_MATCH`
+#: ALONE makes the measured 2106-void loop WORSE than the old 0 did: the 0 was
+#: a false measurement, but it at least clamped. The cap replaces that
+#: accidental clamp with a bound that terminates for a stated reason.
+#:
+#: 3, because a defer exists to let rank-local state SETTLE (a request landing
+#: in the running batch, a slot's chunked req being restored), and that settles
+#: within one ring lap; `pp_size - 1` rounds is the longest a decision takes to
+#: visit every rank, so three gives that a full round trip plus one. A larger
+#: number does not buy a better outcome -- it buys more voided passes before
+#: the same escape.
+UNRESOLVED_DEFER_CAP = 3
+
+
 class PPScheduleRefused(Exception):
     """#791 CORE: this rank cannot EXECUTE the forwarded pass geometry.
 
@@ -202,6 +244,26 @@ class PPAdmissionEntry:
     local state -- see `reconcile_pp_admission_decision`'s pass-through
     branch). This is the signal `PPAdmissionCongruenceGuard` (#630) learns
     from -- never a guess, never a timeout, always a real observed shortfall."""
+
+    unresolved: bool = False
+    """#944: this rank could not LOCATE the request at all, so it measured
+    nothing and `observed_local` is None.
+
+    A SEPARATE FIELD, NOT A SPECIAL VALUE OF `observed_local`, and that is the
+    whole point of this ticket. "I looked and found N tokens" and "I could not
+    find the request" are different facts with opposite correct responses -- the
+    first must void the pass, the second must let the group retry -- and #797c,
+    #798 and #944 are three instances of one class in which they shared a
+    spelling and no reader could tell them apart. Encoding the miss as a
+    sentinel `observed_local` would be that same class one level up: THIS
+    field's readers treat it as a LENGTH and feed it to `_learned_floor`, which
+    clamps the next round's offer, and a floor learned from a number nobody
+    measured is exactly the defect.
+
+    ON THE WIRE because the rank that OBSERVES the miss is never the rank that
+    can ACT on it: only PP0 chooses `told`. Downstream ranks report; PP0 owns
+    the count and the escalation (`UNRESOLVED_DEFER_CAP`). A defer that only
+    one rank takes IS the next divergence, so no rank takes one alone."""
 
 
 @dataclass(frozen=True)
@@ -269,8 +331,36 @@ class PPAdmissionCongruenceGuard:
     has not yet reconciled this rid this pass).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, unresolved_defer_cap: int = UNRESOLVED_DEFER_CAP) -> None:
         self._learned_floor: Dict[str, int] = {}
+        #: #944: consecutive rounds `rid` came back UNRESOLVED (no rank could
+        #: locate it). Distinct from `_learned_floor` because it counts a
+        #: different population -- see `PPAdmissionEntry.unresolved`.
+        self._unresolved_rounds: Dict[str, int] = {}
+        #: rids whose loud refusal has already been emitted, so the escalation
+        #: is one line and not one line per pass. A bounded refusal that
+        #: re-logs every pass is the 2106-line log this ticket is about, in a
+        #: different colour.
+        self._escalated: set = set()
+        #: <= 0 disables the #944 bound entirely, restoring the pre-cap
+        #: behaviour exactly -- the same neuterable escape `#552`'s
+        #: `defer_limit` carries, so a can-fail proof can take the cap down on
+        #: its own without taking the sentinel down with it.
+        self._unresolved_defer_cap = int(unresolved_defer_cap)
+
+    def unresolved_rounds(self, rid: str) -> int:
+        """#944 diagnostic/test hook: consecutive unresolved rounds for `rid`."""
+        return self._unresolved_rounds.get(rid, 0)
+
+    def learned_floor(self, rid: str) -> Optional[int]:
+        """Diagnostic/test hook: the outstanding floor for `rid`, or None.
+
+        The SIBLING of `unresolved_rounds` above, and both exist so a test can
+        tell the two populations apart from the outside -- reading them off one
+        accessor, or off `prefix_len_for`, would fold them back together at the
+        exact seam this ticket is about.
+        """
+        return self._learned_floor.get(rid)
 
     def prefix_len_for(self, rid: str, candidate_prefix_len: int) -> int:
         """What PP0 should tell downstream ranks for `rid` this pass.
@@ -280,7 +370,48 @@ class PPAdmissionCongruenceGuard:
         Clamped to the learned floor if one is outstanding for `rid`;
         returned unchanged otherwise (a rid with no retraction history is
         not constrained by this guard at all).
+
+        #944 ESCALATION, AND IT IS DECIDED HERE BECAUSE ONLY PP0 CAN ACT ON IT.
+        A rid that has come back UNRESOLVED `UNRESOLVED_DEFER_CAP` times in a
+        row is pinned to `told=0` and refused loudly, once. Downstream ranks
+        observe the miss but cannot fix it -- they do not choose `told`, and a
+        rank that rewrote the geometry mid-ring would be the instr20 crash --
+        so the report rides the wire and the single decision is taken here.
+
+        WHY told=0 WHEN THIS CLASS'S OWN DOCSTRING REJECTS A told=0 PIN. It
+        rejects it as the GENERAL policy for an ordinary shortfall, where
+        learning the real observed value costs the same and keeps the degrade
+        rare. That argument does not reach here: a lookup miss measured
+        NOTHING, so there is no value to learn, and `told=0` is the only offer
+        that is honourable without a measurement (`reconcile_pp_admission_
+        decision` admits it unconditionally). It is therefore not the rejected
+        shape creeping back in -- it is the only terminator available once the
+        measurable one is gone. The cost is one request's prefix reuse, once,
+        after three voided rounds; the alternative is the unbounded re-offer,
+        which is the #858 livelock shape.
         """
+        if self._unresolved_defer_cap > 0:
+            rounds = self._unresolved_rounds.get(rid, 0)
+            if rounds >= self._unresolved_defer_cap:
+                if rid not in self._escalated:
+                    self._escalated.add(rid)
+                    logger.error(
+                        "#944 PP-ADMISSION UNRESOLVABLE rid=%s: %d consecutive "
+                        "rounds in which no PP rank could locate this request "
+                        "in any of the four places a request can live -- the "
+                        "waiting queue, `chunked_req`, the named slot's "
+                        "chunked req, or the running batch. No rank measured a "
+                        "prefix, so no floor can be learned and the offer "
+                        "cannot be damped by measurement. Offering told=0 "
+                        "instead: it is honourable without a measurement, so "
+                        "the pass runs, at the cost of this request's prefix "
+                        "reuse for one pass. If this line repeats for many "
+                        "rids, the lookup chain has a FIFTH gap and that is "
+                        "the bug -- not this refusal.",
+                        rid,
+                        rounds,
+                    )
+                return 0
         floor = self._learned_floor.get(rid)
         if floor is None:
             return candidate_prefix_len
@@ -306,14 +437,41 @@ class PPAdmissionCongruenceGuard:
         """
         for entry in decision.entries:
             if entry.retracted:
+                if entry.unresolved:
+                    # #944 THE OTHER POPULATION, COUNTED SEPARATELY. No rank
+                    # could locate this rid, so there is nothing to learn a
+                    # floor from -- but the round still happened and still cost
+                    # a voided pass, and something has to bound how many times
+                    # that may repeat. Counted here rather than at the reporting
+                    # rank because the count has to be the GROUP's: every rank
+                    # reports independently, only PP0 acts (`prefix_len_for`).
+                    #
+                    # INCREMENT-ONLY ON THIS PATH, cleared only by a pass that
+                    # actually served the rid (below). A defer that resets its
+                    # own counter makes the bound unreachable, which is #552's
+                    # measured lesson: "the bug itself wearing a fix".
+                    self._unresolved_rounds[entry.rid] = (
+                        self._unresolved_rounds.get(entry.rid, 0) + 1
+                    )
+                    continue
                 observed = entry.observed_local
                 if observed is None:
-                    # Defensive: a retraction without an observed value
-                    # cannot safely tighten a floor -- leave any existing
-                    # floor as-is rather than guess. Every retraction this
-                    # module itself produces always sets observed_local, so
-                    # this branch guards a malformed/foreign decision, not
-                    # an expected path.
+                    # A retraction without an observed value cannot safely
+                    # tighten a floor -- leave any existing floor as-is rather
+                    # than guess.
+                    #
+                    # #944 MADE THIS AN EXPECTED PATH, and the comment is
+                    # corrected rather than left to mislead. It used to read
+                    # "every retraction this module itself produces always sets
+                    # observed_local, so this branch guards a malformed/foreign
+                    # decision, not an expected path". The #944 UNRESOLVED
+                    # branch now retracts with `observed_local=None` on purpose:
+                    # a LOOKUP MISS taught this pass nothing about the rank's
+                    # prefix, so there is no lesson to learn, and inventing one
+                    # (0, or the -1 sentinel) would clamp the next round's offer
+                    # from a number that was never measured. The guard was
+                    # already the correct behaviour; only its reachability
+                    # changed.
                     continue
                 existing = self._learned_floor.get(entry.rid)
                 self._learned_floor[entry.rid] = (
@@ -321,6 +479,14 @@ class PPAdmissionCongruenceGuard:
                 )
             elif entry.admitted:
                 self._learned_floor.pop(entry.rid, None)
+                # #944: the rid was SERVED, so both kinds of outstanding state
+                # are stale -- the learned floor and the unresolved streak. The
+                # streak must clear here and nowhere else: one bad minute of
+                # lookups must not cap a request's reuse for the rest of its
+                # life, and the escalation must be able to fire again if the
+                # rid genuinely becomes unresolvable a second time.
+                self._unresolved_rounds.pop(entry.rid, None)
+                self._escalated.discard(entry.rid)
 
     def outstanding_rids(self) -> Tuple[str, ...]:
         """Diagnostic/test hook: rids currently carrying a learned floor."""
@@ -591,14 +757,103 @@ def reconcile_pp_admission_decision(
             amended.append(entry)
             continue
 
-        local = int(local_match_lens.get(entry.rid, 0))
+        raw_local = local_match_lens.get(entry.rid, UNKNOWN_MATCH)
+        local = int(raw_local)
         told = entry.prefix_len
+        unknown = local == UNKNOWN_MATCH
+
+        if told <= 0:
+            # #944 A ZERO OFFER DEMANDS NOTHING, so no lookup result -- not
+            # even a failed one -- can make it unhonourable. The rank is being
+            # asked to reuse no prefix at all and to compute the request from
+            # its first token; that is executable whether or not the rank has
+            # ever heard of the rid.
+            #
+            # BEFORE THE SENTINEL THIS FELL OUT OF THE ARITHMETIC and needed no
+            # branch: a miss answered 0 and `0 >= 0` held. `UNKNOWN_MATCH` is
+            # -1, so it stops falling out, and leaving it implicit retracts the
+            # FIRST, congruent round of every request -- strictly worse than
+            # the defect being fixed here, and measured as exactly that by
+            # `test_the_park_alone_leaves_a_flat_livelock`.
+            #
+            # It is also load-bearing for the bound: `UNRESOLVED_DEFER_CAP`'s
+            # escape offers told=0 precisely because this branch honours it
+            # without a measurement. Remove this and the cap stops terminating.
+            #
+            # A NO-OP for every rank that DID resolve (local >= 0 >= told), so
+            # the known path below is unchanged, not merely equivalent.
+            effective[entry.rid] = told
+            amended.append(entry)
+            continue
 
         if local >= told:
             # SAFE: truncate any extra local reuse to `told`. Same slack
             # trade #616g already makes on the TP axis -- take it.
             effective[entry.rid] = told
             amended.append(entry)
+            continue
+
+        if unknown:
+            # #944: A MISS IS NOT A ZERO, AND IT IS NOT A VERDICT EITHER.
+            #
+            # The producer could not locate this request in any of the places it
+            # knows to look. That is a statement about the LOOKUP, not about
+            # this rank's cache, and the two have opposite correct responses:
+            # a genuine shortfall must void the pass, whereas a miss on a
+            # request this rank is very likely holding must not.
+            #
+            # Reported distinctly -- in the log AND in a field of its own on
+            # the wire -- so the two populations can never again be read as
+            # one, which is the whole reason #797c and #798 each looked like a
+            # fresh defect instead of the same one twice.
+            #
+            # THE GROUP DEFERS, NOT THIS RANK. Excluding the rid from
+            # `effective` and retracting the entry puts the pass through the
+            # existing #797 void, and that void is already group-uniform:
+            # `pp_pass_should_void` ORs the incoming flag and never clears it,
+            # so a retraction anywhere on the ring stops every rank. This rank
+            # therefore does not decide anything -- it reports. Whether the
+            # group defers AGAIN or gives up is decided once, by PP0, from the
+            # count `unresolved` feeds (`PPAdmissionCongruenceGuard`,
+            # `UNRESOLVED_DEFER_CAP`). A defer that only one rank takes IS the
+            # next divergence.
+            log.warning(
+                "#944 PP-ADMISSION UNRESOLVED prefix on rank %d: rid=%s "
+                "told=%d local=UNKNOWN -- the reconcile could not find this "
+                "request in the waiting queue, in chunked_req, in the slot's "
+                "chunked req, or in the running batch. This is a LOOKUP MISS "
+                "reported as such, NOT a measured zero: the rank may well hold "
+                "the prefix. Excluded from this pass.",
+                rank,
+                entry.rid,
+                told,
+            )
+            # #944 THE SENTINEL MUST NOT REACH THE WIRE, and a test caught
+            # this: `observed_local` feeds `_learned_floor[rid]` (:293), which
+            # clamps the NEXT round's `told`, and this field is documented at
+            # :237 as "never zero". Writing -1 there makes the learned floor
+            # -1 and changes the offer sequence -- which is exactly what
+            # `test_the_park_alone_leaves_a_flat_livelock` went red on, on
+            # BEHAVIOUR rather than on a number.
+            #
+            # The field is Optional[int], so None is the honest value: this
+            # pass learned NOTHING about the rank's prefix, which is a
+            # different statement from "it has -1 of it". The sentinel stays
+            # where it belongs, inside the resolution map.
+            #
+            # Same discipline the sentinel exists for, one level up: a value's
+            # meaning is a property of its READERS, and `observed_local` has
+            # readers `local_match_lens` does not.
+            amended.append(
+                replace(
+                    entry,
+                    admitted=False,
+                    retracted=True,
+                    retracted_by_rank=rank,
+                    observed_local=None,
+                    unresolved=True,
+                )
+            )
             continue
 
         # UNSAFE and physically un-fixable this pass (see module docstring).

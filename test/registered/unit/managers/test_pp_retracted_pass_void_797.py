@@ -1320,10 +1320,16 @@ class PPChunkedOfferLivelock797c(unittest.TestCase):
             "a voided round must not advance the offer",
         )
 
-    def test_a_rid_that_is_genuinely_unknown_still_reads_as_zero(self):
-        """REGRESSION. The waiting-queue miss must keep meaning "nothing
-        known" for every request that is NOT this rank's chunked one --
-        that default is what #791's cold-cache retraction rests on."""
+    def test_a_rid_that_is_genuinely_unknown_is_reported_as_unresolved(self):
+        """REGRESSION, RENAMED WITH THE CONTRACT IT PINS (#944).
+
+        It was `..._still_reads_as_zero`, and the name outlived its meaning by
+        one ticket: the BEHAVIOUR it guards is that a rid this rank cannot
+        locate is never admitted this pass, and that is unchanged. What
+        changed is how the rank SAYS SO. "Nothing known" and "nothing there"
+        were the same word, and being the same word is the defect (#797c,
+        #798, #944 -- three instances). A name that still said "zero" would
+        keep teaching the next reader the sentence that cost three boots."""
         from sglang.srt.managers.pp_admission_congruence import (
             PPAdmissionDecision,
             PPAdmissionEntry,
@@ -1341,7 +1347,20 @@ class PPChunkedOfferLivelock797c(unittest.TestCase):
         effective, amended = h._pp_reconcile_incoming_admission(decision)
         self.assertEqual(effective, {})
         self.assertTrue(amended.entries[0].retracted)
-        self.assertEqual(amended.entries[0].observed_local, 0)
+        # #944 CONTRACT INVERTED, NOT RELAXED. This pinned the miss as the
+        # specimen's exact 0 -- correct while a lookup miss was SPELLED AS A
+        # MEASUREMENT, which is the class #944 removes (#797c, #798 and #944
+        # are three instances of it). The BEHAVIOUR reproduced here is
+        # unchanged: the entry is still retracted and still absent from
+        # `effective`. Only the number changes, from a 0 indistinguishable
+        # from "no prefix" to a named sentinel. Inverted deliberately and
+        # never deleted -- this file is the proof the class fix landed.
+        self.assertIsNone(amended.entries[0].observed_local)
+        self.assertTrue(
+            amended.entries[0].unresolved,
+            "and the miss must SAY it is a miss, on the wire, not by being a "
+            "number that happens to look like one",
+        )
 
 
 class _PP0View:
