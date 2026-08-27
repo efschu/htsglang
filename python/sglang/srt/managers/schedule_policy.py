@@ -145,8 +145,29 @@ def match_prefix_for_req(
     )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    # #927: THE TWO SETTERS MUST NOT GUESS DIFFERENTLY. This assigns
+    # `req.prefix_indices` unconditionally, and on a hit those ARE the tree's
+    # row ids -- the request reuses them, it does not copy them. The only thing
+    # that later stops `_insert_helper`'s duplicate free from running over them
+    # is `req.cache_protected_len`, which arrives there as
+    # `InsertParams.prev_prefix_len`.
+    #
+    # `MatchResult.cache_protected_len` defaults to None and `UnifiedRadixCache`
+    # never populates it, so on this rig the branch below never fired and the
+    # field kept whatever it held -- 0 for a fresh Req
+    # (`schedule_batch.py:1677`). Its sibling `Req.init_next_round_input`
+    # already falls back to `len(self.prefix_indices)` for exactly this case
+    # (`schedule_batch.py:1351-1354`); this one did not, so which value a
+    # request carried depended on which of the two touched it last.
+    #
+    # Measured consequence, with `prev_prefix_len=0` and a full prefix hit:
+    # every row of the hit prefix ends up in the free list AND in the tree at
+    # once -- the `double_owned=N src=live` population, pinned in
+    # test_insert_dup_free_927.py.
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+    else:
+        req.cache_protected_len = len(req.prefix_indices)
     return match_result
 
 

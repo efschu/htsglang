@@ -1838,6 +1838,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
         # This is deferred from evict_component because free_swa needs it.
+        #
+        # #927 INVESTIGATED AND LEFT ALONE -- the trigger test is not the
+        # narrower question it looks like, it is EQUIVALENT here, and the
+        # priority lattice is why. On the DEVICE target this function is
+        # reached with a non-BASE trigger from exactly two places, both on
+        # INTERNAL nodes (`mamba_component.py:529`, `swa_component.py:441`),
+        # and internal priorities are "full=2 > swa=1 > mamba=0"
+        # (tree_component.py:292). The cascade loop admits a component only
+        # when `eviction_priority(is_leaf) <= trigger_priority`, so Full at 2
+        # is unreachable from a trigger at 0 or 1. The leaf path does not use
+        # this function at all (`_evict_device_leaf` loops the components
+        # directly), and `_evict_to_host` -- the only path that leaves a node
+        # in the tree -- passes the BASE component as the trigger explicitly
+        # (`:2065-2071`). So "Full was the trigger" and "Full's rows were
+        # freed in this cascade" name the same set of cascades.
+        #
+        # Recorded because a rewrite to `base_rows_freed` was built, shipped
+        # in 698cd396ce and reverted here as a NO-OP: it changed no behaviour,
+        # and a one-line mutant back to this condition leaves a behavioural
+        # suite green precisely because the two are equivalent. #927's real
+        # root is elsewhere; the doubly-claimed rows are not produced here.
         if (
             target is EvictLayer.DEVICE
             and trigger.component_type == BASE_COMPONENT_TYPE

@@ -11972,7 +11972,39 @@ class Scheduler(
         # arming). Inactive window (or no flip boot) = direct call,
         # byte-identical to today.
         window = self.phase_flip_abort_window
-        if window is not None and window.active:
+        deferred = window is not None and window.active
+        # #801 CORROBORATION MARKER, and it exists because its absence was
+        # unreadable. An abort applied on one rank before its peers diverges
+        # the replicated live set -- pin 4 says exactly that, one comment up --
+        # and outside an armed flip nothing defers it. That makes an abort the
+        # leading candidate for the rank-local slot divergence behind the
+        # PP output-ring wedges.
+        #
+        # IT COULD NOT BE CHECKED. Every marker inside `_abort_request_now` is
+        # `logger.debug`, and the boots run `log_level='info'` -- measured:
+        # zero DEBUG lines in all three wedge logs
+        # (boot_accept2e0827_0827_0454, boot_accept2e0827b6_0827_0613,
+        # boot_802f_staged1_0822_1716). So "no abort near the wedge onset" was
+        # a LOGGING GAP and not a finding, which is the marker-absence trap
+        # #843 hit on this same path ("the only refusal marker was a
+        # logger.debug on a boot running log_level='info', so it could never
+        # appear").
+        #
+        # ONE SUMMARY LINE, not the per-request ones: `abort_all` can name the
+        # whole live set, so promoting those would trade a blind spot for a
+        # flood. This says that an abort happened, when, whether it was
+        # deferred, and what it targeted -- which is all the discriminator
+        # needs to place it against a wedge onset.
+        logger.info(
+            "#801 ABORT RECEIVED: rid=%s abort_all=%s deferred=%s. A "
+            "non-deferred abort mutates THIS rank's live set at whatever pass "
+            "it lands on; deferred=True means the flip window is holding it "
+            "until after the cutover (#631 pin 4).",
+            getattr(recv_req, "rid", None),
+            getattr(recv_req, "abort_all", None),
+            deferred,
+        )
+        if deferred:
             window.submit(lambda: self._abort_request_now(recv_req))
             return
         self._abort_request_now(recv_req)

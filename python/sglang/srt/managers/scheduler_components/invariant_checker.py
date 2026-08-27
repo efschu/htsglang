@@ -332,6 +332,79 @@ class SchedulerInvariantChecker:
             if live_double_owned:
                 double_owned = int(live_double_owned)
                 double_owned_src = "live"
+                # #927 CORRECTED. THE FIRST VERSION OF THIS WAS A TAUTOLOGY
+                # AND ITS SILENCE WAS READ AS EVIDENCE, which is worse than
+                # having no instrument at all.
+                #
+                # It compared `len(free_reading.rows)` against
+                # `free_reading.count`. Those are the SAME NUMBER by
+                # construction: `read_free_rows` builds the enumerated reading
+                # as `rows=rows, count=len(rows)` (kv_row_ownership.py:1007-
+                # 1009). The line could therefore never print, and "it printed
+                # zero times" says nothing whatever about the two readings
+                # agreeing.
+                #
+                # Worse, the ledger's `available` is ALSO that same reading --
+                # `full_available_size = free_reading.count if
+                # free_reading.is_enumerable else ps.full_available_size`, ~30
+                # lines up. So enumeration and ledger cannot disagree here at
+                # all, and the "enumeration over-reports" branch was
+                # unreachable from the start.
+                #
+                # WHAT THAT LEAVES, and it is derivable without any new
+                # instrument: `available` counts the enumerated free set and
+                # `protected`/`evictable` count the tree, so a NON-ZERO
+                # intersection means those rows are counted twice in the raw
+                # sum. Specimen 2's raw sum equalled `total` exactly, which
+                # means the double-count is masked by an equal number of rows
+                # that have NO owner. Subtracting `double_owned` is what
+                # exposes them. The rows are genuinely doubly claimed AND
+                # there is a real 8192-row hole; the exact balance was two
+                # errors cancelling.
+                #
+                # THE COMPARISON WORTH MAKING is against the allocator's OWN
+                # `available_size()`, which `ps.full_available_size` carries
+                # and which is an INDEPENDENT source from the enumeration.
+                # That one can genuinely disagree, and if it does the
+                # difference names which side moved.
+                try:
+                    enumerated = len(free_reading.rows)
+                    alloc_says = getattr(ps, "full_available_size", None)
+                    if alloc_says is not None and int(alloc_says) != enumerated:
+                        logger.warning(
+                            "#927 FREE ENUMERATION vs ALLOCATOR COUNT: the "
+                            "enumeration holds %d row(s) while available_size() "
+                            "says %d (delta %d). double_owned=%d is the "
+                            "intersection of that enumeration with the tree; "
+                            "the ledger's available is the ENUMERATION, so a "
+                            "delta here means the allocator and its own free "
+                            "list disagree. evictable=%s protected=%s",
+                            enumerated,
+                            int(alloc_says),
+                            enumerated - int(alloc_says),
+                            double_owned,
+                            full_evictable_size,
+                            protected,
+                        )
+                    else:
+                        # The two INDEPENDENT sources agree, so the
+                        # intersection is not an enumeration artefact: those
+                        # rows are in the free list and in the tree at once.
+                        logger.warning(
+                            "#927 GENUINE DOUBLE CLAIM: %d row(s) are in the "
+                            "free list AND in the prefix tree; the allocator "
+                            "and its free enumeration agree at %d, so this is "
+                            "not a reading artefact. An equal number of rows "
+                            "must therefore have no owner at all -- that is "
+                            "the hole the subtraction exposes. evictable=%s "
+                            "protected=%s",
+                            double_owned,
+                            enumerated,
+                            full_evictable_size,
+                            protected,
+                        )
+                except Exception:  # noqa: BLE001 - a diagnostic may never raise
+                    pass
         leak, msg = self._check_pool_invariant(
             "full",
             full_available_size,

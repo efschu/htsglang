@@ -744,6 +744,13 @@ class Envs:
     # 2353 of them in five seconds. 512 is roughly one second of that spin and
     # two orders of magnitude above any burst this corpus has measured.
     SGLANG_PP_IDLE_VOID_STREAK_BOUND = EnvInt(512)
+    #: #926: cadence gate for the at-arm pool census. The census walks the pool
+    #: and the KV row-ownership map, which was affordable when an arm was rare;
+    #: the 0827 window measured 69 cutovers in five minutes and one boot died
+    #: in a CPU spin on this frame. Either admission opens the gate; setting
+    #: BOTH to 0 restores the unconditional pre-#926 behaviour.
+    SGLANG_PP_ARM_CENSUS_EVERY_N = EnvInt(16)
+    SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S = EnvFloat(30.0)
 
     # PP: how long an UNDECLARED tensor-dict kind may hold the phase flip's
     # presence gate before it is retired loudly (#800). Deliberately shorter
