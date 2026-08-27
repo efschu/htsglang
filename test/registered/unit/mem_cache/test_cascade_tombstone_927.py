@@ -11,117 +11,166 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""#927: a cascade that frees Full's rows must tombstone them, whoever triggered it.
+"""#927: no live tree node may name a row the allocator has handed back.
 
-THE DEFECT, and it is an EXCLUSIVITY defect before it is an accounting one.
-``full_component.evict_component`` frees the device rows on any cascade that
-reaches it and deliberately leaves ``cd.value`` set, because ``free_swa`` has
-to read it first; the tombstone is deferred to ``_cascade_evict``. That
-tombstone asked whether the Full component was the TRIGGER -- a different
-question from whether its rows were freed. A cascade triggered by MAMBA or SWA
-(``mamba_component.py:529``, ``swa_component.py:441``) that reaches Full freed
-its rows and never cleared them, so a LIVE TREE NODE went on naming ids the
-allocator had already handed back. Those ids stay matchable, so a later prefix
-hit can serve KV out of rows that have been reissued -- the #767 direction.
+WHAT THIS FILE IS, STATED PRECISELY, because its first two versions were both
+mislabelled.
 
-HOW IT SURFACED. The on-idle ledger looks for exactly this: it intersects the
-free list with ``all_values_flatten()``, which reads this ``value`` and does
-not test ``evicted``. The intersection can only be as large as the tree, and
-until the mamba checkpoint grid stopped vetoing every anchor no prefix match
-ever succeeded -- the tree stayed at ``evictable=1`` and the term measured
-about one row, which is the 2c precedent that motivated it. The first real
-8538-row cached prefix made it 8129 against a 120-row surplus, an 8009-row
-DEFICIT, and PP0 raised 14 s after the first hit
-(SPECIMEN-2026-08-27T0643Z-HIT-DOUBLE-OWNED-CRASH.txt). Old defect, newly
-reachable.
+It is an INVARIANT PIN, not a red-first proof. It passes on the unmodified
+tree and it is EXPECTED to: the defect it was written to catch does not exist.
 
-WHAT IS PINNED HERE is the invariant itself, stated without reference to the
-ledger that happened to notice it: after an eviction, no node may name a row
-that has been freed. Both trigger directions, because fixing only the observed
-one would leave the sibling live.
+The story, kept because the lesson outlived the bug:
+
+1. The first version asserted on ``inspect.getsource`` strings and was checked
+   in as "red-first proven". That proof was an artefact -- the mutant I ran had
+   restored the original's exact multi-line formatting, which is what
+   ``assertNotIn`` matched. A one-line mutant leaves all five green. A
+   source-string test observes the source, not the system, and structurally
+   cannot go red for a behavioural change.
+
+2. The rewrite below builds a real cache on CPU and asserts on TREE STATE --
+   and a one-line mutant back to the old condition STILL leaves it green. That
+   is not a second test weakness. The two conditions are EQUIVALENT:
+   ``_cascade_evict`` is reached on the DEVICE target with a non-BASE trigger
+   only from ``mamba_component.py:529`` and ``swa_component.py:441``, both on
+   INTERNAL nodes, where the priorities are "full=2 > swa=1 > mamba=0"
+   (``tree_component.py:292``); the cascade admits a component only at
+   ``eviction_priority <= trigger_priority``, so Full at 2 is unreachable from
+   a trigger at 0 or 1. The leaf path never calls the function
+   (``_evict_device_leaf`` loops components directly) and ``_evict_to_host``,
+   the only path leaving a node in the tree, passes BASE as the trigger
+   explicitly.
+
+So the #927 fix commit was a no-op and has been reverted. What survives is the
+INVARIANT these tests state, which is worth pinning on its own account and is
+the property the on-idle ledger's ``double_owned`` term measures: after an
+eviction, the intersection of the allocator's free list with the rows the tree
+still names must be EMPTY. If a future change breaks it, this goes red -- which
+is the only claim made for it.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
-import inspect
 import unittest
 
+import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.test.test_utils import CustomTestCase
 
+from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
-class TestTheTombstoneAsksAboutFreeingNotTriggering(CustomTestCase):
-    """Source-level, because the condition IS the defect and it is one line."""
+BASE = ComponentType.FULL
 
-    def test_the_tombstone_is_not_gated_on_who_triggered(self):
-        """RED BEFORE THE FIX: the guard read
-        `trigger.component_type == BASE_COMPONENT_TYPE`, so a mamba- or
-        SWA-triggered cascade skipped it."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        src = inspect.getsource(UnifiedRadixCache._cascade_evict)
-        tomb = src.index("value = None")
-        guard = src[:tomb]
-        self.assertNotIn(
-            "trigger.component_type == BASE_COMPONENT_TYPE\n        ):",
-            guard,
-            "the tombstone is still gated on the trigger's identity",
+def _leaf_of(cache):
+    """The single leaf of a one-branch tree."""
+    node = cache.root_node
+    while node.children:
+        node = next(iter(node.children.values()))
+    return node
+
+
+class TestACascadeThatFreesFullTombstonesIt(CustomTestCase):
+    """The invariant, stated without reference to the ledger that noticed it:
+    after an eviction, no live node may name a row that has been freed."""
+
+    def _fixture(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            mamba_cache_size=8,
         )
-        self.assertIn("base_rows_freed", guard)
+        return build_fixture(cfg)
 
-    def test_the_flag_is_set_when_full_is_cascaded_into(self):
-        """The other half: being cascaded into must count, or the fix only
-        renames the old condition."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        src = inspect.getsource(UnifiedRadixCache._cascade_evict)
-        self.assertIn("base_rows_freed = True", src)
-        setter = src.index("base_rows_freed = True")
-        evict_call = src.index("_evict_component_and_detach_lru")
-        self.assertLess(
-            evict_call,
-            setter,
-            "the flag must be set after the eviction that frees the rows",
+    def _insert(self, cache, allocator, tokens):
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value, "fixture pool too small")
+        cache.insert(
+            InsertParams(
+                key=RadixKey(list(tokens), None),
+                value=value.to(dtype=torch.int64),
+            )
         )
+        return value
 
-    def test_a_cascade_that_never_reaches_full_must_not_tombstone(self):
-        """The direction that must NOT move. Clearing `value` on a node whose
-        Full rows were never freed would strand live KV -- a deficit, the
-        opposite and worse defect."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    def test_evicting_the_tree_leaves_no_node_naming_a_freed_row(self):
+        """RED ON THE OLD CONDITION. Evict everything, then intersect the
+        allocator's free list with the rows the tree still names. A node that
+        kept a tombstone-less value puts its freed ids in both sets.
 
-        src = inspect.getsource(UnifiedRadixCache._cascade_evict)
-        init = src.index("base_rows_freed =")
-        self.assertIn(
-            "trigger.component_type == BASE_COMPONENT_TYPE", src[init : init + 120]
-        )
+        This is exactly the population `_live_double_claimed_rows` counts as
+        `double_owned`, computed here from the same two sources."""
+        cache, allocator, _ = self._fixture()
+        self._insert(cache, allocator, range(1, 33))
 
+        cache.evict(EvictParams(num_tokens=10**6))
 
-class TestTheInstrumentReadsWhatTheTombstoneClears(CustomTestCase):
-    """Why the ledger is the thing that noticed, stated so the two cannot be
-    fixed apart by accident."""
-
-    def test_all_values_flatten_does_not_filter_evicted(self):
-        """`all_values_flatten` reads `value` with no `evicted` test, which is
-        correct ONLY while an evicted node's value is tombstoned. If this ever
-        starts filtering, the tombstone stops being load-bearing and this
-        file's premise needs re-reading."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        src = inspect.getsource(UnifiedRadixCache.all_values_flatten)
-        self.assertNotIn("evicted", src)
-        self.assertIn("value", src)
-
-    def test_the_live_reading_is_an_enumerated_intersection(self):
-        """It returns known ids, not an estimate -- which is why 8129 was a
-        real claim about real rows and not a tolerance to widen."""
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
-            SchedulerInvariantChecker,
+        cached = {int(v) for v in cache.all_values_flatten().tolist()}
+        free = {int(v) for v in allocator.free_pages.tolist()}
+        doubly_claimed = cached & free
+        self.assertEqual(
+            doubly_claimed,
+            set(),
+            "the tree still names rows the allocator has handed back; those "
+            "ids stay matchable and a later hit would serve reissued KV",
         )
 
-        src = inspect.getsource(SchedulerInvariantChecker._live_double_claimed_rows)
-        self.assertIn("free_rows & cached_rows", src)
+    def test_the_evicted_node_carries_no_full_value(self):
+        """The same property read directly off the node, so a failure says
+        WHICH half broke rather than only that the sets intersect."""
+        cache, allocator, _ = self._fixture()
+        self._insert(cache, allocator, range(1, 33))
+        leaf = _leaf_of(cache)
+        self.assertIsNotNone(leaf.component_data[BASE].value, "nothing to evict")
+
+        cache.evict(EvictParams(num_tokens=10**6))
+
+        node = cache.root_node
+        while node.children:
+            node = next(iter(node.children.values()))
+            self.assertIsNone(
+                node.component_data[BASE].value,
+                "an evicted node kept its Full value; its rows are free and "
+                "still named",
+            )
+
+
+class TestTheOppositeDirectionMustNotMove(CustomTestCase):
+    """Clearing `value` on a node whose Full rows were NOT freed would strand
+    live KV -- a deficit, the worse sign. Pinned so the fix cannot be widened
+    into that."""
+
+    def test_a_live_node_keeps_its_value(self):
+        cfg = CacheConfig(page_size=1, components=(ComponentType.FULL,))
+        cache, allocator, _ = build_fixture(cfg)
+        value = allocator.alloc(16)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(list(range(1, 17)), None),
+                value=value.to(dtype=torch.int64),
+            )
+        )
+        leaf = _leaf_of(cache)
+        cache.inc_lock_ref(leaf)
+
+        cache.evict(EvictParams(num_tokens=10**6))
+
+        self.assertIsNotNone(
+            leaf.component_data[BASE].value,
+            "a locked node was tombstoned; its KV is live and now unreachable",
+        )
+        cached = {int(v) for v in cache.all_values_flatten().tolist()}
+        free = {int(v) for v in allocator.free_pages.tolist()}
+        self.assertEqual(
+            cached & free,
+            set(),
+            "a locked node's rows were freed while it still names them",
+        )
 
 
 if __name__ == "__main__":

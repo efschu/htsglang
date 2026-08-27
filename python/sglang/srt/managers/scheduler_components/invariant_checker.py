@@ -332,43 +332,74 @@ class SchedulerInvariantChecker:
             if live_double_owned:
                 double_owned = int(live_double_owned)
                 double_owned_src = "live"
-                # #927: SAY WHICH OF THE TWO FREE READINGS IS SPEAKING.
+                # #927 CORRECTED. THE FIRST VERSION OF THIS WAS A TAUTOLOGY
+                # AND ITS SILENCE WAS READ AS EVIDENCE, which is worse than
+                # having no instrument at all.
                 #
-                # This term is subtracted from a ledger built on
-                # `available_size()` (a COUNT) while it is itself derived from
-                # `free_reading.rows` (an ENUMERATION). The type's own docstring
-                # warns that "HOW MANY" and "WHICH ONES" are different questions
-                # on this allocator family, and nothing compared them here.
+                # It compared `len(free_reading.rows)` against
+                # `free_reading.count`. Those are the SAME NUMBER by
+                # construction: `read_free_rows` builds the enumerated reading
+                # as `rows=rows, count=len(rows)` (kv_row_ownership.py:1007-
+                # 1009). The line could therefore never print, and "it printed
+                # zero times" says nothing whatever about the two readings
+                # agreeing.
                 #
-                # Measured, boot 2f repro (0649Z): the ledger balanced EXACTLY
-                # -- available 125865 + protected 8192 + evictable 1111 = 135168
-                # = the post-cutover free pool, + withheld 305265 = total
-                # 440433, surplus ZERO -- and the run still died, because
-                # subtracting a live reading of 8192 turned that exact balance
-                # into an 8192-row deficit. A correction that large against a
-                # ledger with nothing to correct means the two readings disagree
-                # by exactly the protected count, and the log could not say so.
+                # Worse, the ledger's `available` is ALSO that same reading --
+                # `full_available_size = free_reading.count if
+                # free_reading.is_enumerable else ps.full_available_size`, ~30
+                # lines up. So enumeration and ledger cannot disagree here at
+                # all, and the "enumeration over-reports" branch was
+                # unreachable from the start.
                 #
-                # Printed, not acted on. Whether the enumeration over-reports or
-                # `available_size()` under-reports decides which side is the
-                # defect, and that is a different fix on each side -- so this
-                # names the disagreement and leaves the verdict to the reader,
-                # rather than guessing and calling one of them wrong.
+                # WHAT THAT LEAVES, and it is derivable without any new
+                # instrument: `available` counts the enumerated free set and
+                # `protected`/`evictable` count the tree, so a NON-ZERO
+                # intersection means those rows are counted twice in the raw
+                # sum. Specimen 2's raw sum equalled `total` exactly, which
+                # means the double-count is masked by an equal number of rows
+                # that have NO owner. Subtracting `double_owned` is what
+                # exposes them. The rows are genuinely doubly claimed AND
+                # there is a real 8192-row hole; the exact balance was two
+                # errors cancelling.
+                #
+                # THE COMPARISON WORTH MAKING is against the allocator's OWN
+                # `available_size()`, which `ps.full_available_size` carries
+                # and which is an INDEPENDENT source from the enumeration.
+                # That one can genuinely disagree, and if it does the
+                # difference names which side moved.
                 try:
                     enumerated = len(free_reading.rows)
-                    counted = free_reading.count
-                    if counted is not None and enumerated != counted:
+                    alloc_says = getattr(ps, "full_available_size", None)
+                    if alloc_says is not None and int(alloc_says) != enumerated:
                         logger.warning(
-                            "#927 FREE READING DISAGREES WITH ITSELF: the "
-                            "enumeration holds %d row(s) while the count says "
-                            "%d (delta %d); double_owned=%d is derived from the "
-                            "ENUMERATION and subtracted from a ledger built on "
-                            "the COUNT. available=%s evictable=%s protected=%s",
+                            "#927 FREE ENUMERATION vs ALLOCATOR COUNT: the "
+                            "enumeration holds %d row(s) while available_size() "
+                            "says %d (delta %d). double_owned=%d is the "
+                            "intersection of that enumeration with the tree; "
+                            "the ledger's available is the ENUMERATION, so a "
+                            "delta here means the allocator and its own free "
+                            "list disagree. evictable=%s protected=%s",
                             enumerated,
-                            counted,
-                            enumerated - counted,
+                            int(alloc_says),
+                            enumerated - int(alloc_says),
                             double_owned,
-                            full_available_size,
+                            full_evictable_size,
+                            protected,
+                        )
+                    else:
+                        # The two INDEPENDENT sources agree, so the
+                        # intersection is not an enumeration artefact: those
+                        # rows are in the free list and in the tree at once.
+                        logger.warning(
+                            "#927 GENUINE DOUBLE CLAIM: %d row(s) are in the "
+                            "free list AND in the prefix tree; the allocator "
+                            "and its free enumeration agree at %d, so this is "
+                            "not a reading artefact. An equal number of rows "
+                            "must therefore have no owner at all -- that is "
+                            "the hole the subtraction exposes. evictable=%s "
+                            "protected=%s",
+                            double_owned,
+                            enumerated,
                             full_evictable_size,
                             protected,
                         )
