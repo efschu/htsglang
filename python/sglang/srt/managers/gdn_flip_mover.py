@@ -859,6 +859,40 @@ def install_phase_aware_mamba_state_pool(scheduler) -> None:
 
     scheduler.tree_cache.phase_active_mamba_pool = _active_mamba_pool
 
+    # #928 SIBLING, NAMED AT BOOT RATHER THAN LEFT ARMED. The bf16 state pools
+    # above are per-stack, which is the defect #928 roots: an anchor donated
+    # while one stack computes is resumed out of the other stack's tensors at
+    # the same slot id. The int8 CHECKPOINT pool has the identical shape in the
+    # opposite direction -- `_commit_int8_checkpoint` writes into the
+    # TREE-BOUND pool (`cache.req_to_token_pool.mamba_ckpt_pool`) while
+    # `model_runner._maybe_execute_deferred_mamba_cow_and_clear` reads the
+    # EXECUTING runner's (`self.req_to_token_pool.mamba_ckpt_pool`,
+    # model_runner.py:4361-4367). It is inert today only because
+    # `mamba_ckpt_size` is unset on the shipping geometry, so the pools are
+    # both None. Silence would make that a boot-flag away from the same wrong
+    # answer, so the mismatch announces itself here, where both objects are in
+    # scope for the only time.
+    bound_ckpt = getattr(scheduler.req_to_token_pool, "mamba_ckpt_pool", None)
+    tp_ckpt = getattr(
+        scheduler.phase_flip_stacks.tp_worker.model_runner.req_to_token_pool,
+        "mamba_ckpt_pool",
+        None,
+    )
+    if bound_ckpt is not tp_ckpt:
+        logger.warning(
+            "%s #928 int8 mamba CHECKPOINT pools are per-stack (bound=%s tp=%s). "
+            "Checkpoints are written into the tree-bound pool and read from the "
+            "executing runner's, so a phase change between donate and resume "
+            "hands the request another stack's bytes -- the #928 defect in the "
+            "int8 lineage. The bf16 lineage is refused at the match seam "
+            "(mamba_component.py, '[#928 anchor] REFUSING resume'); this one has "
+            "no such seam because the tree cannot see the runner's pool. Do not "
+            "enable --mamba-ckpt-size on a phase-flip boot until it does",
+            LOG_PREFIX,
+            "none" if bound_ckpt is None else hex(id(bound_ckpt)),
+            "none" if tp_ckpt is None else hex(id(tp_ckpt)),
+        )
+
 
 def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
     """Production pre_cutover_fn: preconditions re-validated per flip,
