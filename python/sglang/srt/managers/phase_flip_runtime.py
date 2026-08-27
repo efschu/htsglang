@@ -6071,6 +6071,22 @@ class PhaseFlipRuntime:
                 for v in found
                 if v.law == Law.EXCLUSIVITY and v.kind == EXCLUSIVITY_DOUBLED
             )
+            # #916: THE LEDGER STILL NEEDS THE SHARE THE LAW STOPPED CALLING A
+            # VIOLATION. `resident:requests` is a REFERENCE, so the tree and
+            # the request that holds its ids no longer produce an
+            # EXCLUSIVITY_DOUBLED row -- correctly, because sharing them is how
+            # `cache_unfinished_req` works. The on-idle ledger's arithmetic is
+            # unmoved by that: such a row is still counted once in `evictable`
+            # and again in `session_held`, so it is still a SURPLUS against
+            # `total` and must still be subtracted, or #822 root A's "the
+            # working set reads as a leak" comes back through the invariant
+            # checker instead of through the census.
+            #
+            # ASKED OF THE AUTHORITY, NOT DERIVED FROM THE VERDICT. Sourcing a
+            # correction term from a violation list means the term changes
+            # whenever the verdict does -- which is precisely what #916 just
+            # did to it.
+            double_owned += int(authority.shared_reference_rows())
             alloc_obj = getattr(self._census_scheduler, "token_to_kv_pool_allocator", None)
             if alloc_obj is not None:
                 try:

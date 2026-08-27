@@ -575,6 +575,24 @@ class CpuCopyUnmappedRows(ValueError):
     """
 
 
+class CpuCopyIdsUnreadable(CpuCopyUnmappedRows):
+    """The guard could not READ the ids, so it declines instead of dying (#916).
+
+    A SUBCLASS ON PURPOSE. `seam_copy_state` already catches
+    `CpuCopyUnmappedRows` and answers it with the decline-and-recompute path
+    that exists for exactly this cost; a sibling type would have needed a
+    second `except` clause at every call site, and the one that got forgotten
+    would be the one that killed a rank.
+
+    IT IS STILL ITS OWN NAME, because the two facts are not the same fact.
+    `CpuCopyUnmappedRows` is a VERDICT about these ids: they were read, and
+    they sit above the backing. This one is the ABSENCE of a verdict: the
+    device would not answer, so nothing is known about the ids and the copy is
+    refused on that ground alone. A log that cannot tell those apart cannot
+    tell a dial-shrink hazard from a context that was already dead.
+    """
+
+
 def check_cpu_copy_rows(
     indices, rows: int, direction: str, axis: str, backed_rows: Optional[int] = None
 ) -> None:
@@ -658,11 +676,63 @@ def check_cpu_copy_rows(
     """
     if indices is None:
         return
+    # ------------------------------------------------------------------
+    # HOST-ONLY PROLOGUE (#916 posten 2). Nothing below this block touches the
+    # device; `numel()` is tensor metadata and `rows`/`backed_rows` are host
+    # ints the pool already computed.
+    #
+    # WHY THE ORDER IS THE FIX. In the 0826 rerun (boot #2, 21:53:36) this
+    # guard was reached with the CUDA context ALREADY faulted -- the same rank
+    # had just reported "#760 quiesce ... synchronizing load_stream failed
+    # (illegal memory access)" one line earlier. `indices.min()` is a device
+    # reduction, so the guard died on its own first sync and the rank went with
+    # it: `SEAM COPY DECLINED: 0` and `CpuCopyUnmappedRows: 0` in a boot whose
+    # crash was on exactly this path. A guard that must read a CUDA tensor
+    # before it can decide cannot decline a fault that already exists.
+    # ------------------------------------------------------------------
     n = int(indices.numel())
     if n == 0:
         return
-    lo = int(indices.min())
-    hi = int(indices.max())
+    if backed_rows is not None and int(backed_rows) <= 0 < int(rows):
+        # NOTHING IS MAPPED, and that is answerable without a single id.
+        # `None` means the pool cannot state a backing; a pool that HAS an
+        # arena and reports zero is saying its pages are all released, so every
+        # id this copy could name is unmapped. Refusing here costs a recompute
+        # and takes no device access at all.
+        raise CpuCopyUnmappedRows(
+            f"HiCache CPU copy ({direction}): this pool's committed backing is 0 "
+            f"{axis}s against a {int(rows)}-{axis} reservation, so every {axis} "
+            f"this copy names is unmapped. Refused on host facts alone, without "
+            f"reading the ids -- a device read here is what killed the rank in "
+            f"the 0826 rerun (#916). These tokens are recomputed instead."
+        )
+    try:
+        # ONE device round trip instead of two, and fault-isolated. A driver
+        # error raised here is NOT this copy's fault and must not be reported
+        # as one -- it is converted into a DECLINE so the seam's existing
+        # recompute path runs and the log names the real state.
+        #
+        # THE FUSE IS ONLY TAKEN FOR A DEVICE TENSOR. A host tensor's min/max
+        # are already host math, and this function is also handed non-torch id
+        # containers by tests and by the mamba slot path; routing those through
+        # `torch.stack` would turn a working reading into a decline, which is
+        # the opposite defect. Same values either way -- only the number of
+        # syncs changes.
+        low, high = indices.min(), indices.max()
+        if torch.is_tensor(low) and torch.is_tensor(high) and low.device.type != "cpu":
+            bounds = torch.stack((low, high)).tolist()
+        else:
+            bounds = (low, high)
+    except Exception as exc:  # noqa: BLE001 -- a guard refuses, it never dies
+        raise CpuCopyIdsUnreadable(
+            f"HiCache CPU copy ({direction}): the {n} {axis} id(s) could not be "
+            f"read to check them -- the device refused before this guard could "
+            f"look ({type(exc).__name__}: {exc}). The context was already faulted "
+            f"when the copy was requested, so this is not a verdict about these "
+            f"ids; it is a refusal to add a second fault on top of the first. "
+            f"Declined; these tokens are recomputed instead (#916)."
+        ) from exc
+    lo, hi = int(bounds[0]), int(bounds[1])
     if (
         lo >= 0
         and hi < int(rows)

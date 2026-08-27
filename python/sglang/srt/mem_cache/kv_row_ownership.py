@@ -24,8 +24,24 @@ The law::
 
     exposed id space  <=  committed backing
     every claimed row  <   committed backing
-    the claims partition the space: exactly one owner per row, no row unowned
+    the row STATES partition the space: exactly one state per row, none
+        stateless -- and a REFERENCE to a row is not one of its states
     a phase cutover retires the whole old id space in ONE step
+
+#916 AMENDED THE THIRD LINE, and the amendment is the whole of that ticket.
+As first written it read "exactly one owner per row", which is true of the
+three owners it was written for (free list, radix tree, cap band -- mutually
+exclusive STATES) and false of the fourth that #822 added. A resident request
+does not hold a row instead of the tree; it holds the tree's own ids, written
+back into ``req_to_token`` by ``cache_unfinished_req`` after a pool ref is
+taken (``radix_cache.py:509,534-537``). Under the un-amended line every cached
+prefix on the stack read as "two owners writing the same KV row is silent
+corruption": measured 2026-08-26 21:53:13 on all three ranks,
+``cached=12281`` against ``[exclusivity] 12280 rows
+[('radix_cache', 'resident:requests')]``, ``sample=[2..9]``.
+The teeth did not come out with it. A reference over a row the allocator has
+already FREED is a use-after-free and now has its own violation kind, instead
+of being one indistinguishable line among 33.
 
 The first line already existed as :func:`exposure_over_backing`
 (``kv_backing_relief.py:504``) and is reused verbatim here rather than
@@ -159,6 +175,44 @@ class Law(str, Enum):
 EXCLUSIVITY_DOUBLED = "claimed_by_multiple"
 #: LAW.EXCLUSIVITY's "claimed by no one" shape -- see ``Violation.kind``.
 EXCLUSIVITY_UNOWNED = "unclaimed"
+#: LAW.EXCLUSIVITY's third shape (#916): a REFERENCE holder still names a row
+#: the allocator has already put back on its free list. Not the same fact as
+#: :data:`EXCLUSIVITY_DOUBLED` and far more dangerous -- the next ``alloc``
+#: hands that row to a second writer while the first still reads it, which is
+#: the use-after-free the seam copy dies on.
+EXCLUSIVITY_FREED_REFERENCE = "referenced_after_free"
+
+
+# ----------------------------------------------------------------------
+# #916: A CLAIM HAS A ROLE, BECAUSE NOT EVERY HOLDER IS AN OWNER
+# ----------------------------------------------------------------------
+# The law's third line -- "the claims partition the space: exactly one owner
+# per row" -- is true of the three owners it was written for and FALSE of the
+# fourth one #822 added. `free_list`, `radix_cache` and `cap_withheld` are
+# mutually exclusive STATES of a row: free, cached, or withheld above the cap.
+# `resident:requests` is not a state, it is a REFERENCE: a live request naming
+# a row that some state already holds.
+#
+# AND THE STACK SHARES THOSE ROWS ON PURPOSE. `RadixCache.cache_unfinished_req`
+# inserts the request's rows into the tree and then writes the TREE's ids back
+# into `req_to_token` (`radix_cache.py:534-537`, upstream), taking one ref in
+# the memory pool (`:509`). From that instant the tree and the request name the
+# SAME ids, by design, refcounted by `inc_lock_ref`. Treating that as "two
+# owners writing the same KV row is silent corruption" reported the ordinary
+# working set as corruption: measured on this rig 2026-08-26 21:53:13, all
+# three ranks, `cached=12281` against `[exclusivity] 12280 rows ...
+# [('radix_cache', 'resident:requests')]` -- every cached row but one, with
+# `sample=[2..9]`, the head of a shared prefix.
+#
+# THE ROLE IS DECLARED, NEVER INFERRED FROM THE NAME. A prefix test on
+# "resident:" would be the #908 substring shape one level down; the caller that
+# knows what it is declaring says so.
+#: a row STATE that excludes every other state (radix_cache, cap_withheld)
+ROLE_EXCLUSIVE = "exclusive"
+#: the free list -- also a state, and the one a reference must never overlap
+ROLE_FREE = "free"
+#: a holder that NAMES rows another owner holds (resident requests)
+ROLE_REFERENCE = "reference"
 
 
 @dataclass(frozen=True)
@@ -213,10 +267,18 @@ class Claim:
     owner: str
     rows: frozenset
     epoch: int
+    #: #916: what this claim IS -- a row state or a reference to one. See the
+    #: ROLE_* constants. Defaults to the exclusive state, which is what every
+    #: pre-#916 caller meant.
+    role: str = ROLE_EXCLUSIVE
 
     @property
     def count(self) -> int:
         return len(self.rows)
+
+    @property
+    def is_reference(self) -> bool:
+        return self.role == ROLE_REFERENCE
 
 
 def _sample(rows: Iterable[int], limit: int = 8) -> Tuple[int, ...]:
@@ -328,18 +390,31 @@ class RowOwnershipAuthority:
             return self._space.epoch
 
     def declare(
-        self, owner: str, rows: Iterable[int], *, epoch: Optional[int] = None
+        self,
+        owner: str,
+        rows: Iterable[int],
+        *,
+        epoch: Optional[int] = None,
+        role: str = ROLE_EXCLUSIVE,
     ) -> None:
         """Record that ``owner`` holds ``rows``.
 
         ``epoch`` defaults to the CURRENT one, which is the honest default for
         a live writer. Tests and replayed census data pass an explicit epoch to
         reconstruct a #796 survivor.
+
+        ``role`` (#916) says WHAT the claim is: an exclusive row state, the
+        free list, or a reference to a row some state already holds. The
+        default is the exclusive state, which is what every caller before #916
+        meant, so an un-updated caller cannot silently become a reference.
         """
         with self._lock:
             stamp = self._space.epoch if epoch is None else int(epoch)
             self._claims[owner] = Claim(
-                owner=owner, rows=frozenset(int(r) for r in rows), epoch=stamp
+                owner=owner,
+                rows=frozenset(int(r) for r in rows),
+                epoch=stamp,
+                role=str(role),
             )
 
     def withdraw(self, owner: str) -> None:
@@ -349,6 +424,38 @@ class RowOwnershipAuthority:
     def owners(self) -> Tuple[str, ...]:
         with self._lock:
             return tuple(sorted(self._claims))
+
+    def shared_reference_rows(self) -> int:
+        """Rows a REFERENCE names that a row STATE also holds (#916).
+
+        THE LEDGER'S QUESTION, NOT THE LAW'S, and they stopped being the same
+        question when the reference role landed. #912's ``double_owned`` term
+        exists because a row counted in ``evictable`` (the tree) and again in
+        ``session_held`` (the request holding it) is a SURPLUS against
+        ``total`` -- and that arithmetic does not care whether the two holders
+        are a lawful share or a corruption. The law now says the tree/request
+        share is lawful; the ledger still has to subtract it, or the on-idle
+        invariant reads the working set as a leak again.
+
+        So this is deliberately NOT derived from the violation list. A
+        correction term sourced from a verdict would silently change whenever
+        the verdict does, which is exactly what would have happened here.
+
+        Retired claims are excluded, on the same reasoning as :meth:`audit`:
+        ids from a dead epoch are not rows.
+        """
+        with self._lock:
+            space_epoch = self._space.epoch
+            claims = [c for c in self._claims.values() if c.epoch >= space_epoch]
+        state_union: Set[int] = set()
+        for claim in claims:
+            if not claim.is_reference:
+                state_union |= claim.rows
+        shared: Set[int] = set()
+        for claim in claims:
+            if claim.is_reference:
+                shared |= claim.rows & state_union
+        return len(shared)
 
     def set_backing(
         self, *, exposed: Optional[int] = None, committed: Optional[int] = None
@@ -493,16 +600,33 @@ class RowOwnershipAuthority:
                 )
             )
 
-        # LAW 3 -- the claims partition the space.
+        # LAW 3 -- the row STATES partition the space, and a REFERENCE is not
+        # a state (#916).
+        #
+        # `seen` answers "does this row have any holder at all", which is the
+        # unowned half's question, and a resident request is a perfectly good
+        # answer to it -- that is the whole of #822 root A. `doubled` answers
+        # "do two writers own this row", and only the exclusive STATES can
+        # break that: the tree and the request that references it hold the same
+        # ids by construction (`radix_cache.py:534-537`), so counting their
+        # overlap as a violation republished the working set as corruption.
         seen: Dict[int, str] = {}
         doubled: Dict[int, Tuple[str, str]] = {}
-        for claim in sorted(current, key=lambda c: c.owner):
+        states = [c for c in current if not c.is_reference]
+        references = [c for c in current if c.is_reference]
+        for claim in sorted(states, key=lambda c: c.owner):
             for row in claim.rows:
                 prior = seen.get(row)
                 if prior is None:
                     seen[row] = claim.owner
                 else:
                     doubled.setdefault(row, (prior, claim.owner))
+        # References fill the coverage answer without ever creating a doubled
+        # row: `setdefault` records the first holder and never overwrites a
+        # state, so a referenced row keeps naming the state that holds it.
+        for claim in sorted(references, key=lambda c: c.owner):
+            for row in claim.rows:
+                seen.setdefault(row, claim.owner)
         if doubled:
             pairs = sorted({p for p in doubled.values()})
             out.append(
@@ -518,6 +642,38 @@ class RowOwnershipAuthority:
                     kind=EXCLUSIVITY_DOUBLED,
                 )
             )
+        # THE SHAPE THE OLD LUMP WAS HIDING (#916). A reference over a FREE row
+        # is not the benign share -- it is a use-after-free with a delay fuse:
+        # the row is back in the free list, the next `alloc` hands it to a
+        # second request, and the first one is still reading it. Before this it
+        # was reported in the same sentence and with the same severity as the
+        # tree/request share, which is why 33 violation lines in one boot could
+        # not be triaged. It gets its own kind so a boot can be grepped for the
+        # dangerous one alone.
+        freed = {c.owner: c.rows for c in states if c.role == ROLE_FREE}
+        if freed and references:
+            free_union: Set[int] = set()
+            for rows in freed.values():
+                free_union |= rows
+            for claim in sorted(references, key=lambda c: c.owner):
+                hit = set(claim.rows) & free_union
+                if not hit:
+                    continue
+                out.append(
+                    Violation(
+                        law=Law.EXCLUSIVITY,
+                        rows=len(hit),
+                        detail=(
+                            f"{claim.owner!r} still references {len(hit)} row id(s) that "
+                            f"the allocator has already returned to its free list "
+                            f"{sorted(freed)}; the next allocation hands those rows to a "
+                            f"second writer while this holder is still reading them -- a "
+                            f"use-after-free, not the ordinary tree/request share"
+                        ),
+                        sample=_sample(hit),
+                        kind=EXCLUSIVITY_FREED_REFERENCE,
+                    )
+                )
         if expect_full_coverage:
             # THE #814 DEFECT, STATED AS A CHOICE OF RANGE.
             #
@@ -601,11 +757,17 @@ class RowOwnershipAuthority:
         into an ownership violation.
         """
         if free_rows is not None:
-            self.declare("free_list", free_rows)
-        self.declare("radix_cache", cached_rows)
-        self.declare("cap_withheld", withheld_rows)
+            self.declare("free_list", free_rows, role=ROLE_FREE)
+        self.declare("radix_cache", cached_rows, role=ROLE_EXCLUSIVE)
+        self.declare("cap_withheld", withheld_rows, role=ROLE_EXCLUSIVE)
+        # #916: the fourth owner is a REFERENCE, and saying so here is the fix.
+        # A resident request does not hold a row INSTEAD of the tree, it holds
+        # the tree's own ids -- `cache_unfinished_req` writes them back into
+        # `req_to_token` (`radix_cache.py:534-537`) after taking a pool ref.
+        # Declared as an exclusive state, that share was reported as "two
+        # owners writing the same KV row" on every census with a cached prefix.
         for owner, rows in (resident_rows or {}).items():
-            self.declare(f"resident:{owner}", rows)
+            self.declare(f"resident:{owner}", rows, role=ROLE_REFERENCE)
         return self.audit(expect_full_coverage=expect_full_coverage)
 
 
