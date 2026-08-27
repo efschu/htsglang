@@ -496,6 +496,252 @@ class TheBoundActuallyTerminates(unittest.TestCase):
             self.assertEqual(effective, {})
 
 
+class _CanRunListReq:
+    """A request in the shape PRODUCTION re-offers, which is the shape none of
+    the earlier tests ever built.
+
+    `PrefillAdder` writes `extend_range` via `set_extend_range` on every path
+    that appends to `can_run_list`, so a mid-chunked-prefill request always has
+    one -- and `_executed_extent` therefore returns a value for it, which sends
+    `build_pp_admission_decision` down its EXECUTED branch. That branch is the
+    one the guard is not on.
+    """
+
+    class _Range:
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+
+    def __init__(self, rid, prefix_len, extend_len):
+        self.rid = rid
+        self.prefix_indices = list(range(prefix_len))
+        self.extend_range = self._Range(prefix_len, prefix_len + extend_len)
+        self.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
+
+
+class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
+    """#944c THE REACHABILITY RATCHET -- one test per instance of the class.
+
+    THE CLASS, three instances, all the same shape: a compensator that does the
+    right thing when called, sitting off the path that produces the defect.
+
+      #939  the prefetch re-issue, behind the refusal it compensates
+      #944  the defer cap, behind the return trip the void breaks
+      #944b the offer streak, behind a `prefix_len_for` the re-offer skips
+
+    Every one of them passed a test asking "does this do the right thing when
+    called". None of them had a test asking "IS THIS ON THE PATH THE DEFECT
+    TAKES". That second question is what these are, and instance 4 must fail
+    HERE rather than on a boot -- two windows were spent learning that.
+    """
+
+    def _build(self, guard, req, pp_size=WORLD):
+        from sglang.srt.managers.pp_admission_congruence import (
+            build_pp_admission_decision,
+        )
+
+        return build_pp_admission_decision(
+            0,
+            [req],
+            pp_size=pp_size,
+            guard=guard,
+            # THE PRODUCTION SETTING. scheduler.py:9076 is the one production
+            # call site and it passes True. Every earlier test in this file
+            # left it False, which is why they all exercised the fallback
+            # branch -- the one the guard IS on -- and never the real one.
+            require_executed_geometry=True,
+        )
+
+    def test_944b_the_streak_sees_the_EXECUTED_reoffer_path(self):
+        """#944b REACHABILITY. Measured on the rig 2026-08-27: two rids,
+        `told=8192` on every line, `UNRESOLVABLE` 0 against 3506 UNRESOLVED --
+        because `build_pp_admission_decision`'s executed branch returns before
+        the guard block, so `prefix_len_for` is never called for an
+        already-admitted request. This is that failure as a desk test."""
+        g = PPAdmissionCongruenceGuard()
+        req = _CanRunListReq(RID, prefix_len=8192, extend_len=512)
+        tolds = []
+        for _ in range(UNRESOLVED_DEFER_CAP + 3):
+            d = self._build(g, req)
+            tolds.append(d.entries[0].prefix_len)
+        self.assertGreater(
+            g.offer_streak(RID),
+            0,
+            "THE #944b LIVE FAILURE: the guard never saw the offer at all, so "
+            "its streak stayed at 0 while production re-offered the same "
+            "length thousands of times. A bound the defect's own path does "
+            "not traverse is not a bound.",
+        )
+        self.assertGreater(
+            g.offer_streak(RID),
+            UNRESOLVED_DEFER_CAP,
+            f"and the streak must actually cross the cap: {tolds}",
+        )
+        # THE REPORT IS NEVER REWRITTEN ON THIS BRANCH, and that is not a
+        # shortfall of the fix -- it is the contract. `prefix_len` here is what
+        # the rank EXECUTED (`extend_range.start`); reporting anything else
+        # names a pass no rank ran (instr21). So the executed branch COUNTS and
+        # refuses loudly; the acting half belongs upstream, where the prefix is
+        # still choosable. See #946.
+        self.assertEqual(
+            tolds,
+            [8192] * len(tolds),
+            "the executed geometry must be reported truthfully, always",
+        )
+
+    def test_the_loud_refusal_FIRES_on_the_executed_path(self):
+        """CRITERION (1) OF THE WINDOW, as a desk test. Two boots measured
+        `UNRESOLVABLE` = 0 while the rig re-offered a frozen `told` thousands
+        of times. The escalation must now fire from the branch production
+        actually takes, and fire exactly once."""
+        g = PPAdmissionCongruenceGuard()
+        req = _CanRunListReq(RID, prefix_len=8192, extend_len=512)
+        catcher = _Catcher(logging.ERROR)
+        log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
+        log.addHandler(catcher)
+        try:
+            for _ in range(UNRESOLVED_DEFER_CAP + 4):
+                self._build(g, req)
+        finally:
+            log.removeHandler(catcher)
+        self.assertEqual(
+            len(catcher.records),
+            1,
+            f"expected exactly one UNRESOLVABLE from the executed path, got "
+            f"{catcher.messages}",
+        )
+        self.assertIn("UNRESOLVABLE", catcher.messages[0])
+        self.assertIn(RID, catcher.messages[0])
+
+    def test_946_the_learned_floor_is_INERT_on_the_reoffer_path_ON_PURPOSE(self):
+        """#946 DECIDED, NOT INFERRED.
+
+        The question filed as #946 is whether `_learned_floor` is inert on the
+        re-offer path. IT IS, and this test pins that as INTENTIONAL rather
+        than leaving it as a suspicion: the executed branch reports
+        `extend_range.start` -- the prefix the rank actually used -- and
+        applying a floor there would report a prefix the rank did NOT use,
+        which is the instr21 defect the builder's own docstring forbids.
+
+        So #944c does NOT cover #946 by making the floor apply here, and it
+        must not. What it covers is the OBSERVABILITY half: the offer is now
+        counted on this path, so a floor that cannot bite still produces a
+        loud, named refusal instead of silence. The remaining half of #946 --
+        applying an escape to a chunked continuation -- lives upstream, where
+        the prefix is still choosable, and is not this function's to take.
+        """
+        g = PPAdmissionCongruenceGuard()
+        g.record_return_trip(
+            _decision(
+                8192,
+                admitted=False,
+                retracted=True,
+                retracted_by_rank=RANK,
+                observed_local=128,
+            )
+        )
+        self.assertEqual(g.learned_floor(RID), 128, "a floor IS outstanding")
+        req = _CanRunListReq(RID, prefix_len=8192, extend_len=512)
+        d = self._build(g, req)
+        self.assertEqual(
+            d.entries[0].prefix_len,
+            8192,
+            "#946: the floor is deliberately NOT applied to an executed "
+            "geometry -- the report must state what ran, not what a floor "
+            "would have preferred. Changing this to 128 would be the instr21 "
+            "defect, not a fix.",
+        )
+        self.assertEqual(
+            g.offer_streak(RID),
+            1,
+            "but the offer IS counted, which is the half #944c does deliver: "
+            "an inert floor now produces a named refusal instead of silence",
+        )
+
+    def test_the_offer_construction_sites_are_all_covered(self):
+        """THE RATCHET ITSELF. `prefix_len` is written into a
+        `PPAdmissionEntry` at exactly N sites inside the builder; every one of
+        them is an OFFER, and the streak must see all of them.
+
+        Pinned as a count so a NEW branch that emits an offer turns this red
+        and forces the same question to be asked again. That is the whole
+        mechanism: instance 4 fails here, not on a boot.
+        """
+        import inspect
+
+        from sglang.srt.managers import pp_admission_congruence as pac
+
+        src = inspect.getsource(pac.build_pp_admission_decision)
+        sites = src.count("PPAdmissionEntry(")
+        self.assertEqual(
+            sites,
+            2,
+            "The builder emits offers from a different number of sites than "
+            "this pin expects. Each one is a place production can propose a "
+            "`told`, and the #944b bound is only real if EVERY one of them is "
+            "counted. Sweep the new site, route it through the same counter, "
+            "then update this pin.",
+        )
+
+    def test_939_the_prefetch_reissue_is_WIRED_not_merely_present(self):
+        """#939 REACHABILITY -- the FIRST instance of the class, kept here so
+        all three sit together and instance 4 has a pattern to match.
+
+        Measured across six boots: `PREFETCH RE-ISSUED` 0 and `RETIRED
+        PREFETCH REAPED` 0 -- the compensator existed, was correct, and was
+        never reached, because it sat behind the refusal it was built to
+        compensate. Presence at file:line was never the question.
+
+        THREE STATES, NEVER TWO (the delivery rule): ABSENT /
+        PRESENT-BUT-UNWIRED / PRESENT-AND-WIRED. The middle one is the
+        expensive mistake in both directions, so it gets its own assertion:
+        an importer OUTSIDE the defining module is what separates it from the
+        third state.
+        """
+        import pathlib
+
+        import sglang
+
+        root = pathlib.Path(sglang.__file__).resolve().parent
+        home = root / "srt/mem_cache/unified_radix_cache.py"
+        self.assertTrue(home.exists())
+        text = home.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("def drain_retired_prefetch", text, "ABSENT would be state 1")
+
+        outside = [
+            p
+            for p in root.rglob("*.py")
+            if p != home
+            and "drain_retired_prefetch"
+            in p.read_text(encoding="utf-8", errors="replace")
+        ]
+        self.assertTrue(
+            outside,
+            "PRESENT-BUT-UNWIRED: `drain_retired_prefetch` has no caller "
+            "outside its own file, so it cannot run in production no matter "
+            "how correct it is. That is the #939 shape and it costs a boot to "
+            "discover.",
+        )
+
+    def test_944_the_cap_does_not_depend_on_a_lap(self):
+        """#944 REACHABILITY, kept as its own arm. The first bound was fed by
+        `record_return_trip`, i.e. by a ring lap the void itself breaks."""
+        g = PPAdmissionCongruenceGuard()
+        for _ in range(UNRESOLVED_DEFER_CAP + 2):
+            g.prefix_len_for(RID, 4096)
+        self.assertEqual(
+            g.prefix_len_for(RID, 4096),
+            0,
+            "the bound must arm with NOTHING ever delivered back",
+        )
+        self.assertEqual(
+            g.unresolved_rounds(RID),
+            0,
+            "and with the lap-fed counter still at zero, which is the proof "
+            "it is not what armed it",
+        )
+
+
 class TheConsumerSweepRatchet(unittest.TestCase):
     """THE ZUKUNFTS-CHECK: what test would have caught instance FOUR?
 

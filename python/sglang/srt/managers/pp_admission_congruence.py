@@ -381,6 +381,67 @@ class PPAdmissionCongruenceGuard:
         """
         return self._unresolved_rounds.get(rid, 0)
 
+    def note_offer(self, rid: str, told: int) -> bool:
+        """#944c RECORD ONE OFFER. True iff `rid` has now exceeded the cap.
+
+        COUNTING IS NOT CLAMPING, and splitting them is the whole of #944c.
+        The bound needs to SEE every offer production makes; it may only ACT on
+        the offers it is allowed to rewrite. Those are different sets, and
+        conflating them is what put the counter on one branch of a two-branch
+        function.
+
+        THE TWO BRANCHES, measured. `build_pp_admission_decision` constructs an
+        offer in two places: the EXECUTED branch (`_executed_extent` returned a
+        geometry -- an already-admitted, mid-chunked-prefill request being
+        re-offered out of `can_run_list`, which is the production case) and the
+        FALLBACK branch (no executed geometry). Until #944c only the fallback
+        consulted the guard, so on the rig the streak stayed at 0 while two
+        rids were re-offered `told=8192` thousands of times and the cap never
+        armed. This method is what both branches now call.
+
+        It never rewrites anything, so the EXECUTED branch can call it safely:
+        that branch must REPORT the prefix the rank actually used, and a value
+        derived from anything else names a pass no rank ran (the instr21
+        defect, and the reason this class's docstring forbids re-applying the
+        clamp there). See `prefix_len_for` for the acting half.
+        """
+        if self._unresolved_defer_cap <= 0:
+            return False
+        told = int(told)
+        prev_told, streak = self._offer_streak.get(rid, (None, 0))
+        streak = streak + 1 if prev_told == told else 1
+        self._offer_streak[rid] = (told, streak)
+        # `told <= 0` is already the terminator, so a rid sitting there is
+        # progressing by definition and is never "over the cap".
+        if told <= 0 or streak <= self._unresolved_defer_cap:
+            return False
+        if rid not in self._escalated:
+            self._escalated.add(rid)
+            logger.error(
+                "#944 PP-ADMISSION UNRESOLVABLE rid=%s: this rank has offered "
+                "the SAME prefix length (told=%d) for %d consecutive passes "
+                "without the request ever being served. Reported unresolved "
+                "rounds for it: %d -- if that is 0 while this streak is not, "
+                "the return trip is not completing, which is the ring being "
+                "blocked by the very void this bound exists to end. No rank "
+                "could locate the request in any of the four places one can "
+                "live -- the waiting queue, `chunked_req`, the named slot's "
+                "chunked req, or the running batch -- so no rank measured a "
+                "prefix, no floor can be learned, and the offer cannot be "
+                "damped by measurement. Where this rank is allowed to rewrite "
+                "the offer it now offers told=0, which is honourable without a "
+                "measurement; where it is only allowed to REPORT what already "
+                "executed it leaves the geometry alone and this line is the "
+                "whole of its response. If this repeats for many rids, the "
+                "lookup chain has a FIFTH gap and that is the bug -- not this "
+                "refusal.",
+                rid,
+                told,
+                streak,
+                self._unresolved_rounds.get(rid, 0),
+            )
+        return True
+
     def offer_streak(self, rid: str) -> int:
         """#944b diagnostic/test hook: consecutive identical re-offers of `rid`.
 
@@ -459,45 +520,9 @@ class PPAdmissionCongruenceGuard:
         told = (
             candidate_prefix_len if floor is None else min(candidate_prefix_len, floor)
         )
-        if self._unresolved_defer_cap <= 0:
-            return told
-
-        # Count THIS offer before deciding on it: the streak is "how many
-        # passes in a row have proposed this exact length", so the offer being
-        # made now is part of it.
-        prev_told, streak = self._offer_streak.get(rid, (None, 0))
-        streak = streak + 1 if prev_told == told else 1
-        self._offer_streak[rid] = (told, streak)
-
-        # `told <= 0` is already the terminator, so a rid sitting at 0 is
-        # progressing by definition and must never be "escalated" to 0 again.
-        if told <= 0 or streak <= self._unresolved_defer_cap:
-            return told
-
-        if rid not in self._escalated:
-            self._escalated.add(rid)
-            logger.error(
-                "#944 PP-ADMISSION UNRESOLVABLE rid=%s: this rank has offered "
-                "the SAME prefix length (told=%d) for %d consecutive passes "
-                "without the request ever being served. Reported unresolved "
-                "rounds for it: %d -- if that is 0 while this streak is not, "
-                "the return trip is not completing, which is the ring being "
-                "blocked by the very void this bound exists to end. No rank "
-                "could locate the request in any of the four places one can "
-                "live -- the waiting queue, `chunked_req`, the named slot's "
-                "chunked req, or the running batch -- so no rank measured a "
-                "prefix, no floor can be learned, and the offer cannot be "
-                "damped by measurement. Offering told=0 instead: it "
-                "is honourable without a measurement, so the pass runs, at the "
-                "cost of this request's prefix reuse for one pass. If this "
-                "line repeats for many rids, the lookup chain has a FIFTH gap "
-                "and that is the bug -- not this refusal.",
-                rid,
-                told,
-                streak,
-                self._unresolved_rounds.get(rid, 0),
-            )
-        return 0
+        # #944c COUNT, THEN ACT -- and the counting half is shared with the
+        # EXECUTED branch, which may count but must never be clamped.
+        return 0 if self.note_offer(rid, told) else told
 
     def record_return_trip(self, decision: PPAdmissionDecision) -> None:
         """Consume a fully chain-reconciled decision on its way back to PP0.
@@ -730,6 +755,21 @@ def build_pp_admission_decision(
     for req in reqs:
         executed = _executed_extent(req)
         if executed is not None:
+            # #944c THE OFFER THE BOUND USED TO MISS. This is the PRODUCTION
+            # case -- an already-admitted, mid-chunked-prefill request being
+            # re-offered out of `can_run_list` -- and until #944c it returned
+            # here without the guard ever seeing it. Measured on the rig: two
+            # rids, `told=8192` on every line, streak 0, cap never armed.
+            #
+            # COUNTED, NEVER CLAMPED, and the asymmetry is required rather
+            # than cautious: this branch REPORTS the prefix the rank actually
+            # executed, so rewriting it would name a pass no rank ran -- the
+            # instr21 defect, and exactly what this function's docstring
+            # forbids. `note_offer` returns whether the cap is exceeded; here
+            # the loud refusal it emits IS the whole response, and the acting
+            # half belongs upstream where the prefix is still choosable.
+            if guard is not None and pp_size > 1:
+                guard.note_offer(req.rid, executed[0])
             entries.append(
                 PPAdmissionEntry(
                     rid=req.rid,
