@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -382,10 +382,96 @@ class SchedulerInvariantChecker:
             uncached,
         )
 
+    @staticmethod
+    def _mamba_double_claimed(mamba_allocator, tree_cache) -> Optional[tuple]:
+        """``(duplicate_count, duplicate_ids, free_and_cached)``, or ``None``.
+
+        #924, and it is the MAMBA half of the term ``_check_full_pool`` has
+        carried since #912. The full pool's reading comes from
+        ``read_free_rows`` (a UNION over free + release) and from the #822
+        authority; the mamba allocator has neither, and its own free list is a
+        bare ``torch.cat`` (``allocator/mamba.py:88-91``) with no membership
+        ledger, so a slot returned twice is REPRESENTABLE and inflates
+        ``available_size()`` -- which is ``len(free_slots)`` -- by exactly the
+        duplicate count.
+
+        MEASURED, 2026-08-27 boot 1 of the 2d acceptance, all three ranks
+        (/spinning/evidence-665-f1/boot_accept2d0827_0827_0253.log:32825)::
+
+            [mamba] total=20, available=23, evictable=0, protected=0,
+                    session_held=0, uncached=0, withheld=0, double_owned=0,
+                    leaked_mamba_pages=None
+
+        +3 on a 20-slot pool, and ``leaked_mamba_pages=None`` in the SAME line
+        because the existing diagnosis builds ``set(free_slots.tolist())``
+        (below) and a set collapses exactly the duplicates that caused the
+        surplus. The ledger said "leak" and the diagnosis said "nothing is
+        missing"; both were right and neither named the defect.
+
+        TWO POPULATIONS, deliberately reported apart:
+
+        * ``duplicate_count`` -- a slot listed MORE THAN ONCE in the free list.
+          This is a DOUBLE FREE, not a shared claim: the allocator will hand
+          the same state slot to two requests, which is a wrong answer with no
+          crash. It is named, its ids are printed, and it stays FATAL below.
+        * ``free_and_cached`` -- a slot in the free list that the radix tree
+          also holds. That is the #912 population, one pool over, and it is
+          subtracted for the #912 reason: it does not occupy anything, and
+          leaving it unnamed makes a surplus read as an unexplained leak.
+
+        ``None`` when the free list cannot be read. ``None`` is not zero.
+        """
+        free_slots = getattr(mamba_allocator, "free_slots", None)
+        try:
+            free_list = [int(v) for v in free_slots.tolist()]
+        except (AttributeError, TypeError, ValueError):
+            return None
+        free_set = frozenset(free_list)
+        duplicate_ids = sorted(
+            slot for slot, seen in Counter(free_list).items() if seen > 1
+        )
+        duplicate_count = len(free_list) - len(free_set)
+        shared = 0
+        flatten = getattr(tree_cache, "all_mamba_values_flatten", None)
+        if callable(flatten):
+            try:
+                cached = frozenset(int(v) for v in flatten().tolist())
+            except Exception:  # noqa: BLE001 -- unreadable is not empty
+                cached = None
+            if cached is not None:
+                shared = len(free_set & cached)
+        return duplicate_count, duplicate_ids, shared
+
+    def _mamba_double_owned_terms(self) -> tuple:
+        """``(double_owned, source, duplicate_count, suffix)`` for the mamba
+        ledger -- the #912 census-then-live precedence, one pool over."""
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        published = getattr(mamba_allocator, "double_owned_slots", None)
+        double_owned = int(published or 0)
+        source = "census"
+        duplicate_count = 0
+        suffix = ""
+        if not double_owned:
+            reading = self._mamba_double_claimed(mamba_allocator, self.tree_cache)
+            if reading is not None:
+                duplicate_count, duplicate_ids, shared = reading
+                if duplicate_count or shared:
+                    double_owned = duplicate_count + shared
+                    source = "live"
+                    suffix = (
+                        f", free_list_duplicates={duplicate_count}"
+                        f", duplicate_slot_ids={duplicate_ids or None}"
+                        f", free_and_cached={shared}"
+                    )
+        return double_owned, source, duplicate_count, suffix
+
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
         if ckpt_pool is not None:
             return self._check_mamba_pool_with_int8(ps, ckpt_pool)
+        double_owned, double_owned_src, duplicates, detail = (
+            self._mamba_double_owned_terms()
+        )
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -393,7 +479,20 @@ class SchedulerInvariantChecker:
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            0,
+            0,
+            double_owned,
         )
+        msg = f"{msg}, double_owned_src={double_owned_src}{detail}"
+        if duplicates:
+            # A DUPLICATE IN THE FREE LIST IS NOT ABSOLVED BY BALANCING THE
+            # EQUATION. Subtracting it stops the reader hunting a leak that is
+            # not there; it does not make the allocator sound. The next
+            # ``alloc`` hands one state slot to two requests, and two requests
+            # sharing a Mamba state is a wrong answer that never crashes -- the
+            # #767 direction. So the check stays fatal here even when the sums
+            # now close, and it says WHICH ids.
+            leak = True
         if leak:
             # Page-level leak diagnosis for mamba
             free_full_pages = set(
@@ -435,6 +534,12 @@ class SchedulerInvariantChecker:
           * int8 checkpoint pool: backs the radix-cached states; its occupancy is
             exactly the radix evictable + protected counts.
         """
+        # #924 sibling: the int8 lane's ACTIVE pool is the same
+        # ``mamba_allocator`` free list, so it inherits the same double-free
+        # blindness. Same term, same fatality rule.
+        double_owned, double_owned_src, duplicates, detail = (
+            self._mamba_double_owned_terms()
+        )
         active_leak, active_msg = self._check_pool_invariant(
             "mamba-active",
             ps.mamba_available_size,
@@ -442,7 +547,13 @@ class SchedulerInvariantChecker:
             0,
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            0,
+            0,
+            double_owned,
         )
+        active_msg = f"{active_msg}, double_owned_src={double_owned_src}{detail}"
+        if duplicates:
+            active_leak = True
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",
             ckpt_pool.available_size(),
