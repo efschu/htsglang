@@ -1320,6 +1320,31 @@ class MambaPool:
 
         register_mamba_state_sets(self)
 
+    @property
+    def mamba_map(self) -> dict:
+        """GLOBAL linear-layer id -> this pool's local index. #931.
+
+        THE MAP THE CANONICAL BLOB ASKS FOR, ON THE OBJECT ITS CALLER NAMES.
+        ``canonical_page_store.local_mamba_layer_range`` takes a parameter
+        called ``mamba_pool`` and its docstring says "``MambaPool.mamba_map``
+        maps GLOBAL layer id to local index" -- and that attribute existed only
+        on ``HybridReqToTokenPool``, one object away. The caller passed a third
+        object again (the KV pool), so the read missed and the canonical GDN
+        blob refused to attach: the SECOND wrong-object hop on the same attach
+        path, after ModelConfig-vs-hf_text_config (#931 first half).
+
+        Derived from ``self.mamba_layer_ids``, which this pool is constructed
+        with, so it cannot drift from ``HybridReqToTokenPool.mamba_map``: both
+        enumerate the SAME list the pool was built from, in the same order.
+        This is a second READING of one fact, never a second copy of it.
+
+        A property rather than a field: nothing may go stale, and a pool that
+        genuinely has no layer ids still yields an empty map, which
+        ``local_mamba_layer_range`` refuses on -- the refusal is preserved, not
+        papered over.
+        """
+        return {int(gid): i for i, gid in enumerate(self.mamba_layer_ids)}
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
