@@ -1608,6 +1608,46 @@ class Req(ReqDllmMixin):
         if self._check_token_based_finish(new_accepted_tokens):
             return
 
+    def truncate_prefix_to(self, told: int) -> None:
+        """Shorten the reused prefix to ``told`` AND keep the protected length
+        consistent with it (#930).
+
+        ONE HELPER FOR TWO SITES, because the two sites are siblings of each
+        other and drifted identically. ``get_new_batch_prefill``'s #791
+        admission-uniformity block truncates ``prefix_indices`` on PP0 (from
+        the guard's clamped candidate) and on every downstream rank (from PP0's
+        decision), and NEITHER touched ``cache_protected_len``.
+
+        WHY THAT IS NOT MERELY UNTIDY. ``cache_protected_len`` means "how many
+        LEADING rows of this request's KV the TREE owns". ``init_next_round_
+        input`` had just set it equal to ``len(prefix_indices)``; truncating
+        one and not the other leaves the request claiming more tree-owned rows
+        than it holds. That surplus is the SAFE direction for
+        ``_insert_helper``'s duplicate free (a larger ``dup_start`` frees less)
+        -- which is how it stayed invisible -- and it is the DANGEROUS
+        direction for ``cache_finished_req``'s truncate branch:
+
+            free_start = max(effective_cache_len, req.cache_protected_len)
+            free(kv_indices[free_start:])   # starts ABOVE the gap
+            ...                             # insert covers only up to ecl
+
+        so when ``cache_protected_len > effective_cache_len`` the rows in
+        ``[effective_cache_len, cache_protected_len)`` are neither freed nor
+        inserted, and belong to nobody afterwards. That interval is #935's
+        per-request row leak. The gap is the root and must not be able to leak
+        whatever the value is; this closes one of the two PRODUCERS that make
+        it reachable (the other is the #928 refusal re-prefill).
+
+        MIN, NEVER ASSIGN: this may only LOWER the claim. A request whose
+        protected length was already below ``told`` owns exactly that many, and
+        raising it here would invent protection the tree never granted.
+        """
+        told = int(told)
+        if told < len(self.prefix_indices):
+            self.prefix_indices = self.prefix_indices[:told]
+        if self.cache_protected_len > told:
+            self.cache_protected_len = told
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.

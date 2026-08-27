@@ -8762,8 +8762,9 @@ class Scheduler(
                     told = self._pp_admission_guard.prefix_len_for(
                         req.rid, len(req.prefix_indices)
                     )
-                    if told < len(req.prefix_indices):
-                        req.prefix_indices = req.prefix_indices[:told]
+                    # #930: prefix_indices and cache_protected_len move
+                    # TOGETHER. See Req.truncate_prefix_to.
+                    req.truncate_prefix_to(told)
                 elif self._pp_admission_incoming_effective is not None:
                     told = self._pp_admission_incoming_effective.get(req.rid)
                     if told is None:
@@ -8781,8 +8782,9 @@ class Scheduler(
                     # reconcile_pp_admission_decision's own contract
                     # guarantees told <= this rank's local match, i.e.
                     # len(req.prefix_indices) >= told always holds here.
-                    if len(req.prefix_indices) > told:
-                        req.prefix_indices = req.prefix_indices[:told]
+                    # #930: same helper as the PP0 branch above -- these two
+                    # are siblings and drifted identically.
+                    req.truncate_prefix_to(told)
 
             try:
                 res = adder.add_one_req(
