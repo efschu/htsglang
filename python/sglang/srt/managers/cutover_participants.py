@@ -446,6 +446,11 @@ class HeldResource:
     #: what is still missing, when the release is absent or unreachable
     gap: Optional[str] = None
     found_by: str = "boot"
+    #: a runtime condition the door depends on. A door behind an unarmed
+    #: flag is SHUT, and this fork has paid three times in two days for a
+    #: flag that read as inert while its feature looked present -- so the
+    #: condition is a field, not a sentence.
+    gated_by: Optional[str] = None
     #: branch the named symbol lands with, when it is not on this base yet.
     #: Declared rather than omitted: a row left out until its branch merges is
     #: a row nobody adds afterwards, which is how the population thinned in
@@ -484,15 +489,33 @@ HELD_RESOURCES: Tuple[HeldResource, ...] = (
     ),
     HeldResource(
         name="mamba_anchor_pin",
-        what="#773 §8's pin on a mamba anchor, held until the write-through "
-        "is acked",
-        released_by=None,
-        paths=(),
-        ticket="#773 §8",
-        gap="the pin release is ABSENT -- NOTE_773 defers it to its own "
-        "ticket. Declared here so 'held with no door at all' is a row rather "
-        "than a sentence in another document.",
+        what="#773 §8's pin on a mamba anchor, taken at admission and held "
+        "for the request's life",
+        # NOT absent, which is what NOTE_888b §5 recorded from NOTE_773's
+        # deferral. #755's reorder release EXISTS on this base
+        # (`UnifiedRadixCache._mamba_anchor_early_release`, :1022, guarded by
+        # `MambaComponent.anchor_release_admissible`, which requires the host
+        # copy to have LANDED rather than merely been intended). The row was
+        # wrong in the safe direction -- "no door" instead of "a door on one
+        # path" -- and checking it before building is what turned it up.
+        released_by="sglang.srt.mem_cache.unified_radix_cache."
+        "UnifiedRadixCache._mamba_anchor_early_release",
+        # Its ONLY call site is `cache_unfinished_req` (:1173), which runs
+        # while prefill batches are built; finish releases it with everything
+        # else the request holds.
+        paths=(ReleasePath.PREFILL, ReleasePath.FINISH_OR_ABORT),
+        ticket="#773 §8 / #755",
+        gated_by="sglang.srt.mem_cache.mamba_pool_floor."
+        "mamba_slot_reorder_active",
+        gap="the door is on the PREFILL path, so under strict purity the TP "
+        "window cannot open it, and finish is not a path the seam takes. "
+        "#811 (`fix/811-admission-pin-ack-release`, 14606c62fd, NOT in this "
+        "base's ancestry) adds the layout-independent door -- release at the "
+        "write-through ACK -- and its metal proof is still the open W-811 "
+        "ticket. Until that merges this stays a true finding, sharpened from "
+        "'no door' to 'no door THIS layout can open'.",
         found_by="desk",
+        pending_branch=None,
     ),
     HeldResource(
         name="kvso_host_region",
@@ -602,6 +625,18 @@ def release_path_conformance(target_layout: str, *, strict: bool = True) -> list
             )
             continue
         reachable = [p for p in res.paths if p not in forbidden]
+        if reachable and res.gated_by:
+            # A door behind an unarmed flag is SHUT. This check is pure and
+            # cannot evaluate the flag, so it says so instead of pretending
+            # the resource is safe -- the alternative is a field nobody reads,
+            # which is the defect this whole file exists to prevent.
+            findings.append(
+                f"CONDITIONAL {res.name} ({res.ticket}): reachable from "
+                f"{target_layout} via {'/'.join(reachable)} ONLY while "
+                f"{res.gated_by} is armed; unarmed, it has no door at all"
+                + (f". {res.gap}" if res.gap else "")
+            )
+            continue
         if not reachable:
             findings.append(
                 f"UNREACHABLE {res.name} ({res.ticket}): {res.what} -- its "

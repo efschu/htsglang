@@ -83,12 +83,32 @@ class TestReleasePathDeclarations902(unittest.TestCase):
                 missing.append(f"{res.name} -> {res.released_by}")
         self.assertEqual(missing, [], f"declared but absent: {missing}")
 
-    def test_a_row_with_no_door_is_reported_undeclared(self):
-        """#773 §8's pin: held, with no release site at all."""
-        findings = release_path_conformance("pp")
+    def test_the_pins_door_is_on_the_prefill_path_and_gated(self):
+        """#773 §8's pin, corrected by checking before building.
+
+        NOTE_888b §5 recorded "pin release ABSENT" from NOTE_773's deferral,
+        and that was wrong in the safe direction. #755's reorder release
+        EXISTS on this base (`_mamba_anchor_early_release`), guarded by
+        `anchor_release_admissible` -- which requires the host copy to have
+        LANDED, not merely been intended. Its only call site is
+        `cache_unfinished_req`, i.e. the PREFILL path, and it sits behind
+        `mamba_slot_reorder_active`.
+
+        So the finding sharpens rather than vanishes: reachable from the PP
+        window while the flag is armed, and reachable from NOWHERE in the TP
+        window under strict purity. #811 adds the layout-independent door (at
+        the write-through ack) and is not in this base's ancestry.
+        """
+        pp = release_path_conformance("pp", strict=True)
         self.assertTrue(
-            any(f.startswith("UNDECLARED mamba_anchor_pin") for f in findings),
-            f"the pin has no door and must say so; got {findings}",
+            any(f.startswith("CONDITIONAL mamba_anchor_pin") for f in pp),
+            f"pp: the prefill door is reachable but gated; got {pp}",
+        )
+        tp = release_path_conformance("tp", strict=True)
+        self.assertTrue(
+            any(f.startswith("UNREACHABLE mamba_anchor_pin") for f in tp),
+            f"tp: strict purity forbids prefill and the seam does not finish "
+            f"requests, so no door opens; got {tp}",
         )
 
     def test_a_finish_only_door_is_unreachable_at_the_seam(self):
