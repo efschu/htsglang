@@ -1019,6 +1019,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp.release_component_lock(node, None)
         return True
 
+    def _note_protected_beyond_retention(self, req, effective_cache_len: int) -> None:
+        """#935: name the rows that neither the tree nor the allocator will own.
+
+        `cache_protected_len` means "the tree owns the KV below this". The
+        finished path frees from it and inserts only up to
+        `effective_cache_len`, so a cpl ABOVE the retention leaves
+        [effective_cache_len, cache_protected_len) in neither -- a silent,
+        per-request loss that scales with the prompt.
+
+        Counted and rate-limited rather than raised: this runs at request
+        finish, and an exception here would kill a rank over an accounting
+        fault. The number is what was missing, not the crash.
+        """
+        cpl = int(getattr(req, "cache_protected_len", 0) or 0)
+        orphaned = cpl - int(effective_cache_len)
+        if orphaned <= 0:
+            return
+        self._protected_beyond_retention_rows = (
+            getattr(self, "_protected_beyond_retention_rows", 0) + orphaned
+        )
+        n = getattr(self, "_protected_beyond_retention_count", 0) + 1
+        self._protected_beyond_retention_count = n
+        if n <= 3 or n % 100 == 0:
+            logger.warning(
+                "#935 PROTECTED-BEYOND-RETENTION rid=%s: cache_protected_len="
+                "%d exceeds the retained length %d, so %d row(s) are neither "
+                "inserted (the key is truncated to the retention) nor freed "
+                "(the free starts at cache_protected_len). They are owned by "
+                "nobody from here on. cpl means 'the tree owns the KV below "
+                "this' and it does not here. occurrence=%d cumulative_rows=%d",
+                getattr(req, "rid", None),
+                cpl,
+                int(effective_cache_len),
+                orphaned,
+                n,
+                self._protected_beyond_retention_rows,
+            )
+
     def _mamba_anchor_early_release(self, req) -> bool:
         """Decide, per request, whether to take the #755 reorder this step.
 
@@ -1111,6 +1149,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Truncate if needed
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
+                # #935: THE FINISHED PATH TRUSTS cache_protected_len AND NEVER
+                # CHECKS IT, while the unfinished path ASSERTS on it (:1231,
+                # the #824 guard). Both free-sites here start at
+                # `cache_protected_len` on one premise, stated by
+                # `retention_shrinks_protected`: "that length is COMMITTED: the
+                # tree owns the KV below it". When that is true the max() is a
+                # correct optimisation and nothing leaks.
+                #
+                # When it is FALSE -- cpl carried forward above what was
+                # actually retained -- the rows in
+                # [effective_cache_len, cache_protected_len) are neither
+                # inserted (token_ids is truncated to effective_cache_len just
+                # below) nor freed (the free starts at cpl). They are then
+                # owned by nobody: exactly the census's "belong to no
+                # enumerated owner", and exactly the per-request deficit #935
+                # measures.
+                #
+                # NAMED, NOT FREED, and the direction is deliberate. Freeing
+                # the range would be right if the tree does not own it and a
+                # DOUBLE FREE if it does, and this site cannot tell the two
+                # apart -- that is the whole reason the premise is trusted
+                # here. A wrong free is a use-after-free; a named leak is a
+                # number in a log. Whoever lets cpl go stale is the repair
+                # (#930's PP-admission truncation is one such producer); this
+                # is the guard that stops the loss from being SILENT, which is
+                # what let it accumulate unattributed.
+                self._note_protected_beyond_retention(req, effective_cache_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
