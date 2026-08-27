@@ -998,3 +998,121 @@ class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
             "the `x or ()` spelling is the landmine itself -- use prefix_len",
         )
         self.assertIn("prefix_len", code)
+
+
+class _StoreTreeCache(_FakeTreeCache):
+    """Tree cache whose controller answers a CONTENT-KEY presence query."""
+
+    def __init__(self, pages_present: int, **kw):
+        super().__init__(**kw)
+        self.root_node = object()
+        self.presence_calls = []
+        outer = self
+
+        class _CC:
+            def store_presence_pages(self, token_ids, last_hash, prefix_keys=None):
+                outer.presence_calls.append(len(token_ids or ()))
+                return pages_present
+
+        self.cache_controller = _CC()
+
+
+class TheEscapeMustIssueWithoutALocalAnchor(unittest.TestCase):
+    """#950 ARM 1 -- THE ROOT WINDOW-946RF PROVED, ANSWERED.
+
+    Measured on metal: `reason=anchor_no_vote` 5 of 5, `[#915 prefetch-gate] no
+    observation`. The escape's precondition is `last_host_node.backuped` --
+    "the full KV is ALREADY in this rank's host pool" -- demanded as the entry
+    price for an operation whose whole purpose is to obtain what is NOT
+    resident. It is anti-correlated with the situation the escape exists for.
+
+    The replacement is presence BY CONTENT KEY. Under #706 the key is a
+    function of the tokens, not of any rank's layout or residency, so the fetch
+    lands in the CURRENT layout -- which is also why this is the practical route
+    to `cached>0` after a flip.
+    """
+
+    def _sched(self, tc, enable=True):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        s = types.SimpleNamespace()
+        s.enable_hicache_storage = enable
+        s.tree_cache = tc
+        s._prefetch_kvcache = types.MethodType(Scheduler._prefetch_kvcache, s)
+        return s
+
+    def _anchorless_req(self):
+        """A dead-premise request with NO local anchor -- the metal shape."""
+        req = _Req(RID_CHUNKED, prefix_len=8192, extend_len=4096)
+        req.init_next_round_input = lambda *a, **kw: None
+        req.last_host_node = types.SimpleNamespace(
+            backuped=False,  # <-- the anchor is ABSENT, as on metal
+            get_last_hash_value=lambda: None,
+            get_prefix_hash_values=lambda parent: None,
+            parent=None,
+        )
+        req.host_hit_length = 0
+        req._compute_max_prefix_len = lambda n: n
+        return req
+
+    def test_no_anchor_but_the_STORE_HOLDS_THE_PAGES_so_the_fetch_is_ISSUED(self):
+        tc = _StoreTreeCache(pages_present=4, register=True)
+        sched = self._sched(tc)
+        req = self._anchorless_req()
+        self.assertEqual(sched._prefetch_kvcache(req), "issued")
+        self.assertIn(
+            req.rid,
+            tc.ongoing_prefetch,
+            "delivery is proven by the EFFECT, never by the return value",
+        )
+        self.assertTrue(tc.presence_calls, "the presence check must actually run")
+
+    def test_the_store_is_asked_with_the_REAL_span_not_an_empty_one(self):
+        """The pre-#950 code blanked the token list on the ineligible branch. A
+        presence query on an empty span would answer about nothing."""
+        tc = _StoreTreeCache(pages_present=4, register=True)
+        self._sched(tc)._prefetch_kvcache(self._anchorless_req())
+        self.assertTrue(
+            tc.presence_calls and tc.presence_calls[0] > 0,
+            f"presence asked about an empty span: {tc.presence_calls}",
+        )
+
+    def test_CANFAIL_store_does_NOT_hold_the_pages_declines_with_store_absent(self):
+        """THE COUNTER-ARM. Presence must be able to say NO, with a reason --
+        otherwise it is not a check, it is a rubber stamp."""
+        tc = _StoreTreeCache(pages_present=0, register=False)
+        verdict = self._sched(tc)._prefetch_kvcache(self._anchorless_req())
+        self.assertEqual(verdict, "declined:store_absent")
+        self.assertEqual(tc.calls, [], "an absent store must not enter the fetch")
+
+    def test_a_LOCALLY_ANCHORED_request_never_pays_for_a_presence_query(self):
+        """The default path is untouched and costs nothing extra: `backuped`
+        still short-circuits, so the normal admission path adds no round-trip."""
+        tc = _StoreTreeCache(pages_present=4, register=True)
+        req = self._anchorless_req()
+        req.last_host_node.backuped = True
+        self.assertEqual(self._sched(tc)._prefetch_kvcache(req), "issued")
+        self.assertEqual(
+            tc.presence_calls, [], "an anchored request must not query the store"
+        )
+
+    def test_the_presence_verdict_feeds_the_580_VOTE_not_a_new_early_return(self):
+        """GROUP UNIFORMITY. `prefetch_from_storage` is a collective under
+        `symmetric`; a rank-local presence answer must ride the EXISTING vote as
+        `locally_eligible`, never become a new early return and never a new
+        collective -- that would be the #580 desync again."""
+        seen = {}
+        tc = _StoreTreeCache(pages_present=4, register=True)
+
+        def _pfs(req_id, node, tokens, last_hash=None, prefix_keys=None, **kw):
+            seen.update(kw)
+            tc.ongoing_prefetch[req_id] = object()
+
+        tc.prefetch_from_storage = _pfs
+        tc.prefetch_participation_is_collective = lambda: True
+        self._sched(tc)._prefetch_kvcache(self._anchorless_req())
+        self.assertIn("locally_eligible", seen)
+        self.assertTrue(
+            seen["locally_eligible"],
+            "the presence verdict must arrive AS the vote's local term",
+        )

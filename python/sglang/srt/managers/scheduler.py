@@ -4989,23 +4989,69 @@ class Scheduler(
             self.tree_cache, "prefetch_participation_is_collective", None
         )
         group_decides = bool(group_decides is not None and group_decides())
+
+        # #950: THE SPAN IS COMPUTED BEFORE ELIGIBILITY IS DECIDED, because the
+        # content-key presence check needs the real tokens. The pre-#950 code
+        # blanked them on the ineligible branch, so a presence query there would
+        # have asked about an empty span and answered about nothing.
+        _last_hash = last_host_node.get_last_hash_value()
+        _matched_len = len(req.prefix_indices) + req.host_hit_length
+        _match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+        _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
+        _prefix_keys = (
+            last_host_node.get_prefix_hash_values(last_host_node.parent)
+            if self.tree_cache.hicache_storage_pass_prefix_keys
+            else None
+        )
+
+        store_present = False
+        _probe = None
+        if not locally_eligible:
+            # #950 THE PRECONDITION REPLACEMENT. `backuped` asks "is it already
+            # here" as the price of admission to fetching what is not here --
+            # anti-correlated with the escape's own target population, and
+            # measured as such in window-946rf-0828 (anchor_no_vote 5 of 5,
+            # "[#915 prefetch-gate] no observation"). The honest question is
+            # whether the STORE holds the pages, by content key.
+            #
+            # Cached per streak increment on the request, so an escape costs at
+            # most ONE backend round-trip per attempt and never one per pass.
+            _cc = getattr(self.tree_cache, "cache_controller", None)
+            _probe = getattr(_cc, "store_presence_pages", None)
+            if callable(_probe):
+                _key = (_matched_len, len(_new_input_tokens))
+                _cached = getattr(req, "_pp_store_presence_cache", None)
+                if _cached is not None and _cached[0] == _key:
+                    store_present = _cached[1]
+                else:
+                    store_present = bool(
+                        _probe(_new_input_tokens, _last_hash, _prefix_keys)
+                    )
+                    req._pp_store_presence_cache = (_key, store_present)
+            # The verdict enters the EXISTING #580 vote as this rank's local
+            # term. Never a new early return, never a new collective -- a
+            # rank-local answer that skipped the vote is the #580 desync.
+            locally_eligible = store_present
+
         if not locally_eligible and not group_decides:
-            # #915 names this one ANCHOR: the caller's own local gate
-            # (`last_host_node.backuped`) said no and no group vote is being
-            # held that could overrule it. Nothing downstream runs.
-            return "declined:anchor_no_vote"
+            # NAMED SEPARATELY from the old anchor decline: with the content-key
+            # check in place, "no anchor" is no longer the reason -- the store
+            # genuinely does not hold these pages (or could not be asked, which
+            # the controller logs). `store_absent` is a fact about the store;
+            # `anchor_no_vote` was a fact about local residency.
+            # `anchor_no_vote` survives for tree caches with no controller to
+            # ask: there the old criterion is still the only one available, and
+            # calling that "store_absent" would claim a check we never made.
+            return (
+                "declined:store_absent"
+                if callable(_probe)
+                else "declined:anchor_no_vote"
+            )
 
         if locally_eligible:
-            last_hash = last_host_node.get_last_hash_value()
-            matched_len = len(req.prefix_indices) + req.host_hit_length
-            match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
-            new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-
-            prefix_keys = (
-                last_host_node.get_prefix_hash_values(last_host_node.parent)
-                if self.tree_cache.hicache_storage_pass_prefix_keys
-                else None
-            )
+            last_hash = _last_hash
+            new_input_tokens = _new_input_tokens
+            prefix_keys = _prefix_keys
         else:
             # Ineligible here: enter the vote carrying nothing. The empty token
             # list keeps every derived length at 0 on this rank, and the vote

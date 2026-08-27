@@ -2034,6 +2034,67 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
+        """#950: how many pages the STORE holds for this span, by CONTENT KEY.
+
+        THE PRECONDITION REPLACEMENT. `Scheduler._prefetch_kvcache` gated the
+        fetch on `last_host_node.backuped` -- "the full KV is ALREADY in this
+        rank's host pool" -- as the entry price for an operation whose whole
+        purpose is to obtain what is NOT resident. Window-946rf-0828 measured
+        the consequence exactly: `reason=anchor_no_vote` 5 of 5, and
+        `[#915 prefetch-gate] no observation` confirming the gate was never
+        even reached. The criterion was anti-correlated with the situation the
+        escape exists for.
+
+        Presence by content key is the honest question, and under #706 it is a
+        well-posed one: a page carries all attention layers for its tokens and
+        the cut happens at READ time, so the key is a function of the CONTENT,
+        not of any rank's layout or residency. That is also why a fetch answered
+        here lands in the CURRENT layout and sidesteps the layer-sharded seam
+        problem of #941.
+
+        SAME KEY DERIVATION AS THE REAL FETCH, deliberately. `_storage_hit_query`
+        below computes `get_hash_str(tokens, last_hash, page_size)` and asks
+        `batch_exists`; this asks the identical question with the identical
+        helper. A second spelling of a key chain would be a second installer of
+        the same payload -- the exact rule the #949b tensor landmine was fixed
+        under, one layer up.
+
+        ONE ROUND-TRIP: the whole key chain goes in a single `batch_exists`, and
+        the caller caches the verdict per streak increment, so the escape costs
+        at most one query per attempt and never one per pass.
+
+        Returns 0 on any failure. A store that cannot be asked is treated as not
+        holding the pages, which declines the fetch rather than issuing one that
+        cannot land -- and the decline is NAMED, so "we could not ask" never
+        reads as "it is not there".
+        """
+        if not token_ids:
+            return 0
+        try:
+            page_hashes = self.get_hash_str(
+                list(token_ids), last_hash, page_size=self.page_size
+            )
+            if not page_hashes:
+                return 0
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=list(prefix_keys) if prefix_keys else None
+            )
+            return int(
+                self.storage_backend.batch_exists(
+                    page_hashes[:STORAGE_BATCH_SIZE], extra_info
+                )
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe never breaks admission
+            logger.warning(
+                "#950 store presence probe failed (%s); treating the span as "
+                "ABSENT, which declines the re-fetch rather than issuing one "
+                "that cannot land",
+                exc,
+            )
+            return 0
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
