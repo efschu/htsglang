@@ -81,6 +81,33 @@ def _decline_retention(is_finished: bool) -> Optional[int]:
     return None if is_finished else 0
 
 
+def _same_mamba_slot(a, b) -> bool:
+    """#929: do these two handles name the SAME mamba slot?
+
+    Compared by VALUE, never by object identity: the donation on the
+    no-int8-checkpoint path is `req.mamba_pool_idx.unsqueeze(-1).clone()`
+    (mamba_component.py:956/:965) -- a distinct tensor carrying the same id, so
+    `is` and even `==` on the objects answer the wrong question. Shapes differ
+    between the two handles (0-d/1-d against 1-d/2-d), so both are flattened to
+    a set of ints before comparing.
+
+    Answers False on anything unreadable. That is the conservative direction
+    HERE: a False means "different slots", so the donation is released -- and
+    the release itself is guarded by the allocator's own #924 double-free
+    check, which raises rather than corrupting. A True on unreadable input
+    would instead SKIP a release and leak, which is the defect this whole
+    ticket is about.
+    """
+    if a is None or b is None:
+        return False
+    try:
+        ia = {int(x) for x in a.reshape(-1).tolist()}
+        ib = {int(x) for x in b.reshape(-1).tolist()}
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(ia) and ia == ib
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -980,8 +1007,23 @@ class MambaComponent(TreeComponent):
                 # the signature (see the `is_finished=True` callsite at
                 # `unified_radix_cache.py:1081`, which passes neither result
                 # nor params), so it is checked rather than assumed.
-                if insert_params is not None and insert_params.mamba_value is not None:
-                    self._free_mamba_value(insert_params.mamba_value)
+                # AND THE DONATION IS NOT ALWAYS A SECOND SLOT. `_donate_mamba_
+                # value` allocates a fresh one only on the branch at :1030; the
+                # branch taken when there is no int8 checkpoint pool builds
+                # `active_value = req.mamba_pool_idx.unsqueeze(-1).clone()`
+                # (:956) and assigns THAT (:965). There the donation IS the
+                # request's own slot, and `free_mamba_cache(req)` below already
+                # releases it -- freeing both handles is one slot returned
+                # twice. Measured: boot 2i died on it, MambaSlotDoubleFree on
+                # slot 6, and the first version of this very fix is what
+                # produced it. So the release is conditioned on the donation
+                # being a DIFFERENT slot, compared by id and not by identity:
+                # the clone is a distinct tensor object carrying the same value.
+                donated = insert_params.mamba_value if insert_params is not None else None
+                if donated is not None and not _same_mamba_slot(
+                    donated, getattr(req, "mamba_pool_idx", None)
+                ):
+                    self._free_mamba_value(donated)
                 pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
