@@ -299,7 +299,7 @@ _DEFAULT_RESERVE_BYTES = 256 * (1024**3)  # 256 GiB virtual; free until committe
 #: alive by being observed, and the WeakSet form of this pattern was already
 #: fixed once in the attention workspace registry for exactly that reason.
 #: Keyed by instance counter, which is unique per process.
-_LIVE_ARENAS: "weakref.WeakValueDictionary[int, KvVmmArena]" = (
+_LIVE_ARENAS: weakref.WeakValueDictionary[int, KvVmmArena] = (
     weakref.WeakValueDictionary()
 )
 
@@ -1101,7 +1101,7 @@ def arena_reserve_bytes(reserved_spans: Sequence[int], granularity: int) -> int:
 
 
 def serviceable_reserved_tokens(
-    buffer_descs: Sequence["KvBufferDesc"], itemsize: int, page_size: int
+    buffer_descs: Sequence[KvBufferDesc], itemsize: int, page_size: int
 ) -> int:
     """The largest ``final_num_tokens`` these buffers' BYTES can actually serve.
 
