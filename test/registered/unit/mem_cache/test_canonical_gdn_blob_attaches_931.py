@@ -196,3 +196,145 @@ class TestCanonicalGdnBlobAttaches931(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheSecondObjectHop931(unittest.TestCase):
+    """#931 second half -- caught on metal by the refusal the first half added.
+
+    The first hop was ModelConfig-vs-hf_text_config. With it fixed the blob
+    path was entered for the first time since a38f39f1ee, and one line further
+    on it hit the SAME class again: ``local_mamba_layer_range`` takes a
+    parameter named ``mamba_pool`` whose docstring says "``MambaPool.mamba_map``
+    maps GLOBAL layer id to local index", and the caller passed ``hybrid`` --
+    the KV pool (``HybridLinearKVPool``), which holds a ``.mamba_pool`` but no
+    map of its own. Verbatim from the boot::
+
+        HybridLinearKVPool does not expose mamba_map, so which GDN layers this
+        rank holds cannot be established. The canonical blob addresses layers
+        globally; refusing to guess from a count.
+
+    KV page active = 0 AND GDN blob active = 0, so the refusal fired BEFORE
+    either attached -- it prevented the KV-canonical / GDN-dark split rather
+    than reporting it afterwards, which is what the refusal was built for.
+
+    THE FIX IS THE OBJECT, NOT A FALLBACK. ``MambaPool`` grows the map its
+    caller already names, derived from the ``mamba_layer_ids`` it is
+    constructed with, and both calls in ``_canonical_mamba_window`` now take
+    the SAME object -- the asymmetry that let one be right while the other was
+    wrong is what is actually removed. The refusal stays for a pool that
+    genuinely has no map.
+
+    SIBLING SWEEP, this being the second hop on one path. Every other
+    object-taking read here was checked against the owner its own docstring
+    names: ``local_attention_layer_ids`` reads
+    ``full_attention_layer_id_mapping`` on ``HybridLinearKVPool`` and is
+    passed exactly that; ``host_page_bytes`` reads
+    ``get_dummy_flat_data_page`` on the host pool and is passed exactly that;
+    ``derive_mamba_blob_spec`` reads pool fields off the MambaPool it is
+    given; ``build_mamba_window`` takes values only. The first two are also
+    proven by the same boot -- the KV page attached three times, and
+    ``derive_mamba_blob_spec`` ran before the refusal. No third hop.
+    """
+
+    def test_the_map_derives_from_the_pools_own_layer_ids(self):
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        pool = object.__new__(MambaPool)
+        pool.mamba_layer_ids = (0, 1, 2, 4, 5, 6)
+        self.assertEqual(
+            pool.mamba_map,
+            {0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5},
+            "a second READING of the ids the pool was built from, never a "
+            "second copy that could drift from HybridReqToTokenPool's",
+        )
+
+    def test_the_wrong_object_still_refuses(self):
+        """NO SILENT FALLBACK: a pool with no map is still a refusal."""
+        from sglang.srt.mem_cache.canonical_page_store import (
+            local_mamba_layer_range,
+        )
+
+        class _KvPool:  # HybridLinearKVPool's shape: holds a pool, not a map
+            mamba_pool = object()
+
+        with self.assertRaises(CanonicalPageError) as caught:
+            local_mamba_layer_range(_KvPool(), _LINEAR_IDS)
+        self.assertIn("mamba_map", str(caught.exception))
+
+    def test_the_right_object_yields_the_range(self):
+        from sglang.srt.mem_cache.canonical_page_store import (
+            local_mamba_layer_range,
+        )
+
+        class _MambaPool:
+            mamba_map = {gid: i for i, gid in enumerate(_LINEAR_IDS[:12])}
+
+        lo, hi = local_mamba_layer_range(_MambaPool(), _LINEAR_IDS)
+        self.assertEqual((lo, hi), (0, 12))
+
+    def test_the_caller_passes_the_map_owner_not_the_kv_pool(self):
+        """THE HOP ITSELF. Records which object the callee is handed."""
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache import canonical_page_store
+
+        seen = {}
+
+        class _MambaPool:
+            mamba_map = {gid: i for i, gid in enumerate(_LINEAR_IDS)}
+
+        class _Hybrid:
+            mamba_pool = _MambaPool()
+
+        class _Self:
+            mem_pool_device_hybrid = _Hybrid()
+            tp_size = 1
+            tp_rank = 0
+
+        def _spy_range(pool, ids):
+            seen["pool"] = pool
+            return (0, len(ids))
+
+        class _Spec:
+            num_layers = 64
+
+        def _spec(*a, **kw):
+            return _Spec()
+
+        def _window(spec, **kw):
+            class _W:
+                payload_bytes = 1
+                total_bytes = 1
+                extents = ()
+
+            return _W()
+
+        orig = (
+            canonical_page_store.local_mamba_layer_range,
+            canonical_page_store.derive_mamba_blob_spec,
+            canonical_page_store.build_mamba_window,
+        )
+        (
+            canonical_page_store.local_mamba_layer_range,
+            canonical_page_store.derive_mamba_blob_spec,
+            canonical_page_store.build_mamba_window,
+        ) = (_spy_range, _spec, _window)
+        try:
+            cfg = _ModelConfig(
+                _TextConfig(
+                    layers_block_type=_BLOCK_TYPES, linear_layer_ids=_LINEAR_IDS
+                )
+            )
+            HiCacheController._canonical_mamba_window(_Self(), None, cfg)
+        finally:
+            (
+                canonical_page_store.local_mamba_layer_range,
+                canonical_page_store.derive_mamba_blob_spec,
+                canonical_page_store.build_mamba_window,
+            ) = orig
+
+        self.assertIs(
+            seen.get("pool"),
+            _Self.mem_pool_device_hybrid.mamba_pool,
+            "the map owner must be handed to the callee; passing the KV pool "
+            "is the hop that kept the blob dark on metal",
+        )

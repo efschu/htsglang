@@ -1044,7 +1044,15 @@ class HiCacheController:
         spec = derive_mamba_blob_spec(
             model_config, mamba_pool, num_linear_layers=len(mamba_layer_ids)
         )
-        layer_lo, layer_hi = local_mamba_layer_range(hybrid, mamba_layer_ids)
+        # #931 second hop: `mamba_pool`, NOT `hybrid`. The parameter is named
+        # `mamba_pool` and the callee's docstring says `MambaPool.mamba_map`;
+        # what was passed was the KV pool (HybridLinearKVPool), which holds a
+        # `.mamba_pool` but no map of its own, so the read missed and the blob
+        # refused to attach -- caught on metal by the refusal the first half of
+        # #931 installed, which is what it was for. Both calls now take the
+        # SAME object, which is what removes the asymmetry that allowed one of
+        # them to be wrong while the other was right.
+        layer_lo, layer_hi = local_mamba_layer_range(mamba_pool, mamba_layer_ids)
         # Head sharding: the uneven-TP vector when set, equal shares otherwise.
         # Under the PP prefill phase tp_size is 1, so this is [1] and the window
         # carries full heads -- exactly the layer-only cut.
