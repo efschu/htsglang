@@ -2020,6 +2020,20 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
+    #
+    # #920 SIBLING, NAMED RATHER THAN GUESSED. This branch reaches the SAME
+    # `Req.offload_kv_cache` with the SAME raw `req_to_token` slice as the seam
+    # copy above, so under a layout whose pool is indexed by compacted rows --
+    # this fork's TP stack, see `seam_copy_addresses_the_bound_pool`
+    # (phase_flip_runtime.py) -- it carries the identical defect: a global slot
+    # id handed to a pool that does not store it at that row. It is NOT gated
+    # here because the gate's input is the resident layout, which is a property
+    # of the scheduler and is not reachable from this frame, and because no
+    # measured specimen exists for it (this branch needs
+    # `disaggregation_mode == "decode"`, which no boot in the #918/#920 family
+    # ran). Gating it on a guess would put an ungrounded refusal on a live
+    # decode-disagg path; recording it is what keeps it from being rediscovered
+    # as a new finding.
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree

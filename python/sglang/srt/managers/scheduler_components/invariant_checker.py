@@ -101,6 +101,70 @@ class SchedulerInvariantChecker:
     )
 
     @staticmethod
+    def _live_double_claimed_rows(free_reading, tree_cache) -> Optional[int]:
+        """Rows claimed RIGHT NOW by both the free enumeration and the tree.
+
+        #912 REST, and the reason this exists is that the term it re-derives is
+        a SNAPSHOT while everything it is subtracted from is LIVE.
+
+        ``double_owned`` reaches ``_check_full_pool`` as
+        ``allocator.double_owned_slots``, published by the phase-flip census's
+        ownership audit and, at every cutover, cleared to ``None`` by
+        ``_retire_row_id_space`` (phase_flip_runtime.py:6255-6264, whose own
+        comment says the cleared state makes the on-idle check "fall back to
+        the pre-#912 raw comparison for the short window before the
+        post-cutover census runs"). ``available`` and ``evictable``, meanwhile,
+        are read at the instant of the check. So a row that becomes doubly
+        claimed AFTER the last census is invisible to the correction and the
+        ledger raises with ``double_owned=0`` -- a surplus with no named
+        holder, which sends the reader to the wrong place.
+
+        MEASURED, boot 2 of the 2c acceptance
+        (/spinning/evidence-665-f1/boot_accept2c0827_0827_0049.log:21372, all
+        three ranks, 00:57:49Z, three minutes into a deliberate idle)::
+
+            pool memory leak detected! [full] total=432089, available=133120,
+              evictable=1, protected=0, session_held=0, uncached=0,
+              withheld=298969, double_owned=0
+
+        ``available + evictable + withheld = 432090``, one over ``total``. The
+        SAME boot's post-cutover census one second earlier (:21367) partitions
+        the id space with nothing left over::
+
+            size=432089 free=133120 cached=0 withheld=298969 unaccounted=0
+
+        ``free + withheld == size`` exactly, so every id already has an owner;
+        the ``evictable=1`` the checker then reads is a row the tree took on in
+        the round between the two readings (the boot's own OUTTRACE names it:
+        ``HEALTH_C n=1 (new) off=1 tail=[49276]``, :21340, and 49276 is below
+        the 133120 cap, i.e. inside the free range). One row, two owners, and
+        the census that could have named it had already been taken.
+
+        NOT A TOLERANCE AND NOT AN EPSILON. This returns the SIZE OF AN
+        ENUMERATED INTERSECTION -- the ids are known, not estimated -- and the
+        caller subtracts exactly that and still raises on any residue. It is
+        the same population ``double_owned`` already names, read from live
+        state instead of from a snapshot a cutover invalidated.
+
+        ``None`` when the intersection cannot be taken (a non-enumerable
+        allocator, a tree that cannot flatten its values). ``None`` is not
+        zero: zero would assert that nothing is doubly claimed, which is
+        exactly the false statement the stale snapshot was already making.
+        """
+        if free_reading is None or not getattr(free_reading, "is_enumerable", False):
+            return None
+        flatten = getattr(tree_cache, "all_values_flatten", None)
+        if not callable(flatten):
+            return None
+        try:
+            cached = flatten()
+            cached_rows = frozenset(int(v) for v in cached.tolist())
+            free_rows = frozenset(int(v) for v in free_reading.rows)
+        except Exception:  # noqa: BLE001 -- an unreadable set is not an empty one
+            return None
+        return len(free_rows & cached_rows)
+
+    @staticmethod
     def _check_pool_invariant(
         pool_name: str,
         available: int,
@@ -245,6 +309,29 @@ class SchedulerInvariantChecker:
                 // allocator.page_size
                 * allocator.page_size
             )
+        # #912 REST: the correction term, from LIVE state when the published
+        # snapshot has nothing to say. `double_owned_slots` is `None` for the
+        # whole window between a cutover's id-space retirement and the next
+        # census (phase_flip_runtime.py:6255-6264) and 0 whenever the last
+        # census found nothing -- and in both readings a row that became doubly
+        # claimed since then is missing from the ledger. `_live_double_claimed_
+        # rows` enumerates the intersection at the instant of the check.
+        #
+        # ONLY WHEN THE SNAPSHOT IS ABSENT OR EMPTY. A census reading that DID
+        # find rows is a measurement over the whole authority (free list, tree,
+        # residents, cap) and is strictly wider than the two sets available
+        # here, so it keeps precedence and is never overwritten by this
+        # narrower reading.
+        published_double_owned = getattr(allocator, "double_owned_slots", None)
+        double_owned = int(published_double_owned or 0)
+        double_owned_src = "census"
+        if not double_owned:
+            live_double_owned = self._live_double_claimed_rows(
+                free_reading, self.tree_cache
+            )
+            if live_double_owned:
+                double_owned = int(live_double_owned)
+                double_owned_src = "live"
         leak, msg = self._check_pool_invariant(
             "full",
             full_available_size,
@@ -261,11 +348,17 @@ class SchedulerInvariantChecker:
             # more than one owner (free list + tree, free list + a resident
             # request, ...) at the last phase-flip census. Published by
             # phase_flip_runtime.py's `_census_ownership_audit`
-            # (kv_row_ownership.py's own detection, not re-derived here).
-            # Zero whenever no census has run or nothing was double-claimed,
+            # (kv_row_ownership.py's own detection, not re-derived here), or --
+            # when that snapshot is absent or empty -- enumerated live just
+            # above. Zero whenever neither reading finds a doubly claimed row,
             # so this is a no-op on every path that does not exercise #822.
-            int(getattr(allocator, "double_owned_slots", 0) or 0),
+            double_owned,
         )
+        # WHICH READING PAID, in the line that raises. A surplus explained by a
+        # snapshot and one explained by a live intersection are different
+        # findings, and the boot log has to be able to tell them apart without
+        # re-deriving anything (#912 rest).
+        msg = f"{msg}, double_owned_src={double_owned_src}"
         if (
             leak
             and getattr(self.server_args, "dcp_size", 1) > 1
