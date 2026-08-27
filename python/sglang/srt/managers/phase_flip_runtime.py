@@ -5281,6 +5281,27 @@ class PhaseFlipRuntime:
         try:
             elapsed_s = quiesce(f"phase flip {direction}")
             drain_ms = float(elapsed_s or 0.0) * 1000.0
+            # #917: SAY WHICH OF THE TWO THINGS HAPPENED. This line is the one a
+            # three-rank log is read by -- it carries the direction and the
+            # prefix, which the controller's own line does not -- and it used to
+            # report "quiesced" whether or not a stream had drained. In the 0826
+            # rerun it printed "quiesced in 0.2 ms" on PP1 and PP2 immediately
+            # after both of their streams raised an illegal-access, so a grep of
+            # this line found three clean drains in a boot that had one. The
+            # controller now publishes which streams failed; a diagnostic that
+            # cannot be read as a false all-clear is worth the extra getattr.
+            failed = tuple(getattr(controller, "last_quiesce_failed", ()) or ())
+            if failed:
+                logger.error(
+                    "%s [#760] SEAM DRAIN %s: device-tier streams did NOT "
+                    "quiesce after %.1f ms -- %s still holds in-flight copies "
+                    "at the no-return point. The seam proceeds without them.",
+                    LOG_PREFIX,
+                    direction,
+                    drain_ms,
+                    " and ".join(failed),
+                )
+                return drain_ms
             # Carries LOG_PREFIX deliberately: the controller's own line has no
             # prefix and no direction, so it cannot be correlated with the flip
             # it belongs to in a three-rank log.

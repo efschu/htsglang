@@ -422,6 +422,43 @@ def operation_is_stale(controller, operation, kind: str) -> bool:
     return True
 
 
+def _record_quiesce_poison(reason: str, name: str, exc: BaseException) -> None:
+    """Register a poison-class drain failure with the process-wide record. #917.
+
+    The #760 drain sits at a NAMED BOUNDARY of the cutover -- between the
+    device-tier writeback that precedes it and the resident release that
+    follows -- which makes it one of the few sites whose POSITION IN THE WALK
+    is worth recording. `barlink_abort_gate.record_poison` is FIRST-WINS, so
+    this competes with nothing: it either names the origin or defers to
+    whoever observed the fault earlier.
+
+    WHY THIS IS NOT AN ACCUSATION. A stream synchronize raising an
+    illegal-access does not mean a copy on that stream made the bad access; a
+    poisoned context raises at whatever call synchronizes next, and in BOTH
+    0826 specimens the barlink watchdog had already reported the same fault on
+    the same rank before this drain ran. Recording the site is how the
+    attribution bracket gets an end, not how blame gets assigned.
+
+    A MODULE FUNCTION, not a method, and that is load-bearing: the drain's own
+    hermetic harness calls `HiCacheController.quiesce_device_io` unbound
+    against a `types.SimpleNamespace` (`test_flip_seam_guard_760.py`), where a
+    `self.` lookup for this helper would raise `AttributeError` from inside an
+    exception handler on the no-return path. The shape of the existing test is
+    the shape the drain must survive.
+
+    Degrades, never raises.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
+        if barlink_abort_gate.is_poison_error(exc):
+            barlink_abort_gate.record_poison(
+                f"#760 device-tier quiesce ({reason}, {name})", exc
+            )
+    except Exception:  # noqa: BLE001 - pragma: no cover, the no-return path owns this
+        pass
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -1330,7 +1367,24 @@ class HiCacheController:
         so a slow drain is attributable instead of vanishing into the flip's
         residual (#690).
         """
+        # (#917) A DRAIN THAT DID NOT DRAIN MUST NOT REPORT THAT IT DID.
+        #
+        # The per-stream failure was already loud, but the summary below was
+        # emitted unconditionally and said "streams drained" either way -- so
+        # the one line every reader of this corpus greps was byte-identical
+        # for a clean drain and for a blind one. Measured in the specimen
+        # (`boot_rerun0826_0826_2149.log`): PP1 logged two synchronize failures
+        # at L2189/L2195 and then "device-tier I/O quiesced ... in 0.2 ms" at
+        # L2201, and PP2 the same at L2464/L2470/L2476. A grep for the success
+        # line finds three clean drains in a boot that had one.
+        #
+        # This is the same class as #867 and as `SeamCensus.mark`: an
+        # exception handler on the no-return path that cannot tell a survivable
+        # failure from a context kill, feeding an instrument that then reports
+        # the survivable reading. Fixed the same way -- classify, then say what
+        # actually happened.
         t0 = time.perf_counter()
+        failed: list = []
         for name in ("write_stream", "load_stream"):
             stream = getattr(self, name, None)
             if stream is None:
@@ -1338,6 +1392,7 @@ class HiCacheController:
             try:
                 stream.synchronize()
             except Exception as e:  # noqa: BLE001 - a dead stream must be loud
+                failed.append(name)
                 logger.error(
                     "#760 quiesce (%s): synchronizing %s failed (%s). "
                     "In-flight copies on it may still race the seam.",
@@ -1345,7 +1400,34 @@ class HiCacheController:
                     name,
                     e,
                 )
+                _record_quiesce_poison(reason, name, e)
         elapsed = time.perf_counter() - t0
+        # (#917) THE OUTCOME TRAVELS WITH THE CALL, because the runtime emits a
+        # SECOND success claim off this one's return value
+        # (`phase_flip_runtime._quiesce_hicache`, "[#760] SEAM DRAIN ...
+        # device-tier streams quiesced"), and a float carries no outcome. Fixing
+        # only the line in this module would have left the correlated,
+        # direction-tagged line -- the one a three-rank log is actually read by
+        # -- still claiming a drain that did not happen.
+        #
+        # An ATTRIBUTE rather than a widened return type: the signature is
+        # pinned by `test_flip_seam_guard_760.py` and read by two callers, and
+        # a drain is not the place to break a contract for a diagnostic.
+        try:
+            self.last_quiesce_failed = tuple(failed)
+        except Exception:  # noqa: BLE001 - pragma: no cover
+            pass
+        if failed:
+            logger.error(
+                "#760 device-tier I/O NOT quiesced for %s after %.1f ms: "
+                "%s did not drain. Their in-flight copies are unaccounted for "
+                "and the seam proceeds without them -- this is NOT the clean "
+                "drain the success line reports.",
+                reason,
+                elapsed * 1000.0,
+                " and ".join(failed),
+            )
+            return elapsed
         logger.info(
             "#760 device-tier I/O quiesced for %s in %.1f ms (write and load "
             "streams drained while their pools are still live).",
