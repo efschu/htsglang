@@ -8738,6 +8738,15 @@ class Scheduler(
             # continuation at this exact site, and its own comment establishes
             # why that is safe: the request stays `self.chunked_req`, is not
             # dropped, and resumes mid-chunk unharmed.
+            # #947 MARKER: this is the site window-946 measured as UNREACHED
+            # (~6 entries against 9471 voids). Kept, and now COUNTED, so the
+            # ring census can show the two candidate sites side by side in one
+            # boot rather than by comparing two boots.
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_ring_note as _pp_ring_note,
+            )
+
+            _pp_ring_note(self, "prefill:chunked_block", False)
             _pp_apply_dead_premise(self, self.chunked_req)
 
             if bool(getattr(self, _STR_ATTR, False)) and not _grant_open(

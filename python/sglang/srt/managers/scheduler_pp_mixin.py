@@ -1126,6 +1126,83 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     return True
 
 
+#: #947: env flip for the RELOCATED dead-premise actuator. Default OFF, and
+#: that default is the whole discipline: five compensators in this family were
+#: placed on paths the failure starves, and each cost a boot to discover. This
+#: one ships INERT. The boot MEASURES the ring first (`pp_ring_note`), and the
+#: actuator is flipped only once the markers show its site actually runs per
+#: void iteration and lies before the follow-on pass is parametrised. Flipping
+#: on suspicion would be placement number six with extra steps.
+_ACT_AT_RING_ENV = "SGLANG_946_ACT_AT_RING"
+
+
+def pp_act_at_ring_enabled() -> bool:
+    """True iff the relocated actuator is armed. Read at the call site, never
+    cached, so a boot can be compared against itself in a log."""
+    return os.environ.get(_ACT_AT_RING_ENV, "") == "1"
+
+
+def pp_ring_note(holder, site: str, voided: bool) -> None:
+    """#947 THE VOID-ITERATION INSTRUMENT: counting only, no behaviour.
+
+    THE QUESTION THIS ANSWERS, and it is the one five failed placements could
+    not: not "did my compensator do the right thing when called" but "does the
+    path it sits on RUN AT ALL under the failure it is meant to fix". The
+    reachability ratchet cannot ask that -- it can only pin a path once the
+    path is known -- so the ring gets measured instead of reasoned about.
+
+    TWO OBSERVABLES, both per-iteration and both cheap:
+
+      * `voids_between_admissions` -- how many passes void between two entries
+        of the admission path. Boot window-946 could only offer the QUOTIENT
+        (9471 voids / 6 prefill batches = ~1578), which cannot distinguish "a
+        steady 1578 every time" from "one burst of 9000 and five healthy
+        rounds". A quotient is not a curve, and the fix differs between those
+        two shapes.
+      * `site` -- which site was reached on THIS iteration. A site that never
+        appears while voids climb is a site no actuator may be placed on,
+        proven rather than assumed.
+
+    Emitted on a cadence, never per line: this runs in the hot loop of a wedged
+    instance and 9471 log lines is the defect it is investigating, in a new
+    colour.
+    """
+    counts = getattr(holder, "_pp_ring_site_counts", None)
+    if counts is None:
+        counts = {}
+        holder._pp_ring_site_counts = counts
+    counts[site] = counts.get(site, 0) + 1
+    if voided:
+        holder._pp_ring_voids_run = getattr(holder, "_pp_ring_voids_run", 0) + 1
+        return
+    # A NON-VOIDED iteration is the "admission path was entered" event, so the
+    # streak that ends here is exactly the quantity in question.
+    run = getattr(holder, "_pp_ring_voids_run", 0)
+    hist = getattr(holder, "_pp_ring_void_runs", None)
+    if hist is None:
+        hist = []
+        holder._pp_ring_void_runs = hist
+    if run:
+        hist.append(run)
+    holder._pp_ring_voids_run = 0
+    holder._pp_ring_admissions = getattr(holder, "_pp_ring_admissions", 0) + 1
+    every = int(os.environ.get("SGLANG_947_RING_EVERY", "25") or 25)
+    if every > 0 and holder._pp_ring_admissions % every == 0:
+        runs = list(hist)
+        logger.warning(
+            "#947 VOID-RING CENSUS: %d admission-path entries so far; void "
+            "runs between them (most recent last, up to 20): %s; max=%s "
+            "mean=%.1f; sites reached this boot: %s. A site absent from that "
+            "map does NOT run under this failure and no actuator may be "
+            "placed on it.",
+            holder._pp_ring_admissions,
+            runs[-20:],
+            max(runs) if runs else 0,
+            (sum(runs) / len(runs)) if runs else 0.0,
+            dict(sorted(counts.items())),
+        )
+
+
 def pp_request_locations(holder) -> Dict[str, object]:
     """#946: every place a request can live, as one rid -> req mapping.
 
@@ -1711,6 +1788,31 @@ class SchedulerPPMixin:
                 # is the pre-admission one and that is what every rank must
                 # agree on. See `_pp_absorb_void_output`.
                 self._pp_note_chunked_req_before_admission(mb_id)
+                # #947 THE RING SITE, and the whole reason this instrument
+                # exists. This line runs on EVERY iteration of the PP body --
+                # voided ones included -- and `get_next_batch_to_run` directly
+                # below is where the follow-on pass is parametrised. So it is
+                # the one point that satisfies both halves of the criterion
+                # five previous placements failed: it RUNS under the failure,
+                # and it lies BEFORE the commitment it would change.
+                #
+                # Boot window-946 proved the previous act point does not: the
+                # dead-premise escape sat inside `_get_new_batch_prefill_raw`'s
+                # chunked block, which was entered ~6 times while 9471 passes
+                # voided (`#946 PREMISE RECOMPUTE` 0 with the mark correctly
+                # set on the frozen rid). Legal, and unreached.
+                #
+                # MEASURE BEFORE ACTING. The census below is counting only; the
+                # actuator is env-gated and OFF by default, so this boot
+                # answers "does this site run per void iteration" before
+                # anything is moved onto it.
+                pp_ring_note(
+                    self, "ring:pre_plan", bool(self._pp_admission_pass_voided)
+                )
+                if pp_act_at_ring_enabled():
+                    pp_apply_dead_premise_at_chunk_boundary(
+                        self, getattr(self, "chunked_req", None)
+                    )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -2901,9 +3003,7 @@ class SchedulerPPMixin:
         # Consumed once, like the slot it qualifies: a stale epoch must not
         # be able to answer for a later window.
         self._pp_flip_arm_epoch = None
-        would_restore = (
-            passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id)
-        )
+        would_restore = passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id)
         # #838 CLASS 1, THE W12 FORM. Keyed on the SHAPE (zero armed passes
         # across a ring rebuild) and NOT on `would_restore`, deliberately:
         # the branch below speaks only when a jump was actually averted, and
@@ -2920,9 +3020,7 @@ class SchedulerPPMixin:
                 arm_epoch,
                 now_epoch,
                 arm_mb,
-                getattr(
-                    getattr(self, "phase_policy_state", None), "last_reason", None
-                ),
+                getattr(getattr(self, "phase_policy_state", None), "last_reason", None),
             )
             if alarm:
                 layout_conformance.note_conformance_violation(

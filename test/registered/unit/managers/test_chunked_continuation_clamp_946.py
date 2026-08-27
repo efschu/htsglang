@@ -293,3 +293,114 @@ class _Catcher(logging.Handler):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRingInstrumentMustNotLIE(unittest.TestCase):
+    """#947 THE INDIKATOR-GESETZ ARM. An indicator is not a finding until it is
+    shown to measure what it claims.
+
+    This family has now spent five boots discovering that a compensator sat on
+    a path the failure starves. The answer was to MEASURE the ring instead of
+    reasoning about it -- and a measurement that cannot itself be falsified
+    would just move the same mistake one level up. So: the markers must fire
+    under a constructed void cycle, and must NOT report voids during a healthy
+    run.
+    """
+
+    def _note(self, holder, site, voided):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_ring_note
+
+        return pp_ring_note(holder, site, voided)
+
+    def test_a_void_cycle_is_counted_as_a_RUN_not_as_a_rate(self):
+        """The window-946 evidence could only give a quotient (9471/6). A
+        quotient cannot tell a steady 1578 from one burst of 9000 -- and the
+        fix differs between those shapes, so the instrument records RUNS."""
+        h = _holder()
+        for _ in range(7):
+            self._note(h, "ring:pre_plan", True)
+        self._note(h, "ring:pre_plan", False)
+        for _ in range(3):
+            self._note(h, "ring:pre_plan", True)
+        self._note(h, "ring:pre_plan", False)
+        self.assertEqual(
+            h._pp_ring_void_runs,
+            [7, 3],
+            "two void runs of 7 and 3 -- not a mean of 5, which is what a rate "
+            "would have reported and what would have hidden the burst",
+        )
+
+    def test_a_healthy_run_reports_NO_voids(self):
+        """THE CAN-LIE DIRECTION. If the instrument counted iterations rather
+        than voids it would look identical on a healthy boot, and every future
+        reading would be worthless."""
+        h = _holder()
+        for _ in range(20):
+            self._note(h, "ring:pre_plan", False)
+        self.assertEqual(getattr(h, "_pp_ring_void_runs", []), [])
+        self.assertEqual(h._pp_ring_voids_run, 0)
+        self.assertEqual(h._pp_ring_admissions, 20)
+
+    def test_a_site_that_never_runs_is_ABSENT_from_the_map(self):
+        """The load-bearing claim: 'a site absent from that map does not run
+        under this failure'. It only holds if absence is real absence."""
+        h = _holder()
+        for _ in range(5):
+            self._note(h, "ring:pre_plan", True)
+        self.assertIn("ring:pre_plan", h._pp_ring_site_counts)
+        self.assertNotIn(
+            "prefill:chunked_block",
+            h._pp_ring_site_counts,
+            "a site that was never reached must not appear at all -- a zero "
+            "entry and an absent entry must not be confusable",
+        )
+
+    def test_the_census_is_rate_limited_and_never_one_line_per_pass(self):
+        """9471 log lines is the defect this is investigating. The census may
+        not become it."""
+        import os
+
+        h = _holder()
+        catcher = _Catcher(logging.WARNING)
+        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log.addHandler(catcher)
+        old = os.environ.get("SGLANG_947_RING_EVERY")
+        os.environ["SGLANG_947_RING_EVERY"] = "25"
+        try:
+            for _ in range(60):
+                self._note(h, "ring:pre_plan", True)
+                self._note(h, "ring:pre_plan", False)
+        finally:
+            log.removeHandler(catcher)
+            if old is None:
+                os.environ.pop("SGLANG_947_RING_EVERY", None)
+            else:
+                os.environ["SGLANG_947_RING_EVERY"] = old
+        self.assertEqual(
+            len(catcher.records),
+            2,
+            f"60 admissions at every=25 must emit exactly 2 lines, got "
+            f"{len(catcher.records)}",
+        )
+        self.assertIn("#947 VOID-RING CENSUS", catcher.messages[0])
+
+    def test_the_relocated_actuator_is_OFF_unless_the_env_says_otherwise(self):
+        """DEFAULT-OFF IS THE DISCIPLINE, not a convenience. Five placements
+        were shipped armed and each cost a boot; this one measures first."""
+        import os
+
+        from sglang.srt.managers.scheduler_pp_mixin import pp_act_at_ring_enabled
+
+        old = os.environ.get("SGLANG_946_ACT_AT_RING")
+        try:
+            os.environ.pop("SGLANG_946_ACT_AT_RING", None)
+            self.assertFalse(pp_act_at_ring_enabled(), "must ship inert")
+            os.environ["SGLANG_946_ACT_AT_RING"] = "1"
+            self.assertTrue(pp_act_at_ring_enabled(), "and must be flippable")
+            os.environ["SGLANG_946_ACT_AT_RING"] = "0"
+            self.assertFalse(pp_act_at_ring_enabled())
+        finally:
+            if old is None:
+                os.environ.pop("SGLANG_946_ACT_AT_RING", None)
+            else:
+                os.environ["SGLANG_946_ACT_AT_RING"] = old
