@@ -268,6 +268,8 @@ class SchedulerDPAttnAdapter:
     tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    #: #927: resolve the allocator PER ACCESS. See :meth:`_allocator`.
+    get_token_to_kv_pool_allocator: Optional[Callable] = None
     tree_cache: BasePrefixCache
     offload_tags: set[str]
     ps: ParallelState
@@ -276,6 +278,23 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+
+    def _allocator(self):
+        """The KV allocator AS BOUND RIGHT NOW (#927 sibling).
+
+        Same defect as ``SchedulerInvariantChecker._allocator``, same class:
+        a dataclass field holding an object the phase flip REBINDS
+        (``hicache_phase_binding._stamp``), on a component ``readers_of`` does
+        not name -- so after the first cutover this audits the boot phase's
+        pool for the rest of the process. Resolved per access, which is the
+        form the next component cannot forget.
+        """
+        getter = self.get_token_to_kv_pool_allocator
+        if getter is not None:
+            live = getter()
+            if live is not None:
+                return live
+        return self.token_to_kv_pool_allocator
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(

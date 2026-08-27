@@ -39,6 +39,13 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         )
 
         _check_kv_page_invariants = _RIC._check_kv_page_invariants
+        # #927: the checker resolves its allocator PER ACCESS now, so the
+        # double has to carry that resolver too -- bound off the real class,
+        # like the method under test. A double that models the pre-change
+        # production shape is the drift this suite exists to catch, not to
+        # reproduce.
+        get_token_to_kv_pool_allocator = None
+        _allocator = _RIC._allocator
 
     return _FakeChecker(), rtt, tc, alloc
 

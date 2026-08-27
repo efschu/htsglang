@@ -94,11 +94,56 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    #: #927: resolve the KV allocator PER ACCESS, not once at construction.
+    #: See :meth:`_allocator`. Optional so existing constructions keep working;
+    #: absent means "fall back to the boot-time field", which is the pre-#927
+    #: behaviour and is what a caller outside the phase-flip boot wants.
+    get_token_to_kv_pool_allocator: Optional[Callable] = None
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
+
+    def _allocator(self):
+        """The KV allocator AS BOUND RIGHT NOW.
+
+        #927: THE WATCHDOG WAS READING THE WRONG POOL. This class stored
+        ``token_to_kv_pool_allocator`` as a dataclass field, taken once at
+        construction (``scheduler.py``'s ``SchedulerInvariantChecker(...)``).
+        The phase flip REBINDS that allocator -- ``hicache_phase_binding``'s
+        ``_stamp`` sets ``token_to_kv_pool_allocator = incoming.allocator``, and
+        ``phase_pools_for`` takes that object from the incoming phase's OWN
+        worker stack, so it is a different object per phase.
+
+        But ``readers_of`` names exactly three readers -- scheduler, tree_cache,
+        cache_controller -- and this class is not one of them. Its own docstring
+        states the consequence: "a reader this function forgets is a reader the
+        rebind silently leaves behind". Nothing else refreshed the field either
+        (``vram_dial._refresh_capacity_snapshots`` touches only
+        ``max_total_num_tokens``).
+
+        So after the first cutover the ledger read the BOOT phase's allocator
+        while ``cache_controller.load`` allocated from the INCOMING one. The two
+        address the same id space, so rows that load-back had legitimately
+        allocated read as FREE here, while the tree named them -- and
+        ``_live_double_claimed_rows`` reported that overlap as ``double_owned``,
+        ``src=live``, in the exact magnitude of the loaded-back prefix, at the
+        exact moment ``load_back`` filled the nodes' ``value``. That is the
+        on-idle raise, and it is a FALSE POSITIVE of the watchdog against the
+        wrong object rather than a real double claim.
+
+        Resolved per access rather than by adding this class to ``readers_of``:
+        a reader that derives the binding when it reads cannot be forgotten by
+        the next component that needs one, which is the failure this very method
+        exists to undo.
+        """
+        getter = self.get_token_to_kv_pool_allocator
+        if getter is not None:
+            live = getter()
+            if live is not None:
+                return live
+        return self.token_to_kv_pool_allocator
 
     @staticmethod
     def _live_double_claimed_rows(free_reading, tree_cache) -> Optional[int]:
@@ -248,7 +293,7 @@ class SchedulerInvariantChecker:
             else:
                 protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.token_to_kv_pool_allocator.size
+            total = self._allocator().size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
@@ -267,11 +312,11 @@ class SchedulerInvariantChecker:
             # the lane the two are the same number by construction.
             total = _dcp_global_slot_total(
                 self.server_args,
-                self.token_to_kv_pool_allocator,
+                self._allocator(),
                 self.max_total_num_tokens,
             )
         full_evictable_size = ps.full_evictable_size
-        allocator = self.token_to_kv_pool_allocator
+        allocator = self._allocator()
         # #912: read free capacity the SAME way the phase-flip census and the
         # #822 authority already do, instead of re-deriving it from the raw
         # allocator method. `TokenToKVPoolAllocator.available_size()`
@@ -569,12 +614,12 @@ class SchedulerInvariantChecker:
         if leak:
             # Page-level leak diagnosis for mamba
             free_full_pages = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
-                + self.token_to_kv_pool_allocator.release_pages.tolist()
+                self._allocator().free_pages.tolist()
+                + self._allocator().release_pages.tolist()
             )
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             expected_full_pages = set(
-                range(1, self.token_to_kv_pool_allocator.size + 1)
+                range(1, self._allocator().size + 1)
             )
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
@@ -767,7 +812,7 @@ class SchedulerInvariantChecker:
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
-        alloc = self.token_to_kv_pool_allocator
+        alloc = self._allocator()
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None
