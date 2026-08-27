@@ -378,3 +378,235 @@ NOT_PARTICIPANTS = frozenset(
         "epoch",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# #902: THE READ WINDOW'S TWIN -- where a resource's RELEASE site lives.
+#
+# NOTE_888b §5 wrote this extension out before it existed, and named the class
+# it closes: "a resource held by a resident that the current layout forbids to
+# make progress, with NO RELEASE PATH REACHABLE FROM THAT LAYOUT." The seat
+# fix proved the shape is real; the note's own sweep found the siblings and
+# left them as prose. Prose is what a boot finds one at a time.
+#
+# A participant already declares WHO moves it (`hook`), PROOF that the mover
+# ran (`probe`), and WHEN its state is honest (`ReadWindow`). What it could
+# not say is: this thing is HELD, here is the door out, and here are the paths
+# that door lives on. Without that, "held with no reachable exit" is a
+# property nobody can evaluate -- so it is found by a window, once per
+# resource, for ever.
+#
+# NOTHING HERE CHANGES A RELEASE. This is declaration plus a check, and that
+# boundary is deliberate: a conformance test that also rewired the releases it
+# judges would be two changes wearing one ticket, and the failure mode of the
+# second one is a wedged cutover mid-window. The check WARNS by name and hands
+# its findings back; it never blocks a flip. Refusing here would be a
+# behaviour change of exactly the kind that ended two of this fork's windows.
+# ---------------------------------------------------------------------------
+
+
+class ReleasePath:
+    """The path a release site lives on -- i.e. what must be RUNNING for the
+    door to be reachable."""
+
+    #: The cutover itself releases it. Reachable from either layout by
+    #: construction, because the seam runs in both.
+    SEAM = "seam"
+    #: Released only while decode steps run.
+    DECODE = "decode"
+    #: Released only while prefill batches are built.
+    PREFILL = "prefill"
+    #: Released only when the holder FINISHES or is ABORTED. Not reachable at
+    #: a cutover: the seam RETRACTS residents, it does not finish them, so a
+    #: parked holder keeps the resource for its whole life. This is not a
+    #: pessimistic reading -- it is NOTE_888b's measured verdict for the kvso
+    #: host region, in its own words: "both are finish/abort paths only. A
+    #: parked session holds its host region for its whole life."
+    FINISH_OR_ABORT = "finish_or_abort"
+    #: Reachable from anywhere; no layout or phase gates it.
+    ANY = "any"
+
+
+@dataclass(frozen=True)
+class HeldResource:
+    """Something a resident HOLDS, and the door out of it.
+
+    ``paths`` is the set of ReleasePath values its release site lives on. An
+    EMPTY tuple means undeclared -- the state this file exists to make
+    visible, not a shorthand for "none".
+    """
+
+    name: str
+    what: str
+    #: dotted path to the call that releases it; None when nothing does yet
+    released_by: Optional[str]
+    #: the paths that call lives on
+    paths: Tuple[str, ...]
+    ticket: str
+    #: what is still missing, when the release is absent or unreachable
+    gap: Optional[str] = None
+    found_by: str = "boot"
+    #: branch the named symbol lands with, when it is not on this base yet.
+    #: Declared rather than omitted: a row left out until its branch merges is
+    #: a row nobody adds afterwards, which is how the population thinned in
+    #: the first place. The existence check skips these BY NAME.
+    pending_branch: Optional[str] = None
+
+
+#: The population from NOTE_888b §5's sweep, plus the two families that
+#: post-date it (#890/#906 grants, #773 §8's pin). Rows whose door is absent
+#: or unreachable carry a `gap` and are the filed, unbuilt items -- visible as
+#: a list rather than as institutional memory, exactly as REGISTRY's are.
+HELD_RESOURCES: Tuple[HeldResource, ...] = (
+    HeldResource(
+        name="request_seat",
+        what="the req_to_token_pool seat a parked/spilled request occupies",
+        released_by="sglang.srt.managers.schedule_batch.release_req",
+        paths=(ReleasePath.SEAM, ReleasePath.DECODE),
+        ticket="#888b",
+        found_by="boot",
+    ),
+    HeldResource(
+        name="device_kv_rows",
+        what="the device KV rows that seat owns; freed by the same call",
+        released_by="sglang.srt.managers.schedule_batch.release_req",
+        paths=(ReleasePath.SEAM, ReleasePath.DECODE),
+        ticket="#888b",
+        found_by="boot",
+    ),
+    HeldResource(
+        name="mamba_slot",
+        what="the mamba/GDN state slot a resident holds",
+        released_by="sglang.srt.managers.schedule_batch.release_req",
+        paths=(ReleasePath.SEAM, ReleasePath.DECODE),
+        ticket="#888b",
+        found_by="boot",
+    ),
+    HeldResource(
+        name="mamba_anchor_pin",
+        what="#773 §8's pin on a mamba anchor, held until the write-through "
+        "is acked",
+        released_by=None,
+        paths=(),
+        ticket="#773 §8",
+        gap="the pin release is ABSENT -- NOTE_773 defers it to its own "
+        "ticket. Declared here so 'held with no door at all' is a row rather "
+        "than a sentence in another document.",
+        found_by="desk",
+    ),
+    HeldResource(
+        name="kvso_host_region",
+        what="the host region a spilled session occupies in the kv-session "
+        "offload tier",
+        released_by="sglang.srt.managers.kv_session_offload."
+        "KVSessionOffloadManager.release_finished_spilled_req",
+        paths=(ReleasePath.FINISH_OR_ABORT,),
+        ticket="#888b",
+        gap="finish/abort ONLY, and the seam RETRACTS rather than finishes, "
+        "so a parked session holds its host region for its whole life. Same "
+        "shape as the seat, host tier, still unfixed -- NOTE_888b named it "
+        "and this row is where it stops being prose.",
+        found_by="desk",
+    ),
+    HeldResource(
+        name="draft_weights",
+        what="the drafter's weights, spilled and restored across the seam",
+        released_by="sglang.srt.managers.phase_flip_spill."
+        "PhaseFlipSpillLadder.on_enter_pp",
+        paths=(ReleasePath.SEAM,),
+        ticket="#888b",
+        found_by="desk",
+    ),
+    HeldResource(
+        name="seam_transport_grant",
+        what="the one-chunk seam-transport credit a retracted request holds "
+        "(#906 slice 1); spent at the exempt admission, re-issued by the next "
+        "cutover stamp",
+        released_by="sglang.srt.managers.phase_purity.consume_seam_grant",
+        paths=(ReleasePath.SEAM, ReleasePath.PREFILL),
+        ticket="#890/#906",
+        found_by="desk",
+        pending_branch="fix/906-one-chunk-consumption",
+    ),
+    HeldResource(
+        name="batch_is_full_latch",
+        what="the scheduler flag latched at running=0 across the #856 retract "
+        "-- a latch is a held resource whose door is the clear",
+        released_by="sglang.srt.managers.phase_flip_draft_bootstrap."
+        "reset_stale_batch_flags",
+        paths=(ReleasePath.SEAM,),
+        ticket="W37-C",
+        gap="its OTHER clear sites are all finish paths, which #856 does not "
+        "take -- the seam handler is the only reachable door, and its own "
+        "call site says so: 'Every clear site for these is a FINISH path and "
+        "#856 RETRACTS'. Declared so the dependency on that one handler is a "
+        "row rather than a comment.",
+        found_by="boot",
+    ),
+)
+
+
+#: Which release paths a target layout CANNOT reach, under strict phase
+#: purity. This is the whole reachability rule and it is two lines because the
+#: purity law is two lines: the PP window forbids decode, and the TP window
+#: forbids prefill (the seam-transport exemption is not a general prefill
+#: path, which is exactly why #906 had to debit it per chunk).
+LAYOUT_CANNOT_REACH = {
+    "pp": (ReleasePath.DECODE,),
+    "tp": (ReleasePath.PREFILL,),
+}
+
+#: Paths NO layout reaches at a cutover, whatever the purity setting. The seam
+#: RETRACTS its residents -- #856's own words, "nothing is carried across" --
+#: and a retracted request is not a finished one, so a door that only opens on
+#: finish or abort stays shut for the whole of a parked holder's life. This is
+#: NOTE_888b's verdict for the kvso host region, encoded rather than restated:
+#: the first draft of this rule left it out, and the conformance test caught
+#: the omission by asking for the finding the note had already established.
+NEVER_REACHABLE_AT_CUTOVER = (ReleasePath.FINISH_OR_ABORT,)
+
+
+def release_path_conformance(target_layout: str, *, strict: bool = True) -> list:
+    """Resources with no release path reachable from ``target_layout``. #902.
+
+    Returns a list of human-readable findings, empty when every held resource
+    has a door the target layout can open. PURE: no imports, no runtime, no
+    side effects -- the caller logs, and a test can assert on the list without
+    a scheduler.
+
+    Two kinds of finding, kept apart because their remedies differ:
+
+      * UNDECLARED -- the row names no release site, or names one with no
+        paths. Nothing can be said about reachability, which is worse than an
+        unreachable door and is the state #902 exists to surface.
+      * UNREACHABLE -- every declared path is one this layout forbids. That is
+        NOTE_888b's class, evaluated instead of discovered.
+
+    ``strict`` False lifts the prefill bar only: a non-strict boot may prefill
+    in TP, so a PREFILL-only door is reachable there. Decode is never
+    permitted in the PP window under either setting, so the pp row does not
+    move.
+    """
+    forbidden = set(LAYOUT_CANNOT_REACH.get(target_layout, ()))
+    forbidden.update(NEVER_REACHABLE_AT_CUTOVER)
+    if not strict:
+        forbidden.discard(ReleasePath.PREFILL)
+    findings = []
+    for res in HELD_RESOURCES:
+        if res.released_by is None or not res.paths:
+            findings.append(
+                f"UNDECLARED {res.name} ({res.ticket}): {res.what} -- no "
+                f"release path is declared, so whether any layout can free it "
+                f"cannot be evaluated"
+                + (f". {res.gap}" if res.gap else "")
+            )
+            continue
+        reachable = [p for p in res.paths if p not in forbidden]
+        if not reachable:
+            findings.append(
+                f"UNREACHABLE {res.name} ({res.ticket}): {res.what} -- its "
+                f"release lives on {'/'.join(res.paths)}, and the "
+                f"{target_layout} layout reaches none of those"
+                + (f". {res.gap}" if res.gap else "")
+            )
+    return findings

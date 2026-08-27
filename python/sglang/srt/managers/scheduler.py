@@ -11378,6 +11378,7 @@ class Scheduler(
             PhasePolicyInputs,
             decide,
             note_flip_armed,
+            note_release_path_conformance,
             observe_idle,
         )
 
@@ -11837,6 +11838,15 @@ class Scheduler(
             "phase_at_arm": getattr(self, "phase_flip_active_stack", None),
         }
         note_flip_armed(state, decision, inp.now)
+        # #902: ONE conformance check, at the moment a target layout is
+        # chosen. Warns by name; never blocks. `cfg` is in scope here, which
+        # is why the check lives at the call site rather than inside
+        # `note_flip_armed` -- the purity setting is a policy config field,
+        # not a server arg, and looking it up would have been the wrong-object
+        # hop this fork has now paid for three times.
+        note_release_path_conformance(
+            decision.direction, strict=not cfg.prefill_runs_in_tp
+        )
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
         )

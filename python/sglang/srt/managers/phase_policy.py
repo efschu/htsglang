@@ -3734,6 +3734,63 @@ def note_flip_armed(
     state.last_reason = decision.reason
 
 
+#: #902: findings already announced, so the arm does not repeat itself. The
+#: population is static, so the first arm into each layout says everything
+#: there is to say about that layout.
+_RELEASE_CONFORMANCE_SAID: set = set()
+
+
+def note_release_path_conformance(direction: Optional[str], *, strict: bool) -> None:
+    """#902: name every held resource this arm's TARGET layout cannot free.
+
+    THE ONE CHECK, at the one moment it is actionable. NOTE_888b's class is
+    "a resource held by a resident that the current layout forbids to make
+    progress, with no release path reachable from that layout", and an ARM is
+    exactly when a target layout is chosen. Reading the declaration here turns
+    that class from something a window discovers into something the scheduler
+    states before it commits.
+
+    WARNS, NEVER BLOCKS. The declarations are new and the releases they
+    describe are not changed by #902, so a refusal here could only convert a
+    known-and-tolerated hold into a stopped flip -- a behaviour change wearing
+    a conformance ticket, whose failure mode is a wedged cutover mid-window.
+    The findings are true today and were true before this line existed; what
+    changes is that they are said.
+
+    Once per direction: the population is static, so repeating it every arm
+    would be noise that trains readers to skip it.
+    """
+    if direction in _RELEASE_CONFORMANCE_SAID:
+        return
+    try:
+        from sglang.srt.managers.cutover_participants import (
+            release_path_conformance,
+        )
+
+        # `strict` is PASSED, never looked up. The obvious lookup here would
+        # have been `getattr(get_server_args(), "phase_purity_prefill_in_tp",
+        # False)` -- an attribute that does not exist, which would have made
+        # every boot read as strict and the flag silently inert. The purity
+        # setting lives on PhasePolicyConfig as `prefill_runs_in_tp`, and the
+        # arm site holds that config, so the caller supplies it.
+        target = "tp" if direction == PP_TO_TP else "pp"
+        findings = release_path_conformance(target, strict=strict)
+        _RELEASE_CONFORMANCE_SAID.add(direction)
+        if findings:
+            logger.warning(
+                "[#902] RELEASE-PATH CONFORMANCE for the %s layout: %d held "
+                "resource(s) have no release path this layout can reach. Each "
+                "is a resident that cannot give the thing back while the "
+                "layout it lands in forbids the path its door lives on "
+                "(NOTE_888b's class). Declared, not blocking:\n  - %s",
+                target,
+                len(findings),
+                "\n  - ".join(findings),
+            )
+    except Exception:  # noqa: BLE001 - a declaration check may never break an arm
+        pass
+
+
 def note_flip_outcome(
     cfg: PhasePolicyConfig,
     state: PhasePolicyState,
