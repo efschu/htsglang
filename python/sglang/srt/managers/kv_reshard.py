@@ -1225,12 +1225,13 @@ def _cutover_fn_for(scheduler) -> Callable[[Tuple[int, ...]], None]:
         from sglang.srt.layers.dcp.owner import refresh_all_owner_bounds
 
         set_cp_token_ratios(list(new_vector))
+        # #923 reconciliation: the HiCache controller's memoized owner ctx used
+        # to be deleted by hand right here, and NOWHERE ELSE -- so the phase
+        # flip, a second installer of the same payload, left it stale for
+        # process life. The controller now registers with the #297 registry, so
+        # this one call refreshes it along with every attention backend. One
+        # job, one mover.
         refreshed = refresh_all_owner_bounds()
-        # HiCache's controller memoizes the owner ctx; Stage A refuses to arm
-        # with hicache active, but a stale memo must still not survive.
-        controller = getattr(scheduler, "cache_controller", None)
-        if controller is not None and hasattr(controller, "_dcp_owner_ctx_cache"):
-            delattr(controller, "_dcp_owner_ctx_cache")
         logger.info(
             "%s cutover: vector %s installed, %d owner-bounds consumers refreshed",
             LOG_PREFIX,

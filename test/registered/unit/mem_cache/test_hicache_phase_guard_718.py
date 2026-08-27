@@ -52,9 +52,20 @@ class _Exploding:
 class _Stub:
     """The parts of the controller the guarded prologue can see."""
 
+    # #923 added a second prologue question -- "is the row this copy would read
+    # a row of this rank's device pool?" -- ahead of the pool touch. It is the
+    # controller's own method, so the stub answers it the controller's way
+    # rather than stubbing the answer: with no readable device buffer below,
+    # ``_kv_device_row_capacity`` returns None and the check fails OPEN, which
+    # is the same "absence is not a mismatch" contract the #760 seam guard
+    # carries. The exploding pool is still what this suite is proving.
+    _refuse_unaddressable_kv_rows = HiCacheController._refuse_unaddressable_kv_rows
+    _kv_device_row_capacity = HiCacheController._kv_device_row_capacity
+
     def __init__(self):
         self.mem_pool_host = _Exploding()
         self.mem_pool_device_allocator = _Exploding()
+        self.mem_pool_device = object()
         self.write_queue = []
         self.load_queue = []
 
