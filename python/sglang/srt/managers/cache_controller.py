@@ -77,7 +77,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -148,6 +150,23 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
 
 
+#: #943: sentinel for "this operation has never been stamped", distinct from a
+#: stamp of None (which `StorageOperation.__init__` records when the generation
+#: could not be read). The two must not compare equal: an unstamped operation may
+#: still receive its first stamp, while a None-stamped one has already been
+#: through the constructor's except path and is refused by
+#: `write_back_stamp_is_current` anyway.
+_UNSTAMPED = object()
+
+
+class StaleStampRewrite(RuntimeError):
+    """A completed operation's binding generation was rewritten (#943).
+
+    Never downgraded to a warning: the rewrite's only effect is to make a span
+    fetched from a replaced host pool look publishable to #937's check.
+    """
+
+
 class StorageOperation:
     counter = 0
 
@@ -180,6 +199,56 @@ class StorageOperation:
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
+
+    #: #943: THE STAMP IS WRITE-ONCE, AND THAT IS THE WHOLE SAFETY PROPERTY.
+    #
+    # #937 refuses to PUBLISH a completed prefetch whose binding generation is
+    # no longer current, because the span was fetched into a host pool that a
+    # cutover has since replaced. Publishing it anyway is what the 2j soak
+    # measured as garbage at every prompt at or above the 256-token prefetch
+    # threshold, non-deterministic at temperature 0.
+    #
+    # The bisection (#943, window-943-bisect-0827) put that refusal at the exact
+    # commit where the anti-correlation flips: merges 2/9/13 publish stale spans
+    # and return 1/7 coherent, merges 15/16 refuse them and return 7/7. So the
+    # refusal is the garbage fix, and the "lost anchors" are its cost.
+    #
+    # THE CHEAP-LOOKING WAY TO WIN THAT COST BACK IS THE ONE THAT MUST BE
+    # IMPOSSIBLE. `write_back_stamp_is_current(operation.binding_generation)` is
+    # the only thing standing between a stale span and the model, so anyone
+    # restoring cache hits after a refusal can make the symptom disappear by
+    # re-stamping the operation instead of re-fetching under the new binding.
+    # That reads as "the re-issue works" and reinstates the corruption exactly:
+    # same bytes, same replaced pool, now with a stamp that passes the check.
+    #
+    # A re-issue must therefore mint a NEW operation -- new stamp, new host
+    # slots, a fresh fetch from the content-keyed store -- and never revive this
+    # one. Making the rewrite raise is what keeps that a property of the code
+    # rather than a note in a commit message. Idempotent writes are allowed so
+    # the constructor and any equal re-assignment stay legal; only a CHANGE to
+    # an already-stamped operation is refused.
+    #
+    # A property rather than `__setattr__`: this class carries hot fields
+    # (`completed_tokens` is updated per transfer), and a Python-level hook on
+    # every attribute write would tax all of them to guard one.
+    @property
+    def binding_generation(self):
+        return self._binding_generation
+
+    @binding_generation.setter
+    def binding_generation(self, value):
+        prev = getattr(self, "_binding_generation", _UNSTAMPED)
+        if prev is not _UNSTAMPED and prev is not None and value != prev:
+            raise StaleStampRewrite(
+                f"refusing to re-stamp operation {getattr(self, 'id', '?')} from "
+                f"binding generation {prev} to {value}. The host slots this "
+                f"operation holds were allocated under {prev}; a cutover has "
+                f"since rebound the tier, and re-stamping would let #937's "
+                f"publish check pass for a span fetched out of a pool that no "
+                f"longer exists -- the 2j garbage, restored. A re-issue mints a "
+                f"NEW operation and fetches again; it never revives this one."
+            )
+        self._binding_generation = value
 
     def __lt__(self, other: StorageOperation):
         return self.id < other.id
@@ -900,9 +969,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
-                "tp_lcm_size must be divisible by tp_size."
-            )
+            assert (
+                tp_lcm_size % self.tp_size == 0
+            ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
