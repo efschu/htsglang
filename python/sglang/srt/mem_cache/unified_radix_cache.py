@@ -1293,12 +1293,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -3049,12 +3049,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 hit_pages[p] = int(packed[_pool_slot(p, 1)].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
-        insert_result = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            host_indices[:min_completed_tokens],
-            hash_value[: min_completed_tokens // self.page_size],
+        # #937: DO NOT PUBLISH A SPAN WHOSE TIER NO LONGER EXISTS.
+        #
+        # The two frees below are stamped with `operation.binding_generation`
+        # (#905/#719) precisely because a prefetch opened under binding N can
+        # complete after a cutover has rebound the host tier to N+1. This
+        # insert sat between them consulting none of it, so the completion that
+        # could not safely FREE its own slots was still allowed to ADVERTISE
+        # them to every later match walk. One side of the axis was closed; this
+        # is the other side, and it is the side that reaches the model.
+        #
+        # MEASURED (2j soak boot boot_2h_4e855cc80a_0827_1056.log, all three
+        # ranks): every prompt at or above 256 tokens -- the HiCache storage
+        # prefetch gate, `prefetch_threshold` in TOKENS -- returned garbage,
+        # non-deterministic at temperature 0, while 255 and below were correct.
+        # The prefetch completions enumerate the failing lengths exactly
+        # (256, 257, 258, 260, 272, 284, 300) and every one reports
+        # `matched=0 loaded=N refused=0` beside a `MOVED=True` free-site line:
+        # the span was adopted whole, out of a pool that had already been
+        # replaced. Under `phase_flip_purity=strict:1` every request crosses a
+        # pp_to_tp cutover between prefill and re-admission, so this is the
+        # common case on this rig, not a rare race.
+        #
+        # The refusal reuses #841's existing shape rather than inventing a
+        # second one: `host_span_unclaimed` makes `unclaimed_to` the WHOLE
+        # completed span, which routes it through the generation-stamped free
+        # below to the pool that actually minted it -- so the span is neither
+        # leaked nor freed against the wrong tier -- and makes
+        # `loaded_from_storage` 0, so the metric reports the retention that
+        # actually happened. Same authority as the free, no second stamp
+        # scheme: `write_back_stamp_is_current` is the predicate
+        # `append_host_mem_release` already consults.
+        from sglang.srt.mem_cache.hicache_phase_binding import (
+            write_back_stamp_is_current,
         )
+
+        _stamp = getattr(operation, "binding_generation", None)
+        if not write_back_stamp_is_current(_stamp):
+            self._prefetch_insert_refused_stale = (
+                getattr(self, "_prefetch_insert_refused_stale", 0) + 1
+            )
+            logger.warning(
+                "#937 STALE PREFETCH INSERT REFUSED: req=%s %d token(s) fetched "
+                "under binding generation %s, which is no longer current; the "
+                "span is released to that generation's pool instead of being "
+                "published to the tree. (%d so far.)",
+                req_id,
+                int(min_completed_tokens),
+                _stamp,
+                self._prefetch_insert_refused_stale,
+            )
+            insert_result = InsertResult(prefix_len=0, host_span_unclaimed=True)
+        else:
+            insert_result = self._insert_helper_host(
+                last_host_node,
+                fetched_key,
+                host_indices[:min_completed_tokens],
+                hash_value[: min_completed_tokens // self.page_size],
+            )
 
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
