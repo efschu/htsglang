@@ -1520,7 +1520,24 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
         delattr(req, _REFETCH_DECLINE_STREAK)
     except AttributeError:
         pass
-    discarded = len(getattr(req, "prefix_indices", None) or ())
+    # #796 CLASS, and this line is its third instance -- it killed all three
+    # ranks in window-946rf-0828 the first time a boot ever REACHED the
+    # terminator. `prefix_indices` is a torch tensor; `x or ()` asks `bool(x)`,
+    # which torch refuses from two elements up. Fine for an empty prefix, fine
+    # for one token, fatal for a real one -- which is why it survived every
+    # earlier boot: the escape always returned "refetch" above it and this code
+    # never ran. #949 made the terminator deliverable and the landmine went off
+    # on the same pass.
+    #
+    # ONE DEFINITION. `prefix_len` exists because this exact crash already
+    # happened at phase_flip_draft_bootstrap.py (W37-B, 2026-08-25) and
+    # scheduler.py:8108 carries the same warning in a comment. #946 spelled a
+    # third copy regardless. Use the canonical one rather than adding a fourth.
+    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+        prefix_len as _prefix_len,
+    )
+
+    discarded = _prefix_len(req)
     logger.warning(
         "#946 PREMISE RECOMPUTE rid=%s: no re-fetch could be issued, so the "
         "dead prefix premise is dropped and %d token(s) will be recomputed. "

@@ -895,3 +895,106 @@ class The915GateLineMustBeWIREDNotMerelyPresent(unittest.TestCase):
         finally:
             mrc.PREFETCH_GATE_COUNTS.clear()
             mrc.PREFETCH_GATE_COUNTS.update(before)
+
+
+class TheTerminatorMustSurviveATensorPrefix(unittest.TestCase):
+    """#796 CLASS, THIRD INSTANCE -- and the first one a boot actually reached.
+
+    Window-946rf-0828 killed all three ranks here:
+
+        RuntimeError: Boolean value of Tensor with more than one value is
+        ambiguous
+          scheduler_pp_mixin.py:1523
+          discarded = len(getattr(req, "prefix_indices", None) or ())
+
+    `Req.prefix_indices` is a torch tensor. `x or ()` asks `bool(x)`, which
+    torch refuses from two elements up -- fine for an empty prefix, fine for a
+    ONE-token prefix, fatal for a real one.
+
+    THE LINE IS PRE-EXISTING (#946) AND WAS UNREACHABLE UNTIL #949. The escape
+    always took the silent `return "refetch"`, so the terminator below it had
+    never run in production. Making the terminator DELIVERABLE is what exposed
+    it -- the bug and its discovery have the same cause.
+
+    IT IS ALSO THE THIRD COPY OF A SPELLING THAT ALREADY HAD ONE CANONICAL
+    DEFINITION. `phase_flip_draft_bootstrap.prefix_len` exists precisely
+    because this crash happened before (W37-B, 2026-08-25) and its docstring
+    opens "ONE DEFINITION, because two of them is what put the boot on the
+    floor". `scheduler.py:8108` carries the same warning in a comment. #946
+    wrote a fourth spelling anyway, so the fix is to USE the canonical helper,
+    not to write a fifth.
+    """
+
+    def _apply(self, holder, req):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_apply_dead_premise_at_chunk_boundary,
+        )
+
+        return pp_apply_dead_premise_at_chunk_boundary(holder, req)
+
+    def _tensor_req(self, n):
+        import torch
+
+        req = _Req(RID_CHUNKED, prefix_len=0, extend_len=4096)
+        req.prefix_indices = torch.arange(n)
+
+        def _truncate(told):
+            req.prefix_indices = req.prefix_indices[:told]
+
+        req.truncate_prefix_to = _truncate
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        pp_mark_premise_dead(req)
+        return req
+
+    def test_the_terminator_survives_a_MULTI_ELEMENT_tensor_prefix(self):
+        """The exact metal crash: 8192 cached slot ids as a tensor."""
+        req = self._tensor_req(8192)
+        holder = _holder(chunked_req=req)  # no _prefetch_kvcache -> terminator
+        catcher = _Catcher(logging.WARNING)
+        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log.addHandler(catcher)
+        try:
+            self.assertEqual(self._apply(holder, req), "recompute")
+        finally:
+            log.removeHandler(catcher)
+        self.assertIn(
+            "8192",
+            "\n".join(catcher.messages),
+            "the discarded token count must still be NAMED -- a law breach may "
+            "be necessary, it may never be silent",
+        )
+
+    def test_a_ZERO_D_tensor_prefix_reads_as_one_token_not_an_exception(self):
+        """`len()` RAISES on a 0-d tensor while `numel()` answers 1. The
+        canonical helper asks numel first for exactly this reason."""
+        import torch
+
+        req = self._tensor_req(0)
+        req.prefix_indices = torch.tensor(7)  # 0-d
+        req.truncate_prefix_to = lambda told: None
+        holder = _holder(chunked_req=req)
+        self.assertEqual(self._apply(holder, req), "recompute")
+
+    def test_it_uses_the_CANONICAL_helper_and_does_not_spell_a_fifth_copy(self):
+        """ONE DEFINITION. Two of them put the boot on the floor once already;
+        three of them did it again in window-946rf."""
+        import inspect
+
+        from sglang.srt.managers import scheduler_pp_mixin as m
+
+        src = inspect.getsource(m.pp_apply_dead_premise_at_chunk_boundary)
+        # CODE ONLY. The first version of this assertion grepped raw source and
+        # went red on the fix's own COMMENT, which quotes the landmine in order
+        # to explain it. An assertion about code must not be satisfiable or
+        # breakable by prose -- that is the #915 guard-comment lesson applied to
+        # a test.
+        code = "\n".join(
+            line.split("#", 1)[0] for line in src.splitlines() if line.strip()
+        )
+        self.assertNotIn(
+            "or ()",
+            code,
+            "the `x or ()` spelling is the landmine itself -- use prefix_len",
+        )
+        self.assertIn("prefix_len", code)
