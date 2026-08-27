@@ -111,21 +111,68 @@ class TestReleasePathDeclarations902(unittest.TestCase):
             f"requests, so no door opens; got {tp}",
         )
 
-    def test_a_finish_only_door_is_unreachable_at_the_seam(self):
-        """The kvso host region -- NOTE_888b's named, still-unfixed sibling.
+    def test_a_finish_only_door_is_unreachable_from_either_layout(self):
+        """THE RULE, on a synthetic row.
 
-        Its only doors are finish/abort, and the seam retracts rather than
-        finishes, so a parked session holds its host region for its whole
-        life. That must be a finding in BOTH target layouts: the defect is
-        that no layout reaches it, not that one does not.
+        Pinned on a row this test owns rather than on the live population:
+        both live findings turned out to be inherited prose and were corrected
+        (the pin has a prefill door, the kvso region is freed at park commit),
+        and a rule test that depends on the population still containing a
+        defect stops testing the rule the moment someone fixes one.
         """
-        for layout in ("pp", "tp"):
-            findings = release_path_conformance(layout)
+        import dataclasses
+
+        from sglang.srt.managers import cutover_participants as cp
+
+        row = dataclasses.replace(
+            cp.HELD_RESOURCES[0],
+            name="synthetic_finish_only",
+            released_by="sglang.srt.managers.cutover_participants.ReleasePath",
+            paths=(ReleasePath.FINISH_OR_ABORT,),
+            gated_by=None,
+            gap=None,
+        )
+        original = cp.HELD_RESOURCES
+        cp.HELD_RESOURCES = (row,)
+        try:
+            for layout in ("pp", "tp"):
+                findings = release_path_conformance(layout)
+                self.assertTrue(
+                    any(
+                        f.startswith("UNREACHABLE synthetic_finish_only")
+                        for f in findings
+                    ),
+                    f"{layout}: the seam retracts rather than finishes, so a "
+                    f"finish-only door opens for no layout; got {findings}",
+                )
+        finally:
+            cp.HELD_RESOURCES = original
+
+    def test_an_undeclared_row_is_reported_undeclared(self):
+        """The other verdict, also on a row this test owns."""
+        import dataclasses
+
+        from sglang.srt.managers import cutover_participants as cp
+
+        row = dataclasses.replace(
+            cp.HELD_RESOURCES[0],
+            name="synthetic_no_door",
+            released_by=None,
+            paths=(),
+            gated_by=None,
+            gap=None,
+        )
+        original = cp.HELD_RESOURCES
+        cp.HELD_RESOURCES = (row,)
+        try:
+            findings = release_path_conformance("pp")
             self.assertTrue(
-                any(f.startswith("UNREACHABLE kvso_host_region") for f in findings),
-                f"{layout}: expected the host region to be unreachable; "
-                f"got {findings}",
+                any(f.startswith("UNDECLARED synthetic_no_door") for f in findings),
+                f"a row naming no release site cannot be evaluated for "
+                f"reachability and must say so; got {findings}",
             )
+        finally:
+            cp.HELD_RESOURCES = original
 
     def test_a_seam_door_is_reachable_from_both_layouts(self):
         """MUTANT GUARD. A check that flags everything names nothing."""
@@ -167,24 +214,26 @@ class TestReleasePathDeclarations902(unittest.TestCase):
 
         from sglang.srt.managers import cutover_participants as cp
 
-        before = release_path_conformance("pp")
-        self.assertTrue(any("kvso_host_region" in f for f in before))
-
-        patched = tuple(
-            dataclasses.replace(r, paths=(ReleasePath.SEAM,))
-            if r.name == "kvso_host_region"
-            else r
-            for r in cp.HELD_RESOURCES
+        row = dataclasses.replace(
+            cp.HELD_RESOURCES[0],
+            name="synthetic_consulted",
+            released_by="sglang.srt.managers.cutover_participants.ReleasePath",
+            paths=(ReleasePath.FINISH_OR_ABORT,),
+            gated_by=None,
+            gap=None,
         )
         original = cp.HELD_RESOURCES
-        cp.HELD_RESOURCES = patched
+        cp.HELD_RESOURCES = (row,)
         try:
+            before = release_path_conformance("pp")
+            self.assertTrue(any("synthetic_consulted" in f for f in before))
+            cp.HELD_RESOURCES = (dataclasses.replace(row, paths=(ReleasePath.SEAM,)),)
             after = release_path_conformance("pp")
         finally:
             cp.HELD_RESOURCES = original
 
         self.assertFalse(
-            any("kvso_host_region" in f for f in after),
+            any("synthetic_consulted" in f for f in after),
             "giving the resource a seam door must clear its finding; if it "
             "does not, the check is not reading the declaration",
         )
@@ -204,8 +253,14 @@ class TestTheArmSaysIt902(unittest.TestCase):
             phase_policy.note_release_path_conformance("pp_to_tp", strict=True)
         blob = "\n".join(cm.output)
         self.assertIn("[#902] RELEASE-PATH CONFORMANCE", blob)
+        # The LIVE population's current verdict, deliberately asserted so this
+        # arm is a record of what the scheduler says today. Both of the
+        # original two findings were inherited prose and were corrected after
+        # being checked; what remains is the mamba anchor pin, whose only door
+        # is on the prefill path (#811 adds the layout-independent one and is
+        # not in this base's ancestry). If a later commit clears it, THIS is
+        # the assertion that should fail and be updated with the reason.
         self.assertIn("mamba_anchor_pin", blob)
-        self.assertIn("kvso_host_region", blob)
 
     def test_it_says_it_once_per_direction(self):
         """The population is static; repeating it every arm trains readers to

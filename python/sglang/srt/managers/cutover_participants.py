@@ -521,14 +521,30 @@ HELD_RESOURCES: Tuple[HeldResource, ...] = (
         name="kvso_host_region",
         what="the host region a spilled session occupies in the kv-session "
         "offload tier",
-        released_by="sglang.srt.managers.kv_session_offload."
-        "KVSessionOffloadManager.release_finished_spilled_req",
-        paths=(ReleasePath.FINISH_OR_ABORT,),
+        # NOT finish/abort-only, which is what NOTE_888b §5 recorded. The
+        # region is returned to the free list AT PARK COMMIT --
+        # `_commit_park` (kv_session_spill_destination.py:1464):
+        #     mgr._free_regions.append(slot.region)
+        #     mgr.backend._sess_close_slot(t.rpi)
+        # and `_release_parked_req`'s own docstring says so in as many words:
+        # it "mirrors release_finished_spilled_req MINUS the region/backend-
+        # slot part (already released at park commit)". A parked session does
+        # not hold its host region; it holds the SpillSlot payload, whose door
+        # is `_release_parked_req` on the park flow.
+        released_by="sglang.srt.managers.kv_session_spill_destination."
+        "_commit_park",
+        # The park flow runs in `KVSessionOffloadManager.pre_schedule`
+        # (kv_session_offload.py:4791), called from
+        # `Scheduler.get_next_batch_to_run` (scheduler.py:6972) -- the
+        # per-round batch builder, which runs in BOTH layouts and is gated by
+        # neither decode nor prefill.
+        paths=(ReleasePath.ANY,),
         ticket="#888b",
-        gap="finish/abort ONLY, and the seam RETRACTS rather than finishes, "
-        "so a parked session holds its host region for its whole life. Same "
-        "shape as the seat, host tier, still unfixed -- NOTE_888b named it "
-        "and this row is where it stops being prose.",
+        gap="row corrected 2026-08-27: §5's sweep read the finish/abort "
+        "release sites and did not reach the park-commit one, so 'held for "
+        "its whole life' was inherited rather than measured. The remaining "
+        "hold is the SpillSlot payload, released by `_release_parked_req` on "
+        "the same per-round path.",
         found_by="desk",
     ),
     HeldResource(
