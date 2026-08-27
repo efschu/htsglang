@@ -59,6 +59,28 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_direct_pf_lf = None
         transfer_kv_per_layer_mla = None
         transfer_kv_per_layer_mla_pf_lf = None
+else:
+    # #909: THE BRANCH THAT WAS NOT THERE. On a backend that is neither
+    # CUDA nor HIP -- NPU, XPU, MPS, CPU, and a hermetic
+    # CUDA_VISIBLE_DEVICES="" run -- the `if` body never executed, so these
+    # names were never bound and the first use was a bare NameError.
+    #
+    # BOUND TO None, MATCHING THE except BRANCH, and that is not a style
+    # choice: `test/registered/unit/mem_cache/conftest.py` installs a
+    # SkipTest stub for exactly these symbols, gated on
+    # `getattr(mod, sym, None) is None`. None keeps that contract; a raising
+    # stub silently blocks the install and turns 19 documented environment
+    # skips into false failures (measured on this desk before it was
+    # reverted). That conftest also states the intended fix in its own
+    # words -- "bind the seven names to None unconditionally" -- so this is
+    # that fix, and the two now agree instead of one guessing.
+    transfer_kv_all_layer_direct_lf_pf = None
+    transfer_kv_all_layer_mla = None
+    transfer_kv_all_layer_mla_lf_pf = None
+    transfer_kv_direct = None
+    transfer_kv_per_layer_direct_pf_lf = None
+    transfer_kv_per_layer_mla = None
+    transfer_kv_per_layer_mla_pf_lf = None
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
