@@ -1117,6 +1117,94 @@ SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
 SEAM_RESTORE_REFUSED_ATTR = "seam_restore_refused"
 
 
+#: #906: the grant this request has already SPENT. The seam stamp
+#: (`SEAM_READMIT_ATTR`) says a cutover retracted this request; it does not say
+#: how much prefill that buys. One chunk is the answer, and this is the ledger
+#: entry that makes it one -- set where the exempt admission happens, cleared
+#: only by a fresh cutover stamp.
+SEAM_GRANT_CONSUMED_ATTR = "seam_grant_consumed"
+
+
+def seam_grant_is_open(req) -> bool:
+    """Does this request still hold an UNSPENT seam-transport grant? #906.
+
+    THE LEAK THE USER SAW. `seam_transport_exempt` derives the whole round's
+    exemption from "a stamped request exists", and the stamp is a fact about
+    the past that never expires. Live specimen: a 20 000-token wave running
+    `phase=tp` under SEAM-TRANSPORT-CREDIT, chunk after chunk, EVERY admitted
+    chunk `#cached-token: 0` -- the premise ("this is a restore, it recomputes
+    nothing") contradicted by the scheduler's own batches, and nothing in the
+    chain able to notice, because one stamp licensed an unbounded number of
+    chunks.
+
+    A GRANT IS A QUANTITY, NOT A PROPERTY. The exemption's justification is
+    per-chunk: THIS chunk's tokens were already computed in the PP window and
+    are being read back. Nothing in that argument extends to the next chunk,
+    which is why the grant is spent when it is used and the next chunk needs
+    its own. #858's shape, and #501's before it: a permission checked at issue
+    and never debited at execution.
+
+    WHY CONSUMPTION IS EXPRESSED HERE AND NOT AT THE TWO GATES. This predicate
+    feeds `seam_readmit_candidates`, which is THE ONE AUTHORITY with two
+    callers (`seam_transport_exempt` for "may TP build a prefill batch" and
+    `seam_transport_pending_tokens` for "do these tokens demand a flip back to
+    PP") -- the file's own rule, one predicate, one clock. Debiting here moves
+    BOTH in the same step, and that is what makes the refusal safe:
+
+        a spent grant drops the request out of candidacy
+          -> `seam_transport_exempt` stops exempting the round (no more
+             unbounded TP prefill), AND
+          -> `seam_transport_pending_tokens` stops SUBTRACTING its remaining
+             tokens from pending prefill, so the policy sees them as ordinary
+             prefill and arms `tp_to_pp`.
+
+    THAT SECOND HALF IS THE WHOLE ANTI-WEDGE ARGUMENT and it is why the debit
+    could not be a local check at the builder. The transport tokens are
+    excluded from `pending_prefill_tokens` precisely so the tp-ward flip does
+    not undo itself; refusing the next chunk while still excluding its tokens
+    would leave the request with no layout willing to run it and no policy
+    input able to say so -- a mid-prefill wedge, which is the one outcome this
+    posten may not produce. Spending the grant hands the remainder back to PP,
+    where it is honest work in the right layout.
+
+    RANK-UNIFORM: the stamp comes from a group-unanimous cutover and the debit
+    happens in the replicated builder on the same round on every rank, so the
+    candidate list stays identical across ranks -- the property the purity
+    branch is required to have.
+    """
+    if getattr(req, SEAM_READMIT_ATTR, None) is None:
+        return False
+    return not bool(getattr(req, SEAM_GRANT_CONSUMED_ATTR, False))
+
+
+def consume_seam_grant(req) -> bool:
+    """Debit this request's seam grant. Returns True if one was open.
+
+    Idempotent: spending an already-spent grant is not an error, it is the
+    common case on the second chunk and must stay quiet.
+    """
+    if not seam_grant_is_open(req):
+        return False
+    try:
+        setattr(req, SEAM_GRANT_CONSUMED_ATTR, True)
+    except Exception:  # noqa: BLE001 - a ledger entry may never break a build
+        return False
+    return True
+
+
+def reissue_seam_grant(req) -> None:
+    """A fresh cutover stamp is a fresh grant. #906.
+
+    Called where the seam stamps `SEAM_READMIT_ATTR`, so a request retracted
+    again by a later cutover is transported again -- the grant is per
+    retraction, not per lifetime.
+    """
+    try:
+        setattr(req, SEAM_GRANT_CONSUMED_ATTR, False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def seam_readmit_candidates(scheduler) -> list:
     """Queued requests the #856 cutover retracted and must re-admit.
 
@@ -1124,10 +1212,15 @@ def seam_readmit_candidates(scheduler) -> list:
     (scheduler.py's own note: "``self.waiting_queue``, which is replicated
     across the TP ranks"), so this list is the same on every rank in the same
     round -- the property the purity branch is required to have.
+
+    #906: a request whose grant is SPENT is no longer a candidate. See
+    `seam_grant_is_open` for why the debit belongs here rather than at either
+    gate -- both of this function's callers must move together, or refusing
+    the next chunk wedges the request instead of sending it back to PP.
     """
     out = []
     for req in getattr(scheduler, "waiting_queue", ()) or ():
-        if getattr(req, SEAM_READMIT_ATTR, None) is not None:
+        if seam_grant_is_open(req):
             out.append(req)
     return out
 

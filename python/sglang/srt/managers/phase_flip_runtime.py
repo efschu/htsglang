@@ -1763,6 +1763,12 @@ def build_cutover_release(scheduler):
         for r in reqs or ():
             try:
                 r.seam_readmit_epoch = epoch
+                # #906: a fresh retraction is a fresh grant. Without this a
+                # request retracted by a SECOND cutover would arrive with the
+                # first cutover's grant already spent and never transport.
+                from sglang.srt.managers.phase_purity import reissue_seam_grant
+
+                reissue_seam_grant(r)
             except Exception:  # noqa: BLE001 - a stamp may never break a seam
                 pass
         return out
