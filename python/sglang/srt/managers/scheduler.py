@@ -4931,9 +4931,46 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req) -> str:
+        """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
+
+        THE DEFECT THIS RETURN VALUE CLOSES, measured on window-946fix-0828.
+        This function used to return ``None`` on every path, and #946's escape
+        read that as success: `prefetch(req); return "refetch"` reported a
+        re-fetch whether or not one was ever issued. The boot then showed the
+        escape firing 8885 times (`act_rid_hit`) with `PREFETCH RE-ISSUED` 0,
+        `cached>0` 0 and the rid still frozen at `told=8192` -- a compensator
+        that was, for the first time in this family, provably ON the defect's
+        path and still did nothing, because ITS SUCCESS VALUE WAS NOT EVIDENCE
+        THAT IT ACTED.
+
+        SAME CLASS, NAMED SIBLINGS: #685 ("a silent precondition is
+        indistinguishable from dead code" -- the derivation logged only on its
+        success branch), #656/HANDOFF_678 §4.0 (four early ABSTAIN returns
+        ABOVE the trace, so a rank that could not take part logged nothing
+        while doing it), #767 (name the eaten branch), #872 (silent falsy
+        paths) and #501 (the contract promises what the code does not
+        deliver). Every one of them is a decline that could not be counted.
+
+        THE VERDICT IS AN OBSERVATION, NOT A PROMISE, and that is the whole
+        design. There are SIX silent exits between here and registration --
+        two here (`:storage_disabled`, `:anchor_no_vote`) and four more inside
+        `prefetch_from_storage` (`not enable_storage`, the
+        `not eligible and not symmetric` gate, and two alloc-failure returns).
+        Enumerating them one by one is how this family has failed five times:
+        a seventh exit added later would be silent again. So the verdict is
+        taken from the EFFECT instead -- did the operation appear in
+        ``ongoing_prefetch``? -- which is true of every exit at once, including
+        ones nobody has written yet. A mutant that returns "issued"
+        unconditionally cannot pass this, and the falsifier says so.
+
+        The deep reason, when there is one, comes from the #915 prefetch-gate
+        counters (`anchor` / `too_short` / `rate_limited`), sampled as a DELTA
+        across the call so it names THIS request's verdict rather than the
+        boot's running total.
+        """
         if not self.enable_hicache_storage:
-            return
+            return "declined:storage_disabled"
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
@@ -4953,7 +4990,10 @@ class Scheduler(
         )
         group_decides = bool(group_decides is not None and group_decides())
         if not locally_eligible and not group_decides:
-            return
+            # #915 names this one ANCHOR: the caller's own local gate
+            # (`last_host_node.backuped`) said no and no group vote is being
+            # held that could overrule it. Nothing downstream runs.
+            return "declined:anchor_no_vote"
 
         if locally_eligible:
             last_hash = last_host_node.get_last_hash_value()
@@ -4972,6 +5012,20 @@ class Scheduler(
             # will be negative, so no rank registers a prefetch.
             last_hash, new_input_tokens, prefix_keys = None, [], None
 
+        # DELIVERY IS OBSERVED ACROSS THE CALL, never inferred from it. The
+        # registration `ongoing_prefetch[req_id] = _OngoingPrefetch(...)`
+        # (unified_radix_cache.py:2996) is the one event that means "a prefetch
+        # exists"; every silent exit above it, present or future, leaves this
+        # set unchanged.
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since as _gate_reason_since,
+            gate_snapshot as _gate_snapshot,
+        )
+
+        _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
+        _was_registered = _ongoing is not None and req.rid in _ongoing
+        _gate_before = _gate_snapshot()
+
         if group_decides:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
@@ -4989,6 +5043,19 @@ class Scheduler(
                 last_hash,
                 prefix_keys,
             )
+
+        if _ongoing is None:
+            # No such set on this tree cache (hiradix/flexkv variants). We
+            # cannot observe delivery here, and saying "issued" would be the
+            # very promise this function exists to stop making.
+            return "declined:unobservable"
+        if req.rid in _ongoing and not _was_registered:
+            return "issued"
+        if _was_registered:
+            # It was already in flight before we asked; the escape did not
+            # create it and must not take credit for it.
+            return "declined:already_in_flight"
+        return f"declined:{_gate_reason_since(_gate_before)}"
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

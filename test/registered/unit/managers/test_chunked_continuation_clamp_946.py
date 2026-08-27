@@ -233,10 +233,23 @@ class TheEscapePrefersARefetchOverARecompute(unittest.TestCase):
         generation costs a fetch, whereas `told=0` costs a full recompute of
         8192 tokens. The law allows one chunk of loss, so the fetch is not
         merely nicer -- it is the only compliant answer when it is available."""
+        # CONTRACT INVERTED 2026-08-27 (#949), reasoning recorded at the site
+        # like the four inversions before it. This stub used to return None --
+        # `called.append(...)` evaluates to None -- and the escape reported
+        # "refetch" for it. That is EXACTLY the defect window-946fix-0828
+        # measured on metal: the escape fired 8885 times, reported success
+        # every time, and issued nothing. The test was green while the shipped
+        # code was blind, because the test supplied the same empty answer the
+        # production path did. A stub must now say what really happened.
         req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
         called = []
+
+        def _issue(r):
+            called.append(r.rid)
+            return "issued"
+
         holder = _holder(chunked_req=req)
-        holder._prefetch_kvcache = lambda r: called.append(r.rid)
+        holder._prefetch_kvcache = _issue
         self.assertEqual(self._apply(holder, req), "refetch")
         self.assertEqual(called, [RID_CHUNKED])
         self.assertEqual(
@@ -265,10 +278,16 @@ class TheEscapePrefersARefetchOverARecompute(unittest.TestCase):
         self.assertIn("8192", msg, f"the discarded token count must be named: {msg}")
         self.assertIn("#946", msg)
 
-    def test_the_mark_is_consumed_so_the_escape_fires_once(self):
+    def test_the_mark_is_consumed_by_an_ISSUED_refetch_so_it_fires_once(self):
+        # CONTRACT INVERTED 2026-08-27 (#949). The old spelling used a stub
+        # returning None and asserted the mark was consumed anyway. Under the
+        # corrected contract the mark is spent by an OUTCOME, not by an
+        # attempt: an issued re-fetch consumes it, a decline keeps it. The
+        # anti-re-fire guarantee this test exists for is unchanged and is still
+        # asserted -- only the thing that earns it moved.
         req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
         holder = _holder(chunked_req=req)
-        holder._prefetch_kvcache = lambda r: None
+        holder._prefetch_kvcache = lambda r: "issued"
         self.assertEqual(self._apply(holder, req), "refetch")
         self.assertEqual(
             self._apply(holder, req),
@@ -556,9 +575,12 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
     def test_it_acts_on_a_marked_request_in_the_WAITING_QUEUE(self):
         from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
 
+        # CONTRACT INVERTED 2026-08-27 (#949): the stub must now report what
+        # actually happened. `lambda r: None` used to read as a successful
+        # re-fetch, which is the defect this ticket closes.
         stuck = _Req(RID_WAITING, prefix_len=8192, extend_len=4096)
         h = _holder(waiting_queue=[stuck])
-        h._prefetch_kvcache = lambda r: None
+        h._prefetch_kvcache = lambda r: "issued"
         pp_mark_premise_dead(stuck)
         self.assertEqual(self._sweep(h), {RID_WAITING: "refetch"})
 
@@ -568,7 +590,12 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
         stuck = _Req(RID_RUNNING, prefix_len=8192, extend_len=4096)
         seen = []
         h = _holder(running_batch=types.SimpleNamespace(reqs=[stuck]))
-        h._prefetch_kvcache = lambda r: seen.append(r.rid)
+
+        def _issue(r):
+            seen.append(r.rid)
+            return "issued"  # #949: report the outcome, never nothing
+
+        h._prefetch_kvcache = _issue
         pp_mark_premise_dead(stuck)
         self.assertEqual(self._sweep(h), {RID_RUNNING: "refetch"})
         self.assertEqual(seen, [RID_RUNNING])
@@ -598,3 +625,273 @@ class TheActMustSweepTheFourPlacesNotOneField(unittest.TestCase):
         self.assertEqual(
             self._sweep(h), {}, "the mark is consumed -- no re-firing per pass"
         )
+
+
+class _FakeTreeCache:
+    """A tree cache whose ONLY honest signal is the ongoing set.
+
+    Deliberately minimal: the verdict under test must be derived from the
+    EFFECT (did an operation get registered?) and not from anything this stub
+    says about itself.
+    """
+
+    def __init__(self, register: bool = True, gate_reason=None):
+        self.ongoing_prefetch = {}
+        self._register = register
+        self._gate_reason = gate_reason
+        self.calls = []
+        self.hicache_storage_pass_prefix_keys = False
+        self.root_node = object()
+
+    def prefetch_from_storage(self, req_id, *a, **kw):
+        self.calls.append(req_id)
+        if self._gate_reason is not None:
+            from sglang.srt.mem_cache.match_refusal_census import note_prefetch_gate
+
+            note_prefetch_gate(self._gate_reason, 4096)
+        if self._register:
+            self.ongoing_prefetch[req_id] = object()
+
+
+class TheRefetchVerdictMustBeAnOBSERVATIONNotAPromise(unittest.TestCase):
+    """#949 ARM 1 -- THE ONE WINDOW-946FIX PAID FOR.
+
+    The measured failure: `_prefetch_kvcache` returned None on all six of its
+    silent exits, the escape read that as success, and the boot showed 8885
+    escapes reporting "refetch" while `PREFETCH RE-ISSUED` stayed 0, `cached>0`
+    stayed 0 and the rid stayed frozen at told=8192. The compensator was, for
+    the first time in this family, provably ON the defect's path -- and its
+    SUCCESS VALUE WAS NOT EVIDENCE THAT IT ACTED.
+
+    THIS ARM IS DELIBERATELY NOT BEHIND `SGLANG_946_ACT_AT_RING`. My own
+    pre-boot finding this window was that the #948 discriminator counters sat
+    inside the actuator's env gate, so the stage that was supposed to read them
+    could not. An indicator must never sit behind the gate whose state it
+    measures, and this class is written to that lesson: it drives
+    `_prefetch_kvcache` and the actuator directly, with no env flag involved.
+    """
+
+    def _scheduler_with(self, tree_cache, enable=True):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        sched = types.SimpleNamespace()
+        sched.enable_hicache_storage = enable
+        sched.tree_cache = tree_cache
+        sched._prefetch_kvcache = types.MethodType(Scheduler._prefetch_kvcache, sched)
+        return sched
+
+    def _req(self):
+        req = _Req(RID_CHUNKED, prefix_len=8192, extend_len=4096)
+        req.init_next_round_input = lambda *a, **kw: None
+        req.last_host_node = types.SimpleNamespace(
+            backuped=True,
+            get_last_hash_value=lambda: "h",
+            get_prefix_hash_values=lambda parent: None,
+            parent=None,
+        )
+        req.host_hit_length = 0
+        req._compute_max_prefix_len = lambda n: n
+        return req
+
+    def test_an_ISSUED_refetch_is_proven_by_the_ONGOING_SET_not_the_return(self):
+        """DELIVERY PROOF. "issued" is only allowed to be returned when the
+        operation actually appears in `ongoing_prefetch` -- the registration at
+        unified_radix_cache.py:2996 that is the one event meaning a prefetch
+        exists. A return value alone is exactly what failed on metal."""
+        tc = _FakeTreeCache(register=True)
+        sched = self._scheduler_with(tc)
+        req = self._req()
+        self.assertEqual(sched._prefetch_kvcache(req), "issued")
+        self.assertIn(
+            req.rid,
+            tc.ongoing_prefetch,
+            "the verdict must be backed by a real registration, not asserted",
+        )
+
+    def test_CANFAIL_a_call_that_registers_NOTHING_is_never_issued(self):
+        """THE CAN-FAIL ARM, and it is the mutant that shipped. A
+        `prefetch_from_storage` that runs, raises nothing and registers nothing
+        is the shape of every one of the six silent exits. The old code called
+        this success."""
+        tc = _FakeTreeCache(register=False)
+        sched = self._scheduler_with(tc)
+        verdict = sched._prefetch_kvcache(self._req())
+        self.assertTrue(
+            verdict.startswith("declined:"),
+            f"a call that registered nothing must decline, got {verdict!r}",
+        )
+        self.assertTrue(tc.calls, "and it must genuinely have reached the call")
+
+    def test_each_silent_exit_declines_WITH_ITS_OWN_REASON(self):
+        """#767's lesson -- NAME THE EATEN BRANCH. A decline that cannot say
+        which term produced it sends the next reader to re-argue it, which is
+        how #915's three verdicts wore one boolean for twelve days."""
+        sched = self._scheduler_with(_FakeTreeCache(), enable=False)
+        self.assertEqual(
+            sched._prefetch_kvcache(self._req()), "declined:storage_disabled"
+        )
+
+        tc = _FakeTreeCache(register=False)
+        sched = self._scheduler_with(tc)
+        req = self._req()
+        req.last_host_node.backuped = False
+        self.assertEqual(sched._prefetch_kvcache(req), "declined:anchor_no_vote")
+        self.assertEqual(tc.calls, [], "an anchor decline must not reach the call")
+
+    def test_the_915_RATE_LIMITED_reason_reaches_the_verdict(self):
+        """CANDIDATE (iii) MADE READABLE. The coordinator's structural
+        suspicion -- the host-tier capacity asymmetry across the flip, where
+        `prefetch_capacity_limit` is `0.5 * mem_pool_host.size`
+        (cache_controller.py:841) and #905 measured 703472 PP rows against
+        30518 TP rows, a 23x gap -- can now ARRIVE at the escape as a named
+        reason instead of being re-derived from a comment."""
+        from sglang.srt.mem_cache import match_refusal_census as mrc
+
+        before = dict(mrc.PREFETCH_GATE_COUNTS)
+        try:
+            tc = _FakeTreeCache(register=False, gate_reason="rate_limited")
+            sched = self._scheduler_with(tc)
+            self.assertEqual(
+                sched._prefetch_kvcache(self._req()), "declined:rate_limited"
+            )
+        finally:
+            mrc.PREFETCH_GATE_COUNTS.clear()
+            mrc.PREFETCH_GATE_COUNTS.update(before)
+
+
+class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
+    """#949 ARM 2 -- THE CONSEQUENCE, and it is where the old code leaked.
+
+    The mark used to be cleared BEFORE the attempt, so a declined re-fetch
+    spent it for nothing and the request never saw the escape again. Invisible,
+    because the decline reported success. The corrected rule: an outcome spends
+    the mark, an attempt does not.
+    """
+
+    def _apply(self, holder, req):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_apply_dead_premise_at_chunk_boundary,
+        )
+
+        return pp_apply_dead_premise_at_chunk_boundary(holder, req)
+
+    def _marked(self, req):
+        from sglang.srt.managers.scheduler_pp_mixin import pp_mark_premise_dead
+
+        pp_mark_premise_dead(req)
+        return req
+
+    def test_a_decline_KEEPS_the_mark_so_the_escape_can_retry(self):
+        req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
+        holder = _holder(chunked_req=req)
+        holder._prefetch_kvcache = lambda r: "declined:rate_limited"
+        self.assertEqual(self._apply(holder, req), "refetch-declined")
+        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
+
+        self.assertTrue(
+            pp_premise_is_dead(req),
+            "a declined attempt must not spend the mark -- that is the leak "
+            "that made the escape a one-shot that never shot",
+        )
+        self.assertEqual(len(req.prefix_indices), 8192, "and the prefix is kept")
+
+    def test_the_decline_names_its_REASON_in_the_log(self):
+        req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
+        holder = _holder(chunked_req=req)
+        holder._prefetch_kvcache = lambda r: "declined:rate_limited"
+        catcher = _Catcher(logging.WARNING)
+        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log.addHandler(catcher)
+        try:
+            self._apply(holder, req)
+        finally:
+            log.removeHandler(catcher)
+        msg = "\n".join(catcher.messages)
+        self.assertIn("REFETCH DECLINED", msg)
+        self.assertIn("rate_limited", msg)
+        self.assertIn(
+            "cache_controller.py:841",
+            msg,
+            "a persistent rate_limited decline points at the #915 capacity "
+            "asymmetry, and the line must say so rather than leave it to be "
+            "rediscovered",
+        )
+
+    def test_the_retry_is_BOUNDED_and_ends_in_the_named_terminator(self):
+        """UNBOUNDED RETRY IS THE #858 LIVELOCK SHAPE. The cap is what makes
+        keeping the mark safe, and the terminator still names its discard so a
+        Kein-Doppel-Prefill breach can never be silent."""
+        from sglang.srt.managers.scheduler_pp_mixin import REFETCH_DECLINE_CAP
+
+        req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
+        holder = _holder(chunked_req=req)
+        holder._prefetch_kvcache = lambda r: "declined:rate_limited"
+        catcher = _Catcher(logging.WARNING)
+        log = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        log.addHandler(catcher)
+        try:
+            outcomes = [self._apply(holder, req) for _ in range(REFETCH_DECLINE_CAP)]
+        finally:
+            log.removeHandler(catcher)
+        self.assertEqual(
+            outcomes[:-1], ["refetch-declined"] * (REFETCH_DECLINE_CAP - 1)
+        )
+        self.assertEqual(outcomes[-1], "recompute", "the cap must terminate")
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertIn("8192", "\n".join(catcher.messages))
+
+    def test_CANFAIL_a_None_returning_prefetch_is_a_DECLINE_not_a_success(self):
+        """THE REGRESSION PIN FOR THE WHOLE TICKET. A tree cache that predates
+        the honest verdict returns None. Reading that as success is precisely
+        what produced 8885 silent no-ops on metal, so it must read as a
+        decline and the mark must survive."""
+        req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
+        holder = _holder(chunked_req=req)
+        holder._prefetch_kvcache = lambda r: None
+        self.assertEqual(self._apply(holder, req), "refetch-declined")
+        from sglang.srt.managers.scheduler_pp_mixin import pp_premise_is_dead
+
+        self.assertTrue(pp_premise_is_dead(req))
+
+
+class The915GateLineMustBeWIREDNotMerelyPresent(unittest.TestCase):
+    """#949 ARM 3 -- THE THREE-STATE DELIVERY RULE, applied to #915.
+
+    #915 was PRESENT-BUT-UNWIRED for twelve days: `note_prefetch_gate` recorded
+    the decline reason on every attempt, and `format_prefetch_gate` had ZERO
+    callers anywhere in the tree, so it was never printed. Every boot script
+    printed that state and it was read as a note rather than as the missing
+    half. This arm pins the wiring so it cannot silently regress.
+    """
+
+    def test_the_formatter_has_an_importer_OUTSIDE_its_own_module(self):
+        import sglang.srt.mem_cache.unified_radix_cache as urc
+
+        self.assertTrue(
+            hasattr(urc, "_format_prefetch_gate"),
+            "PRESENT-BUT-UNWIRED is the middle state and the expensive one: "
+            "the reason was recorded all along and could not be read",
+        )
+
+    def test_the_gate_line_is_rate_limited_and_shares_the_census_knob(self):
+        from sglang.srt.mem_cache import match_refusal_census as mrc
+
+        self.assertEqual(
+            mrc.prefetch_gate_due.__module__,
+            "sglang.srt.mem_cache.match_refusal_census",
+        )
+
+    def test_ABSENT_is_not_zero_in_the_gate_line(self):
+        from sglang.srt.mem_cache import match_refusal_census as mrc
+
+        before = dict(mrc.PREFETCH_GATE_COUNTS)
+        try:
+            mrc.PREFETCH_GATE_COUNTS.clear()
+            self.assertIn("no observation", mrc.format_prefetch_gate())
+            mrc.note_prefetch_gate("rate_limited", 4096)
+            line = mrc.format_prefetch_gate()
+            self.assertIn("rate_limited=1", line)
+            self.assertNotIn("anchor=", line, "a term that never fired is ABSENT")
+        finally:
+            mrc.PREFETCH_GATE_COUNTS.clear()
+            mrc.PREFETCH_GATE_COUNTS.update(before)

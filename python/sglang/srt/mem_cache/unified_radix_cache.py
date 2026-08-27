@@ -66,8 +66,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.match_refusal_census import (
     emit as census_emit,
+    format_prefetch_gate as _format_prefetch_gate,
     new_match_census,
     note_prefetch_gate as _note_prefetch_gate,
+    prefetch_gate_due as _prefetch_gate_due,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -1509,6 +1511,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         census_emit(census, logger)
+        # #915 THE OTHER HALF, wired at last. The reason a prefetch declined has
+        # been recorded on every attempt since #915 landed and was never once
+        # printed, because this call did not exist. See `prefetch_gate_due`.
+        if _prefetch_gate_due():
+            logger.info("%s", _format_prefetch_gate())
         return (
             value,
             best_match_node,

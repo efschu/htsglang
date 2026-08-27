@@ -1326,6 +1326,15 @@ def pp_request_locations(holder) -> Dict[str, object]:
 #: rank that must ACT on the mark is not always the rank that saw the void.
 _PREMISE_DEAD_STAMP = "_pp_premise_dead_generation"
 
+#: #949: how many DECLINED re-fetches a request may collect before the escape
+#: gives up on the cheap path and spends the expensive one. Bounded because an
+#: unbounded retry is the #858 livelock shape; small because each round costs a
+#: pass. The retry only exists at all now that a decline can be TOLD APART from
+#: a success -- before window-946fix-0828 every decline was reported as
+#: "refetch" and there was nothing to retry on.
+_REFETCH_DECLINE_STREAK = "_pp_refetch_decline_streak"
+REFETCH_DECLINE_CAP = 3
+
 
 def pp_mark_premise_dead(req) -> None:
     """#946 DECIDE AT THE VOID: record that this request's prefix premise is
@@ -1396,9 +1405,17 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
     names the tokens it throws away: a law breach may be necessary, it may
     never be silent.
 
-    CONSUMED ONCE. The mark is cleared whichever branch runs, so an escape
-    cannot re-fire on every chunk -- that would be the 2106-line log in a new
-    colour.
+    CONSUMED BY AN OUTCOME, NOT BY AN ATTEMPT (#949, corrected after
+    window-946fix-0828). The mark used to be cleared before the re-fetch was
+    even tried, so a DECLINED re-fetch spent the mark and the request never got
+    the escape again. That was invisible while every decline was reported as
+    "refetch". Now: ISSUED clears it, the terminator clears it, and a decline
+    KEEPS it and retries -- bounded by `REFETCH_DECLINE_CAP`, after which the
+    terminator runs. The escape still cannot re-fire for ever, which is what
+    the old blanket clear was protecting against; it simply no longer pays for
+    that with a silently wasted mark.
+
+    Returns "none" / "refetch" / "refetch-declined" / "recompute".
     """
     # #948 COUNTER (c): did the stamp move between mark and act? Counted with
     # BOTH values, because "they differ" without the numbers cannot tell a
@@ -1420,15 +1437,18 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
         )
     if not pp_premise_is_dead(req):
         return "none"
-    try:
-        delattr(req, _PREMISE_DEAD_STAMP)
-    except AttributeError:
-        pass
+
+    # #949 THE MARK IS NO LONGER CONSUMED BEFORE THE ATTEMPT. It used to be
+    # cleared here, unconditionally, so a re-fetch that was DECLINED still
+    # burned the mark and the request was never offered the escape again --
+    # invisible, because the decline was reported as "refetch". Now the mark is
+    # spent only by an outcome that actually changed something: an ISSUED
+    # re-fetch, or the terminator.
     prefetch = getattr(holder, "_prefetch_kvcache", None)
     if callable(prefetch):
+        verdict = "declined:raised"
         try:
-            prefetch(req)
-            return "refetch"
+            verdict = prefetch(req)
         except Exception as exc:  # noqa: BLE001 - fall through to the terminator
             logger.warning(
                 "#946 re-fetch could not be issued for rid=%s (%s); falling "
@@ -1436,6 +1456,70 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
                 getattr(req, "rid", "?"),
                 exc,
             )
+        # A tree cache that predates the honest verdict returns None. Treat
+        # that as UNOBSERVABLE, never as success -- reading a missing answer as
+        # a good one is the exact defect this ticket closes.
+        if verdict is None:
+            verdict = "declined:unobservable"
+        if verdict == "issued":
+            try:
+                delattr(req, _PREMISE_DEAD_STAMP)
+            except AttributeError:
+                pass
+            try:
+                delattr(req, _REFETCH_DECLINE_STREAK)
+            except AttributeError:
+                pass
+            pp_premise_probe(holder, "refetch_issued", rid=getattr(req, "rid", "?"))
+            return "refetch"
+
+        streak = int(getattr(req, _REFETCH_DECLINE_STREAK, 0) or 0) + 1
+        setattr(req, _REFETCH_DECLINE_STREAK, streak)
+        reason = str(verdict).split(":", 1)[-1]
+        pp_premise_probe(
+            holder,
+            "refetch_declined",
+            rid=getattr(req, "rid", "?"),
+            reason=reason,
+            streak=streak,
+        )
+        if streak < REFETCH_DECLINE_CAP:
+            # KEEP THE MARK and retry next round. The premise is still dead and
+            # the cheap escape has not been shown impossible -- only unavailable
+            # on this pass. Bounded by the cap directly below.
+            logger.warning(
+                "#946 REFETCH DECLINED rid=%s reason=%s streak=%d/%d: the "
+                "dead-premise escape asked for a re-fetch and NONE WAS ISSUED. "
+                "The mark is kept and the escape retries next round. If "
+                "reason=rate_limited persists, the root is the #915 host-tier "
+                "capacity asymmetry across the flip (prefetch_capacity_limit "
+                "is 0.5 * mem_pool_host.size, cache_controller.py:841) and "
+                "NOT this escape.",
+                getattr(req, "rid", "?"),
+                reason,
+                streak,
+                REFETCH_DECLINE_CAP,
+            )
+            return "refetch-declined"
+        logger.warning(
+            "#946 REFETCH DECLINED rid=%s reason=%s streak=%d/%d -- CAP "
+            "REACHED, spending the terminator below.",
+            getattr(req, "rid", "?"),
+            reason,
+            streak,
+            REFETCH_DECLINE_CAP,
+        )
+
+    # The terminator consumes the mark: this branch does change something, and
+    # a request that reaches it must not arrive again on the same premise.
+    try:
+        delattr(req, _PREMISE_DEAD_STAMP)
+    except AttributeError:
+        pass
+    try:
+        delattr(req, _REFETCH_DECLINE_STREAK)
+    except AttributeError:
+        pass
     discarded = len(getattr(req, "prefix_indices", None) or ())
     logger.warning(
         "#946 PREMISE RECOMPUTE rid=%s: no re-fetch could be issued, so the "

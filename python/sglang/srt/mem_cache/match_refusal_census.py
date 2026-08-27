@@ -273,6 +273,68 @@ def format_prefetch_gate() -> str:
     return f"[#915 prefetch-gate] {body}"
 
 
+_gate_emitted = 0
+
+
+def prefetch_gate_due() -> bool:
+    """True on the cadence at which the #915 gate line should be logged.
+
+    #915 SHIPPED HALF-WIRED AND STAYED THAT WAY FOR TWELVE DAYS.
+    `note_prefetch_gate` has always been called (unified_radix_cache.py:2842),
+    so the decline reason was RECORDED on every prefetch attempt -- but
+    `format_prefetch_gate` had ZERO callers anywhere in the tree, so it was
+    never REPORTED. The boot script printed that state at every window
+    ("1 hit in its own file and 0 caller file(s) elsewhere -> STILL
+    PRAESENT-ABER-UNVERDRAHTET") and it was read as a note rather than as the
+    missing half it was.
+
+    The cost was measured on window-946fix-0828: the #946 escape declined
+    thousands of times and the reason -- anchor / too_short / rate_limited --
+    was sitting in this module's counters the whole time, unreadable from the
+    log. PRESENT-BUT-UNWIRED, the middle state of the three-state delivery
+    rule, and the most expensive one in both directions.
+
+    Shares `census_every()` so one env knob arms both and the two lines cannot
+    drift apart in a log.
+    """
+    global _gate_emitted
+    every = census_every()
+    if every <= 0:
+        return False
+    _gate_emitted += 1
+    return _gate_emitted % every == 0
+
+
+def gate_snapshot() -> Dict[str, int]:
+    """Copy of the gate counters, for a per-call DELTA.
+
+    A running total cannot say which term declined THIS request, and the whole
+    point of a decline reason is that it belongs to one request. Taken before
+    the call, compared after.
+    """
+    return dict(PREFETCH_GATE_COUNTS)
+
+
+def gate_reason_since(before: Dict[str, int]) -> str:
+    """Which #915 term declined during the call bracketed by ``before``.
+
+    Order is attribution order, matching the caller in `prefetch_from_storage`
+    which evaluates the three terms in sequence and names the FIRST that fails;
+    a request can trip several and summing them would double-count.
+
+    ``attempted_but_unregistered`` is the honest answer for "the gate let it
+    through and it still never registered" -- an alloc failure or a negative
+    consensus vote below the gate. It is deliberately NOT called a success:
+    the whole defect being fixed is a path that reported one.
+    """
+    for key in ("anchor", "too_short", "rate_limited"):
+        if PREFETCH_GATE_COUNTS.get(key, 0) > before.get(key, 0):
+            return key
+    if PREFETCH_GATE_COUNTS.get("attempted", 0) > before.get("attempted", 0):
+        return "attempted_but_unregistered"
+    return "unreported"
+
+
 def classify(
     census: Optional[MatchRefusalCensus],
 ) -> MatchOutcome:
