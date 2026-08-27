@@ -2491,7 +2491,7 @@ class KvBufferDesc:
         return (page_size // self.tokens_per_row) * self.row_bytes
 
 
-def maybe_poison_pool_data(tensors, source: str) -> None:
+def maybe_poison_pool_data(tensors, source: str, row_limit=None) -> None:
     """SGLANG_POISON_POOL_DATA: fill freshly allocated pool DATA buffers with
     NaN instead of zeros (index/cursor tensors must stay semantic zeros and
     are not passed here).
@@ -2511,18 +2511,29 @@ def maybe_poison_pool_data(tensors, source: str) -> None:
     buffers and the falsifier reported a false pass for the KV read paths.
     (For the packed-fp4 pool 0xFF is not NaN but a saturated extreme value —
     still a loud, deterministic poison.)
+
+    ``row_limit`` (#918): a VMM-backed pool's tensor spans its VA reservation
+    while only the rows below the watermark are mapped, and at construction
+    that watermark is ONE PAGE. ``fill_`` over the whole tensor there is an
+    illegal address, i.e. the falsifier would kill exactly the boots it was
+    switched on to diagnose. ``None`` keeps the whole-tensor behaviour for
+    eager pools, whose rows are as mapped as the tensor is.
     """
     if not envs.SGLANG_POISON_POOL_DATA.get():
         return
     poisoned = 0
+    limit = None if row_limit is None else max(0, int(row_limit))
     for t in tensors:
         if t is None:
             continue
+        view = t if limit is None else t[:limit]
+        if view.numel() == 0:
+            continue
         if t.is_floating_point():
-            t.fill_(float("nan"))
+            view.fill_(float("nan"))
             poisoned += 1
         elif t.dtype == torch.uint8:
-            t.fill_(0xFF)
+            view.fill_(0xFF)
             poisoned += 1
     logger.warning(
         "SGLANG_POISON_POOL_DATA: poisoned %d %s buffers with NaN "
@@ -2984,6 +2995,7 @@ class MHATokenToKVPool(KVCache):
             list(getattr(self, "k_buffer", []) or [])
             + list(getattr(self, "v_buffer", []) or []),
             "MHA KV pool",
+            row_limit=self.safe_zero_rows,
         )
 
         self.device_module = torch.get_device_module(self.device)
@@ -3057,6 +3069,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        # Cleared first so a re-creation cannot inherit the previous layout's
+        # descriptors through the post-capture hand-off below (#918).
+        self._kv_buffer_descs = None
         if self.post_capture_active or self.swappable_backing:
             self._alloc_post_capture_buffers()
             if self.swappable_backing and not self.post_capture_active:
@@ -3065,7 +3080,11 @@ class MHATokenToKVPool(KVCache):
                 self._post_capture_owner.finalize(int(self.size))
         else:
             self._create_buffers_normal()
-        self._kv_buffer_descs = self._build_kv_buffer_descs()
+        # The post-capture lane already published the descs the ARENA holds
+        # (#918); rebuilding here would derive a second list from the widened
+        # tensors and re-infer a layout the widening deliberately obscures.
+        if getattr(self, "_kv_buffer_descs", None) is None:
+            self._kv_buffer_descs = self._build_kv_buffer_descs()
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -3153,10 +3172,25 @@ class MHATokenToKVPool(KVCache):
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
-    def _build_kv_buffer_descs(self):
+    def _build_kv_buffer_descs(self, reserved_rows: Optional[int] = None):
         """Per-buffer layout descriptors, k0..k(L-1) then v0..v(L-1). Drives both the
         CUDA-VMM post-capture backing and PD-transfer registration
-        (get_contiguous_buf_infos). Override per layout."""
+        (get_contiguous_buf_infos). Override per layout.
+
+        ``reserved_rows`` (#918) sizes the LEADING dimension for a token count
+        the pool may later dial up to, instead of for ``self.size`` at this
+        instant. It exists so the VA reservation and the token ceiling are ONE
+        derivation: ``_alloc_post_capture_buffers`` passes the same
+        ``_lawful_reserved_tokens()`` here and to ``reserved_num_tokens``. Until
+        #918 only the ceiling was raised (#851 F2), the tensors kept their boot
+        size, and every dial target in between passed ``_check_final`` and was
+        refused by ``_check_span`` one phase flip later. ``store_bound_rows``
+        and ``check_cpu_copy_rows`` already DOCUMENT the widened value as what
+        this lane holds ("On the dial lane it is the boot VA reservation") --
+        this is what makes those sentences true. It buys address space, not
+        pages: the arena commits lazily and ``torch.empty`` never touches the
+        unbacked tail.
+        """
         itemsize = self.store_dtype.itemsize
         # Derive from the real buffers when they exist (covers arbitrary layouts,
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
@@ -3168,10 +3202,27 @@ class MHATokenToKVPool(KVCache):
             k_shape, v_shape = self._kv_buffer_shapes()
         # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
         # a single token slot for the plain NHD [slots, ...] layout.
+        #
+        # CACHED, BECAUSE THE TEST IS ONLY VALID AGAINST AN UNWIDENED SHAPE. It
+        # infers the layout from the relation ``leading_dim * page_size ==
+        # size + page_size``, which a ``reserved_rows`` widening deliberately
+        # breaks -- a second call against the widened tensors would silently
+        # read a paged layout as slot-major and inflate every span by
+        # ``page_size``. The layout does not change during a pool's life, so
+        # the first answer is the answer (#918).
         num_slots = self.size + self.page_size
-        tokens_per_row = (
-            self.page_size if k_shape[0] * self.page_size == num_slots else 1
-        )
+        tokens_per_row = getattr(self, "_kv_tokens_per_row", None)
+        if tokens_per_row is None:
+            tokens_per_row = (
+                self.page_size if k_shape[0] * self.page_size == num_slots else 1
+            )
+            self._kv_tokens_per_row = int(tokens_per_row)
+        tokens_per_row = int(tokens_per_row)
+        if reserved_rows is not None:
+            want = -(-(int(reserved_rows) + self.page_size) // tokens_per_row)
+            if want > int(k_shape[0]):
+                k_shape = (want,) + tuple(k_shape[1:])
+                v_shape = (want,) + tuple(v_shape[1:])
         descs = []
         for prefix, shape in (("k", k_shape), ("v", v_shape)):
             row_bytes = int(np.prod(shape[1:])) * itemsize
@@ -3280,22 +3331,37 @@ class MHATokenToKVPool(KVCache):
             swappable=bool(self.swappable_backing),
             retain_env=os.environ.get("SGLANG_FLIP_SEAM_RETAIN_HANDLES", ""),
         )
+        # #851 F2: reserve for every backing the dial may LAWFULLY reach, not
+        # for the size at this instant. A VA reservation is address space, not
+        # committed pages (the point of swappable_backing), so over-reserving
+        # costs nothing that matters while under-reserving is a permanent wall
+        # no runtime actuator can lift.
+        #
+        # #918: ONE VALUE, BOTH USES, ON ONE LINE, and that is the entire fix.
+        # F2 raised `reserved_num_tokens` and left `buffer_descs` sized for
+        # `self.size`, so the owner's token ceiling ran 1 + admission_reserve
+        # rows ahead of the bytes behind it and the dial walked into the gap.
+        # Passing the same number to both makes the divergence unrepresentable
+        # rather than merely currently-absent; `KvVmmBufferOwner.__init__`
+        # refuses the pair if a future caller separates them again.
+        lawful_reserved = int(self._lawful_reserved_tokens())
+        buffer_descs = self._build_kv_buffer_descs(reserved_rows=lawful_reserved)
         self._post_capture_owner = KvVmmBufferOwner(
             device=self.device,
             device_id=device_id,
             store_dtype=self.store_dtype,
             page_size=self.page_size,
-            # #851 F2: reserve for every backing the dial may LAWFULLY reach,
-            # not for the size at this instant. A VA reservation is address
-            # space, not committed pages (the point of swappable_backing), so
-            # over-reserving costs nothing that matters while under-reserving
-            # is a permanent wall no runtime actuator can lift.
-            reserved_num_tokens=self._lawful_reserved_tokens(),
-            buffer_descs=self._build_kv_buffer_descs(),
+            reserved_num_tokens=lawful_reserved,
+            buffer_descs=buffer_descs,
             commit_chunk_bytes=self._vmm_commit_chunk_bytes or seam_chunk,
             retain_handles=retain,
         )
         self._assign_post_capture_tensors(self._post_capture_owner.tensors)
+        # THE SAME LIST THE ARENA HOLDS, not a second build of it. The zeroing
+        # loop in `runtime_set_backing_tokens` and `get_contiguous_buf_infos`
+        # index the pool's descs while `_check_span` bounds the owner's; two
+        # separately-derived lists is the same defect shape one level down.
+        self._kv_buffer_descs = buffer_descs
 
     def finalize_backing(self, config) -> None:
         """After capture+sizing: back the final span and set serving capacity.
@@ -3520,17 +3586,31 @@ class MHATokenToKVPool(KVCache):
         leaves stale bytes in a region no sequence reads, while zeroing more
         touches unmapped memory and kills the process. Those two errors are
         not comparable, so the conservative one is chosen on purpose.
+
+        BOUNDED BY THE WATERMARK, NOT BY ``size`` (#918). The docstring above
+        states the rule -- "only the rows below the current watermark are
+        mapped" -- and the body derived its answer from the EXPOSED axis
+        instead. That was harmless only while the tensor ended at
+        ``size + page_size``, i.e. while the guard could not actually be wrong.
+        Since the reservation is now the tensor's real extent, ``size`` may sit
+        above the committed backing (that is the whole point of a dial), and
+        zeroing to ``size`` would write unmapped VA -- the precise fault this
+        property exists to prevent.
         """
         owner = self._post_capture_owner
         specs = getattr(owner, "_specs", None) if owner is not None else None
         if not specs:
             return None
+        tokens = int(self.size) + int(self.page_size)
+        watermark = self._committed_row_bound()
+        if watermark is not None:
+            tokens = min(tokens, int(watermark))
         rows = []
         for spec in specs:
             desc = getattr(spec, "desc", None)
             if desc is None:
                 return None
-            rows.append(desc._rows(int(self.size) + int(self.page_size)))
+            rows.append(desc._rows(tokens))
         return min(rows) if rows else None
 
     @property
@@ -3539,9 +3619,32 @@ class MHATokenToKVPool(KVCache):
 
     @property
     def uniform_backed_rows(self) -> int:
-        """Rows backed in EVERY buffer. See KvVmmBufferOwner.uniform_backed_tokens."""
+        """Rows backed in EVERY buffer. See KvVmmBufferOwner.uniform_backed_tokens.
+
+        READS THE ARENA, NOT THE RESERVATION, AND #913 BRIEFLY MADE IT READ THE
+        RESERVATION. ``940a7bba31`` changed this body from
+        ``owner.uniform_backed_tokens`` to ``owner.reserved_rows`` while adding
+        ``_committed_row_bound`` below; nothing in that commit's message asks
+        for the change, and its own argument is the opposite one -- "the hazard
+        lives on uniform_backed_rows, which moves on every shrink". A
+        reservation does not move. The collateral edit collapsed the two axes
+        #828 had just separated, and every consumer that plans against this
+        number was then planning against an immutable ceiling:
+
+          * ``kv_backing_relief._physical_backed_rows`` promises it "never
+            invents backing that is not there" and reads exactly this;
+          * ``runtime_set_backing_tokens`` skips ``owner.finalize`` -- and with
+            it the ONLY span check on the grow path -- whenever ``n <= backed``.
+
+        Measured, boot_rerun0826 21:59:41Z PP1: the rung read ``current=131917``
+        (the reservation) where the arena held 115533 rows, took 94.1% of it,
+        and dialled ``size`` to 124127 -- 8595 rows past the end of the K/V
+        tensors, with no check anywhere on the way. Thirteen seconds later the
+        flip's ``restore_backing`` asked for that span and ``_check_span``
+        refused it (#918).
+        """
         owner = self._post_capture_owner
-        return int(owner.reserved_rows) if owner is not None else 0
+        return int(owner.uniform_backed_tokens) if owner is not None else 0
 
     def _committed_row_bound(self) -> Optional[int]:
         """Highest row id + 1 whose page is committed, or None if unanswerable.

@@ -1100,6 +1100,57 @@ def arena_reserve_bytes(reserved_spans: Sequence[int], granularity: int) -> int:
     return total
 
 
+def serviceable_reserved_tokens(
+    buffer_descs: Sequence["KvBufferDesc"], itemsize: int, page_size: int
+) -> int:
+    """The largest ``final_num_tokens`` these buffers' BYTES can actually serve.
+
+    #918, AND IT IS THE OTHER HALF OF A NUMBER THAT WAS ONLY EVER RAISED ON ONE
+    SIDE. ``KvVmmBufferOwner`` carries two independent derivations of "the
+    reservation" and enforces them in two different places:
+
+    * ``_check_final`` bounds a request by ``_reserved_num_tokens`` -- a TOKEN
+      COUNT the caller passes in, since #851 F2 (``e62b1fae26``)
+      ``lawful_reservation_rows(size, admission_reserve, 0)`` = ``size + 1 +
+      reserve``;
+    * ``_check_span`` bounds the resulting BYTES by ``spec.reserved_span`` =
+      ``prod(desc.shape) * itemsize`` -- the tensor, whose leading dimension
+      came from ``size + page_size``.
+
+    Nothing ever tied the two together. #851 F2 raised the token ceiling by
+    ``1 + reserve`` rows and left the byte reservation exactly where it was, so
+    every value in ``(shape rows - page_size, reserved_num_tokens]`` passes the
+    first check and fails the second. Measured, boot_rerun0826 21:59:55Z, PP1::
+
+        reserved tensor bytes 118305792 = (115532 + 1) rows x 1024 B
+        _reserved_num_tokens  131917    = 115532 + 1 + 16384
+        the dial exposed       124127   -> span (124127 + 1) x 1024
+                                        =  127107072  > 118305792   BOOM
+
+    Pure, so the divergence is constructible without a card, a driver or a
+    boot -- which is what it took to find it, because both numbers are correct
+    in isolation and only their RELATION is wrong.
+
+    ``final_span_bytes(n)`` is ``ceil((n + page_size) / tokens_per_row) *
+    row_bytes``, monotone in ``n``, so the inverse is exact: a buffer holding
+    ``R = reserved_span // row_bytes`` whole rows serves at most
+    ``R * tokens_per_row - page_size`` tokens. The minimum across buffers is
+    the owner's real ceiling.
+    """
+    page = int(page_size)
+    best: Optional[int] = None
+    for desc in buffer_descs:
+        row_bytes = int(desc.row_bytes)
+        if row_bytes <= 0:
+            return 0
+        rows = int(desc.reserved_span_bytes(int(itemsize))) // row_bytes
+        per_row = max(1, int(desc.tokens_per_row))
+        serviceable = rows * per_row - page
+        if best is None or serviceable < best:
+            best = serviceable
+    return max(0, int(best)) if best is not None else 0
+
+
 class _BufferSpec:
     """Per-buffer placement + backing state inside the shared VA reservation."""
 
@@ -1149,6 +1200,32 @@ class KvVmmBufferOwner:
         self.tensors: List[torch.Tensor] = []
 
         itemsize = store_dtype.itemsize
+
+        # #918: THE TWO DERIVATIONS OF "THE RESERVATION" MUST AGREE, AND THE
+        # ONLY PLACE THAT CAN SEE BOTH IS HERE. ``reserved_num_tokens`` arrives
+        # as a token count from the caller; ``buffer_descs`` arrive as shapes.
+        # ``_check_final`` enforces the first and ``_check_span`` the second,
+        # 13 seconds and one phase flip apart, so a caller that raises one
+        # without the other ships a ceiling that is pure fiction and finds out
+        # from a dead rank. Refuse at construction instead, naming BOTH numbers
+        # and the row count each implies -- a boot-time refusal is recoverable,
+        # an unbackable exposed id space is not.
+        serviceable = serviceable_reserved_tokens(
+            buffer_descs, itemsize, self.page_size
+        )
+        if self._reserved_num_tokens > serviceable:
+            raise ValueError(
+                f"KvVmmBufferOwner: reserved_num_tokens={self._reserved_num_tokens} "
+                f"exceeds the {serviceable} tokens these buffer shapes can hold "
+                f"(smallest buffer's reserved tensor bytes / row_bytes, minus the "
+                f"padded page). The token ceiling and the byte reservation are two "
+                f"derivations of ONE quantity: raising only the first publishes a "
+                f"ceiling `_check_final` accepts and `_check_span` then refuses, "
+                f"which is #918. Size the buffer_descs for the reservation "
+                f"(MHATokenToKVPool._alloc_post_capture_buffers passes the same "
+                f"_lawful_reserved_tokens() to both), or lower the ceiling."
+            )
+
         with torch.cuda.device(self.device_id):
             gran = query_granularity(self.device_id)
             reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
@@ -1426,6 +1503,15 @@ class KvVmmBufferOwner:
         ``size + 1 + reserve`` (memory_pool.py, ``KvVmmBufferOwner(...)``), so
         the reservation covers the largest floor the rung can demand AT THE
         BOOT SIZE. #848 is closed and measured 0 from W24 onward.
+
+        AND UNTIL #918 THIS NUMBER WAS NOT BACKED BY BYTES. F2 raised the
+        token ceiling and left ``buffer_descs`` sized for ``self.size``, so
+        ``reserved_rows`` ran ``1 + reserve`` rows ahead of the tensors it
+        claims to describe: ``_check_final`` accepted targets in that gap and
+        ``_check_span`` refused them, one phase flip later, on a live rank.
+        ``__init__`` now refuses that pair outright and the caller passes ONE
+        ``_lawful_reserved_tokens()`` to both sides, so this property and
+        ``MHATokenToKVPool.store_bound_rows`` describe the same extent again.
 
         WHAT IS STILL NOT COVERED, named rather than implied: the law is not
         a FIXED POINT. ``size`` may lawfully climb to this reservation, and at
