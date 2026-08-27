@@ -219,15 +219,28 @@ class TestTheWiring(CustomTestCase):
     wiring is checked structurally and the behaviour is checked above."""
 
     def test_the_cutover_is_the_only_caller_that_copies(self):
+        """#920 turned the constant into a DECISION, and this pin followed it.
+
+        The property being pinned is unchanged and is the one that matters:
+        ``build_cutover_release`` is the only site in the tree that can turn
+        ``copy_state`` on, so it is the only site that has to be read to know
+        who copies. What changed is that the site no longer says ``True``
+        unconditionally -- it asks ``seam_copy_addresses_the_bound_pool``
+        whether this rank's ``req_to_token`` entries are rows of the pool that
+        is bound right now, because under the TP layout they are compacted and
+        are not (test_seam_idspace_920.py carries the measurement). Asserting
+        the literal would now pass only on a revert of that fix, so the
+        assertion names the decision instead, and still refuses a second
+        copying site.
+        """
         import inspect
 
         import sglang.srt.managers.schedule_batch as sb
         from sglang.srt.managers import phase_flip_runtime
 
-        self.assertIn(
-            "copy_state=True",
-            inspect.getsource(phase_flip_runtime.build_cutover_release),
-        )
+        src = inspect.getsource(phase_flip_runtime.build_cutover_release)
+        self.assertIn("copy_state=copy_state", src)
+        self.assertIn("seam_copy_addresses_the_bound_pool(", src)
         self.assertNotIn(
             "copy_state=True", inspect.getsource(sb.ScheduleBatch.retract_all)
         )

@@ -76,6 +76,7 @@ from __future__ import annotations
 import types
 from typing import List, Optional
 
+from sglang.srt.managers.phase_flip_runtime import PHASE_PP
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -435,6 +436,16 @@ class FaithfulCensusScheduler:
         self.token_to_kv_pool_allocator = self.ledger
         self.hisparse_coordinator = None
         self.phase_flip_runtime = None
+        # #920: THE DOUBLE HAS TO SAY WHICH LAYOUT IT IS, because that is now
+        # what decides whether the cutover may copy resident state out. This
+        # ledger hands out row ids that ARE its pool's rows -- the PP-side
+        # identity `local_pp = my_slots` (layers/dcp/phase_flip_plan.py:573) --
+        # so `pp` is the truthful declaration and the copy assertions above
+        # keep exercising the path they were written for. Leaving it unset
+        # would make the double an UNKNOWN layout, which the seam declines,
+        # and the decline is correct for an unknown: a row id means nothing
+        # without the pool it was enumerated in (`_active_layout_tag`).
+        self.phase_flip_active_stack = PHASE_PP
         self.waiting_queue: List[FaithfulReq] = []
         self.queued: List[tuple] = []
         self.rank = rank
