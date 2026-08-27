@@ -124,6 +124,14 @@ _COLLECTIVE_REEXPORTS = (
 _POOL_SLOT_ORDER: tuple[PoolName, ...] = tuple(PoolName)
 _POOL_SLOT_COUNT: int = len(_POOL_SLOT_ORDER)
 
+#: #939: how many times one request's storage prefetch may be re-issued across
+#: cutovers before the situation is reported as a recompute. A REPORT, not a
+#: gate: refusing the re-issue would be a rank-local decision taken inside the
+#: #580 participation region, which is the one thing this whole path may not
+#: do. The line exists so a cutover cadence faster than a fetch completes is
+#: named in the log instead of showing up only as an unexplained `cached=0`.
+_MAX_PREFETCH_REISSUES: int = 3
+
 # Poll schedule for _wait_bounded. The spin window covers the latency of a
 # healthy CPU collective between local ranks, so the sleep path is only ever
 # reached once something is actually wrong.
@@ -759,6 +767,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
+        # #939: prefetch records displaced by a RE-ISSUE of the same req_id.
+        # They are terminated but NOT freed here -- see `_retire_ongoing_prefetch`
+        # -- and drained by `drain_retired_prefetch` from the per-round reap.
+        self._retired_prefetch: list[_OngoingPrefetch] = []
+        self._retired_prefetch_attempts: dict[str, int] = {}
+        self._retired_prefetch_reaped = 0
+        self._retired_prefetch_recompute = 0
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         # #810: built in `init_hicache`, once the controller and the
         # symmetrized prefetch reservation exist. None here and for the whole
@@ -1293,12 +1308,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -2947,6 +2962,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - a diagnostic may never break a path
             operation._host_pool_id_at_reg = None
             operation._host_pool_epoch_at_reg = None
+        # #939: A RE-ISSUE MUST NOT CLOBBER THE RECORD IT REPLACES.
+        #
+        # `_prefetch_kvcache` re-runs this whole path when a retracted request
+        # is re-queued (`_add_request_to_queue`), which is exactly what a phase
+        # cutover produces -- so a pre-cutover record can still be registered
+        # under this req_id when the post-cutover one arrives. The assignment
+        # below used to overwrite it outright: its `host_indices` were lost to
+        # every owner (nothing else holds them) and its `anchor_lock_params`
+        # lock ref was never decremented, leaving the node PROTECTED forever.
+        # The next cutover's drop then orphans exactly that node's device rows,
+        # which is the #938 shape -- one request's allocation per cutover --
+        # without any in-flight write-through being needed to explain it.
+        #
+        # Retire, do not reap. See `_retire_ongoing_prefetch`.
+        self._retire_ongoing_prefetch(req_id)
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
@@ -2956,6 +2986,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _retire_ongoing_prefetch(self, req_id: str) -> bool:
+        """Displace the record under ``req_id``, terminated but NOT freed.
+
+        FREEING HERE WOULD BE A USE-AFTER-FREE. Whether this operation's host
+        span is safe to release is answered by `can_terminate_prefetch`, which
+        checks `pool_transfers_done` and is COLLECTIVE (an all_reduce over the
+        attention groups). `HiCacheController.terminate_prefetch` is only
+        `operation.mark_terminate()` -- a flag, not a join -- so a span freed
+        at this point can still be the destination the prefetch transfer thread
+        is writing into. And running that collective here is not an option
+        either: whether a clobber happens is a RANK-LOCAL condition, and this
+        function already sits inside the #580 participation region, so a
+        collective conditional on it is the #580 desync verbatim.
+
+        So the record moves to `_retired_prefetch`, where the per-round drain --
+        which is allowed to run collectives, and does -- reaps it.
+
+        THE ORDERING QUESTION IS ANSWERED BY CONSTRUCTION, not by timing: the
+        re-issue owns the `req_id` slot from here on, so a late completion for
+        the displaced operation resolves through `check_prefetch_progress` to
+        the NEW record and never touches the old one. The old one is reachable
+        only from the retired list, i.e. only from the reap.
+        """
+        record = self.ongoing_prefetch.pop(req_id, None)
+        if record is None:
+            return False
+        try:
+            record.operation.mark_terminate()
+        except Exception:  # noqa: BLE001 - a terminated flag may never break this
+            pass
+        self._retired_prefetch.append(record)
+        attempts = self._retired_prefetch_attempts.get(req_id, 0) + 1
+        self._retired_prefetch_attempts[req_id] = attempts
+        logger.info(
+            "#939 PREFETCH RE-ISSUED: req=%s displaced record retired (attempt "
+            "%d); its host span is released by the reap, not here, because the "
+            "transfer may still be reading it.",
+            req_id,
+            attempts,
+        )
+        if attempts >= _MAX_PREFETCH_REISSUES:
+            self._retired_prefetch_recompute += 1
+            logger.warning(
+                "#939 RE-FETCH BUDGET SPENT: req=%s had %d re-fetches crossed "
+                "by cutovers, recomputing. The prefix is not being served from "
+                "storage for this request; a cutover cadence faster than a "
+                "fetch completes will do this every time.",
+                req_id,
+                attempts,
+            )
+        return True
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -3192,6 +3274,117 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
+
+    @staticmethod
+    def _req_id_digest(req_id: str) -> int:
+        """A rank-independent 63-bit digest of a req_id, never 0.
+
+        Deterministic across processes on purpose -- Python's own ``hash`` is
+        salted per process and would make every rank disagree. 0 is reserved
+        for "this rank has nothing to drain".
+        """
+        import hashlib
+
+        raw = hashlib.sha256(req_id.encode("utf-8")).digest()[:8]
+        return (int.from_bytes(raw, "big") & 0x7FFF_FFFF_FFFF_FFFF) or 1
+
+    def drain_retired_prefetch(self) -> int:
+        """Reap ONE agreed retired prefetch record. Call every round.
+
+        UNIFORMITY IS ENFORCED HERE, NOT INFERRED. It would be easy to argue
+        that the retired list is rank-uniform -- retirement follows a
+        registration that only happens under the #580 positive consensus -- but
+        this module refuses arguments of exactly that shape elsewhere
+        (`_prefetch_done_for` RAISES rather than assume a request is in the
+        replicated set), and a wrong inference here is a three-rank hang rather
+        than a wrong answer. So both halves are enforced:
+
+        * ORDER: candidates are taken in sorted req_id order, a canonical
+          sequence every rank computes identically from the ids themselves.
+          Insertion order is never consulted.
+        * MEMBERSHIP: the ranks AGREE on the candidate before anyone reaps it,
+          via one all_reduce. Each rank contributes ``[d, -d]`` for its own
+          first candidate's digest (``[0, 0]`` when it has none) and reduces
+          with MIN, which yields ``min(d)`` and ``-max(d)`` in a single
+          collective. Reaping proceeds only when ``min == max != 0``, i.e.
+          every rank named the same record. A rank that has not retired it yet
+          contributes 0, the agreement fails, and the record simply waits for
+          the next round -- it never hangs, and it is never reaped on one rank
+          only.
+
+        THE COLLECTIVE IS UNCONDITIONAL. Running it "only in rounds with a
+        non-empty list" would make participation depend on a rank-local
+        predicate, which is the #580 failure this design exists to avoid. An
+        empty list contributes zeros and the reduce is a no-op, so the common
+        case costs one two-element all_reduce per round. Measure before
+        optimising: correctness first, and piggy-backing this onto an existing
+        round collective is a micro-optimisation, not a fix.
+
+        Returns the number of records reaped (0 or 1).
+        """
+        if self.cache_controller is None:
+            return 0
+
+        # Sort by the req_id we can recover from the operation, not by position.
+        candidates = sorted(
+            self._retired_prefetch,
+            key=lambda rec: getattr(rec.operation, "request_id", "") or "",
+        )
+        local = candidates[0] if candidates else None
+        digest = (
+            self._req_id_digest(getattr(local.operation, "request_id", "") or "")
+            if local is not None
+            else 0
+        )
+
+        vote = torch.tensor([digest, -digest], dtype=torch.int64)
+        self._all_reduce_attn_groups(
+            vote, torch.distributed.ReduceOp.MIN, label="drain_retired_prefetch"
+        )
+        agreed_min = int(vote[0].item())
+        agreed_max = -int(vote[1].item())
+        if agreed_min == 0 or agreed_min != agreed_max:
+            # No agreement this round (or nothing anywhere to drain). The
+            # record keeps its host span and its lock ref until every rank
+            # names it -- visible meanwhile as #938 protected residue, which
+            # is why that counter is expected to RETURN rather than grow.
+            return 0
+        if local is None or digest != agreed_min:
+            return 0
+
+        self._retired_prefetch.remove(local)
+        if not self.can_terminate_prefetch(local.operation):
+            # Still in flight: put it back and try again next round. This is
+            # the one question that decides whether the span is safe to free,
+            # and it is asked here -- where running a collective is legal --
+            # rather than at the retire site, where it is not.
+            self._retired_prefetch.append(local)
+            return 0
+
+        req_id = getattr(local.operation, "request_id", "") or ""
+        completed_tokens, _ = self.cache_controller.terminate_prefetch(local.operation)
+        generation = getattr(local.operation, "binding_generation", None)
+        # The whole span, by the #905/#911 route: this record published
+        # NOTHING to the tree, so every row it holds is unclaimed and goes back
+        # to the pool that minted it, not to whatever is bound now.
+        self.cache_controller.append_host_mem_release(
+            host_indices=local.host_indices,
+            generation=generation,
+        )
+        self.dec_host_lock_ref(local.anchor_node, local.anchor_lock_params)
+        self.cache_controller.prefetch_tokens_occupied -= len(local.prefetch_key)
+        self._retired_prefetch_reaped += 1
+        logger.info(
+            "#939 RETIRED PREFETCH REAPED: req=%s %d row(s) returned to "
+            "binding generation %s and its anchor lock released (%d reaped, "
+            "%d still retired).",
+            req_id,
+            int(local.host_indices.numel()),
+            generation,
+            self._retired_prefetch_reaped,
+            len(self._retired_prefetch),
+        )
+        return 1
 
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:

@@ -4285,9 +4285,7 @@ class Scheduler(
                 queue_len=len(self.waiting_queue),
                 allocatable_reqs=int(allocatable),
                 resident_bs=int(running_bs),
-                parked_count=int(
-                    getattr(self.parked_decode_set, "resident_count", 0)
-                ),
+                parked_count=int(getattr(self.parked_decode_set, "resident_count", 0)),
                 chunk_in_flight=self.chunked_req is not None,
                 req_slots_free=seats_before,
                 kv_avail_tokens=int(self.token_to_kv_pool_allocator.available_size()),
@@ -8226,6 +8224,19 @@ class Scheduler(
         """
         if not self.enable_hicache_storage:
             return {}
+        # #939: reap one re-issue-displaced prefetch record, UNCONDITIONALLY and
+        # before the per-request drain. Unconditional is the point: the drain
+        # runs its own tiny agreement collective, and gating that on "this rank
+        # has something retired" would make participation depend on a
+        # rank-local predicate -- the #580 failure. An empty retired list
+        # contributes zeros and the reduce is a no-op.
+        #
+        # It must also not be tied to request lifetime. A displaced record
+        # belongs to a request that may already be finished, so draining it
+        # only while its req_id is in the waiting queue would leak exactly the
+        # records this fix exists to reclaim. Hence: here, every round,
+        # independent of the comprehension below.
+        self.tree_cache.drain_retired_prefetch()
         return {
             req.rid: self.tree_cache.check_prefetch_progress(req.rid)
             for req in self.waiting_queue
@@ -8748,8 +8759,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     _note_skip("batch_full_break", req.rid)
                     break
@@ -8874,11 +8886,7 @@ class Scheduler(
             # chunked continuation below refusable -- `add_chunked_req` runs
             # BEFORE this filter on the next round (#890's second hole), so a
             # ledger written later would always be read too late.
-            if (
-                transport_only
-                and adder.can_run_list
-                and req is adder.can_run_list[-1]
-            ):
+            if transport_only and adder.can_run_list and req is adder.can_run_list[-1]:
                 # Identity against the tail, the same test the `added = ...`
                 # line below uses -- an equality scan over the list would cost
                 # more and mean less.
@@ -12502,9 +12510,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
-        "phase flip x PD disaggregation is refused at argument time"
-    )
+    assert (
+        scheduler.disaggregation_mode == DisaggregationMode.NULL
+    ), "phase flip x PD disaggregation is refused at argument time"
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
