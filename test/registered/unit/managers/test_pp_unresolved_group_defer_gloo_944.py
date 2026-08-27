@@ -200,6 +200,31 @@ def _worker(rank, init_file, out_dir, scenario, mutant, deliver=True):
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
         wire = _RingWire(rank)
+        if scenario == "marks":
+            # #946 ARM 4. Each rank independently stamps a mark on ITS OWN
+            # request object and reads it back, before and after the binding
+            # generation moves. Real processes, so "the generation is global"
+            # cannot be confused with "I just wrote this object".
+            from sglang.srt.mem_cache import hicache_phase_binding as _hpb
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_mark_premise_dead,
+                pp_premise_is_dead,
+            )
+
+            local = _FakeReq(RID, PP0_PREFIX)
+            res["generation_seen"] = int(_hpb.current_generation())
+            pp_mark_premise_dead(local)
+            res["mark_live_same_generation"] = bool(pp_premise_is_dead(local))
+            _real_gen = _hpb.current_generation
+            try:
+                _hpb.current_generation = lambda: _real_gen() + 1
+                res["mark_live_after_generation_moves"] = bool(
+                    pp_premise_is_dead(local)
+                )
+            finally:
+                _hpb.current_generation = _real_gen
+            res["ok"] = True
+            return
         # Scenario 'one': only PP1 has lost the request. PP2 holds the whole
         # prefix, so a bug that pooled "unresolved" with "short" would show up
         # as PP2 re-deriving a verdict it is not entitled to.
@@ -524,6 +549,44 @@ class FalsifierDTheBoundMustSurviveABrokenRing(unittest.TestCase):
             "and the LAP-FED counter stayed at zero throughout -- which is "
             "the proof the bound no longer leans on the return trip. If this "
             "is non-zero the harness delivered something and the arm is void.",
+        )
+
+
+class FalsifierETheDeadPremiseMarkIsRANK_LOCAL_AND_GENERATION_SCOPED(unittest.TestCase):
+    """#946 ARM 4 -- UNIFORMITY, over three real processes.
+
+    The mark lives on a REQUEST OBJECT, and request objects are rank-local: the
+    rank that observes the void is not always the rank that will act on the
+    continuation. So the property that has to hold is NOT "the mark is shared"
+    -- it cannot be -- but "every rank derives the SAME verdict from state it
+    can see", which for a generation-stamped mark means: same generation ->
+    same answer, moved generation -> same absence, on every rank independently.
+
+    Proving that in three real processes is the point. A single-process test
+    cannot distinguish "the generation is global" from "the generation happens
+    to be the same object I just wrote".
+    """
+
+    def test_every_rank_agrees_on_a_stamped_mark_and_on_its_invalidation(self):
+        res = _run("marks")
+        r0, r1, r2 = _require_clean(self, res)
+        for name, r in (("PP0", r0), ("PP1", r1), ("PP2", r2)):
+            self.assertTrue(
+                r["mark_live_same_generation"],
+                f"{name}: a mark stamped under the current generation must "
+                f"read as live on the rank that holds the request",
+            )
+            self.assertFalse(
+                r["mark_live_after_generation_moves"],
+                f"{name}: once the binding generation moves, the mark must "
+                f"read as ABSENT -- that self-invalidation is what replaces a "
+                f"reset_for_retract special case",
+            )
+        self.assertEqual(
+            {r0["generation_seen"], r1["generation_seen"], r2["generation_seen"]},
+            {r0["generation_seen"]},
+            "the three ranks must start from the SAME generation, or the "
+            "stamp compares different clocks and means nothing",
         )
 
 

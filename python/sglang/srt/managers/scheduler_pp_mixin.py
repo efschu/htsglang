@@ -1126,6 +1126,178 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     return True
 
 
+def pp_request_locations(holder) -> Dict[str, object]:
+    """#946: every place a request can live, as one rid -> req mapping.
+
+    THE FOUR PLACES, and they are the SAME enumeration `_pp_reconcile_incoming_
+    admission` already walks for #944: the waiting queue, `chunked_req`, the
+    named slot's chunked req, and the running batch. Sharing the list rather
+    than re-deriving it is the point -- a FIFTH place must not have to be
+    discovered once per consumer, which is exactly how #797c, #798 and #944
+    became three tickets for one class.
+
+    WHY IT EXISTS AT ALL, measured. `scheduler.py`'s #943b re-issue built its
+    candidate set as `{r.rid: r for r in self.waiting_queue}`. A chunked
+    continuation is never in the waiting queue -- #797b deliberately RESTORES
+    it as `self.chunked_req`, because that state outlives the round and putting
+    it back is what stopped boot instr19 dying on `extend_range.end`. So the
+    re-issue could not nominate the one request that was stuck (`PREFETCH
+    RE-ISSUED` 0 across six boots), and the same request never re-entered
+    through the waiting-queue path where `prefix_len_for` applies (the offer
+    froze at `told=8192` for thousands of passes). ONE structural fact, both
+    symptoms -- the fourth instance of the compensator-reachability class.
+
+    EVERY LOOKUP IS A getattr (#787 convention), and that is load-bearing here
+    rather than defensive: this mapping feeds `take_agreed_reissue`, which is a
+    COLLECTIVE. A rank that raised while building its candidate set would skip
+    an all_reduce its peers had already entered -- the deadlock family this
+    whole feature is a list of. A holder that carries none of the fields yields
+    an empty mapping, which the vote is already built to answer 0 for.
+
+    WAITING QUEUE FIRST, so a request that is somehow in two places resolves to
+    the one the admission loop would act on.
+    """
+    out: Dict[str, object] = {}
+    for req in getattr(holder, "waiting_queue", None) or ():
+        rid = getattr(req, "rid", None)
+        if rid is not None:
+            out.setdefault(rid, req)
+    chunked = getattr(holder, "chunked_req", None)
+    rid = getattr(chunked, "rid", None)
+    if rid is not None:
+        out.setdefault(rid, chunked)
+    by_slot = getattr(holder, "_pp_chunked_req_before_by_slot", None) or {}
+    try:
+        slot_reqs = list(by_slot.values())
+    except AttributeError:  # a stand-in that is not a mapping
+        slot_reqs = []
+    for req in slot_reqs:
+        rid = getattr(req, "rid", None)
+        if rid is not None:
+            out.setdefault(rid, req)
+    running = getattr(holder, "running_batch", None)
+    for req in getattr(running, "reqs", None) or ():
+        rid = getattr(req, "rid", None)
+        if rid is not None:
+            out.setdefault(rid, req)
+    return out
+
+
+#: #946: the attribute the dead-premise mark lives under. On the REQUEST and
+#: not in a guard-side dict, because #797b restores the same object and the
+#: rank that must ACT on the mark is not always the rank that saw the void.
+_PREMISE_DEAD_STAMP = "_pp_premise_dead_generation"
+
+
+def pp_mark_premise_dead(req) -> None:
+    """#946 DECIDE AT THE VOID: record that this request's prefix premise is
+    dead, stamped with the binding generation it was decided under.
+
+    STAMPED, AND THAT IS WHAT MAKES IT SAFE TO LEAVE ON A LIVE OBJECT. The mark
+    must survive the #797b chunked restore (same generation -- the whole point)
+    and must NOT survive a retract or a cutover, which move the binding. A
+    stamp does both with no `reset_for_retract` special case and no cleanup
+    path that could be forgotten: the reader compares generations and a
+    superseded mark simply reads as absent. Same rule #911 uses for completion
+    routing.
+
+    DECIDED HERE, NOT ACTED ON HERE. The void fires AFTER this pass's geometry
+    was committed and launched; changing the premise now would rewrite a pass
+    in flight, which is the instr20 crash. The acting half is
+    `pp_apply_dead_premise_at_chunk_boundary`, at the one point where nothing
+    is committed yet.
+    """
+    if req is None:
+        return
+    from sglang.srt.mem_cache import hicache_phase_binding as _hpb
+
+    try:
+        setattr(req, _PREMISE_DEAD_STAMP, int(_hpb.current_generation()))
+    except Exception:  # noqa: BLE001 - a mark may never break the void path
+        pass
+
+
+def pp_premise_is_dead(req) -> bool:
+    """True iff `req` carries a dead-premise mark from the CURRENT generation.
+
+    A mark from a superseded binding reads as absent, which is the
+    self-invalidation `pp_mark_premise_dead` exists for.
+    """
+    if req is None:
+        return False
+    stamped = getattr(req, _PREMISE_DEAD_STAMP, None)
+    if stamped is None:
+        return False
+    from sglang.srt.mem_cache import hicache_phase_binding as _hpb
+
+    try:
+        return int(stamped) == int(_hpb.current_generation())
+    except Exception:  # noqa: BLE001 - unreadable generation means "not live"
+        return False
+
+
+def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
+    """#946 ACT AT THE CHUNK BOUNDARY. Returns "none" / "refetch" / "recompute".
+
+    THE ONE LEGAL POINT, and the criterion it satisfies is #944c's: the point
+    must lie BEFORE the commitment it changes, never after. `add_chunked_req`
+    derives everything from `len(req.prefix_indices)` and only THEN calls
+    `set_extend_range`, so before that call no geometry for the next chunk
+    exists and changing the premise cannot contradict a report -- the report
+    has not been made. The previous chunk is finished or voided; nothing is in
+    flight. `#906 / #890 hole 2` already gates this exact site and its own
+    comment establishes the safety: the request stays `self.chunked_req`, is
+    not dropped, and resumes mid-chunk unharmed.
+
+    RE-FETCH IS PREFERRED AND IT IS A LAW, NOT A TASTE. `told=0` on the
+    measured rid discards 8192 tokens -- two full `--chunked-prefill-size 4096`
+    chunks -- against a standing user law that allows at most ONE chunk of
+    loss. The store still holds the pages, so re-fetching under the current
+    generation pays a fetch instead of a full recompute and keeps the premise.
+    `told=0` is the bounded last resort for when no fetch can be issued, and it
+    names the tokens it throws away: a law breach may be necessary, it may
+    never be silent.
+
+    CONSUMED ONCE. The mark is cleared whichever branch runs, so an escape
+    cannot re-fire on every chunk -- that would be the 2106-line log in a new
+    colour.
+    """
+    if not pp_premise_is_dead(req):
+        return "none"
+    try:
+        delattr(req, _PREMISE_DEAD_STAMP)
+    except AttributeError:
+        pass
+    prefetch = getattr(holder, "_prefetch_kvcache", None)
+    if callable(prefetch):
+        try:
+            prefetch(req)
+            return "refetch"
+        except Exception as exc:  # noqa: BLE001 - fall through to the terminator
+            logger.warning(
+                "#946 re-fetch could not be issued for rid=%s (%s); falling "
+                "back to the recompute terminator",
+                getattr(req, "rid", "?"),
+                exc,
+            )
+    discarded = len(getattr(req, "prefix_indices", None) or ())
+    logger.warning(
+        "#946 PREMISE RECOMPUTE rid=%s: no re-fetch could be issued, so the "
+        "dead prefix premise is dropped and %d token(s) will be recomputed. "
+        "THIS IS A DOUBLE PREFILL and the standing law allows at most one "
+        "chunk of loss -- it is spent here only because the bounded "
+        "alternative is an unterminated re-offer. If this line is frequent, "
+        "the re-fetch path is unreachable and THAT is the bug, not this "
+        "fallback.",
+        getattr(req, "rid", "?"),
+        discarded,
+    )
+    truncate = getattr(req, "truncate_prefix_to", None)
+    if callable(truncate):
+        truncate(0)
+    return "recompute"
+
+
 def pp_chunked_local_match(req) -> Optional[int]:
     """#797c: how much of THIS request this rank has already computed.
 

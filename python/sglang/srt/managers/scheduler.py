@@ -8271,7 +8271,20 @@ class Scheduler(
         _rid = None
         _by_rid = {}
         try:
-            _by_rid = {r.rid: r for r in self.waiting_queue}
+            # #946: THE CANDIDATE SET IS THE FOUR PLACES, NOT THE QUEUE.
+            # This read `{r.rid: r for r in self.waiting_queue}` and a chunked
+            # continuation is never in the waiting queue -- #797b restores it
+            # as `self.chunked_req`, deliberately, because that state outlives
+            # the round. So the re-issue could not nominate the one request
+            # that was stuck: measured `PREFETCH RE-ISSUED` 0 across six boots
+            # while a single rid was re-offered `told=8192` thousands of times.
+            # Same structural fact also kept that rid out of the waiting-queue
+            # path where the #630/#944 clamp applies -- one cause, two defects.
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_request_locations as _pp_request_locations,
+            )
+
+            _by_rid = _pp_request_locations(self)
             _rid = self.tree_cache.take_agreed_reissue(list(_by_rid.keys()))
         except Exception as exc:  # noqa: BLE001 - a re-issue may never break a round
             logger.warning(
@@ -8708,6 +8721,24 @@ class Scheduler(
                 SEAM_TRANSPORT_ROUND_ATTR as _STR_ATTR,
                 seam_grant_is_open as _grant_open,
             )
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_apply_dead_premise_at_chunk_boundary as _pp_apply_dead_premise,
+            )
+
+            # #946 ACT HERE, AND ONLY HERE. This is the one point at which a
+            # dead prefix premise may legally be replanned: `add_chunked_req`
+            # below derives everything from `len(req.prefix_indices)` and only
+            # THEN calls `set_extend_range`, so nothing about the next chunk is
+            # committed yet and changing the premise cannot contradict a report
+            # that has not been made. The void, where the premise is DECLARED
+            # dead, fires after the pass was launched -- replanning there would
+            # rewrite a pass in flight (instr20). Decide there, act here.
+            #
+            # The #906 gate immediately below is the precedent for touching a
+            # continuation at this exact site, and its own comment establishes
+            # why that is safe: the request stays `self.chunked_req`, is not
+            # dropped, and resumes mid-chunk unharmed.
+            _pp_apply_dead_premise(self, self.chunked_req)
 
             if bool(getattr(self, _STR_ATTR, False)) and not _grant_open(
                 self.chunked_req
@@ -9084,6 +9115,30 @@ class Scheduler(
                 # optimisation -- refuse and name it.
                 require_executed_geometry=True,
             )
+            # #946 DECIDE HERE, ACT AT THE CHUNK BOUNDARY. `note_offer` has
+            # just run for every entry in the decision above, so any rid whose
+            # prefix premise is now declared dead is known -- and PP0 is the
+            # rank that knows it, because PP0 is the only rank that builds an
+            # offer (#791: PP0 owns the verdict).
+            #
+            # The mark goes ON THE REQUEST and is STAMPED with the binding
+            # generation, so it survives the #797b chunked restore (same
+            # generation) and invalidates ITSELF on a retract or cutover (the
+            # generation moves and the reader sees it as absent). No
+            # `reset_for_retract` special case and no cleanup path that could
+            # be forgotten -- the same rule #911 uses for completion routing.
+            #
+            # Nothing is replanned here: this pass's geometry is already
+            # committed, and rewriting it would name a pass no rank ran.
+            _guard = self._pp_admission_guard
+            if _guard is not None:
+                from sglang.srt.managers.scheduler_pp_mixin import (
+                    pp_mark_premise_dead as _pp_mark_premise_dead,
+                )
+
+                for _req in can_run_list:
+                    if _guard.is_escalated(getattr(_req, "rid", None)):
+                        _pp_mark_premise_dead(_req)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

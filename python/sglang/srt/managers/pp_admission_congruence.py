@@ -442,6 +442,17 @@ class PPAdmissionCongruenceGuard:
             )
         return True
 
+    def is_escalated(self, rid: str) -> bool:
+        """#946: has this rid's prefix premise been declared dead?
+
+        The read side of `note_offer`'s escalation, exposed so the SCHEDULER
+        can act on it at the one point where acting is legal (the chunk
+        boundary). This class must not reach into the scheduler itself -- it is
+        the pure half of the feature and importing upward would be the cycle
+        the module docstring's NO COLLECTIVE section is careful about.
+        """
+        return rid in self._escalated
+
     def offer_streak(self, rid: str) -> int:
         """#944b diagnostic/test hook: consecutive identical re-offers of `rid`.
 
