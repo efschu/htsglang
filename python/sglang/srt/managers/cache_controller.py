@@ -1009,10 +1009,25 @@ class HiCacheController:
             build_mamba_window,
             derive_mamba_blob_spec,
             local_mamba_layer_range,
+            resolve_linear_layer_ids,
         )
 
-        cache_params = getattr(model_config, "mamba2_cache_params", None)
-        mamba_layer_ids = list(getattr(cache_params, "layers", None) or [])
+        # #931: RESOLVED, not guessed -- the same ladder the KV half above got,
+        # for the same reason. The line that stood here read
+        # `getattr(model_config, "mamba2_cache_params", None)`, and that
+        # property belongs to the CHECKPOINT config, never to sglang's
+        # ModelConfig (`grep -c` in configs/model_config.py is 0). It therefore
+        # missed on every model, the id list was always empty, and the
+        # `return None` below fired on every boot since a38f39f1ee -- so this
+        # blob has never once attached. Boot 2g proves it from the other end:
+        # "#706 canonical KV page active" x3, "#706 canonical GDN blob active"
+        # x0, refusals x0, with the format explicitly armed.
+        #
+        # An empty list is now a PROVEN "this model has no linear layers"
+        # (ladder step (c)); every unresolvable hybrid raises there instead of
+        # arriving here as a silent skip. That is what makes the `return None`
+        # below sound rather than the hole it was.
+        mamba_layer_ids = resolve_linear_layer_ids(model_config)
         if not mamba_layer_ids:
             return None
 
