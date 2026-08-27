@@ -506,6 +506,25 @@ class BudgetHarness:
     waiting_queue: list = []
     enable_hicache_storage = False
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
+
+    # #943b: the drain grew a RE-ISSUE step -- one agreed stale-refused prefetch
+    # re-registered per round -- and the drift guard below caught it again, on
+    # the same day it was written. A STAND-IN and not the real binding: this
+    # harness exercises the budget reduce, not the prefetch path, and
+    # `_prefetch_kvcache` reaches allocation and a second participation vote
+    # that have nothing to do with what these cases pin. It is never CALLED
+    # here -- `enable_hicache_storage` is False three lines up, so the shipped
+    # drain returns {} before reaching the re-issue -- but the guard reads the
+    # SOURCE, so the attribute has to exist or the harness fails with an
+    # AttributeError instead of a verdict.
+    def _prefetch_kvcache(self, req):  # pragma: no cover - unreachable here
+        raise AssertionError(
+            "BudgetHarness._prefetch_kvcache was called; with "
+            "enable_hicache_storage False the drain returns {} long before the "
+            "#943b re-issue, so reaching this means the drain's early return "
+            "moved and these cases are no longer pinning what they claim"
+        )
+
     # #794: the reduce grew the CORRIDOR WIDTH CEILING, the same way #616g,
     # #639, #639b and #791b grew theirs, and the drift guard below caught it
     # the same way again -- the fifth time this guard has paid for itself.
@@ -549,6 +568,7 @@ class BudgetHarness:
         budget cases.
         """
         return 8
+
     uniform_corridor_width = Scheduler.uniform_corridor_width
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.

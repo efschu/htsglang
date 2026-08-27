@@ -9,7 +9,15 @@ from array import array
 from collections import Counter, defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -773,6 +781,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._retired_prefetch: list[_OngoingPrefetch] = []
         self._retired_prefetch_attempts: dict[str, int] = {}
         self._retired_prefetch_reaped = 0
+        #: #943b: requests whose prefetch #937 refused to publish because its
+        #: binding generation had gone stale, and which are therefore owed a
+        #: FRESH fetch under the current binding. req_id -> times refused.
+        #: Never a span and never an operation: reviving either is the corruption
+        #: `StaleStampRewrite` exists to forbid.
+        self._reissue_pending: dict[str, int] = {}
+        self._reissue_taken = 0
+        self._reissue_disagreements = 0
         self._retired_prefetch_recompute = 0
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         # #810: built in `init_hicache`, once the controller and the
@@ -3182,6 +3198,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._prefetch_insert_refused_stale,
             )
             insert_result = InsertResult(prefix_len=0, host_span_unclaimed=True)
+            # #943b: OWED A FRESH FETCH, NOT A REVIVED ONE.
+            #
+            # The span above is released to the generation that minted it and is
+            # gone. What the request has lost is its PREFIX, and the only
+            # correct way to get it back is to fetch again under the binding
+            # that is current now -- a NEW operation, a NEW stamp, NEW host
+            # slots, out of the content-keyed store. Recording the req_id here
+            # is the whole of the state this needs; nothing about the dead
+            # operation is kept, because keeping it is what would tempt the
+            # re-stamp that `StaleStampRewrite` refuses.
+            #
+            # The COUNT is reported, never gated (#943b design point 4). A cap
+            # that refused a fourth attempt would be a rank-local predicate
+            # deciding participation, which is the #580 shape this whole path
+            # is arranged to avoid; the natural terminator is admission, which
+            # takes the request out of the waiting queue the drain reads.
+            self._reissue_pending[req_id] = self._reissue_pending.get(req_id, 0) + 1
+            _n = self._reissue_pending[req_id]
+            if _n > _MAX_PREFETCH_REISSUES:
+                logger.info(
+                    "#943b RE-FETCH BUDGET EXCEEDED: req=%s has been refused %d "
+                    "time(s), above the reporting budget of %d. Reported, NOT "
+                    "refused: a cap here would be a rank-local predicate "
+                    "deciding collective participation (#580).",
+                    req_id,
+                    _n,
+                    _MAX_PREFETCH_REISSUES,
+                )
         else:
             insert_result = self._insert_helper_host(
                 last_host_node,
@@ -3489,6 +3533,93 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             len(self._retired_prefetch),
         )
         return 1
+
+    def take_agreed_reissue(self, local_candidates: Sequence[str]) -> Optional[str]:
+        """One req_id every rank agrees is owed a fresh fetch, or ``None``.
+
+        #943b. The re-issue itself runs through the scheduler's ordinary
+        ``_prefetch_kvcache``, so it inherits the whole #580 participation
+        machinery instead of re-inventing it. What this method owns is the ONE
+        decision that machinery cannot make for it: WHICH request, agreed by
+        every rank before any of them acts.
+
+        THE HAZARD, AND WHY A LIVE MEASUREMENT IS NOT ENOUGH. Boot a810ef69ec
+        measured the #937 refusal verdict as rank-uniform (DIVERGES 0, AGREES 3,
+        over 111 cutovers and 48 refusals). That is evidence about one boot on
+        one rig, and building a collective on it would make the uniformity a
+        LOAD-BEARING ASSUMPTION verified nowhere in the code. So the agreement
+        is taken here, every time, by the same shape ``drain_retired_prefetch``
+        already uses: MIN over ``[d, -d]`` yields the group min and max in one
+        pass, and only ``min == max != 0`` is an agreement.
+
+        The candidate set is the intersection the caller can see -- requests
+        that are BOTH owed a re-fetch AND present in this rank's waiting queue.
+        Voting on "owed" alone would agree on a request some rank cannot act on,
+        and that rank would then sit out the collective its peers entered, which
+        is the failure this is arranged to prevent rather than a smaller version
+        of it.
+
+        DISAGREEMENT IS A WAIT, NOT A LOSS. The pending entry survives, so the
+        next round votes again. A request whose peers never agree simply keeps
+        its recompute -- today's behaviour -- and the disagreement is counted so
+        that "the re-issue never fires" and "the re-issue fires and does not
+        help" stay distinguishable.
+        """
+        pending = [r for r in local_candidates if r in self._reissue_pending]
+        pending.sort()
+        local = pending[0] if pending else ""
+        digest = self._req_id_digest(local) if local else 0
+
+        vote = torch.tensor([digest, -digest], dtype=torch.int64)
+        self._all_reduce_attn_groups(
+            vote, torch.distributed.ReduceOp.MIN, label="take_agreed_reissue"
+        )
+        agreed_min = int(vote[0].item())
+        agreed_max = -int(vote[1].item())
+
+        if agreed_min == 0:
+            # Nothing owed anywhere, or some rank has nothing to offer. Not a
+            # disagreement worth counting: an empty round is the common case.
+            return None
+        if agreed_min != agreed_max:
+            self._reissue_disagreements += 1
+            if (
+                self._reissue_disagreements <= 3
+                or self._reissue_disagreements % 100 == 0
+            ):
+                logger.warning(
+                    "#943b RE-ISSUE NOT AGREED: this rank offered %r (digest %d) "
+                    "and the group spans [%d, %d], so NO rank re-issues this "
+                    "round. The request keeps its recompute and the entry keeps "
+                    "its place in the queue. Entering the re-registration on a "
+                    "split verdict is the #580 failure and is the one thing this "
+                    "gate exists to refuse. (disagreement %d)",
+                    local,
+                    digest,
+                    agreed_min,
+                    agreed_max,
+                    self._reissue_disagreements,
+                )
+            return None
+        if digest != agreed_min:
+            # Agreement reached on a req_id this rank did not nominate. It
+            # cannot act, so it must not: returning None here keeps it out of a
+            # collective its peers are entering under a different key.
+            return None
+
+        self._reissue_pending.pop(local, None)
+        self._reissue_taken += 1
+        logger.info(
+            "#943b PREFETCH RE-ISSUED: req=%s agreed by every rank; fetching "
+            "again under the CURRENT binding generation (a new operation, new "
+            "host slots, fresh bytes from the content-keyed store -- the "
+            "refused span was released to its minting generation and is not "
+            "revived). (%d re-issued, %d still owed.)",
+            local,
+            self._reissue_taken,
+            len(self._reissue_pending),
+        )
+        return local
 
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:

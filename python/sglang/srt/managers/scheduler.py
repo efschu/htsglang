@@ -8237,6 +8237,51 @@ class Scheduler(
         # records this fix exists to reclaim. Hence: here, every round,
         # independent of the comprehension below.
         self.tree_cache.drain_retired_prefetch()
+        # #943b: RE-ISSUE ONE AGREED STALE-REFUSED PREFETCH, from the same
+        # per-round point and for the same reason the reap above lives here.
+        #
+        # #937 refuses to publish a prefetch whose binding generation went stale
+        # across a cutover -- correctly: the bisection (#943) put the garbage
+        # fix at exactly that commit. What it leaves behind is a request owed
+        # its prefix, and the only correct way to give it back is to fetch AGAIN
+        # under the binding that is current now. `take_agreed_reissue` picks the
+        # request, and it is the group that picks it: a split verdict returns
+        # None and every rank waits, because entering the re-registration on a
+        # subset is the #580 failure.
+        #
+        # The re-issue then runs through the ORDINARY `_prefetch_kvcache`, so it
+        # inherits the existing participation vote, the rank-local eligibility
+        # handling and the symmetric-mode branch rather than reproducing them.
+        # A second, subtly different path here is how the two would drift.
+        #
+        # THE CANDIDATE SET IS THE INTERSECTION, not the pending set: only
+        # requests this rank can actually act on -- present in the replicated
+        # waiting queue -- are nominated, so an agreement can never name a
+        # request some rank would have to sit out.
+        # UNCONDITIONAL, and the first draft of this block was not -- it read
+        # `if self.tree_cache._reissue_pending:` before calling. That is a
+        # rank-local predicate in front of a collective: a rank with nothing
+        # owed would skip the all_reduce its peers had already entered. The
+        # comment on the reap above states the same rule for the same reason
+        # ("an empty retired list contributes zeros and the reduce is a no-op"),
+        # and the vote is built to answer 0 for an empty candidate set exactly
+        # so this call needs no guard. Recorded rather than quietly corrected:
+        # it is the failure this whole path is arranged around, and it was one
+        # line away in the code meant to prevent it.
+        _rid = None
+        _by_rid = {}
+        try:
+            _by_rid = {r.rid: r for r in self.waiting_queue}
+            _rid = self.tree_cache.take_agreed_reissue(list(_by_rid.keys()))
+        except Exception as exc:  # noqa: BLE001 - a re-issue may never break a round
+            logger.warning(
+                "#943b re-issue vote skipped this round (%s); every request "
+                "keeps its recompute, which is today's behaviour and never a "
+                "wrong answer",
+                exc,
+            )
+        if _rid is not None and _rid in _by_rid:
+            self._prefetch_kvcache(_by_rid[_rid])
         return {
             req.rid: self.tree_cache.check_prefetch_progress(req.rid)
             for req in self.waiting_queue
