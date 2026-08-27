@@ -4358,6 +4358,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
+            # #928 INSTRUMENT, one line, no D2H sync: which pool object does
+            # this resume read its state bytes OUT OF? The match seam logs the
+            # pool that WROTE the anchor ("[#928 anchor] ... anchor_pool=0x..")
+            # and this logs the pool that reads it, so `grep '#928'` on one
+            # boot puts the two ids side by side. They were silently different
+            # on every strict-purity resume: the anchor is donated while PP
+            # computes and consumed while TP computes, and these pools are
+            # distinct objects (gdn_flip_mover.py:848-851). Rate-limited to
+            # the first few and then every 1000th -- this is a per-request
+            # path, but it is on the admission hot path the #790 incident
+            # wedged on, so it stays cheap and never touches a tensor.
+            self._mamba_cow_reads = getattr(self, "_mamba_cow_reads", 0) + 1
+            if self._mamba_cow_reads <= 3 or self._mamba_cow_reads % 1000 == 0:
+                logger.info(
+                    "[#928 cow] reading anchor state from executing pool "
+                    "state=0x%x ckpt=%s n=%d occurrence=%d",
+                    id(pool.mamba_pool),
+                    "0x%x" % id(pool.mamba_ckpt_pool)
+                    if pool.mamba_ckpt_pool is not None
+                    else "none",
+                    len(forward_batch.mamba_cow_src_indices),
+                    self._mamba_cow_reads,
+                )
             if pool.mamba_ckpt_pool is not None:
                 # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
                 pool.mamba_ckpt_pool.load_to_active(

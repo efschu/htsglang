@@ -17,7 +17,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import peer_needs_mamba_evict
-from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
+from sglang.srt.mem_cache.mamba_state_pool import (
+    active_mamba_state_pool,
+    anchor_bytes_pool,
+    anchor_bytes_reachable,
+    anchor_provenance_verdict,
+    note_anchor_bytes,
+)
 from sglang.srt.mem_cache.memory_pool import sync_free_tensor_repr
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -114,6 +120,12 @@ class MambaComponent(TreeComponent):
         #: structurally non-monotone tracked position must announce itself
         #: rather than look like ordinary grid misses.
         self._protected_retention_declines = 0
+        #: #928 resume refusals, split by which term said no. A foreign-pool
+        #: anchor and a stateless node are different defects with different
+        #: remedies (carry the anchor across the cutover / stop planting
+        #: tombstones under a full key), so one counter for each.
+        self._foreign_pool_resume_refusals = 0
+        self._stateless_resume_refusals = 0
 
     def _raw_token_pos(self, key_units: int) -> int:
         """Absolute RAW-token position of a node measured in KEY units.
@@ -308,6 +320,99 @@ class MambaComponent(TreeComponent):
             return result._replace(mamba_branching_seqlen=branching_seqlen)
 
         mamba_value = last_node.component_data[self.component_type].value
+
+        # #928: TWO WAYS THIS NODE IS NOT A RESUME POINT, AND BOTH USED TO BE
+        # SILENT. The rule is not new -- it is stated verbatim thirty lines
+        # below for the slot-starvation case ("Reusing the KV prefix without
+        # the matching mamba state would be silently wrong, so the whole match
+        # is zeroed") -- it simply was not applied to the two cases that
+        # actually occur on a phase-flip boot.
+        #
+        # Both refusals keep `branching_seqlen`, as the strict-resume zeroing
+        # above does: the re-prefill re-establishes the anchor at that grid
+        # position, and dropping it would make the next request pay again.
+        if cow_mamba:
+            host_value = last_node.component_data[self.component_type].host_value
+            if mamba_value is None and host_value is None:
+                # (a) NO STATE AT ALL. `prepare_for_caching_req` plants such a
+                # tombstone by design (:753/:799/:830) and
+                # `commit_insert_component_data` accepts it, so the tree
+                # legitimately holds full-length keys with no anchor. Falling
+                # through left `req.mamba_cow_src_index` unset and
+                # `req.mamba_needs_clear` True (memory_pool.py:2090), so the
+                # request ZEROED its recurrent state and reused the whole KV
+                # prefix anyway: the full-attention layers saw every token,
+                # the recurrent layers saw a sequence that had not started.
+                self._stateless_resume_refusals += 1
+                count = self._stateless_resume_refusals
+                if count <= 3 or count % 1000 == 0:
+                    logger.warning(
+                        "[#928 anchor] REFUSING resume: node carries no "
+                        "recurrent state on device or host, so its KV prefix "
+                        "cannot be reused; re-prefilling. occurrence=%d rid=%s",
+                        count,
+                        getattr(req, "rid", None),
+                    )
+                return zero_match_result(self.cache, result)._replace(
+                    mamba_branching_seqlen=branching_seqlen
+                )
+            if mamba_value is not None and not anchor_bytes_reachable(
+                self.cache, mamba_value
+            ):
+                # (b) STATE THIS PHASE CANNOT READ. The anchor's bytes are in
+                # the other stack's tensors at the same slot id; the deferred
+                # COW (model_runner.py:4368-4373) copies from the EXECUTING
+                # runner's pool and would hand this request whatever the other
+                # phase last left at that index. See mamba_state_pool.py for
+                # why the bytes cannot simply be fetched here.
+                self._foreign_pool_resume_refusals += 1
+                count = self._foreign_pool_resume_refusals
+                # #928 LIVELOCK WATCH, and it is the honest cost of this
+                # refusal. Refusing sends the request back to a full prefill.
+                # Under strict purity that prefill runs in PP, donates a fresh
+                # PP-pool anchor, and the pp_to_tp re-admission meets the same
+                # foreign-pool verdict again -- so a request that is RETRACTED
+                # rather than carried across the cutover can refuse forever,
+                # paying two cutovers a lap. The loop is not created here: it
+                # is the pre-existing hole that the wrong answer was hiding,
+                # and the way out is the carry (gdn_flip_mover already moves
+                # RESIDENT slots; the 2g cutover moved none -- "0 live slots,
+                # sent 0 cells / 0.00 MiB"), not a softer refusal. A second
+                # refusal of the SAME request is therefore the signal that the
+                # carry is the blocking posten, and it says so by name rather
+                # than looping in silence.
+                seen = getattr(req, "_mamba_resume_refusals", 0) + 1
+                if req is not None:
+                    req._mamba_resume_refusals = seen
+                if seen >= 2:
+                    logger.error(
+                        "[#928 anchor] REPEAT refusal #%d for rid=%s: this "
+                        "request has now re-prefilled and been refused again, "
+                        "which means it is being RETRACTED at the cutover "
+                        "instead of carried. The anchor can never be local "
+                        "while that holds, and the request cannot make "
+                        "progress. The blocking posten is the resident carry "
+                        "of the mamba state across pp_to_tp, not this seam",
+                        seen,
+                        getattr(req, "rid", None),
+                    )
+                if count <= 3 or count % 1000 == 0:
+                    logger.warning(
+                        "[#928 anchor] REFUSING resume: verdict=%s "
+                        "anchor_pool=0x%x active_pool=0x%x -- the anchor's "
+                        "state bytes belong to the other phase's pool at this "
+                        "slot id and are unreachable from the computing "
+                        "layout; re-prefilling. occurrence=%d rid=%s",
+                        anchor_provenance_verdict(self.cache, mamba_value),
+                        id(anchor_bytes_pool(self.cache, mamba_value)),
+                        id(active_mamba_state_pool(self.cache)),
+                        count,
+                        getattr(req, "rid", None),
+                    )
+                return zero_match_result(self.cache, result)._replace(
+                    mamba_branching_seqlen=branching_seqlen
+                )
+
         if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
@@ -435,6 +540,10 @@ class MambaComponent(TreeComponent):
             result.mamba_exist = True
             return
         if is_new_leaf:
+            # #928: the anchor enters the tree here, so THIS is the moment its
+            # bytes' owner is known -- the stack that was computing when the
+            # state was produced. The id alone cannot say it later.
+            note_anchor_bytes(self.cache, params.mamba_value)
             node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(
@@ -442,6 +551,9 @@ class MambaComponent(TreeComponent):
             )
             return
         if node.component_data[self.component_type].value is None:
+            # #928: same moment, the other arm -- a node that held only a host
+            # copy (or a tombstone) is being given device state now.
+            note_anchor_bytes(self.cache, params.mamba_value)
             node.component_data[self.component_type].value = params.mamba_value
             # move from host LRU to device LRU
             host_lru = self.cache.host_lru_lists[self.component_type]

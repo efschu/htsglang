@@ -45,7 +45,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     requests_forced_host_write_through,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
+from sglang.srt.mem_cache.mamba_state_pool import (
+    active_mamba_state_pool,
+    anchor_bytes_reachable,
+    anchor_provenance_verdict,
+    note_anchor_bytes,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, sync_free_tensor_repr
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -1870,6 +1875,43 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
+        # #928, SECOND LINEAGE (#747's rule: one decision, both trees). The
+        # unified lineage refuses a resume whose anchor bytes belong to the
+        # other phase's pool at mamba_component.py's match seam; the same
+        # anchor donated through this tree is unreadable for exactly the same
+        # reason, so it is refused here in the same shape. `mamba_value is
+        # None` needs no arm of its own in this lineage: the `is not None`
+        # gate below already declines to COW, and this tree's match walk caps
+        # the returned prefix at the last node that carried state.
+        if (
+            cow_mamba
+            and last_node.mamba_value is not None
+            and not anchor_bytes_reachable(self, last_node.mamba_value)
+        ):
+            self._foreign_pool_resume_refusals = (
+                getattr(self, "_foreign_pool_resume_refusals", 0) + 1
+            )
+            count = self._foreign_pool_resume_refusals
+            if count <= 3 or count % 1000 == 0:
+                logger.warning(
+                    "[#928 anchor] REFUSING resume: verdict=%s -- the anchor's "
+                    "state bytes belong to the other phase's pool at this slot "
+                    "id and are unreachable from the computing layout; "
+                    "re-prefilling. occurrence=%d rid=%s",
+                    anchor_provenance_verdict(self, last_node.mamba_value),
+                    count,
+                    getattr(req, "rid", None),
+                )
+            return MatchResult(
+                device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                best_match_node=self.root_node,
+                mamba_branching_seqlen=mamba_branching_seqlen,
+            )
+
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
@@ -2051,6 +2093,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            # #928: the anchor enters this tree here -- record which pool's
+            # tensors hold its bytes while that is still knowable.
+            note_anchor_bytes(self, mamba_value)
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
@@ -2059,6 +2104,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.mamba_evictable_size_ += len(mamba_value)
             self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
+            note_anchor_bytes(self, mamba_value)  # #928, same moment
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
