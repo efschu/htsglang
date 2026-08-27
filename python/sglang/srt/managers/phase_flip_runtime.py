@@ -1690,6 +1690,41 @@ def build_cutover_release(scheduler):
         if not reqs:
             return []
         from sglang.srt.managers.schedule_batch import retract_all
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            FORCE_HOST_WRITE_THROUGH_ATTR,
+        )
+
+        # #792 THE BOUNDARY SNAPSHOT, at the one boundary this seam owns.
+        #
+        # Retraction runs `release_req` -> `release_kv_cache` ->
+        # `cache_finished_req` (see `release_residents_for_cutover`), so each
+        # resident's mamba state is already donated to the tree at exactly the
+        # position the flip interrupted it. The tree is then RESET two lines
+        # later, which drops every device-only anchor -- so the anchor has to
+        # be in the canonical store before it is dropped, or the re-admission
+        # this seam logs ("the new layout re-admits them and serves the prefix
+        # by read-through") reaches a node with KV and no recurrent state, the
+        # match refuses it, and the request recomputes in full. That is the
+        # #858 livelock, and it is why W40/W41 read `#cached-token: 0` on
+        # every re-admission.
+        #
+        # `requests_forced_host_write_through` is exactly the right existing
+        # mechanism and its docstring already describes this situation: "the
+        # donated prefix is not a caching opportunity but the session's only
+        # surviving copy". The hit-count write-through heuristic must not get
+        # a vote here for the same reason it must not for a session hand-off.
+        #
+        # Independent of #920. That refusal governs `copy_state`, the
+        # PER-REQUEST `req.mamba_state_cpu` carry, which is measured OFF on
+        # this rig ("the cutover will NOT copy resident state out", all three
+        # ranks, every flip). This route is the CANONICAL one: it deposits the
+        # anchor in the shared store keyed by the prefix, where a re-admission
+        # -- or any other request sharing that prefix -- can read it back.
+        for r in reqs or ():
+            try:
+                setattr(r, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+            except Exception:  # noqa: BLE001 - a stamp may never break a seam
+                pass
 
         out = retract_all(
             reqs=list(reqs),
@@ -8732,6 +8767,53 @@ class PhaseFlipRuntime:
             self._retracted_refs_retired = consume_retracted_from_live_universe(
                 scheduler, rs
             )
+            # #792 ORDERING: ACK BEFORE THE DROP, or the anchor dies in the
+            # cutover it was built for.
+            #
+            # `reset_tree()` runs on the very next line of
+            # `release_residents_for_cutover`, and #924 traced where that goes:
+            # `_drop_tree` -> `drop_prefix_tree_returning_rows` -> `tree.evict`
+            # -> `_evict_component_and_detach_lru` ->
+            # `mamba_component.evict_component` -> `_free_mamba_value` ->
+            # `mamba_allocator.free`. The cutover evicts the prefix tree
+            # INCLUDING its mamba values. The boundary anchors the retraction
+            # just donated are device-side at that instant, so unless their
+            # write-through has been ACKED they are freed by the same cutover.
+            #
+            # The #703 fence is exactly this operation and it already awaits
+            # storage acks (`_await_storage_acks`). It ran earlier in the
+            # cutover, BEFORE the retraction -- so it covered the prefixes that
+            # were already in the tree and could not cover the anchors that did
+            # not exist yet. Running it once more here, after the donations and
+            # before the drop, is the same proven primitive at the point where
+            # the new anchors are the thing that needs persisting.
+            #
+            # Best-effort by construction: a fence that cannot run leaves the
+            # anchor device-only, which degrades to a recompute after the flip
+            # -- today's behaviour -- and never to a wrong answer.
+            try:
+                from sglang.srt.mem_cache.hicache_flip_writeback import (
+                    maybe_flip_writeback,
+                )
+
+                post_report = maybe_flip_writeback(scheduler)
+                if post_report is not None:
+                    self._last_retract_writeback_report = post_report
+                    logger.info(
+                        "%s #792 post-retract writeback fence: %s",
+                        LOG_PREFIX,
+                        post_report.as_log()
+                        if hasattr(post_report, "as_log")
+                        else post_report,
+                    )
+            except Exception as exc:  # noqa: BLE001 - never break the cutover
+                logger.warning(
+                    "%s #792 post-retract writeback fence did not run (%s); the "
+                    "boundary anchors stay device-only and are dropped with the "
+                    "tree, so re-admission recomputes as it does today.",
+                    LOG_PREFIX,
+                    exc,
+                )
             return out
 
         # W29: SAY HOW MANY ROWS THE DROP RETURNED. `drop_prefix_tree_
