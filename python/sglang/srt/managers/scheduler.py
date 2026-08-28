@@ -8635,6 +8635,57 @@ class Scheduler(
         # purity verdict says this layout forbids decode.
         self._rederive_latched_batch_full(running_batch)
 
+        # #962b: A FULL BATCH THAT HOLDS NOTHING IS NOT A STATE, IT IS A
+        # CONTRADICTION -- so at this junction the memo is not evidence.
+        #
+        # `batch_is_full` is written at the adder's stop condition below
+        # (search: `>= self._uniform_allocatable_reqs`) and means "seats ran
+        # out while packing THIS pass". That is a PASS-scoped claim, but it is
+        # stored on `running_batch`, whose lifetime is the whole scheduler.
+        # One field, two lifetimes: the gate above reads a round later what
+        # the adder wrote for a pass.
+        #
+        # Ordinarily that costs nothing, because the decode path clears the
+        # flag every round. Under the requeue-without-finish family
+        # (#797/#798/#791b/#971) it costs the boot: those paths release
+        # residents into `waiting_queue` WITHOUT finishing them, so at
+        # running=0 every clear site the flag has is unreachable -- the finish
+        # path needs a shrinking `extend` `last_batch` the void already
+        # destroyed, and the two `update_running_batch` sites sit behind
+        # `if not running_batch.is_empty()`. The memo then latches for the
+        # rest of the residency and this gate declines for ever, ABOVE the
+        # seat test, with free seats and a non-empty queue. Measured on boot 2
+        # of window-flip-0828 (11:21:37Z): three declines reading
+        # `gate=batch_full_or_empty_queue(batch_is_full=1,queue=4)` at
+        # running=0, self-sustaining until an external kill.
+        #
+        # RE-DERIVE, DO NOT CLEAR, and that distinction is the whole safety
+        # argument: this admits nothing. It restores the QUESTION the memo was
+        # standing in for, and the seat test -- the same
+        # `get_num_allocatable_reqs` the pass below applies -- answers it. If
+        # the seats really are gone the flag comes straight back True and the
+        # gate declines exactly as before.
+        #
+        # ONE JUNCTION, NOT AN EIGHTH CLEAR SITE. Put here rather than in each
+        # void path because the defect is not that any one path forgot to
+        # clear a flag: it is that a pass-scoped memo outlives its pass. A
+        # requeue path written next year inherits this without knowing the
+        # flag exists. Precedent in this file: the retract-RPC clears the same
+        # flag after `retract_all` + re-queue, for exactly this reason.
+        # NOT a replacement for #888b above, which covers the opposite case --
+        # a NON-empty batch of carriers the active phase forbids to run.
+        if running_batch.batch_is_full and running_batch.is_empty():
+            running_batch.batch_is_full = self.get_num_allocatable_reqs(0) <= 0
+            if not running_batch.batch_is_full:
+                logger.info(
+                    "#962b re-derived a latched batch_is_full: the running "
+                    "batch holds zero requests, so the memo could not have "
+                    "been written for this batch and no clear site of it is "
+                    "reachable at running=0 (%d request(s) waiting). The seat "
+                    "test decides this pass instead.",
+                    len(self.waiting_queue),
+                )
+
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
