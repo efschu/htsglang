@@ -7132,16 +7132,40 @@ class SchedulerPPMixin:
             # receive is unconditional once its own slot is non-empty -- sat
             # in `_pp_recv_dict_from_prev_stage` for ever (wedge_802f_1712).
             #
-            # WHAT THIS PREDICATE STILL DOES NOT COVER, stated where a reader
-            # will look for it: the case where this rank received NOTHING
-            # because its OWN slot was empty while the successor's was not.
-            # No rank publishes its per-slot expectation to its PREDECESSOR,
-            # so this end cannot see that disagreement -- closing it is a
-            # wire against the ring direction and is a separate posting, not
-            # part of this one. That case is bounded and loud rather than
-            # silent since #802-ring: `_pp_recv_dict_from_prev_stage` enters
-            # through `_pp_wait_for_dict_readiness(kind="output")`, whose
-            # timeout text names this exact asymmetry.
+            # WHAT THIS PREDICATE DOES NOT COVER, AND WHAT DOES. The case this
+            # one cannot see is the inverse of the relay hole: this rank
+            # received NOTHING because its OWN slot was empty while the
+            # successor's was not, so `pp_outputs` is None and the successor's
+            # unconditional receive has nothing coming. No rank publishes its
+            # per-slot expectation to its PREDECESSOR, so this end genuinely
+            # cannot answer it.
+            #
+            # THE RING DOES NOT NEED A WIRE AGAINST ITS OWN DIRECTION FOR IT,
+            # and the note that once said so here was read as an open posting
+            # for long enough to be ordered built. #951 closes the same
+            # disagreement FORWARDS: `_pp_send_admission_decision` carries
+            # `launched=self.mbs[mb_id] is not None`, overwritten by every hop,
+            # `_pp_recv_admission_decision` reads it into
+            # `_pp_upstream_launched_incoming`, and `pp_upstream_void_pending`
+            # REFUSES a pass whose upstream posted nothing. The successor gives
+            # up its receive instead of the predecessor acquiring an obligation
+            # to send -- one hop of an existing message rather than a fifth
+            # collective pair on a ring that has already buried four.
+            #
+            # REACHABLE AND MEASURED, not argued: the state is produced by a
+            # request lost from an intermediate rank's four lookup places
+            # (#944) meeting the zero offer `UNRESOLVED_DEFER_CAP` escapes
+            # with, which `reconcile_pp_admission_decision` honours WITHOUT a
+            # lookup -- so nothing retracts, that rank admits nothing, and its
+            # successor still does. A retraction can never produce it: it
+            # spreads emptiness only AWAY from rank 0.
+            # `test_pp_reverse_wire_reachability_801.py` drives that path to a
+            # wedge with the posting absent and to twelve clean passes with it.
+            #
+            # Bounded and loud rather than silent either way since #802-ring:
+            # `_pp_recv_dict_from_prev_stage` enters through
+            # `_pp_wait_for_dict_readiness(kind="output")`, whose timeout text
+            # names this exact asymmetry.
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
