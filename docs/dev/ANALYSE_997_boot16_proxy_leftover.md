@@ -272,3 +272,50 @@ Ko-Symptomatik, keine Kette. Wer FILL-ADOPT abschaltet, behebt den Crash nicht.
   entsteht nach dem Disarm), nicht durch vollstaendiges Tracing ihrer Koerper.
 - Die Frage, ob `_abandon_unjoined_flip` (`phase_flip_runtime.py:3949`) dieselbe
   Slot-Asymmetrie erzeugt wie `_abandon_no_quorum` — plausibel, ungeprueft.
+
+---
+
+## 8. NACHTRAG — konkurrierende Ursache (Arithmetik-Achse), per ORDNUNG entschieden
+
+Der Arithmetik-Sweep schlaegt fuer dasselbe Specimen eine andere Wurzel vor: eine
+falsch abgeleitete `last_chunk`-Entscheidung habe eine Continuation gemintet, die
+die Decision nie nannte, und DEREN Proxy sei der Leftover. Cut C dagegen ist
+committet (`26ccc1065f`).
+
+**Beide Mechanismen sind in diesem Specimen vorhanden. Die Slot-Divergenz ist die
+FRUEHERE und steht unabhaengig, und das entscheidet die Zeitachse:**
+
+| Zeit | Ereignis | Beleg |
+|---|---|---|
+| 22:20:47 | armed window beginnt, alle drei Raenge | `:2061`, `:2075`, `:2088` |
+| 22:20:47–22:21:47 | **das armed window**: PP0 haelt (kein Chunk, passes=0), PP1/PP2 halten nicht (Chunk, passes=1 je). Die Slot-Gauges divergieren HIER, publiziert je armed tick bei `:5025` | `:2090`, `:2094` |
+| 22:21:47 | ABANDON nach 60 s | `:2099` |
+| 22:21:48 | PASS-CLOCK meldet `RESUME SLOTS [1, 2, 2] -- DIVERGED` | `:2105` |
+| 22:21:48 | FILL-ADOPT auf PP1/PP2; der behauptete Fehl-Mint kann fruehestens JETZT stattfinden | `:2120`, `:2126` |
+| 22:21:48 | Refusal auf PP1 | `:2147` |
+
+Die Divergenz entsteht waehrend des 60-Sekunden-Fensters und ist gemessen, bevor
+irgendein Post-Abandon-Mint existieren kann. **Ein Ereignis um 22:21:48 kann eine
+Zustandsdivergenz nicht verursacht haben, die zwischen 22:20:47 und 22:21:47
+entstanden und um 22:21:48 bereits ausgedruckt ist.**
+
+Hinzu kommt: der beobachtete Stempel `mb_id=1` ist genau PP0s publizierter
+Resume-Slot. PP0 nimmt nach dem Abbruch den normalen Betrieb auf Slot 1 wieder
+auf und sendet an PP1, das auf Slot 2 steht — dafuer braucht es **gar keinen
+Extra-Mint**. Die einfachste Erklaerung des konkreten Stempels ist der
+Normalbetrieb ueber einen divergenten Ring.
+
+**Was daraus NICHT folgt:** dass der Fehl-Mint kein echter Defekt ist. Er kann
+ein zweiter, unabhaengiger Beitrag sein, und Cut C ist unabhaengig davon
+gerechtfertigt. Die vom Sweep vorgeschlagene Probe ist gut und ich nehme sie an:
+verschwindet der Leftover nach Cut C, war der Mint hinreichend; bleibt er, ist
+die Ring-Divergenz die Wurzel. Meine Vorhersage, damit sie falsifizierbar
+protokolliert ist: **der Leftover bleibt**, solange `_pp_flip_hold_slot`
+rang-lokal auf `chunked_req` ausnimmt — denn `passes [0,1,1]` haengt an der
+Chunk-Asymmetrie und nicht an der Chunk-Laenge.
+
+**Korrektur einer Zuschreibung:** meine These ist NICHT "wer haelt den Slot ueber
+den Reset". In diesem Specimen gab es keinen Reset — der Flip wurde abgebrochen
+(§1). Die These ist enger: *der Aktuator, der die Raenge waehrend eines armed
+window slot-uniform halten soll, ist rang-lokal konditioniert und hebt damit
+seine eigene, im Docstring ausgeschriebene Korrektheits-Voraussetzung auf.*
