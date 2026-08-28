@@ -973,10 +973,28 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
         if reason is None:
             continue
         n = prefix_len(req)
-        if n > 0:
+        if n > 0 and not tier_armed:
             # The PREFIX only. The extend region's draft rows are written by
             # this very batch's `_draft_extend_for_prefill`, and scrubbing them
             # would erase the one part that is real.
+            #
+            # #993: AND ONLY WHILE THE DRAFT TIER IS DISARMED. With the tier
+            # armed, this prefix was restored THROUGH the draft read path, so
+            # its draft rows are real where the page existed and ZERO where it
+            # did not (`cache_controller._draft_page_get_generic` writes the
+            # zero page on a miss since #993). Scrubbing them here would throw
+            # away the one thing that makes speculation over a cached prefix
+            # possible at all -- and it is the whole reason the persisted draft
+            # pages had a writer and no reader: every page that did come back
+            # was zeroed again a moment later, one funnel further on.
+            #
+            # The MARK is deliberately NOT made conditional with it. Splitting
+            # the scrub from the seed is #631's own decomposition ("a switch to
+            # separate the scrub from the seed"), and the seed is the cheap
+            # half: one non-drafting round whose FULL-captured hidden states
+            # start the real chain. Keeping it costs one round and keeps the
+            # seam re-admission argument intact; dropping the scrub is what
+            # buys the acceptance back.
             slot_rows.append(req_to_token[req.req_pool_idx, :n])
         cold.append((req, reason))
 
@@ -993,27 +1011,43 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
             LOG_PREFIX,
             len(cold),
         )
-    else:
+    elif slot_rows:
         rows, layer_ids = scrub_draft_kv(pool, slot_rows)
 
     for req, _reason in cold:
         mark_draft_cold(req)
         setattr(req, COLD_ARMED_ATTR, True)
 
+    # #993 EXECUTION PROOF for the admission link. `kept` is the number of
+    # requests marked whose prefix draft rows were LEFT STANDING because the
+    # draft tier was armed for their restore -- the quantity that was
+    # structurally zero before #993, since every marked request was also
+    # scrubbed. A line with kept=0 while the tier is armed means the read path
+    # is not delivering and the fault is upstream of here, which is exactly
+    # the distinction the old line could not make.
+    kept = len(cold) if tier_armed else 0
     logger.info(
         "%s ADMISSION draft-cold: %d request(s) marked, %d prefix draft KV "
-        "row(s) scrubbed across layer(s) %s of %s. First reason: %s. Each runs "
-        "a 1-node verify (no draft) whose hidden states seed the real chain; "
-        "from the next round they speculate normally, with acceptance climbing "
-        "as real draft rows accumulate behind the admission point.",
+        "row(s) scrubbed across layer(s) %s of %s, %d prefix(es) KEPT "
+        "(draft tier armed=%s). First reason: %s. Each runs a 1-node verify "
+        "(no draft) whose hidden states seed the real chain; a KEPT prefix "
+        "then speculates over the draft rows the L3 read restored instead of "
+        "over rows this funnel had just zeroed.",
         LOG_PREFIX,
         len(cold),
         rows,
         layer_ids,
         type(pool).__name__,
+        kept,
+        tier_armed,
         cold[0][1],
     )
-    return {"cold": len(cold), "rows": rows, "layers": layer_ids}
+    return {
+        "cold": len(cold),
+        "rows": rows,
+        "layers": layer_ids,
+        "kept": kept,
+    }
 
 
 def rounds_owed(req) -> int:

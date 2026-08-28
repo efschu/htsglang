@@ -604,6 +604,14 @@ class HiCacheController:
         self.draft_binding_generation = None
         self.draft_identity = None
         self._draft_disarm_warned = set()
+        # #993 EXECUTION PROOF for the draft READ path. The write half was
+        # observable from the store (pages on disk); the read half had no
+        # instrument at all, so "the draft tier is armed" and "draft pages
+        # actually come back" were indistinguishable from outside. Counted
+        # here, reported by `_log_draft_l3_progress`.
+        self._draft_l3_hits = 0
+        self._draft_l3_misses = 0
+        self._draft_l3_logged_at = -1
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -2472,6 +2480,36 @@ class HiCacheController:
             self.draft_page_get_func(hash_values, host_indices)
         except Exception:
             logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+        self._log_draft_l3_progress()
+
+    def _log_draft_l3_progress(self) -> None:
+        """#993: one line per doubling of the pages this read path has seen.
+
+        THE INSTRUMENT, and it is written so that it cannot read as success
+        when nothing happened: it fires off the page count, so a process that
+        never reads a draft page emits NOTHING and the absence of the line is
+        itself the finding. `hit` and `miss` are counted at the one site that
+        knows which is which (`_draft_page_get_generic`), not inferred.
+        """
+        total = self._draft_l3_hits + self._draft_l3_misses
+        if total == 0:
+            return
+        if self._draft_l3_logged_at >= 0 and total < 2 * self._draft_l3_logged_at:
+            # First batch always speaks (execution proof), then one line per
+            # doubling so a long run does not drown in them.
+            return
+        self._draft_l3_logged_at = total
+        logger.info(
+            "#993 draft L3 READ: %d page(s) requested, %d hit / %d miss "
+            "(%.1f %% hit). A miss writes ZEROS into its draft host row, so a "
+            "restored prefix's draft half is real-or-zero and never the "
+            "previous occupant's bytes; that is what lets admission keep the "
+            "rows that did come back instead of scrubbing the whole prefix.",
+            total,
+            self._draft_l3_hits,
+            self._draft_l3_misses,
+            100.0 * self._draft_l3_hits / total,
+        )
 
     # UNREACHABLE SINCE #861, and kept rather than deleted: these are the
     # landing site for task #861 item (a). The v2 route keys a page by POOL
@@ -2542,7 +2580,27 @@ class HiCacheController:
         ]
         self.storage_backend.batch_set(draft_keys, draft_data)
 
-    def _draft_page_get_generic(self, hash_values, host_indices) -> None:
+    def _draft_page_get_generic(self, hash_values, host_indices) -> int:
+        """Fill the draft host rows for these pages. Returns the number HIT.
+
+        #993: A MISS NOW WRITES ZEROS RATHER THAN LEAVING THE ROW ALONE.
+
+        The row this page would occupy is a recycled host slot holding the
+        PREVIOUS occupant's draft bytes. Leaving it untouched on a miss made
+        "restored target prefix" and "draft rows of an unrelated request"
+        indistinguishable downstream, which is why the admission path had to
+        scrub the WHOLE prefix and could never keep the pages that did come
+        back. Writing the zero page (``get_dummy_flat_data_page`` is
+        ``torch.zeros``) makes a missing draft page DETERMINISTIC instead of
+        arbitrary -- the same argument, and the same value, that
+        ``phase_flip_draft_bootstrap.scrub_draft_kv`` already makes for the
+        rows it clears, moved to the one place that knows WHICH pages missed.
+        It also removes the fp8 NaN/Inf path into the draft softmax that
+        arbitrary recycled bytes carry.
+
+        Correctness is unchanged either way -- the target verifies every
+        proposed token -- so this buys acceptance, not answers.
+        """
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
         draft_dummy = [
@@ -2550,12 +2608,24 @@ class HiCacheController:
         ]
         draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
         if draft_pages is None:
-            return
+            # The whole batch failed: no row is known-good, so every one of
+            # them still holds its previous occupant. Zero them all rather
+            # than return early -- an early return here is exactly the state
+            # the admission scrub existed to clean up after.
+            draft_pages = [None] * len(draft_keys)
+        hits = 0
         for i, p in enumerate(draft_pages):
-            if p is not None:
-                self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
-                )
+            if p is None:
+                # `draft_dummy[i]` is untouched zeros for a miss.
+                p = draft_dummy[i]
+            else:
+                hits += 1
+            self.mem_pool_host_draft.set_from_flat_data_page(
+                host_indices[i * self.page_size], p
+            )
+        self._draft_l3_hits += hits
+        self._draft_l3_misses += len(draft_keys) - hits
+        return hits
 
     # Backup batch by batch
     def _page_backup(self, operation):

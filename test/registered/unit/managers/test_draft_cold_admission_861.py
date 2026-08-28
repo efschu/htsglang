@@ -258,6 +258,53 @@ def test_warm_batch_is_untouched():
     assert torch.all(pool.get_key_buffer(0) == 7.0)
 
 
+def test_an_armed_tier_keeps_the_restored_draft_rows_and_still_marks():
+    """#993: the mark survives, the SCRUB does not, once the tier is armed.
+
+    THE DEFECT THIS PINS. Every persisted draft page had a writer and no
+    reader: `_page_transfer` restored the draft half of a cached prefix and
+    this funnel zeroed it again one step later, unconditionally, because the
+    seam trigger asks WHERE the request came from rather than WHETHER its
+    draft rows arrived. A request re-admitted at the seam therefore decoded
+    over an all-zero draft chain for its whole prefix, for the life of the
+    request -- nothing rewrites a prefix's draft rows after admission.
+
+    Deliberately a cold test rather than a boot observation: on metal the two
+    behaviours differ only in the acceptance number, which no single boot can
+    separate from the model, the traffic, or the flip cadence.
+    """
+    pool = FakeKVPool()
+    sched = make_scheduler(pool, tier_armed=True)
+    req = make_req("c", 1, prefix_len=5, seam=True)
+
+    report = arm_draft_cold_for_admission(sched, batch_of(req))
+
+    # Still marked: one non-drafting round seeds the chain (#631's split of
+    # the scrub from the seed -- the seed is the half worth keeping).
+    assert report["cold"] == 1
+    assert rounds_owed(req) == DEFAULT_DRAFT_COLD_ROUNDS
+    # ... and NOT scrubbed: the rows the L3 read restored are left standing.
+    assert report["rows"] == 0 and report["kept"] == 1
+    rows = sched.req_to_token_pool.req_to_token[1, :5]
+    assert torch.all(pool.get_key_buffer(0)[rows] == 7.0)
+    assert torch.all(pool.get_value_buffer(0)[rows] == 9.0)
+
+
+def test_a_disarmed_tier_still_scrubs_so_the_default_path_is_unchanged():
+    """The other direction of the same guard: with the tier disarmed nothing
+    restored the draft half, so the previous occupants' bytes must still go.
+    This is the byte-identical-to-#861 path for every non-flip deployment."""
+    pool = FakeKVPool()
+    sched = make_scheduler(pool, tier_armed=False)
+    req = make_req("c", 1, prefix_len=5, seam=True)
+
+    report = arm_draft_cold_for_admission(sched, batch_of(req))
+
+    assert report["cold"] == 1 and report["rows"] == 5 and report["kept"] == 0
+    rows = sched.req_to_token_pool.req_to_token[1, :5]
+    assert torch.all(pool.get_key_buffer(0)[rows] == 0)
+
+
 def test_mixed_batch_marks_only_the_cold_ones():
     sched = make_scheduler(FakeKVPool(), tier_armed=True)
     cold = make_req("c", 1, prefix_len=4, seam=True)
