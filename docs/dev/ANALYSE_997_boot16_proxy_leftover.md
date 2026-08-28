@@ -466,6 +466,16 @@ Der Request **wird ausgefuehrt**, er wird nur nicht als Continuation
 angekuendigt. Das Verhalten ist gewollt und `#995b` begruendet es an
 `:1599-1610` schluessig; falsch ist allein der Satz "Nothing of it has run".
 
+**Und die Lock-Ref faellt nicht bloss moeglicherweise, sondern ZWINGEND.** Der
+Decline-Block steht innerhalb von `:1554` `if not last_chunk and not
+carried_chunk:` — Einrueckung nachgemessen: `:1611` liegt auf 12, `:1615` auf 8,
+und das naechste umschliessende `if` auf 8er-Ebene ist genau `:1554`. Innerhalb
+dieses Blocks ist `carried_chunk` konstruktiv `False`, also ist `if not
+carried_chunk:` (`:1615`) auf diesem Pfad unausweichlich wahr. Es heisst nicht
+"kann eine Lock-Ref nehmen", es heisst **"nimmt sie immer"** — gefolgt von
+`_update_prefill_budget` (`:1617`), dessen erstes Argument aus demselben Grund
+`prefix_len` und nicht `0` ist (`:1618`).
+
 **Warum das hier und nicht nur in der Nachbar-Achse steht:** Boot 16s beide
 Refusals sind `site=_add_scheduled_req` (`:2034`, `:2045`). Wer diese zwei Zeilen
 im Specimen liest, entnimmt ihnen woertlich, dass nichts gelaufen sei und nichts
@@ -473,8 +483,39 @@ gekostet habe — waehrend beide Requests eine Lock-Ref genommen und Budget
 belastet haben. Das ist kein hypothetisches Risiko: es ist eine Fehlleitung, die
 in genau dem Log wartet, das diese Analyse auswertet.
 
-Damit steht die Form viermal in einer Kampagne: der tote Ratchet (`#996`), der
-Guard-Hinweis auf die Drains (`#997` §3), der "uncalled"-Docstring eines
-aufgerufenen Drains (`:5521-5530`), und diese Meldung. Vier Instrumente, deren
-Text nicht beschreibt, was sie tun. **Gefilt, nicht gebaut** — die Korrektur ist
-ein Satz im Log-Text und gehoert nicht in einen Boot-Zyklus.
+### 8.6 ZWEI Formen, nicht eine — die Zaehlung sauber getrennt
+
+§8.4 und §8.5 beschreiben **nicht dasselbe**, und sie zu vermengen macht die
+Zaehlung unpraeziser statt eindrucksvoller. Der Einwand kam von der
+Arithmetik-Achse und er ist richtig:
+
+**Form A — das Instrument luegt.** Der Text eines Mechanismus beschreibt nicht,
+was der Mechanismus tut. Viermal in dieser Kampagne:
+
+| # | Instrument | Der Text sagt | Tatsaechlich |
+|---|---|---|---|
+| A1 | Discovery-Diff (`#996`) | prueft, dass nichts Undeklariertes geschrieben wird | tautologisch gruen, prueft nichts (`test_cutover_discovery_diff_859.py:54-64`) |
+| A2 | `#631`-Guard-Hinweis (`#997` §3) | "the drains … did not [prevent it], THAT is the defect to chase" | beide Drains sind im Einschlagsmoment konstruktiv abgeschaltet |
+| A3 | Drain-Docstring (`:5521-5530`) | "left here, **uncalled**" | wird `:5832` aufgerufen |
+| A4 | Refusal-Meldung (`:59-75`) | "Nothing of it has run, so no progress is lost" | nimmt an `_add_scheduled_req` **immer** eine Lock-Ref und belastet Budget |
+
+**Form B — der Leser irrt am Instrument.** Ein Log-Ereignis, das zu einer
+Hypothese PASST, wird als deren Bestaetigung gelesen, ohne die Zeile daneben zu
+pruefen, die die Alternative nennt. Zweimal in dieser Kampagne, beide Male auf
+der Arithmetik-Achse, beide Male vom Autor selbst gefunden und zurueckgezogen,
+bevor Metall dafuer bezahlt wurde (`:2105` vor `:2120`; `:2033`/`:2044` ueber
+`:2034`/`:2045`).
+
+A ist ein Defekt im Code-Artefakt und wird durch Editieren behoben. B ist ein
+Fehler im Verfahren und wird durch die Gegenprobe behoben — *die Zeile darueber
+lesen*. Beide teilen die Wurzel des INDIKATOR-GESETZES (ein Indikator gilt als
+Befund, bevor geprueft ist, DASS er misst, was er behauptet), aber sie sind
+verschiedene Sachen und verlangen verschiedene Abhilfe. **Vier A-Instanzen und
+zwei B-Instanzen — nicht sechs von irgendwas.**
+
+**Gefilt, nicht gebaut.** Die A4-Korrektur ist ein String. Dagegen steht, dass
+der naechste Boot die `#997`-Vorhersage testet und eine sachfremde
+Code-Aenderung die Attribution unscharf macht, ohne dass der Boot sie braucht.
+Speed-Modus verlangt fuer ein Einzelstueck im kritischen Pfad einen Grund, und
+"ein Logtext liest sich schief" ist keiner. Beim naechsten Anfassen dieser Datei
+mitnehmen.
