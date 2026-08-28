@@ -3846,7 +3846,71 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_indices_list.append(host_indices)
                 released_tokens += len(host_indices)
             if host_indices_list:
-                cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+                # #989 OWNERSHIP AT THE GIVE-BACK: FREE ONLY WHAT IS OWNED.
+                #
+                # This queue has FIFTEEN producers and this is their ONE
+                # give-back, with no dedup and no ownership test -- the
+                # fourth instance today of "many producers, one give-back,
+                # no provenance" (#990 lock_ref, #991 mamba slot, #993
+                # req-pool row, now the host region). Measured, boot 18
+                # (ecedf3f791, 2026-08-28 22:57:26, plain PP=3 with the flip
+                # PROVABLY off -- arming 0, flipdone 0): PP0 died on
+                # `Double-free detected: slots not currently allocated:
+                # [60934…60971+]` from this exact call.
+                #
+                # Two shapes reach here and both are handled: the same span
+                # queued TWICE (duplicate within the batch) and a span queued
+                # again AFTER it was already freed (already-free in the pool).
+                # Freeing a slot that is not allocated is never correct, so
+                # dropping those is not a heuristic -- it is the give-back
+                # doing what it always should have done.
+                #
+                # THE PROVENANCE IS THE POINT, not the containment. Each
+                # offender is named with the `module:lineno` that queued it
+                # (#989 stamp in `append_host_mem_release`), so the NEXT
+                # 90-second boot identifies the producer PAIR itself instead
+                # of us choosing the likeliest of fifteen candidates.
+                _idx = torch.cat(host_indices_list, dim=0)
+                _cpu = _idx.detach().to("cpu", copy=False).flatten()
+                _uniq, _counts = torch.unique(_cpu, return_counts=True)
+                _dupes = _uniq[_counts > 1]
+                _pool = cc.mem_pool_host
+                _slot_used = getattr(_pool, "slot_used", None)
+                if _slot_used is not None:
+                    _unowned = _uniq[~_slot_used[_uniq]]
+                else:
+                    _unowned = _uniq[:0]
+                if _dupes.numel() or _unowned.numel():
+                    _n = getattr(self, "_989_release_conflicts", 0) + 1
+                    self._989_release_conflicts = _n
+                    if _n <= 8 or _n % 256 == 0:
+                        _site = getattr(cc, "host_release_site", None)
+                        _names = []
+                        for _t in (_dupes, _unowned):
+                            for _s in _t[:4].tolist():
+                                _names.append(
+                                    f"{_s}<-{_site(_s) if _site else '?'}"
+                                )
+                        logger.error(
+                            "#989 HOST RELEASE CONFLICT occurrence=%d: %d slot(s) "
+                            "queued twice, %d slot(s) already free. Freeing only "
+                            "the owned, unique set (%d of %d). Offenders with the "
+                            "site that queued them: %s. This queue has fifteen "
+                            "producers and one give-back; a slot arriving here "
+                            "unowned means two of them claimed the same span. "
+                            "The W35 generation guard cannot see this -- it "
+                            "routes by BINDING GENERATION, and these are two "
+                            "current-generation batches.",
+                            _n,
+                            int(_dupes.numel()),
+                            int(_unowned.numel()),
+                            int((_uniq.numel() - _unowned.numel())),
+                            int(_cpu.numel()),
+                            ", ".join(_names) or "-",
+                        )
+                _to_free = _uniq if _slot_used is None else _uniq[_slot_used[_uniq]]
+                if _to_free.numel():
+                    cc.mem_pool_host.free(_to_free.to(_idx.device))
             return len(host_indices_list), released_tokens
 
         def _drain_extra_release():

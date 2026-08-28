@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import sys
 import threading
 import time
 from queue import Empty, Queue
@@ -720,6 +721,10 @@ class HiCacheController:
         self.prefetch_revoke_queue: Queue[str] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+        # #989: first-slot -> "module:lineno" of whoever queued that page.
+        # Read by `_drain_release` when it finds a duplicate or an
+        # already-free slot, so the crash names PRODUCERS and not only slots.
+        self.host_release_provenance: dict[int, str] = {}
 
         self.prefetch_thread.start()
         self.backup_thread.start()
@@ -2065,9 +2070,32 @@ class HiCacheController:
 
         A stale batch whose pool is UNKNOWN is refused loudly and NOT queued:
         freeing it here would corrupt and queueing it would corrupt later.
+
+        #989 PROVENANCE AT THE ENQUEUE, BECAUSE THE FREE CANNOT RECONSTRUCT IT.
+        `_drain_release` frees whatever arrives, so when two producers queue the
+        same span the pool's assert names the SLOTS and nothing names the
+        PRODUCERS -- which is why boot 18's double-free (span 60934-60971+,
+        plain PP=3, flip provably off) could be localised to this queue and no
+        further. The site is taken from the caller's frame rather than added as
+        a parameter to all fifteen call sites, so a producer that is added
+        LATER is stamped without anyone remembering to: eight sites in
+        unified_radix_cache.py, plus swa_component, mamba_component,
+        hiradix_cache (x3), hi_mamba_radix_cache (x2) and this file.
+
+        THE W35 GUARD ABOVE DOES NOT COVER THIS AND THAT IS THE POINT. It routes
+        by BINDING GENERATION -- it catches a producer naming slots from the
+        pool bound BEFORE a cutover. Two producers queueing the same span
+        WITHIN one generation are, to that guard, two ordinary current-
+        generation batches: structurally invisible to it, not merely missed.
+        The guard names the hazard, not the gap.
         """
         if host_indices.numel() == 0:
             return
+        try:
+            f = sys._getframe(1)
+            site = f"{f.f_globals.get('__name__', '?').rsplit('.', 1)[-1]}:{f.f_lineno}"
+        except Exception:  # noqa: BLE001 - provenance may never break a release
+            site = "?"
         if generation is not None:
             from sglang.srt.mem_cache.hicache_phase_binding import (
                 host_pool_for_generation,
@@ -2109,7 +2137,20 @@ class HiCacheController:
                 return
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
+            # #989: record who queued this page, keyed by its first slot. The
+            # map is authoritative only until the page is drained; the drain
+            # pops what it reads, so it cannot grow without bound while the
+            # drain keeps up, and `_drain_release`'s own clamp covers the case
+            # where it does not.
+            try:
+                self.host_release_provenance[int(page[0])] = site
+            except Exception:  # noqa: BLE001 - provenance may never break a release
+                pass
             self.host_mem_release_queue.put(page)
+
+    def host_release_site(self, first_slot: int) -> str:
+        """#989: who queued the page starting at this slot, '?' if unrecorded."""
+        return self.host_release_provenance.get(int(first_slot), "?")
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
