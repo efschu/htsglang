@@ -1735,6 +1735,52 @@ class Req(ReqDllmMixin):
             # point, rather than nulled and left for a caller to fix up.
             if getattr(self, "extend_range", None) is not None:
                 self.extend_range = Range(told, told)
+            # #965 THE WHOLE CO-DERIVED GROUP, AS A GROUP.
+            #
+            # `init_next_round_input` reads the tree ONCE and unpacks that one
+            # `match_result` into EIGHT attributes in a single tuple assignment
+            # (the statement above `if match_result.cache_protected_len is not
+            # None`). They are one reading of one geometry wearing eight names,
+            # and the sentence four lines up -- "the geometry was DERIVED from
+            # the prefix that just moved, so it is now a stale reading rather
+            # than a report" -- is true, word for word, of every one of them.
+            #
+            # It was paid for one field at a time, twice, each found by a boot:
+            # #930 carried `cache_protected_len` through this truncation, #958
+            # added `extend_range`. Clearing the rest here, together, is what
+            # stops a third window buying the same lesson.
+            #
+            # WHAT THE STALE READINGS DO, at `PrefillAdder.add_one_req` twelve
+            # lines further down the path (`scheduler.py` derives them, both
+            # arms of the `pp_size > 1` fork call THIS method, then
+            # `adder.add_one_req` reads them, with no `match_prefix` between):
+            #   * `real_input_tokens = cand_extend_input_len -
+            #     req.host_hit_length` subtracts a host hit that is no longer
+            #     part of this prefix, under-counting the input against the
+            #     budget gates;
+            #   * `needs_host_load_back()` is still true, so `init_load_back`
+            #     runs on a stale `best_match_node`/`host_hit_length` and does
+            #     `prefix_indices = torch.cat([prefix_indices, new_indices])`
+            #     -- leaving `[0, told)` and then `[L_dev, L_dev+H)` with a HOLE
+            #     between them, while `prepare_for_extend` sizes the
+            #     cross-stage tensor off `len(prefix_indices)` as though it
+            #     were contiguous. That is the silently-wrong-context class;
+            #   * that same branch then re-raises `cache_protected_len` to the
+            #     grown length, undoing #930 nine lines after it was applied.
+            #
+            # `last_node` IS NOT CLEARED, and the asymmetry is the point. It is
+            # not a reading, it is a RESOURCE HANDLE: `cache_unfinished_req`
+            # took `inc_lock_ref` on it and this attribute is the only surviving
+            # reference to that ref. Nulling it would leak the lock ref and make
+            # the node permanently unevictable -- a defect that already exists
+            # on the PP void path and must not be manufactured here as well. It
+            # is invalidated by RELEASE, which is not this method's job.
+            self.last_host_node = None
+            self.best_match_node = None
+            self.host_hit_length = 0
+            self.swa_host_hit_length = 0
+            self.mamba_host_hit_length = 0
+            self.mamba_branching_seqlen = None
         if self.cache_protected_len > told:
             self.cache_protected_len = told
 

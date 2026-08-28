@@ -11,6 +11,45 @@ from sglang.srt.utils import get_bool_env_var
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
+#: #967: how many times the #959 "one continuation at a time" guard has
+#: refused a FRESH request in this process, per mint site.
+#:
+#: THE GUARD WAS UNOBSERVABLE, and that is the whole posten. #959 is closed by
+#: two bare `return AddReqResult.OTHER` statements with no trace of any kind,
+#: so whether they ever fire is not readable from any boot log -- a refusal
+#: that leaves no trace is indistinguishable from a scheduler that simply
+#: built nothing, which is precisely the state the next window has to tell
+#: apart. Its neighbour `Scheduler._note_seam_chunk_refused` shows the
+#: counter-pattern and this follows it: unconditional count, first three
+#: occurrences logged, then every thousandth, so a guard that fires every
+#: round costs a handful of lines rather than one per iteration.
+#:
+#: MODULE-LEVEL, not on the adder: `PrefillAdder` is rebuilt every pass, so an
+#: instance counter would reset before anyone could read it. The question this
+#: answers -- "was this guard reached at all in this boot" -- is a
+#: process-lifetime question.
+_SECOND_CONTINUATION_REFUSALS = {}  # site -> count (str -> int)
+
+
+def note_second_continuation_refused(req, site: str) -> int:
+    """Count and (rate-limited) name one #959 refusal. Returns the new count."""
+    n = _SECOND_CONTINUATION_REFUSALS.get(site, 0) + 1
+    _SECOND_CONTINUATION_REFUSALS[site] = n
+    if n <= 3 or n % 1000 == 0:
+        logger.info(
+            "[#967] SECOND CONTINUATION REFUSED rid=%s site=%s: a resident "
+            "chunked request is still outstanding, so this FRESH request is "
+            "left for a later pass rather than minted as a second "
+            "continuation (#959). Nothing of it has run, so no progress is "
+            "lost and no double prefill is incurred; it is admitted as soon "
+            "as the resident continuation finishes. occurrence=%d",
+            getattr(req, "rid", None),
+            site,
+            n,
+        )
+    return n
+
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1651,6 +1690,8 @@ class PrefillAdder:
             # which already refuses to announce a NEW chunked req for exactly
             # this reason and names this assert while doing it.
             if self.chunked_req_outstanding:
+                # #967: count and name it -- see note_second_continuation_refused.
+                note_second_continuation_refused(req, "add_one_req_ignore_eos")
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -1892,6 +1933,8 @@ class PrefillAdder:
                 # site already has its own (`carried_chunk`). Missing it here
                 # would leave the same assert reachable by the longer path.
                 if self.chunked_req_outstanding:
+                    # #967: same guard, second mint site, same instrument.
+                    note_second_continuation_refused(req, "add_one_req")
                     return AddReqResult.OTHER
 
                 # Chunked prefill
