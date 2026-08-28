@@ -58,6 +58,11 @@ def _cache(*, controller=_Controller, enable_storage=False, backend_type=None):
     c.prefetch_threshold = 256
     c.prefetch_stop_policy = "best_effort"
     c.write_through_threshold = 2
+    # #966: detach now also releases the retired prefetch records, whose reap
+    # its own clearing of `enable_hicache_storage` makes unreachable. A real
+    # instance always carries this list (`_reset_full`, which `__init__` runs);
+    # the shell has to carry it too, or it pins a detach that cannot run.
+    c._retired_prefetch = []
     c.calls = []
     c._apply_storage_runtime_config = lambda **kw: c.calls.append(("config", kw))
     c._symmetrize_prefetch_capacity = lambda: c.calls.append(("symmetrize", None))
