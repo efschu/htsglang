@@ -99,11 +99,47 @@ what frames it, and the counter counts LOGICAL messages on it:
             Sender k, receiver k+1.
   ``dict``  the tensor-dict stream, ``send_tensor_dict`` /
             ``recv_tensor_dict``. Sender k, receiver (k+1) % pp_size.
-            NOTE: ``proxy`` (hidden states) and ``output`` messages share
-            this ONE wire and are demultiplexed by ``__msg_type__`` after
-            the fact, so they must share ONE counter. Counting them
-            separately would let a rank believe a wire was empty while a
-            message of the other kind sat on it.
+            NOTE: ``proxy`` (hidden states), ``output`` and
+            ``admission_decision`` messages share this ONE wire and are
+            demultiplexed by ``__msg_type__`` after the fact, so they must
+            share ONE counter. Counting them separately would let a rank
+            believe a wire was empty while a message of the other kind sat
+            on it.
+
+THE PER-KIND AXIS, AND WHY IT DOES NOT CONTRADICT THE PARAGRAPH ABOVE (#974)
+---------------------------------------------------------------------------
+That paragraph is about the question the DRAINS ask ("may I take something
+off this wire?"), and it is still exactly right for them: a drain that
+believed a wire empty while another kind sat on it would leave an unmatched
+message behind -- the bounded-recv corpse. The shared counter stays the sole
+authority there, unchanged.
+
+There is a second question, asked only by ``_pp_wait_for_dict_readiness``:
+*is my OWN message ever coming?* The shared counter answers a strictly
+weaker question than that one -- "is ANY message coming?" -- and the
+difference is not academic. Measured, boot 1 vs boot 2 of window-flip-0828:
+
+  * boot 1: an unrelated livelock froze ALL traffic, the shared counter
+    froze with it, and the gate fired twice (a loud, diagnosable death).
+  * boot 2: that livelock was fixed, so the upstream stayed busy posting
+    ``admission_decision`` messages. ``consumed < posted`` was therefore
+    true at every single poll, the gate returned early every time, and the
+    receiver sailed into an unbounded wait for an ``output`` nobody had
+    posted -- a SILENT wedge. Zero gate firings.
+
+A compensator whose trigger condition was supplied by a foreign defect, and
+which the foreign fix (correctly) disarmed. So the readiness gate needs
+per-KIND accounting, and gets it WITHOUT a second mechanism: the kind rides
+the existing ``chan`` axis as a sub-channel, ``dict|output``, one more file
+of the same shape, written by the same single writer, swept by the same
+sweep. Every send bumps both its wire's counter and its kind's.
+
+The precedent for a second, differently-scoped counter that only ONE reader
+may use is ``attempted``, three paragraphs down: it too would be wrong for a
+drain and is right for the gate. Same discipline here -- the per-kind
+counters are read by the readiness gate alone, and only through
+``kind_axis_covers``, which refuses the axis unless the sender demonstrably
+labels everything it posts.
 """
 
 from __future__ import annotations
@@ -145,6 +181,56 @@ CHAN_PASS = "pass"
 #: nothing else. So this gauge is what the falling-edge check reads, and
 #: agreement on it is the invariant the armed window must preserve.
 CHAN_SLOT = "slot"
+
+#: #974: separates a wire's name from the MESSAGE KIND riding it, forming a
+#: sub-channel of the same wire (``dict|output``). A separator rather than a
+#: new axis in the file name because ``chan`` is already a free-form string
+#: that names one countable stream: the sub-channel is one, so it needs no
+#: new machinery, no new naming scheme, and no change to ``sweep`` (which
+#: matches on the instance prefix and the ``role``/rank suffix, both of which
+#: a sub-channel file carries unchanged).
+KIND_SEP = "|"
+
+
+def kind_channel(chan: str, kind: str) -> str:
+    """The sub-channel of ``chan`` carrying only messages of ``kind``."""
+    return f"{chan}{KIND_SEP}{kind}"
+
+
+def kind_axis_covers(counters, chan: str, rank: int) -> bool:
+    """May a reader trust the per-kind counters of ``rank`` on ``chan``?
+
+    ONLY IF THE SENDER LABELS EVERYTHING IT POSTS, proved rather than
+    assumed: the per-kind totals must account for every post the wire
+    counter knows about. Anything less and the kind axis would read "no
+    message of your kind is coming" for messages that simply were not
+    labelled -- a false raise, which is the one direction this gate must
+    never move in.
+
+    FALSE IS ALWAYS THE SAFE ANSWER, and it is the answer for every case
+    that is not provably covered: a counters object without the per-kind
+    API at all (the stand-in holders across the #631/#757/#787/#789/#791/
+    #795/#797/#798 test family carry only ``sent``/``attempted``/
+    ``local_consumed``), a sender that has posted nothing yet, or a sender
+    mixing labelled and unlabelled posts. In every one of them the caller
+    falls back to the wire counter and behaves exactly as it did before
+    #974 existed.
+
+    The ``getattr`` is therefore not a default standing in for a value --
+    it is the presence test itself, and its negative answer selects the
+    unchanged code path rather than a guessed number.
+    """
+    total = getattr(counters, "kind_sent_total", None)
+    if total is None:
+        return False
+    posted = counters.sent(chan, rank)
+    if posted <= 0:
+        # Nothing posted at all: both axes say the same thing, so there is
+        # no reason to prefer the newer one. Keeps the "no upstream ever
+        # scheduled anything" case (#789's original defect) byte-identical.
+        return False
+    return int(total(chan, rank)) >= int(posted)
+
 
 _SENT = "s"
 _CONSUMED = "c"
@@ -210,6 +296,11 @@ class PhaseFlipCounters:
         MUST be called strictly AFTER the isend is posted -- see the module
         docstring. Every caller is on the far side of the send call, and
         that placement is the safety property, not a style choice.
+
+        #974: a per-kind SUB-CHANNEL is bumped through this same method,
+        with ``chan=kind_channel(wire, kind)``. It needs no parameter here
+        because a sub-channel is a channel: same single writer, same
+        monotonicity, same ordering rule, same sweep.
         """
         key = (chan, _SENT)
         n = self._local.get(key, 0) + 1
@@ -350,6 +441,58 @@ class PhaseFlipCounters:
     def local_consumed(self, chan: str) -> int:
         return self._local.get((chan, _CONSUMED), 0)
 
+    # -- the per-kind axis (#974) ---------------------------------------
+    #
+    # Same files, same writer, same sweep -- one sub-channel per message
+    # kind riding the wire. Read ONLY by `_pp_wait_for_dict_readiness`, and
+    # only after `kind_axis_covers` has confirmed the sender labels
+    # everything it posts. The drains keep reading the wire counter; see the
+    # module docstring for why both statements are true at once.
+
+    def sent_of_kind(self, chan: str, kind: str, rank: int) -> int:
+        return self._read(kind_channel(chan, kind), _SENT, rank)
+
+    def attempted_of_kind(self, chan: str, kind: str, rank: int) -> int:
+        return self._read(kind_channel(chan, kind), _ATTEMPTED, rank)
+
+    def local_consumed_of_kind(self, chan: str, kind: str) -> int:
+        return self._local.get((kind_channel(chan, kind), _CONSUMED), 0)
+
+    def kind_sent_total(self, chan: str, rank: int) -> int:
+        """How many of ``rank``'s posts on ``chan`` carried a kind label.
+
+        Summed over the sub-channels that EXIST rather than over a declared
+        list of kinds, so a kind added later counts itself. For a peer this
+        is one directory listing; it is read on the readiness gate's polling
+        path only -- never on the send path.
+        """
+        rank = int(rank)
+        stem = f"{chan}{KIND_SEP}"
+        if rank == self.rank:
+            return sum(
+                value
+                for (sub, role), value in self._local.items()
+                if role == _SENT and sub.startswith(stem)
+            )
+        prefix = f"{self.instance}.ctr.{stem}"
+        suffix = f".{_SENT}{rank}"
+        total = 0
+        try:
+            names = os.listdir(self.directory)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            try:
+                with open(os.path.join(self.directory, name)) as fh:
+                    total += int(fh.read().strip() or 0)
+            except (OSError, ValueError):
+                # Same answer one poll early -- counter-lags-send, the safe
+                # skew, exactly as in `_read`.
+                continue
+        return total
+
     def sweep(self) -> int:
         """Drop THIS RANK's own counter files. Boot housekeeping only.
 
@@ -389,6 +532,9 @@ class PhaseFlipCounters:
 
 __all__ = [
     "PhaseFlipCounters",
+    "KIND_SEP",
+    "kind_channel",
+    "kind_axis_covers",
     "CHAN_REQ",
     "CHAN_DICT",
     "CHAN_PASS",

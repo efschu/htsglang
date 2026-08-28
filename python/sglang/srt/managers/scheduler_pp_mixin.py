@@ -38,6 +38,8 @@ from sglang.srt.managers.phase_flip_counters import (
     CHAN_PASS,
     CHAN_REQ,
     CHAN_SLOT,
+    kind_axis_covers,
+    kind_channel,
 )
 from sglang.srt.managers.pp_admission_congruence import (
     UNKNOWN_MATCH,
@@ -112,6 +114,61 @@ _PP_STATS_UNSET = object()
 # while an admission_decision message was still on it would be the same bug
 # class as miscounting a proxy or output message.
 ADMISSION_DECISION_KIND = "admission_decision"
+
+
+def _pp_flip_bump_kind(holder, method: str, chan: str, kind) -> None:
+    """#974: bump ``chan``'s per-KIND sub-channel, if there is one to bump.
+
+    A MODULE-LEVEL FUNCTION, NOT A METHOD, and that is not a style choice --
+    it is the one thing this file's own history says must not be got wrong
+    twice. Roughly ten stand-in holders across the
+    #631/#757/#787/#789/#791/#795/#797/#798 family are plain
+    ``types.SimpleNamespace`` objects that bind mixin methods ONE NAME AT A
+    TIME (``setattr(h, name, MethodType(getattr(SchedulerPPMixin, name),
+    h))``). A new method reached through ``self.`` would be invisible to
+    every one of them: measured on the first cut of this fix,
+    ``test_pp_retracted_pass_void_797.py`` went from 31 passed to 7 failed,
+    all of them ``AttributeError: 'types.SimpleNamespace' object has no
+    attribute '_pp_flip_bump_kind'``. This is the same constraint the
+    ``_pp_wait_for_proxy_readiness`` ALIAS below records for the same
+    reason, arriving through a different door.
+
+    Adding the kind to the three existing bump helpers instead would fail
+    the same way for the same family: those are replaced by ONE-ARGUMENT
+    lambdas (``lambda chan: None``), so a second parameter is a
+    ``TypeError``. The new behaviour therefore goes BESIDE the old entry
+    point and reaches the counters object directly.
+
+    THE FALL-THROUGHS ARE THE COMPATIBILITY CONTRACT, not defensive padding.
+    A holder with no counters, or a stub counters object carrying only the
+    three readers, simply does not label its posts -- and
+    ``kind_axis_covers`` then reports the axis unusable, so the readiness
+    gate falls back to the wire counter and behaves exactly as it did before
+    #974. Unlabelled is a state the reader already handles correctly; it is
+    never a wrong number.
+    """
+    counters = getattr(holder, "pp_flip_counters", None)
+    if counters is None or not kind:
+        return
+    bump = getattr(counters, method, None)
+    if bump is None:
+        return
+    bump(kind_channel(chan, kind))
+
+
+def _msg_kind_of(message) -> Optional[str]:
+    """The ``__msg_type__`` a dict message carries, or ``None`` for unlabelled.
+
+    #974. ``None`` is a real answer, not a failure: an unlabelled message is
+    counted on the wire and on no kind, which ``kind_axis_covers`` detects as
+    an incomplete axis and answers by falling back to the wire counter. So a
+    message this cannot classify degrades the gate to its pre-#974
+    behaviour rather than mis-classifying it into some other kind's account.
+    """
+    if not isinstance(message, dict):
+        return None
+    kind = message.get("__msg_type__")
+    return str(kind) if kind else None
 
 # The single non-tensor payload key the decision travels under. Riding a
 # plain python object inside the tensor dict is established practice on this
@@ -4166,6 +4223,7 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 )
             )
+            _pp_flip_bump_kind(self, "bump_consumed", CHAN_DICT, _msg_kind_of(raw))
             self._pp_flip_bump_consumed(CHAN_DICT)
             drained += 1
             stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
@@ -4324,6 +4382,7 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 )
             )
+            _pp_flip_bump_kind(self, "bump_consumed", CHAN_DICT, _msg_kind_of(raw))
             self._pp_flip_bump_consumed(CHAN_DICT)
             drained_messages += 1
             kind = raw.get("__msg_type__", "default") if isinstance(raw, dict) else None
@@ -5695,6 +5754,11 @@ class SchedulerPPMixin:
         # below still means "on the wire" and is still published strictly
         # after the post; this is a second counter with a second meaning.
         # See PhaseFlipCounters.bump_attempted for the full argument.
+        # #974: the kind's sub-channel FIRST, then the wire, under the same
+        # ordering rule -- so a reader can never see the wire count move for
+        # a post whose kind was not yet accounted (which would make it fall
+        # back to the wire counter for a poll it did not need to).
+        _pp_flip_bump_kind(self, "bump_attempted", CHAN_DICT, msg_type)
         self._pp_flip_bump_attempted(CHAN_DICT)
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -5712,6 +5776,14 @@ class SchedulerPPMixin:
         # -- they are demultiplexed by __msg_type__ AFTER coming off it,
         # so counting them apart would let a rank call a wire empty while
         # a message of the other kind was still on it.
+        #
+        # #974: that sentence governs the WIRE counter and the drains that
+        # read it, and is unchanged. The per-kind sub-channel bumped beside
+        # it answers a different question for a single reader -- "is a
+        # message of MY kind coming?" -- which the wire counter cannot
+        # answer and which boot 2 of window-flip-0828 needed it to. No drain
+        # reads it; see phase_flip_counters' module docstring.
+        _pp_flip_bump_kind(self, "bump_sent", CHAN_DICT, msg_type)
         self._pp_flip_bump_sent(CHAN_DICT)
         return p2p_work
 
@@ -5739,6 +5811,16 @@ class SchedulerPPMixin:
             # #631 G: counted here, off the WIRE, before the demultiplex --
             # a stashed message has still left the wire, and the upstream's
             # blocking commit is waiting on exactly that fact.
+            #
+            # #974: the kind is charged to the kind that ACTUALLY arrived,
+            # not to the kind this receive asked for. A wrong-kind message
+            # that gets stashed has left the wire and must be counted, but
+            # it has not satisfied the caller -- and keeping those two facts
+            # apart is precisely what lets the readiness gate tell "my
+            # message is late" from "the wire is busy with someone else's".
+            _pp_flip_bump_kind(
+                self, "bump_consumed", CHAN_DICT, _msg_kind_of(tensor_dict)
+            )
             self._pp_flip_bump_consumed(CHAN_DICT)
             started[0] = time.perf_counter()
 
@@ -6907,21 +6989,52 @@ class SchedulerPPMixin:
         by __msg_type__ AFTER coming off it, so counting them apart would
         let a rank call a wire empty while a message of the other kind was
         still on it." So this gate reads the same true statement about the
-        same wire whichever kind its caller is about to ask for. `kind` is
-        used for ONE thing only: the non-destructive inbox peek, which is
-        per-`(src, kind)` and must match the key the caller's own receive
-        will use a moment later.
+        same wire whichever kind its caller is about to ask for. #974 adds a
+        SECOND, per-kind reading of that same true statement -- one
+        sub-channel per `__msg_type__`, bumped beside the wire counter by
+        the same single writer -- because "whichever kind" is exactly the
+        imprecision that let boot 2 wedge in silence (see below). `kind` is
+        therefore used for two things now: the non-destructive inbox peek,
+        which is per-`(src, kind)` and must match the key the caller's own
+        receive will use a moment later, and the sub-channel this poll
+        reads when the upstream labels what it posts.
 
-        THAT SHARED COUNTER IS ALSO THIS GATE'S PRECISION LIMIT, and saying
-        so is not a caveat but the reason the budget exists. A message of
-        the OTHER kind in flight reads as positive evidence here, so the
-        caller may proceed into a receive whose own message is still not
-        posted. That is not a regression -- it is exactly the unguarded
-        behaviour, and the caller's `_pp_recv_typed_dict` stashes a
+        THAT SHARED COUNTER WAS ALSO THIS GATE'S PRECISION LIMIT -- AND #974
+        IS THE MEASUREMENT THAT THE LIMIT WAS THE DEFECT, NOT A CAVEAT. The
+        paragraph that stood here said: a message of the OTHER kind in flight
+        reads as positive evidence, so the caller may proceed into a receive
+        whose own message is still not posted; the caller stashes the
         wrong-kind message and receives again, which is the demultiplexer
-        working as designed. The gate's guarantee is therefore one-sided and
-        precisely stated: a rank never waits FOR EVER on a wire its upstream
-        has posted nothing to, and never refuses a wire its upstream has.
+        working as designed. Every clause of that is true. What it does not
+        say is that the receive it proceeds into is UNBOUNDED, so "proceed"
+        is only harmless while the wire eventually carries the caller's own
+        message.
+
+        MEASURED, boot 1 against boot 2 of window-flip-0828, same build but
+        for one unrelated fix:
+
+            boot 1  an admission livelock froze ALL traffic on the wire, the
+                    shared counter froze with it, and this gate fired TWICE
+                    -- "#789 READINESS TIMEOUT", a loud, diagnosable death.
+            boot 2  that livelock was fixed (#971), so the upstream stayed
+                    busy posting `admission_decision` messages. `consumed <
+                    posted` was therefore true at EVERY poll, this gate
+                    returned early every time, and PP2 walked into the
+                    unbounded output receive and wedged in silence. Zero
+                    firings.
+
+        A compensator whose trigger condition was being supplied by a foreign
+        defect, and which the foreign fix -- correctly -- disarmed. The
+        counters were not wrong; they were answering a weaker question than
+        the one being asked ("is ANY message coming?" instead of "is MINE?").
+
+        SO THE POLL READS THE KIND'S OWN SUB-COUNTERS when the upstream
+        provably labels everything it posts (`kind_axis_covers`), and the
+        wire counters otherwise. The wire counters remain the drains'
+        authority, unchanged and for their original reason. The guarantee
+        gains one word and loses nothing: a rank never waits FOR EVER for a
+        message OF ITS KIND its upstream has posted nothing of, and never
+        refuses one its upstream has.
 
         THE DEFECT THIS CLOSES. Measured py-spy specimen (evidence-665-f1,
         2026-08-20, PP=3 with --enable-phase-flip): PP0 and PP1 both idle
@@ -7067,6 +7180,15 @@ class SchedulerPPMixin:
         upstream = self._pp_flip_upstream()
         src = resolve_src(self.pp_group, None)
         deadline = None
+        # #974: re-tested each poll rather than once, and only until it holds.
+        # An upstream that has posted nothing yet cannot be judged kind-aware
+        # (see kind_axis_covers), and deciding that once, at entry, would pin
+        # this call to the wire counter for its whole budget -- which is the
+        # disarm this fix exists to remove. Once true it stays true (the
+        # counters are monotone), so the directory read happens at most once
+        # per stalled poll and never on a healthy pass, which returns below
+        # before the second iteration.
+        per_kind = False
         while True:
             if typed_inbox(self.pp_group).get((src, kind)):
                 # Already fully off the wire and stashed for this exact
@@ -7077,8 +7199,17 @@ class SchedulerPPMixin:
                 # above) and would otherwise wait out the whole budget for
                 # something already delivered.
                 return
-            posted = counters.sent(CHAN_DICT, upstream)
-            consumed = counters.local_consumed(CHAN_DICT)
+            if not per_kind:
+                per_kind = kind_axis_covers(counters, CHAN_DICT, upstream)
+            if per_kind:
+                # THE QUESTION THIS GATE ACTUALLY ASKS. Not "is anything
+                # coming?" but "is MY message coming?" -- see the docstring
+                # section on the shared counter, and boot 2.
+                posted = counters.sent_of_kind(CHAN_DICT, kind, upstream)
+                consumed = counters.local_consumed_of_kind(CHAN_DICT, kind)
+            else:
+                posted = counters.sent(CHAN_DICT, upstream)
+                consumed = counters.local_consumed(CHAN_DICT)
             if consumed < posted:
                 # Positive presence signal: the upstream provably posted a
                 # message this rank has not yet taken off the wire. Return
@@ -7086,7 +7217,11 @@ class SchedulerPPMixin:
                 # from here it is bounded by transfer time, not by whether
                 # the upstream ever schedules anything.
                 return
-            attempted = counters.attempted(CHAN_DICT, upstream)
+            attempted = (
+                counters.attempted_of_kind(CHAN_DICT, kind, upstream)
+                if per_kind
+                else counters.attempted(CHAN_DICT, upstream)
+            )
             if consumed < attempted:
                 # #789: the upstream is INSIDE a send for this rank right
                 # now. That is just as positive a signal as "posted", and
@@ -7112,9 +7247,16 @@ class SchedulerPPMixin:
                 continue
             budget = _pp_proxy_readiness_budget_s()
             label = str(kind).upper()
+            # #974: NAME THE AXIS THE NUMBERS WERE COUNTED ON. Reporting a
+            # per-kind count under the wire's name would be actively
+            # misleading in exactly the situation this line exists for --
+            # "posted 0 on CHAN_DICT" while the wire carried hundreds of
+            # another kind is the sentence that would send the next reader
+            # hunting the wrong hop. The axis is part of the measurement.
+            axis = kind_channel(CHAN_DICT, kind) if per_kind else CHAN_DICT
             logger.error(
                 "%s #789 %s READINESS TIMEOUT: mb_id=%s -- this rank's "
-                "upstream (rank %s) has posted %d dict message(s) on CHAN_DICT "
+                "upstream (rank %s) has posted %d dict message(s) on %s "
                 "(entered %d) and this rank has consumed %d; no new message "
                 "appeared within %.1fs. No upstream scheduled work for this "
                 "slot -- refusing to enter the blocking %s receive rather "
@@ -7124,6 +7266,7 @@ class SchedulerPPMixin:
                 mb_id,
                 upstream,
                 posted,
+                axis,
                 attempted,
                 consumed,
                 budget,
@@ -7148,7 +7291,7 @@ class SchedulerPPMixin:
             raise RuntimeError(
                 f"#789 {label} READINESS TIMEOUT: mb_id={mb_id}: this rank's "
                 f"upstream (rank {upstream}) posted {posted} dict message(s) "
-                f"on CHAN_DICT (entered {attempted}), this rank has consumed "
+                f"on {axis} (entered {attempted}), this rank has consumed "
                 f"{consumed}, and no new "
                 f"message appeared within {budget:.1f}s. No upstream scheduled "
                 f"work for this slot; refusing to enter an unbounded blocking "
