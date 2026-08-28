@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     compute_model_identity_hash,
@@ -2034,6 +2035,58 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def _presence_pool_transfers(self) -> Optional[list[PoolTransfer]]:
+        """The component transfers the REAL fetch carries, rebuilt for the probe.
+
+        #869b, and it is the half `store_presence_pages` promised but did not
+        deliver. Its own paragraph below says the probe "asks the identical
+        question with the identical helper" as the real fetch. It did not: the
+        fetch runs through `_storage_hit_query`, which calls `batch_exists_v2`
+        WITH the tree's component transfers, and that call MIN-CLAMPS the
+        usable KV prefix to the last page that also carries the component's
+        blob (`hicache_storage.py` file backend, and the hf3fs/mooncake twins).
+        The probe called plain `batch_exists`, which can only ever see KV pages.
+
+        MEASURED, hermetically, on the real file backend: four KV pages
+        present, the mamba anchor present only at page 1. `batch_exists`
+        answers 4; `batch_exists_v2` answers 2. So the gate green-lit a fetch
+        whose mamba half could not land at the depth it promised -- the KV
+        bytes arrived and the match walk then refused the node for want of a
+        recurrent state. That is the #873 census reading
+        `refusers=MambaComponent` on 671 of 675 walks with the KV bytes
+        demonstrably present: not a validator refusing wrongly, but a fetch
+        nobody had asked the anchor about.
+
+        REBUILT HERE rather than taken from the tree, because the probe runs
+        on the admission path BEFORE any prefetch operation exists to carry
+        transfers. Only a pool whose hit policy is a CONSTANT of the pool can
+        be reproduced this way. Mamba's is: exactly one trailing page, fixed
+        identically by `MambaComponent.build_hicache_transfers`
+        (`mamba_component.py:1231-1232`) and by its HiMamba twin
+        (`hi_mamba_radix_cache.py:2503-2504`).
+
+        SWA IS DELIBERATELY LEFT OUT. Its trailing count is a function of the
+        window, not of the pool, and is not derivable here. Under-including a
+        pool keeps the probe optimistic in exactly the direction it was
+        already optimistic in before this change -- no regression, no new
+        wrong answer -- whereas guessing a window width would make the gate
+        wrong in a NEW direction, and the direction it would be wrong in is
+        "declare a prefix usable that is not".
+
+        Returns None when there is nothing extra to ask about, which keeps
+        every non-hybrid deployment on the exact pre-#869b call.
+        """
+        pools = getattr(self.storage_backend, "registered_pools", None)
+        if not pools or PoolName.MAMBA not in pools:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=["__placeholder__"],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+
     def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 
@@ -2054,11 +2107,27 @@ class HiCacheController:
         problem of #941.
 
         SAME KEY DERIVATION AS THE REAL FETCH, deliberately. `_storage_hit_query`
-        below computes `get_hash_str(tokens, last_hash, page_size)` and asks
-        `batch_exists`; this asks the identical question with the identical
-        helper. A second spelling of a key chain would be a second installer of
-        the same payload -- the exact rule the #949b tensor landmine was fixed
-        under, one layer up.
+        below computes `get_hash_str(tokens, last_hash, page_size)`; this asks
+        the identical question with the identical helper. A second spelling of a
+        key chain would be a second installer of the same payload -- the exact
+        rule the #949b tensor landmine was fixed under, one layer up.
+
+        SAME COMPONENTS, TOO, SINCE #869b -- and until then this paragraph was
+        half false in a way that cost the whole fetch. The key chain matched;
+        the QUESTION did not. `_storage_hit_query` asks `batch_exists_v2` with
+        the tree's component transfers, which min-clamps the answer to the last
+        page that also carries a mamba anchor; this probe asked plain
+        `batch_exists`, which sees KV pages alone. Measured on the file backend
+        with the anchor only at page 1 of 4: the probe said 4, the fetch could
+        use 2. The gate therefore admitted fetches whose recurrent half could
+        not land, and the match walk refused the result -- #873's 671-of-675
+        `refusers=MambaComponent` with the KV bytes present. `_presence_pool_
+        transfers` above rebuilds the mamba transfer so both sides ask one
+        question about BOTH components, and the number returned here is already
+        the anchor-capped one: the caller inherits the honest depth instead of a
+        KV-only promise. A backend without the v2 interface falls back to the
+        KV-only question and SAYS SO, so "cannot be asked" never reads as
+        "the anchor is there".
 
         ONE ROUND-TRIP: the whole key chain goes in a single `batch_exists`, and
         the caller caches the verdict per streak increment, so the escape costs
@@ -2080,11 +2149,31 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=list(prefix_keys) if prefix_keys else None
             )
+            batch = page_hashes[:STORAGE_BATCH_SIZE]
+            pool_transfers = self._presence_pool_transfers()
+            if pool_transfers:
+                try:
+                    return int(
+                        self.storage_backend.batch_exists_v2(
+                            batch, pool_transfers, extra_info
+                        ).kv_hit_pages
+                        or 0
+                    )
+                except NotImplementedError:
+                    # A backend without the v2 interface cannot be asked about
+                    # component blobs at all. Fall through to the KV-only
+                    # question rather than reporting 0: this is the pre-#869b
+                    # behaviour, and it is NAMED here so "this backend cannot
+                    # be asked about the anchor" never reads as "the anchor is
+                    # there".
+                    logger.debug(
+                        "#869b: %s has no batch_exists_v2; the presence probe "
+                        "answers on KV pages alone and the mamba anchor is not "
+                        "part of this issuance decision",
+                        type(self.storage_backend).__name__,
+                    )
             return int(
-                self.storage_backend.batch_exists(
-                    page_hashes[:STORAGE_BATCH_SIZE], extra_info
-                )
-                or 0
+                self.storage_backend.batch_exists(batch, extra_info) or 0
             )
         except Exception as exc:  # noqa: BLE001 - a probe never breaks admission
             logger.warning(
