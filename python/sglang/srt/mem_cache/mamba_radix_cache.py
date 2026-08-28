@@ -1955,6 +1955,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                         mamba_branching_seqlen=None,
                     )
                 req.mamba_pool_idx = dst_index[0]
+                # #991 sibling of unified_cache_components/mamba_component.py:
+                # stamp the provenance at the acquire, so scheduler.py's revert
+                # site can tell a slot this round took from one it inherited.
+                req.mamba_slot_acquired_this_admission = True
             req.mamba_cow_src_index = last_node.mamba_value
             req.mamba_needs_clear = False
 

@@ -9353,19 +9353,86 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
+                #
+                # #991 THE PREDICATE WAS A PROXY, AND THIS FORK INVALIDATED IT.
+                #
+                # Upstream's `not req.session` encodes "nobody else could own
+                # this slot already", because a session was the only carrier of
+                # a pre-existing one. Under the phase flip that is no longer
+                # true: #984 (void-park), #968b (rehome-on-displace) and #971
+                # (rehome-on-refusal) all re-queue a request UNRESET, holding
+                # the live mamba slot its still-IN-FLIGHT prefill batch is
+                # computing into. When such a request re-enters this loop and
+                # is not added, the line below used to hand a LIVE OWNER's slot
+                # back to the allocator and null the field.
+                #
+                # Measured, boot 10 (b27d7c2ff4, 2026-08-28 19:58:17, rid
+                # e3d6a9ff11c5460cb115f266f2b187a3): the request was freed here
+                # during a pass that ran while its earlier batch was in flight;
+                # the result of THAT batch then reached
+                # `mamba_component.prepare_for_caching_req` and dereferenced
+                # `req.mamba_pool_idx.unsqueeze(0)` on None.
+                #
+                # THE SILENT DIRECTION IS THE SAME DEFECT. If the free lands
+                # OUTSIDE the in-flight window, the next `alloc` simply
+                # re-acquires a fresh slot with `mamba_needs_clear=True` -- a
+                # ZEROED state where the request's own recurrent state used to
+                # be. No crash, no log line, wrong tokens (#767's shape). Both
+                # directions close here, at the provenance test, and not with a
+                # reader-side None guard.
+                #
+                # The stamp is set at the four resume/COW acquire sites that
+                # this loop's rejection genuinely owes a give-back for, and is
+                # cleared the moment `HybridReqToTokenPool.alloc` takes the
+                # slot into a batch. `req.session` is kept as a second, weaker
+                # term: it costs nothing and it is upstream's own contract.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
                     req.mamba_needs_clear = False
+                    acquired_here = getattr(
+                        req, "mamba_slot_acquired_this_admission", False
+                    )
                     if req.mamba_pool_idx is not None and not getattr(
                         req, "session", None
                     ):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.mamba_pool_idx = None
+                        if acquired_here:
+                            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                                req.mamba_pool_idx.unsqueeze(-1)
+                            )
+                            req.mamba_pool_idx = None
+                            req.mamba_slot_acquired_this_admission = False
+                        else:
+                            # AFFIRMATIVE REPORTING, and it is what makes the
+                            # next boot the metal proof of this root rather
+                            # than a yes/no on the crash: none of the five
+                            # mamba free sites named a rid, so the specimen
+                            # could only be reached by elimination. This one
+                            # does. A line here is the give-back that #991
+                            # REFUSED -- i.e. the defect firing, caught.
+                            self._991_slot_keeps_owner = (
+                                getattr(self, "_991_slot_keeps_owner", 0) + 1
+                            )
+                            count = self._991_slot_keeps_owner
+                            if count <= 8 or count % 256 == 0:
+                                logger.info(
+                                    "#991 MAMBA SLOT KEPT rid=%s result=%s "
+                                    "occurrence=%d: this admission round did "
+                                    "not acquire the slot, so the rejection "
+                                    "owes no give-back for it. The owner is "
+                                    "an earlier pass -- possibly one still in "
+                                    "flight, whose result will dereference "
+                                    "this very field. Freeing it here is the "
+                                    "boot-10 crash "
+                                    "(mamba_component.py:1056) in its loud "
+                                    "direction and a zeroed recurrent state "
+                                    "(#767) in its silent one.",
+                                    req.rid,
+                                    res.name,
+                                    count,
+                                )
                 _note_skip(f"add_result_{res.name}", req.rid)
                 break
 

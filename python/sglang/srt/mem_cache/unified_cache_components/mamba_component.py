@@ -475,6 +475,10 @@ class MambaComponent(TreeComponent):
                     self._log_mamba_slot_starvation("mamba (prefix-resume COW)")
                     return zero_match_result(self.cache, result)
                 req.mamba_pool_idx = dst_index[0]
+                # #991: acquired speculatively by THIS admission round's match.
+                # If `add_one_req` then rejects the request, scheduler.py's
+                # revert site owes this slot back -- and ONLY this one.
+                req.mamba_slot_acquired_this_admission = True
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
 
@@ -856,6 +860,53 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        # #991 BACKSTOP, NAMED AS A DEFECT AND NOT AS A DESIGN.
+        #
+        # Every dereference of `req.mamba_pool_idx` below (:907-908, :983,
+        # :1027, :1056) is unguarded, and that is the correct shape: a request
+        # whose result is being cached went through `HybridReqToTokenPool.alloc`
+        # and owns an active state slot by construction. So "the slot is never
+        # None here" is a LIFECYCLE obligation of every path that can reach
+        # re-admission, not a local fact -- and boot 10 (b27d7c2ff4) broke it
+        # at `scheduler.py`'s revert site, killing rank 0 with an
+        # AttributeError on :1056.
+        #
+        # THE FIX FOR THAT IS AT THE JUNCTION, in `scheduler.py` (#991
+        # provenance stamp), not here. This is only the net that turns the
+        # NEXT unknown producer from a dead scheduler into a named, counted
+        # line -- because a crash here takes the whole instance and a decline
+        # takes one step's retention.
+        #
+        # IT IS NOT FREE, AND THE COST IS STATED: `_decline_retention(False)`
+        # returns 0, so the shared `effective_cache_len` collapses and this
+        # step retains nothing. That is a re-prefill of the chunk on the next
+        # match -- i.e. it spends exactly what the standing no-double-prefill
+        # order forbids as a routine. Reaching this line is therefore a BUG
+        # REPORT with a rid on it, and the counter exists so it cannot become
+        # quiet routine.
+        if req.mamba_pool_idx is None:
+            self._991_absent_active_slot = (
+                getattr(self, "_991_absent_active_slot", 0) + 1
+            )
+            count = self._991_absent_active_slot
+            if count <= 8 or count % 256 == 0:
+                logger.warning(
+                    "#991 ACTIVE MAMBA SLOT ABSENT AT CACHE-INSERT rid=%s "
+                    "is_finished=%s occurrence=%d: a request whose batch ran "
+                    "holds no active state slot, so some path released it "
+                    "between `alloc` and this result. Declining retention "
+                    "(0) instead of dereferencing None -- this costs the "
+                    "step's retention and re-prefills the chunk, so it is a "
+                    "DEFECT REPORT, not a supported degradation. The known "
+                    "producer is the admission revert site fixed by #991; a "
+                    "hit here names a second one.",
+                    getattr(req, "rid", None),
+                    is_finished,
+                    count,
+                )
+            insert_params.mamba_value = None
+            return _decline_retention(is_finished)
+
         if self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
             # #747 cache_len seam (mirrors mamba_radix_cache.py:626-640 and
@@ -1199,6 +1250,8 @@ class MambaComponent(TreeComponent):
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     if dst is not None:
                         req.mamba_pool_idx = dst[0]
+                        # #991: host load-back sibling of the COW acquire.
+                        req.mamba_slot_acquired_this_admission = True
                     else:
                         # #581 sibling site: exhausted with nothing evictable.
                         # Skip the host->device restore instead of asserting;

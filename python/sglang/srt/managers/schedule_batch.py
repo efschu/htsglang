@@ -863,6 +863,24 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # #991 PROVENANCE OF THE ACTIVE MAMBA SLOT.
+        #
+        # True only while the slot in `mamba_pool_idx` was acquired
+        # SPECULATIVELY by THIS admission round's prefix match (the COW /
+        # host-load-back resume sites), i.e. while a rejection by
+        # `add_one_req` still owes a give-back for it. Cleared the moment the
+        # slot becomes batch-owned (`HybridReqToTokenPool.alloc`), and on
+        # every path that releases or drops the slot.
+        #
+        # It exists because `not req.session` -- upstream's predicate at
+        # `scheduler.py`'s revert site -- is a PROXY for provenance that this
+        # fork invalidated: #984/#968b/#971 re-queue voided and displaced
+        # requests UNRESET, so "in the waiting queue holding a live slot it
+        # did not acquire this round" became the ordinary case rather than a
+        # session-only one. This is #984's own "pages versus claim" doctrine
+        # applied to the third increment; the lock ref and the chunk already
+        # carry provenance, the mamba slot was the one that did not.
+        self.mamba_slot_acquired_this_admission: bool = False
         # Deferred clear for freshly claimed ping-pong track slots: every
         # claimed mamba slot must be zeroed before any kernel can observe it
         # (fresh-boot semantics; recycled slots otherwise expose the previous
@@ -1915,6 +1933,8 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
+        # #991: the stamp describes the slot, so it dies with the slot.
+        self.mamba_slot_acquired_this_admission = False
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None

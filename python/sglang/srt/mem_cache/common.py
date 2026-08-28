@@ -1758,6 +1758,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+            # #991: the stamp describes the slot, so it dies with it.
+            req.mamba_slot_acquired_this_admission = False
         return
 
     # kv-session-offload: a SPILLED session's req_to_token row holds host

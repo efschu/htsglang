@@ -1466,6 +1466,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     error_message="Can not alloc mamba cache",
                 )
                 req.mamba_pool_idx = dst_index[0]
+                # #991 sibling: see mamba_component.py's acquire.
+                req.mamba_slot_acquired_this_admission = True
             req.mamba_cow_src_index = mamba_node.mamba_value
             req.mamba_needs_clear = False
 
@@ -2564,6 +2566,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=last_hit_node,
                     error_message="Cannot alloc request mamba cache for host load back",
                 )[0]
+                # #991 sibling: host load-back acquire.
+                req.mamba_slot_acquired_this_admission = True
             transfers.append(
                 PoolTransfer(
                     name=PoolName.MAMBA,

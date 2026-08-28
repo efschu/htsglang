@@ -2088,6 +2088,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         fresh_pingpong_reqs: list[Req] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                # #991: THE BATCH NOW OWNS IT. Whatever acquired this slot --
+                # this round's prefix-match COW, or a pass whose batch is still
+                # in flight -- the request is in a batch that is about to be
+                # prepared, so no later admission rejection may hand it back.
+                # Clearing the stamp here is what makes the provenance test at
+                # scheduler.py's revert site one-shot instead of sticky.
+                req.mamba_slot_acquired_this_admission = False
                 note_mamba_carry_without_copy(self, req)
                 if (
                     getattr(req, "mamba_cow_src_index", None) is None
@@ -2113,6 +2120,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     return None
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                # #991: batch-owned from birth; `_rollback_alloc` is the only
+                # give-back this slot has, and it is this call's own.
+                req.mamba_slot_acquired_this_admission = False
                 fresh_state_reqs.append(req)
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
@@ -2243,6 +2253,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba_pool_idx is not None:
                 self.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_pool_idx = None
+                # #991: the stamp describes the slot, so it dies with it.
+                req.mamba_slot_acquired_this_admission = False
             req.mamba_needs_clear = False
         # Hand the request-pool rows back (mirrors ReqToTokenPool.free).
         #
@@ -2369,6 +2381,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
+        # #991: the stamp describes the slot, so it dies with it.
+        req.mamba_slot_acquired_this_admission = False
 
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
