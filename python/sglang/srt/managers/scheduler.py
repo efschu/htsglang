@@ -222,6 +222,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionCongruenceGuard,
     PPScheduleRefused,
     build_pp_admission_decision,
+    forwarded_fill_carry,
     pp_admission_verdict_is_vacuous,
     void_pp_admission_decision,
 )
@@ -8055,6 +8056,33 @@ class Scheduler(
             return None
         return getattr(self, "_pp_admission_incoming_schedule", None)
 
+    def _pp_scheduled_fill_carry(
+        self,
+    ) -> Optional[Dict[str, Tuple[int, Tuple[int, ...]]]]:
+        """#987: what the upstream says each scheduled request's FILL is.
+
+        THE TWIN OF `_pp_scheduled_extents`, gated identically and on purpose:
+        `None` on the rank that BUILDS the decision and on every `pp_size <= 1`
+        boot, because a rank that owns its own admission truth has nothing to
+        adopt and must keep the pre-#987 path unentered.
+
+        Derived from `_pp_admission_amended_to_forward` -- the same object
+        `_pp_forwarded_schedule_from` projects the extents out of -- rather
+        than from a third piece of scheduler state kept in step by hand. That
+        is the point: `_pp_refuse_forwarded_schedule` and the void paths empty
+        the amended decision, so this map empties with the extents map on
+        exactly the same passes, and the two can never name different rid
+        sets. Adding a parallel field would have been one more thing to reset
+        on five paths and one more way for the two halves of one fact to
+        disagree.
+        """
+        ps = getattr(self, "ps", None)
+        if ps is None or ps.pp_size <= 1 or ps.pp_rank == 0:
+            return None
+        return forwarded_fill_carry(
+            getattr(self, "_pp_admission_amended_to_forward", None)
+        )
+
     def _pp_refuse_forwarded_schedule(self, refusal: Exception) -> None:
         """#791 CORE: turn an unexecutable forwarded geometry into a void.
 
@@ -8947,6 +8975,11 @@ class Scheduler(
             # is what turns the adder from a second scheduler into an
             # executor -- see `PrefillAdder._add_scheduled_req`.
             scheduled_extents=self._pp_scheduled_extents(),
+            # #987: the SECOND projection of the same decision -- what the
+            # upstream says this request's fill actually is. Paired with the
+            # extents above deliberately: the geometry and the fill it is
+            # measured against come from one object and are emptied together.
+            scheduled_fill_carry=self._pp_scheduled_fill_carry(),
         )
 
         if self.chunked_req is not None:

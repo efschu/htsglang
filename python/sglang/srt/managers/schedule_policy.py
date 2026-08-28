@@ -684,7 +684,14 @@ class PrefillAdder:
         commitment_ledger: Optional[ChunkedCommitmentLedger] = None,
         chunked_admission_enabled: bool = True,
         scheduled_extents: Optional[Dict[str, Tuple[int, int]]] = None,
+        scheduled_fill_carry: Optional[Dict[str, Tuple[int, Tuple[int, ...]]]] = None,
     ):
+        # #987: `rid -> (upstream_fill_len, upstream_fill_tail)` off the SAME
+        # forwarded decision as `scheduled_extents` below, or None on every
+        # rank that owns its own admission truth. The geometry and the fill it
+        # is measured against travel together; see `_add_scheduled_req`, the
+        # one place either is read.
+        self.scheduled_fill_carry = scheduled_fill_carry
         # #791 CORE: `rid -> (prefix_len, extend_len)` decided ONCE by the
         # first PP rank and forwarded on the admission decision, or None.
         #
@@ -1353,11 +1360,34 @@ class PrefillAdder:
         # repo's `prefix_lens_check` import makes in schedule_batch.py.
         from sglang.srt.managers.pp_admission_congruence import (
             PPScheduleRefused,
+            adopt_carried_fill,
             schedule_refusal_reason,
         )
 
         prefix_len, extend_len = int(extent[0]), int(extent[1])
         local_prefix_len = len(req.prefix_indices)
+        # #987 THE ADOPT, IMMEDIATELY BEFORE THE COMPARISON IT SERVES. The
+        # third clause of `schedule_refusal_reason` measures the forwarded
+        # geometry against `len(full_untruncated_fill_ids)`, and R9's census
+        # (boots 6-7) found 506 of 513 void-causing refusals to be that
+        # comparison failing by ONE TOKEN: rank 0 holds a sampled token that
+        # never crossed the `tp_to_pp` seam, so it reads 8447 where its
+        # followers read 8446.
+        #
+        # The clause is not weakened -- it is asked the question after the
+        # disagreement has been ended rather than before. `adopt_carried_fill`
+        # materialises the upstream's trailing OUTPUT tokens into this rank's
+        # fill (a shadow pair honoured by `Req._refresh_fill_ids`; NOT
+        # `output_ids`, NOT `prefix_indices`, so nothing is recomputed and
+        # nothing is emitted twice), or declines loudly and leaves the fill
+        # exactly as it found it, in which case the clause below refuses this
+        # pass on its own unchanged terms.
+        #
+        # ONE JUNCTION. This is the only site that reads the carried fill, and
+        # it is the same statement that reads the carried geometry, so a rank
+        # can never adopt one half of a decision and not the other.
+        if self.scheduled_fill_carry:
+            adopt_carried_fill(req, self.scheduled_fill_carry.get(req.rid))
         local_fill_len = len(req.full_untruncated_fill_ids)
         reason = schedule_refusal_reason(
             rid=req.rid,

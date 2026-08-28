@@ -157,7 +157,7 @@ import hashlib
 import logging
 import struct
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 def offered_prefix_key(
@@ -252,6 +252,21 @@ class PPScheduleRefused(Exception):
     """
 
 
+#: #987: the widest fill divergence a decision may carry across the seam.
+#:
+#: The defect this closes is ONE token wide and cannot be wider for the reason
+#: it exists: a single sampled token held on one side of one `tp_to_pp` hop
+#: (#631 OUTTRACE, boot 7 -- PP0 `n=1 off=0 tail=[25]`, followers `n=0`). The
+#: cap is 8 rather than 1 so a two- or three-token variant of the same seam
+#: shape is carried rather than deadlocked, and it is SMALL rather than
+#: generous on purpose: past it, the two ranks are not one token out of step
+#: on a seam, they hold different requests, and shipping an arbitrary suffix
+#: of one across the wire would convert a loud, correct refusal into a silent
+#: fabrication. Beyond the cap the entry is not adopted and the existing
+#: refusal stands, with both numbers named (`#987 FILL-REFUSE`).
+FILL_CARRY_TAIL_CAP = 8
+
+
 @dataclass(frozen=True)
 class PPAdmissionEntry:
     """One request's admission decision, as it crosses the wire.
@@ -301,6 +316,48 @@ class PPAdmissionEntry:
     can ACT on it: only PP0 chooses `told`. Downstream ranks report; PP0 owns
     the count and the escalation (`UNRESOLVED_DEFER_CAP`). A defer that only
     one rank takes IS the next divergence, so no rank takes one alone."""
+
+    fill_len: Optional[int] = None
+    """#987: the UPSTREAM's own `len(full_untruncated_fill_ids)` for this rid.
+
+    `None` on every entry built before this field existed and on every entry
+    from a rank that does not set it -- and `None` means "say nothing", not
+    "zero". A receiver that reads `None` behaves exactly as it did before this
+    field was added.
+
+    WHY A LENGTH TRAVELS AT ALL, when the module docstring's WHAT CROSSES THE
+    WIRE section is otherwise strict that a receiver reconstructs local
+    quantities locally. `prefix_len` is a quantity each rank may legitimately
+    hold differently -- it is a statement about a CACHE, and a rank that
+    cannot honour it retracts. `fill_len` is not: it is the length of the
+    REQUEST, origin tokens plus tokens already generated for it, and two ranks
+    disagreeing about it is the third clause of `schedule_refusal_reason`
+    saying, correctly, that they "disagree about the request itself, not
+    merely about its cache". That disagreement has exactly one true answer,
+    the upstream holds it, and until #987 no rank could ask.
+
+    MEASURED, R9 census over boots 6-7: 506 of 513 void-causing refusals are
+    ONE rid, off by ONE token. Rank 0 held an output token (id 25) that never
+    crossed the `tp_to_pp` seam, so rank 0 read 8447 and its followers 8446,
+    and the third clause vetoed every pass for two minutes."""
+
+    fill_tail: Tuple[int, ...] = ()
+    """#987: the trailing output token ids the upstream holds beyond a
+    follower's own fill, newest last. Empty when nothing is carried.
+
+    THE TAIL AND THE LENGTH TRAVEL TOGETHER OR NOT AT ALL, and pairing them is
+    a correctness requirement rather than a convenience. A follower that
+    adopted `fill_len` alone would agree about the SIZE of the request while
+    still not holding its last token: every subsequent index into the fill --
+    the extend range, the radix match key, the KV row count -- would name a
+    position it has no token for. That is a worse defect than the refusal it
+    would silence, so the adopt is defined only over the pair.
+
+    BOUNDED AT `FILL_CARRY_TAIL_CAP`. The seam divergence this closes is one
+    token wide by construction (one sampled token, held on one side of one
+    hop). A divergence wider than the cap is not this shape and must not be
+    papered over by shipping an arbitrary suffix of a request across the
+    wire -- it is refused loudly instead, with both numbers named."""
 
 
 @dataclass(frozen=True)
@@ -435,6 +492,38 @@ class PPAdmissionCongruenceGuard:
         #: no collective, which is exactly why it survives the failure it is
         #: meant to bound.
         self._offer_streak: Dict[str, Tuple[int, int]] = {}
+        #: #987 rids whose LAST OFFERED PASS came back VOIDED, i.e. rids this
+        #: rank offered and that were demonstrably NOT SERVED.
+        #:
+        #: WHY THE STREAK NEEDED A SECOND KEY, measured on boots 6-7 (R9, the
+        #: 506/513 census). `_offer_streak` above bounds the loop by asking
+        #: "did the OFFER stop moving?", and #944b's reasoning for that key is
+        #: sound for the failure it was written against (one rid, `told=8192`,
+        #: 8023 identical lines). It is blind to the failure actually on the
+        #: rig: rank 0 ALTERNATES between two offers for the same rid --
+        #: `told=7939` when it re-offers it as a waiting-queue member and
+        #: `told=0` when it re-offers it as `chunked_req` -- so the offer moves
+        #: on every single pass, the streak resets on every single pass, and
+        #: the cap armed ONCE in 506 laps. A moving offer was read as progress;
+        #: it was two spellings of the same standstill.
+        #:
+        #: SO THE KEY IS THE REFUSAL, NOT THE OFFER. What this set records is
+        #: the one fact the alternation cannot fake: the pass carrying that
+        #: offer came home VOID. It is PP0-local in exactly the sense #944b
+        #: requires -- `_pp_absorb_void_output` is rank 0's own consumption of
+        #: its own launched batch, needs no peer to answer and no lap to
+        #: complete, and runs precisely on the passes that fail. It is NOT
+        #: `_unresolved_rounds`: that one is fed by the chain-reconciled
+        #: decision, which `_pp_refuse_forwarded_schedule` EMPTIES
+        #: (`void_pp_admission_decision`) before it laps home, so the refused
+        #: rid is not in it -- the reason R9 measured `UNRESOLVABLE=0` beside a
+        #: 506-refusal census.
+        #:
+        #: CONSUMED BY `note_offer`, one mark per offer: a mark set by pass N's
+        #: void is read by pass N+1's offer and cleared there, so the set never
+        #: grows past the rids currently in flight and a rid that starts being
+        #: served resets by simply not being marked again.
+        self._refused_since_offer: Set[str] = set()
         #: #955 rid -> the `told` at which the RECOMPUTE TERMINATOR was spent.
         #:
         #: WHAT IT BUYS: the standing law allows a dead-premise recompute as a
@@ -540,7 +629,13 @@ class PPAdmissionCongruenceGuard:
             return False
         told = int(told)
         prev_told, streak = self._offer_streak.get(rid, (None, 0))
-        if prev_told == told:
+        # #987 THE REFUSAL KEY, read and spent in the same breath. One mark per
+        # offer: pass N's void sets it, pass N+1's offer consumes it. See
+        # `_refused_since_offer` for why the OFFER moving is not evidence that
+        # anything moved, and why this is.
+        refused = rid in self._refused_since_offer
+        self._refused_since_offer.discard(rid)
+        if prev_told == told or refused:
             streak = streak + 1
         else:
             # #955 THE LAP-FREE END OF THE ESCALATION, and the exact
@@ -552,12 +647,32 @@ class PPAdmissionCongruenceGuard:
             # `is_escalated` (read at scheduler.py:9325) re-write the
             # dead-premise mark every pass from state the terminator never
             # touches.
+            #
+            # #987 NARROWED, NOT REMOVED, and the narrowing is one word: this
+            # branch now requires that the offer moved AND that the last pass
+            # carrying it was not refused. #955's argument survives intact for
+            # the case it was written about (an offer that moves on a ring that
+            # turns); what it never covered is an offer that moves on a ring
+            # that voids, which is the alternation R9 measured. Ending an
+            # escalation on evidence the failure itself manufactures is the
+            # #939 class -- a compensator answered by the defect it compensates
+            # -- so the end is gated on the one fact the defect cannot forge.
             streak = 1
             self._escalated.discard(rid)
         self._offer_streak[rid] = (told, streak)
         # `told <= 0` is already the terminator, so a rid sitting there is
         # progressing by definition and is never "over the cap".
-        if told <= 0 or streak <= self._unresolved_defer_cap:
+        #
+        # #987 "BY DEFINITION" HELD ONLY WHILE told=0 MEANT PROGRESS. On the
+        # rig it is half of the alternation: rank 0 offers the SAME rid
+        # `told=0` on every pass it re-offers it as `chunked_req`, and 168 of
+        # R9's 506 refusals are that offer being refused (`names prefix 0,
+        # holds 7939`). A rid whose told=0 pass came home VOID is not
+        # progressing -- it is not being served at all -- so the exemption is
+        # withdrawn for exactly that rid and kept for every other. This cannot
+        # re-arm the recompute: `_terminator_spent` below still answers the
+        # second escalation with a clamp.
+        if (told <= 0 and not refused) or streak <= self._unresolved_defer_cap:
             return False
         if rid in self._terminator_spent:
             # #955 CLAMP, BUT DO NOT RE-ARM. The rid has already had its one
@@ -597,6 +712,56 @@ class PPAdmissionCongruenceGuard:
                 self._unresolved_rounds.get(rid, 0),
             )
         return True
+
+    def note_pass_refused(self, rids: Iterable[str]) -> int:
+        """#987: these rids were offered on a pass that came home VOID.
+
+        The write side of `_refused_since_offer`. Called by PP0 as it absorbs
+        a void output (`scheduler_pp_mixin._pp_absorb_void_output`), over the
+        members of the batch that void names -- so the argument is rank 0's
+        own launched batch, not a downstream report, and no lap has to
+        complete for it to be true.
+
+        WHY NOT `record_return_trip`. That is the other half of the same
+        message and it is fed the CHAIN-RECONCILED decision, which
+        `_pp_refuse_forwarded_schedule` empties with
+        `void_pp_admission_decision` before the void starts home. A schedule
+        refusal therefore arrives as a void carrying ZERO entries: the pass is
+        known to have failed and the rid that failed it is not in the payload.
+        That is the exact shape R9 measured (506 refusals, `UNRESOLVABLE=0`,
+        `_unresolved_rounds` never incremented), and it is why the refusal has
+        to be read off the batch rather than off the decision.
+
+        IDEMPOTENT AND BOUNDED. A set, marked once per void and spent by the
+        next `note_offer` for that rid; several voids between two offers leave
+        one mark, which is correct -- the streak counts OFFERS that were not
+        served, not voids. Returns how many rids were newly marked, for the
+        caller's instrument line. Never raises on a member with no rid.
+        """
+        # BOUNDED. A mark is normally spent by the next offer for that rid, but
+        # a rid that voids and is then finished or aborted is never offered
+        # again and its mark would sit here for the life of the process. The
+        # bound is generous relative to the rids that can be in flight at once,
+        # so clearing it can only ever cost a streak one lap of counting -- it
+        # cannot make the bound unreachable, because the void that would refill
+        # it repeats every pass.
+        if len(self._refused_since_offer) > 4096:
+            self._refused_since_offer.clear()
+        marked = 0
+        for rid in rids:
+            if not rid:
+                continue
+            rid = str(rid)
+            if rid not in self._refused_since_offer:
+                marked += 1
+            self._refused_since_offer.add(rid)
+        return marked
+
+    def refused_since_offer(self, rid: str) -> bool:
+        """#987 diagnostic/test hook: is this rid carrying an unspent refusal
+        mark? Reads False for a rid that has never been refused and for one
+        whose mark the next offer already spent."""
+        return rid in self._refused_since_offer
 
     def is_escalated(self, rid: str) -> bool:
         """#946: has this rid's prefix premise been declared dead?
@@ -829,10 +994,86 @@ class PPAdmissionCongruenceGuard:
                 # actually served the rid is, by construction, a pass on which
                 # it turned.
                 self._offer_streak.pop(entry.rid, None)
+                # #987: and so does the refusal mark, on the same argument. A
+                # rid that reached here was served, so any mark still standing
+                # for it describes a pass that is now history; leaving it would
+                # let one old void count against the first offer of a rid that
+                # is demonstrably being served again.
+                self._refused_since_offer.discard(entry.rid)
 
     def outstanding_rids(self) -> Tuple[str, ...]:
         """Diagnostic/test hook: rids currently carrying a learned floor."""
         return tuple(self._learned_floor)
+
+
+def fill_carry_for(req) -> Tuple[Optional[int], Tuple[int, ...]]:
+    """#987: `(fill_len, fill_tail)` this rank should PUBLISH for `req`.
+
+    Read off the request as it stands on the deciding rank: the length of its
+    `full_untruncated_fill_ids` and the last `FILL_CARRY_TAIL_CAP` OUTPUT
+    tokens of it. `(None, ())` when the request carries no readable fill,
+    which is the pre-#987 wire content exactly.
+
+    ONLY OUTPUT TOKENS ARE ELIGIBLE, and the bound is not cosmetic. The tail
+    is capped at `len(output_ids)` as well as at `FILL_CARRY_TAIL_CAP`, so
+    what this publishes can only ever be tokens this rank GENERATED. The
+    prompt half of the fill is `origin_input_ids`, which every rank receives
+    from the tokenizer over its own channel and which no rank may amend from a
+    peer -- carrying prompt tokens here would be the double-prefill law's
+    forbidden direction (a request's input rewritten by another rank), and the
+    seam defect never produces one: `tp_to_pp` strands a SAMPLED token.
+
+    NO SYNCHRONISATION AND NO TENSOR (#790, #796). `full_untruncated_fill_ids`
+    and `output_ids` are `array("q")` host arrays (schedule_batch.py:742,746);
+    `len()` and a small trailing slice of them touch no device.
+    """
+    fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+    if fill_ids is None:
+        return (None, ())
+    try:
+        fill_len = int(len(fill_ids))
+    except Exception:  # noqa: BLE001 - an unreadable fill names no fill
+        return (None, ())
+    output_ids = getattr(req, "output_ids", None)
+    n_output = 0 if output_ids is None else len(output_ids)
+    k = min(FILL_CARRY_TAIL_CAP, int(n_output), fill_len)
+    if k <= 0:
+        return (fill_len, ())
+    try:
+        tail = tuple(int(t) for t in fill_ids[fill_len - k :])
+    except Exception:  # noqa: BLE001 - an unreadable tail names no tail
+        return (fill_len, ())
+    return (fill_len, tail)
+
+
+def forwarded_fill_carry(
+    decision: Optional[PPAdmissionDecision],
+) -> Dict[str, Tuple[int, Tuple[int, ...]]]:
+    """#987: the `rid -> (fill_len, fill_tail)` map a receiving rank adopts from.
+
+    The exact twin of `scheduler_pp_mixin._pp_forwarded_schedule_from`: a
+    second projection of the SAME decision object, so the two maps can never
+    name different rid sets or different passes. A voided decision has no
+    entries and therefore yields `{}`, which is the same emptying the schedule
+    map gets on that path -- one fact, read twice, never two facts to keep in
+    step.
+
+    Entries with no `fill_len` (a legacy sender, or a rank that published
+    nothing) are absent from the map, so an absent rid and a rid with nothing
+    to say are the same thing to every reader: no adopt.
+    """
+    if decision is None:
+        return {}
+    out: Dict[str, Tuple[int, Tuple[int, ...]]] = {}
+    for entry in getattr(decision, "entries", ()) or ():
+        fill_len = getattr(entry, "fill_len", None)
+        if fill_len is None:
+            continue
+        out[entry.rid] = (
+            int(fill_len),
+            tuple(int(t) for t in (getattr(entry, "fill_tail", ()) or ())),
+        )
+    return out
 
 
 def _executed_extent(req) -> Optional[Tuple[int, int]]:
@@ -998,12 +1239,19 @@ def build_pp_admission_decision(
             # half belongs upstream where the prefix is still choosable.
             if guard is not None and pp_size > 1:
                 guard.note_offer(req.rid, executed[0])
+            # #987: the request's own length and its trailing output tokens
+            # ride the decision on BOTH branches. This one is the production
+            # case (an already-admitted, mid-chunked-prefill request), i.e.
+            # exactly the shape the R9 census found refused 506 times.
+            executed_fill_len, executed_fill_tail = fill_carry_for(req)
             entries.append(
                 PPAdmissionEntry(
                     rid=req.rid,
                     prefix_len=executed[0],
                     extend_len=executed[1],
                     admitted=True,
+                    fill_len=executed_fill_len,
+                    fill_tail=executed_fill_tail,
                 )
             )
             continue
@@ -1069,12 +1317,16 @@ def build_pp_admission_decision(
         # stays put.
         extend_len = raw_extend_len + (raw_prefix_len - told)
 
+        # #987: same publication on the fallback branch, from the same reader.
+        fallback_fill_len, fallback_fill_tail = fill_carry_for(req)
         entries.append(
             PPAdmissionEntry(
                 rid=req.rid,
                 prefix_len=told,
                 extend_len=extend_len,
                 admitted=True,
+                fill_len=fallback_fill_len,
+                fill_tail=fallback_fill_tail,
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))
@@ -1334,6 +1586,181 @@ def order_batch_by_schedule(reqs: Sequence, schedule: Dict[str, Tuple[int, int]]
         return list(reqs)
     order = {rid: i for i, rid in enumerate(schedule)}
     return sorted(reqs, key=lambda req: order[req.rid])
+
+
+#: #987 rid -> how many times its adopt has been reported. The adopt repeats
+#: every pass until the follower produces the token itself, so the LINE is
+#: rate-limited while the ACT is not: the first occurrence and every 64th
+#: after it. A no-op adopt (nothing carried, or the fill already agrees) is
+#: never printed at all -- it is the healthy state and printing it would bury
+#: the occurrence that matters.
+#:
+#: BOUNDED, because it is keyed by rid and rids are unbounded over a run. A
+#: log gate that grows one entry per request for the life of the process is a
+#: leak wearing an instrument's clothes; past the bound the whole table is
+#: dropped, which costs one extra line per surviving rid and nothing else.
+_FILL_ADOPT_SEEN: Dict[str, int] = {}
+_FILL_ADOPT_LOG_EVERY = 64
+_FILL_ADOPT_SEEN_CAP = 4096
+
+
+def adopt_carried_fill(
+    req, carried: Optional[Tuple[int, Tuple[int, ...]]]
+) -> Optional[int]:
+    """#987: materialise the upstream's fill on this rank. Tokens appended, or None.
+
+    THE DEFECT, measured (R9 census, boots 6-7). Rank 0 holds one sampled
+    output token that never crossed the `tp_to_pp` seam -- #631 OUTTRACE:
+    `PP0 n=1 off=0 tail=[25]`, followers `n=0`. So rank 0's
+    `len(full_untruncated_fill_ids)` is 8447 and every follower's is 8446, and
+    `schedule_refusal_reason`'s third clause reads `7939 + 508 > 8446` and
+    vetoes -- correctly, on its own terms: the two ranks really do disagree
+    about the request. 506 of 513 void-causing refusals are that one token.
+
+    THE FIX IS TO END THE DISAGREEMENT, NOT TO WEAKEN THE CLAUSE. The clause
+    is right and stays exactly as it is; what changes is that the upstream now
+    SAYS what it holds (`PPAdmissionEntry.fill_len` / `fill_tail`) and this
+    rank materialises it before the clause is asked. Loosening the inequality
+    by one instead would have left the follower executing an extend range over
+    a token it does not have, which is the same corruption in the other
+    direction.
+
+    OUTPUT TAIL ONLY, NEVER THE PREFIX (Kein-Doppel-Prefill). Nothing here
+    touches `prefix_indices`, `last_node`, `origin_input_ids` or any pool
+    handle: not one cached token is discarded and not one prompt token is
+    rewritten by a peer. What is adopted is the trailing GENERATED tokens the
+    upstream already holds -- see `fill_carry_for` for why only those are
+    eligible to be published in the first place.
+
+    AND NOT `output_ids` EITHER, which is the shape this function's first
+    draft would have taken. A consumer sweep of this tree (2026-08-28) shows
+    `req.output_ids` is read by the client stream and by the finish check with
+    NO PP-rank guard on either: `output_streamer.py:383-384` slices
+    `output_ids[send_token_offset:]` into the payload that
+    `output_streamer.py:166` sends, and the socket that carries it belongs to
+    `pp_rank == 0` (`ipc_channels.py:36-72`), which under this feature is a
+    RECEIVING rank, not the sampler; and `schedule_batch.py:1584` compares
+    `len(output_ids) >= max_new_tokens` on every rank independently, so one
+    extra local token lets one rank declare a request finished a step before
+    its peers -- the divergence class `tp_worker.py:679-694` records as a
+    permanent cross-rank hang. A token this rank did not sample must therefore
+    never enter `output_ids`. It goes into a SHADOW pair
+    (`Req.pp_carried_fill_len` / `Req.pp_carried_fill_tail`) that exactly one
+    reader honours, `Req._refresh_fill_ids`, which is the definition of the
+    fill and the only quantity in dispute. Same discipline as #944's
+    `unresolved`: a distinct fact gets a distinct field, never a second
+    meaning bolted onto an existing one.
+
+    SELF-CANCELLING, hence idempotent across passes. The deficit is recomputed
+    every call against `len(origin_input_ids) + len(output_ids)`, so once this
+    rank generates the token itself the deficit is 0, the shadow is cleared,
+    and the fill is back to being made of nothing but this rank's own state.
+    Re-adopting an unchanged deficit rewrites the same shadow and is a no-op.
+
+    TWO LOUD REFUSALS, neither of which raises. Both leave the fill untouched,
+    which hands the decision straight back to `schedule_refusal_reason` -- the
+    refusal is delivered by the clause that already owns it, and this line
+    only names the two numbers the clause cannot see:
+      * the divergence is WIDER than what is carried (`FILL_CARRY_TAIL_CAP`,
+        or a tail shorter than the gap). Not the seam shape; adopting an
+        arbitrary suffix would fabricate a request.
+      * this rank is AHEAD of the upstream. Never truncate: a fill is not
+        shortened to match a peer, and the honest response is to say so and
+        let the geometry check answer.
+
+    Returns the number of tokens now carried (0 when the fill already agreed
+    and the shadow was cleared), or None when there was nothing to adopt.
+    """
+    if carried is None:
+        return None
+    carried_fill_len, carried_tail = carried
+    if carried_fill_len is None:
+        return None
+    rid = getattr(req, "rid", "?")
+    origin = getattr(req, "origin_input_ids", None)
+    output = getattr(req, "output_ids", None)
+    if origin is None or output is None:
+        return None
+    natural_len = len(origin) + len(output)
+    deficit = int(carried_fill_len) - int(natural_len)
+
+    if deficit == 0:
+        # Agreed. Drop any shadow a previous pass left standing -- this rank
+        # has caught up on its own and the carried tokens are now its own.
+        if getattr(req, "pp_carried_fill_len", None) is not None:
+            _clear_carried_fill(req)
+        return 0
+
+    if deficit < 0:
+        logger.error(
+            "#987 FILL-REFUSE rid=%s: this rank holds %d fill token(s), the "
+            "upstream names only %d -- this rank is AHEAD by %d. A fill is "
+            "never truncated to match a peer, so nothing is adopted and the "
+            "forwarded geometry is answered by the ordinary check. This is "
+            "not the #631 seam shape (there the UPSTREAM holds the extra "
+            "token); a receiver running ahead of its decider means the "
+            "decision was built from state older than this rank's own.",
+            rid,
+            natural_len,
+            int(carried_fill_len),
+            -deficit,
+        )
+        return None
+
+    if deficit > FILL_CARRY_TAIL_CAP or deficit > len(carried_tail):
+        logger.error(
+            "#987 FILL-REFUSE rid=%s: the upstream names %d fill token(s), "
+            "this rank holds %d -- a gap of %d, against a carried tail of %d "
+            "token(s) and a cap of %d. NOT ADOPTED: past the cap the two "
+            "ranks are not one seam token out of step, they hold different "
+            "requests, and shipping an arbitrary suffix of one across the "
+            "wire would replace a correct refusal with a fabrication. The "
+            "geometry check refuses this pass on its own terms; the #631 "
+            "seam is the thing to fix, not this bound.",
+            rid,
+            int(carried_fill_len),
+            natural_len,
+            deficit,
+            len(carried_tail),
+            FILL_CARRY_TAIL_CAP,
+        )
+        return None
+
+    tail = tuple(int(t) for t in carried_tail[len(carried_tail) - deficit :])
+    req.pp_carried_fill_len = int(carried_fill_len)
+    req.pp_carried_fill_tail = tail
+    # The shadow is only a promise until the fill is rebuilt from it; this is
+    # the line that makes `len(full_untruncated_fill_ids)` -- the quantity the
+    # third clause reads -- actually equal the upstream's.
+    req._refresh_fill_ids()
+
+    if len(_FILL_ADOPT_SEEN) > _FILL_ADOPT_SEEN_CAP:
+        _FILL_ADOPT_SEEN.clear()
+    seen = _FILL_ADOPT_SEEN.get(rid, 0)
+    _FILL_ADOPT_SEEN[rid] = seen + 1
+    if seen == 0 or seen % _FILL_ADOPT_LOG_EVERY == 0:
+        logger.warning(
+            "#987 FILL-ADOPT rid=%s local=%d -> upstream=%d appended=%d "
+            "tail=%s (seam #631, seen=%d). The upstream holds output token(s) "
+            "this rank never received across tp_to_pp; they are carried on "
+            "the admission decision and materialised HERE, in the fill only "
+            "-- output_ids, prefix_indices and the cached prefix are "
+            "untouched, so no token is recomputed and none is emitted twice.",
+            rid,
+            natural_len,
+            int(carried_fill_len),
+            deficit,
+            list(tail),
+            seen + 1,
+        )
+    return deficit
+
+
+def _clear_carried_fill(req) -> None:
+    """#987: drop the shadow and rebuild the fill from this rank's own state."""
+    req.pp_carried_fill_len = None
+    req.pp_carried_fill_tail = ()
+    req._refresh_fill_ids()
 
 
 def schedule_refusal_reason(
