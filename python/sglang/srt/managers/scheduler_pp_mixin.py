@@ -2956,7 +2956,26 @@ def pp_rehome_displaced_chunked_req(scheduler, incoming, *, mb_id, route):
     # does not synchronise; it must never reach a boolean context.
     prefix_len = 0 if prefix_indices is None else len(prefix_indices)
     if int(end) != int(prefix_len):
-        return None
+        # #968b-2 -- BOOT 5's THIRD EXIT WAS THIS VERY LINE (R6, register
+        # 18:xx 2026-08-28). The park-shape equality made this re-home refuse
+        # the UN-parked, mid-plan occupant (boot 5: end=7939 prefix=4096,
+        # named verbatim by its own `#968 MINT none` line), return None, and
+        # the caller's next statement nulled the live occupant: a DROP. The
+        # fix that closed the cross-slot displacement carried the class it
+        # closed -- a predicate ASSUMED (parked shape == worth keeping)
+        # where `pp_chunked_req_is_reachable` below already TESTS it.
+        #
+        # The un-parked shape owes exactly one thing first: the geometry
+        # give-back for its prepared-but-never-run chunk. Its pass was BUILT
+        # (this occupant became chunked via the normal mint after a built
+        # batch), so the void-path default `pass_allocated=True` is the
+        # correct ledger: KV rows and the inflight increment go back too.
+        # Then it falls through to the SAME reachability+queue junction as
+        # the parked shape -- zero cached tokens discarded, nothing reset.
+        # The `#968 PARK` line (route=void-give-backs) plus
+        # REHOME-ON-DISPLACE now fire where boot 5 printed the ambiguous
+        # `displaced=None`, closing that instrument blind spot as well.
+        _park_chunked_prefill_chunk(scheduler, current)
     if not pp_queue_orphaned_chunked_req(
         scheduler, current, tag="REHOME-ON-DISPLACE", mb_id=mb_id, route=route
     ):
