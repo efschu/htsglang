@@ -788,6 +788,14 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         # drive and 0 on at least one round of the danger mutant.
         "test_pp_unresolved_group_defer_gloo_944.py",
         "test_pp_void_send_contract_801.py",
+        # #963: the prefix-scoped floor learns from the same `observed_local`,
+        # so it is a reader of this value's MEANING. Its assertion for the
+        # UNRESOLVED (None) case is that the miss teaches the PREFIX floor
+        # nothing -- the stakes are strictly higher than for the rid-scoped
+        # floor, because a floor invented from a miss would cap every request
+        # over that prefix rather than one request
+        # (`test_an_unresolved_miss_teaches_the_prefix_floor_nothing`).
+        "test_pp_prefix_scoped_floor_963.py",
     }
 
     def _tree(self):

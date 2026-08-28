@@ -153,9 +153,46 @@ above, which continues to hold with this class in play.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+def offered_prefix_key(
+    fill_ids: Optional[Sequence[int]], prefix_len: int
+) -> Optional[int]:
+    """#963: a stable identity for the PREFIX an offer is made over.
+
+    Returns None when the tokens are not available, which leaves the guard on
+    its pre-#963 rid-scoped path -- the caller must never invent a key, because
+    two different prefixes sharing one key would clamp a prefix no rank ever
+    reported short (cache loss on every rank, silent and permanent).
+
+    STABLE ACROSS PROCESSES, and that is not a detail. The ranks are separate
+    processes and `hash()` is salted per process by PYTHONHASHSEED, so a
+    built-in hash here would disagree between the very ranks this feature
+    exists to keep congruent -- and would do so only on multi-process runs,
+    i.e. never in a unit test. `tree_congruence` learned this as its
+    constraint 3 and chose blake2b; the same choice, for the same reason.
+
+    LENGTH IS MIXED IN so that a prefix and its extension cannot collide: two
+    requests matching 1250 and 2500 tokens of the same text are different
+    cache states and must not share a floor.
+
+    ONE `struct.pack` rather than a per-token join: this runs once per offered
+    request per pass, on the admission path, and the prefix can be tens of
+    thousands of tokens.
+    """
+    if fill_ids is None or prefix_len <= 0:
+        return None
+    ids = list(fill_ids[:prefix_len])
+    if len(ids) != prefix_len:
+        # A prefix longer than the tokens we hold is not a prefix we can name.
+        return None
+    payload = struct.pack("<Q", prefix_len) + struct.pack(f"<{len(ids)}q", *ids)
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +370,34 @@ class PPAdmissionCongruenceGuard:
 
     def __init__(self, unresolved_defer_cap: int = UNRESOLVED_DEFER_CAP) -> None:
         self._learned_floor: Dict[str, int] = {}
+        #: #963: the same shortfall, scoped to the PREFIX it was measured
+        #: against instead of to the request that happened to carry it.
+        #:
+        #: WHY THE RID-SCOPED TABLE ABOVE CANNOT REACH THIS DEFECT. A rank's
+        #: shortfall is a fact about that rank's TREE, not about the request.
+        #: When the trees diverge -- one rank admitted a chunk its peers were
+        #: still prefetching, reached the unconditional stash
+        #: (`scheduler.py:7010-7011`) and inserted a prefix the others never
+        #: received -- every FRESH rid over that prefix starts from an
+        #: unclamped `told` and buys its own voided pass. This class's
+        #: termination argument is per rid and is silent about the
+        #: population, which is exactly the gap: measured window-958 boot 2,
+        #: `_learned_floor` RAN and LOWERED on PP0 and still never bound,
+        #: because all six offers were six DISTINCT rids over ONE 1250-token
+        #: prefix. Keyed here, the first voided pass teaches every later
+        #: request sharing that prefix.
+        #:
+        #: The key is an opaque, caller-supplied fingerprint of the offered
+        #: prefix TOKENS. It must be stable across processes -- `hash()` is
+        #: PYTHONHASHSEED-salted and would disagree across the very ranks this
+        #: exists to keep congruent (`tree_congruence`'s constraint 3, learned
+        #: the same way).
+        self._prefix_floor: Dict[int, int] = {}
+        #: rid -> the prefix key its most recent offer was made over, so a
+        #: retraction arriving on the return trip can be attributed to the
+        #: prefix that was actually offered rather than to whatever the
+        #: request matches by the time it comes home.
+        self._offer_prefix_key: Dict[str, int] = {}
         #: #944: consecutive rounds `rid` came back UNRESOLVED (no rank could
         #: locate it). Distinct from `_learned_floor` because it counts a
         #: different population -- see `PPAdmissionEntry.unresolved`.
@@ -562,7 +627,27 @@ class PPAdmissionCongruenceGuard:
         """
         return self._learned_floor.get(rid)
 
-    def prefix_len_for(self, rid: str, candidate_prefix_len: int) -> int:
+    #: #963: cap on `_prefix_floor` / `_offer_prefix_key`. The rid-scoped
+    #: tables are bounded by the live request population and clear on serve;
+    #: a prefix-scoped one is bounded by nothing, and an unbounded dict on the
+    #: admission path is a leak that only shows up after hours. Oldest entry
+    #: evicted first -- losing a floor is safe in the direction that matters
+    #: (the prefix is re-offered, one rank retracts, the floor is re-learned),
+    #: whereas losing a RECENT one would reopen the livelock.
+    PREFIX_FLOOR_SLOTS = 512
+
+    def _remember_prefix_floor(self, key: int, observed: int) -> None:
+        """Tighten (never widen) the floor for one prefix, under the cap."""
+        existing = self._prefix_floor.get(key)
+        self._prefix_floor[key] = (
+            int(observed) if existing is None else min(int(existing), int(observed))
+        )
+        while len(self._prefix_floor) > self.PREFIX_FLOOR_SLOTS:
+            self._prefix_floor.pop(next(iter(self._prefix_floor)))
+
+    def prefix_len_for(
+        self, rid: str, candidate_prefix_len: int, *, prefix_key: Optional[int] = None
+    ) -> int:
         """What PP0 should tell downstream ranks for `rid` this pass.
 
         `candidate_prefix_len` is PP0's own fresh local match -- what
@@ -618,7 +703,23 @@ class PPAdmissionCongruenceGuard:
         after three voided rounds; the alternative is the unbounded re-offer,
         which is the #858 livelock shape.
         """
+        # #963: the offer is clamped by the poorest of the two scopes. The rid
+        # floor is what THIS request was already told it could not have; the
+        # prefix floor is what ANY request over this prefix was measured
+        # short of. Both are honest observations from a rank that looked, and
+        # the group has to live with the poorest of them.
+        #
+        # `prefix_key=None` -- a caller that cannot name the prefix -- leaves
+        # the behaviour byte-identical to the pre-#963 rid-scoped path, so
+        # this cannot change a call site it was never reasoned about on.
         floor = self._learned_floor.get(rid)
+        if prefix_key is not None:
+            self._offer_prefix_key[rid] = prefix_key
+            while len(self._offer_prefix_key) > self.PREFIX_FLOOR_SLOTS:
+                self._offer_prefix_key.pop(next(iter(self._offer_prefix_key)))
+            prefix_floor = self._prefix_floor.get(prefix_key)
+            if prefix_floor is not None:
+                floor = prefix_floor if floor is None else min(floor, prefix_floor)
         told = (
             candidate_prefix_len if floor is None else min(candidate_prefix_len, floor)
         )
@@ -686,8 +787,26 @@ class PPAdmissionCongruenceGuard:
                 self._learned_floor[entry.rid] = (
                     observed if existing is None else min(existing, observed)
                 )
+                # #963: THE SAME LESSON, SCOPED TO THE PREFIX. The retracting
+                # rank measured its own tree against the prefix this offer was
+                # made over; that measurement is true of every other request
+                # over the same prefix until the trees change. Learning it here
+                # is what turns "one voided pass per rid, for ever" into "one
+                # voided pass, once".
+                offered_key = self._offer_prefix_key.get(entry.rid)
+                if offered_key is not None:
+                    self._remember_prefix_floor(offered_key, observed)
             elif entry.admitted:
                 self._learned_floor.pop(entry.rid, None)
+                # #963: SERVED means every rank admitted this pass, ran it and
+                # reached its own `cache_unfinished_req` -- so the trees agree
+                # on this prefix again and the floor must go. Holding it would
+                # convert a transient divergence into permanent cache loss on a
+                # prefix every rank holds, which is the one direction this fix
+                # must never fail in.
+                served_key = self._offer_prefix_key.pop(entry.rid, None)
+                if served_key is not None:
+                    self._prefix_floor.pop(served_key, None)
                 # #944: the rid was SERVED, so both kinds of outstanding state
                 # are stale -- the learned floor and the unresolved streak. The
                 # streak must clear here and nowhere else: one bad minute of
@@ -927,7 +1046,20 @@ def build_pp_admission_decision(
         raw_extend_len = int(raw_extend_len)
 
         if guard is not None and pp_size > 1:
-            told = guard.prefix_len_for(req.rid, raw_prefix_len)
+            # #963: name the PREFIX this offer is made over, so a downstream
+            # rank's shortfall is learned against the prefix rather than
+            # against this one request. The rid-scoped floor alone cannot
+            # bind when the divergence is a property of the tree: measured
+            # window-958 boot 2, six DISTINCT rids were offered the same
+            # 1250-token prefix and each bought its own voided pass. `None`
+            # (tokens unavailable) keeps the pre-#963 behaviour exactly.
+            told = guard.prefix_len_for(
+                req.rid,
+                raw_prefix_len,
+                prefix_key=offered_prefix_key(
+                    getattr(req, "full_untruncated_fill_ids", None), raw_prefix_len
+                ),
+            )
         else:
             told = raw_prefix_len
 
