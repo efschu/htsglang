@@ -81,6 +81,27 @@ own fix and still reads as an open posting; that staleness is what generated
 this order, and it is corrected at the site rather than left to generate the
 order again.
 
+THE VERDICT'S OWN BOUNDARY (#978, measured on metal 2026-08-28 before it was
+believed: boot-2 ring, PP2 in `_do_recv` unbounded, PP0/PP1 in
+`_pp_commit_comm_work`). The closure above is a SAME-SLOT argument: #951's
+`launched` posting refuses the generation being ADMITTED. The output ring's
+two predicates serve the LAGGED slot -- the sender forwards on `if
+pp_outputs:` (what it took off the wire last iteration) and the receiver
+reads `mbs[next_mb_id]`, committed passes earlier -- and no per-pass posting
+can retract a batch already resident there. The uncovered path is the void
+relay: `pp_void_relay_stop_rank` derives its stop from the RETRACTION
+structure, so a void that names no retraction (the #944 zero-offer escape:
+a rank that lost the request retracts nothing and launches nothing) is
+forwarded to a rank whose slot for it is empty, taken off the wire by that
+rank's next ADMISSION receive, stashed, and served POSITIONALLY to a healthy
+later generation's receive -- which `_pp_absorb_void_output` then empties on
+one rank only, leaving the ring one message short for ever.
+`TheLaggedSlotIsBeyondTheLaunchedPosting` drives that to the wedge (fix
+disabled) and to twelve clean passes (shipped code); the closure is the
+launched CHAIN (`_PP_LAUNCHED_CHAIN_KEY` / `pp_void_relay_launched_verdict`),
+the same statement #951 consumes, kept per generation -- still forwards,
+still no reverse wire.
+
 HARNESS. The ring, the wire and every method under test are 791b's and #795's
 verbatim. What this file adds is the hazard SHAPE and POSITION as parameters
 (791b fixes both), the per-pass occupancy trace that turns reachability into a
@@ -132,6 +153,22 @@ MODE_COLD = "cold"
 #: the rank still has no batch -- a void naming no retracting rank.
 MODE_LOST_RID = "lost_rid"
 
+#: #978: the LAGGED-SLOT hazard. Identical to `lost_rid` at the hazard pass --
+#: told 0 everywhere, the hazard rank no longer holds the request, so nothing
+#: is retracted anywhere -- but the traffic CONTINUES afterwards. That is the
+#: whole difference, and it is what the closure argument below never drove:
+#: with `busy` ending at the hazard pass, the void the last rank emits for the
+#: hazard generation is forwarded into PP1's inbox and sits there for ever,
+#: harmless, because no later generation ever posts a receive. Keep admitting,
+#: and PP1's own receive for the hazard slot early-returns (slot empty), so
+#: its NEXT full-slot receive takes the stale void off the wire POSITIONALLY
+#: and `_pp_absorb_void_output` consumes it against a HEALTHY later
+#: generation's slot -- the lagged-slot mispair. From there PP1 is one output
+#: send short for the rest of the run and PP2's last unconditional receive has
+#: nothing coming: boot-2's ring (PP2 in the output exchange, PP0/PP1
+#: overtaking and then parking in their own flushes).
+MODE_LAGGED = "lagged_lost_rid"
+
 MODE_ENV = "SGLANG_801_H3_MODE"
 HAZARD_RANK_ENV = "SGLANG_801_H3_HAZARD_RANK"
 
@@ -139,6 +176,69 @@ HAZARD_RANK_ENV = "SGLANG_801_H3_HAZARD_RANK"
 #: reads it. 791b's driver predates both and models neither, which is exactly
 #: what lets the red arm here reach the H3 state at all.
 GUARD_951_ENV = "SGLANG_801_H3_GUARD_951"
+
+#: #978: bind ARMED CHAN_DICT counters (consumed < posted on every poll), so
+#: the #789/#802 readiness gate is exercised on the defect path and RETURNS
+#: EARLY into the blocking receive -- the boot-2 state. Boot 1 never wedged
+#: here only because its #944 livelock FROZE the shared counter
+#: (posted == consumed == 542) and the gate timed out loudly; #971 made the
+#: upstream busy again, the counter moved on every poll, and the gate was
+#: disarmed. A falsifier that leaves the counters unbound models the gate
+#: ABSENT, which is boot 1's accident, not boot 2's defect.
+ARMED_COUNTERS_ENV = "SGLANG_801_H3_ARMED_COUNTERS"
+
+#: #978: run the spawn worker with the launched-chain relay verdict forced
+#: back to the legacy retraction-derived stop rule -- the pre-#978 tree, kept
+#: drivable so the wedge stays measurable after the fix ships (the same
+#: pattern this file already uses for #797's relay default).
+FIX_OFF_ENV = "SGLANG_801_H3_LAUNCHED_CHAIN_OFF"
+
+
+class _ArmedCounters:
+    """#978: the disarmed compensator, as a counter object.
+
+    `sent()` always answers one more than `local_consumed()`, which is the
+    truthful reading of a busy wire (#971's effect): a message of SOME kind is
+    always in flight, so the gate's `consumed < posted` presence check
+    succeeds on every poll and the caller proceeds into the blocking receive.
+    `polls` records that the gate genuinely ran -- silence of the gate and
+    absence of the gate must not be indistinguishable (indicator law).
+    """
+
+    def __init__(self, rank: int, n_ranks: int):
+        self.rank = rank
+        self.n_ranks = n_ranks
+        self.consumed = 0
+        self.polls = 0
+
+    def sent(self, chan, rank):
+        self.polls += 1
+        return self.consumed + 1
+
+    def local_consumed(self, chan):
+        return self.consumed
+
+    def attempted(self, chan, rank):
+        return self.consumed
+
+
+def _event(out_dir, rank, msg):
+    """Append-only per-rank event log. Unlike `_progress` (last state only),
+    this survives for a TERMINATED process, which is what the mispair
+    evidence needs: the rank that absorbs the stale void is one of the ranks
+    that wedges."""
+    with open(os.path.join(out_dir, f"events_r{rank}.log"), "a") as f:
+        f.write(msg + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _read_events(out_dir, rank):
+    path = os.path.join(out_dir, f"events_r{rank}.log")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 def _rid_for(pass_idx: int) -> str:
@@ -170,9 +270,17 @@ class _StubBatch:
         self.return_logprob = False
 
 
-def _make_holder(rank, wire, chain_group):
+def _make_holder(rank, wire, chain_group, armed_counters=False):
     """791b's holder verbatim: the shipped chain, decision and output-ring
-    methods bound onto one stand-in."""
+    methods bound onto one stand-in.
+
+    #978: `armed_counters=True` additionally binds `_ArmedCounters` as
+    `pp_flip_counters` plus the shipped `_pp_flip_ring`, so the #789/#802
+    readiness gate in `_pp_recv_dict_from_prev_stage` runs its real
+    `consumed < posted` poll on every blocking output receive and returns
+    early -- the boot-2 disarmed state. The unarmed holders keep
+    `pp_flip_counters` absent, which makes the gate a no-op exactly as the
+    existing arms measured it."""
     from sglang.srt.managers.pp_admission_congruence import PPAdmissionCongruenceGuard
     from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
@@ -254,6 +362,14 @@ def _make_holder(rank, wire, chain_group):
     h._pp_flip_bump_attempted = lambda chan: None
     h._pp_flip_bump_consumed = lambda chan: None
     h._pp_boundary_stats = lambda: None
+    if armed_counters:
+        counters = _ArmedCounters(rank, WORLD)
+        h.pp_flip_counters = counters
+
+        def _bump_consumed(chan, _c=counters):
+            _c.consumed += 1
+
+        h._pp_flip_bump_consumed = _bump_consumed
     h._pp_prep_batch_result = lambda target, meta, outputs: {"result_for": id(target)}
     for name in (
         "_pp_forward_and_process_input_requests",
@@ -265,6 +381,8 @@ def _make_holder(rank, wire, chain_group):
         "_pp_recv_admission_decision",
         "_pp_reconcile_incoming_admission",
         "_pp_commit_admission_send_work",
+        # #978: the launched-chain per-slot recorder the decision send calls.
+        "_pp_note_launched_chain",
         "_pp_send_dict_to_next_stage",
         "_pp_recv_typed_dict",
         "_pp_note_output_expectation",
@@ -276,6 +394,11 @@ def _make_holder(rank, wire, chain_group):
         "_pp_recv_dict_from_prev_stage",
         "_pp_send_recv_and_preprocess_output_tensors",
         "_pp_commit_send_output_work_and_preprocess_output_tensors",
+        # #978: the readiness gate's ring helpers. Bound unconditionally --
+        # they are inert while `pp_flip_counters` is absent, so the existing
+        # arms keep their measured behaviour byte for byte.
+        "_pp_flip_ring",
+        "_pp_flip_upstream",
     ):
         setattr(h, name, types.MethodType(getattr(SchedulerPPMixin, name), h))
     return h
@@ -301,6 +424,18 @@ def _worker(rank, init_file, out_dir, n_passes):
     mode = os.environ.get(MODE_ENV, MODE_COLD)
     hazard_rank = int(os.environ.get(HAZARD_RANK_ENV, PP1))
     guard_951 = os.environ.get(GUARD_951_ENV) == "1"
+    armed = os.environ.get(ARMED_COUNTERS_ENV) == "1"
+
+    if os.environ.get(FIX_OFF_ENV) == "1":
+        # #978: force the void relay back onto the legacy retraction-derived
+        # stop rule, i.e. the pre-#978 tree. `None` from the verdict is the
+        # documented "no chain on the message" answer, so this restores the
+        # old behaviour through the shipped fallback path rather than
+        # through a private re-implementation of it.
+        import sglang.srt.managers.scheduler_pp_mixin as _mixin
+
+        if hasattr(_mixin, "pp_void_relay_launched_verdict"):
+            _mixin.pp_void_relay_launched_verdict = lambda *a, **k: None
 
     def _local_match(pass_idx):
         if mode == MODE_COLD and rank == hazard_rank and pass_idx == RETRACT_PASS:
@@ -311,13 +446,15 @@ def _worker(rank, init_file, out_dir, n_passes):
         # The zero offer is the recipe's door into a void that names no
         # retraction: honoured without a lookup, so a rank that no longer
         # holds the request retracts NOTHING and still has no batch.
-        if mode == MODE_LOST_RID and pass_idx == RETRACT_PASS:
+        if mode in (MODE_LOST_RID, MODE_LAGGED) and pass_idx == RETRACT_PASS:
             return 0
         return TOLD
 
     def _rank_holds_request(pass_idx):
         return not (
-            mode == MODE_LOST_RID and pass_idx == RETRACT_PASS and rank == hazard_rank
+            mode in (MODE_LOST_RID, MODE_LAGGED)
+            and pass_idx == RETRACT_PASS
+            and rank == hazard_rank
         )
 
     res = {
@@ -335,7 +472,7 @@ def _worker(rank, init_file, out_dir, n_passes):
         )
         chain_group = dist.new_group(ranks=list(range(WORLD)))
         wire = ring._RingWire(rank)
-        h = _make_holder(rank, wire, chain_group)
+        h = _make_holder(rank, wire, chain_group, armed_counters=armed)
 
         for p in range(n_passes):
             mb_id = p % LOOP
@@ -349,7 +486,21 @@ def _worker(rank, init_file, out_dir, n_passes):
                 recv_reqs = h._pp_recv_pyobj_from_prev_stage()
             h._pp_forward_and_process_input_requests(recv_reqs)
 
-            busy = p <= LAST_BUSY_PASS
+            # #978: the lagged hazard keeps ADMITTING after the hazard pass.
+            # That is the entire delta against `lost_rid`, and it is what
+            # turns a void parked harmlessly in an inbox into a mispaired
+            # absorb: only continued traffic ever posts the later receive
+            # that takes the stale message positionally. The last LOOP
+            # passes DRAIN: a generation admitted there could never
+            # complete its output round-trip before the run ends (its
+            # forward would fall on a pass that does not exist), so a
+            # busy-to-the-end arm wedges on harness geometry rather than
+            # on the defect -- measured before this clause existed, all
+            # three ranks parked on pass 11 with the mispair already
+            # closed.
+            busy = p <= LAST_BUSY_PASS or (
+                mode == MODE_LAGGED and p <= n_passes - LOOP - 1
+            )
             rid = _rid_for(p)
             told = _told_for(p)
             if busy and _rank_holds_request(p):
@@ -393,6 +544,9 @@ def _worker(rank, init_file, out_dir, n_passes):
                 h._pp_send_admission_decision(
                     decision,
                     expects_output=expects_output,
+                    # #978: the chain is the shipped default the event loop
+                    # now always sends; the worker mirrors it.
+                    launched_chain=(h.mbs[mb_id] is not None,),
                     **({"launched": h.mbs[mb_id] is not None} if guard_951 else {}),
                 )
             else:
@@ -404,6 +558,14 @@ def _worker(rank, init_file, out_dir, n_passes):
                 h._pp_send_admission_decision(
                     fwd,
                     expects_output=h._pp_output_expected_incoming,
+                    # #978: append this rank's own statement, as the shipped
+                    # event loop does. `_pp_launched_chain_incoming` was
+                    # written by the shipped `_pp_recv_admission_decision`
+                    # above.
+                    launched_chain=(
+                        *getattr(h, "_pp_launched_chain_incoming", ()),
+                        h.mbs[mb_id] is not None,
+                    ),
                     # #951: overwritten by every hop -- it is THIS rank's own
                     # slot, not an OR-ed ring fact like `pass_voided`.
                     **({"launched": h.mbs[mb_id] is not None} if guard_951 else {}),
@@ -442,6 +604,13 @@ def _worker(rank, init_file, out_dir, n_passes):
             )
             if len(h.waiting_queue) > before:
                 res["voids"] += 1
+                # #978: the mispair evidence. `_pp_absorb_void_output` was
+                # consumed against `next_mb_id`; if that is not the hazard
+                # generation's slot, a stale void just emptied a healthy
+                # batch. Appended (not overwritten) because the rank that
+                # does this is one of the ranks that wedges, and a wedged
+                # process never reaches its result-writing `finally`.
+                _event(out_dir, rank, f"pass={p} void_absorbed slot={next_mb_id}")
             entry["forwarded"] = npo is not None
             res["trace"].append(entry)
             h.pp_outputs = npo
@@ -471,6 +640,8 @@ def _worker(rank, init_file, out_dir, n_passes):
     except BaseException as exc:  # noqa: BLE001 - the error IS the result here
         res["error"] = f"{type(exc).__name__}: {exc}"[:400]
     finally:
+        counters = locals().get("h") and getattr(h, "pp_flip_counters", None)
+        res["gate_polls"] = getattr(counters, "polls", 0) if counters else 0
         with open(os.path.join(out_dir, f"result_r{rank}.json"), "w") as f:
             json.dump(res, f)
         if dist.is_initialized():
@@ -481,18 +652,35 @@ def _worker(rank, init_file, out_dir, n_passes):
 
 
 def _run(
-    mode, hazard_rank, n_passes=N_PASSES, join_timeout=JOIN_TIMEOUT_S, guard_951=False
+    mode,
+    hazard_rank,
+    n_passes=N_PASSES,
+    join_timeout=JOIN_TIMEOUT_S,
+    guard_951=False,
+    armed=False,
+    fix_off=False,
 ):
     ctx = mp.get_context("spawn")
     previous = {
-        k: os.environ.get(k) for k in (MODE_ENV, HAZARD_RANK_ENV, GUARD_951_ENV)
+        k: os.environ.get(k)
+        for k in (
+            MODE_ENV,
+            HAZARD_RANK_ENV,
+            GUARD_951_ENV,
+            ARMED_COUNTERS_ENV,
+            FIX_OFF_ENV,
+        )
     }
     os.environ[MODE_ENV] = mode
     os.environ[HAZARD_RANK_ENV] = str(hazard_rank)
-    if guard_951:
-        os.environ[GUARD_951_ENV] = "1"
-    else:
-        os.environ.pop(GUARD_951_ENV, None)
+    for flag, env in ((guard_951, GUARD_951_ENV), (armed, ARMED_COUNTERS_ENV), (
+        fix_off,
+        FIX_OFF_ENV,
+    )):
+        if flag:
+            os.environ[env] = "1"
+        else:
+            os.environ.pop(env, None)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             init_file = os.path.join(tmp, "pg_init")
@@ -523,6 +711,7 @@ def _run(
                 if os.path.exists(path):
                     with open(path) as f:
                         out[f"result_{r}"] = json.load(f)
+                out[f"events_{r}"] = _read_events(tmp, r)
             return out
     finally:
         for key, prev in previous.items():
@@ -884,6 +1073,238 @@ class TheForwardContractIsTotalOverTheReachableStates(unittest.TestCase):
                 _holds(mutant),
                 f"mutant '{name}' survived the coverage theorem -- the theorem "
                 f"does not constrain this boundary",
+            )
+
+
+class TheLaggedSlotIsBeyondTheLaunchedPosting(unittest.TestCase):
+    """#978: the boundary of the closure this file's own verdict declared.
+
+    THE VERDICT ABOVE ("#951 already closes it, forwards") is a SAME-SLOT
+    argument: `launched` is posted for the generation being ADMITTED, and
+    `pp_upstream_void_pending` refuses that same generation on the successor.
+    The output ring's receive predicate reads a DIFFERENT slot -- the LAGGED
+    `mbs[next_mb_id]`, committed passes earlier -- and no per-pass launched
+    posting can retract a batch that is already resident there.
+
+    THE PATH (boot-2, 2026-08-28, py-spy: PP2 `_do_recv` unbounded, PP0/PP1 in
+    `_pp_commit_comm_work`): the hazard generation's void, emitted by the last
+    rank because PP0 still expected an output, is FORWARDED by PP0 to a rank
+    whose slot for it is empty -- `pp_void_relay_stop_rank` derives its stop
+    from the RETRACTION structure, and this void names no retraction, so the
+    legacy rule answers "widest travel" even though the hazard rank never
+    launched. The unmatched forward is taken off the wire by the hazard
+    rank's next ADMISSION receive (the demultiplexer working as designed),
+    stashed under (src, "output"), and served POSITIONALLY to its next
+    full-slot output receive: `_pp_absorb_void_output` then consumes a stale
+    void against a healthy later generation, that batch is emptied on ONE
+    rank only, and the ring is one message short for ever after.
+
+    The CHAN_DICT counters are ARMED in every arm here (consumed < posted on
+    each poll -- the #971 busy-upstream state), so the #789/#802 readiness
+    gate genuinely runs and genuinely returns early. Boot 1's loud timeout
+    was that gate reading a counter another defect had FROZEN; a harness
+    without counters would re-stage boot 1's accident, not boot 2's defect.
+
+    Corpse-F discipline: nothing here waits on a work handle or delivers a
+    message for the ring -- every send and receive in the wedge is the
+    shipped code's own.
+    """
+
+    def test_a_stale_void_on_the_lagged_slot_wedges_despite_951(self):
+        """RED PIN, fix disabled: #951 wired in, counters armed, and the ring
+        still closes -- the reachability proof that the launched posting does
+        not cover the lagged slot.
+
+        `fix_off` forces `pp_void_relay_launched_verdict` back to the legacy
+        "no chain" answer inside the spawn worker, which is byte-for-byte the
+        pre-#978 relay rule via its own fallback path. MEASURED SIGNATURE
+        (2026-08-28, red-first run against the unfixed tree): stuck [0, 1, 2];
+        PP2 parked in the output exchange; PP1's event log carries
+        `void_absorbed` against a slot that is NOT the hazard generation's,
+        at a pass after the hazard -- the mispair itself, on the wire.
+        """
+        out = _run(
+            MODE_LAGGED,
+            PP1,
+            join_timeout=RED_JOIN_TIMEOUT_S,
+            guard_951=True,
+            armed=True,
+            fix_off=True,
+        )
+
+        self.assertEqual(
+            out["stuck_ranks"],
+            [PP0, PP1, PP2],
+            f"the lagged-slot hazard was expected to close the ring with the "
+            f"chain verdict disabled: {out}",
+        )
+        stalls = out["stall_report"]
+        self.assertIn(
+            "output_exchange",
+            stalls[PP2],
+            f"PP2 holds the full lagged slot whose message never comes, so it "
+            f"must be the rank parked in the output exchange: {stalls}",
+        )
+        hazard_slot = RETRACT_PASS % LOOP
+        mispairs = [
+            e
+            for e in out[f"events_{PP1}"]
+            if "void_absorbed" in e and f"slot={hazard_slot}" not in e
+        ]
+        self.assertTrue(
+            mispairs,
+            f"the wedge must arrive THROUGH the mispaired absorb on PP1 -- a "
+            f"wedge without that event is a different defect wearing this "
+            f"test's name: {out}",
+        )
+
+    def test_the_launched_chain_relay_stop_closes_the_lagged_slot(self):
+        """GREEN, shipped code: the same hazard, twelve clean passes.
+
+        The closure is the launched CHAIN riding the admission decision
+        (`_PP_LAUNCHED_CHAIN_KEY`, one bool per rank, each rank appending its
+        own statement -- the same statement #951's guard consumes, now kept
+        per generation instead of per pass) and `pp_void_forward_payload`
+        consulting it: a void is forwarded to the successor exactly when the
+        successor SAID it launched that generation. Sender and receiver
+        predicates now derive from the same source, one rank's own
+        admission-time statement, so the void stops at PP0 and the stale
+        message that seeded the mispair is never on the wire at all.
+
+        The gate polls are asserted positive: the readiness gate ran, early-
+        returned on every poll (armed counters), and the run is still clean --
+        the fix does not lean on the compensator boot 1 happened to have.
+        """
+        out = _run(MODE_LAGGED, PP1, guard_951=True, armed=True)
+
+        self.assertEqual(out["stuck_ranks"], [], f"the ring still wedged: {out}")
+        for r in range(WORLD):
+            res = out[f"result_{r}"]
+            self.assertIsNotNone(res, f"rank {r} produced no result: {out}")
+            self.assertTrue(res["ok"], f"rank {r} failed: {res}")
+            self.assertEqual(res["passes"], N_PASSES, f"rank {r}: {res}")
+        self.assertEqual(
+            out[f"events_{PP1}"],
+            [],
+            f"with the chain verdict live the void must stop at PP0, so PP1 "
+            f"absorbs nothing at all in this mode: {out}",
+        )
+        hazard_slot = RETRACT_PASS % LOOP
+        self.assertTrue(
+            any(
+                f"slot={hazard_slot}" in e
+                for e in out[f"events_{PP0}"]
+                if "void_absorbed" in e
+            ),
+            f"PP0 still holds the hazard generation and must absorb its void "
+            f"against exactly that slot -- otherwise this arm proved a hazard "
+            f"that never fired (indicator law): {out}",
+        )
+        self.assertGreater(
+            out[f"result_{PP2}"]["gate_polls"],
+            0,
+            f"the readiness gate must have been exercised on the receiver -- "
+            f"an unpolled gate makes this arm indistinguishable from boot 1's "
+            f"frozen-counter accident: {out}",
+        )
+
+
+class TheLaunchedChainVerdictIsTotal(unittest.TestCase):
+    """#978: the forward rule as a pure function, exhaustive over ring sizes,
+    with its can-fail proof on both hazard directions."""
+
+    @staticmethod
+    def _verdict():
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_void_relay_launched_verdict,
+        )
+
+        return pp_void_relay_launched_verdict
+
+    def test_the_verdict_matches_admission_occupancy_exactly(self):
+        """Over every ring size 2..8 and every occupancy vector the admission
+        chain can produce under #951 (a launched prefix, then nothing -- plus
+        the all-launched vector a lost-rid-at-last run yields), the void is
+        forwarded to exactly the launched ranks and never to its source.
+        """
+        verdict = self._verdict()
+        for pp_size in range(2, 9):
+            for first_false in range(0, pp_size + 1):
+                chain = tuple(r < first_false for r in range(pp_size))
+                for rank in range(pp_size - 1):
+                    nxt = rank + 1
+                    want = nxt < pp_size - 1 and chain[nxt]
+                    self.assertEqual(
+                        verdict(chain, rank, pp_size),
+                        want,
+                        f"pp_size={pp_size} chain={chain} rank={rank}: the "
+                        f"void must reach exactly the launched, non-source "
+                        f"ranks",
+                    )
+
+    def test_no_usable_chain_defers_to_the_legacy_rule(self):
+        """`None` is a distinct answer, not a False: it hands the decision to
+        `pp_void_relay_stop_rank`, which is the entire pre-#978 behaviour --
+        an older sender or a stand-in must reproduce it byte for byte."""
+        verdict = self._verdict()
+        self.assertIsNone(verdict((), 0, 3))
+        self.assertIsNone(verdict(None, 0, 3))
+        self.assertIsNone(verdict((True, True), None, 3))
+        self.assertIsNone(verdict((True, True), 0, None))
+        # A chain too short to name the successor cannot answer for it.
+        self.assertIsNone(verdict((True,), 0, 4))
+
+    def test_each_boundary_mutant_fails_on_a_hazard_direction(self):
+        """Three plausible edits, each breaking one of the two corpses this
+        boundary sits between: handing the void back to its source (the
+        unmatched-send corpse, #796's law -- the 1716 shape), reading this
+        rank's own entry instead of the successor's (the mispair direction
+        the red arm measures), and treating a short chain as launched
+        (conjuring a forward no statement backs)."""
+        verdict = self._verdict()
+
+        def _holds(fn):
+            for pp_size in range(2, 9):
+                for first_false in range(0, pp_size + 1):
+                    chain = tuple(r < first_false for r in range(pp_size))
+                    for rank in range(pp_size - 1):
+                        nxt = rank + 1
+                        if fn(chain, rank, pp_size) != (
+                            nxt < pp_size - 1 and chain[nxt]
+                        ):
+                            return False
+            if fn((True,), 0, 4) is not None:
+                return False
+            return True
+
+        def _mutant_hands_void_back_to_source(chain, rank, pp_size):
+            if not chain or rank is None or pp_size is None:
+                return None
+            nxt = rank + 1
+            if nxt >= len(chain):
+                return None
+            return bool(chain[nxt])
+
+        def _mutant_reads_own_entry(chain, rank, pp_size):
+            base = verdict(chain, rank, pp_size)
+            if base is None:
+                return None
+            return bool(chain[rank]) and rank + 1 < pp_size - 1
+
+        def _mutant_short_chain_forwards(chain, rank, pp_size):
+            base = verdict(chain, rank, pp_size)
+            return True if base is None and chain else base
+
+        self.assertTrue(_holds(verdict), "the shipped rule")
+        for name, mutant in (
+            ("hands the void back to its source", _mutant_hands_void_back_to_source),
+            ("reads its own entry, not the successor's", _mutant_reads_own_entry),
+            ("treats a short chain as launched", _mutant_short_chain_forwards),
+        ):
+            self.assertFalse(
+                _holds(mutant),
+                f"mutant '{name}' survived -- the theorem does not constrain "
+                f"this boundary",
             )
 
 

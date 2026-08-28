@@ -189,6 +189,38 @@ _PP_PASS_VOIDED_KEY = "__pp_pass_voided__"
 # capacity reasons that never reach the decision). So the sender states it.
 _PP_UPSTREAM_LAUNCHED_KEY = "__pp_upstream_launched__"
 
+# #978: THE SAME STATEMENT, KEPT PER GENERATION INSTEAD OF PER HOP. One bool
+# per rank, index = pp_rank, accumulated as the admission decision travels
+# 0 -> 1 -> ... -> last: PP0 starts the tuple with its own `launched`, every
+# forwarding rank appends its own, and the last rank appends its own when it
+# records the chain for the slot (it sends no decision, #796). Each entry is
+# the identical expression `self.mbs[mb_id] is not None` that already rides
+# `_PP_UPSTREAM_LAUNCHED_KEY` -- nothing new is derived, the per-hop fact is
+# merely not thrown away after one hop.
+#
+# WHY IT HAS TO SURVIVE THE PASS. `_PP_UPSTREAM_LAUNCHED_KEY` answers "did my
+# upstream launch THIS pass's generation", and #951's guard refuses that same
+# generation on the successor -- a SAME-SLOT closure. The output ring's
+# receive reads a LAGGED slot (`mbs[next_mb_id]`, committed passes earlier),
+# and the void for a generation is forwarded or withheld hop by hop passes
+# AFTER its admission, when the per-hop fact is long overwritten. The legacy
+# stop rule (`pp_void_relay_stop_rank`) reconstructs the occupancy from the
+# RETRACTION structure and is exactly right for retraction voids -- but a
+# void that names no retraction is not proof that every rank launched: a
+# rank that lost the request admits nothing and retracts nothing (#944's
+# zero-offer escape), and forwarding the void to it leaves an unmatched
+# message that the demultiplexer later serves POSITIONALLY to a healthy
+# generation's receive (`_pp_absorb_void_output` then empties a live batch
+# on one rank only -- the boot-2 ring wedge, 2026-08-28, PP2 in `_do_recv`
+# unbounded while PP0/PP1 sat in `_pp_commit_comm_work`).
+#
+# The chain rides the decision message that already travels within the pass
+# and the output/void payload that already rides back (`pp_output_payload_
+# with_return_trip`), so no new message and no reverse wire exists. Absent
+# key means "no chain": every consumer falls back to the legacy stop rule,
+# so a stand-in or an older sender produces exactly the pre-#978 behaviour.
+_PP_LAUNCHED_CHAIN_KEY = "__pp_launched_chain__"
+
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
 # not required for this iteration's forward progress" family. PP0's ring
 # wraparound receive for the admission decision (feeding
@@ -1148,6 +1180,42 @@ def pp_idle_void_streak_exceeded(streak: int, bound: int) -> bool:
     return bound > 0 and streak >= bound
 
 
+def pp_void_relay_launched_verdict(
+    chain, rank: Optional[int], pp_size: Optional[int]
+) -> Optional[bool]:
+    """#978: should rank ``rank`` forward this void to its successor?
+
+    ``True``/``False`` when the message carries a launched chain that can
+    answer it; ``None`` when it cannot (no chain, unknown rank/ring, or a
+    chain too short to name the successor) -- the caller then applies the
+    legacy retraction-derived stop rule, which is byte-for-byte the pre-#978
+    behaviour.
+
+    THE PREDICATE IS THE SUCCESSOR'S OWN STATEMENT. ``chain[nxt]`` was
+    written by the successor itself at the moment it admitted this
+    generation (`launched=self.mbs[mb_id] is not None`, the same expression
+    #951's per-hop key carries), so the sender's forward gate and the
+    successor's receive gate (`_do_recv`'s ``mbs[next_mb_id] is not None``,
+    not rewritten between admission and receive) finally read the SAME
+    source. The legacy rule inferred the successor's occupancy from the
+    retraction structure, which is silent about a rank that lost the
+    request and therefore retracts nothing while launching nothing.
+
+    THE SOURCE IS NEVER HANDED ITS OWN VOID BACK. Voids originate at the
+    last rank (`_pp_void_output_payload`); a hop to it would be the
+    unmatched message #796's law forbids, whatever the chain says --
+    identical to the legacy rule's ``pp_size - 1`` ceiling.
+    """
+    if not chain or rank is None or pp_size is None:
+        return None
+    nxt = int(rank) + 1
+    if nxt >= int(pp_size) - 1:
+        return False
+    if nxt >= len(chain):
+        return None
+    return bool(chain[nxt])
+
+
 def pp_void_forward_payload(
     holder, message: Dict[str, object]
 ) -> Optional[Dict[str, object]]:
@@ -1199,6 +1267,18 @@ def pp_void_forward_payload(
     rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
     if rank is None:
         return None
+    # #978: the launched chain, when the message carries one, answers the
+    # forward question from the successor's own admission-time statement --
+    # see `pp_void_relay_launched_verdict`. The legacy retraction-derived
+    # rule below is the fallback for a message without a chain, which keeps
+    # every older sender and every stand-in at the pre-#978 behaviour.
+    verdict = pp_void_relay_launched_verdict(
+        message.get(_PP_LAUNCHED_CHAIN_KEY),
+        rank,
+        getattr(getattr(holder, "ps", None), "pp_size", None),
+    )
+    if verdict is not None:
+        return dict(message) if verdict else None
     raw = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
     first = (
         pp_first_retracting_rank(
@@ -1252,10 +1332,20 @@ def pp_output_payload_with_return_trip(
     """
     carried = getattr(holder, "_pp_admission_amended_by_slot", None)
     decision = carried[mb_id] if carried and 0 <= mb_id < len(carried) else None
-    if decision is None:
+    # #978: the launched chain for this generation rides the same message,
+    # independently of whether a decision does -- a void with no decision at
+    # all (the last rank simply had no batch) is exactly the case whose
+    # forward rule needs the chain most, because the legacy stop rule then
+    # has no retraction to derive the occupancy from.
+    chains = getattr(holder, "_pp_launched_chain_by_slot", None)
+    chain = chains[mb_id] if chains and 0 <= mb_id < len(chains) else None
+    if decision is None and not chain:
         return payload
     out = dict(payload)
-    out.update(pp_admission_decision_to_wire(decision))
+    if decision is not None:
+        out.update(pp_admission_decision_to_wire(decision))
+    if chain:
+        out[_PP_LAUNCHED_CHAIN_KEY] = tuple(bool(x) for x in chain)
     return out
 
 
@@ -1272,6 +1362,12 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     """
     if not isinstance(message, dict):
         return False
+    # #978: popped for the identical reason the decision payload is -- what
+    # is left of this dict becomes a `PPProxyTensors`, which maps `v[key]`
+    # over every entry, and a tuple of bools would slice to nonsense rather
+    # than raise. Popped BEFORE the decision check so a message carrying a
+    # chain but no decision is cleaned too.
+    message.pop(_PP_LAUNCHED_CHAIN_KEY, None)
     raw = message.pop(_ADMISSION_DECISION_PAYLOAD_KEY, None)
     if raw is None:
         return False
@@ -2145,6 +2241,10 @@ class SchedulerPPMixin:
                 # retraction in it at all.
                 self._pp_pass_voided_incoming = False
                 self._pp_upstream_launched_incoming = False
+                # #978: reset with its per-hop twin and for the same reason --
+                # a pass that receives nothing must not forward a chain a
+                # previous pass accumulated.
+                self._pp_launched_chain_incoming = ()
                 self._pp_admission_pass_voided = False
                 # #951: reset in the same breath and for the same reason. This
                 # one is written by scheduler.py's void guard DURING the pass
@@ -2385,6 +2485,9 @@ class SchedulerPPMixin:
                             # can only ever start downstream of here.
                             pass_voided=False,
                             launched=self.mbs[mb_id] is not None,
+                            # #978: the chain starts here -- one entry, PP0's
+                            # own statement; every hop appends its own.
+                            launched_chain=(self.mbs[mb_id] is not None,),
                         )
                         self._pp_admission_pending_sends.append(mb_id)
                         # Capped, not unbounded -- see
@@ -2455,6 +2558,14 @@ class SchedulerPPMixin:
                             # rank's own slot, overwritten for the next hop.
                             pass_voided=self._pp_admission_pass_voided,
                             launched=self.mbs[mb_id] is not None,
+                            # #978: append this rank's own statement to the
+                            # chain received above -- per generation, never
+                            # overwritten, so the void relay can still read
+                            # it when the slot's output comes due.
+                            launched_chain=(
+                                *getattr(self, "_pp_launched_chain_incoming", ()),
+                                self.mbs[mb_id] is not None,
+                            ),
                         )
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
@@ -4692,6 +4803,8 @@ class SchedulerPPMixin:
         self._pp_admission_pass_voided: bool = False
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
+        # #978: pass-scoped like its per-hop twin above.
+        self._pp_launched_chain_incoming: Tuple[bool, ...] = ()
         # #951: pass-scoped like the three above -- scheduler.py's void guard
         # writes it, `_pp_void_pass_without_upstream_launch` reads it once, and
         # a cutover must not carry either across.
@@ -4717,6 +4830,14 @@ class SchedulerPPMixin:
         # left with no feeder at all when it removed the wraparound -- learns
         # the observed shortfall and #630's termination argument holds again.
         self._pp_admission_amended_by_slot: List[Optional[PPAdmissionDecision]] = [
+            None
+        ] * self.pp_loop_size
+        # #978: the launched chain per slot, written by
+        # `_pp_note_launched_chain` when the slot's decision is sent or
+        # forwarded, ridden back on the slot's output/void by
+        # `pp_output_payload_with_return_trip`. All-None at re-entry is
+        # correct for the same ring-rebuild reason as the two arrays above.
+        self._pp_launched_chain_by_slot: List[Optional[Tuple[bool, ...]]] = [
             None
         ] * self.pp_loop_size
         # #797b: `self.chunked_req` as it stood before each slot's admission,
@@ -5495,6 +5616,27 @@ class SchedulerPPMixin:
             self._pp_chunked_req_before_by_slot = carried
         carried[int(mb_id)] = getattr(self, "chunked_req", None)
 
+    def _pp_note_launched_chain(self: Scheduler, mb_id: int, chain) -> None:
+        """#978: record this generation's launched chain for slot ``mb_id``.
+
+        Written when this pass's admission decision is sent or forwarded
+        (the last rank records without sending, #796). Read by
+        `pp_output_payload_with_return_trip` when the slot's output or void
+        is built, ``pp_size - 1`` passes later -- PER SLOT and not one
+        scalar, for the staleness reason `_pp_note_chunked_req_before_
+        admission` gives: by then a scalar would name a different round.
+
+        Tolerant of a stand-in that never ran ``init_pp_loop_state``, as
+        this file's convention requires (#787): a holder without the array
+        grows one here rather than raising.
+        """
+        size = max(int(getattr(self, "pp_loop_size", 0) or 0), int(mb_id) + 1)
+        carried = getattr(self, "_pp_launched_chain_by_slot", None)
+        if carried is None or len(carried) < size:
+            carried = list(carried or []) + [None] * (size - len(carried or []))
+            self._pp_launched_chain_by_slot = carried
+        carried[int(mb_id)] = tuple(bool(x) for x in chain)
+
     def _pp_output_expected_for_slot(self: Scheduler, mb_id: int) -> bool:
         """#791b: did the FIRST rank say it will receive an output for this
         slot? False whenever nothing was ever published for it."""
@@ -5532,6 +5674,7 @@ class SchedulerPPMixin:
         expects_output: bool = False,
         pass_voided: bool = False,
         launched: bool = False,
+        launched_chain: Tuple[bool, ...] = (),
     ) -> None:
         """#791: forward this pass's admission decision to the next stage.
 
@@ -5607,6 +5750,11 @@ class SchedulerPPMixin:
         """
         if self.ps.pp_size <= 1:
             return
+        # #978: recorded BEFORE the last-rank return below -- the last rank
+        # sends no decision (#796) but is the rank that BUILDS the slot's
+        # void, so it is the one that needs the chain per slot most.
+        if launched_chain:
+            self._pp_note_launched_chain(decision.mb_id, launched_chain)
         if self.pp_group.is_last_rank:
             return
         tensor_dict = pp_admission_decision_to_wire(decision)
@@ -5620,6 +5768,12 @@ class SchedulerPPMixin:
         # `launched` is overwritten by every hop.
         tensor_dict[_PP_PASS_VOIDED_KEY] = bool(pass_voided)
         tensor_dict[_PP_UPSTREAM_LAUNCHED_KEY] = bool(launched)
+        # #978: the same statement, accumulated per generation instead of
+        # overwritten per hop -- see `_PP_LAUNCHED_CHAIN_KEY`.
+        if launched_chain:
+            tensor_dict[_PP_LAUNCHED_CHAIN_KEY] = tuple(
+                bool(x) for x in launched_chain
+            )
         works = self._pp_send_dict_to_next_stage(
             tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
         )
@@ -5684,6 +5838,12 @@ class SchedulerPPMixin:
         self._pp_pass_voided_incoming = bool(message.get(_PP_PASS_VOIDED_KEY, False))
         self._pp_upstream_launched_incoming = bool(
             message.get(_PP_UPSTREAM_LAUNCHED_KEY, False)
+        )
+        # #978: the accumulated launched chain, appended to and forwarded by
+        # this rank's own decision send. Absent means empty, and an empty
+        # chain keeps every consumer on the legacy relay rule.
+        self._pp_launched_chain_incoming = tuple(
+            bool(x) for x in message.get(_PP_LAUNCHED_CHAIN_KEY, ())
         )
         return pp_admission_decision_from_wire(message)
 
@@ -7152,6 +7312,25 @@ class SchedulerPPMixin:
             # to send -- one hop of an existing message rather than a fifth
             # collective pair on a ring that has already buried four.
             #
+            # #978 -- WHERE #951'S REACH ENDS, measured on metal before it was
+            # believed (boot-2 ring, 2026-08-28: PP2 in `_do_recv` unbounded,
+            # PP0/PP1 in `_pp_commit_comm_work`). The launched posting is a
+            # SAME-SLOT closure: it refuses the generation being ADMITTED.
+            # This send's `pp_outputs` and its successor's receive both serve
+            # the LAGGED slot (`mbs[next_mb_id]`, committed passes earlier),
+            # which no per-pass posting can retract -- so a void relayed past
+            # a rank that never launched is taken off the wire by that rank's
+            # next ADMISSION receive, stashed, and served POSITIONALLY to a
+            # healthy later generation's receive, whose batch it then empties
+            # on one rank only (`test_pp_reverse_wire_reachability_801.py`'s
+            # lagged arms drive it to the wedge and back). Closed -- still
+            # forwards, still no reverse wire -- by the launched CHAIN: the
+            # same statement, kept per generation on the decision message
+            # (`_PP_LAUNCHED_CHAIN_KEY`), consulted by the void relay
+            # (`pp_void_relay_launched_verdict`), so a void stops before the
+            # first rank whose own admission-time statement says it never
+            # launched and the stale message is never on the wire at all.
+            #
             # REACHABLE AND MEASURED, not argued: the state is produced by a
             # request lost from an intermediate rank's four lookup places
             # (#944) meeting the zero offer `UNRESOLVED_DEFER_CAP` escapes
@@ -7243,6 +7422,33 @@ class SchedulerPPMixin:
         """
         if not isinstance(message, dict) or not message.pop(_PP_VOID_OUTPUT_KEY, False):
             return False
+
+        # #978 TRIPWIRE, log-only. A void names the slot it was built for
+        # (its return-trip decision's mb_id); consuming it against a
+        # different slot is the lagged-slot mispair -- a stale void emptying
+        # a healthy generation's batch on one rank only. The launched-chain
+        # relay stop makes this unreachable; if this line ever fires, the
+        # relay let a void past a rank that never launched, and THAT is the
+        # defect to chase (#791c tripwire convention: stays in place, a boot
+        # carrying the fix should count zero of it).
+        _raw_stale = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
+        if _raw_stale is not None:
+            _stale_mb = getattr(
+                pp_admission_decision_from_wire(
+                    {_ADMISSION_DECISION_PAYLOAD_KEY: _raw_stale}
+                ),
+                "mb_id",
+                None,
+            )
+            if _stale_mb is not None and int(_stale_mb) != int(mb_id):
+                logger.error(
+                    "#978 STALE VOID: a void built for slot %s is being "
+                    "consumed against slot %s -- the lagged-slot mispair the "
+                    "launched-chain relay stop exists to prevent. The batch "
+                    "about to be emptied belongs to a healthy generation.",
+                    _stale_mb,
+                    mb_id,
+                )
 
         # #797: decided BEFORE the pops below strip the decision out, and
         # published for `_do_recv` to forward. See `pp_void_forward_payload`
