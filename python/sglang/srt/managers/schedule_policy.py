@@ -1437,6 +1437,60 @@ class PrefillAdder:
         # its prefix is carried allocation rather than a fresh cache hit --
         # the same two distinctions the local `add_chunked_req` makes.
         if not last_chunk and not carried_chunk:
+            # #995 THE THIRD MINT SITE, AND THE ONE #959's SWEEP MISSED.
+            #
+            # #959 gave `add_one_req` and `add_one_req_ignore_eos` an explicit
+            # `chunked_req_outstanding` check because the invariant behind
+            # `scheduler.py`'s `assert self.chunked_req is None` is held "by
+            # ARITHMETIC, not by a check". It skipped THIS site, reasoning (see
+            # the note at the sibling) that it "already has its own
+            # (`carried_chunk`)". That is the guard-comment-names-the-hazard
+            # trap: `carried_chunk` answers "is THIS request the resident
+            # continuation", which is a different question from "is there a
+            # resident continuation at all". It covers the request being
+            # re-announced; it does not cover a DIFFERENT named request
+            # becoming a second one while the first is resident.
+            #
+            # MEASURED, boot 14 (cf16281b3f, 2026-08-28 22:01:29, PP1, 39 s):
+            # the resident continuation survived `add_chunked_req`, so
+            # `chunked_req_outstanding` was True and both sibling sites
+            # correctly refused -- and this one minted anyway, on another rid
+            # the same forwarded schedule named. `assert self.chunked_req is
+            # None` then killed rank 1. Boot 13 never reached this line: the
+            # #791 geometry refusal killed every pass before a batch was
+            # built. #994 removed that refusal and made this site reachable in
+            # the ordinary flow -- so #994 exposed this, it did not create it.
+            # Third recorded fundstelle of the family, after :9286 (#951) and
+            # :9367 (#959).
+            #
+            # WHY A PASS REFUSAL AND NOT A REQUEST SKIP, which is the whole
+            # danger-direction question. On a forwarded schedule this rank may
+            # NOT drop a named request -- the upstream's hidden states for it
+            # are already on the wire, which is the contract this very method
+            # raises `PPScheduleRefused` for a few lines above. Silently
+            # running the chunk without announcing it is worse still: the
+            # continuation would be untracked, and the next pass would
+            # re-prefill it, which is the double prefill the standing law
+            # forbids. So the honest disposal is the one this path already
+            # has: refuse the PASS, by name, and let the existing #791/#797
+            # machinery void it and re-derive next pass, when the resident
+            # continuation has advanced. It cannot starve -- the resident
+            # continuation is consuming chunks, and when it finishes
+            # `chunked_req` is None and this schedule is executable.
+            if self.chunked_req_outstanding:
+                note_second_continuation_refused(req, "_add_scheduled_req")
+                raise PPScheduleRefused(
+                    f"#995 FORWARDED SCHEDULE UNEXECUTABLE for rid={req.rid}: "
+                    "the decision makes this request a NEW chunked "
+                    "continuation while this rank already holds a resident "
+                    "one, and `scheduler.chunked_req` is a single field. "
+                    "Announcing a second one trips the scheduler's "
+                    "`assert self.chunked_req is None`; running it unannounced "
+                    "would lose the continuation and re-prefill it next pass. "
+                    "Voiding the pass instead -- the resident continuation is "
+                    "consuming chunks, so this schedule becomes executable as "
+                    "soon as it finishes."
+                )
             self.new_chunked_req = req
         if not carried_chunk:
             self._req_inc_lock_ref(req)
