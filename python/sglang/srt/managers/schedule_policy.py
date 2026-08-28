@@ -1463,35 +1463,40 @@ class PrefillAdder:
             # Third recorded fundstelle of the family, after :9286 (#951) and
             # :9367 (#959).
             #
-            # WHY A PASS REFUSAL AND NOT A REQUEST SKIP, which is the whole
-            # danger-direction question. On a forwarded schedule this rank may
-            # NOT drop a named request -- the upstream's hidden states for it
-            # are already on the wire, which is the contract this very method
-            # raises `PPScheduleRefused` for a few lines above. Silently
-            # running the chunk without announcing it is worse still: the
-            # continuation would be untracked, and the next pass would
-            # re-prefill it, which is the double prefill the standing law
-            # forbids. So the honest disposal is the one this path already
-            # has: refuse the PASS, by name, and let the existing #791/#797
-            # machinery void it and re-derive next pass, when the resident
-            # continuation has advanced. It cannot starve -- the resident
-            # continuation is consuming chunks, and when it finishes
-            # `chunked_req` is None and this schedule is executable.
+            # DO NOT ANNOUNCE -- AND DO NOT REFUSE. The first version of this
+            # guard raised `PPScheduleRefused` here, and boot 15 (473f3ad7b0,
+            # 2026-08-28 22:12-22:13) measured that as a LIVELOCK: 175
+            # refusals on ONE rid (ddb6f38b…) in ~40 s, 4 batches, rank 2 idle
+            # at 0% while ranks 0-1 burned on corridor-reclaim. A voided pass
+            # computes nothing, so the resident continuation never advanced
+            # and every following pass rebuilt the identical refusal -- the
+            # same 512-refusal shape this branch already has on record. The
+            # refusal ALSO armed a leak that is only safe while rare: the
+            # `except PPScheduleRefused` handler in scheduler.py documents
+            # that requests admitted earlier in the same loop keep their
+            # `inc_lock_ref` when the batch never completes, and justifies
+            # leaving it open with "Bounded: it takes a genuinely unexecutable
+            # geometry to reach this line at all". This condition is ordinary,
+            # not exotic, so the refusal turned a bounded leak into a per-pass
+            # ratchet. Both reasons point the same way and the refusal is
+            # withdrawn.
+            #
+            # WHY NOT ANNOUNCING LOSES NOTHING HERE, which is what the raise
+            # got wrong. `new_chunked_req` / `scheduler.chunked_req` is LOCAL
+            # bookkeeping for a chunk this rank decided itself: it exists so
+            # the next pass can find the continuation and resume it. On a
+            # FORWARDED schedule that job belongs to the upstream -- this
+            # method is handed `prefix_len` and `extend_len` fresh every pass
+            # (`_add_scheduled_req`'s own "LAST CHUNK OR NOT IS ALSO THE
+            # SCHEDULE'S TO SAY"), so the continuation is re-established from
+            # the decision whether or not this rank remembered it. The chunk
+            # therefore runs, as decided, and nothing is re-prefilled: no
+            # double prefill, no dropped named request, and the assert stays
+            # intact because the single field keeps its one occupant.
             if self.chunked_req_outstanding:
                 note_second_continuation_refused(req, "_add_scheduled_req")
-                raise PPScheduleRefused(
-                    f"#995 FORWARDED SCHEDULE UNEXECUTABLE for rid={req.rid}: "
-                    "the decision makes this request a NEW chunked "
-                    "continuation while this rank already holds a resident "
-                    "one, and `scheduler.chunked_req` is a single field. "
-                    "Announcing a second one trips the scheduler's "
-                    "`assert self.chunked_req is None`; running it unannounced "
-                    "would lose the continuation and re-prefill it next pass. "
-                    "Voiding the pass instead -- the resident continuation is "
-                    "consuming chunks, so this schedule becomes executable as "
-                    "soon as it finishes."
-                )
-            self.new_chunked_req = req
+            else:
+                self.new_chunked_req = req
         if not carried_chunk:
             self._req_inc_lock_ref(req)
         self._update_prefill_budget(
