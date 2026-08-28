@@ -235,12 +235,20 @@ def _holder(chunked_by_slot, batches, tree_cache):
     )
 
 
-def _run_absorb(tree_cache, reqs):
-    """Drive the REAL `_pp_absorb_void_output` over a slot holding `reqs`."""
+def _run_absorb(tree_cache, reqs, chunked_req=None):
+    """Drive the REAL `_pp_absorb_void_output` over a slot holding `reqs`.
+
+    `chunked_req` sets the scheduler's CURRENT carried chunk, which is not
+    the same thing as the slot's pre-admission snapshot: the void's keep
+    check asks about the SNAPSHOT (`chunked_before`), so a member that is
+    the current `chunked_req` and was not the snapshot walks straight into
+    the disposal. That gap is #990's specimen.
+    """
     from sglang.srt.managers import scheduler_pp_mixin as m
 
     batches = [types.SimpleNamespace(reqs=list(reqs))]
     holder = _holder([None], batches, tree_cache)
+    holder.chunked_req = chunked_req
 
     saved = {
         name: getattr(m, name)
@@ -388,6 +396,122 @@ class PPVoidReleasesItsTreeLock969(unittest.TestCase):
             "what the next offer reports as already executed. Clearing them "
             "here is what would force the re-computation #984 prevents",
         )
+
+
+class TheGiveBackRespectsOwnership990(unittest.TestCase):
+    """#990: a CARRIED CHUNK does not take a fresh ref, so it keeps its one.
+
+    THE PREMISE #984 GOT RIGHT FOR ONE CASE AND WRONG FOR THE OTHER. Its
+    argument for giving the ref back is that re-admission takes a FRESH one:
+    `init_next_round_input` re-matches and `_req_inc_lock_ref` increments
+    again, so holding the old ref would leak one per void cycle. That is true
+    for a request going back to the WAITING QUEUE. It is false for the
+    request currently held as `self.chunked_req`: a carried chunk is
+    re-admitted from that field by `add_chunked_req`, and the stash transfers
+    the one admission ref stash-to-stash
+    (`unified_radix_cache.py:1354-1355`). No fresh ref is taken, so giving
+    this one back makes ONE inc meet TWO decs -- this give-back and the first
+    stash's -- which is boot 9's `full_component.py:320` underflow assert.
+
+    WHY THE MEMBER EVEN REACHES THE GIVE-BACK, which is the part worth
+    stating because it is not obvious: the void's keep check asks
+    `pp_void_keeps_request(req, resident, chunked_before)` about the slot's
+    PRE-ADMISSION SNAPSHOT. A request that became `self.chunked_req` during
+    THIS pass is not that snapshot, so it is not kept, and it walks into the
+    disposal and the give-back as an ordinary member. Ownership and
+    snapshot-identity are two different questions and only one of them was
+    being asked.
+
+    NOT A WEAKENED ASSERT. The underflow detector is untouched; what changed
+    is that ownership is discriminated before the decrement. The #986 orphan
+    route still gives back, correctly -- by definition an orphan has LEFT the
+    `chunked_req` field, so nothing will transfer its ref.
+    """
+
+    @unittest.expectedFailure
+    def test_an_orphaned_request_must_give_its_ref_back(self):
+        """#990 REGRESSION, MEASURED at b27d7c2ff4. Expected-failure ON PURPOSE.
+
+        A request DISPLACED out of `chunked_req` and re-homed into the waiting
+        queue keeps its admission lock ref. Re-admission from the queue runs
+        `init_next_round_input` -> `match_prefix` -> `_req_inc_lock_ref` and
+        takes a SECOND ref, so the count climbs by one per void cycle and the
+        prefix never becomes evictable again -- #969's leak, reopened by a new
+        route.
+
+        THE CAUSE IS A STATEMENT ORDER. #990's guard reads `if req is
+        scheduler.chunked_req: return False` (:3160) and justifies itself with
+        "the #986 orphan route keeps giving back: by its own definition the
+        orphan has LEFT the chunked_req field". At the call site it has not
+        left yet: the re-home runs BEFORE the field is overwritten
+        (:7909/:7913 own-void, :9261/:9265 void-output), and the comment there
+        explains why that order is required -- "Re-homed BEFORE the overwrite
+        -- after it, the reference is already gone" (#968b needs it). So the
+        guard fires on exactly the request being orphaned.
+
+        MEASURED, at the tip, by instrumenting the give-back's caller:
+          member IS current chunked_req -> called from
+              pp_queue_orphaned_chunked_req, suppressed=True, lock_ref stays 1
+          ordinary member               -> called from
+              pp_park_voided_batch_member, suppressed=False, lock_ref -> 0
+        In those two shapes the guard's only observed firing is the harmful
+        one. #990's INTENT is sound and Boot 10 confirmed it on metal (no
+        underflow); what is wrong is that it discriminates "is still in the
+        field right now" instead of "will keep the field".
+
+        MARKED expectedFailure rather than deleted or inverted: inverting it
+        would encode the leak as correct, and deleting it would lose the only
+        executable record. When the ownership question is asked properly this
+        turns into an UNEXPECTED SUCCESS, which is a loud, self-clearing
+        signal to drop the marker.
+        """
+        tree = _FakeTreeCache()
+        node = tree.new_node("orphaned")
+        tree.inc_lock_ref(node)
+        req = _FakeReq("orphan-rid", node=node)
+
+        holder = _run_absorb(tree, [req], chunked_req=req)
+
+        self.assertTrue(
+            any(r is req for r in holder.waiting_queue),
+            "precondition: the request must actually have been orphaned into "
+            "the queue -- otherwise this arm is not measuring the leak",
+        )
+        self.assertIsNone(
+            holder.chunked_req,
+            "precondition: it must have LEFT the field, which is what makes "
+            "the ref nobody's to transfer",
+        )
+        self.assertIn(
+            node,
+            tree.dec_calls,
+            "a request that left the chunked_req field and sits in the "
+            "waiting queue must hand its admission ref back: re-admission "
+            "takes a fresh one, so keeping this one leaks exactly one ref "
+            "per void cycle and the prefix never becomes evictable",
+        )
+
+    def test_an_ordinary_member_still_gives_its_ref_back(self):
+        """The #969/#984 case is untouched: not-carried still means give back.
+
+        Without this, #990 could be 'fixed' by never giving any ref back,
+        which would reinstate the #969 leak this file was written for.
+        """
+        tree = _FakeTreeCache()
+        node = tree.new_node("ordinary")
+        tree.inc_lock_ref(node)
+        req = _FakeReq("ordinary-rid", node=node)
+
+        _run_absorb(tree, [req], chunked_req=None)
+
+        self.assertIn(
+            node,
+            tree.dec_calls,
+            "an ordinary voided member goes back to the waiting queue, where "
+            "re-admission DOES take a fresh ref -- keeping the old one is the "
+            "#969 leak",
+        )
+        self.assertEqual(node.lock_ref, 0)
 
 
 class PPVoidDoesNotOverRelease969(unittest.TestCase):
