@@ -349,16 +349,45 @@ nicht** (NK-2) und sein charakteristischer Tod **trat nicht ein** (NK-1).
 Der Fill-Skew 8446/8447 bleibt als Phaenomen boot-bewiesen, Site #0 bleibt als
 Defekt desk-bewiesen — beides unberuehrt. Nur die Todesursache war er nicht.
 
-### 8.2 Zwei Vorhersagen, unabhaengig, vom naechsten Boot getrennt beantwortbar
+### 8.2 EINE Vorhersage — die zweite ist am Log bereits falsifiziert
 
-| Achse | Vorhersage unter Cut C (`26ccc1065f`) | Was ein Treffer bedeutet |
+**Korrektur einer publizierten Aussage.** Commit `7398727ce9` fuehrte hier zwei
+Vorhersagen. Die zweite ist von ihrem Autor zurueckgezogen worden, **bevor der
+Boot lief**, und ich habe die Widerlegung selbst am Log nachgefahren. Sie steht
+hier gestrichen statt entfernt, weil eine publizierte Vorhersage nicht
+verschwinden darf.
+
+| Achse | Vorhersage unter Cut C (`26ccc1065f`) | Status |
 |---|---|---|
-| Diese (#997) | Der `#631`-Leftover **BLEIBT** | Die Ring-Divergenz ist die Wurzel; `passes [0,1,1]` haengt an der Chunk-ASYMMETRIE (`:5330-5331`), nicht an der Chunk-Laenge |
-| Arithmetik (Site #0) | Die zwei `SECOND CONTINUATION REFUSED site=_add_scheduled_req` gehen auf **NULL** | Das getragene Verdikt sagt `last_chunk=True`, es entsteht kein zweiter Mint-Versuch mehr |
+| Diese (#997) | Der `#631`-Leftover **BLEIBT** | **OFFEN** — die einzige, die der Boot entscheidet |
+| ~~Arithmetik (Site #0)~~ | ~~Die zwei `SECOND CONTINUATION REFUSED` gehen auf NULL~~ | **FALSIFIZIERT vor dem Boot**, siehe unten |
 
-Die beiden Groessen sind disjunkt (Slot-Index vs. Mint-Zaehler); ein Boot
-beantwortet beide getrennt. Treffen beide zu, sind zwei Defekte sauber getrennt
-statt einer doppelt erzaehlt.
+**Warum (b) falsch ist, dreifach am Log belegt:**
+
+1. **Die Ursache der Refusals steht direkt darueber und ist eine andere.**
+   `:2033` (PP1) und `:2044` (PP2): `#992 CHUNKED CONTINUATION NOT NAMED
+   rid=da614e20… executed=7939 decision_names=5689567b… occurrence=4/5`.
+   Die Refusal entspringt der **#992-Asymmetrie** — PP1/PP2 halten `da614e20`
+   als Residenten, den PP0s Decision nicht nennt, waehrend die Decision
+   `5689567b` als neuen Chunk nennt. Kein falsches `last_chunk` beteiligt.
+2. **`5689567b` war ein echter Mittel-Chunk.** `:2028`
+   `#968 MINT none rank=0 rid=5689567b… end=4096 prefix=0`. `last_chunk=False`
+   war **korrekt**; Cut C truege dasselbe Verdikt und die Refusal feuerte
+   unveraendert. Die zwei bleiben zwei.
+3. **Der Fill-Skew liegt in der GEDECKTEN Richtung.** `:2120`
+   `local=8446 -> upstream=8447 appended=1`: der Follower ist **kuerzer**,
+   `adopt_carried_fill` hebt ihn an, der Adopt gelang. Danach ist
+   `local_fill_len == 8447 ==` die Laenge, gegen die die Decision gebaut wurde.
+   Site #0 braucht den Ausfuehrenden **laenger**. Das ist in Boot 16 nirgends
+   passiert.
+
+**Endstand Site #0, vom Autor selbst gestuft:** als Defekt **DESK-BEWIESEN**
+(einseitiger Waechter `pp_admission_congruence.py:1817`, lokal abgeleitetes
+Verdikt `schedule_policy.py:1433`, am Schreibtisch end-to-end falsifiziert);
+**boot-beobachtete Instanzen: NULL**; Kausalbeitrag zu Boot 16: **keiner**.
+Cut C ist damit ein Fix fuer einen **latenten** Defekt — der naechste Boot kann
+ihn weder bestaetigen noch widerlegen, und wer auf einen Indikator dafuer
+wartet, wartet auf einen, der nicht kommen kann.
 
 ### 8.3 Beide Fundstellen sind DIESELBE Klasse
 
@@ -367,6 +396,33 @@ Der Punkt stammt von der Arithmetik-Achse und ist richtig: Site #0
 D1 (`scheduler_pp_mixin.py:5330-5331`, Hold-Ausnahme auf rang-lokalem
 `chunked_req`) sind **eine Klasse an zwei Naehten** — *ein rang-lokales
 Praedikat entscheidet ueber eine Groesse, die gruppen-uniform sein muss.*
-Das ist dieselbe Klasse, die `ANALYSE_996` als Familie B fuehrt, und zwei
-unabhaengig gefundene Fundstellen sind ein besseres Argument fuer die Klasse als
-jede einzelne.
+Das ist dieselbe Klasse, die `ANALYSE_996` als Familie B fuehrt.
+
+**Die beiden Haelften tragen NICHT dieselbe Beleg-Stufe, und das muss der
+Klassen-Abschnitt aushalten, ohne es einzuebnen:**
+
+| Naht | Beleg-Stufe | Grundlage |
+|---|---|---|
+| D1 (`:5330-5331`) | **BOOT-BEWIESEN am Symptom** | `passes [0,1,1]`, `RESUME SLOTS [1,2,2] DIVERGED` (`:2105`), Refusal 1 s spaeter (`:2147`) |
+| Site #0 (`:1433`) | **DESK-BEWIESEN**, null boot-beobachtete Instanzen | Waechter `pp_admission_congruence.py:1817` einseitig; am Schreibtisch end-to-end falsifiziert |
+
+Zwei unabhaengig gefundene Fundstellen bleiben ein besseres Argument fuer die
+Klasse als jede einzelne — aber die Klasse wird von der metall-belegten Haelfte
+getragen, nicht von beiden gleichermassen. Ein Klassen-Argument, das eine
+desk-bewiesene Naht als metall-belegt fuehrt, erbt genau die Ueberbehauptung,
+gegen die das INDIKATOR-GESETZ geschrieben ist.
+
+### 8.4 Die Fehlerform, die diese Kampagne zweimal bezahlt hat
+
+Die Arithmetik-Achse hat ihre eigene Diagnose zweimal zuruecknehmen muessen und
+die Form beide Male selbst benannt: *ein Log-Ereignis gesehen, das zum eigenen
+Mechanismus PASST, und daraus geschlossen, es SEI der eigene Mechanismus — ohne
+die Zeile darueber zu lesen, die die Alternative nennt.* Beide Male stand die
+Widerlegung eine Zeile hoeher im selben Log (`:2105` vor `:2120`; `:2033`/`:2044`
+ueber `:2034`/`:2045`).
+
+Das gehoert hierher, weil es kein fremder Fehler ist: es ist dieselbe Form, in
+der `#996` den toten Ratchet und `#997` den falschen Guard-Hinweis gefunden hat —
+ein Indikator wird zum Befund erklaert, bevor geprueft ist, DASS er misst, was er
+behauptet. Die billige Gegenprobe ist in allen drei Faellen dieselbe und kostet
+Sekunden: **die Zeile darueber lesen.**
