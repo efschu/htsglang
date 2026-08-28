@@ -56,6 +56,13 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.device_communicators import (  # noqa: F401
     barlink_env_guard,
 )
+from sglang.srt.distributed.pp_object_recv import (
+    get_or_create_frame as get_or_create_object_recv_frame,
+)
+from sglang.srt.distributed.pp_object_recv import (
+    recv_object_abort_after_s,
+    recv_object_step_budget_s,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -2123,29 +2130,45 @@ class GroupCoordinator:
             "Invalid source rank. Source rank is the same as the current rank."
         )
 
-        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
-
-        # Receive object size
-        # We have to use irecv here to make it work for both isend and send.
-        work = torch.distributed.irecv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
+        # #980: the two naked ``work.wait()`` calls that used to stand here --
+        # one on the size header, one on the payload -- are the site where PP1
+        # was caught LIVE and SILENT in boot 7 of the flip window. They are now
+        # driven by a RESUMABLE frame that holds the protocol position
+        # explicitly, because this stream cannot survive a terminal timeout:
+        # once the size has been received the payload is already on the wire,
+        # and a receiver that gives up mid-frame and re-posts later reads a
+        # payload AS a size and misframes every later message.
+        #
+        # The wait itself is unchanged -- still the unbounded ``wait()`` that is
+        # the only call with positive evidence that it DRIVES gloo -- but it is
+        # parked on its own thread and the deadline sits on the join. So an
+        # expired step never closes the pair (#829) and never abandons a
+        # half-received message (#630 rules out is_completed() polling as the
+        # alternative). The DEFAULT abort deadline is 0 == never abort, so this
+        # path still blocks exactly as long as it did before; what changed is
+        # that it now names the stall, per frame state, instead of going silent.
+        #
+        # The frame is kept per (src, tag) ON THE COORDINATOR, not per call:
+        # that is what makes an expired or aborted step resumable, and a
+        # per-call frame would post a second receive on a stream whose first is
+        # still parked. Lazily attached in the local style of
+        # ``_shape_cache_recv`` below rather than in __init__.
+        frames = getattr(self, "_object_recv_frames", None)
+        if frames is None:
+            frames = self._object_recv_frames = {}
+        frame = get_or_create_object_recv_frame(
+            frames,
+            (src, tag),
+            group=self.cpu_group,
+            src_global=self.ranks[src],
+            tag=tag,
+            site=f"{self.unique_name}/recv_object[src={src},tag={tag}]",
+            rank_desc=f"rank_in_group={self.rank_in_group}/{self.world_size}",
         )
-        work.wait()
-
-        # Tensor to receive serialized objects into.
-        object_tensor: Any = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu",
+        return frame.receive(
+            step_budget_s=recv_object_step_budget_s(),
+            abort_after_s=recv_object_abort_after_s(),
         )
-
-        work = torch.distributed.irecv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
-        )
-        work.wait()
-
-        obj = pickle.loads(object_tensor.numpy())
-        return obj
 
     def broadcast_tensor_dict(
         self,
@@ -2654,8 +2677,7 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 def get_tp_group() -> GroupCoordinator:
     if _PHASE_FLIP_TP_ACTIVE:
         assert _FLIP_TP is not None, (
-            "phase-flip TP routing is active but the flip group set is not "
-            "initialized"
+            "phase-flip TP routing is active but the flip group set is not initialized"
         )
         return _FLIP_TP
     if _ENABLE_PDMUX_P_TP:
@@ -2696,8 +2718,7 @@ def get_attn_tp_group() -> GroupCoordinator:
         # The flip TP phase is pure TP (no dp-attention, guarded in
         # server_args): attn_tp == tp, served by the same flip group.
         assert _FLIP_TP is not None, (
-            "phase-flip TP routing is active but the flip group set is not "
-            "initialized"
+            "phase-flip TP routing is active but the flip group set is not initialized"
         )
         return _FLIP_TP
     assert _ATTN_TP is not None, (
@@ -2723,8 +2744,7 @@ def get_dcp_group() -> GroupCoordinator:
     # so the two can never be legitimately active together.
     if _PHASE_FLIP_TP_ACTIVE:
         assert _FLIP_DCP is not None, (
-            "phase-flip TP routing is active but the flip dcp group is not "
-            "initialized"
+            "phase-flip TP routing is active but the flip dcp group is not initialized"
         )
         return _FLIP_DCP
     # kv-session-offload decoupling: route the (serial, per-forward) spill
@@ -2834,8 +2854,7 @@ def get_pp_group() -> GroupCoordinator:
     # 3-stage pipeline's.
     if _PHASE_FLIP_TP_ACTIVE:
         assert _FLIP_PP is not None, (
-            "phase-flip TP routing is active but the flip pp group is not "
-            "initialized"
+            "phase-flip TP routing is active but the flip pp group is not initialized"
         )
         return _FLIP_PP
     assert _PP is not None, "pipeline model parallel group is not initialized"
@@ -3209,7 +3228,9 @@ def initialize_model_parallel(
     # the invariant dcp_group_guard.py:38-42 documents, and the guard would
     # still pass. Token-sharded KV under PP goes through the #704b
     # decoupled-KV group, which carries its own flag.
-    refuse_pp_dcp_combination(pipeline_model_parallel_size, decode_context_parallel_size)
+    refuse_pp_dcp_combination(
+        pipeline_model_parallel_size, decode_context_parallel_size
+    )
 
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
@@ -3513,9 +3534,7 @@ def plan_decoupled_kv_ranks(
             "and cannot be guessed from a world that does not factor."
         )
     num_pp_groups = world_size // pp_size
-    return [
-        list(range(idx, world_size, num_pp_groups)) for idx in range(num_pp_groups)
-    ]
+    return [list(range(idx, world_size, num_pp_groups)) for idx in range(num_pp_groups)]
 
 
 def decoupled_kv_manifest(planned: object, salt: int = 0) -> str:
@@ -3688,7 +3707,10 @@ def initialize_phase_flip_secondary_groups(
             dcp_ranks, local_rank, backend, group_name="flip_dcp"
         )
     _FLIP_PP = init_model_parallel_group(
-        pp_ranks, local_rank, backend, use_custom_allreduce=False,
+        pp_ranks,
+        local_rank,
+        backend,
+        use_custom_allreduce=False,
         group_name="flip_pp",
     )
     logger.info(

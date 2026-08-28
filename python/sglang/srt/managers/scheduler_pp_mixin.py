@@ -7,7 +7,7 @@ import time
 from array import array
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -369,6 +369,16 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     # it. Both ends of this codec ship together, so the tuple
                     # width is a single-version fact.
                     bool(e.unresolved),
+                    # #987: the request's own fill length and the trailing
+                    # OUTPUT tokens the sender holds beyond a receiver's fill.
+                    # Appended at the END of the row so the reader below can
+                    # be written by INDEX and stay legacy-tolerant: a row from
+                    # a sender that predates this field is simply shorter, and
+                    # a shorter row reads back as `fill_len=None`, which every
+                    # consumer treats as "nothing to adopt" -- byte-identical
+                    # to the behaviour before this pair existed.
+                    e.fill_len,
+                    tuple(int(t) for t in (e.fill_tail or ())),
                 )
                 for e in decision.entries
             ),
@@ -376,31 +386,46 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
     }
 
 
+#: #987: how wide a wire row was before the fill-carry pair was appended.
+#: A row of exactly this width is a legacy row and carries no fill facts.
+_ADMISSION_ROW_WIDTH_PRE_987 = 8
+
+
+def _pp_admission_entry_from_row(row: Sequence) -> PPAdmissionEntry:
+    """#791/#987: one wire row back into an entry, tolerant of row WIDTH.
+
+    Read by index rather than by tuple unpacking, which is the whole
+    legacy-tolerance mechanism: `pp_admission_decision_to_wire` gained two
+    trailing fields in #987, and a fixed-arity unpack would turn a row from
+    either width into a `ValueError` on the receiving rank -- i.e. the
+    ordinary tuple-width assumption the codec's own comment used to license
+    ("both ends of this codec ship together") becomes a crash the moment the
+    two ends are one commit apart. Absent trailing fields read as `None`/`()`,
+    which every consumer already treats as "this sender said nothing".
+    """
+    n = len(row)
+    return PPAdmissionEntry(
+        rid=row[0],
+        prefix_len=row[1],
+        extend_len=row[2],
+        admitted=row[3],
+        retracted=row[4],
+        retracted_by_rank=row[5],
+        observed_local=row[6],
+        unresolved=row[7],
+        fill_len=(row[8] if n > _ADMISSION_ROW_WIDTH_PRE_987 else None),
+        fill_tail=(
+            tuple(int(t) for t in (row[9] or ()))
+            if n > _ADMISSION_ROW_WIDTH_PRE_987 + 1
+            else ()
+        ),
+    )
+
+
 def pp_admission_decision_from_wire(message: Dict[str, object]) -> PPAdmissionDecision:
     """#791: inverse of pp_admission_decision_to_wire."""
     mb_id, raw_entries = message[_ADMISSION_DECISION_PAYLOAD_KEY]
-    entries = tuple(
-        PPAdmissionEntry(
-            rid=rid,
-            prefix_len=prefix_len,
-            extend_len=extend_len,
-            admitted=admitted,
-            retracted=retracted,
-            retracted_by_rank=retracted_by_rank,
-            observed_local=observed_local,
-            unresolved=unresolved,
-        )
-        for (
-            rid,
-            prefix_len,
-            extend_len,
-            admitted,
-            retracted,
-            retracted_by_rank,
-            observed_local,
-            unresolved,
-        ) in raw_entries
-    )
+    entries = tuple(_pp_admission_entry_from_row(row) for row in raw_entries)
     return PPAdmissionDecision(mb_id=int(mb_id), entries=entries)
 
 
@@ -2908,6 +2933,22 @@ def pp_queue_orphaned_chunked_req(scheduler, req, *, tag, mb_id, route) -> bool:
     queue = getattr(scheduler, "waiting_queue", None)
     if queue is None:
         return False
+    # #986: THE ADMISSION LOCK REF, GIVEN BACK ON THIS DOOR TOO. This function
+    # is the #968b re-home/re-queue junction, and it is a queueing of a request
+    # whose pass never reached a forward -- so it owes exactly what
+    # `pp_park_voided_batch_member` owes and for the identical reason
+    # (`pp_give_back_admission_lock_ref`): `_req_inc_lock_ref` took a
+    # `tree_cache.inc_lock_ref` at admission, its matching decrement lives only
+    # in `cache_unfinished_req`/`cache_finished_req` after a forward, and
+    # re-admission takes a FRESH ref rather than reusing this one
+    # (`init_next_round_input` re-runs `match_prefix` and overwrites
+    # `last_node` with no `dec_lock_ref` on the path). Net +1 per cycle
+    # otherwise -- the #969 shape by a second route, on the door #968b opened.
+    # Unconditional for the same reason it is unconditional there: the ref is
+    # taken whether or not a chunk was prepared on top of it. The pages are NOT
+    # returned; only the request's claim on them is, which is the state every
+    # ordinary waiting-queue member is already in.
+    pp_give_back_admission_lock_ref(scheduler, req)
     try:
         queue.append(req)
     except Exception:  # noqa: BLE001 - a stand-in with an immutable queue
@@ -2967,6 +3008,37 @@ def pp_rehome_displaced_chunked_req(scheduler, incoming, *, mb_id, route):
     extend_range = getattr(current, "extend_range", None)
     end = getattr(extend_range, "end", None)
     if end is None or getattr(current, "is_retracted", False):
+        # #987 THE ZERO CASE, SAID OUT LOUD (test-agent finding, window
+        # flip-0828). This early return is the reset-shape exit, and until
+        # here it was SILENT: nothing distinguished "no displacement happened"
+        # from "a displacement happened and was declined here". The docstring
+        # below settles the decline by citing `pp_chunked_req_is_reachable` --
+        # but that test lives inside `pp_queue_orphaned_chunked_req`, past
+        # this return, so on THIS path the guard names a check it never runs.
+        # The standing guard-comment rule asks the comment to name the hazard
+        # rather than imply a check; the cheap half of that is making the exit
+        # visible. LOG ONLY -- the behaviour is unchanged, deliberately: this
+        # instrument exists so the next boot can say whether the path is taken
+        # at all before anyone changes what it does.
+        rid = getattr(current, "rid", None)
+        emit, seen = pp_968_log_gate(f"rehome-reset-shape:{rid}")
+        if emit:
+            logger.warning(
+                "#987 REHOME-DECLINED-RESET-SHAPE rid=%s from-slot=%s "
+                "route=%s: a request was displaced out of self.chunked_req in "
+                "the reset shape (extend_range=%r is_retracted=%s), so the "
+                "re-home declined it WITHOUT consulting "
+                "pp_chunked_req_is_reachable. If this rid is also absent from "
+                "the waiting queue and the running batch, this line is the "
+                "drop and the reachability test is the thing to move up "
+                "(seen=%d).",
+                rid,
+                mb_id,
+                route,
+                extend_range,
+                getattr(current, "is_retracted", False),
+                seen,
+            )
         return None
     prefix_indices = getattr(current, "prefix_indices", None)
     # #796: a TENSOR of KV-pool slot pointers -- `len()` reads the shape and
@@ -9104,6 +9176,32 @@ class SchedulerPPMixin:
 
         batch = mbs[mb_id] if mb_id < len(mbs) else None
         reqs = list(getattr(batch, "reqs", None) or ())
+        # #987 THE REFUSAL FACT, READ WHERE IT IS ACTUALLY TRUE. This method is
+        # rank 0 consuming a void for a batch rank 0 itself launched, so `reqs`
+        # IS the set of rids that were offered and not served -- rank 0's own
+        # state, needing no peer and no completed lap, which is the property
+        # #944b's docstring demands of anything that bounds this loop.
+        #
+        # IT CANNOT BE READ OFF THE DECISION, and that is why this line is
+        # here and not in `pp_absorb_admission_return` below.
+        # `_pp_refuse_forwarded_schedule` runs `void_pp_admission_decision`
+        # before the void starts home, so a schedule refusal arrives carrying
+        # ZERO entries: `record_return_trip` is handed an empty tuple and
+        # learns nothing. That is exactly the R9 census shape -- 506 refusals,
+        # `UNRESOLVABLE=0`, `_unresolved_rounds` never incremented once -- and
+        # the compensator-unreachability class (#939) it belongs to.
+        _guard = getattr(self, "_pp_admission_guard", None)
+        _note_refused = getattr(_guard, "note_pass_refused", None)
+        if callable(_note_refused) and reqs:
+            try:
+                _note_refused(getattr(r, "rid", None) for r in reqs)
+            except Exception:  # noqa: BLE001 - bookkeeping may never break a void
+                logger.warning(
+                    "#987 could not record the refusal for slot %s; the void "
+                    "is absorbed normally, but the #944 bound will not count "
+                    "this pass",
+                    mb_id,
+                )
         if mb_id < len(mbs):
             mbs[mb_id] = None
         if mb_id < len(mb_metadata):

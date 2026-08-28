@@ -744,6 +744,27 @@ class Req(ReqDllmMixin):
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
+        # #987 THE SHADOW FILL TAIL: output tokens an UPSTREAM PP rank holds
+        # for this request that this rank has not produced itself, carried on
+        # the admission decision (`PPAdmissionEntry.fill_len` / `fill_tail`)
+        # and adopted by `pp_admission_congruence.adopt_carried_fill`.
+        #
+        # DELIBERATELY NOT `output_ids`, and this is the whole reason the pair
+        # exists. `output_ids` is what this rank GENERATED: the client stream
+        # slices it (scheduler_components/output_streamer.py:383-384) and
+        # `_update_finish_state_impl` below counts it against
+        # `max_new_tokens`, both unguarded by PP rank. A token this rank never
+        # sampled must not enter it. It belongs to the FILL -- the length two
+        # ranks were disagreeing about across the `tp_to_pp` seam -- and
+        # `_refresh_fill_ids` is the one reader that honours it.
+        #
+        # `pp_carried_fill_len` is the upstream's total fill length and is
+        # kept only so a reader can tell a live carry from a stale one;
+        # `pp_carried_fill_tail` is the suffix itself, newest last. Both stay
+        # None/() on every rank that never adopts, which is every rank on a
+        # healthy pass and every rank of a `pp_size <= 1` boot.
+        self.pp_carried_fill_len: Optional[int] = None
+        self.pp_carried_fill_tail: Tuple[int, ...] = ()
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
@@ -1246,6 +1267,26 @@ class Req(ReqDllmMixin):
           (output_ids reset to empty), or set_finish_with_abort (origin
           replaced by a 1-token stub).
         """
+        # #987: THE ONE READER OF THE CARRIED TAIL. When an upstream PP rank
+        # holds output tokens this rank has not produced, the fill is
+        # `origin + output + carried_tail` -- and it is rebuilt whole rather
+        # than extended, because the in-place branch below infers how many
+        # output tokens are already present FROM LENGTHS ALONE and a suffix it
+        # does not know about makes that inference wrong by exactly the length
+        # of the tail. The rebuild is O(fill) but reachable only for a request
+        # that is actually mid-divergence at the seam, which is one request on
+        # the passes that would otherwise all have voided.
+        #
+        # SELF-CANCELLING: `adopt_carried_fill` recomputes the deficit against
+        # `origin + output` on every pass and clears the pair the moment this
+        # rank produces the token itself, so this branch stops being taken
+        # without anything here having to detect it.
+        carried_tail = getattr(self, "pp_carried_fill_tail", None)
+        if carried_tail:
+            self.full_untruncated_fill_ids = (
+                self.origin_input_ids + self.output_ids + array("q", carried_tail)
+            )
+            return
         n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
         if (
             self.full_untruncated_fill_ids is not self.origin_input_ids
@@ -1855,6 +1896,15 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
+        # #987: the carried fill tail is a statement about ONE pass's seam
+        # divergence, and a retraction ends that pass. Left standing it would
+        # survive into a re-prefill whose `output_ids` may be shorter (the
+        # input_embeds branch below empties them outright), where the deficit
+        # it implies names no seam at all. `adopt_carried_fill` re-establishes
+        # it on the next pass that still needs it, from the decision, which is
+        # the only place the fact is authoritative.
+        self.pp_carried_fill_len = None
+        self.pp_carried_fill_tail = ()
         self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
