@@ -3147,6 +3147,18 @@ def pp_give_back_admission_lock_ref(scheduler, req) -> bool:
     A module-level function so a can-fail proof can neuter this ONE step.
     Never raises.
     """
+    # #990 OWNERSHIP GUARD (R12, boot 9): a CARRIED CHUNK does not take a
+    # fresh ref per pass -- the stash transfers the one admission ref
+    # stash-to-stash (unified_radix_cache.py:1354-1355), so the premise
+    # "re-admission takes a FRESH ref" is FALSE exactly for the request
+    # currently held as self.chunked_req. Giving its ref back here made one
+    # inc meet two decs: this give-back (boot 9 slice line 270,
+    # lock_ref_returned=True) and the first stash's dec -> the
+    # full_component.py:320 underflow assert. The #986 orphan route keeps
+    # giving back: by its own definition the orphan has LEFT the chunked_req
+    # field. The assert is never weakened; ownership is discriminated.
+    if req is getattr(scheduler, "chunked_req", None):
+        return False
     node = getattr(req, "last_node", None)
     if node is None:
         return False
