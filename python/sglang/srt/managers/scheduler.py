@@ -9117,6 +9117,64 @@ class Scheduler(
             ):
                 self._note_seam_chunk_refused(self.chunked_req)
             else:
+                # #994 THE SECOND HALF OF THE SAME EXEMPTION.
+                #
+                # `#791 PP ADMISSION UNIFORMITY` has two halves -- MEMBERSHIP
+                # ("only what the decision names") and GEOMETRY ("exactly the
+                # prefix the decision named") -- and both live in the
+                # waiting-queue loop below, applied strictly before
+                # `adder.add_one_req`. The chunked continuation reaches
+                # `can_run_list` through `add_chunked_req` here instead, so it
+                # was exempt from BOTH. #992 closed membership. This closes
+                # geometry, and until it did, a named continuation entered the
+                # batch carrying its OWN prefix while the decision named a
+                # different one -- which is a SHAPE disagreement, because
+                # `prepare_for_extend` sizes the cross-stage tensor directly
+                # off `len(req.prefix_indices)`.
+                #
+                # MEASURED, boot 13 (4fde6e5d19, 2026-08-28 21:53-21:55):
+                # 239 identical refusals, `#791 FORWARDED SCHEDULE
+                # UNEXECUTABLE for rid=901a7d29…: the decision names
+                # prefix_len=0, this rank holds 7938`, and a hard admission
+                # wedge behind them (5 queued, 0 running, no first token). The
+                # decision said 0 because PP0 had spent its `#946 PREMISE
+                # RECOMPUTE` terminator on that rid; the follower may not
+                # second-guess that -- it must adopt it.
+                #
+                # SAME HELPER, SAME ORDER, ON PURPOSE. `truncate_prefix_to`
+                # moves `prefix_indices` and `cache_protected_len` together
+                # (#930), and #961's rule is that the mover must be followed
+                # by the re-derivation it invalidates: in the queue loop that
+                # is `add_one_req`, here it is `add_chunked_req` on the very
+                # next line. Nothing is re-derived by hand.
+                if incoming is not None:
+                    told = incoming.get(self.chunked_req.rid)
+                    if told is not None and told != len(
+                        self.chunked_req.prefix_indices
+                    ):
+                        self._994_chunked_geometry_adopted = (
+                            getattr(self, "_994_chunked_geometry_adopted", 0) + 1
+                        )
+                        count = self._994_chunked_geometry_adopted
+                        if count <= 8 or count % 256 == 0:
+                            logger.info(
+                                "#994 CHUNKED CONTINUATION ADOPTS DECIDED "
+                                "GEOMETRY rid=%s local_prefix=%d told=%d "
+                                "occurrence=%d: the decision names a prefix "
+                                "this rank does not currently hold, and the "
+                                "geometry is the upstream's to decide. "
+                                "Adopting it here, before `add_chunked_req` "
+                                "re-derives the extend range, is what the "
+                                "queue loop already does before "
+                                "`add_one_req`. Without it the pass is "
+                                "refused as UNEXECUTABLE and nothing "
+                                "progresses.",
+                                self.chunked_req.rid,
+                                len(self.chunked_req.prefix_indices),
+                                told,
+                                count,
+                            )
+                        self.chunked_req.truncate_prefix_to(told)
                 self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
