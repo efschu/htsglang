@@ -144,6 +144,12 @@ class _Rank:
     _pp_send_admission_decision = SchedulerPPMixin._pp_send_admission_decision
     _pp_commit_admission_send_work = SchedulerPPMixin._pp_commit_admission_send_work
     _pp_drain_voided_proxy = SchedulerPPMixin._pp_drain_voided_proxy
+    # #978 HARNESS REPAIR (interface drift, no assertion touched): the send
+    # path now records the per-generation launched chain per slot. Taken
+    # UNBOUND like the twelve above -- it is the SHIPPING method, and its own
+    # docstring guarantees stand-in tolerance (#787: a holder without the
+    # array grows one rather than raising).
+    _pp_note_launched_chain = SchedulerPPMixin._pp_note_launched_chain
 
     PP_LOOP_SIZE = 4
     CYCLES = 25

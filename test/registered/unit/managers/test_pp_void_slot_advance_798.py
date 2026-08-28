@@ -797,7 +797,15 @@ class PPVoidWithoutUpstreamLaunchWiring798(unittest.TestCase):
         h._pp_drain_voided_proxy = _drain_voided_proxy
 
         def _send_admission_decision(
-            amended, expects_output=None, pass_voided=None, launched=None
+            amended,
+            expects_output=None,
+            pass_voided=None,
+            launched=None,
+            # #978 HARNESS REPAIR (interface drift, no assertion touched):
+            # the event loop now also forwards the per-generation launched
+            # chain; this recorder ignores it exactly as it ignores
+            # `expects_output`.
+            launched_chain=(),
         ):
             calls["sent"].append({"pass_voided": pass_voided, "launched": launched})
 
