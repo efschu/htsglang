@@ -236,6 +236,26 @@ def _pp0_pass(pp0, *, queue_rids, cap=CAP):
     hand-built queue deliberately -- it is the unit test of the reorder and
     the decision build, given the queue -- and the other module is the
     integration proof that the queue is populated at all.
+
+    THE SAME LIMIT WITH ITS CITATIONS, so the next reader can check the claim
+    instead of taking it. This file's own header says it four hundred lines
+    up -- "That request is then in NO queue on ANY rank -- `add_chunked_req`
+    re-admits it from `self.chunked_req` directly -- so PP0 could not see
+    it" -- and the shipped code says it twice more: `pp_rehome_refused_chunked_req`
+    (scheduler_pp_mixin.py:2563-2565) "The chunked continuation is the one
+    request that is never in the waiting queue, which is exactly why it is
+    the one that goes missing", and the void's own disposal (:798-802) is
+    what keeps it out. The ACT's docstring (:1757-1759) claims the opposite
+    ("requests already in PP0's own `waiting_queue` -- the void's requeue put
+    them there"); that claim is the one that is wrong.
+
+    So: arms driven through this helper measure the REORDER MECHANISM given
+    queue membership -- that `pp_parked_continuation_priority` rotates a
+    named rid to the front, that the seat walk then admits it, and that
+    `build_pp_admission_decision` names it. They do NOT measure that a parked
+    continuation reaches a seat in production, and no assertion in them may
+    be read that way. `Arm6ActIsANoOpOnTheRealDefectPath` pins what the act
+    does when the queue membership is absent, without this helper.
     """
     pp0.waiting_queue = [
         _req(rid, prefix_len=EXECUTED if rid == RID_PARKED else 0, extend_len=64)
@@ -289,7 +309,19 @@ def _follower_batch(named_rids, *, parked_rid=RID_PARKED, cap=CAP):
 
 
 class Arm1TheBoot3Loop(unittest.TestCase):
-    """The loop, and its end."""
+    """The loop, and its end -- links 1 to 4 of five, and only those.
+
+    HONESTLY BOUNDED 2026-08-28 (window-flip-0828 #968 self-audit). The lap
+    itself -- MINT on PP1, FORWARD over the shipped sender/relay/absorber,
+    ABSORB into PP0's carry table -- is driven for real here and the arms
+    that assert on it stand. The FIFTH link, PP0 acting on what it absorbed,
+    is reached in these arms only through `_pp0_pass`, which supplies the
+    queue membership production never supplies (see that helper's docstring).
+    The arms below therefore carry their scope in their own docstrings, and
+    the unbounded reading -- "so a parked continuation gets named" -- is
+    retracted. `Arm6ActIsANoOpOnTheRealDefectPath` states what actually
+    happens on the defect path.
+    """
 
     def test_the_fact_reaches_pp0_over_the_real_lap(self):
         pp0, _pp1, _pp2, downstream, on_the_wire, home = _drive_lap()
@@ -315,7 +347,21 @@ class Arm1TheBoot3Loop(unittest.TestCase):
             "PP0 must know the rid, the executed extent, and which rank holds it",
         )
 
-    def test_pp0_names_it_within_one_pass_and_the_follower_builds(self):
+    def test_a_carried_rid_THAT_IS_QUEUED_is_reordered_named_and_built(self):
+        """Reorder -> seat -> naming, GIVEN queue membership. Not delivery.
+
+        Renamed 2026-08-28 from `test_pp0_names_it_within_one_pass_and_the_
+        follower_builds`, whose name asserted the unconditional delivery this
+        arm does not measure: `_pp0_pass` puts `RID_PARKED` into
+        `pp0.waiting_queue` itself. What is genuinely pinned here is that
+        once a carried rid IS queued, the shipped reorder moves it to the
+        front, the seat walk admits it inside `CAP`, the shipped
+        `build_pp_admission_decision` names it, `told` reports the executed
+        extent rather than a re-derived one, and the follower's
+        `add_chunked_req` occupant is then a NAMED member. Every one of those
+        is a real property of the shipped functions; none of them is evidence
+        that a parked continuation ever reaches `waiting_queue`.
+        """
         pp0, _pp1, _pp2, _downstream, _wire, _home = _drive_lap()
 
         # The specimen's queue: the parked rid rotated to the TAIL, two
@@ -348,7 +394,16 @@ class Arm1TheBoot3Loop(unittest.TestCase):
         )
 
     def test_without_the_carry_the_rid_is_never_named_and_the_pass_refuses(self):
-        """The BEFORE shape, pinned: an empty table reproduces boot 3."""
+        """The BEFORE shape, pinned: an empty carry table refuses every pass.
+
+        SCOPE, tightened 2026-08-28. This reproduces the boot-3 REFUSAL
+        ARITHMETIC (missing/extra, never "ok") from an empty carry table, and
+        that much is real. It does not reproduce boot 3's full geometry: the
+        specimen's rid was not merely un-carried, it was in no queue at all,
+        whereas `_pp0_pass` queues it here. Read this as "an empty table is
+        sufficient for the refusal loop", not as "an empty table is the only
+        way to get there" -- the self-audit found a second, live way.
+        """
         pp0 = _holder(PP0)
         self.assertEqual(m.pp_parked_continuation_carry(pp0), {})
 
@@ -483,6 +538,14 @@ class Arm4CanFail(unittest.TestCase):
             m.pp_note_parked_continuation = original
 
     def test_blinding_the_priority_leaves_the_rid_unnamed(self):
+        """Can-fail for the REORDER, under the same queue-membership premise.
+
+        SCOPE, added 2026-08-28: this proves the reorder is load-bearing for
+        a QUEUED carried rid -- neuter it and the tail rid never reaches a
+        seat. It does not prove the reorder is load-bearing on the defect
+        path, where the rid is not in the queue and the reorder is already a
+        no-op with or without neutering (`Arm6ActIsANoOpOnTheRealDefectPath`).
+        """
         original = m.pp_parked_continuation_priority
         m.pp_parked_continuation_priority = lambda scheduler: ()
         try:
@@ -636,6 +699,119 @@ class TheHarnessMatchesProduction(unittest.TestCase):
                 hasattr(m.SchedulerPPMixin, name),
                 f"{name} must not also exist as a mixin method",
             )
+
+
+class Arm6ActIsANoOpOnTheRealDefectPath(unittest.TestCase):
+    """What the ACT does when the continuation is where production leaves it.
+
+    THE HONEST STATEMENT of the #968 self-audit (window-flip-0828,
+    2026-08-28), pinned as a test so it cannot be re-forgotten. Links 1-4 of
+    the carry deliver: the fact is minted on PP1, travels the shipped wire,
+    and lands in PP0's carry table. Link 5 -- `pp_parked_continuation_
+    priority` -- then permutes `scheduler.waiting_queue` and NOTHING ELSE
+    (scheduler_pp_mixin.py:1785-1793, three silent `return ()` at :1784,
+    :1787, :1792). A parked continuation is never in that queue: the void's
+    disposal keeps it out (:798-802), `pp_void_keeps_request` skips the
+    requeues (:2626-2628), and `pp_rehome_refused_chunked_req` says it in
+    words (:2563-2565). So on the path that actually failed, the act returns
+    the empty tuple and the rid stays unnamed.
+
+    These arms are GREEN BEFORE AND AFTER the #968b fix by design -- that fix
+    re-homes the continuation at the cross-slot restore sites and leaves the
+    act unchanged. They are the regression fence around the retracted claim:
+    if someone later "fixes" the act by teaching it to admit out of the carry
+    table, these go red and the DESIGN_679 §4 rule-1 violation (a second
+    admission authority) is caught at the desk instead of at a boot.
+    """
+
+    def _pp0_with_carry(self):
+        pp0, _pp1, _pp2, _downstream, _wire, _home = _drive_lap()
+        self.assertEqual(
+            m.pp_parked_continuation_carry(pp0),
+            {RID_PARKED: (EXECUTED, PP1)},
+            "precondition: links 1-4 must have delivered the fact",
+        )
+        return pp0
+
+    def test_the_fact_arrives_and_the_act_still_cannot_name_it(self):
+        """The production shape: carry table full, continuation NOT queued."""
+        pp0 = self._pp0_with_carry()
+        # Production: PP0's queue holds OTHER requests. The continuation is
+        # in none of them -- it lives in a `chunked_req` slot, or, under the
+        # cross-slot defect #968b repairs, in nothing at all.
+        pp0.waiting_queue = [
+            _req(rid, prefix_len=0, extend_len=64) for rid in (RID_A, RID_B)
+        ]
+        before = list(pp0.waiting_queue)
+
+        moved = m.pp_parked_continuation_priority(pp0)
+
+        self.assertEqual(
+            moved,
+            (),
+            "the act can only reorder what is IN the queue; the parked "
+            "continuation is not, so it names nothing -- this is the "
+            "structural no-op the self-audit found, not a bug in this test",
+        )
+        self.assertEqual(
+            [r.rid for r in pp0.waiting_queue],
+            [r.rid for r in before],
+            "and it must leave the queue untouched when it names nothing",
+        )
+
+        guard = PPAdmissionCongruenceGuard()
+        decision = build_pp_admission_decision(
+            MB_ID,
+            pp0.waiting_queue[:CAP],
+            pp_size=WORLD,
+            guard=guard,
+            require_executed_geometry=True,
+        )
+        named = [e.rid for e in decision.entries]
+        self.assertNotIn(
+            RID_PARKED,
+            named,
+            "unnamed, exactly as in the 407-extra specimen: PP1's "
+            "add_chunked_req occupant is an extra PP0 never named",
+        )
+        self.assertIn(
+            _membership_verdict(named, _follower_batch(named))[0],
+            ("missing", "extra"),
+            "and so the pass refuses -- the boot-3/boot-4 signature",
+        )
+
+    def test_an_empty_queue_takes_the_silent_early_return(self):
+        """queue=0 on 259 of PP0's 468 passes in the boot-4 specimen."""
+        pp0 = self._pp0_with_carry()
+        pp0.waiting_queue = []
+        self.assertEqual(
+            m.pp_parked_continuation_priority(pp0),
+            (),
+            "empty queue takes the `if not queue: return ()` branch "
+            "(scheduler_pp_mixin.py:1787) -- silently, which is why the "
+            "boot-4 log carried zero '#968' lines while the chain ran",
+        )
+        self.assertEqual(pp0.waiting_queue, [])
+
+    def test_the_act_never_admits_out_of_the_carry_table(self):
+        """DESIGN_679 §4 rule 1, fenced: reorder only, never a second adder.
+
+        The fix for the real defect is upstream (re-home the continuation so
+        an ordinary authority owns it again), never here. If a future edit
+        makes the act synthesise a queue member out of the carry table, the
+        rid appears without ever having been queued -- caught here.
+        """
+        pp0 = self._pp0_with_carry()
+        pp0.waiting_queue = [
+            _req(rid, prefix_len=0, extend_len=64) for rid in (RID_A, RID_B)
+        ]
+        m.pp_parked_continuation_priority(pp0)
+        self.assertEqual(
+            sorted(r.rid for r in pp0.waiting_queue),
+            sorted((RID_A, RID_B)),
+            "the act must not have ADDED anything to the queue -- it "
+            "reorders a set it does not own",
+        )
 
 
 if __name__ == "__main__":
