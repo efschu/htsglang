@@ -55,7 +55,7 @@ from sglang.srt.managers.pp_stash_disposition import (
     census_stash,
     stash_keys_with_disposition,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, release_req
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -481,6 +481,25 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
     Idempotent and never raises: it runs on the abort path too, where the
     request may hold some slots and not others, and an instrument that can
     raise while cleaning up after a failure turns one defect into two.
+
+    #969 -- FOR THE PROBE ONLY, AND THAT IS NOT AN OVERSIGHT. This releases
+    memory WITHOUT `cache_finished_req`, so it never reaches the
+    `dec_lock_ref(req.last_node)` those methods end in. That is correct here
+    and only here: the request this frees is the synthetic
+    ``_dyn_chunk_probe_req``, built inside the profiling loop below, never
+    matched against the prefix tree, and therefore holding no lock ref to
+    give back. It is WRONG for any admitted request, and applying it to the
+    PP voids is precisely the defect #969 closes -- the rows went back to the
+    allocator while the tree kept its lock on them, `reset_for_retract` then
+    cleared `last_node`, and the ref became unreachable for the life of the
+    process. Admitted requests go through `_release_voided_request` below.
+
+    Do not "unify" the two. Routing the probe through the disciplined path
+    would decrement a ref it never took --
+    `UnifiedRadixCache.cache_finished_req` decrements `req.last_node` with no
+    None guard -- which is the same accounting defect in the other direction
+    (#929). The two functions are not one discipline written twice; they are
+    a request that holds a tree lock and a request that does not.
     """
     if req is None:
         return
@@ -508,6 +527,73 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
             pool.free(req)
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("[PP Dynamic Chunk] probe req-slot release failed: %s", exc)
+
+
+def _release_voided_request(scheduler, req, remaining_req_count: int = 0) -> None:
+    """#969: a voided request is a RETRACTED request, and is released as one.
+
+    THE LEAK THIS CLOSES. Both void sites used to hand their non-resident
+    requests to `_release_dynamic_chunk_probe`, which returns KV rows, the
+    mamba slot and the req-pool row by calling the allocator and the pool
+    directly. Nothing on that route reaches `cache_finished_req`, and
+    `cache_finished_req` is where `dec_lock_ref(req.last_node)` lives (the
+    last two lines of every implementation of it: radix_cache.py,
+    pure_swa_radix_cache.py, radix_cache_cpp.py, unified_radix_cache.py). So
+    the pages went back to the allocator while the radix tree kept its lock
+    on them; `reset_for_retract` then cleared `last_node`, and the ref could
+    no longer even be found, let alone returned. One leaked lock per voided
+    request, for the life of the process.
+
+    WHAT THAT LOOKED LIKE FROM OUTSIDE. `evictable_size_` counts UNLOCKED
+    tokens, so a tree whose nodes are all pinned reports nothing evictable at
+    all -- and every funding rung downstream reads its reclaim off that
+    number. The boots logged "reclaimed 0 MiB" against a full tree, which is
+    not a pressure reading but the statement that nothing in it was ever
+    unlocked (#813/#694 family).
+
+    NOT A THIRD MECHANISM. `release_req` (schedule_batch.py) already IS this
+    discipline, and both correct retraction paths -- `retract_decode` and
+    `retract_all` -- are its only callers. This function holds no release
+    logic of its own: it supplies the scheduler's collaborators and the
+    never-raise contract this path has always carried, and delegates the
+    rest. The probe keeps its own release for the reason given in
+    `_release_dynamic_chunk_probe`'s docstring, which is a different premise
+    rather than a second expression of this one.
+
+    THE CALLER MUST NOT RESET. `release_req` calls `reset_for_retract` as its
+    LAST act -- last because that method clears `last_node` and
+    `mamba_pool_idx`, so a release sequenced after it has nothing left to
+    release and no node left to unlock. A call site that resets again
+    double-counts `retraction_count`, which feeds `retract_decode`'s
+    solo-OOM abort ladder: the request would be aborted at half the retries
+    the operator configured. The fallback below covers only the case where
+    the release raised before reaching that point -- the caller re-queues
+    this request either way, and the next pass's `get_next_batch_to_run`
+    dereferences `extend_range` on it with no guard of its own (#797b/#798).
+    """
+    if req is None:
+        return
+    try:
+        release_req(
+            req=req,
+            remaing_req_count=remaining_req_count,
+            server_args=scheduler.server_args,
+            req_to_token_pool=scheduler.req_to_token_pool,
+            token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+            tree_cache=scheduler.tree_cache,
+            hisparse_coordinator=getattr(scheduler, "hisparse_coordinator", None),
+        )
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning(
+            "#969 voided-request release failed for %s: %s",
+            getattr(req, "rid", None),
+            exc,
+        )
+    if not getattr(req, "is_retracted", False):
+        try:
+            req.reset_for_retract()
+        except Exception as exc:  # noqa: BLE001 - a retract may not raise
+            logger.warning("#969 voided-request retract failed: %s", exc)
 
 
 def _park_chunked_prefill_chunk(scheduler, req) -> bool:
@@ -1796,7 +1882,7 @@ def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
     round:
 
       * RESIDENT DECODE REQUEST (`running_mbs[mb_id]`). It keeps decoding from
-        the very pages `_release_dynamic_chunk_probe` would return to the
+        the very pages `_release_voided_request` would return to the
         allocator, so freeing them corrupts another request's cache, and
         re-queueing it puts it in the batch twice. The pass simply did not
         run; it decodes again next pass from the state it still holds.
@@ -6107,11 +6193,15 @@ class SchedulerPPMixin:
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
                 continue
-            _release_dynamic_chunk_probe(self, req)
-            try:
-                req.reset_for_retract()
-            except Exception as exc:  # noqa: BLE001 - a retract may not raise
-                logger.warning("#797d own-void retract failed: %s", exc)
+            # #969: THE RETRACTION PATH, NOT THE PROBE PATH. These are
+            # admitted requests -- they were matched against the prefix tree
+            # at admission and hold a lock ref on `req.last_node`. The probe
+            # helper that used to stand here frees rows without ever reaching
+            # `cache_finished_req`, so it left that ref behind on pages it had
+            # already returned to the allocator, and `reset_for_retract`
+            # cleared the only handle to it one line later. `release_req`
+            # resets the request as its last act, so this site does not.
+            _release_voided_request(self, req, len(reqs) - released)
             self.waiting_queue.append(req)
             released += 1
 
@@ -7109,9 +7199,15 @@ class SchedulerPPMixin:
            batch's KV pages, mamba slot and req-pool slot have no owner at
            all: `process_batch_result_prefill` is what normally hands them to
            the tree cache, and it never runs for a voided pass.
-           `_release_dynamic_chunk_probe` is reused verbatim because it
-           already frees the three in the one order that works (mamba before
-           the req slot) and is documented idempotent and non-raising.
+           The release goes through `_release_voided_request`, i.e. through
+           the same `release_req` both retraction paths use. It was
+           `_release_dynamic_chunk_probe` until #969, "reused verbatim
+           because it already frees the three in the one order that works",
+           and that reasoning was itself the defect: freeing the three is not
+           the whole obligation. The probe helper never reaches
+           `cache_finished_req`, so it returned the pages to the allocator
+           and left the tree's lock ref standing on them. A voided request is
+           a RETRACTED request and is released as one.
 
         3. The carried decision teaches `PPAdmissionCongruenceGuard` the
            shortfall. Without it PP0 re-offers the identical `told` next pass,
@@ -7280,11 +7376,13 @@ class SchedulerPPMixin:
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
                 continue
-            _release_dynamic_chunk_probe(self, req)
-            try:
-                req.reset_for_retract()
-            except Exception as exc:  # noqa: BLE001 - a retract may not raise
-                logger.warning("#791b void-output retract failed: %s", exc)
+            # #969: THE RETRACTION PATH, NOT THE PROBE PATH -- same reason as
+            # the twin site in `_pp_void_own_batch`. The probe helper never
+            # reaches `dec_lock_ref`, so every request voided here used to
+            # leave a permanent lock on its prefix and the tree reported
+            # nothing evictable. `release_req` resets the request as its last
+            # act, so this site does not.
+            _release_voided_request(self, req, len(reqs) - released)
             self.waiting_queue.append(req)
             released += 1
 

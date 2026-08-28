@@ -130,6 +130,10 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
                 "pp_absorb_admission_return",
                 "_park_chunked_prefill_chunk",
                 "_release_dynamic_chunk_probe",
+                # #969: what the void sites actually call now. Stubbed for
+                # the same reason the probe helper was -- this file tests the
+                # chunked-req carry guard, not the release.
+                "_release_voided_request",
             )
         }
         m.pp_void_forward_payload = lambda *a, **k: None
@@ -139,6 +143,14 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
         # cannot repair this state, so the stub must NOT repair it either.
         m._park_chunked_prefill_chunk = lambda scheduler, req: False
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
+        # The real one RELEASES AND RESETS (release_req calls
+        # reset_for_retract as its last act), which is why the call
+        # sites no longer reset themselves. The stub drops only the
+        # memory release -- dropping the reset too would silently
+        # remove the precondition this file's first test asserts.
+        m._release_voided_request = (
+            lambda scheduler, req, remaining=0: req.reset_for_retract()
+        )
         try:
             for mb_id in (0, 1):
                 holder._absorb(
@@ -199,12 +211,24 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
                 "pp_absorb_admission_return",
                 "_park_chunked_prefill_chunk",
                 "_release_dynamic_chunk_probe",
+                # #969: what the void sites actually call now. Stubbed for
+                # the same reason the probe helper was -- this file tests the
+                # chunked-req carry guard, not the release.
+                "_release_voided_request",
             )
         }
         m.pp_void_forward_payload = lambda *a, **k: None
         m.pp_absorb_admission_return = lambda *a, **k: None
         m._park_chunked_prefill_chunk = lambda scheduler, req: True
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
+        # The real one RELEASES AND RESETS (release_req calls
+        # reset_for_retract as its last act), which is why the call
+        # sites no longer reset themselves. The stub drops only the
+        # memory release -- dropping the reset too would silently
+        # remove the precondition this file's first test asserts.
+        m._release_voided_request = (
+            lambda scheduler, req, remaining=0: req.reset_for_retract()
+        )
         try:
             holder._absorb(
                 holder, 0, {m._PP_VOID_OUTPUT_KEY: True}, list(batches), [None]
@@ -249,12 +273,24 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
                 "pp_absorb_admission_return",
                 "_park_chunked_prefill_chunk",
                 "_release_dynamic_chunk_probe",
+                # #969: what the void sites actually call now. Stubbed for
+                # the same reason the probe helper was -- this file tests the
+                # chunked-req carry guard, not the release.
+                "_release_voided_request",
             )
         }
         m.pp_void_forward_payload = lambda *a, **k: None
         m.pp_absorb_admission_return = lambda *a, **k: None
         m._park_chunked_prefill_chunk = lambda scheduler, req: False
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
+        # The real one RELEASES AND RESETS (release_req calls
+        # reset_for_retract as its last act), which is why the call
+        # sites no longer reset themselves. The stub drops only the
+        # memory release -- dropping the reset too would silently
+        # remove the precondition this file's first test asserts.
+        m._release_voided_request = (
+            lambda scheduler, req, remaining=0: req.reset_for_retract()
+        )
         try:
             holder._absorb(
                 holder, 0, {m._PP_VOID_OUTPUT_KEY: True}, list(batches), [None]

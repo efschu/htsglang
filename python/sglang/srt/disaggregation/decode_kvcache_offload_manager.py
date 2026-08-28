@@ -286,7 +286,27 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # #969 SIBLING, found by the sweep that closed the PP-void leak.
+        # This used to hand-edit `protected_size_` by the request's prefix
+        # length. That is an approximation of ONE of the four things
+        # `dec_lock_ref` does for each node on the path to root: it also adds
+        # the same length back to `evictable_size_`, drops the node's
+        # `lock_ref`, and refreshes its leaf status. Editing the counter
+        # alone therefore left every node on this request's prefix path
+        # locked for ever and nothing evictable -- the identical mechanism to
+        # the PP-void leak, hand-rolled here instead of inherited.
+        #
+        # Reachable whenever --disaggregation-decode-enable-radix-cache is
+        # set alongside the offload flag that gates this manager: that swaps
+        # `tree_cache` from `ChunkCache` to a real `RadixCache`, whose
+        # `match_prefix` gives these decode requests a genuine lock chain.
+        # Under the `ChunkCache` default the old line was wrong in the other
+        # direction instead of harmless: that cache's `inc_lock_ref` never
+        # raises `protected_size_`, so subtracting from it drove the counter
+        # negative. Its `dec_lock_ref` is a no-op, which is the right answer
+        # for a cache that holds no locks -- one call is correct for both.
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
