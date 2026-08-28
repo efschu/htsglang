@@ -659,7 +659,24 @@ def _release_dynamic_chunk_probe(scheduler, req) -> None:
 
 
 def _release_voided_request(scheduler, req, remaining_req_count: int = 0) -> None:
-    """#969: a voided request is a RETRACTED request, and is released as one.
+    """#969: when a voided request IS released, it is released as a retraction.
+
+    #984 RETRACTS THE FIRST HALF OF THIS FUNCTION'S ORIGINAL TITLE, and the
+    retraction is kept beside the text rather than replacing it, because the
+    #969 argument below is still exactly right for the calls that remain.
+    The old title read "a voided request is a RETRACTED request". That was
+    the asymmetry R7 measured at the metal: the follower ranks PARK the very
+    same requests, per this family's own doctrine ("A VOID IS A PARK, NOT A
+    RETRACTION", `_park_chunked_prefill_chunk`), and rank 0 retracting them
+    is what produced boot 6's 169 `told=0` refusals -- one full re-prefill
+    per voided rid per void cycle. A voided request is a PARKED request; see
+    `pp_park_voided_batch_member`, which is what both void sites call now.
+
+    WHAT STILL COMES HERE: a voided member that is already FINISHED. No
+    admission loop will ever look at it again, so a park would strand its
+    pages for the life of the process -- which is the one shape for which
+    "released as a retraction" remains the correct disposal, and for which
+    every word below still holds.
 
     THE LEAK THIS CLOSES. Both void sites used to hand their non-resident
     requests to `_release_dynamic_chunk_probe`, which returns KV rows, the
@@ -3004,6 +3021,346 @@ def pp_requeue_cleared_chunked_carry(scheduler, req, *, mb_id, route) -> bool:
     """
     return pp_queue_orphaned_chunked_req(
         scheduler, req, tag="REQUEUE-ON-CLEAR", mb_id=mb_id, route=route
+    )
+
+
+def pp_give_back_admission_lock_ref(scheduler, req) -> bool:
+    """#984: hand back the tree lock ref THIS PASS's admission took. True iff done.
+
+    THE PAIRING, and it is the whole argument. `PrefillAdder._req_inc_lock_ref`
+    (schedule_policy.py:1256-1259) takes `tree_cache.inc_lock_ref(req.last_node)`
+    for every request it admits -- called at :1885 (dllm), :1893 (ordinary) and
+    :1948 (chunked). Its matching decrement is NOT at any admission site: it
+    lives in `cache_unfinished_req` / `cache_finished_req`, which run AFTER a
+    forward pass (radix_cache.py:545 and :492; unified_radix_cache.py:1354).
+    A voided pass never reaches either, so the increment it took is still
+    outstanding when the request goes back to the queue.
+
+    THIS IS THE SAME CLASS AS THE `inflight_middle_chunks` GIVE-BACK one
+    function over, and `_park_chunked_prefill_chunk`'s own third bullet states
+    the rule this obeys: an admission-side increment whose matching decrement
+    lives in a post-forward path that never ran must be handed back, because
+    "a leaked increment is a request that can never report finished". The lock
+    ref is that sentence with `evictable_size_` in place of `finished()`:
+    #969 measured what an unreturned ref does -- "reclaimed 0 MiB against a
+    full tree", the statement that nothing in it was ever unlocked.
+
+    WHY THE PARK CANNOT SIMPLY KEEP IT, which is the premise this function
+    corrects. Keeping the ref would be sound only if re-admission reused it.
+    It does not: `Req.init_next_round_input` (schedule_batch.py:1308-1341) is
+    called unconditionally for every waiting-queue member
+    (scheduler.py:9204), re-runs `match_prefix`, and assigns straight onto
+    `self.prefix_indices` / `self.last_node` with NO `dec_lock_ref` anywhere
+    on that path -- then `_req_inc_lock_ref` takes a SECOND ref. Net +1 per
+    void cycle, on a node that is usually the same object, so the count
+    climbs and the prefix never becomes evictable again. Skipping the release
+    without this give-back would reintroduce #969 by a new route.
+
+    THE PAGES ARE STILL NOT RETURNED, so this is not the #969 split in
+    disguise. #969 was pages handed to the allocator while the tree kept a
+    lock whose handle was then destroyed. Here the opposite half moves: the
+    prefix pages stay exactly where they are, in the tree, and only the
+    request's CLAIM on them is released -- which is the correct state for a
+    request sitting in the waiting queue, and the state every ordinary queued
+    request is already in. `last_node` and `prefix_indices` are deliberately
+    NOT cleared: they are what the next offer reports as executed, which is
+    the entire point of #984, and re-admission overwrites both from a fresh
+    match anyway. If the pages are evicted before re-admission, that match
+    simply returns less and the request re-computes the difference honestly.
+
+    `swa_uuid_for_lock` is cleared with the ref, mirroring the inverse of
+    `_req_inc_lock_ref` (which STORES it on the way in): a uuid naming a lock
+    this request no longer holds must never reach a second decrement.
+
+    A module-level function so a can-fail proof can neuter this ONE step.
+    Never raises.
+    """
+    node = getattr(req, "last_node", None)
+    if node is None:
+        return False
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    dec = getattr(tree_cache, "dec_lock_ref", None)
+    if dec is None:
+        return False
+    try:
+        from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+
+        uuid_for_lock = getattr(req, "swa_uuid_for_lock", None)
+        dec(node, DecLockRefParams(swa_uuid_for_lock=uuid_for_lock))
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+        logger.warning(
+            "#984 admission lock-ref give-back failed for %s: %s",
+            getattr(req, "rid", None),
+            exc,
+        )
+        return False
+    try:
+        req.swa_uuid_for_lock = None
+    except Exception:  # noqa: BLE001 - cleanup must not raise
+        pass
+    return True
+
+
+#: #984: what `pp_park_voided_batch_member` did with ONE voided batch member.
+#:
+#: Strings rather than a bool because the call site has to tell the two
+#: refusals apart, and a bool collapses them into one "not parked" it would
+#: then have to guess about:
+#:   * ALREADY REACHABLE -- an earlier slot's void in this same retraction
+#:     already queued it, or it is decoding in `running_batch`. Nothing is
+#:     owed; queueing again is the duplicate this constant exists to refuse.
+#:   * FINISHED -- no admission loop will ever pick it up again, so a park
+#:     would strand its pages for the life of the process. That, and only
+#:     that, still goes down the `_release_voided_request` retraction path.
+VOID_PARK_QUEUED = "queued"
+VOID_PARK_ALREADY_REACHABLE = "already-reachable"
+VOID_PARK_FINISHED = "finished"
+VOID_PARK_NOTHING = "no-request"
+
+
+def pp_park_voided_batch_member(scheduler, req, *, mb_id, route) -> str:
+    """#984: a VOIDED batch member is PARKED, not retracted. The symmetry fix.
+
+    THE ASYMMETRY THIS CLOSES, measured on boot 6 (2026-08-28, R7). Every
+    void in this family treats the ranks differently, and the family's own
+    doctrine says which of the two is right: `_park_chunked_prefill_chunk`'s
+    docstring states "A VOID IS A PARK, NOT A RETRACTION". Follower ranks
+    obey it -- they never ran the pass, so they park their continuations and
+    keep prefix, pages and handles. Rank 0's batch members did not: they went
+    through `_release_voided_request` -> `release_req` -> `reset_for_retract`,
+    which clears `prefix_indices` (schedule_batch.py:1849) and returns the
+    pages. The two ends of the ring then disagreed about the SAME request:
+
+      * 169 refusals carrying `told=0` -- rank 0 offering a request it had
+        just told itself had executed nothing. That is a full re-prefill of
+        an already-computed prefix per voided rid per void cycle, i.e. a
+        standing violation of the no-double-prefill law on EVERY void, not
+        an edge case.
+      * 333 past-fill refusals -- `prefix_len + extend_len` measured against
+        the follower's `len(full_untruncated_fill_ids)`. A total-token
+        mismatch strictly downstream of the same asymmetric state.
+      * rotating missing/extra membership across passes: with the #968b-2
+        drop closed, boot 6 churned honestly and still did not converge,
+        because each void re-opened the divergence it was disposing of.
+
+    WHY NOT RELEASING IS THE CORRECT LEDGER, not a leak waiver. The premise
+    of both void sites is that THIS PASS NEVER RAN. `release_req` is right
+    for `retract_decode` / `retract_all`, whose requests DID run and whose
+    pages are genuinely finished with; it is wrong here for the same reason
+    the resident-decode exemption in `pp_void_keeps_request` is right -- "the
+    pass simply did not run, and it decodes again next pass from the state it
+    still holds". A request that keeps its pages and its `last_node` lock ref
+    is in the shape it was admitted in; nothing is double-held.
+
+    WHY THIS DOES NOT REOPEN #969 -- AND THE FIRST DRAFT OF THIS PARAGRAPH
+    WAS WRONG, which is left visible because the error is instructive. It
+    argued the park may simply KEEP the lock ref: #969's defect was the SPLIT
+    (pages returned to the allocator while the tree kept its lock, and
+    `reset_for_retract` then destroyed the only handle to it), so keeping
+    BOTH halves had to be safe. That reasoning silently assumed re-admission
+    REUSES the held ref. It does not. `Req.init_next_round_input`
+    (schedule_batch.py:1308-1341) re-runs `match_prefix` for every
+    waiting-queue member (scheduler.py:9204) and assigns straight over
+    `prefix_indices` / `last_node` with no `dec_lock_ref` anywhere on that
+    path, after which `_req_inc_lock_ref` (schedule_policy.py:1256-1259,
+    called at :1893 / :1948) takes a SECOND ref. Keeping it would have leaked
+    exactly one ref per voided member per cycle -- #969 again by a new route,
+    the shape that reports "reclaimed 0 MiB" against a full tree. The
+    predicate was ASSUMED where the call graph could be read: the same class
+    #968b-2 closed one junction up this file.
+
+    So the park hands the ADMISSION's ref back --
+    `pp_give_back_admission_lock_ref` above -- for the identical reason
+    `_park_chunked_prefill_chunk` hands back the admission's
+    `inflight_middle_chunks`: both are increments taken at admission whose
+    matching decrement lives in a post-forward path this pass never reached.
+    What is NOT returned is the MEMORY: the prefix pages stay in the tree,
+    the request keeps `prefix_indices` and `last_node`, and only its CLAIM on
+    them is released -- which is the ordinary state of a queued request, and
+    the state re-admission's fresh match expects to find. The distinction
+    that matters is pages versus claim, not keep-both versus release-both.
+
+    ONLY THE NEVER-RUN CHUNK IS GIVEN BACK. `prepare_for_extend` allocated
+    KV rows for this pass's chunk before the void fired, so the geometry
+    `[len(prefix_indices):extend_range.end]` is this round's and nobody
+    else's. `_park_chunked_prefill_chunk` is the one actuator for that give-
+    back and is called here with `pass_allocated=True` -- the batch was BUILT
+    (that is what a void disposes of), so the KV rows and the
+    `inflight_middle_chunks` increment are both genuinely owed, exactly like
+    the #968b-2 junction in `pp_rehome_displaced_chunked_req`. The executed
+    prefix `[:len(prefix_indices)]` is the RADIX TREE's and is never touched.
+    Zero cached tokens are discarded anywhere on this path.
+
+    REACHABILITY IS TESTED BEFORE ANYTHING IS WRITTEN, and the order is
+    load-bearing twice over. It closes boot 6's 6 duplicate-rid decisions
+    (the void requeue had no dedup at all), and it keeps the give-back off a
+    request that is still in flight: `pp_chunked_req_is_reachable` covers
+    `waiting_queue` and `running_batch`, so a request another slot already
+    queued, or one that is decoding, is refused here before
+    `_park_chunked_prefill_chunk` could free rows out from under it. This is
+    the same instr20 rule `pp_queue_orphaned_chunked_req` states: nothing in
+    flight is rewritten.
+
+    BLAST RADIUS, named rather than discovered later.
+
+      (a) A VOID NO LONGER FREES MEMORY. Under a void storm, KV pressure
+          therefore rises where it used to fall. Accepted, and not a trade
+          made blind: a void storm is exactly the state that dies today, and
+          the memory it "freed" was bought by re-prefilling the same prefix
+          on the next pass -- pressure deferred at the price of the work,
+          not pressure avoided. The admission gates (#656/#788) already
+          refuse on available memory, so the pressure surfaces as a refusal
+          to admit rather than as an OOM.
+      (b) THE REAL RETRACTION PATHS ARE UNTOUCHED. `retract_decode` and
+          `retract_all` still call `release_req` -> `reset_for_retract`, and
+          they are right to: their passes RAN. `reset_for_retract` itself is
+          not modified.
+      (c) THE #971 / #968b CONTINUATION PATHS ARE UNTOUCHED. They already
+          park and queue unreset; this makes the ordinary members obey the
+          rule those paths were built on, so the two stop contradicting each
+          other.
+      (d) THE #962b EMPTINESS INVARIANT IS UNAFFECTED. `batch_is_full`
+          re-derives from seats, not from anything this function writes.
+      (e) THE FLIP ECONOMICS READ CHANGES DIRECTION, and it is named here
+          rather than fixed here (one junction per iteration). Both fields
+          `reset_for_retract` stamped for the phase policy --
+          `cached_prompt_tokens_at_retract` and `needs_prefill_pass` -- are
+          no longer set for a parked member, and the two consumers move
+          OPPOSITE ways, which is why each has to be read on its own:
+            * `_pending_prefill_tokens_for` (scheduler.py:488-501) returns
+              the FULL prompt for a request that is not `is_retracted`. A
+              parked member therefore reports its whole prompt as pending
+              where the retracted one reported `total - credit`. The backlog
+              is OVER-reported by roughly the executed prefix, i.e. the
+              policy becomes more eager to flip -- the opposite of the
+              conservative direction that function's own docstring claims
+              for itself. Note the pre-#984 number was not right either: it
+              credited `extend_range.end`, which included the chunk that
+              never ran. Both are wrong; this one errs the other way. The
+              honest figure for a park is `total - len(prefix_indices)`,
+              and supplying it means teaching that reader about a request
+              that kept its prefix without being retracted -- a separate
+              posten, deliberately not bundled into this one.
+            * `_layout_admits_prefill`'s backlog term (scheduler.py:3876-3895)
+              improves: `needs_prefill_pass` exists to say "the seam dropped
+              the tree this request was credited against, so it owes a whole
+              pass". A parked member did NOT lose its tree handles, so
+              falling through to the `cache_protected_len` term is the
+              correct existence answer for it, where the retract branch
+              would have over-stated the work.
+
+    A module-level function looked up through this module's globals at call
+    time, like `pp_void_keeps_request` and `pp_queue_orphaned_chunked_req`
+    beside it, so a can-fail proof can neuter this ONE step and show which
+    assertions depend on it. Never raises: it runs while cleaning up after a
+    divergence, and an instrument that can raise there turns one defect into
+    two.
+    """
+    if req is None:
+        return VOID_PARK_NOTHING
+    rid = getattr(req, "rid", None)
+    if getattr(req, "finished_reason", None) is not None:
+        # Nothing left to run. A park would leave its pages held by a request
+        # no admission loop will ever look at again, so this one shape keeps
+        # the retraction path -- see the constants above.
+        return VOID_PARK_FINISHED
+    if pp_chunked_req_is_reachable(scheduler, req):
+        return VOID_PARK_ALREADY_REACHABLE
+    prefix_indices = getattr(req, "prefix_indices", None)
+    # #796: `prefix_indices` is a TENSOR of KV-pool slot pointers -- `len()`
+    # reads the shape and does not synchronise; it must never reach a boolean
+    # context.
+    prefix_len = 0 if prefix_indices is None else len(prefix_indices)
+    extend_range = getattr(req, "extend_range", None)
+    end = getattr(extend_range, "end", None)
+    try:
+        prepared = end is not None and int(end) > int(prefix_len)
+    except Exception:  # noqa: BLE001 - cleanup must not raise
+        prepared = False
+    gave_back = False
+    if prepared:
+        gave_back = _park_chunked_prefill_chunk(scheduler, req, pass_allocated=True)
+    # The admission's tree lock ref, given back for the same reason the chunk
+    # above is -- see `pp_give_back_admission_lock_ref`. Unconditional, not
+    # gated on `prepared`: the ref is taken by `_req_inc_lock_ref` at
+    # admission whether or not a chunk was prepared on top of it.
+    lock_returned = pp_give_back_admission_lock_ref(scheduler, req)
+    queue = getattr(scheduler, "waiting_queue", None)
+    if queue is None:
+        return VOID_PARK_ALREADY_REACHABLE
+    try:
+        queue.append(req)
+    except Exception:  # noqa: BLE001 - a stand-in with an immutable queue
+        return VOID_PARK_ALREADY_REACHABLE
+    rank = getattr(getattr(scheduler, "ps", None), "pp_rank", None)
+    emit, seen = pp_968_log_gate(f"void-park:{rank}:{rid}")
+    if emit:
+        # `prefix` and `kept_pages` COINCIDE BY CONSTRUCTION for this shape
+        # and are printed anyway: the void's premise is that the extend never
+        # ran, so the executed extent IS the matched prefix, and the rows kept
+        # are exactly its rows. Both are printed so that a boot in which they
+        # DIVERGE is legible as a finding rather than hidden behind one
+        # number that happens to be right for two reasons.
+        logger.info(
+            "#984 VOID-PARK rank=%s rid=%s prefix=%d kept_pages=~%d "
+            "chunk_given_back=%s lock_ref_returned=%s from-slot=%s route=%s: "
+            "the pass never ran, so this member is queued UNRESET -- "
+            "prefix_indices, last_node and its KV pages all intact; only this "
+            "pass's admission-side increments are handed back (the "
+            "prepared-but-never-run chunk, and the tree lock ref whose "
+            "matching dec lives after a forward that did not happen). "
+            "Releasing it here was boot 6's 169 told=0 refusals, i.e. a full "
+            "re-prefill per voided rid per cycle (seen=%d)",
+            rank,
+            rid,
+            int(prefix_len),
+            int(prefix_len),
+            gave_back,
+            lock_returned,
+            mb_id,
+            route,
+            seen,
+        )
+    return VOID_PARK_QUEUED
+
+
+def pp_log_void_park_census(
+    scheduler, *, mb_id, route, considered, parked, reachable, released
+) -> None:
+    """#984: what the void's disposal loop did, INCLUDING when it did nothing.
+
+    THE ZERO CASE IS THE POINT (standing instrument order, and the #962a
+    blind probe is why). A loop that parks nothing and a loop that never ran
+    are different worlds, and a per-request line can only ever report the
+    first world by staying silent -- which is indistinguishable from the
+    second. This fires once per disposal loop whatever the outcome.
+
+    NOT COVERED BY THE #797d / #791b LINES BESIDE IT. The own-void line is
+    suppressible (`_pp_idle_void_suppress_log`, the #801-spin path), so on
+    exactly the passes that flag silences there would otherwise be no record
+    of the disposal at all. What #801-spin asks to be quiet about is the
+    RETRACTION NOTICE, not the ledger; this is the ledger, and it is rate
+    limited by the same gate as every other instrument on this path.
+
+    Never raises.
+    """
+    rank = getattr(getattr(scheduler, "ps", None), "pp_rank", None)
+    emit, seen = pp_968_log_gate(f"void-park-census:{rank}:{route}:{int(parked)}")
+    if not emit:
+        return
+    logger.info(
+        "#984 VOID-PARK census rank=%s slot=%s route=%s: considered=%d "
+        "parked=%d already-reachable=%d released-finished=%d (parked=0 with "
+        "considered>0 means every member was kept or already reachable, NOT "
+        "that the loop was silent; seen=%d)",
+        rank,
+        mb_id,
+        route,
+        int(considered),
+        int(parked),
+        int(reachable),
+        int(released),
+        seen,
     )
 
 
@@ -7523,23 +7880,62 @@ class SchedulerPPMixin:
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
         reqs = list(getattr(batch, "reqs", None) or ())
         released = 0
-        released_rids, kept_rids = [], []
+        released_rids, kept_rids, parked_rids, reachable_rids = [], [], [], []
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
                 kept_rids.append(getattr(req, "rid", None))
                 continue
-            # #969: THE RETRACTION PATH, NOT THE PROBE PATH. These are
-            # admitted requests -- they were matched against the prefix tree
-            # at admission and hold a lock ref on `req.last_node`. The probe
-            # helper that used to stand here frees rows without ever reaching
-            # `cache_finished_req`, so it left that ref behind on pages it had
-            # already returned to the allocator, and `reset_for_retract`
-            # cleared the only handle to it one line later. `release_req`
-            # resets the request as its last act, so this site does not.
-            _release_voided_request(self, req, len(reqs) - released)
-            self.waiting_queue.append(req)
-            released_rids.append(getattr(req, "rid", None))
-            released += 1
+            # #984: A VOID IS A PARK FOR RANK 0's MEMBERS TOO. This loop used
+            # to hand every non-kept member to `_release_voided_request` ->
+            # `release_req` -> `reset_for_retract`, which clears
+            # `prefix_indices` (schedule_batch.py:1849). The follower ranks
+            # park the very same requests, so the two ends of the ring left a
+            # void disagreeing about what had executed -- boot 6's 169 told=0
+            # refusals (a full re-prefill per voided rid per cycle) and 333
+            # past-fill refusals. The pass never ran; the pages are correct;
+            # nothing is retracted here any more. See
+            # `pp_park_voided_batch_member` for the ledger and the #969
+            # argument.
+            #
+            # #969 IS NOT REOPENED, and the boundary is pages versus CLAIM,
+            # not keep-everything. The prefix pages are NOT returned and
+            # `last_node` is NOT cleared -- that is what makes the next offer
+            # report the executed prefix instead of zero. What IS returned is
+            # this pass's admission-side tree lock ref, because re-admission
+            # takes a fresh one (`_req_inc_lock_ref`, schedule_policy.py:1893/
+            # :1948) after `init_next_round_input` re-matches; holding on to
+            # the old one would leak exactly one ref per voided member per
+            # cycle. See `pp_give_back_admission_lock_ref`.
+            #
+            # THE REAL RETRACTION PATHS ARE UNTOUCHED. `retract_decode` and
+            # `retract_all` still release and reset, correctly -- their passes
+            # RAN. `_release_voided_request` keeps exactly one caller here: a
+            # member that is already FINISHED, which no admission loop would
+            # ever pick up again, so parking it would strand its pages.
+            verdict = pp_park_voided_batch_member(
+                self, req, mb_id=mb_id, route="own-void"
+            )
+            if verdict == VOID_PARK_FINISHED:
+                _release_voided_request(self, req, len(reqs) - released)
+                self.waiting_queue.append(req)
+                released_rids.append(getattr(req, "rid", None))
+                released += 1
+            elif verdict == VOID_PARK_QUEUED:
+                parked_rids.append(getattr(req, "rid", None))
+            else:
+                # Already in `waiting_queue` or `running_batch`. Appending
+                # again is boot 6's duplicate-rid decision; the dedup lives in
+                # the helper so both sites inherit it.
+                reachable_rids.append(getattr(req, "rid", None))
+        pp_log_void_park_census(
+            self,
+            mb_id=mb_id,
+            route="own-void",
+            considered=len(reqs),
+            parked=len(parked_rids),
+            reachable=len(reachable_rids),
+            released=released,
+        )
 
         # #801-spin: CONSUMED, never merely read -- read and cleared at the top
         # of this method (see there for why the position is load-bearing), so
@@ -7551,15 +7947,22 @@ class SchedulerPPMixin:
                 "#797d PP-ADMISSION own pass voided on slot %d: get_next_batch_to_run "
                 "still returned a batch for a pass this rank had already voided, so "
                 "it is being cleared here instead of launched. %d of %d request(s) "
-                "released and re-queued (the rest are resident in the running batch, "
-                "or are the chunked request, and keep their pages -- #797/#797b; "
-                "chunk parked=%s). released=%s kept=%s displaced=%s.",
+                "PARKED and re-queued with prefix and pages intact (#984 -- the pass "
+                "never ran, so nothing is retracted; %d released because already "
+                "finished, %d skipped as already reachable; the rest are resident in "
+                "the running batch, or are the chunked request, and keep their pages "
+                "-- #797/#797b; chunk parked=%s). parked=%s released=%s kept=%s "
+                "dup-skipped=%s displaced=%s.",
                 mb_id,
-                released,
+                len(parked_rids),
                 len(reqs),
+                released,
+                len(reachable_rids),
                 parked,
+                pp_rid_digest(parked_rids),
                 pp_rid_digest(released_rids),
                 pp_rid_digest(kept_rids),
+                pp_rid_digest(reachable_rids),
                 displaced,
             )
         return True
@@ -8876,21 +9279,58 @@ class SchedulerPPMixin:
         running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
         released = 0
-        released_rids, kept_rids = [], []
+        released_rids, kept_rids, parked_rids, reachable_rids = [], [], [], []
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
                 kept_rids.append(getattr(req, "rid", None))
                 continue
-            # #969: THE RETRACTION PATH, NOT THE PROBE PATH -- same reason as
-            # the twin site in `_pp_void_own_batch`. The probe helper never
-            # reaches `dec_lock_ref`, so every request voided here used to
-            # leave a permanent lock on its prefix and the tree reported
-            # nothing evictable. `release_req` resets the request as its last
-            # act, so this site does not.
-            _release_voided_request(self, req, len(reqs) - released)
-            self.waiting_queue.append(req)
-            released_rids.append(getattr(req, "rid", None))
-            released += 1
+            # #984: THE TWIN OF `_pp_void_own_batch`'s park, and the sibling
+            # sweep is part of the fix rather than a follow-up -- an asymmetry
+            # closed at one of its two exits is an asymmetry that returns
+            # through the other (the #968b lesson, one junction up this same
+            # file). This site is if anything the more load-bearing of the
+            # two: it fires because a rank DOWNSTREAM retracted, which is
+            # precisely the case in which the followers park their
+            # continuations while rank 0 was retracting its members.
+            #
+            # Same three facts as the twin: (1) the pass never ran, so
+            # `release_req` -> `reset_for_retract` was disposing of state that
+            # was still correct; (2) #969 is not reopened, because the prefix
+            # PAGES and `last_node` are kept while this pass's admission-side
+            # lock ref is handed back -- re-admission takes a fresh one, so
+            # keeping the old would leak one per voided member per cycle
+            # (`pp_give_back_admission_lock_ref`); (3) `retract_decode` /
+            # `retract_all` are untouched and
+            # still release, correctly. `_release_voided_request` keeps its one
+            # remaining caller here: an already-FINISHED member, whose pages no
+            # future admission would ever return.
+            verdict = pp_park_voided_batch_member(
+                self, req, mb_id=mb_id, route="void-output"
+            )
+            if verdict == VOID_PARK_FINISHED:
+                _release_voided_request(self, req, len(reqs) - released)
+                self.waiting_queue.append(req)
+                released_rids.append(getattr(req, "rid", None))
+                released += 1
+            elif verdict == VOID_PARK_QUEUED:
+                parked_rids.append(getattr(req, "rid", None))
+            else:
+                # Already reachable in `waiting_queue` / `running_batch`. This
+                # site is the one that "fires ONCE PER SLOT, several times in a
+                # row" (its own guard comment above), so the same request can
+                # legitimately arrive here from two slots' batches -- which is
+                # exactly boot 6's 6 duplicate-rid decisions when the append
+                # was unconditional.
+                reachable_rids.append(getattr(req, "rid", None))
+        pp_log_void_park_census(
+            self,
+            mb_id=mb_id,
+            route="void-output",
+            considered=len(reqs),
+            parked=len(parked_rids),
+            reachable=len(reachable_rids),
+            released=released,
+        )
 
         # #968b: RIDS, NOT ONLY COUNTS. All 514 of boot 4's void lines were
         # rid-free, so no void could be joined to the refusal that followed
@@ -8901,19 +9341,26 @@ class SchedulerPPMixin:
         logger.warning(
             "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
             "this microbatch downstream, so the last rank produced nothing for "
-            "it, and %d of rank 0's %d request(s) have been released and "
-            "re-queued (the rest are resident in the running batch, or are the "
-            "chunked request, and keep their pages -- #797/#797b; chunk "
-            "parked=%s). released=%s kept=%s displaced=%s. The message itself "
+            "it, and %d of rank 0's %d request(s) have been PARKED and "
+            "re-queued with prefix and pages intact (#984 -- the pass never "
+            "ran, so nothing is retracted; %d released because already "
+            "finished, %d skipped as already reachable; the rest are resident "
+            "in the running batch, or are the chunked request, and keep their "
+            "pages -- #797/#797b; chunk parked=%s). parked=%s released=%s "
+            "kept=%s dup-skipped=%s displaced=%s. The message itself "
             "is what keeps the output ring matched -- without it rank 0 blocks "
             "for ever in a receive no rank is required to satisfy (boot "
             "instr11, 2026-08-21).",
             mb_id,
-            released,
+            len(parked_rids),
             len(reqs),
+            released,
+            len(reachable_rids),
             parked,
+            pp_rid_digest(parked_rids),
             pp_rid_digest(released_rids),
             pp_rid_digest(kept_rids),
+            pp_rid_digest(reachable_rids),
             displaced,
         )
         return True
