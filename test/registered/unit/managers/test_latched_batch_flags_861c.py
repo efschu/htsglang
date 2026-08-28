@@ -138,3 +138,69 @@ def test_can_fail_the_reset_is_not_a_tautology():
     assert b.batch_is_full is True
     reset_stale_batch_flags(sched_with(running_batch=b))
     assert b.batch_is_full is False
+
+
+# --------------------------------------------------------------------------
+# #962a: the probe must distinguish "ran and found nothing" from "never ran".
+#
+# `cutover_participants.py` registers a REACHABILITY PROBE for this hook and
+# obliges it to prove the hook RAN -- the #719 lesson, "clean" and "blind" may
+# not be byte-identical. The registered observable was the
+# `#861c cleared latched batch flag(s)` log line, emitted only when something
+# was cleared, so an all-clear seam produced no line at all. Settling
+# window-958-boot's `batch_is_full=1 at running=0` decline required exactly
+# that distinction and could only borrow it from two unrelated unconditional
+# lines in the same function -- luck, not a probe.
+# --------------------------------------------------------------------------
+
+
+def test_the_reach_is_reported_so_a_ZERO_can_be_read():
+    """Reach N with nothing cleared is an all-clear; reach 0 proves nothing."""
+    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+        reachable_batch_count,
+    )
+
+    blind = sched_with()
+    assert reachable_batch_count(blind) == 0
+    assert reset_stale_batch_flags(blind) == {"batch_is_full": 0}
+
+    seen = sched_with(running_batch=FakeBatch(batch_is_full=False))
+    assert reachable_batch_count(seen) == 1
+    assert reset_stale_batch_flags(seen) == {"batch_is_full": 0}
+
+
+def test_the_two_numbers_describe_the_SAME_set():
+    """One walk, two readings -- not two opinions about the reach.
+
+    Three batches reachable, one latched: the counter must say 3 and the hook
+    must say 1. A counter that walked a different set would make the receipt
+    unreadable in the direction that matters (a clear that came from a batch
+    the probe never counted).
+    """
+    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+        reachable_batch_count,
+    )
+
+    latched = FakeBatch(batch_is_full=True)
+    sched = sched_with(
+        running_batch=latched,
+        last_batch=FakeBatch(batch_is_full=False),
+        cur_batch=FakeBatch(batch_is_full=False),
+    )
+    assert reachable_batch_count(sched) == 3
+    assert reset_stale_batch_flags(sched) == {"batch_is_full": 1}
+
+
+def test_can_fail_a_blind_seam_is_not_reported_as_an_all_clear():
+    """The failure mode the probe exists for, asserted rather than described."""
+    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+        reachable_batch_count,
+    )
+
+    blind = sched_with()
+    all_clear = sched_with(running_batch=FakeBatch(batch_is_full=False))
+    assert reset_stale_batch_flags(blind) == reset_stale_batch_flags(all_clear)
+    assert reachable_batch_count(blind) != reachable_batch_count(all_clear), (
+        "the cleared counts are identical in both states -- if the reach does "
+        "not separate them, the receipt is blind"
+    )

@@ -578,11 +578,36 @@ def _park_chunked_prefill_chunk(scheduler, req) -> bool:
     prefix_indices = getattr(req, "prefix_indices", None)
     start = 0 if prefix_indices is None else len(prefix_indices)
     pool = getattr(scheduler, "req_to_token_pool", None)
+    # #961 ONE PREDICATE FOR BOTH GIVE-BACKS, because they answer the same
+    # question and had drifted into two expressions of it. `end > start` is
+    # "this round actually prepared a chunk": the KV release below already
+    # tests it, and the `inflight_middle_chunks` give-back below did NOT --
+    # it ran whenever the function got past the `end is None` gate.
+    #
+    # THAT GAP IS ALREADY REACHABLE, and not only through #961's change. A
+    # chunk parked by `add_chunked_req`'s #679 branch carries
+    # `Range(prefix, prefix)` (schedule_policy.py:1434-1436), so `end` is not
+    # None, nothing was prepared, and the increment this line hands back was
+    # never taken -- `process_batch_result_prefill` owns the matching
+    # decrement and no pass ran. Handing back an increment that was not made
+    # is the same accounting defect as leaking one, in the other direction:
+    # this function's own third bullet says a leaked increment is "a request
+    # that can never report finished"; a spurious give-back is a request that
+    # reports finished while a chunk is still owed.
+    #
+    # #961 makes the same shape arrive from a second producer -- a truncated
+    # request now carries `Range(told, told)` rather than `None` -- so the
+    # predicate is made exact here rather than relying on the None gate above
+    # to keep catching it by accident.
+    try:
+        prepared = int(end) > int(start)
+    except Exception:  # noqa: BLE001 - cleanup must not raise
+        prepared = False
     try:
         if (
             pool is not None
             and getattr(req, "req_pool_idx", None) is not None
-            and int(end) > int(start)
+            and prepared
         ):
             kv_indices = pool.req_to_token[req.req_pool_idx, int(start) : int(end)]
             scheduler.token_to_kv_pool_allocator.free(kv_indices)
@@ -593,7 +618,7 @@ def _park_chunked_prefill_chunk(scheduler, req) -> bool:
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("#797b parked-chunk extend_range reset failed: %s", exc)
     try:
-        if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+        if prepared and int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
             req.inflight_middle_chunks -= 1
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("#797b parked-chunk inflight accounting failed: %s", exc)

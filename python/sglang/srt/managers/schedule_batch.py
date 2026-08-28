@@ -1661,26 +1661,66 @@ class Req(ReqDllmMixin):
         never delivered it: PP1 retracted every pass, and PP2 voided 512
         CONSECUTIVE passes into the ``#801-spin`` refusal.
 
-        NONE, NOT A RECOMPUTED RANGE, and the choice is the whole safety
-        argument. Moving ``start`` down to ``told`` and keeping ``end`` would
-        INVENT a pass: the discarded tokens would have to be computed in this
-        chunk, inflating it past the chunk budget the adder already decided --
-        instr21 in the other direction (a report naming rows no rank will run).
-        ``None`` invents nothing. It is also not a new state: ``reset_for_
-        retract`` already sets ``extend_range = None`` (below), every reader on
-        this path is already None-safe, and ``build_pp_admission_decision``
-        already has a loud, rid-naming refusal for it
-        (``PPScheduleRefused``, ``require_executed_geometry=True``).
+        A ZERO-LENGTH RANGE AT THE NEW PREFIX, NOT THE OLD ``end`` AND NOT
+        ``None``. #958 refused ``Range(told, old_end)`` and that refusal
+        stands: keeping ``end`` would INVENT a pass -- the discarded tokens
+        would have to be computed in this chunk, inflating it past the budget
+        the adder already decided, instr21 in the other direction (a report
+        naming rows no rank will run). ``Range(told, told)`` invents nothing
+        either: it says ZERO ROWS at the prefix that now exists, which is
+        exactly what a request whose premise was just dropped will run this
+        pass. It is not a new state -- ``_park_chunked_prefill_chunk`` writes
+        ``Range(start, start)`` for the same purpose
+        (scheduler_pp_mixin.py:592), ``add_chunked_req``'s #679 park writes it
+        (schedule_policy.py:1434-1436), and ``_executed_extent`` declares the
+        shape first-class ("A ZERO-LENGTH RANGE IS REPORTED, NOT SUPPRESSED").
 
-        SO THE REQUEST GETS EXACTLY THE THREE HONEST EXITS. The truncation
-        happens at the one legal point -- before ``add_chunked_req`` commits
-        the next chunk (``scheduler.py``'s "#946 ACT HERE, AND ONLY HERE") --
-        so normally the adder re-derives the geometry from the shortened
-        prefix, the offer moves to 0, and the request continues. If the adder
-        did NOT re-derive it, that is the defect state itself, and the refusal
-        names the rid on the first pass instead of offering a stale length
-        forever. What is no longer reachable is the fourth exit: silent,
-        unbounded re-offer of a geometry the request no longer has.
+        #961 AND WHY ``None`` COULD NOT STAY. The sentence that used to stand
+        here -- "``reset_for_retract`` already sets ``extend_range = None``
+        (below), every reader on this path is already None-safe" -- was FALSE,
+        and it was refuted on metal 25 s into window-958-boot's first boot:
+
+            scheduler.py:7010, in get_next_batch_to_run
+              if self.chunked_req.extend_range.end > len(...prefix_indices):
+            AttributeError: 'NoneType' object has no attribute 'end'
+
+        The equivocation was on "this path". ``reset_for_retract``'s None is
+        safe because the two disposal sites that see it CLEAR the resident
+        pointer (scheduler_pp_mixin.py:6061-6075 and :7222-7236); those sites
+        are upstream of this producer and are not on its path. Three readers
+        take the geometry off the RESIDENT cross-round pointer behind a guard
+        that tests the REQUEST and not the geometry -- scheduler.py:7010,
+        scheduler.py:9424-9428 and ``_compute_chunked_req_next_prompt_token``
+        (below) -- and none of them was None-safe.
+
+        AND THE ADDER IS NOT THE RE-DERIVER IT WAS TAKEN FOR. The old argument
+        was that the truncation runs at "#946 ACT HERE, AND ONLY HERE", just
+        before ``add_chunked_req`` re-derives. #948 then MOVED the act to
+        ``pp_apply_dead_premise_anywhere`` (called from
+        scheduler_pp_mixin.py:2159), for a measured reason: the old site was
+        entered ~6 times while 9471 passes voided. Two statements later, :2161
+        calls ``get_next_batch_to_run``. The legality argument was a property
+        of the old neighbourhood and did not travel with the call, and three
+        further producers reach a reader without an adder in between -- the
+        #906 seam refusal (scheduler.py:8916), ``add_chunked_req``'s
+        hybrid-SWA zero-budget return (schedule_policy.py:1396), and the #791
+        clamp sites when the admission loop breaks on ``NO_TOKEN``. Re-deriving
+        HERE closes all four at the writer instead of one branch per boot.
+
+        SO THE REQUEST STILL GETS EXACTLY THE THREE HONEST EXITS, and the
+        offer still moves: ``_executed_extent`` now reads ``(told, 0)`` instead
+        of refusing to read at all, so PP0 offers ``told`` -- 0 after the
+        terminator -- which is the value ``reconcile_pp_admission_decision``
+        admits UNCONDITIONALLY. The fourth exit stays gone: there is no silent,
+        unbounded re-offer of a geometry the request no longer has, because the
+        geometry is re-derived rather than left behind. What is also gone is
+        the reliance on ``PPScheduleRefused`` /
+        ``require_executed_geometry=True`` as the net for this case. That net
+        fired 0 times on metal while the unguarded dereference killed the
+        process, because it iterates ``can_run_list`` and a resident
+        continuation the adder did not add is not in it. It is not made
+        reachable here; it is made unnecessary, because the state it was meant
+        to name can no longer be produced.
 
         ONLY WHEN THE PREFIX ACTUALLY MOVES. A no-op truncation
         (``told >= len(prefix_indices)``) leaves a valid geometry valid --
@@ -1689,11 +1729,12 @@ class Req(ReqDllmMixin):
         told = int(told)
         if told < len(self.prefix_indices):
             self.prefix_indices = self.prefix_indices[:told]
-            # #958: the geometry was DERIVED from the prefix that just moved,
-            # so it is now a stale reading rather than a report. Invalidate it
-            # and let the adder derive the honest one.
+            # #958/#961: the geometry was DERIVED from the prefix that just
+            # moved, so it is now a stale reading rather than a report. It is
+            # RE-DERIVED here, to the only honest value available at this
+            # point, rather than nulled and left for a caller to fix up.
             if getattr(self, "extend_range", None) is not None:
-                self.extend_range = None
+                self.extend_range = Range(told, told)
         if self.cache_protected_len > told:
             self.cache_protected_len = told
 

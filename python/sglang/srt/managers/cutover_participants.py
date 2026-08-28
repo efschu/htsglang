@@ -180,7 +180,12 @@ REGISTRY: Tuple[Participant, ...] = (
         "batch_is_full (the last latched True at running=0 and refused "
         "admission for ever)",
         hook="sglang.srt.managers.phase_flip_draft_bootstrap.reset_stale_batch_flags",
-        probe=LOG + "#861c cleared latched batch flag(s)",
+        # #962a: was "#861c cleared latched batch flag(s)", emitted only when
+        # something WAS cleared -- so the probe went silent on exactly the
+        # outcome it is most often asked about, and could not prove the hook
+        # ran. The line is now unconditional and carries `reached=`, so an
+        # all-clear seam and a blind one are distinguishable.
+        probe=LOG + "#861c latched batch flags inspected across the seam",
         ticket="W37-C/#861c",
         found_by="boot",
     ),

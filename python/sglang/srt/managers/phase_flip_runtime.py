@@ -3303,6 +3303,7 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         from sglang.srt.managers.phase_flip_draft_bootstrap import (
             arm_draft_bootstrap_all_reachable,
             clear_spec_info_for_unspeculated_phase,
+            reachable_batch_count,
             reset_stale_batch_flags,
             retune_carried_batches_for_phase,
         )
@@ -3312,17 +3313,30 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # would stop protecting after the first phase.
         scheduler._decode_steps_this_phase = 0
 
+        # #962a THE RECEIPT IS UNCONDITIONAL, and the reach is part of it.
+        # This line is the REACHABILITY PROBE `cutover_participants.py`
+        # registers for `latched_batch_flags`, and until now it was emitted
+        # only when something was cleared -- so "the hook ran and found
+        # nothing" and "the hook never ran" were byte-identical, which is the
+        # #719 shape the registry's own docstring forbids. Settling the
+        # window-958 `batch_is_full=1 at running=0` question needed exactly
+        # this distinction and had to borrow it from unrelated lines.
+        # `reached` is reported because W37-C proved a bare zero is not
+        # enough: reach 0 is the blind case, reach N with nothing cleared is a
+        # genuine all-clear, and they must not read the same.
+        _reached = reachable_batch_count(scheduler)
         _stale = reset_stale_batch_flags(scheduler)
-        if any(_stale.values()):
-            logger.info(
-                "%s #861c cleared latched batch flag(s) across the seam: %s. "
-                "Every clear site for these is a FINISH path and #856 RETRACTS "
-                "instead of finishing, so a flag set before the cutover would "
-                "otherwise refuse admission for ever (W37-C: batch_is_full=1 "
-                "with running=0 and avail=468981).",
-                LOG_PREFIX,
-                _stale,
-            )
+        logger.info(
+            "%s #861c latched batch flags inspected across the seam: "
+            "reached=%d cleared=%s. Every clear site for these is a FINISH "
+            "path and #856 RETRACTS instead of finishing, so a flag set "
+            "before the cutover would otherwise refuse admission for ever "
+            "(W37-C: batch_is_full=1 with running=0 and avail=468981). "
+            "reached=0 means this probe saw nothing and proves nothing.",
+            LOG_PREFIX,
+            _reached,
+            _stale,
+        )
 
         retuned = retune_carried_batches_for_phase(scheduler, want_spec_algo)
         if retuned:

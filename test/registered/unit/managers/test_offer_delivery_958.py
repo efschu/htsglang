@@ -302,21 +302,49 @@ class TheTerminatorMustMoveTheOfferItWasSpentOn(unittest.TestCase):
 
     # ---- EXIT 3: the named fail, when the geometry was NOT re-derived ----
 
-    def test_EXIT_3_a_stale_geometry_can_no_longer_be_REPORTED(self):
-        """The pathological ordering gets a loud, rid-naming refusal.
+    def test_EXIT_3_IS_NO_LONGER_HOW_THE_TRUNCATION_ENDS(self):
+        """#961 CORRECTED THIS ASSERTION, and the correction is the finding.
 
-        If the adder did not re-derive the geometry, the request is in the
-        defect state itself. Before #958 that state produced a stale `told=8192`
-        indistinguishable from a fresh measurement, forever. Now the existing
-        `require_executed_geometry` refusal names the rid on the FIRST pass.
+        This test used to require a `PPScheduleRefused` here: after the
+        terminator, before any adder, the geometry was `None` and the producer
+        refused. That was written as exit 3 -- "one loud line beats 336 silent
+        ones". On metal it was refuted twice over. The refusal fired **0**
+        times in window-958-boot while the *reader* two statements downstream
+        of the terminator took the process down with
+        `AttributeError: 'NoneType' object has no attribute 'end'`
+        (scheduler.py:7010); `build_pp_admission_decision` iterates
+        `can_run_list`, and a resident continuation the adder did not add is
+        never in it, so the net sat downstream of the crash it was designed to
+        pre-empt. The docstring predicting "the refusal names the rid on the
+        first pass" is corrected at `Req.truncate_prefix_to`.
 
-        This is exit 3, not a regression: one loud line beats 336 silent ones,
-        and the refusal is the mechanism `reset_for_retract` already relies on.
+        #961 therefore re-derives at the writer: the truncation leaves
+        `Range(told, told)`, so this state is not refused -- it does not exist.
+        The offer moves to 0 with NO adder involved, which is a stronger form
+        of exit 1 than this suite could previously assert.
+        """
+        guard, holder, req = self._stuck()
+        self.assertEqual(_run_terminator(holder, req), "recompute")
+        self.assertEqual(
+            _offer(guard, req),
+            0,
+            "after #961 the terminator delivers the moved offer by itself; a "
+            "refusal here would mean the writer stopped re-deriving",
+        )
+
+    def test_EXIT_3_IS_STILL_REACHABLE_FROM_THE_OTHER_PRODUCER(self):
+        """The loud refusal is not lost -- #961 narrowed it, it did not remove it.
+
+        `reset_for_retract` still sets `extend_range = None`
+        (schedule_batch.py) and #961 deliberately left that sentinel alone: two
+        disposal sites key off it (scheduler_pp_mixin.py:6061-6075, :7222-7236)
+        and flipping it would have silenced them. A request that reaches the
+        producer in THAT shape must still be refused by name.
         """
         from sglang.srt.managers.pp_admission_congruence import PPScheduleRefused
 
-        guard, holder, req = self._stuck()
-        self.assertEqual(_run_terminator(holder, req), "recompute")
+        guard, _holder_, req = self._stuck()
+        req.extend_range = None  # the reset_for_retract shape, not the truncation
         with self.assertRaises(PPScheduleRefused) as caught:
             _offer(guard, req)
         self.assertIn(RID, str(caught.exception), "the refusal must NAME the request")

@@ -713,6 +713,38 @@ def reset_stale_batch_flags(scheduler) -> dict:
     return cleared
 
 
+def reachable_batch_count(scheduler) -> int:
+    """How many batches ``reset_stale_batch_flags`` just walked. #962a.
+
+    THE RETURN VALUE ABOVE CANNOT CARRY THIS and must not be changed to: it is
+    a ``{field: count}`` mapping that `test_latched_batch_flags_861c.py`
+    asserts by equality, and folding a reach into it would make one value
+    answer two questions -- the defect this repo keeps re-finding.
+
+    WHY THE NUMBER IS NEEDED AT ALL. `cutover_participants.py` obliges every
+    participant to name a REACHABILITY PROBE, "a named observable proving the
+    hook actually RAN", and generalises #719: "clean" and "blind" may not be
+    byte-identical. The probe registered for `latched_batch_flags` is the
+    `#861c cleared latched batch flag(s)` log line, and that line was emitted
+    only `if any(_stale.values())` -- so a hook that ran and found nothing
+    looked exactly like a hook that never ran. Measured cost: settling whether
+    a `batch_is_full=1` decline at `running=0` came from a latch that survived
+    the seam (window-958-boot) needed the count to be zero AND the hook to be
+    proven to have run, and the second half was only available by accident,
+    from two unrelated unconditional lines in the same function.
+
+    W37-C ALREADY SHOWED A BARE ZERO IS NOT ENOUGH -- it logged `checked=0`
+    eighteen times and the mechanism was still blind. So the receipt reports
+    what was INSPECTED, not merely what was changed: reach 0 with 0 cleared is
+    the blind case and reads differently from reach N with 0 cleared, which is
+    a genuine all-clear.
+
+    Non-mutating, and it walks the same `_reachable_batches` the hook does, so
+    the two numbers describe the same set by construction.
+    """
+    return len(_reachable_batches(scheduler))
+
+
 def arm_draft_bootstrap_all_reachable(scheduler, draft_worker) -> list:
     """PP->TP leg: seed EVERY reachable non-empty batch, not just one.
 

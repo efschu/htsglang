@@ -1394,6 +1394,31 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
+                    # #961 LEFT DELIBERATELY UNCHANGED, and the reason is
+                    # recorded because the opposite edit was written and
+                    # withdrawn. This branch returns the request WITHOUT
+                    # `set_extend_range`, while the #679 park below writes
+                    # `Range(prefix, prefix)` -- so the two park branches
+                    # describe the same state differently, and the #679
+                    # comment even cites this one as its precedent while
+                    # defining the park by its GEOMETRY.
+                    #
+                    # It is not a #961 producer any more: the only way this
+                    # return could hand on an unreadable geometry was a
+                    # truncation having nulled it first, and
+                    # `Req.truncate_prefix_to` now re-derives instead of
+                    # nulling. Closing it here as well would be consistency,
+                    # not a fix -- and it is not free. `test_prefill_adder.py::
+                    # test_add_chunked_req_hybrid_swa_defers_when_swa_below_page`
+                    # pins "returned unchanged" by asserting
+                    # `set_extend_range.assert_not_called()`, and overwriting
+                    # the geometry here would also overwrite the PREVIOUS
+                    # chunk's range on any path that reaches this branch before
+                    # that chunk is stashed. In production the stash at
+                    # scheduler.py:7010 runs earlier in the same pass, so the
+                    # write would be value-neutral -- but that is an argument,
+                    # not a measurement, and hybrid-SWA is not a configuration
+                    # this fork boots. Named as open rather than changed blind.
                     return req
                 # #679: DO NOT SCHEDULE A CHUNK THE POOL CANNOT FUND.
                 #
