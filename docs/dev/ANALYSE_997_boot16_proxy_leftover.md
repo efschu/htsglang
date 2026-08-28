@@ -319,3 +319,54 @@ den Reset". In diesem Specimen gab es keinen Reset — der Flip wurde abgebroche
 (§1). Die These ist enger: *der Aktuator, der die Raenge waehrend eines armed
 window slot-uniform halten soll, ist rang-lokal konditioniert und hebt damit
 seine eigene, im Docstring ausgeschriebene Korrektheits-Voraussetzung auf.*
+
+### 8.1 Zwei NEGATIVKONTROLLEN, selbst am Log nachgeprueft
+
+Die Arithmetik-Achse hat ihre Kausalbehauptung zurueckgezogen und dabei zwei
+Belege beigebracht. Ich habe beide selbst gegen das Log gefahren — dieselbe
+Regel, die ich auf ihre Berichte angewandt habe, gilt fuer ihre Retraktion:
+
+**NK-1: Der `chunked_req`-Assert feuert in Boot 16 NULL Mal.**
+`grep -c "AssertionError"` ueber das gesamte Log: **0**. Waere ein Fehl-Mint der
+Killer gewesen, waere `assert self.chunked_req is None` der erwartete Tod — das
+ist Boot 14s Tod, nicht Boot 16s. Zwei verschiedene Tode, nicht eine Erzaehlung.
+
+**NK-2: Der Mint-Versuch wurde ABGEFANGEN, und zwar VOR dem armed window.**
+```
+:2034  [22:20:45 PP1] [#967] SECOND CONTINUATION REFUSED rid=5689567b… site=_add_scheduled_req … occurrence=1
+:2045  [22:20:46 PP2] [#967] SECOND CONTINUATION REFUSED rid=5689567b… site=_add_scheduled_req … occurrence=1
+```
+Genau zwei Vorkommen, beide um **22:20:45/46** — das armed window beginnt erst
+22:20:47 (`:2061`/`:2075`/`:2088`). Der #995b/#959-Waechter hat gegriffen
+("Nothing of it has run, so no progress is lost"), es entstand **nie eine zweite
+Continuation**. Ein bewachter und behandelter Pfad, der vor dem Fenster endet,
+kann einen Tod nach dem Fenster nicht verursacht haben.
+
+Damit ist die Ordnung nicht nur ein Reihenfolge-Argument, sondern durch zwei
+unabhaengige Negativbefunde gestuetzt: der behauptete Erzeuger **existierte
+nicht** (NK-2) und sein charakteristischer Tod **trat nicht ein** (NK-1).
+
+Der Fill-Skew 8446/8447 bleibt als Phaenomen boot-bewiesen, Site #0 bleibt als
+Defekt desk-bewiesen — beides unberuehrt. Nur die Todesursache war er nicht.
+
+### 8.2 Zwei Vorhersagen, unabhaengig, vom naechsten Boot getrennt beantwortbar
+
+| Achse | Vorhersage unter Cut C (`26ccc1065f`) | Was ein Treffer bedeutet |
+|---|---|---|
+| Diese (#997) | Der `#631`-Leftover **BLEIBT** | Die Ring-Divergenz ist die Wurzel; `passes [0,1,1]` haengt an der Chunk-ASYMMETRIE (`:5330-5331`), nicht an der Chunk-Laenge |
+| Arithmetik (Site #0) | Die zwei `SECOND CONTINUATION REFUSED site=_add_scheduled_req` gehen auf **NULL** | Das getragene Verdikt sagt `last_chunk=True`, es entsteht kein zweiter Mint-Versuch mehr |
+
+Die beiden Groessen sind disjunkt (Slot-Index vs. Mint-Zaehler); ein Boot
+beantwortet beide getrennt. Treffen beide zu, sind zwei Defekte sauber getrennt
+statt einer doppelt erzaehlt.
+
+### 8.3 Beide Fundstellen sind DIESELBE Klasse
+
+Der Punkt stammt von der Arithmetik-Achse und ist richtig: Site #0
+(`schedule_policy.py:1433`, `last_chunk` aus rang-lokalem `local_fill_len`) und
+D1 (`scheduler_pp_mixin.py:5330-5331`, Hold-Ausnahme auf rang-lokalem
+`chunked_req`) sind **eine Klasse an zwei Naehten** — *ein rang-lokales
+Praedikat entscheidet ueber eine Groesse, die gruppen-uniform sein muss.*
+Das ist dieselbe Klasse, die `ANALYSE_996` als Familie B fuehrt, und zwei
+unabhaengig gefundene Fundstellen sind ein besseres Argument fuer die Klasse als
+jede einzelne.
