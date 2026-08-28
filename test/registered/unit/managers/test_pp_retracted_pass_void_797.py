@@ -929,26 +929,60 @@ class PPVoidChunkedRequest797b(unittest.TestCase):
         """RED, and the can-fail proof for every green below.
 
         ONE RETURN VALUE IS NEUTERED, through `scheduler_pp_mixin`'s own
-        module globals: `pp_void_keeps_request` returning False is exactly the
-        disposal that shipped before it existed -- "every batch member is the
-        round's to hand back". Everything else still runs its own body: the
+        module globals. Everything else still runs its own body: the
         pre-admission value is still recorded, `self.chunked_req` is still put
         back, `_park_chunked_prefill_chunk` still parks the chunk. The loop
         then retracts the chunked request anyway, `reset_for_retract` sets
         `extend_range = None`, and the SHIPPED `get_next_batch_to_run` raises
         instr19's own AttributeError on instr19's own line. A wholesale revert
         would yield an AttributeError from the harness and prove nothing.
+
+        THE MUTANT MOVED AT #984, BECAUSE THE OLD ONE STOPPED BEING ONE.
+        It used to blind `pp_void_keeps_request` to False -- the disposal that
+        shipped before that guard existed, "every batch member is the round's
+        to hand back" -- and that produced a RETRACTION, hence the reset shape,
+        hence the raise. #984 made the void symmetric: the disposal loop now
+        asks `pp_park_voided_batch_member`, and only the `VOID_PARK_FINISHED`
+        verdict still reaches `_release_voided_request`. A member that is
+        merely un-kept is now PARKED, not reset, so blinding the old guard
+        injects no fault at all -- measured at 8be86f55fe, this arm failed on
+        `assertTrue(chunked.retracted)` because nothing retracted anything.
+        A can-fail arm whose mutant has become inert is not a passing guard
+        and not an honest red; it is a guard that has quietly stopped testing.
+        SECOND INSTANCE IN ONE COMMIT: `test_the_underflow_detector_can_
+        actually_fail` in test_pp_void_lock_ref_969.py died the same death,
+        its mutant aimed at a `cache_finished_req` the void no longer calls.
+        The class is worth naming: a change that converts RETRACTION into
+        PARKING disarms every can-fail proof whose injected fault worked by
+        causing a retraction.
+        IT NOW TAKES TWO NEUTERS, AND THAT IS A RESULT, NOT A CONCESSION.
+        Re-aiming at the verdict alone was tried first and left the arm red:
+        `pp_void_keeps_request` still guards the top of the disposal loop and
+        `continue`s past the chunked request before any verdict is asked, so
+        the member never reaches the release path. The instr19 shape
+        therefore requires defeating TWO independent guards after #984 where
+        ONE sufficed before -- the keep-check to get the chunked request into
+        the disposal at all, and the park verdict to send it down
+        release-and-reset once there. Both are neutered here, deliberately
+        and visibly, because a can-fail proof must state the true depth of
+        the thing it is defeating rather than pick the smallest edit that
+        goes red.
         """
         from sglang.srt.managers import scheduler_pp_mixin as m
 
         chunked = _StubChunkedReq()
         h = self._scheduler(chunked, [chunked])
         keeps = m.pp_void_keeps_request
+        park = m.pp_park_voided_batch_member
         m.pp_void_keeps_request = lambda req, resident, chunked_before: False
+        m.pp_park_voided_batch_member = (
+            lambda scheduler, req, *, mb_id, route: m.VOID_PARK_FINISHED
+        )
         try:
             self._void_pass(h)
         finally:
             m.pp_void_keeps_request = keeps
+            m.pp_park_voided_batch_member = park
         # The retraction really happened in the blinded run -- that is what
         # makes the raise below the specimen rather than a broken harness.
         self.assertTrue(chunked.retracted)
@@ -1055,7 +1089,27 @@ class PPVoidChunkedRequest797b(unittest.TestCase):
 
         h._pp_absorb_void_output(0, {_PP_VOID_OUTPUT_KEY: True}, mbs, mb_metadata)
         self.assertIsNone(h.chunked_req, "a chunk started this round was kept")
-        self.assertTrue(started.retracted, "it must be retracted like any member")
+        # #984 RETRACTED THE MECHANISM, NOT THE POINT. This read
+        # `assertTrue(started.retracted, "it must be retracted like any
+        # member")` while the void's disposal RELEASED and re-queued every
+        # member. The void is now symmetric: rank 0's members are PARKED and
+        # re-queued with prefix and pages intact, and only an already-finished
+        # request still takes the release path. "Like any other member" is
+        # therefore still exactly right -- what any other member gets has
+        # changed underneath it.
+        #
+        # THE INVARIANT THIS ARM EXISTS FOR IS THE FIRST AND THIRD ASSERTION,
+        # both untouched: a chunk STARTED this round must be UN-STARTED
+        # (`chunked_req` back to the pre-admission None) and must be back in
+        # the queue. Otherwise this rank is the only one mid-chunk, which is
+        # the membership divergence #797 exists to prevent. Whether it got
+        # there by retraction or by parking is the disposal's business; that
+        # it got there is #797's.
+        self.assertFalse(
+            started.retracted,
+            "#984: a voided member is parked, not retracted -- a retracted "
+            "request here means the reset shape is back on the queue path",
+        )
         self.assertIn(started, h.waiting_queue)
 
     def test_the_crash_line_is_still_the_line_this_pins(self):
