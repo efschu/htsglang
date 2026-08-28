@@ -9164,6 +9164,19 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
+            # `add_chunked_req` appends the continuation to `can_run_list`
+            # while the request may still be resident in `waiting_queue` (the
+            # void family re-queues it there and `pp_chunked_req_is_reachable`
+            # deliberately preserves the co-residency). Without this guard the
+            # loop visits it a SECOND time, the host load-back grows its
+            # prefix in place, and a budget bail-out leaves the first visit's
+            # extend_range behind the moved prefix -- boot 8's 25s assert.
+            # Identity, not rid: two objects with one rid are a different
+            # defect and must not be masked here.
+            if any(_r is req for _r in adder.can_run_list):
+                _note_skip("already_in_batch", req.rid)
+                continue
             if transport_only and not seam_grant_is_open(req):
                 # #906: unstamped OR already spent. The old test was the bare
                 # stamp, which never expires, so one retraction licensed an

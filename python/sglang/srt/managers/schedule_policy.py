@@ -11,6 +11,31 @@ from sglang.srt.utils import get_bool_env_var
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
+#: #988: rate-limit state for the load-back instrument, module-level.
+_988_LOADBACK_SEEN = {"n": 0}
+
+
+def _note_988_loadback(req, new_prefix_len: int) -> None:
+    """#988 instrument (standing order): the prefix moved; say so.
+
+    Module-level, not a method (the holder lesson, three measured
+    instances). Prints the first occurrence and every 64th; the boot-8
+    falsifier question -- was the request already in a batch when its
+    prefix moved -- is answered by the caller-side guard's skip census
+    ('already_in_batch'), so this line carries the geometry facts only.
+    """
+    _988_LOADBACK_SEEN["n"] += 1
+    n = _988_LOADBACK_SEEN["n"]
+    if n == 1 or n % 64 == 0:
+        logger.info(
+            "#988 LOADBACK rid=%s prefix moved to %d, extend_range re-derived "
+            "to the parked shape at the mutation (seen=%d)",
+            getattr(req, "rid", None),
+            new_prefix_len,
+            n,
+        )
+
+
 #: #967: how many times the #959 "one continuation at a time" guard has
 #: refused a FRESH request in this process, per mint site.
 #:
@@ -1888,6 +1913,24 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                # #988 JOIN THE ENSEMBLE AT THE MUTATION, NOT AT THE EXITS.
+                # This host load-back is the ONE prefix mover in the tree that
+                # did not re-derive its co-derived geometry (#965's invariant:
+                # extend_range.start == len(prefix_indices) -- asserted at the
+                # batch boundary, schedule_batch.py prepare_for_extend). Every
+                # early return below this line used to leave the FIRST visit's
+                # extend_range behind a moved prefix; boot 8 of
+                # window-flip-0828 died on exactly that at 25s (a waiting_queue
+                # member already resident in can_run_list was visited twice,
+                # grew its prefix at this line, bailed at a budget return, and
+                # prepare_for_extend read the halves apart). Re-deriving HERE,
+                # immediately, makes every current and future early return
+                # inherit a consistent parked shape automatically -- the same
+                # Range(prefix, prefix) the void park writes -- and the success
+                # paths below overwrite it with the real range as before.
+                # Per-branch bail patches are how #965 was paid for twice.
+                req.set_extend_range(prefix_len, prefix_len)
+                _note_988_loadback(req, prefix_len)
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
