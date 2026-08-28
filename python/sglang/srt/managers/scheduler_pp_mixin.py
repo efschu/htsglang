@@ -61,6 +61,11 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.hicache_collective import (
+    HiCacheCollectiveTimeoutError,
+    bounded_wait,
+    collective_rank_desc,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -803,6 +808,170 @@ def _pp_proxy_readiness_budget_s() -> float:
     except ValueError:
         return DEFAULT_PROXY_READINESS_BUDGET_S
     return value if value > 0 else DEFAULT_PROXY_READINESS_BUDGET_S
+
+
+class RingCommitTimeout(RuntimeError):
+    """#973: a PP ring commit wait gave up by a NAMED branch.
+
+    Raised INSTEAD of parking for ever in ``_pp_commit_comm_work`` when the
+    downstream peer never takes this rank's send off the wire. That is the
+    boot-2 wedge of window-flip-0828 (specimen
+    ``/spinning/evidence-665-f1/SPECIMEN-2026-08-28T1135Z-flip0828-boot2-
+    RING-WAIT-WEDGE.txt``): PP0 and PP1 both blocked in gloo ``waitSend``
+    under this function while PP2 sat in ``_do_recv`` -- a closed cycle,
+    silent, for the 10+ minutes until the boot was killed by hand.
+
+    THE HAZARD WAS ALREADY WRITTEN DOWN IN THIS MODULE, in the #753 comment
+    on ``_pp_commit_send_output_work_and_preprocess_output_tensors``: "Every
+    rank flushing a send that no rank has posted a receive for is a closed
+    cycle: boot v7pp9 sat in _pp_commit_comm_work on all three ranks, three
+    works deep, stuck on the first." #753 fixed the ORDERING that produced
+    one instance of the cycle and left the wait itself unbounded, so the
+    next instance -- reached by a different route -- was silent again.
+
+    THE PAIR IS NOT POISONED WHEN THIS IS RAISED. The bound is the #630/#829
+    canon (``hicache_collective.bounded_wait`` -> ``ParkedWait``): the
+    unbounded ``wait()`` runs on a parked thread and the DEADLINE IS ON THE
+    JOIN, so expiry never interrupts the ``Work`` and never closes the gloo
+    pair. This matters here specifically -- ``hicache_collective``'s own
+    #829 comment names ``scheduler_pp_mixin._pp_commit_comm_work`` as one of
+    the sites that were VICTIMS of the timed-``Work.wait`` design, in 34 of
+    262 boot logs. Bounding this site with ``work.wait(timeout=...)`` would
+    have re-created that defect at the exact place it was measured.
+
+    This error is terminal by intent: the ring is already deadlocked, so the
+    boot dies with a file:line-addressable marker instead of wedging.
+    """
+
+
+#: #973: budget for ONE ring-commit wait in ``_pp_commit_comm_work``.
+#:
+#: WHY 120s, against the existing canon's constants rather than a fresh
+#: guess. Four numbers already bracket this question in this tree:
+#:
+#:   * a healthy phase-flip cutover measures 8-9.5s end to end on this rig,
+#:     and a commit wait is a SUB-STEP of that, so a healthy commit is well
+#:     under 10s;
+#:   * DEFAULT_PROXY_READINESS_BUDGET_S is 30s and already covers "a
+#:     legitimately slow upstream forward pass" (#789, above);
+#:   * SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S defaults to 600s -- but that
+#:     bounds a HiCache CONTROL COLLECTIVE across the whole group, a much
+#:     coarser operation than one point-to-point send flush;
+#:   * the gloo ``cpu_group`` these works ride carries a 7200s timeout
+#:     (parallel_state.py:619).
+#:
+#: 120s sits deliberately between them: 12.6x the longest measured healthy
+#: cutover and 4x the #789 budget, so it cannot fire on a healthy flip or a
+#: slow forward pass; 5x tighter than the HiCache bound, because this is the
+#: narrower operation; and 60x under the group's own timeout, which is what
+#: keeps #825's discriminability check true with room to spare (expiry and
+#: transport failure stay separable by control flow inside bounded_wait).
+#: Against the measured defect it converts a 500s+ silent wedge into a named
+#: death in two minutes.
+DEFAULT_RING_COMMIT_BUDGET_S = 120.0
+
+#: Env override for DEFAULT_RING_COMMIT_BUDGET_S.
+#:
+#: DELIBERATELY NOT the #789 convention above (where <= 0 falls back to the
+#: default). Here a non-positive value means UNBOUNDED, restoring the exact
+#: pre-#973 ``p2p_work.work.wait()``. That is ``bounded_wait``'s own
+#: documented escape hatch ("``timeout_s <= 0`` restores the raw blocking
+#: ``work.wait()``") and this site inherits it rather than inventing a
+#: second meaning for the same value.
+ENV_RING_COMMIT_BUDGET = "SGLANG_PP_RING_COMMIT_BUDGET_S"
+
+
+def _pp_ring_commit_budget_s() -> float:
+    raw = os.environ.get(ENV_RING_COMMIT_BUDGET)
+    if raw is None:
+        return DEFAULT_RING_COMMIT_BUDGET_S
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_RING_COMMIT_BUDGET_S
+
+
+# MODULE-LEVEL, NOT METHODS, AND THAT IS LOAD-BEARING (#802-ring's lesson,
+# re-measured by #973). Roughly a dozen stand-in holders across the
+# #631/#757/#787/#789/#791/#795/#796/#797/#798/#801 test family bind
+# `_pp_commit_comm_work` onto a bare `types.SimpleNamespace` ONE METHOD AT A
+# TIME, via `setattr(h, name, types.MethodType(getattr(SchedulerPPMixin,
+# name), h))`. A helper called as `self._pp_commit_channel_of(...)` from
+# inside the commit would therefore resolve a name those holders never bound,
+# and every one of them would raise AttributeError the moment it committed.
+# MEASURED, not predicted: the method form turned
+# test_pp_admission_send_handle_dropped_796 (5 passed -> 2 failed) and
+# test_pp_void_send_contract_801 (14 passed -> 3 failed) red, with
+# `'types.SimpleNamespace' object has no attribute '_pp_commit_channel_of'`
+# on rank 0 and both peers then dying of "Connection closed by peer". Taking
+# the holder as an explicit argument keeps the helpers testable and reusable
+# without adding anything to what a holder must bind.
+
+
+def _pp_commit_channel_of(holder, work: List[P2PWork]) -> str:
+    """Name the wire ``work`` rides, for the #973 message.
+
+    By IDENTITY against the three handle attributes, which is the same
+    (channel, attribute) mapping ``pp_flip_flush_drained_sends`` already
+    keeps -- rather than a new argument threaded through the ~18 call sites
+    of ``_pp_commit_comm_work``. The disaggregation lists are locals with no
+    channel identity of their own and answer "p2p".
+    """
+    for chan, attr in (
+        (CHAN_REQ, "send_req_work"),
+        (CHAN_DICT, "send_output_work"),
+        (CHAN_DICT, "send_proxy_work"),
+    ):
+        if work is getattr(holder, attr, None):
+            return f"{chan}/{attr}"
+    return "p2p"
+
+
+def _pp_ring_commit_peer_statement(holder, chan: str) -> str:
+    """#650-style: name what each peer is doing and which hop is silent.
+
+    Defensive throughout, for the same reason ``collective_rank_desc`` is:
+    this runs on the failure path of a process that is already deadlocked,
+    and a missing attribute must never mask the timeout it is reporting.
+    """
+    counters = getattr(holder, "pp_flip_counters", None)
+    if counters is None:
+        return (
+            "no phase-flip counters on this boot, so no peer statement is "
+            "available (the CHAN counters are published only under "
+            "--enable-phase-flip); the silent hop must be read from a "
+            "py-spy of the peers instead"
+        )
+    try:
+        key = chan.split("/")[0]
+        downstream = holder._pp_flip_downstream()
+        upstream = holder._pp_flip_upstream()
+        local_sent = counters.local_sent(key)
+        taken = counters.consumed(key, downstream)
+        parts = [
+            f"this rank posted {local_sent} and consumed "
+            f"{counters.local_consumed(key)} on CHAN_{key.upper()}",
+            f"downstream rank {downstream} has consumed {taken} of this "
+            f"rank's posts"
+            + (
+                " -- it has NOT taken this send off the wire, so the "
+                "downstream hop is the silent one"
+                if taken < local_sent
+                else " -- it is level with this rank, so the stall is on the "
+                "wire itself, not in the peer's scheduling"
+            ),
+            f"upstream rank {upstream} posted {counters.sent(key, upstream)} "
+            f"(entered {counters.attempted(key, upstream)})",
+        ]
+        arm = getattr(holder, "_pp_blocked_recv_arm", None)
+        if arm:
+            parts.append(
+                f"this rank is ALSO blocked in a receive on {arm}, so the "
+                f"cycle is closed through this rank"
+            )
+        return "; ".join(parts)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
+        return f"peer statement unavailable ({type(exc).__name__}: {exc})"
 
 
 #: Position of the phase-flip epoch inside a proxy ``__stamp__``, appended by
@@ -5249,8 +5418,72 @@ class SchedulerPPMixin:
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
-        for p2p_work in work:
-            p2p_work.work.wait()
+        """Flush this rank's outstanding p2p sends, with a #973 deadline.
+
+        THE WAIT USED TO BE NAKED, and that is what boot 2 of window-flip-0828
+        died on: ``p2p_work.work.wait()`` with nothing bounding it, on a gloo
+        group whose own timeout is two hours. PP0 and PP1 both sat here in
+        ``waitSend`` (PP1 arriving via ``_pp_commit_pending_req_work``) while
+        PP2 sat in ``_do_recv`` -- a closed three-arc cycle that stayed silent
+        for 10+ minutes. See :class:`RingCommitTimeout` for the specimen and
+        for why the #753 comment below already described this exact shape.
+
+        THE BOUND DOES NOT REPLACE THE PROGRESS, and it does not touch the
+        ``Work``. Both properties come from routing through the #630/#829
+        canon rather than re-deriving one here: ``bounded_wait`` parks the
+        UNBOUNDED ``wait()`` -- the only call with positive evidence that it
+        DRIVES a gloo transfer -- on its own thread and puts the deadline on
+        the join. So a healthy commit behaves exactly as before, an
+        ``is_completed()`` poll loop is never introduced (#630's livelock),
+        and an expiry never closes the gloo pair (#829's group-scope defect,
+        whose measured victims included THIS function).
+
+        On expiry the send is still posted and the peer can still take it;
+        this rank simply stops pretending it might. The raise is terminal by
+        intent -- the ring is deadlocked, so the boot dies with a named,
+        addressable marker instead of wedging.
+        """
+        budget = _pp_ring_commit_budget_s()
+        if budget <= 0:
+            # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
+            # the pre-#973 behaviour, including the unbounded park.
+            for p2p_work in work:
+                p2p_work.work.wait()
+            work.clear()
+            return
+        chan = _pp_commit_channel_of(self, work)
+        total = len(work)
+        for idx, p2p_work in enumerate(work):
+            try:
+                bounded_wait(
+                    p2p_work.work,
+                    f"pp-ring-commit/{chan}[{idx}]",
+                    budget,
+                    collective_rank_desc(self),
+                )
+            except HiCacheCollectiveTimeoutError as exc:
+                # Transport failure is NOT converted: bounded_wait already
+                # raises a named, loud error for it that says "look for a
+                # dead rank, not a slow one" (#734), and re-labelling it here
+                # would destroy that distinction. Only EXPIRY -- the wedge
+                # shape -- becomes RingCommitTimeout.
+                statement = _pp_ring_commit_peer_statement(self, chan)
+                message = (
+                    f"#973 RING COMMIT TIMEOUT: this rank waited {budget:g}s to "
+                    f"commit a {chan} send (work {idx + 1} of {total}) and the "
+                    f"downstream peer never took it off the wire. This is the "
+                    f"closed-ring wedge of scheduler_pp_mixin."
+                    f"_pp_commit_comm_work, not a slow forward pass: the send "
+                    f"was posted a full iteration ago. Peer statement: "
+                    f"{statement}. The send is STILL POSTED and the gloo pair "
+                    f"is intact (the deadline was on the join, not on the "
+                    f"Work); this rank aborts rather than park for the group's "
+                    f"2h timeout. Raise or disable the bound with "
+                    f"{ENV_RING_COMMIT_BUDGET} (<= 0 restores the unbounded "
+                    f"wait). See #973."
+                )
+                logger.error("%s", message)
+                raise RingCommitTimeout(message) from exc
         work.clear()
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
