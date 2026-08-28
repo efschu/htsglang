@@ -685,11 +685,27 @@ class HiCacheFile(HiCacheStorage):
         if self.canonical_kv_page is not None or self.canonical_mamba_blob is not None:
             from sglang.srt.mem_cache.canonical_page_store import sweep_partials
 
+            # 2026-08-28 boot-3 store wipe: this sweep, keyed on age alone,
+            # reaped ALL 16898 partial files the previous boot had deposited
+            # into the store -- the restart gap (100 min) exceeded the TTL
+            # (3600 s), and nothing had completed yet, so cross-boot retention
+            # went to zero at attach. Age cannot tell abandonment from a
+            # restart; the marker can. A pair whose marker decodes against the
+            # geometry THIS attach writes is resumable deposited work and is
+            # kept at any age (computed work is never thrown away); a genuine
+            # format transition is reaped past the TTL but NAMED loudly, never
+            # wiped silently.
+            resumable_totals = []
+            if self.canonical_kv_page is not None:
+                resumable_totals.append(int(self.canonical_kv_page.spec.page_bytes))
+            if self.canonical_mamba_blob is not None:
+                resumable_totals.append(int(self.canonical_mamba_blob.total_bytes))
             try:
                 sweep_partials(
                     self.file_path,
                     older_than_s=self._partial_ttl_s,
                     is_pinned=self.pins.is_pinned,
+                    resumable_totals=tuple(resumable_totals),
                 )
             except OSError as e:
                 # A store that cannot be swept is still usable; orphans only

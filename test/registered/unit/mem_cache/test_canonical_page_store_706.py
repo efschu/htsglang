@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     CanonicalPageWindow,
     build_page_window,
     local_attention_layer_ids,
+    marker_path,
     missing_slots,
     page_is_complete,
     part_path,
@@ -521,6 +522,94 @@ class TestPartialSweep(CustomTestCase):
         self.assertEqual(
             sweep_partials(os.path.join(self.root, "nope"), older_than_s=1), 0
         )
+
+    # -- cross-boot retention (2026-08-28 boot-3 store wipe) -----------------
+    # The attach-time sweep reaped all 16898 files boot 2 had deposited into
+    # /tmp/hicache_flip0828 -- every one a .part706/.slots706 pair of REAL
+    # prefill work, older than the 3600 s TTL only because the next boot came
+    # 100 minutes later. Age alone cannot tell abandoned garbage from work the
+    # next boot would resume; the marker can: it decodes iff it was written
+    # under the geometry this attach is about to write.
+
+    def _deposit(self, stem="cafe01", age_s=7200.0):
+        """A GENUINE partial pair: one PP stage's real deposit, aged."""
+        final = os.path.join(self.root, "ca", f"{stem}.bin")
+        window = window_for_layers(SPEC, ATTN_LAYER_IDS, _stage_layers(0, 28))
+        write_slice(final, window, _payload(window, tag=10))
+        part = part_path(final)
+        marker = marker_path(final)
+        for path in (part, marker):
+            old = os.stat(path).st_mtime - age_s
+            os.utime(path, (old, old))
+        return final, part, marker
+
+    def test_resumable_same_format_partials_survive_any_age(self):
+        """Computed work is never thrown away (Kein-Doppel-Prefill): a partial
+        whose marker decodes against THIS attach's page geometry is resumable
+        deposited work, whatever its age."""
+        final, part, marker = self._deposit(age_s=7200)
+        reaped = sweep_partials(
+            self.root, older_than_s=3600, resumable_totals=(SPEC.page_bytes,)
+        )
+        self.assertEqual(reaped, 0)
+        self.assertTrue(os.path.exists(part))
+        self.assertTrue(os.path.exists(marker))
+        # The retention has VALUE: the next boot's stages complete the page.
+        for lo, hi in PP_CUT[1:]:
+            window = window_for_layers(SPEC, ATTN_LAYER_IDS, _stage_layers(lo, hi))
+            write_slice(final, window, _payload(window, tag=10))
+        self.assertTrue(page_is_complete(final))
+
+    def test_a_foreign_geometry_pair_is_still_reaped_and_named(self):
+        """A marker for a DIFFERENT page geometry is a format transition, not
+        resumable work: it can never complete under this attach (any new
+        writer resets it in place), so the TTL reap stands -- but it must be
+        LOUD, never a silent wipe."""
+        final, part, marker = self._deposit(age_s=7200)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.canonical_page_store", level="WARNING"
+        ) as logs:
+            reaped = sweep_partials(
+                self.root,
+                older_than_s=3600,
+                resumable_totals=(SPEC.page_bytes * 2,),
+            )
+        self.assertEqual(reaped, 2)
+        self.assertFalse(os.path.exists(part))
+        self.assertFalse(os.path.exists(marker))
+        self.assertIn("geometry", "\n".join(logs.output))
+
+    def test_a_young_foreign_pair_is_left_to_its_ttl(self):
+        """The TTL guard is not weakened in the other direction: a young pair
+        is presumed live even when its geometry is foreign."""
+        final, part, marker = self._deposit(age_s=5)
+        reaped = sweep_partials(
+            self.root, older_than_s=3600, resumable_totals=(SPEC.page_bytes * 2,)
+        )
+        self.assertEqual(reaped, 0)
+        self.assertTrue(os.path.exists(part))
+        self.assertTrue(os.path.exists(marker))
+
+    def test_a_markerless_partial_is_not_resumable(self):
+        """No marker = no recorded coverage: the next writer resets the file
+        in place anyway, so keeping it retains nothing."""
+        part = self._write("cafe.bin.part706", age_s=7200)
+        reaped = sweep_partials(
+            self.root, older_than_s=3600, resumable_totals=(SPEC.page_bytes,)
+        )
+        self.assertEqual(reaped, 1)
+        self.assertFalse(os.path.exists(part))
+
+    def test_an_orphan_marker_is_not_resumable(self):
+        """A marker whose partial is gone records coverage of bytes that no
+        longer exist: keeping it retains nothing."""
+        final, part, marker = self._deposit(age_s=7200)
+        os.unlink(part)
+        reaped = sweep_partials(
+            self.root, older_than_s=3600, resumable_totals=(SPEC.page_bytes,)
+        )
+        self.assertEqual(reaped, 1)
+        self.assertFalse(os.path.exists(marker))
 
 
 if __name__ == "__main__":

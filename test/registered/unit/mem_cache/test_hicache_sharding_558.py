@@ -283,5 +283,81 @@ class TestFullDiskDuringCommit(CustomTestCase):
         store.ensure_space(self.root, 1 << 20, 0)  # no raise
 
 
+class TestAttachKeepsPreviousBootsWork(CustomTestCase):
+    """2026-08-28 boot-3 store wipe: the attach-time TTL sweep reaped all
+    16898 partial files boot 2 deposited into /tmp/hicache_flip0828 -- the
+    ENTIRE store, because nothing had completed yet and the next boot came
+    100 minutes (> TTL 3600 s) later. Attach on a same-format store must
+    delete nothing resumable; a real format transition must be loud, never a
+    silent wipe."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        store.reset_space_cache()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(store.reset_space_cache)
+
+    def _age_partials(self, age_s=7200.0):
+        aged = []
+        for dirpath, _dirs, files in os.walk(self.root):
+            for name in files:
+                if name.endswith((".part706", ".slots706")):
+                    path = os.path.join(dirpath, name)
+                    old = os.stat(path).st_mtime - age_s
+                    os.utime(path, (old, old))
+                    aged.append(path)
+        return aged
+
+    def test_attach_on_a_same_format_store_deletes_nothing(self):
+        stage = _backend(self.root, window=_window(*PP_CUT[0]))
+        stage.set("cafe01", _payload(_window(*PP_CUT[0])))
+        aged = self._age_partials()
+        self.assertEqual(len(aged), 2)
+        # The next boot's first attach, same geometry:
+        _backend(self.root, pp_rank=1, window=_window(*PP_CUT[1]))
+        for path in aged:
+            self.assertTrue(os.path.exists(path), path)
+        # The retained work PAYS: the next boot's stages complete the page.
+        for rank, cut in enumerate(PP_CUT[1:], start=1):
+            _backend(self.root, pp_rank=rank, window=_window(*cut)).set(
+                "cafe01", _payload(_window(*cut))
+            )
+        names = sorted(os.listdir(os.path.join(self.root, "ca")))
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].endswith(".bin"))
+
+    def test_attach_under_a_new_format_is_loud_not_silent(self):
+        stage = _backend(self.root, window=_window(*PP_CUT[0]))
+        stage.set("cafe01", _payload(_window(*PP_CUT[0])))
+        self._age_partials()
+        other_spec = CanonicalPageSpec(
+            num_attn_layers=len(ATTN_LAYER_IDS),
+            kv_bytes_per_token_per_attn_layer=CELL * 2,
+        )
+        other = window_for_layers(
+            other_spec, ATTN_LAYER_IDS, [i for i in ATTN_LAYER_IDS if i < 28]
+        )
+        with self.assertLogs(
+            "sglang.srt.mem_cache.canonical_page_store", level="WARNING"
+        ) as logs:
+            _backend(self.root, window=other)
+        self.assertIn("geometry", "\n".join(logs.output))
+
+    def test_attach_never_touches_completed_pages(self):
+        for rank, cut in enumerate(PP_CUT):
+            _backend(self.root, pp_rank=rank, window=_window(*cut)).set(
+                "cafe01", _payload(_window(*cut))
+            )
+        shard = os.path.join(self.root, "ca")
+        names = [n for n in os.listdir(shard) if n.endswith(".bin")]
+        self.assertEqual(len(names), 1)
+        path = os.path.join(shard, names[0])
+        old = os.stat(path).st_mtime - 999999
+        os.utime(path, (old, old))
+        _backend(self.root, window=_window(*PP_CUT[0]))
+        self.assertTrue(os.path.exists(path))
+
+
 if __name__ == "__main__":
     unittest.main()

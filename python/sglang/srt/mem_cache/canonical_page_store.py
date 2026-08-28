@@ -817,6 +817,7 @@ def sweep_partials(
     *,
     older_than_s: float,
     is_pinned: Optional[Callable[[str], bool]] = None,
+    resumable_totals: Sequence[int] = (),
 ) -> int:
     """Reap orphaned ``.part706`` / ``.slots706`` files. Returns the count.
 
@@ -831,23 +832,87 @@ def sweep_partials(
     page need. Anything younger is presumed live and left alone -- reaping a
     partial another stage is still filling would silently undo its work, and the
     page would simply never complete.
+
+    ``resumable_totals`` (2026-08-28 boot-3 store wipe): age alone reads a
+    RESTART as abandonment. Boot 2 deposited 16898 partial files of real
+    prefill work; the next boot attached 100 minutes later and this sweep,
+    keyed on the 3600 s TTL alone, reaped the entire store. A pair whose
+    marker decodes against one of these totals -- the page/blob geometries the
+    attaching backend is itself about to write -- is RESUMABLE deposited work:
+    ``write_extents`` unions its recorded coverage on the next deposit, so
+    keeping it lets the next boot complete the page instead of recomputing it
+    (computed work is never thrown away). Such a pair is kept at ANY age.
+    What stays reapable past the TTL, because keeping it retains nothing:
+    a markerless partial (write resets it in place), an orphan marker (its
+    coverage describes bytes that no longer exist), and a pair whose marker
+    was written under a DIFFERENT geometry -- that last one is a format
+    transition and is named LOUDLY, never wiped silently.
     """
     cutoff = time.time() - float(older_than_s)
     reaped = 0
+    kept_resumable = 0
+    foreign_totals: set[int] = set()
+    foreign_reaped = 0
+    groups: dict[str, dict[str, str]] = {}
     for path in _iter_partial_files(root_dir):
-        try:
-            if os.stat(path).st_mtime >= cutoff:
-                continue
-        except FileNotFoundError:
-            continue
-        if is_pinned is not None and is_pinned(_stem_of_partial(path)):
+        name = os.path.basename(path)
+        kind = "part" if name.endswith(PART_SUFFIX) else "marker"
+        suffix = PART_SUFFIX if kind == "part" else MARKER_SUFFIX
+        base = path[: -len(suffix)]
+        groups.setdefault(base, {})[kind] = path
+    for base, pair in groups.items():
+        any_path = pair.get("part") or pair.get("marker")
+        if is_pinned is not None and is_pinned(_stem_of_partial(any_path)):
             # #410: a conversation checkpoint references this page. Its partial
             # may be mid-assembly by another stage, and reaping it would reset
             # work the checkpoint is waiting on -- age alone cannot tell those
             # apart, but a pin can.
             continue
-        _unlink_quiet(path)
-        reaped += 1
+        recorded_total: Optional[int] = None
+        if resumable_totals and "part" in pair and "marker" in pair:
+            try:
+                with open(pair["marker"], "rb") as f:
+                    blob = f.read()
+            except OSError:
+                blob = b""
+            if any(_decode_marker(blob, t) is not None for t in resumable_totals):
+                kept_resumable += 1
+                continue
+            recorded_total = _marker_recorded_total(blob)
+        for path in pair.values():
+            try:
+                if os.stat(path).st_mtime >= cutoff:
+                    continue
+            except FileNotFoundError:
+                continue
+            _unlink_quiet(path)
+            reaped += 1
+            if recorded_total is not None and recorded_total not in resumable_totals:
+                foreign_reaped += 1
+                foreign_totals.add(recorded_total)
+    if kept_resumable:
+        logger.info(
+            "Kept %d resumable canonical partial pair(s) in %s across the "
+            "restart: their markers decode against this attach's geometry "
+            "%s, so the next deposit resumes their recorded coverage.",
+            kept_resumable,
+            root_dir,
+            tuple(int(t) for t in resumable_totals),
+        )
+    if foreign_reaped:
+        logger.warning(
+            "Reaped %d canonical partial file(s) in %s whose completeness "
+            "markers record a DIFFERENT page geometry (total bytes %s) than "
+            "this attach writes (%s). This is a format transition: these "
+            "partials could never complete under the new format (any new "
+            "writer resets them in place), so the TTL reap stands -- named "
+            "here rather than silent. Completed .bin pages are never touched "
+            "by this sweep.",
+            foreign_reaped,
+            root_dir,
+            sorted(foreign_totals),
+            tuple(int(t) for t in resumable_totals),
+        )
     if reaped:
         logger.info(
             "Reaped %d orphaned canonical partial file(s) older than %.0fs in %s.",
@@ -856,6 +921,19 @@ def sweep_partials(
             root_dir,
         )
     return reaped
+
+
+def _marker_recorded_total(blob: bytes) -> Optional[int]:
+    """The total-bytes a marker was written for, or ``None`` if unreadable.
+
+    Unlike ``_decode_marker`` this does not validate the marker against an
+    expected geometry -- it answers "what geometry does this marker itself
+    claim", which is what the sweep needs to NAME a format transition."""
+    head = len(_MARKER_MAGIC) + _MARKER_HEADER.size
+    if len(blob) < head or blob[: len(_MARKER_MAGIC)] != _MARKER_MAGIC:
+        return None
+    recorded_total, _count = _MARKER_HEADER.unpack(blob[len(_MARKER_MAGIC) : head])
+    return int(recorded_total)
 
 
 def _stem_of_partial(path: str) -> str:
