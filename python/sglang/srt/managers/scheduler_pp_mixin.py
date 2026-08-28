@@ -283,6 +283,41 @@ _PP_UPSTREAM_LAUNCHED_KEY = "__pp_upstream_launched__"
 # so a stand-in or an older sender produces exactly the pre-#978 behaviour.
 _PP_LAUNCHED_CHAIN_KEY = "__pp_launched_chain__"
 
+# #968: THE PARKED CONTINUATION IS A FACT ONLY ITS HOLDER KNOWS, and PP0 is
+# the only rank allowed to act on it.
+#
+# THE DEFECT, boot 3 of window-flip-0828 (measured, 514 refusals in ~2 min).
+# After a #797 void, PP1 re-homes the #971-parked chunked continuation into
+# `self.chunked_req` (`pp_rehome_refused_chunked_req`, via scheduler.py's
+# refusal exit). It never enters `waiting_queue` on ANY rank, so PP0 cannot
+# see it: PP0 kept naming two other rids per decision, and PP1's
+# `add_chunked_req` appended its continuation unconditionally
+# (schedule_policy.py:1521). The membership check then had to refuse the
+# pass every time -- 323 times as an EXTRA ("this rank admitted rid(s)=...,
+# which the decision does not name") and 191 times as a MISSING, because a
+# seat the decision spent on a foreign rid was already occupied. Void ->
+# requeue -> tail rotation -> 512 voids -> the #801-spin guard killed it.
+#
+# WHY NAMING IS THE ONLY FIX. A correctly priced seat does not help: the
+# follower's continuation would still be an UN-NAMED extra, and both raises
+# are right (an extra breaks the pipeline tensor pairing exactly as a
+# missing one does). The follower's continuation can never legally run
+# until PP0 NAMES it, so the fact has to reach PP0.
+#
+# NO NEW COLLECTIVE AND NO NEW WIRE, which is the hard constraint here: a
+# collective on the admission path is a recorded fatal in this family. The
+# fact rides the #791b return trip that already goes home -- the very lap
+# #978 just made robust -- exactly as `_PP_LAUNCHED_CHAIN_KEY` does.
+# MERGED PER HOP rather than overwritten, because the holder of the parked
+# continuation is generally NOT the rank that originates the message: PP1
+# parks, PP2 originates the output, PP0 must receive both facts. Every
+# relay point unions its own fact into what it forwards.
+#
+# Absent key means "no parked continuation anywhere", which is the state
+# every pre-#968 sender and every stand-in produces -- so the legacy path
+# is byte-identical.
+_PP_PARKED_CONTINUATION_KEY = "__pp_parked_continuation__"
+
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
 # not required for this iteration's forward progress" family. PP0's ring
 # wraparound receive for the admission decision (feeding
@@ -1549,6 +1584,216 @@ def pp_void_forward_payload(
     return dict(message)
 
 
+def pp_parked_continuation_fact(holder):
+    """#968: this rank's parked chunked continuation, or None.
+
+    THE #971-PARKED SHAPE, and nothing else. `add_chunked_req`'s #679 park
+    sets `extend_range(prefix, prefix)` and returns WITHOUT appending
+    (schedule_policy.py:1399), so a parked continuation is the request whose
+    executed range ENDS exactly where its prefix ends -- `extend_range.end ==
+    len(prefix_indices)`. A continuation with a real chunk in flight has
+    `end > len(prefix_indices)` and is NOT reported: that one is already a
+    named member of a live pass, and telling PP0 to re-offer it would name a
+    second geometry for a pass in flight (the instr21 defect).
+
+    REPORTS, NEVER MUTATES. This reads `holder.chunked_req` and returns
+    `(rid, executed_len, rank)`; `executed_len` is the prefix the rank has
+    ACTUALLY executed, which is what makes PP0's re-offer honourable under
+    the #963 floor. Nothing here reduces, resets or discards the
+    continuation -- the parked tokens must advance, never be recomputed
+    (Kein-Doppel-Prefill).
+
+    getattr-based throughout, by this file's stand-in convention (#787): a
+    holder with no `chunked_req`, no `ps`, or a torn-down request (an
+    `extend_range` of None, which `reset_for_retract` produces) yields None,
+    which every caller reads as "nothing parked here".
+    """
+    req = getattr(holder, "chunked_req", None)
+    if req is None:
+        return None
+    rid = getattr(req, "rid", None)
+    if not rid:
+        return None
+    extend_range = getattr(req, "extend_range", None)
+    end = getattr(extend_range, "end", None)
+    if end is None:
+        return None
+    prefix_indices = getattr(req, "prefix_indices", None)
+    # #796: `prefix_indices` is a TENSOR of KV-pool slot pointers and must
+    # never reach a boolean context; `len()` reads the shape only and does
+    # not synchronise, which is what #790 requires on this path.
+    prefix_len = 0 if prefix_indices is None else len(prefix_indices)
+    if int(end) != int(prefix_len):
+        return None
+    rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    if rank is None:
+        return None
+    return (str(rid), int(prefix_len), int(rank))
+
+
+def pp_parked_continuation_facts_from_wire(message) -> Tuple:
+    """#968: the facts already riding this message, as a tuple of triples.
+
+    Tolerant of every shape a stand-in or an older sender can produce -- a
+    non-dict, an absent key, a malformed entry -- because this sits on the
+    output path, where raising would turn one defect into two on the path
+    least able to afford it (`pp_chunked_req_before_slot`'s argument).
+    """
+    if not isinstance(message, dict):
+        return ()
+    raw = message.get(_PP_PARKED_CONTINUATION_KEY)
+    if not raw:
+        return ()
+    out = []
+    for entry in raw:
+        try:
+            rid, executed, rank = entry
+        except (TypeError, ValueError):
+            continue
+        out.append((str(rid), int(executed), int(rank)))
+    return tuple(out)
+
+
+def pp_parked_continuation_stamp(holder, incoming, out: Dict[str, object]) -> None:
+    """#968: union this rank's own parked fact into what it forwards.
+
+    THE MERGE IS THE POINT. The rank that PARKS a continuation is generally
+    not the rank that ORIGINATES the message home: in the boot-3 specimen
+    PP1 parks, PP2 originates the output, and PP0 is the only consumer. An
+    overwrite at each hop would lose PP1's fact at PP2; a union carries it.
+
+    LAST WRITER PER RANK, and per rid within a rank: a rank has exactly one
+    `chunked_req` slot, so at most one fact can be true of it at a time, and
+    a newer fact from the same rank replaces the older one rather than
+    accumulating a history the consumer would have to date.
+
+    Writes nothing when there is nothing to say, so an ordinary pass on an
+    ordinary boot produces a byte-identical payload.
+    """
+    merged = {}
+    for rid, executed, rank in pp_parked_continuation_facts_from_wire(incoming):
+        merged[int(rank)] = (rid, executed, int(rank))
+    own = pp_parked_continuation_fact(holder)
+    if own is not None:
+        merged[own[2]] = own
+    elif merged:
+        # THIS RANK NO LONGER HOLDS ONE, so its own earlier claim is
+        # withdrawn as it passes: the rank that parked it is the only
+        # authority on whether it is still parked, and staleness here would
+        # have PP0 re-offering a rid nobody is waiting to build.
+        rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+        if rank is not None:
+            merged.pop(int(rank), None)
+    if not merged:
+        return
+    out[_PP_PARKED_CONTINUATION_KEY] = tuple(merged[rank] for rank in sorted(merged))
+
+
+def pp_note_parked_continuation(holder, message) -> int:
+    """#968: absorb the parked-continuation facts riding home. Count absorbed.
+
+    PP0's side of the carry. The table lives on the holder as
+    ``_pp_parked_continuations``: ``rid -> (executed_len, rank)``, LATEST
+    WINS, and it is small by construction -- one entry per rank at most,
+    because a rank has one `chunked_req` slot.
+
+    THE ARRIVING SET IS THE WHOLE TRUTH, so the table is REPLACED and not
+    merged into. Every relay point unions its own fact in and withdraws its
+    own stale claim as the message passes
+    (`pp_parked_continuation_stamp`), so a message that has completed the
+    lap names exactly the continuations parked right now. Merging instead
+    would let a rid that has since been served sit in the table for ever and
+    have PP0 naming a request nobody is waiting to build. This is the
+    staleness rule, and it is the whole reason the fact is re-stamped on
+    EVERY lap rather than sent once.
+
+    A MESSAGE WITHOUT THE KEY IS NOT AN EMPTY SET, it is a message from a
+    sender that knows nothing about #968 -- a pre-#968 rank or a stand-in.
+    That case leaves the table exactly as it was, which is what makes the
+    legacy path byte-identical.
+
+    Separated from `pp_absorb_admission_return` as its own module-level
+    function for the reason `pp_void_keeps_request` is: a can-fail proof
+    must be able to neuter exactly this absorption without reverting the
+    harness with it.
+    """
+    if not isinstance(message, dict) or _PP_PARKED_CONTINUATION_KEY not in message:
+        return 0
+    facts = pp_parked_continuation_facts_from_wire(message)
+    holder._pp_parked_continuations = {
+        rid: (int(executed), int(rank)) for rid, executed, rank in facts
+    }
+    return len(facts)
+
+
+def pp_parked_continuation_carry(holder) -> Dict[str, Tuple[int, int]]:
+    """#968: PP0's absorbed table, copied. Empty whenever nothing is parked."""
+    table = getattr(holder, "_pp_parked_continuations", None)
+    if not table:
+        return {}
+    return dict(table)
+
+
+def pp_clear_parked_continuation(holder, rid) -> bool:
+    """#968: forget one rid. True iff it was there.
+
+    Called when the rid is served -- PP0 has NAMED it, so the fact has been
+    acted on -- and when it finishes. Self-correcting rather than
+    authoritative: if the follower still holds the continuation, the very
+    next lap re-stamps it, so clearing early costs one pass and never
+    strands the request.
+    """
+    table = getattr(holder, "_pp_parked_continuations", None)
+    if not table or rid not in table:
+        return False
+    del table[rid]
+    return True
+
+
+def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
+    """#968: the rids PP0 must NAME on this pass, in queue order.
+
+    THE ACTING HALF, and it is deliberately the smallest possible act:
+    reorder, never admit. The rids named here are requests already in PP0's
+    own `waiting_queue` -- the void's requeue put them there (mixin
+    :6791-6793/:8104-8106) and the tail rotation is exactly what kept them
+    from ever reaching a seat. Moving them to the FRONT lets the ordinary
+    admission loop admit them, which is what puts them in `can_run_list`,
+    which is what makes `build_pp_admission_decision` name them.
+
+    NOT A SECOND ADMISSION AUTHORITY (DESIGN_679 §4, rule 1): this changes
+    what there is to decide from; the adder still decides. Nothing here
+    admits, prices, clamps or truncates -- and in particular nothing
+    reduces the carried prefix, which is the #963 floor's job and must stay
+    there (a clamp applied twice manufactures a geometry no rank ran).
+
+    THE SEAT ARITHMETIC NEEDS NO CHANGE, and that is worth stating because
+    it was the first design considered. `_update_uniform_pool_budget`
+    MIN-reduces the cap, so every rank carries the SAME integer. Once the
+    continuation is one of PP0's own cap-counted members, PP0 stops at the
+    same seat count the follower does, and the follower's `add_chunked_req`
+    occupant is a NAMED member: no extra, no missing. Pricing the seat
+    separately would double-count it.
+
+    Empty tuple whenever the table is empty, which is every pass of every
+    boot that never parks a continuation -- so the default path is
+    untouched.
+    """
+    carry = pp_parked_continuation_carry(scheduler)
+    if not carry:
+        return ()
+    queue = getattr(scheduler, "waiting_queue", None)
+    if not queue:
+        return ()
+    front, rest = [], []
+    for req in queue:
+        (front if getattr(req, "rid", None) in carry else rest).append(req)
+    if not front:
+        return ()
+    scheduler.waiting_queue = front + rest
+    return tuple(str(getattr(req, "rid", "")) for req in front)
+
+
 def pp_output_payload_with_return_trip(
     holder, payload: Dict[str, object], mb_id: int
 ) -> Dict[str, object]:
@@ -1593,14 +1838,44 @@ def pp_output_payload_with_return_trip(
     # has no retraction to derive the occupancy from.
     chains = getattr(holder, "_pp_launched_chain_by_slot", None)
     chain = chains[mb_id] if chains and 0 <= mb_id < len(chains) else None
-    if decision is None and not chain:
+    # #968: the parked-continuation facts ride the same message for the same
+    # reason the chain does -- and they are the case that needs a VOID most,
+    # because a void is exactly the pass on which a follower ends up holding
+    # a continuation PP0 knows nothing about. `incoming` is this rank's own
+    # absorbed table plus whatever already rides the payload, so a fact that
+    # was parked two hops upstream is not lost at this one.
+    parked_out: Dict[str, object] = {}
+    pp_parked_continuation_stamp(
+        holder, {_PP_PARKED_CONTINUATION_KEY: _pp_parked_carry_wire(holder)}, parked_out
+    )
+    if decision is None and not chain and not parked_out:
         return payload
     out = dict(payload)
     if decision is not None:
         out.update(pp_admission_decision_to_wire(decision))
     if chain:
         out[_PP_LAUNCHED_CHAIN_KEY] = tuple(bool(x) for x in chain)
+    if parked_out:
+        out.update(parked_out)
     return out
+
+
+def _pp_parked_carry_wire(holder) -> Tuple:
+    """#968: this rank's absorbed table, back in wire shape.
+
+    The last rank forwards what it LEARNED from the downstream-travelling
+    decision messages, not only what it holds itself: in a three-rank ring
+    PP1 parks, PP2 originates the home-bound output, and PP0 is the only
+    consumer -- so PP2 must relay PP1's fact or it never arrives. This is
+    the same union `pp_parked_continuation_stamp` performs, expressed from
+    the table rather than from a message.
+    """
+    table = getattr(holder, "_pp_parked_continuations", None)
+    if not table:
+        return ()
+    return tuple(
+        (rid, executed, rank) for rid, (executed, rank) in sorted(table.items())
+    )
 
 
 def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
@@ -1622,6 +1897,14 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     # than raise. Popped BEFORE the decision check so a message carrying a
     # chain but no decision is cleaned too.
     message.pop(_PP_LAUNCHED_CHAIN_KEY, None)
+    # #968: absorbed and popped BEFORE the decision check, for the two
+    # reasons the chain is. What is left of this dict becomes a
+    # `PPProxyTensors`, which maps `v[key]` over every entry, and a tuple of
+    # triples would slice to nonsense rather than raise; and a message
+    # carrying a parked fact but NO decision is exactly the void case this
+    # exists for, so gating the absorption on a decision would starve it.
+    pp_note_parked_continuation(holder, message)
+    message.pop(_PP_PARKED_CONTINUATION_KEY, None)
     raw = message.pop(_ADMISSION_DECISION_PAYLOAD_KEY, None)
     if raw is None:
         return False
@@ -6203,6 +6486,20 @@ class SchedulerPPMixin:
             tensor_dict[_PP_LAUNCHED_CHAIN_KEY] = tuple(
                 bool(x) for x in launched_chain
             )
+        # #968: THE DOWNSTREAM LEG OF THE RETURN LAP, and it is needed because
+        # the ring is not symmetric. The output goes home in ONE hop -- the
+        # last rank sends straight to PP0 -- so a middle rank never relays an
+        # output and has no other way onto the lap. It puts its parked fact on
+        # the decision message that already travels to its successor every
+        # pass (#791b, "SENT EVERY PASS, EVEN WHEN EMPTY"); the successor
+        # absorbs it into the same table, and the last rank forwards that
+        # table home with `pp_output_payload_with_return_trip`. Two existing
+        # messages, no new wire, no collective on the admission path.
+        pp_parked_continuation_stamp(
+            self,
+            {_PP_PARKED_CONTINUATION_KEY: _pp_parked_carry_wire(self)},
+            tensor_dict,
+        )
         works = self._pp_send_dict_to_next_stage(
             tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
         )
@@ -6274,6 +6571,14 @@ class SchedulerPPMixin:
         self._pp_launched_chain_incoming = tuple(
             bool(x) for x in message.get(_PP_LAUNCHED_CHAIN_KEY, ())
         )
+        # #968: the upstream leg's parked facts land in the SAME table PP0
+        # reads, on every rank. A middle rank is a relay here, not a
+        # consumer: it absorbs so that its own decision send can forward the
+        # union onward (`_pp_parked_carry_wire`), and only PP0 ever acts on
+        # the table (`pp_parked_continuation_priority` is called from PP0's
+        # admission alone). Absent key is a no-op, so a pre-#968 sender or a
+        # stand-in leaves this rank exactly where it was.
+        pp_note_parked_continuation(self, message)
         return pp_admission_decision_from_wire(message)
 
     def _pp_try_recv_admission_decision(

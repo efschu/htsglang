@@ -9103,6 +9103,32 @@ class Scheduler(
 
         transport_only = bool(getattr(self, SEAM_TRANSPORT_ROUND_ATTR, False))
 
+        # #968 NAME WHAT THE FOLLOWER IS ALREADY HOLDING. A rank that parked a
+        # chunked continuation after a #797 void has it in `self.chunked_req`
+        # and in NO queue on any rank, so PP0 cannot see it -- and PP1's
+        # `add_chunked_req` will append it to `can_run_list` unconditionally
+        # next pass whatever PP0 decides. Boot 3 of window-flip-0828 spent 514
+        # refusals on that asymmetry (323 of them "this rank admitted rid(s)=
+        # ..., which the decision does not name") and died on the #801-spin
+        # guard. The fact now rides the #791b return lap home; this is the one
+        # place it is ACTED on.
+        #
+        # REORDER, NOT ADMIT: the rids are already in this queue (the void's
+        # requeue put them there, and the tail rotation is what kept them from
+        # a seat). Moving them to the front lets the ordinary loop below admit
+        # them, which is what makes `build_pp_admission_decision` name them.
+        # No seat is priced here and no prefix is touched -- see
+        # `pp_parked_continuation_priority` for why both would be wrong.
+        #
+        # PP0 ONLY, and a no-op whenever the table is empty, which is every
+        # pass of every boot that never parks a continuation.
+        if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_parked_continuation_priority as _pp_parked_priority,
+            )
+
+            _pp_parked_priority(self)
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if transport_only and not seam_grant_is_open(req):
@@ -9421,6 +9447,19 @@ class Scheduler(
                 # optimisation -- refuse and name it.
                 require_executed_geometry=True,
             )
+            # #968 THE FACT HAS BEEN ACTED ON. A rid this decision NAMES is a
+            # rid the follower may now legally build, so its carried fact is
+            # spent here. Self-correcting rather than authoritative: if the
+            # follower still holds the continuation, the very next lap
+            # re-stamps it, so clearing early costs one pass and can never
+            # strand the request. Nothing about the request is touched -- the
+            # parked prefix must advance, never be recomputed.
+            from sglang.srt.managers.scheduler_pp_mixin import (
+                pp_clear_parked_continuation as _pp_clear_parked,
+            )
+
+            for _entry in self._pp_admission_last_built_decision.entries:
+                _pp_clear_parked(self, _entry.rid)
             # #946 DECIDE HERE, ACT AT THE CHUNK BOUNDARY. `note_offer` has
             # just run for every entry in the decision above, so any rid whose
             # prefix premise is now declared dead is known -- and PP0 is the
