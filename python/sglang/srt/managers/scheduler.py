@@ -8917,6 +8917,14 @@ class Scheduler(
             else:
                 self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # #959 THE RESIDENCY FACT, STAMPED WHERE IT IS SETTLED. Both branches
+        # above leave `self.chunked_req` final for this pass -- the seam
+        # refusal KEEPS the continuation without calling the adder at all --
+        # so this is the one point that can state it for every path. The adder
+        # refuses to mint a second continuation while this is True; see
+        # `PrefillAdder.chunked_req_outstanding`.
+        adder.chunked_req_outstanding = self.chunked_req is not None
+
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()

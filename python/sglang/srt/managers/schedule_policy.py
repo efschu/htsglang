@@ -737,6 +737,21 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        #: #959 IS A CONTINUATION ALREADY RESIDENT THIS PASS?
+        #:
+        #: `scheduler.chunked_req` is the authority and it is not this object's
+        #: to read, so the scheduler STAMPS it here right after it has settled
+        #: (scheduler.py, immediately below `add_chunked_req`). Default False
+        #: keeps every caller that does not stamp it exactly as it was.
+        #:
+        #: WHY IT HAS TO BE STAMPED RATHER THAN INFERRED: the continuation can
+        #: stay resident on a pass where `add_chunked_req` is never called at
+        #: all -- the #906 seam refusal keeps the request as
+        #: `scheduler.chunked_req` and skips the adder entirely. Inferring
+        #: residency from this object's own calls would read that pass as
+        #: "nothing resident", which is precisely the pass that then mints a
+        #: second one.
+        self.chunked_req_outstanding = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -1569,6 +1584,50 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            # #959 ONE CONTINUATION AT A TIME, STATED RATHER THAN EMERGENT.
+            #
+            # `scheduler.py`'s `assert self.chunked_req is None` is upheld
+            # today by ARITHMETIC: a surviving continuation has normally spent
+            # all of `rem_chunk_tokens`, so this branch is not reached. #951
+            # recorded that as emergent and BREAKABLE, with witnesses under
+            # /spinning/evidence-665-f1/witness_951/ driving three states where
+            # `add_chunked_req` leaves `rem_chunk_tokens` positive (a
+            # `rem_total_tokens`-bound truncation, the hybrid-SWA early exit,
+            # the #679 park) and a mid-pass replenishment then mints a SECOND
+            # continuation. #951 closed only the PP instance (a #798-voided
+            # pass no longer runs this function); the general case was left as
+            # its own posten.
+            #
+            # THIS IS THAT POSTEN, and it is reachable: window-955-boot's
+            # second boot died on that assert on ALL THREE ranks three seconds
+            # after the first clean `pp_to_tp` cutover, with a `tp_to_pp` flip
+            # already armed and reporting "NOT QUIESCENT: a chunked prefill is
+            # incomplete". A cutover resizes the pool, which is exactly the
+            # mid-pass replenishment the witnesses need. window-951's 0/0 on
+            # that line was VACUOUS -- every batch it saw was `phase=pp`.
+            #
+            # REFUSING IS THE SAFE DIRECTION HERE, and that is the whole
+            # danger-direction analysis. This request is FRESH: nothing of it
+            # has been committed, no KV is held for it, no chunk of it has run.
+            # Leaving it for a later pass is the requeue-for-free the admission
+            # loop already relies on -- no progress is lost, so no double
+            # prefill (the standing law). It cannot starve either: the resident
+            # continuation is consuming chunks, and when it finishes
+            # `chunked_req` is None and this request is admitted.
+            #
+            # WHAT WOULD NOT BE SAFE is the mirror-image fix -- clearing
+            # `scheduler.chunked_req` at the cutover. That drops a request
+            # MID-PREFILL and re-prefills it, which is the double prefill the
+            # law forbids outright, and the #858 wedge shape besides. The
+            # resident continuation is never the one to give way; the fresh
+            # admission is.
+            #
+            # The precedent is `_add_scheduled_req`'s `carried_chunk` flag,
+            # which already refuses to announce a NEW chunked req for exactly
+            # this reason and names this assert while doing it.
+            if self.chunked_req_outstanding:
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -1800,6 +1859,14 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
+                    return AddReqResult.OTHER
+
+                # #959 ONE CONTINUATION AT A TIME -- the sibling of the guard
+                # in the no-prefix branch above, which carries the reasoning.
+                # Both fresh-request mint sites need it; the forwarded-schedule
+                # site already has its own (`carried_chunk`). Missing it here
+                # would leave the same assert reachable by the longer path.
+                if self.chunked_req_outstanding:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
