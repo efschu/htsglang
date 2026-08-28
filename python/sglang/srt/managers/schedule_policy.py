@@ -710,6 +710,7 @@ class PrefillAdder:
         chunked_admission_enabled: bool = True,
         scheduled_extents: Optional[Dict[str, Tuple[int, int]]] = None,
         scheduled_fill_carry: Optional[Dict[str, Tuple[int, Tuple[int, ...]]]] = None,
+        scheduled_last_chunk: Optional[Dict[str, bool]] = None,
     ):
         # #987: `rid -> (upstream_fill_len, upstream_fill_tail)` off the SAME
         # forwarded decision as `scheduled_extents` below, or None on every
@@ -717,6 +718,10 @@ class PrefillAdder:
         # is measured against travel together; see `_add_scheduled_req`, the
         # one place either is read.
         self.scheduled_fill_carry = scheduled_fill_carry
+        # #996: `rid -> last_chunk`, the DECIDING rank's own verdict, off that
+        # same decision. Absent rid = say nothing = fall back to the local
+        # derivation, which is the pre-#996 behaviour exactly.
+        self.scheduled_last_chunk = scheduled_last_chunk
         # #791 CORE: `rid -> (prefix_len, extend_len)` decided ONCE by the
         # first PP rank and forwarded on the admission decision, or None.
         #
@@ -1341,6 +1346,62 @@ class PrefillAdder:
             return None
         return self.scheduled_extents.get(req.rid)
 
+    def _mint_chunked(self, req: Req, site: str) -> None:
+        """#996 RATCHET: announce `req` as THIS pass's new chunked request.
+
+        `scheduler.chunked_req` is a single field, and the scheduler asserts
+        `self.chunked_req is None` before adopting `new_chunked_req`
+        (scheduler.py). That assert is about the RESIDENT continuation from an
+        earlier pass -- which is also all `chunked_req_outstanding` knows, since
+        it is set exactly once per pass (scheduler.py, after `add_chunked_req`)
+        and never at a mint. So neither watcher can see the OTHER way to end up
+        with two: two mints inside ONE pass.
+
+        Nothing has been observed doing that. This exists because the three
+        mint sites below wrote a bare assignment, so a second one would have
+        SILENTLY overwritten the first: the overwritten request stays in
+        `can_run_list` with a partial extend range and is tracked by nobody,
+        gets treated as a finished prefill, and is re-prefilled next pass --
+        the double prefill the standing law forbids, with no assert and no log
+        line anywhere on the path. The whole family (#951, #959, #995, #996) is
+        one invariant held "by ARITHMETIC, not by a check"; this is the check,
+        at the mint, naming both rids and the site.
+
+        It is deliberately an assert and not a refusal: a refusal here would be
+        the #858 wedge shape, and there is no evidence this is reachable. If it
+        ever fires, it fires with everything needed to root it in one line
+        instead of 300 lines later at a watcher that is asking about something
+        else.
+        """
+        assert self.new_chunked_req is None, (
+            f"#996 SECOND CHUNKED MINT IN ONE PASS at {site}: this adder "
+            f"already minted rid={getattr(self.new_chunked_req, 'rid', '?')} "
+            f"and is now being asked to mint rid={getattr(req, 'rid', '?')}. "
+            f"`scheduler.chunked_req` is a single field, so the first would be "
+            f"silently dropped, left in can_run_list with a partial extend "
+            f"range, and re-prefilled next pass."
+        )
+        self.new_chunked_req = req
+
+    def _told_last_chunk(self, req: Req) -> Optional[bool]:
+        """#996: the deciding rank's last-chunk verdict for `req`, or None.
+
+        ONE DEFINITION, TWO READERS. `_add_scheduled_req` executes this verdict
+        and `add_chunked_req` asks the same question again immediately
+        afterwards ("is this still the chunked request"). Before #996 both
+        derived it locally and so could not disagree; now that one of them
+        executes a CARRIED verdict, the other must read the same source or the
+        two halves of one fact drift -- which is the defect class this ticket
+        exists to close, one level up.
+
+        `None` = the decision said nothing for this rid (legacy sender,
+        unreadable fill, or no forwarded schedule at all), and both readers
+        fall back to their pre-#996 local derivation.
+        """
+        if not self.scheduled_last_chunk:
+            return None
+        return self.scheduled_last_chunk.get(req.rid)
+
     def _add_scheduled_req(
         self,
         req: Req,
@@ -1426,11 +1487,65 @@ class PrefillAdder:
 
         req.set_extend_range(prefix_len, prefix_len + extend_len)
         self.can_run_list.append(req)
-        # LAST CHUNK OR NOT IS ALSO THE SCHEDULE'S TO SAY. `prefix + extend`
-        # reaching the request's fill length is the upstream's own
-        # last-chunk verdict, carried here as arithmetic on forwarded
-        # integers rather than re-taken against a local budget.
-        last_chunk = prefix_len + extend_len >= local_fill_len
+        # LAST CHUNK OR NOT IS THE SCHEDULE'S TO SAY -- AND UNTIL #996 IT DID
+        # NOT SAY IT. The old line here read
+        #
+        #     last_chunk = prefix_len + extend_len >= local_fill_len
+        #
+        # under a comment claiming that was "arithmetic on forwarded integers
+        # rather than re-taken against a local budget". Two of the three
+        # integers are forwarded. `local_fill_len` is not: it is rebuilt from
+        # THIS rank's `origin_input_ids + output_ids (+ carried tail)` on every
+        # pass (`Req._refresh_fill_ids`, schedule_batch.py:1326, unconditional
+        # and ahead of the `tree_cache` gate at :1355). So the verdict was a
+        # rank-local quantity wearing a forwarded one's clothes, and the fill
+        # is precisely the quantity this seam is known to disagree about.
+        #
+        # `schedule_refusal_reason` above does not cover it: its third clause
+        # refuses `prefix + extend > local_fill_len`, the decision wanting more
+        # than this rank holds. The opposite skew -- this rank holding MORE
+        # than the rank that decided -- passes every clause and silently turns
+        # a final chunk into a new continuation. `adopt_carried_fill` cannot
+        # close it either; it only ever APPENDS, so it lifts a short follower
+        # up to the decider and never brings a long one down.
+        #
+        # MEASURED, boot 16 (996fbf4aca, 2026-08-28 22:21:48, 68 s after first
+        # load): PP1 and PP2 both logged `#987 FILL-ADOPT rid=da614e20...
+        # local=8446 -> upstream=8447`, and PP1 died at
+        # scheduler_pp_mixin.py:2147 with `#631 PROXY LEFTOVER REFUSED ...
+        # mb_id=1 seq=17 rows=4096 epoch=2 arrived while this rank is on
+        # mb_id=2` -- same-epoch, a proxy for a pass this rank had already
+        # left. The continuation nobody decided on is what put it on the wire.
+        #
+        # NOW CARRIED, NOT RE-DERIVED. The fallback stays exactly the old
+        # expression for an absent rid (legacy sender, unreadable fill), so a
+        # mixed-version group and every non-PP boot behave as before.
+        told_last_chunk = self._told_last_chunk(req)
+        local_last_chunk = prefix_len + extend_len >= local_fill_len
+        last_chunk = local_last_chunk if told_last_chunk is None else told_last_chunk
+        if told_last_chunk is not None and told_last_chunk != local_last_chunk:
+            # THE EXECUTION PROOF, and the one line that makes the next boot
+            # able to read this seam directly. It fires only when the carry
+            # actually CHANGED the verdict -- i.e. exactly on the passes that
+            # used to mint a continuation nobody decided on -- so a quiet log
+            # means the skew did not occur, not that the fix did not run.
+            logger.info(
+                "[#996] LAST-CHUNK CARRIED OVER LOCAL rid=%s prefix=%d extend=%d "
+                "local_fill=%d told_last_chunk=%s local_last_chunk=%s: the "
+                "deciding rank's verdict is executed. Deriving it here would "
+                "have %s -- the boot 16 shape (local=8446 upstream=8447).",
+                req.rid,
+                prefix_len,
+                extend_len,
+                local_fill_len,
+                told_last_chunk,
+                local_last_chunk,
+                (
+                    "minted a continuation the decision never named"
+                    if local_last_chunk is False
+                    else "dropped a continuation the decision did name"
+                ),
+            )
         # `carried_chunk`: this request is ALREADY `scheduler.chunked_req`, so
         # announcing it as a NEW one would trip the `assert self.chunked_req
         # is None` the scheduler takes before adopting `new_chunked_req`, and
@@ -1496,7 +1611,7 @@ class PrefillAdder:
             if self.chunked_req_outstanding:
                 note_second_continuation_refused(req, "_add_scheduled_req")
             else:
-                self.new_chunked_req = req
+                self._mint_chunked(req, "_add_scheduled_req")
         if not carried_chunk:
             self._req_inc_lock_ref(req)
         self._update_prefill_budget(
@@ -1526,8 +1641,17 @@ class PrefillAdder:
             self._add_scheduled_req(req, scheduled, carried_chunk=True)
             # `add_chunked_req` answers "is this still the chunked request",
             # and under a forwarded schedule that is the same last-chunk fact
-            # `_add_scheduled_req` just applied -- read back off the request
-            # so the two can never disagree.
+            # `_add_scheduled_req` just applied -- so it must come from the
+            # same source. #996: the read-back off the request was equivalent
+            # only while BOTH sides derived the verdict locally. Now that
+            # `_add_scheduled_req` executes a carried one, re-deriving here
+            # would put this rank's own `full_untruncated_fill_ids` back into
+            # the answer through the side door -- the very quantity the carry
+            # exists to take out of it, and the boot 16 skew (8446 vs 8447)
+            # would reappear one method along.
+            told_last_chunk = self._told_last_chunk(req)
+            if told_last_chunk is not None:
+                return None if told_last_chunk else req
             return (
                 req
                 if req.extend_range.end < len(req.full_untruncated_fill_ids)
@@ -1816,7 +1940,7 @@ class PrefillAdder:
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self._mint_chunked(req, "add_one_req_ignore_eos")
             self._update_prefill_budget(
                 0,
                 trunc_len,
@@ -2075,7 +2199,7 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self._mint_chunked(req, "add_one_req")
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

@@ -223,6 +223,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPScheduleRefused,
     build_pp_admission_decision,
     forwarded_fill_carry,
+    forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
     void_pp_admission_decision,
 )
@@ -8083,6 +8084,26 @@ class Scheduler(
             getattr(self, "_pp_admission_amended_to_forward", None)
         )
 
+    def _pp_scheduled_last_chunk(self) -> Optional[Dict[str, bool]]:
+        """#996: whether the DECIDING rank called each scheduled extent final.
+
+        THE THIRD TWIN, gated identically to `_pp_scheduled_extents` and
+        `_pp_scheduled_fill_carry` and projected out of the SAME amended
+        decision, so all three maps empty on exactly the same passes and can
+        never name different rid sets.
+
+        `None` on the rank that BUILDS the decision and on every `pp_size <= 1`
+        boot: a rank that owns its own admission truth derives its own verdict,
+        which is correct there precisely because its fill IS the decision's
+        fill.
+        """
+        ps = getattr(self, "ps", None)
+        if ps is None or ps.pp_size <= 1 or ps.pp_rank == 0:
+            return None
+        return forwarded_last_chunk(
+            getattr(self, "_pp_admission_amended_to_forward", None)
+        )
+
     def _pp_refuse_forwarded_schedule(self, refusal: Exception) -> None:
         """#791 CORE: turn an unexecutable forwarded geometry into a void.
 
@@ -8980,6 +9001,10 @@ class Scheduler(
             # extents above deliberately: the geometry and the fill it is
             # measured against come from one object and are emptied together.
             scheduled_fill_carry=self._pp_scheduled_fill_carry(),
+            # #996: the THIRD projection, and the one that stops the receiver
+            # re-deriving a verdict it was told. Same object, same emptying,
+            # same rid set as the two above.
+            scheduled_last_chunk=self._pp_scheduled_last_chunk(),
         )
 
         if self.chunked_req is not None:

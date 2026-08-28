@@ -359,6 +359,50 @@ class PPAdmissionEntry:
     papered over by shipping an arbitrary suffix of a request across the
     wire -- it is refused loudly instead, with both numbers named."""
 
+    last_chunk: Optional[bool] = None
+    """#996: the DECIDING rank's own verdict on whether this extent finishes
+    the request. `None` = "say nothing" (a legacy sender, or a stand-in that
+    published no fill), and a receiver reading `None` falls back to the
+    pre-#996 local derivation exactly.
+
+    WHY THIS TRAVELS, and it is the same argument `fill_len` above makes, one
+    step further. Until #996 the receiver RE-DERIVED this verdict at
+    `schedule_policy.py:_add_scheduled_req` as
+
+        last_chunk = prefix_len + extend_len >= len(full_untruncated_fill_ids)
+
+    over a comment claiming it was "the schedule's to say ... arithmetic on
+    forwarded integers". Two of those three integers are forwarded; the third
+    is not. `len(full_untruncated_fill_ids)` is rebuilt from THIS rank's
+    `origin_input_ids + output_ids (+ carried tail)` on every pass
+    (`Req._refresh_fill_ids`, schedule_batch.py:1326 -- unconditional, ahead of
+    the `tree_cache` gate at :1355), so the verdict was a rank-local quantity
+    wearing a forwarded one's clothes.
+
+    THE GUARD ONLY COVERED HALF THE DISAGREEMENT. `schedule_refusal_reason`'s
+    third clause refuses `prefix + extend > local_fill_len` -- the decision
+    asking for more than this rank holds. The opposite skew, this rank holding
+    MORE than the rank that decided, passes every clause and silently flips the
+    verdict from "last chunk" to "mint a continuation". `adopt_carried_fill`
+    does not close it either: it only ever APPENDS (:1628-1633), so it lifts a
+    short follower up to the decider and can never bring a long one down.
+
+    MEASURED, boot 16 (996fbf4aca, 2026-08-28 22:21:48,
+    boot_943bx_996fbf4aca_0828_221614.log): PP1 and PP2 both logged
+    `#987 FILL-ADOPT rid=da614e20... local=8446 -> upstream=8447`, and PP1 then
+    died at scheduler_pp_mixin.py:2147 with `#631 PROXY LEFTOVER REFUSED: a
+    proxy stamped mb_id=1 seq=17 rows=4096 epoch=2 arrived while this rank is
+    on mb_id=2 in flip epoch 2` -- the same-epoch branch, i.e. a proxy for a
+    pass this rank had already left. All three ranks down 68 s after first
+    load. The continuation nobody decided on is what put that proxy on the
+    wire.
+
+    CARRIED, NOT RE-CHECKED. The fix is not a fourth clause in
+    `schedule_refusal_reason` -- tightening that to `!=` would refuse every
+    legitimate middle chunk, where `prefix + extend < local_fill_len` is the
+    normal case, and void every pass. The verdict simply stops being derived
+    from a local length."""
+
 
 @dataclass(frozen=True)
 class PPAdmissionDecision:
@@ -1046,6 +1090,55 @@ def fill_carry_for(req) -> Tuple[Optional[int], Tuple[int, ...]]:
     return (fill_len, tail)
 
 
+def _last_chunk_verdict(
+    prefix_len: int, extend_len: int, fill_len: Optional[int]
+) -> Optional[bool]:
+    """#996: does `prefix_len + extend_len` finish a request of `fill_len`?
+
+    `None` when the fill is unreadable -- the same "say nothing" that
+    `fill_carry_for` returns for that case, and for the same reason: a verdict
+    derived from a length nobody could read is worse than no verdict, because
+    the receiver's fallback is at least honest about being local.
+
+    ONE EXPRESSION, ON THE DECIDING RANK. This is deliberately the same
+    comparison the receiver used to make for itself
+    (`schedule_policy.py:_add_scheduled_req`); what changes is WHOSE
+    `fill_len` it is asked against. Keeping the arithmetic identical and
+    moving only the authority is what makes this a carry rather than a new
+    rule -- there is no second definition of "last chunk" to drift.
+    """
+    if fill_len is None:
+        return None
+    return int(prefix_len) + int(extend_len) >= int(fill_len)
+
+
+def forwarded_last_chunk(
+    decision: Optional[PPAdmissionDecision],
+) -> Dict[str, bool]:
+    """#996: the `rid -> last_chunk` map a receiving rank EXECUTES.
+
+    The third projection of the same decision object, alongside
+    `forwarded_fill_carry` and `scheduler_pp_mixin._pp_forwarded_schedule_from`,
+    and gated identically -- one fact read three times, never three facts to
+    keep in step. A voided decision has no entries and yields `{}`.
+
+    Entries with no `last_chunk` (a legacy sender, or one whose fill was
+    unreadable) are ABSENT from the map, so an absent rid and a rid with
+    nothing to say are the same thing to the reader: fall back to the local
+    derivation. That is what keeps a mixed-version group behaving exactly as
+    it did before this field existed.
+    """
+    if decision is None:
+        return {}
+    out: Dict[str, bool] = {}
+    for entry in getattr(decision, "entries", ()) or ():
+        verdict = getattr(entry, "last_chunk", None)
+        if verdict is None:
+            continue
+        out[entry.rid] = bool(verdict)
+    return out
+
+
 def forwarded_fill_carry(
     decision: Optional[PPAdmissionDecision],
 ) -> Dict[str, Tuple[int, Tuple[int, ...]]]:
@@ -1252,6 +1345,13 @@ def build_pp_admission_decision(
                     admitted=True,
                     fill_len=executed_fill_len,
                     fill_tail=executed_fill_tail,
+                    # #996: the last-chunk verdict is decided HERE, against
+                    # this rank's own fill, and travels with the geometry it
+                    # belongs to. Same reader as `fill_len` above, so the two
+                    # can never describe different fills.
+                    last_chunk=_last_chunk_verdict(
+                        executed[0], executed[1], executed_fill_len
+                    ),
                 )
             )
             continue
@@ -1327,6 +1427,12 @@ def build_pp_admission_decision(
                 admitted=True,
                 fill_len=fallback_fill_len,
                 fill_tail=fallback_fill_tail,
+                # #996: same verdict, same rule, on the branch that derives
+                # its extent instead of reading it back. `told + extend_len`
+                # is invariant under the #630 guard clamp (which only moves
+                # tokens from prefix to extend), so the verdict does not move
+                # with it either.
+                last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))
