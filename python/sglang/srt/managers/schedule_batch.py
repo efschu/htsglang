@@ -1641,10 +1641,59 @@ class Req(ReqDllmMixin):
         MIN, NEVER ASSIGN: this may only LOWER the claim. A request whose
         protected length was already below ``told`` owns exactly that many, and
         raising it here would invent protection the tree never granted.
+
+        #958 AND THE EXECUTED GEOMETRY GOES WITH IT -- the third sibling, and
+        the one that cost the boot. ``pp_admission_congruence._executed_extent``
+        builds PP0's production offer out of ``extend_range.start`` ALONE, and
+        its docstring rests on ``extend_range.start == len(prefix_indices)``
+        being ONE quantity with one expression. Truncating the prefix and
+        leaving ``extend_range`` behind breaks exactly that: the offer is then
+        read off a geometry describing a pass that no longer exists, and it is
+        read as though it were a fresh measurement.
+
+        MEASURED (window-955-boot, boot_943bx_27bcb4884f_0828_024615.log). The
+        recompute terminator spent itself on rid ``a6132c5de5...``, discarding
+        8192 tokens as a NAMED double prefill -- and the next 336 offers for
+        that rid were ``told=8192``, unchanged. Not one genuine ``told=0``
+        offer exists in the boot. Since ``reconcile_pp_admission_decision``
+        admits ``told <= 0`` UNCONDITIONALLY (the one exit that survives a
+        downstream lookup miss), the escape was built to reach that branch and
+        never delivered it: PP1 retracted every pass, and PP2 voided 512
+        CONSECUTIVE passes into the ``#801-spin`` refusal.
+
+        NONE, NOT A RECOMPUTED RANGE, and the choice is the whole safety
+        argument. Moving ``start`` down to ``told`` and keeping ``end`` would
+        INVENT a pass: the discarded tokens would have to be computed in this
+        chunk, inflating it past the chunk budget the adder already decided --
+        instr21 in the other direction (a report naming rows no rank will run).
+        ``None`` invents nothing. It is also not a new state: ``reset_for_
+        retract`` already sets ``extend_range = None`` (below), every reader on
+        this path is already None-safe, and ``build_pp_admission_decision``
+        already has a loud, rid-naming refusal for it
+        (``PPScheduleRefused``, ``require_executed_geometry=True``).
+
+        SO THE REQUEST GETS EXACTLY THE THREE HONEST EXITS. The truncation
+        happens at the one legal point -- before ``add_chunked_req`` commits
+        the next chunk (``scheduler.py``'s "#946 ACT HERE, AND ONLY HERE") --
+        so normally the adder re-derives the geometry from the shortened
+        prefix, the offer moves to 0, and the request continues. If the adder
+        did NOT re-derive it, that is the defect state itself, and the refusal
+        names the rid on the first pass instead of offering a stale length
+        forever. What is no longer reachable is the fourth exit: silent,
+        unbounded re-offer of a geometry the request no longer has.
+
+        ONLY WHEN THE PREFIX ACTUALLY MOVES. A no-op truncation
+        (``told >= len(prefix_indices)``) leaves a valid geometry valid --
+        clearing it there would void healthy passes for nothing.
         """
         told = int(told)
         if told < len(self.prefix_indices):
             self.prefix_indices = self.prefix_indices[:told]
+            # #958: the geometry was DERIVED from the prefix that just moved,
+            # so it is now a stale reading rather than a report. Invalidate it
+            # and let the adder derive the honest one.
+            if getattr(self, "extend_range", None) is not None:
+                self.extend_range = None
         if self.cache_protected_len > told:
             self.cache_protected_len = told
 
