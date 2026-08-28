@@ -252,7 +252,7 @@ def _run_absorb(tree_cache, reqs):
     }
     m.pp_void_forward_payload = lambda *a, **k: None
     m.pp_absorb_admission_return = lambda *a, **k: None
-    m._park_chunked_prefill_chunk = lambda scheduler, req: False
+    m._park_chunked_prefill_chunk = lambda scheduler, req, **kw: False
     try:
         holder._absorb(holder, 0, {m._PP_VOID_OUTPUT_KEY: True}, list(batches), [None])
     finally:
@@ -310,16 +310,56 @@ class PPVoidReleasesItsTreeLock969(unittest.TestCase):
 
         _run_absorb(tree, [req])
 
-        self.assertTrue(req.is_retracted)
+        # #984 RETRACTED THIS ARM'S PREMISE, and the premise is what changed
+        # -- not the invariant. This used to read `assertTrue(req.is_retracted)`
+        # and `retraction_count == 1`, because a voided pass RETRACTED rank
+        # 0's members. It now PARKS them (the void became symmetric with the
+        # follower ranks), so nothing on this path retracts and
+        # `retraction_count` is never touched at all.
+        #
+        # WHAT THIS ARM WAS PROTECTING SURVIVES VERBATIM, which is why it is
+        # re-encoded rather than deleted: `retraction_count` is the input to
+        # the solo-OOM abort ladder in `retract_decode`, and a request must
+        # never be aborted at half the retractions the operator configured.
+        # A double count was the hazard when the void retracted; an UNASKED
+        # count is the hazard now. Both are the same assertion: after a void,
+        # this number reflects the retractions that actually happened, and a
+        # void-park performed none.
+        self.assertFalse(
+            req.is_retracted,
+            "#984: a voided pass PARKS rank 0's members, it does not retract "
+            "them -- an is_retracted request here means the symmetry broke "
+            "and the reset shape is back on the queue path",
+        )
         self.assertEqual(
             req.retraction_count,
-            1,
-            "the voided request was reset more than once; the release path "
-            "and the call site are both doing it",
+            0,
+            "a void-park retracts nothing, so it must not advance the "
+            "abort-ladder counter -- inflating it aborts the request early",
         )
 
-    def test_the_release_happens_before_the_reset(self):
-        """`reset_for_retract` clears `last_node`; a release after it is blind."""
+    def test_the_ref_goes_back_while_the_prefix_handle_is_KEPT(self):
+        """The #969 invariant under #984's premise: give the ref, keep the handle.
+
+        RENAMED AND RE-ENCODED 2026-08-28, from
+        `test_the_release_happens_before_the_reset`. The old name and its
+        second assertion (`assertIsNone(req.last_node)`) encoded the ORDERING
+        problem of a world where the void RETRACTED: `reset_for_retract`
+        cleared `last_node`, so a release running after it had nothing left
+        to unlock. #984 removes that world -- the void parks, nothing is
+        reset, and `last_node` is deliberately PRESERVED
+        (`pp_give_back_admission_lock_ref`: "`last_node` and `prefix_indices`
+        are deliberately NOT cleared: they are what the next offer reports as
+        executed, which is the entire point of #984").
+
+        THE INVARIANT IS UNCHANGED AND IS WHAT THIS ARM NOW STATES: the
+        admission-side `inc_lock_ref` that `PrefillAdder._req_inc_lock_ref`
+        took must not outlive a pass that never ran. Whether the handle is
+        destroyed afterwards is a detail of the old disposal; whether the
+        REF came back is the thing that decides if the prefix is ever
+        evictable again. Asserting the old `is None` today would assert the
+        absence of the very state #984 exists to keep.
+        """
         tree = _FakeTreeCache()
         node = tree.new_node("order")
         tree.inc_lock_ref(node)
@@ -330,11 +370,24 @@ class PPVoidReleasesItsTreeLock969(unittest.TestCase):
         self.assertIn(
             node,
             tree.dec_calls,
-            "no dec_lock_ref reached the node at all -- the release ran "
-            "after reset_for_retract had already set last_node to None, so "
-            "there was nothing left to unlock",
+            "no dec_lock_ref reached the node at all -- the admission's "
+            "increment is still outstanding and the prefix can never become "
+            "evictable, which is #969 by a new route",
         )
-        self.assertIsNone(req.last_node)
+        self.assertEqual(
+            node.lock_ref,
+            0,
+            "exactly the admission's one ref came back: not zero give-backs "
+            "(a leak) and not two (the #929 underflow)",
+        )
+        self.assertIs(
+            req.last_node,
+            node,
+            "#984: the prefix HANDLE is kept while its CLAIM is released -- "
+            "the pages stay in the tree and `last_node`/`prefix_indices` are "
+            "what the next offer reports as already executed. Clearing them "
+            "here is what would force the re-computation #984 prevents",
+        )
 
 
 class PPVoidDoesNotOverRelease969(unittest.TestCase):
@@ -389,22 +442,47 @@ class PPVoidDoesNotOverRelease969(unittest.TestCase):
         A guard that has never been seen to go red is not a guard. This
         drives the mutant the fix must not become -- a second decrement for
         the same request -- straight at the detector and requires it to fire.
+
+        THE MUTANT HAD TO MOVE, AND A DEAD CAN-FAIL IS WHY THIS MATTERS.
+        It used to replace `tree_cache.cache_finished_req` with a
+        double-decrement, because the void released rank 0's members through
+        `_release_voided_request` -> `release_req` -> `cache_finished_req`.
+        #984 parks them instead, so that path is not taken and the mutant was
+        never invoked: measured at 8be86f55fe the arm failed `0 != -1`, i.e.
+        the injected fault could no longer occur AT ALL. A can-fail arm whose
+        mutant has become unreachable does not report a safe system -- it
+        reports nothing, and it does so while looking like a red that a
+        tired reader would "fix" by deleting the assertion.
+        The mutant is therefore re-aimed at the actuator #984 actually uses.
+        `pp_give_back_admission_lock_ref` is module-level precisely so this
+        is possible -- its own docstring says "A module-level function so a
+        can-fail proof can neuter this ONE step."
         """
+        from sglang.srt.managers import scheduler_pp_mixin as mod
+
         tree = _FakeTreeCache()
         node = tree.new_node("mutant")
         tree.inc_lock_ref(node)
         req = _FakeReq("mutant-rid", node=node)
 
-        # The mutant: cache_finished_req decrements twice, i.e. the void
-        # gives back a ref it took once and a ref it never took.
-        def _double_dec(r, is_insert=True):
-            if r.last_node is not None:
-                tree.dec_lock_ref(r.last_node)
-                tree.dec_lock_ref(r.last_node)
-            r.req_pool_idx = None
+        # The mutant: the give-back hands back a ref it took once AND a ref
+        # it never took -- the #929 underflow, injected at the one step that
+        # now performs the release.
+        original = mod.pp_give_back_admission_lock_ref
 
-        tree.cache_finished_req = _double_dec
-        _run_absorb(tree, [req])
+        def _double_give_back(scheduler, r):
+            n = getattr(r, "last_node", None)
+            if n is None:
+                return False
+            tree.dec_lock_ref(n)
+            tree.dec_lock_ref(n)
+            return True
+
+        mod.pp_give_back_admission_lock_ref = _double_give_back
+        try:
+            _run_absorb(tree, [req])
+        finally:
+            mod.pp_give_back_admission_lock_ref = original
 
         self.assertEqual(node.lock_ref, -1)
         self.assertEqual(
