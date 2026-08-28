@@ -370,6 +370,72 @@ class PPAdmissionCongruenceGuard:
         #: no collective, which is exactly why it survives the failure it is
         #: meant to bound.
         self._offer_streak: Dict[str, Tuple[int, int]] = {}
+        #: #955 rid -> the `told` at which the RECOMPUTE TERMINATOR was spent.
+        #:
+        #: WHAT IT BUYS: the standing law allows a dead-premise recompute as a
+        #: NAMED emergency exit, once per request, with its discard count. It
+        #: does not allow a stream of them. Presence here means "this rid has
+        #: already had its one exit", and `note_offer` will clamp the offer
+        #: without re-arming the escalation that drives the exit.
+        #:
+        #: DELIBERATELY CLEARED ONLY BY AN ADMITTED LAP (`record_return_trip`),
+        #: which is the very lap-gating #955 removes from `_escalated` -- and
+        #: the asymmetry is the point, because the DIRECTION of an unreachable
+        #: clear is opposite here. An unreachable clear on `_escalated` re-arms
+        #: an actuator for ever (a loop); an unreachable clear here can only
+        #: withhold a SECOND recompute, which is what the law asks for anyway.
+        #: A lifecycle end whose failure mode is "the emergency exit is not
+        #: offered twice" needs no lap-free escape hatch. Being served is also
+        #: the only honest proof that the premise genuinely changed: the offer
+        #: moving to 0 is this guard's OWN clamp, not independent evidence, so
+        #: it must not re-open the exit.
+        self._terminator_spent: Dict[str, int] = {}
+
+    def terminator_spent(self, rid: str) -> Optional[int]:
+        """#955 diagnostic/test hook: the `told` this rid's terminator was
+        spent at, or None if it still has its one exit."""
+        return self._terminator_spent.get(rid)
+
+    def note_terminator_spent(self, rid: Optional[str]) -> None:
+        """#955 THE ESCALATION'S OWN CONSEQUENCE ENDS IT.
+
+        Called by the recompute terminator (`scheduler_pp_mixin.
+        pp_apply_dead_premise_at_chunk_boundary`) at the moment it spends
+        itself, from the same branch that deletes the request-side marks.
+
+        WHY THE TERMINATOR AND NOT THE RING. `_escalated` was discarded at
+        exactly one site -- the `elif entry.admitted:` branch of
+        `record_return_trip` -- i.e. only after a completed PP ring round-trip.
+        The escalation's own consequence (mark dead -> decline the re-fetch ->
+        spend the terminator -> void the pass) is what PREVENTS that
+        round-trip, so the only operation able to clear the flag was
+        unreachable from the path the flag creates. Measured on metal
+        (window-951-boot, both boots byte-identical): 87 `#946 PREMISE
+        RECOMPUTE`, 85 of them one rid, 8192 tokens each -- 696,320 tokens
+        re-prefilled for a single request in 14 s, and `told=8192` unchanged
+        across 344 offers.
+        #944b learned this for the INCREMENT and made `_offer_streak` lap-free.
+        This is the same lesson applied to the CLEAR, which the comment at the
+        admitted branch below had recorded as a deliberate asymmetry -- true
+        only while a pass that serves the rid is reachable, which is precisely
+        what the escalation prevents.
+
+        TAKES NO `told`: it reads this guard's OWN last offer for the rid.
+        Passing the value in from the scheduler would create a second
+        expression for a quantity that already has one, which is the defect
+        `_executed_extent` exists to avoid one level up.
+        """
+        if rid is None:
+            return
+        prev_told, _streak = self._offer_streak.get(rid, (None, 0))
+        if prev_told is not None:
+            self._terminator_spent[rid] = int(prev_told)
+        else:
+            # No offer on record (a stand-in, or a rid escalated by a path that
+            # never counted). The exit was still spent, so it must still be
+            # recorded; -1 names "spent, at an offer this guard never saw".
+            self._terminator_spent.setdefault(rid, -1)
+        self._escalated.discard(rid)
 
     def unresolved_rounds(self, rid: str) -> int:
         """#944 diagnostic/test hook: consecutive unresolved rounds for `rid`.
@@ -409,12 +475,37 @@ class PPAdmissionCongruenceGuard:
             return False
         told = int(told)
         prev_told, streak = self._offer_streak.get(rid, (None, 0))
-        streak = streak + 1 if prev_told == told else 1
+        if prev_told == told:
+            streak = streak + 1
+        else:
+            # #955 THE LAP-FREE END OF THE ESCALATION, and the exact
+            # counterpart of the lap-free INCREMENT #944b built two tickets
+            # ago. The offer moving is the same observation the streak reset
+            # already trusts -- PP0's own, needing no peer, no lap and no
+            # collective -- so an escalation raised because the offer STOPPED
+            # moving must end when it moves again. Leaving it set was what let
+            # `is_escalated` (read at scheduler.py:9325) re-write the
+            # dead-premise mark every pass from state the terminator never
+            # touches.
+            streak = 1
+            self._escalated.discard(rid)
         self._offer_streak[rid] = (told, streak)
         # `told <= 0` is already the terminator, so a rid sitting there is
         # progressing by definition and is never "over the cap".
         if told <= 0 or streak <= self._unresolved_defer_cap:
             return False
+        if rid in self._terminator_spent:
+            # #955 CLAMP, BUT DO NOT RE-ARM. The rid has already had its one
+            # named recompute. The offer is still pinned to `told=0` by the
+            # return value below -- that is the FORWARD exit, admitted
+            # unconditionally by `reconcile_pp_admission_decision`, and it
+            # costs nothing to keep making it. What must not happen again is
+            # the ESCALATION, because that is what re-arms the actuator and
+            # buys a second full re-prefill of the same request.
+            #
+            # Counting is not clamping (#944c) and clamping is not escalating
+            # (#955): three separate questions that used to share one boolean.
+            return True
         if rid not in self._escalated:
             self._escalated.add(rid)
             logger.error(
@@ -605,6 +696,13 @@ class PPAdmissionCongruenceGuard:
                 # rid genuinely becomes unresolvable a second time.
                 self._unresolved_rounds.pop(entry.rid, None)
                 self._escalated.discard(entry.rid)
+                # #955: the rid was SERVED, so its one emergency exit is
+                # restored along with everything else. This is the ONLY site
+                # that restores it, and being served is the only honest proof
+                # that the premise genuinely changed -- see
+                # `note_terminator_spent` for why an unreachable clear is the
+                # safe direction here and was the fatal one for `_escalated`.
+                self._terminator_spent.pop(entry.rid, None)
                 # #944b The lap-free streak clears here TOO, and only here.
                 # The asymmetry is deliberate and is the point: the INCREMENT
                 # must survive a broken ring (so it is lap-free), the CLEAR

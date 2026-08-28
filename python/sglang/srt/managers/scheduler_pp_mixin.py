@@ -1567,6 +1567,40 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
         delattr(req, _REFETCH_DECLINE_STREAK)
     except AttributeError:
         pass
+    # #955 AND THE OTHER HALF OF THE SAME LIFECYCLE, which the sentence above
+    # ("must not arrive again on the same premise") asserted and nothing
+    # enforced. Spending the request-side marks is correct and was never the
+    # gap: the request is RE-MARKED from scheduler.py:9324-9326, which reads
+    # `PPAdmissionCongruenceGuard.is_escalated` -- durable guard state this
+    # function never touched. That flag was discarded at exactly one site, the
+    # `elif entry.admitted:` branch of `record_return_trip`, i.e. only after a
+    # completed ring round-trip; and the escalation's own consequence (this
+    # terminator, and the voided pass it produces) is what prevents that
+    # round-trip. So the only operation that could end the escalation was
+    # unreachable from the path the escalation creates, and the escape ran
+    # once every `REFETCH_DECLINE_CAP + 1` passes for the life of the
+    # instance: 85 recomputes of ONE rid at 8192 tokens each in 14 s
+    # (window-951-boot, 2/2 boots, byte-identical).
+    #
+    # TOLD, NOT ASKED. The guard is notified rather than consulted, and it
+    # reads its own last offer for the value -- the scheduler passing a length
+    # in would be a second expression for a quantity that already has one.
+    #
+    # EVERY LOOKUP A getattr (#787), and load-bearing rather than defensive
+    # here: this function is called with stand-in holders by the registered
+    # tests, and a holder that carries no guard must lose nothing but this
+    # bookkeeping.
+    _guard = getattr(holder, "_pp_admission_guard", None)
+    _note_spent = getattr(_guard, "note_terminator_spent", None)
+    if callable(_note_spent):
+        try:
+            _note_spent(getattr(req, "rid", None))
+        except Exception:  # noqa: BLE001 - bookkeeping may never break the escape
+            logger.warning(
+                "#955 could not record the terminator spend for rid=%s; the "
+                "recompute below still happens, but the escalation may re-arm",
+                getattr(req, "rid", "?"),
+            )
     # #796 CLASS, and this line is its third instance -- it killed all three
     # ranks in window-946rf-0828 the first time a boot ever REACHED the
     # terminator. `prefix_indices` is a torch tensor; `x or ()` asks `bool(x)`,
