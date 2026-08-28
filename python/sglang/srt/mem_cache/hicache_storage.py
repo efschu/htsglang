@@ -1123,6 +1123,55 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.abort(suffixed)
             return False
 
+    def install_canonical_windows(self, kv_page, mamba_blob) -> None:
+        """#706 x #719 (0828): swap this backend's read/write-time cut.
+
+        Called by ``HiCacheController.rebind_canonical_windows`` at the flip
+        cutover, AFTER the #719 pool rebind committed, with windows derived
+        from the pools now bound. The store's bytes never move -- one
+        canonical file per key, every phase cutting its own extents out of it
+        -- only WHICH extents this rank reads and writes changes with the
+        phase.
+
+        Never a format transition: window presence decides the KEY shape
+        (`_get_suffixed_key`), so flipping the format on or off here would
+        silently re-key a live store and strand every page written under the
+        other rule. Likewise the canonical TOTAL is a model constant: a
+        different total is a different page format, not another phase's cut
+        of the same one.
+        """
+        if (kv_page is None) != (self.canonical_kv_page is None) or (
+            (mamba_blob is None) != (self.canonical_mamba_blob is None)
+        ):
+            raise CanonicalPageError(
+                "refusing to switch the canonical format on or off at a "
+                "cutover: window presence decides the key shape, and "
+                "re-keying a live store strands every page written under "
+                "the other rule."
+            )
+        if kv_page is None:
+            return
+        if int(kv_page.spec.page_bytes) != int(
+            self.canonical_kv_page.spec.page_bytes
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a KV window of a "
+                f"{kv_page.spec.page_bytes}-byte page over a store keyed for "
+                f"{self.canonical_kv_page.spec.page_bytes}-byte pages: that "
+                "is a different page format, not another phase's cut."
+            )
+        if mamba_blob is not None and int(mamba_blob.total_bytes) != int(
+            self.canonical_mamba_blob.total_bytes
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a mamba window of a "
+                f"{mamba_blob.total_bytes}-byte blob over a store keyed for "
+                f"{self.canonical_mamba_blob.total_bytes}-byte blobs."
+            )
+        self.canonical_kv_page = kv_page
+        self._canonical_kv_extents = kv_page.as_extents()
+        self.canonical_mamba_blob = mamba_blob
+
     def get(
         self,
         key: str,
@@ -1269,7 +1318,7 @@ class HiCacheFile(HiCacheStorage):
             # them all).
             existing_files = set()
             for filename in target_files:
-                if self._stem_exists(filename[:-4]):
+                if self._stem_readable(filename[:-4]):
                     existing_files.add(filename)
             return existing_files
 
@@ -1279,10 +1328,98 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache.contains(stem):
                 existing_files.add(filename)
             else:
-                if self._stem_exists(stem):
+                if self._stem_readable(stem):
                     self.metadata_cache.add(stem)
                     existing_files.add(filename)
         return existing_files
+
+    def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
+        """The canonical width a stem's file must have to be readable, or None."""
+        if self._canonical_kv_extents is None:
+            return None
+        suffix = self.kv_config_suffix
+        if not suffix or not stem.endswith(suffix):
+            return None
+        bare = stem[: -len(suffix)]
+        if self.canonical_mamba_blob is not None and bare.endswith(
+            f".{PoolName.MAMBA}"
+        ):
+            return int(self.canonical_mamba_blob.total_bytes)
+        if "." not in bare:
+            return int(self._canonical_kv_extents.total_bytes)
+        return None
+
+    def _stem_readable(self, stem: str) -> bool:
+        """Presence a reader can actually serve (#706 x #719, 0828).
+
+        A canonical stem counts only when its file has the canonical width;
+        a same-stem file of another width -- a leftover of a different format
+        era in a long-lived store -- would pass an existence check and then
+        refuse at `read_extents`, which is exactly the presence-vs-readability
+        drift the 0828 specimen paid a full re-prefill for. Non-canonical
+        stems keep the plain existence answer.
+        """
+        if not self._stem_exists(stem):
+            return False
+        total = self._canonical_total_for_stem(stem)
+        if total is None:
+            return True
+        try:
+            return os.path.getsize(self._existing_path(stem)) == int(total)
+        except OSError:
+            return False
+
+    # #706 x #719 (0828): occurrences of a refused presence probe, class-wide
+    # so the rate limit survives a backend re-attach.
+    _probe_mismatch_count = 0
+
+    def _canonical_probe_mismatch(self) -> Optional[str]:
+        """Fix 2 of the 0828 specimen: presence must not outrun readability.
+
+        `batch_exists_v2` promised pages by bare file existence while the
+        reader's window refused every one of them ("read target holds 32768
+        bytes but this KV page window is 8192 bytes"), so the issuance saw
+        hits the fetch could never deliver, the match collapsed to 0, and the
+        #928 anchor re-prefilled the WHOLE prefix. The compatibility between
+        the window and the pool the read path actually fills therefore
+        belongs in the probe itself: a store the current window cannot cut is
+        an honest cold miss, never a promise.
+
+        Returns the named mismatch, or None when the probe may answer. Pools
+        this backend was never given (bare-backend unit tests, non-hybrid
+        deployments) are not turned into a claim.
+        """
+        if self._canonical_kv_extents is None:
+            return None
+        pool = getattr(self, "mem_pool_host", None)
+        if pool is not None:
+            try:
+                page = pool.get_dummy_flat_data_page()
+                have = int(page.numel()) * int(page.element_size())
+            except Exception:  # noqa: BLE001 - verification is best-effort
+                have = None
+            want = int(self._canonical_kv_extents.payload_bytes)
+            if have is not None and have != want:
+                return (
+                    f"the KV window cuts {want} bytes but the bound host "
+                    f"pool's page is {have} bytes"
+                )
+        blob = self.canonical_mamba_blob
+        mamba_pool = (getattr(self, "registered_pools", None) or {}).get(
+            PoolName.MAMBA
+        )
+        if blob is not None and mamba_pool is not None:
+            try:
+                page = mamba_pool.get_dummy_flat_data_page()
+                have = int(page.numel()) * int(page.element_size())
+            except Exception:  # noqa: BLE001 - verification is best-effort
+                have = None
+            if have is not None and have != int(blob.payload_bytes):
+                return (
+                    f"the mamba window cuts {blob.payload_bytes} bytes but "
+                    f"the registered mamba pool's page is {have} bytes"
+                )
+        return None
 
     def batch_exists_v2(
         self,
@@ -1290,6 +1427,20 @@ class HiCacheFile(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        mismatch = self._canonical_probe_mismatch()
+        if mismatch is not None:
+            HiCacheFile._probe_mismatch_count += 1
+            n = HiCacheFile._probe_mismatch_count
+            if n <= 3 or n % 100 == 0:
+                logger.error(
+                    "Canonical presence probe refused (occurrence %d): %s. "
+                    "Answering 0 hits -- an honest cold miss -- instead of "
+                    "promising pages the reader's window would refuse (the "
+                    "0828 specimen: a #719 rebind without a window rebuild).",
+                    n,
+                    mismatch,
+                )
+            return PoolTransferResult(0, {})
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
         def has_component(page_idx: int, name: str) -> bool:

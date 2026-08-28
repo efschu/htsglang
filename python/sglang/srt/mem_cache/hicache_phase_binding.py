@@ -77,6 +77,12 @@ class PhasePools:
     device_pool: Any
     host_pool: Any
     allocator: Any
+    # #706 x #719 (0828 specimen): the WRAPPED hybrid pool of the phase, kept
+    # beside the unwrapped one because only the wrapper knows its layers by
+    # GLOBAL id (full_attention_layer_id_mapping / mamba_pool.mamba_map) --
+    # the inputs the canonical-window rebuild reads at this very cutover.
+    # None keeps the unwrapped pool as the stamp target (pre-0828 shape).
+    device_pool_hybrid: Any = None
 
     def layer_num(self) -> Optional[int]:
         return getattr(self.device_pool, "layer_num", None)
@@ -267,9 +273,19 @@ def _stamp(obj: Any, incoming: PhasePools, generation: int) -> None:
     names the allocator), and inventing an attribute on a reader that never had
     one would create a fourth, silent binding.
     """
+    hybrid = incoming.device_pool_hybrid
+    if hybrid is None:
+        hybrid = incoming.device_pool
     mapping = {
         "mem_pool_device": incoming.device_pool,
-        "mem_pool_device_hybrid": incoming.device_pool,
+        # #706: the WRAPPER, deliberately. The controller's own __init__ keeps
+        # the wrapped pool in `mem_pool_device_hybrid` because only the
+        # wrapper knows its layers by GLOBAL id, and the canonical-window
+        # rebuild at this very cutover reads exactly that. Stamping the
+        # unwrapped pool here was the sibling defect of the 0828
+        # frozen-window specimen: it silently removed the rebuild's layer-id
+        # source at the one moment the rebuild must run.
+        "mem_pool_device_hybrid": hybrid,
         "mem_pool_device_allocator": incoming.allocator,
         "mem_pool_host": incoming.host_pool,
         "hybrid_kv_cache": incoming.device_pool,
@@ -356,7 +372,11 @@ def phase_pools_for(scheduler: Any, phase: str) -> PhasePools:
             "is the correct state and this rebind stays refused."
         )
     return PhasePools(
-        phase=phase, device_pool=inner, host_pool=host_pool, allocator=allocator
+        phase=phase,
+        device_pool=inner,
+        host_pool=host_pool,
+        allocator=allocator,
+        device_pool_hybrid=device_pool,
     )
 
 
@@ -524,6 +544,37 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
             "%s the TARGET rebind to '%s' COMMITTED at generation %d; only the "
             "#861 draft half was refused (%s). Draft-piggyback L2/L3 traffic is "
             "off until the next cutover; target device-tier I/O is unaffected.",
+            LOG_PREFIX,
+            incoming.phase,
+            generation,
+            exc,
+        )
+    # #706 x #719 (0828 specimen): the canonical storage windows are DERIVED
+    # QUANTITIES of the pool geometry this rebind just swapped -- the KV
+    # window from the host pool's flat page and the device pool's global
+    # layer ids, the mamba window from the current pool's layer map and this
+    # rank's head shard. They were built ONCE at storage attach; without this
+    # rebuild every canonical read after the first cutover refuses
+    # deterministically ("read target holds 32768 bytes but this KV page
+    # window is 8192 bytes", 128x on boot_943bx_0828), the prefetch completes
+    # 0, and the #928 anchor re-prefills everything.
+    #
+    # A failure here is logged, not raised: the target rebind is COMMITTED,
+    # the old windows stay installed, and the backend's own probe
+    # compatibility check (`_canonical_probe_mismatch`) keeps that state an
+    # honest cold miss instead of a broken promise.
+    try:
+        cc = readers.get("cache_controller")
+        rebuild = getattr(cc, "rebind_canonical_windows", None)
+        if rebuild is not None:
+            rebuild(incoming.phase)
+    except Exception as exc:  # noqa: BLE001 - a window refusal is not a rebind refusal
+        logger.error(
+            "%s the '%s' rebind COMMITTED at generation %d, but the #706 "
+            "canonical storage windows could not be re-derived from the "
+            "incoming pools (%s). The previous windows stay installed; every "
+            "canonical probe now answers 0 (honest miss) until the next "
+            "successful rebuild.",
             LOG_PREFIX,
             incoming.phase,
             generation,
