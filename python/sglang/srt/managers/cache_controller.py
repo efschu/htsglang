@@ -566,6 +566,16 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        # #706 x #719 (0828): attach-time constants for the cutover window
+        # rebuild (`rebind_canonical_windows`). Model constants, resolved once
+        # at storage attach; the PER-PHASE quantities (layer ranges, head
+        # shards, page widths) are re-read from the live pools at every
+        # rebuild instead.
+        self._canonical_server_args = None
+        self._canonical_model_config = None
+        self._canonical_attn_layer_ids = None
+        self._canonical_mamba_spec = None
+        self._canonical_mamba_layer_ids = None
         # #923: the owner rule this controller translates device slots with is
         # a CUTOVER-DEPENDENT quantity, not a boot constant. Join the #297
         # registry here so every installer of a token vector -- the reshard
@@ -1023,6 +1033,12 @@ class HiCacheController:
             # against 64 slots instead of 16. See resolve_attn_layer_ids for
             # the ladder and why the fix is not in get_hybrid_layer_ids.
             attn_layer_ids = resolve_attn_layer_ids(model_config)
+            # #706 x #719: recorded for the cutover window rebuild
+            # (`rebind_canonical_windows`) -- resolved once, from the same
+            # ladder the attach itself trusts.
+            self._canonical_server_args = server_args
+            self._canonical_model_config = model_config
+            self._canonical_attn_layer_ids = [int(i) for i in attn_layer_ids]
             canonical_kv_page = build_page_window(
                 attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
             )
@@ -1064,7 +1080,7 @@ class HiCacheController:
             canonical_mamba_blob=canonical_mamba_blob,
         )
 
-    def _canonical_mamba_window(self, server_args, model_config):
+    def _canonical_mamba_window(self, server_args, model_config, phase=None):
         """This rank's window in the canonical GDN blob (#706 slice 2).
 
         ``None`` only when the model has NO linear/GDN layers -- then there is
@@ -1076,6 +1092,7 @@ class HiCacheController:
         feature was on while every cross-phase lookup missed.
         """
         from sglang.srt.mem_cache.canonical_page_store import (
+            CanonicalPageError,
             build_mamba_window,
             derive_mamba_blob_spec,
             local_mamba_layer_range,
@@ -1097,7 +1114,9 @@ class HiCacheController:
         # (ladder step (c)); every unresolvable hybrid raises there instead of
         # arriving here as a silent skip. That is what makes the `return None`
         # below sound rather than the hole it was.
-        mamba_layer_ids = resolve_linear_layer_ids(model_config)
+        mamba_layer_ids = getattr(self, "_canonical_mamba_layer_ids", None)
+        if mamba_layer_ids is None:
+            mamba_layer_ids = resolve_linear_layer_ids(model_config)
         if not mamba_layer_ids:
             return None
 
@@ -1111,9 +1130,11 @@ class HiCacheController:
                 "geometry-free while its GDN blobs are not -- that combination "
                 "hits nothing at all."
             )
-        spec = derive_mamba_blob_spec(
-            model_config, mamba_pool, num_linear_layers=len(mamba_layer_ids)
-        )
+        spec = getattr(self, "_canonical_mamba_spec", None)
+        if spec is None:
+            spec = derive_mamba_blob_spec(
+                model_config, mamba_pool, num_linear_layers=len(mamba_layer_ids)
+            )
         # #931 second hop: `mamba_pool`, NOT `hybrid`. The parameter is named
         # `mamba_pool` and the callee's docstring says `MambaPool.mamba_map`;
         # what was passed was the KV pool (HybridLinearKVPool), which holds a
@@ -1123,22 +1144,82 @@ class HiCacheController:
         # SAME object, which is what removes the asymmetry that allowed one of
         # them to be wrong while the other was right.
         layer_lo, layer_hi = local_mamba_layer_range(mamba_pool, mamba_layer_ids)
-        # Head sharding: the uneven-TP vector when set, equal shares otherwise.
-        # Under the PP prefill phase tp_size is 1, so this is [1] and the window
-        # carries full heads -- exactly the layer-only cut.
+        # Head sharding: candidate (ratios, rank) resolutions, VERIFIED
+        # against the pool the read path actually fills, in a fixed order.
+        #
+        # #706 x #719 (0828): in the flip's TP phase the mamba states are
+        # head-sharded by the SAME vector that sizes the TP pools
+        # (--phase-flip-tp-vector; the #871 staging pin logs 2:1:1 mamba
+        # halves for 32,16,16), and this process's shard is its boot rank's
+        # entry -- the flip reuses the same ranks (server_args.py). The
+        # attach-time identity (tp_size=1 under the PP boot) cannot see that,
+        # so the PHASE selects the primary candidate. The pre-0828 resolution
+        # (rank_tp_ratio when set, equal shares otherwise) stays as the
+        # attach-time and fallback rule -- under the PP phase it is [1] and
+        # the window carries full heads, exactly the layer-only cut.
+        candidates = []
         raw_ratio = getattr(server_args, "rank_tp_ratio", None)
-        ratios = (
-            [int(x) for x in str(raw_ratio).split(",")]
-            if raw_ratio
-            else [1] * max(1, self.tp_size)
+        if raw_ratio:
+            candidates.append(
+                ([int(x) for x in str(raw_ratio).split(",")], int(self.tp_rank))
+            )
+        flip_vector = getattr(server_args, "phase_flip_tp_vector", None)
+        if phase == "tp" and flip_vector:
+            candidates.insert(
+                0,
+                (
+                    [int(x) for x in str(flip_vector).split(",")],
+                    int(getattr(self, "pp_rank", 0) or 0),
+                ),
+            )
+        candidates.append(
+            ([1] * max(1, int(self.tp_size)), int(self.tp_rank))
         )
-        window = build_mamba_window(
-            spec,
-            ratios=ratios,
-            rank=self.tp_rank,
-            layer_lo=layer_lo,
-            layer_hi=layer_hi,
-        )
+        # The CURRENT mamba host pool's page is the authority a candidate has
+        # to match: `_read_page` fills exactly that buffer, so a window of any
+        # other size would refuse at every read. Verified here, once, instead
+        # of once per refused page. A host tier that exposes no mamba entry
+        # (bare-controller attach, non-grouped pools) keeps the first
+        # candidate -- the attach-time behaviour, byte-identical.
+        expected_bytes = None
+        # getattr on self too: a bare controller probe (the #931 attach tests)
+        # legitimately carries no host pool, and verification is best-effort
+        # by design -- absence of the authority skips the check, it never
+        # invents one.
+        host_group = getattr(self, "mem_pool_host", None)
+        entry_names = getattr(host_group, "entry_map", None) or {}
+        get_pool = getattr(host_group, "get_pool", None)
+        if get_pool is not None and PoolName.MAMBA in entry_names:
+            try:
+                probe_page = get_pool(PoolName.MAMBA).get_dummy_flat_data_page()
+                expected_bytes = int(probe_page.numel()) * int(
+                    probe_page.element_size()
+                )
+            except Exception:  # noqa: BLE001 - verification is best-effort
+                expected_bytes = None
+        window = None
+        tried = []
+        for ratios, rank in candidates:
+            candidate = build_mamba_window(
+                spec,
+                ratios=ratios,
+                rank=rank,
+                layer_lo=layer_lo,
+                layer_hi=layer_hi,
+            )
+            tried.append((list(ratios), int(rank), candidate.payload_bytes))
+            if expected_bytes is None or candidate.payload_bytes == expected_bytes:
+                window = candidate
+                break
+        if window is None:
+            raise CanonicalPageError(
+                f"no head-shard candidate cuts a mamba window matching the "
+                f"bound mamba host pool's page of {expected_bytes} bytes "
+                f"(tried (ratios, rank, payload): {tried}). Such a window "
+                f"would refuse at every read; refusing to install it instead."
+            )
+        self._canonical_mamba_layer_ids = [int(i) for i in mamba_layer_ids]
+        self._canonical_mamba_spec = spec
         logger.info(
             "#706 canonical GDN blob active: layers [%d, %d) of %d, %d of %d "
             "blob bytes on this rank, %d extent(s).",
@@ -1150,6 +1231,92 @@ class HiCacheController:
             len(window.extents),
         )
         return window
+
+    def rebind_canonical_windows(self, incoming_phase: str) -> bool:
+        """#706 x #719 (0828 specimen): re-derive the canonical windows from
+        the pools the cutover has just bound.
+
+        The windows are DERIVED QUANTITIES of the pool geometry: the KV
+        window from the host pool's own flat page and the device pool's
+        global layer ids, the mamba window from the current pool's layer map
+        and this rank's head shard. `_generate_storage_config` builds them
+        ONCE, at attach, from the pools bound at that moment -- and the #719
+        rebind swaps every reader's pools without touching the storage
+        backend. Measured on boot_943bx_0828: after the first pp_to_tp rebind
+        (generation 1, 09:14:10) every canonical read refused
+        deterministically ("read target holds 32768 bytes but this KV page
+        window is 8192 bytes", 128x at 09:25:23), the prefetch completed 0 on
+        all three ranks, and the #928 anchor re-prefilled everything -- with
+        24k healthy pages sitting in the store the whole time (#872).
+
+        Called from `rebind_for_cutover` AFTER the pool swap committed, so it
+        reads exactly the pools the readers now name. Returns False when
+        there is nothing to rebuild (no storage, canonical format not armed,
+        a backend without the installer). Raises on a geometry that cannot be
+        derived: the caller logs it loudly, the old windows stay installed,
+        and `batch_exists_v2`'s compatibility probe keeps that state an
+        honest cold miss instead of a broken promise.
+        """
+        if not getattr(self, "enable_storage", False) or self.storage_backend is None:
+            return False
+        backend = self.storage_backend
+        if getattr(backend, "canonical_kv_page", None) is None:
+            return False
+        install = getattr(backend, "install_canonical_windows", None)
+        if install is None:
+            return False
+        from sglang.srt.mem_cache.canonical_page_store import (
+            CanonicalPageError,
+            build_page_window,
+        )
+
+        attn_layer_ids = getattr(self, "_canonical_attn_layer_ids", None)
+        if not attn_layer_ids:
+            raise CanonicalPageError(
+                "the attach never recorded the model's attention layer ids, "
+                "so the canonical windows cannot be re-derived at the "
+                "cutover."
+            )
+        kv_window = build_page_window(
+            attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
+        )
+        mamba_window = None
+        if getattr(backend, "canonical_mamba_blob", None) is not None:
+            mamba_window = self._canonical_mamba_window(
+                self._canonical_server_args,
+                self._canonical_model_config,
+                phase=incoming_phase,
+            )
+        install(kv_window, mamba_window)
+        # The v2 component reads/writes must land in the pools bound NOW, not
+        # the pools bound at attach -- the same frozen-binding class one layer
+        # down (`_batch_io_v2` resolves `registered_pools[name]`, registered
+        # once at attach).
+        backend.register_mem_pool_host(self.mem_pool_host)
+        entries = getattr(self.mem_pool_host, "entries", None) or []
+        for entry in entries:
+            backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        import dataclasses
+
+        self.storage_config = dataclasses.replace(
+            self.storage_config,
+            canonical_kv_page=kv_window,
+            canonical_mamba_blob=mamba_window,
+        )
+        logger.info(
+            "#706 canonical windows rebound for the '%s' phase: KV slots "
+            "[%d, %d) of %d, mamba %s.",
+            incoming_phase,
+            kv_window.first_slot,
+            kv_window.first_slot + kv_window.num_slots,
+            kv_window.spec.num_attn_layers,
+            (
+                f"{mamba_window.payload_bytes} of {mamba_window.total_bytes} B"
+                if mamba_window is not None
+                else "none"
+            ),
+        )
+        return True
 
     def reset(self):
         self.storage_stop_event.set()
