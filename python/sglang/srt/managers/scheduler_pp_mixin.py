@@ -760,6 +760,76 @@ def _release_voided_request(scheduler, req, remaining_req_count: int = 0) -> Non
             getattr(req, "rid", None),
             exc,
         )
+        # #993 A SWALLOWED RELEASE MUST NOT LEAVE A RE-ADMISSIBLE REQUEST.
+        #
+        # The never-raise contract above is right -- an instrument that raises
+        # while cleaning up after a divergence turns one defect into two -- but
+        # it only decided that this frame does not propagate the failure. It
+        # did NOT decide what the half-released request is afterwards, and the
+        # answer used to be "whatever it happened to be", which is a request
+        # that still holds `req_pool_idx` while the reset below erases the two
+        # fields the allocator reads as the evidence for that claim
+        # (`inflight_middle_chunks` and `kv_committed_len`, both zeroed by
+        # `reset_for_retract`).
+        #
+        # MEASURED, boot 12 (7b855f63fc, 2026-08-28 21:46:05-06, rid
+        # 5708abdd579e4f7097ab97ed796481ea): `release_req` raised
+        # "Committed KV cache already freed (self.kv_committed_len=4096)" from
+        # `Req.pop_committed_kv_cache`; this handler swallowed it; the reset
+        # ran; the request was re-queued and re-admitted one second later, and
+        # `ReqToTokenPool.alloc` killed rank 0 on
+        # "reusing request must be chunked or have committed KV"
+        # (memory_pool.py:395). The assert is CORRECT and it is the only thing
+        # that caught this -- the defect is upstream of it, here.
+        #
+        # THE DISPOSAL, and why it is a give-back rather than an abort: the
+        # reset below drops prefix, pages and geometry anyway, so this request
+        # re-prefills from scratch whatever we do. Then the row it is holding
+        # buys nothing and justifies nothing. Handing it back restores the
+        # allocator's invariant and costs one fresh row on the next admission.
+        # `free_slot` carries its own membership scan and REFUSES a row that is
+        # already free, so a release that failed AFTER returning the row is
+        # caught by name instead of corrupting the free list (#616).
+        #
+        # MAMBA BEFORE THE REQ SLOT: `free_mamba_cache` reads
+        # `req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]`
+        # and `free` nulls that index -- the same ordering
+        # `_release_dynamic_chunk_probe` documents above.
+        pool = getattr(scheduler, "req_to_token_pool", None)
+        if pool is not None:
+            try:
+                if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+                    pool, "free_mamba_cache"
+                ):
+                    pool.free_mamba_cache(req)
+            except Exception as inner:  # noqa: BLE001 - cleanup must not raise
+                logger.warning(
+                    "#993 post-failure mamba give-back failed for %s: %s",
+                    getattr(req, "rid", None),
+                    inner,
+                )
+            try:
+                if getattr(req, "req_pool_idx", None) is not None:
+                    pool.free(req)
+                    logger.warning(
+                        "#993 INCOMPLETE RELEASE DISOWNED rid=%s: the release "
+                        "above did not finish, so this request's req-pool row "
+                        "was handed back explicitly. It is now re-admissible "
+                        "as a fresh request instead of one claiming a row it "
+                        "can no longer justify -- the boot-12 assert at "
+                        "memory_pool.py:395. Reaching this line means a "
+                        "release raised; that producer is the defect and this "
+                        "is the containment.",
+                        getattr(req, "rid", None),
+                    )
+            except Exception as inner:  # noqa: BLE001 - cleanup must not raise
+                logger.warning(
+                    "#993 post-failure req-slot give-back REFUSED for %s: %s "
+                    "-- the row was already returned, so the release got "
+                    "further than the raise suggests. Left alone.",
+                    getattr(req, "rid", None),
+                    inner,
+                )
     if not getattr(req, "is_retracted", False):
         try:
             req.reset_for_retract()
