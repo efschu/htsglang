@@ -67,6 +67,9 @@ RID_CONT = "1fa3f808000000000000000000000000"
 RID_OTHER = "4077b704000000000000000000000000"
 EXECUTED = 4096
 TOTAL = 8422
+# Boot 5's own numbers, from the `#968 MINT none` line that named the
+# occupant this re-home refused: end=7939 against prefix=4096.
+UNPARKED_END = 7939
 
 
 def _req(rid, *, prefix_len, extend_len):
@@ -92,6 +95,37 @@ def _parked(rid=RID_CONT, executed=EXECUTED):
     return _req(rid, prefix_len=executed, extend_len=0)
 
 
+def _unparked(rid=RID_CONT, executed=EXECUTED, end=UNPARKED_END):
+    """The boot-5 shape: a MID-PLAN occupant, prepared but never run.
+
+    Not parked, so `extend_range.end` (7939) is past the prefix (4096). This
+    is what an occupant looks like when it became `chunked_req` through the
+    ordinary mint after a BUILT batch, rather than through a park.
+    """
+    return _req(rid, prefix_len=executed, extend_len=end - executed)
+
+
+class _StubPool:
+    """`req_to_token_pool` as far as the park actuator reads it."""
+
+    def __init__(self, rows=1, cols=TOTAL):
+        self.req_to_token = torch.arange(rows * cols, dtype=torch.int64).view(
+            rows, cols
+        )
+        self.freed_req = []
+
+    def free(self, req):
+        self.freed_req.append(req)
+
+
+class _StubAllocator:
+    def __init__(self):
+        self.freed = []
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
+
+
 def _scheduler():
     """A holder carrying exactly what the two void sites read.
 
@@ -114,6 +148,9 @@ def _scheduler():
         _pp_launched_chain_by_slot=[None] * WORLD,
         _pp_idle_void_suppress_log=False,
         _pp_void_forward_payload=None,
+        req_to_token_pool=_StubPool(),
+        token_to_kv_pool_allocator=_StubAllocator(),
+        tree_cache=None,
     )
     for name in (
         "_pp_absorb_void_output",
@@ -242,6 +279,120 @@ class CrossSlotDisplacementIsARealLoss(unittest.TestCase):
             getattr(found, "is_retracted", False),
             "a re-homed continuation must not be handed on in the "
             "reset_for_retract shape the next pass cannot read",
+        )
+
+
+class TheRehomeMustNotASSUMETheParkedShape(unittest.TestCase):
+    """#968b-2, boot 5's third exit -- and it is the SAME class as #968b.
+
+    The fix that closed the cross-slot displacement carried the defect class
+    it was closing. `pp_rehome_displaced_chunked_req` gated its re-home on
+    `extend_range.end == len(prefix_indices)` -- the PARKED shape -- and
+    returned None for anything else. Boot 5's occupant was not parked: it
+    became `chunked_req` through the ordinary mint after a BUILT batch, so
+    end=7939 against prefix=4096, named verbatim by its own `#968 MINT none`
+    line. The re-home refused it and the caller's next statement nulled the
+    live occupant. A DROP, by the code written to prevent drops.
+
+    THE CLASS, since it is the point: a predicate was ASSUMED where a
+    predicate already existed to be ASKED. `pp_chunked_req_is_reachable`
+    sits four lines below and TESTS reachability; the equality above GUESSED
+    that only a parked request was worth keeping. Same shape as the act
+    docstring that cited two line ranges it had never checked.
+
+    RED at 4b204740a0, GREEN at 646f41087d, same file, same fixture.
+
+    THE SPECIMEN HAD TO BE THE RIGHT ONE, and the first attempt was not --
+    recorded because the wrong one is GREEN ON BOTH TREES and would have
+    been reported as a passing red-first proof. Driving the two-slot
+    cross-slot displacement of `CrossSlotDisplacementIsARealLoss` with an
+    un-parked occupant does NOT reach the refusing gate: the voided slot's
+    own `_park_chunked_prefill_chunk` runs first (the `#791b` line prints
+    `chunk parked=True`), so by the time the SECOND slot's restore asks the
+    re-home, the request is already in the parked shape and the equality
+    holds even before the fix.
+
+    The shape that reaches the gate un-parked is the one boot 5 had: the
+    slot carried NOTHING at the top of the pass, the pass then minted a
+    mid-plan occupant into `self.chunked_req` the ordinary way, and a single
+    void on that slot asks the re-home to keep it. `incoming` is the slot's
+    empty snapshot, `current` is the un-parked occupant, nothing has parked
+    it, and pre-fix the gate refuses and the next statement nulls it.
+    """
+
+    def _minted_then_voided(self, drive):
+        """Boot 5's shape: empty snapshot, ordinary mint, then one void."""
+        h = _scheduler()
+        _snapshot(h, SLOT_A, None)
+        cont = _unparked()
+        # What `new_chunked_req` / `add_chunked_req` leave behind on a pass
+        # that BUILT a batch: an occupant that no park has touched.
+        h.chunked_req = cont
+        self.assertIn(RID_CONT, _located(h), "precondition: reachable before")
+
+        h.mbs[SLOT_A] = _empty_batch()
+        drive(h, SLOT_A)
+        h._pp_note_chunked_req_before_admission(SLOT_A)
+        return h, cont
+
+    def test_an_unparked_mid_plan_occupant_is_not_dropped_by_the_void_output(self):
+        h, _cont = self._minted_then_voided(_absorb)
+        self.assertIn(
+            RID_CONT,
+            _located(h),
+            "the occupant was MID-PLAN (end=7939, prefix=4096), not parked. "
+            "A re-home that keeps only the parked shape drops it -- boot 5's "
+            "third exit, and the drop is performed by the anti-drop code "
+            "itself. Pre-fix the four-place reader returns set()",
+        )
+
+    def test_the_own_void_route_refuses_it_the_same_way(self):
+        """Both call sites pass `route=`; both asked the same bad question."""
+
+        def drive(h, slot):
+            return h._pp_void_own_batch(slot)
+
+        h, _cont = self._minted_then_voided(drive)
+        self.assertIn(
+            RID_CONT,
+            _located(h),
+            "own-void-cross-slot refuses identically -- a fix at only the "
+            "void-output site leaves this red",
+        )
+
+    def test_the_giveback_happens_before_the_queueing(self):
+        """It may be kept only AFTER its never-run tail is given back.
+
+        Queueing a mid-plan occupant while `extend_range` still points past
+        the prefix would leave the next round's unconditional stash caching a
+        chunk no rank ran -- the double-prefill the park exists to prevent.
+        So reachability alone is not the whole assertion: the request must
+        arrive in the parked shape.
+        """
+        h, cont = self._minted_then_voided(_absorb)
+        found = m.pp_request_locations(h).get(RID_CONT)
+        if found is None:
+            self.skipTest(
+                "dropped -- `test_an_unparked_mid_plan_occupant_is_not_"
+                "dropped_by_the_void_output` is the arm that reports that"
+            )
+        self.assertIs(found, cont, "the same object, not a rebuild")
+        self.assertEqual(
+            found.extend_range.end,
+            len(found.prefix_indices),
+            "parked on the way through: the never-run tail [4096:7939) is "
+            "given back, so the next round's stash is a no-op on it",
+        )
+        self.assertEqual(
+            len(found.prefix_indices),
+            EXECUTED,
+            "and the 4096 EXECUTED tokens are untouched -- the give-back "
+            "frees only what this round allocated, never the radix tree's",
+        )
+        self.assertFalse(
+            getattr(found, "is_retracted", False),
+            "parked, not reset: a reset request cannot be read by the next "
+            "pass's get_next_batch_to_run",
         )
 
 
