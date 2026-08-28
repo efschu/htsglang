@@ -9043,7 +9043,76 @@ class Scheduler(
             _pp_ring_note(self, "prefill:chunked_block", False)
             _pp_apply_dead_premise(self, self.chunked_req)
 
-            if bool(getattr(self, _STR_ATTR, False)) and not _grant_open(
+            # #992 UNIFORM MEMBERSHIP HAS ONE HOLE AND IT IS THIS CANDIDATE.
+            #
+            # A rank executing a forwarded schedule may admit only what the
+            # decision names. That rule is enforced ~250 lines below for every
+            # candidate that comes out of `waiting_queue` (`pp_not_named`), and
+            # NOWHERE for the one candidate that never appears in a queue:
+            # `self.chunked_req` is appended here, unconditionally, before the
+            # decision is even consulted.
+            #
+            # The asymmetry is self-sustaining, which is why it ends a boot
+            # rather than costing a pass. Measured, boot 11 (aae7e3b7fd,
+            # 2026-08-28 21:27-21:31, 512 identical rounds): rank 1 held
+            # rid 8a330526c7b9410f963232874adc451b at executed=3332 as its
+            # parked continuation -- in NO queue on ANY rank, so rank 0's
+            # decision could not name it. This site gave it the seat; the
+            # decision's own rid (dfd22a9a… / 9528ff20…) then could not be
+            # reached; `#791 FORWARDED SCHEDULE UNEXECUTABLE` voided the pass;
+            # `#971 REHOME-ON-REFUSAL` put the continuation straight back into
+            # `self.chunked_req`; the next pass was byte-identical. Rank 2
+            # voided 512 consecutive passes and `#801-spin` refused the
+            # livelock. THE COMPENSATOR RESTORED THE PRECONDITION OF ITS OWN
+            # TRIGGER -- that is the class, and the cut has to be upstream of
+            # the rehome, at the admission, not in the rehome.
+            #
+            # NOT A DROP, AND THE PRECEDENT IS THE #906 GATE IMMEDIATELY BELOW:
+            # the continuation stays `self.chunked_req`, keeps its prefix and
+            # its pages, and resumes mid-chunk unharmed on the first pass whose
+            # decision names it. All that is refused is the SEAT, which is the
+            # upstream's to give.
+            #
+            # #968 IS THE OTHER HALF AND IT IS NOT CLOSED BY THIS. #968 makes
+            # the fact ride the return lap so PP0 can name such a rid; its
+            # actuator (`pp_parked_continuation_priority`) REORDERS PP0's own
+            # queue, so it is a no-op exactly when the rid is in no queue on
+            # PP0 -- which is this specimen. That is stated in the log line
+            # below rather than guessed at, so boot 12 measures the second
+            # half instead of assuming it.
+            incoming = getattr(self, "_pp_admission_incoming_effective", None)
+            not_named = (
+                incoming is not None and incoming.get(self.chunked_req.rid) is None
+            )
+            if not_named:
+                self._992_chunked_not_named = (
+                    getattr(self, "_992_chunked_not_named", 0) + 1
+                )
+                count = self._992_chunked_not_named
+                if count <= 8 or count % 256 == 0:
+                    logger.info(
+                        "#992 CHUNKED CONTINUATION NOT NAMED rid=%s executed=%s "
+                        "decision_names=%s occurrence=%d: this rank is "
+                        "executing a forwarded schedule that does not name its "
+                        "own chunked continuation, so the seat is refused and "
+                        "the decision's requests can be reached. The "
+                        "continuation is KEPT (prefix, pages and mid-chunk "
+                        "position intact) and resumes on the first pass that "
+                        "names it. If this rid never becomes named, the open "
+                        "half is #968: its fact rides the return lap, but "
+                        "`pp_parked_continuation_priority` can only REORDER "
+                        "PP0's queue and is a no-op while the rid is in no "
+                        "queue on PP0.",
+                        self.chunked_req.rid,
+                        getattr(
+                            getattr(self.chunked_req, "extend_range", None),
+                            "end",
+                            None,
+                        ),
+                        ",".join(sorted(incoming.keys())) or "-",
+                        count,
+                    )
+            elif bool(getattr(self, _STR_ATTR, False)) and not _grant_open(
                 self.chunked_req
             ):
                 self._note_seam_chunk_refused(self.chunked_req)
