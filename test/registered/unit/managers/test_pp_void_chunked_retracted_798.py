@@ -109,7 +109,15 @@ def _holder(chunked_by_slot, batches):
 class PPVoidChunkedRetracted798(unittest.TestCase):
     """The metal shape: two absorbs in a row, one shared request."""
 
-    def _run_two_absorbs(self, monkeypatched=True):
+    def _run_two_absorbs(self, monkeypatched=True, force_finished=False):
+        """#984: `force_finished` sends members down the release path again.
+
+        The disposal loop now asks `pp_park_voided_batch_member` and only the
+        `VOID_PARK_FINISHED` verdict still reaches `_release_voided_request`.
+        Forcing that verdict is how the reset shape this file exists for can
+        still be produced -- through the shipped decision, not by setting a
+        flag by hand.
+        """
         from sglang.srt.managers import scheduler_pp_mixin as m
 
         shared = _FakeReq("shared-rid")
@@ -141,7 +149,7 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
         # The real park treats `extend_range is None` as "nothing to give
         # back" and leaves the request untouched -- that is exactly why it
         # cannot repair this state, so the stub must NOT repair it either.
-        m._park_chunked_prefill_chunk = lambda scheduler, req: False
+        m._park_chunked_prefill_chunk = lambda scheduler, req, **_kw: False
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
         # The real one RELEASES AND RESETS (release_req calls
         # reset_for_retract as its last act), which is why the call
@@ -151,6 +159,11 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
         m._release_voided_request = (
             lambda scheduler, req, remaining=0: req.reset_for_retract()
         )
+        if force_finished:
+            saved["pp_park_voided_batch_member"] = m.pp_park_voided_batch_member
+            m.pp_park_voided_batch_member = (
+                lambda scheduler, req, *, mb_id, route: m.VOID_PARK_FINISHED
+            )
         try:
             for mb_id in (0, 1):
                 holder._absorb(
@@ -165,26 +178,95 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
                 setattr(m, name, fn)
         return holder, shared
 
-    def test_slot_a_disposal_reaches_slot_b_chunked_request(self):
-        """The precondition. Without it the rest proves nothing."""
+    def test_slot_a_disposal_no_longer_RESETS_slot_bs_chunked_request(self):
+        """#984 removed this file's hazard AT ITS SOURCE. Renamed and inverted.
+
+        This arm was the precondition of the whole file: slot 0's disposal
+        loop reset a request that slot 1 carries as its chunked request, and
+        it asserted `shared.is_retracted` with the honest warning that "if it
+        did not, this test no longer reproduces the boot and its green result
+        is meaningless". That warning came true, in the good direction. The
+        disposal loop now asks `pp_park_voided_batch_member` and PARKS an
+        ordinary member; only an already-FINISHED request still reaches
+        `_release_voided_request`, which is the only thing that resets. The
+        cross-slot reset that produced instr19 is therefore not merely
+        guarded against on this path -- it is no longer produced on it.
+
+        The guard itself STAYS AND STAYS TESTED. It is defence in depth: a
+        reset-shape request could still arrive from a path this file does not
+        model, and `test_the_guard_still_clears_a_reset_shape_that_DOES_arrive`
+        drives the shipped verdict that produces one and proves the clear
+        still fires. What changed is which of the two is the everyday case.
+        """
         _holder_, shared = self._run_two_absorbs()
+        self.assertFalse(
+            shared.is_retracted,
+            "#984: an ordinary voided member is PARKED, not reset -- if this "
+            "is retracted again, the instr19 producer is back and the arms "
+            "below are load-bearing rather than defence in depth",
+        )
+        self.assertIsNotNone(
+            shared.extend_range,
+            "the parked request keeps a readable extend_range; that is the "
+            "whole reason the next pass's unguarded dereference is safe",
+        )
+
+    def test_whatever_is_left_in_chunked_req_is_READABLE(self):
+        """THE INVARIANT, restated at the level that actually matters.
+
+        Renamed from `test_the_retracted_chunk_is_not_carried`, which
+        asserted `chunked_req is None`. That was the right assertion while
+        the only thing that could be sitting there was a RESET request: the
+        next pass dereferences `self.chunked_req.extend_range.end` with no
+        guard of its own, so a reset request had to be cleared. Under #984
+        the carried request is parked rather than reset, so it is perfectly
+        readable and clearing it would throw away the executed prefix for
+        nothing.
+
+        `is None` was never the point; SURVIVING THE NEXT PASS'S READ was.
+        So this arm asserts exactly that and nothing narrower: whatever the
+        void leaves in the field, the scheduler's own read of it must work.
+        """
+        holder, _shared = self._run_two_absorbs()
+        carried = holder.chunked_req
+        if carried is not None:
+            self.assertIsNotNone(
+                getattr(carried, "extend_range", None),
+                "a request in the reset_for_retract shape was left in "
+                "self.chunked_req; the next pass's get_next_batch_to_run "
+                "dereferences it with no guard of its own",
+            )
+        _reads_chunked_req_like_the_scheduler(holder)
+
+    def test_the_guard_still_clears_a_reset_shape_that_DOES_arrive(self):
+        """DEFENCE IN DEPTH, kept under test now that its producer is gone.
+
+        #984 removed the everyday producer of the reset shape from this path.
+        A guard whose only producer has disappeared is a guard nobody
+        exercises, and the next edit to the disposal would be free to
+        reintroduce the state with no test objecting -- which is how #798
+        arrived in the first place.
+
+        So the reset shape is produced HERE THROUGH THE SHIPPED DECISION
+        rather than by setting a flag: forcing `VOID_PARK_FINISHED` sends the
+        member down `_release_voided_request`, which resets it, exactly as
+        the pre-#984 disposal did. The shipped guard must then clear the
+        field rather than carry an unreadable request into the next pass.
+        """
+        holder, shared = self._run_two_absorbs(force_finished=True)
         self.assertTrue(
             shared.is_retracted,
-            "slot 0's disposal loop must have reset the request that slot 1 "
-            "carries -- if it did not, this test no longer reproduces the "
-            "boot and its green result is meaningless",
+            "the forced verdict must actually have produced the reset shape "
+            "-- if it did not, this arm proves nothing",
         )
         self.assertIsNone(shared.extend_range)
-
-    def test_the_retracted_chunk_is_not_carried(self):
-        """THE FIX. Fails with AttributeError before it, passes after."""
-        holder, _shared = self._run_two_absorbs()
         self.assertIsNone(
             holder.chunked_req,
             "a request in the reset_for_retract shape was left in "
             "self.chunked_req; the next pass's get_next_batch_to_run "
             "dereferences it with no guard of its own",
         )
+        _reads_chunked_req_like_the_scheduler(holder)
 
     def test_the_next_pass_read_does_not_raise(self):
         """The boot's actual failure, reproduced at its own call shape."""
@@ -219,7 +301,7 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
         }
         m.pp_void_forward_payload = lambda *a, **k: None
         m.pp_absorb_admission_return = lambda *a, **k: None
-        m._park_chunked_prefill_chunk = lambda scheduler, req: True
+        m._park_chunked_prefill_chunk = lambda scheduler, req, **_kw: True
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
         # The real one RELEASES AND RESETS (release_req calls
         # reset_for_retract as its last act), which is why the call
@@ -281,7 +363,7 @@ class PPVoidChunkedRetracted798(unittest.TestCase):
         }
         m.pp_void_forward_payload = lambda *a, **k: None
         m.pp_absorb_admission_return = lambda *a, **k: None
-        m._park_chunked_prefill_chunk = lambda scheduler, req: False
+        m._park_chunked_prefill_chunk = lambda scheduler, req, **_kw: False
         m._release_dynamic_chunk_probe = lambda scheduler, req: None
         # The real one RELEASES AND RESETS (release_req calls
         # reset_for_retract as its last act), which is why the call
