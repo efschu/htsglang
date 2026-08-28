@@ -778,8 +778,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         # #939: prefetch records displaced by a RE-ISSUE of the same req_id.
-        # They are terminated but NOT freed here -- see `_retire_ongoing_prefetch`
-        # -- and drained by `drain_retired_prefetch` from the per-round reap.
+        # They are terminated but NOT freed here -- see `_retire_ongoing_prefetch`.
+        # TWO release paths, and a new holder like this one needs BOTH or it
+        # becomes unfreeable (#966): `drain_retired_prefetch` from the per-round
+        # reap, which is collective and lives under the enable_hicache_storage
+        # gate, and `_release_retired_prefetch_local` from `detach_storage_backend`,
+        # which is what runs once that gate is cleared and the reap is therefore
+        # unreachable.
         self._retired_prefetch: list[_OngoingPrefetch] = []
         self._retired_prefetch_attempts: dict[str, int] = {}
         self._retired_prefetch_reaped = 0
@@ -3541,6 +3546,76 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return 1
 
+    def _release_retired_prefetch_local(self) -> int:
+        """Release every retired prefetch record on THIS rank. Detach only.
+
+        #966. `drain_retired_prefetch` is the steady-state reap and it is
+        collective by necessity: it runs while the peers run, so WHICH record is
+        reaped has to be agreed before anyone acts. A detach can neither use it
+        nor imitate it -- a detach may not depend on a collective its peers may
+        already have left, which is the rule `detach_storage_backend` above
+        already states for its own control-queue drain.
+
+        WHAT REPLACES THE AGREEMENT IS NOT AN ARGUMENT ABOUT UNIFORMITY. The
+        retire site (`_retire_ongoing_prefetch`) refuses to free because
+        `mark_terminate()` is a flag and not a join, so the prefetch transfer
+        thread may still be writing into the span; the collective exists to
+        answer that one question. By the time this runs, the caller has already
+        JOINED those threads (`HiCacheController.detach_storage_backend` ->
+        `_stop_storage_threads`, which raises rather than returning on failure),
+        so there is no writer left to race and nothing a peer could tell this
+        rank that it does not already know.
+
+        ONLY THE RETIRED LIST, AND THIS IS THE LOAD-BEARING RESTRICTION.
+        `ongoing_prefetch` is deliberately untouched. A retired record published
+        NOTHING to the tree, so every row it holds is unclaimed (the same
+        argument `drain_retired_prefetch` makes at its own free); a LIVE record's
+        span may still be adopted into the tree by `check_prefetch_progress`, so
+        freeing it here would be a use-after-free now and a double free later --
+        strictly worse than the leak this repairs.
+
+        Returns the number of records released.
+        """
+        cc = self.cache_controller
+        if cc is None:
+            return 0
+
+        released = 0
+        rows = 0
+        while self._retired_prefetch:
+            record = self._retired_prefetch.pop()
+            # The whole span, by the #905/#911 route, exactly as the reap does
+            # it: a record retired before a cutover names slots from the pool
+            # that MINTED them, not from whatever is bound now.
+            cc.append_host_mem_release(
+                host_indices=record.host_indices,
+                generation=getattr(record.operation, "binding_generation", None),
+            )
+            self.dec_host_lock_ref(record.anchor_node, record.anchor_lock_params)
+            cc.prefetch_tokens_occupied -= len(record.prefetch_key)
+            if cc.prefetch_tokens_occupied < 0:
+                cc.prefetch_tokens_occupied = 0
+            released += 1
+            rows += int(record.host_indices.numel())
+
+        total = getattr(self, "_retired_prefetch_released_detach", 0) + released
+        self._retired_prefetch_released_detach = total
+        # UNCONDITIONAL, including the zero. A line emitted only on a find
+        # cannot distinguish "nothing was stranded" from "this code never ran",
+        # which is the #962a blind-probe shape; the absence of this line in a
+        # boot that detached is then read as an all-clear. Not reset by
+        # `_reset_full`, so the total spans a whole boot across flips.
+        logger.info(
+            "#966 RETIRED PREFETCH RELEASED AT DETACH: released=%d rows=%d "
+            "(cumulative=%d). These records' only reap sits under the "
+            "enable_hicache_storage gate this detach clears, so anything left "
+            "here would have no reachable free path at all.",
+            released,
+            rows,
+            total,
+        )
+        return released
+
     def take_agreed_reissue(self, local_candidates: Sequence[str]) -> Optional[str]:
         """One req_id every rank agrees is owed a fresh fetch, or ``None``.
 
@@ -4077,6 +4152,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # enable_storage is already False, since that may be leftover
             # state from a partially-failed previous detach.
             self.cache_controller.detach_storage_backend()
+            # #966: THE HOLDER THIS DOCSTRING'S CONTRACT NAMES BUT NEVER DRAINED.
+            #
+            # `_retired_prefetch` (#939) holds a host span, an anchor host lock
+            # ref and a `prefetch_tokens_occupied` charge. Its ONLY release is
+            # `drain_retired_prefetch`, whose only caller (scheduler.py:8400)
+            # sits below `if not self.enable_hicache_storage: return {}`
+            # (scheduler.py:8386) -- and THIS operation is what clears that flag
+            # (scheduler.py:10820). So a record still retired when the detach
+            # returns has no reachable free path at all: precisely the "host
+            # pages and locks leak" this method's own docstring exists to
+            # prevent. The #939 holder was added after that sentence was written
+            # and was never folded into it.
+            #
+            # Nor does anything else close it: `_reset_full` REBINDS the list to
+            # `[]` without releasing, and `cache_controller.reset()` zeroes the
+            # prefetch charge only `if self.enable_storage`, which the call
+            # above has just set False -- so the charge would outlive even a
+            # full reset and throttle prefetch admission for the rest of the boot.
+            #
+            # PLACED HERE, between the two existing drains, because that is the
+            # only slot that is both safe and effective. AFTER the controller
+            # teardown: the retire site refuses to free while a transfer thread
+            # may still be writing into the span, and the join above is what
+            # ends that. BEFORE the second control-queue drain: a
+            # current-generation span is QUEUED rather than freed on the spot,
+            # and that drain -- already here to "sweep whatever the shutdown
+            # itself produced" -- is what turns it into an actual free.
+            self._release_retired_prefetch_local()
             self._drain_storage_control_queues_impl(
                 n_revoke=None,
                 n_backup=None,

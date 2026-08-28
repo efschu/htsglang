@@ -286,6 +286,17 @@ from sglang.srt.mem_cache.pinned_host_budget import (  # noqa: E402
 )
 
 
+class MambaBlobGeometryError(RuntimeError):
+    """#869b: a mamba blob whose byte length is not this pool's page geometry.
+
+    Named rather than a bare RuntimeError so the boot-log grep for it is
+    unambiguous, and so a caller that wants to degrade a cross-geometry read to
+    a cache MISS can catch exactly this and nothing else. Raised only by
+    ``MambaPoolHost.set_from_flat_data_page``; see the comment there for why a
+    refusal is the correct direction.
+    """
+
+
 class MambaPoolHost(HostKVCache):
     @revert_pinned_posts_on_failure  # #729
     def __init__(
@@ -800,6 +811,58 @@ class MambaPoolHost(HostKVCache):
         index: int,
         data_page: torch.Tensor,
     ) -> None:
+        # #869b: THE BYTES MUST BE THIS POOL'S GEOMETRY, and until this check
+        # existed nothing said so. The loop below walks THIS pool's tensors and
+        # reshapes each slice to `tensor.shape` -- the READER's shape. A blob
+        # written by a differently-shaped mamba pool is therefore silently
+        # reinterpreted rather than refused.
+        #
+        # That is reachable, not theoretical, and it is the direction this
+        # whole ticket has to be careful about. A phase-flip boot has TWO mamba
+        # state pools with different geometry on BOTH axes -- the PP stack
+        # holds `[L_stage, S, conv_dim_full, W]` / `[L_stage, S, H_full, D, N]`
+        # while the TP stack holds `[L_all, S, conv_shard, W]` /
+        # `[L_all, S, H_shard, D, N]` (gdn_flip_mover's payload contract). The
+        # host page and the storage blob inherit whichever pool built them,
+        # because `__init__` reads `num_mamba_layers`, `temporal_state_shape`
+        # and `conv_state_shapes` off one `device_pool` and never revisits
+        # them. Making the mamba state come back out of HiCache -- which is
+        # the point of #869b -- is exactly what makes a PP-written blob
+        # reachable by a TP-shaped reader.
+        #
+        # The two #760 phase guards (`_bind_phase_tag`, `_host_binding_is_stale`)
+        # do not cover this pool: they are called only from
+        # `DeepSeekV4PagedHostPool`, and they read `device_buffers` / `layer_num`
+        # / `_bound_tp_phase`, none of which this class sets -- so they would
+        # answer False here even if they were called.
+        #
+        # REFUSING RATHER THAN RETURNING FALSE, deliberately: both callers
+        # (`HiCacheFile._read_page`, hf3fs `_pool_batch_get`) treat this as a
+        # void call and would carry on with a half-written slot, which is the
+        # wrong answer this guard exists to prevent. A refusal costs a
+        # re-prefill; the silence costs a request answered from another
+        # phase's recurrent state -- the failure already on record twice in
+        # this tree (2026-08-19 "a kite prompt answered with a foreign river
+        # essay", and #928's three identical temp-0 sends giving three
+        # different answers).
+        #
+        # Total bytes, not per-tensor: it is the one check that catches BOTH
+        # axes at once (layer count and shard width both move the total), and
+        # it cannot itself be fooled by a coincidence of the first tensor.
+        expected_bytes = self.page_size * self.size_per_token
+        actual_bytes = data_page.numel() * data_page.element_size()
+        if actual_bytes != expected_bytes:
+            raise MambaBlobGeometryError(
+                f"mamba host page {index}: refusing a {actual_bytes}-byte blob "
+                f"into a pool whose page is {expected_bytes} bytes "
+                f"(num_mamba_layers={self.num_mamba_layers}, "
+                f"temporal_state_shape={tuple(self.temporal_state_shape)}, "
+                f"conv_state_shapes={[tuple(s) for s in self.conv_state_shapes]}). "
+                "The blob was written by a mamba pool of different geometry -- "
+                "on a phase-flip boot, the other stack's. Reinterpreting it "
+                "against this pool's shapes would hand the request another "
+                "phase's recurrent state."
+            )
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
         start = 0
         for tensor in self._iter_page_tensors(index):
